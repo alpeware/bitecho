@@ -6,11 +6,20 @@ The architecture is implemented in phases, separating the base routing layer fro
 
 ## Phase 1: The Network Layer (SBRB & Gossip)
 
-The initial phase focuses on establishing a robust, self-healing peer-to-peer mesh.
+### 1. Basalt (Byzantine-Resilient Peer Sampling)
+Basalt is the foundational peer sampling layer. Instead of relying on a centralized tracker, Basalt provides each node with a continuously updating, randomized, and mathematically robust subset of network peers (a "view"). It uses secure hashing (IP/Port/Pubkey) to prevent Sybil attacks and eclipse attacks, ensuring the network topology remains connected and highly resilient to malicious or churning nodes.
 
-* **The Bootstrap Node:** A passive, ICE-Lite listener with a statically persisted certificate and ICE credentials. Its static SDP acts as the entry point for new agents to join the network without prior signaling.
-* **Basal Peer Sampling:** The underlying protocol agents use to continuously discover new peers, maintaining a mathematically sound, randomized, and connected mesh graph.
-* **Contagion / Gossip Protocol:** The routing mechanism. When Agent A wants to connect to Agent B, it broadcasts its WebRTC SDP Offer into the mesh. Nodes use Epidemic Broadcast Trees (SBRB - Scalable Broadcast / Rumor Routing) to efficiently flood the offer to the target, and route the Answer back.
+### 2. The Contagion Stack (Routing & Broadcasting)
+To route WebRTC SDP offers/answers across the Basalt mesh without central servers, we use a 3-layered epidemic broadcast protocol stack based on the "Contagion" family of algorithms:
+
+* **Layer A: Murmur (Probabilistic Broadcast):** The base gossip layer. When a node wants to signal a peer, it "murmurs" the message to a random subset of its Basalt view. Receivers recursively forward it. It is fast and highly scalable, but provides no guarantees against message duplication, omission, or malicious equivocation.
+* **Layer B: Sieve (Probabilistic Consistent Broadcast):**
+    Builds on top of Murmur. Sieve adds history buffers and cryptographic signature verification to filter out duplicate messages and detect byzantine equivocations (e.g., a malicious node sending conflicting signaling data to different parts of the network). It guarantees that if one honest node delivers a message, all honest nodes eventually deliver the *same* message.
+* **Layer C: Contagion (Probabilistic Reliable Broadcast):**
+    The top routing layer. Contagion builds on Sieve by adding anti-entropy and lazy push/pull recovery mechanisms. If the initial Murmur/Sieve wave dies out due to massive network churn (agents dropping offline), Contagion guarantees that the signaling payload will reliably reach all non-faulty nodes with extremely high probability.
+
+### 3. The Pure State Machine (Sans-IO)
+The Bitecho core will model these three layers purely. The state machine will accept inputs (e.g., `{:type :receive-gossip :payload ...}`), transition the internal Basalt views and Sieve history buffers, and emit pure outputs (e.g., `{:network-out [{:dst peer :payload ...}]}`) to be handled by the external WebRTC shell.
 
 ## Phase 2: The Trust & Incentive Layer (Memory & Echos)
 
