@@ -54,3 +54,24 @@
       (let [shuffled (java.util.ArrayList. view-seq)]
         (java.util.Collections/shuffle shuffled rng)
         (take k shuffled)))))
+
+(defn- dedup-peers
+  "Deduplicates a collection of peers by hash, keeping the peer with the minimum age."
+  [peers]
+  (vals (reduce (fn [acc peer]
+                  (let [existing (get acc (:hash peer))]
+                    (if (or (nil? existing) (< (:age peer) (:age existing)))
+                      (assoc acc (:hash peer) peer)
+                      acc)))
+                {}
+                peers)))
+
+(defn merge-views
+  "Merges the local view and received view. Removes duplicates by keeping the youngest.
+   Sorts by age and hash, and keeps up to max-size elements."
+  [local-view received-view max-size]
+  (let [all-peers (concat local-view received-view)
+        deduped (dedup-peers all-peers)
+        sorted (sort-by (juxt :age :hash) deduped)
+        selected (take max-size sorted)]
+    (set selected)))
