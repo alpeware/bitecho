@@ -5,6 +5,7 @@
             [bitecho.crypto-test]
             [bitecho.murmur.core-test]
             [bitecho.sieve.core-test]
+            [bitecho.state-machine-test]
             [clojure.test :as t]))
 
 (defn -main
