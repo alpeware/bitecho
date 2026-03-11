@@ -1,15 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "Checking for remaining tasks in TESTING.md..."
+echo "Checking for remaining tasks in TODO.md..."
 
 # 1. Check if there are any unchecked boxes left
-if ! grep -q "\[ \]" TESTING.md; then
-  echo "Success: All tests in TESTING.md are checked off! Halting the Jules loop."
+if ! grep -q "\[ \]" TODO.md; then
+  echo "Success: All tests in TODO.md are checked off! Halting the Jules loop."
   exit 0
 fi
 
-echo "Unfinished tests found. Proceeding with loop..."
+echo "Unfinished tasks found. Proceeding with loop..."
 
 # 2. Rate Limiter Check (Fixed to look at the previous merge)
 # Fetch the tip of main AND its parent
