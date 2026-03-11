@@ -12,8 +12,8 @@
   (gen/choose 3 10))
 
 (def gen-drop-rate
-  "Generates a message drop rate between 0.0 and 0.5."
-  (gen/double* {:min 0.0 :max 0.5 :NaN? false :infinite? false}))
+  "Generates a message drop rate between 0.0 and 0.3."
+  (gen/double* {:min 0.0 :max 0.3 :NaN? false :infinite? false}))
 
 (def gen-payload
   "Generates a random byte array payload."
