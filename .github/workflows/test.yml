@@ -44,7 +44,7 @@ jobs:
         git diff --exit-code || (echo "Formatting check failed. Code is not properly formatted." && exit 1)
         
     - name: Run tests
-      run: clojure -M:test -m datachannel.test-runner
+      run: clojure -M:test -m bitecho.test-runner
 
     - name: Auto-merge PR on Success
       # Only run this if tests pass AND it's a PR
