@@ -3,6 +3,7 @@
   (:require [bitecho.basalt.core-test]
             [bitecho.crypto-test]
             [bitecho.murmur.core-test]
+            [bitecho.sieve.core-test]
             [clojure.test :as t]))
 
 (defn -main
