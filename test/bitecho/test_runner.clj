@@ -2,6 +2,7 @@
   "Test runner for Bitecho"
   (:require [bitecho.basalt.core-test]
             [bitecho.crypto-test]
+            [bitecho.murmur.core-test]
             [clojure.test :as t]))
 
 (defn -main
