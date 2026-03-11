@@ -1,0 +1,62 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+# Grant the GITHUB_TOKEN permission to interact with PRs
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    environment: test
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+          fetch-depth: 2 # Required to compare the last two commits
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Install Clojure
+      uses: DeLaGuardo/setup-clojure@13
+      with:
+        cli: 'latest'
+
+    - name: Install native dependencies
+      run: sudo apt-get update && sudo apt-get install -y libpulse0
+
+    - name: Run Linter
+      run: clojure -M:lint
+
+    - name: Check Formatting
+      run: |
+        clojure -M:format
+        git diff --exit-code || (echo "Formatting check failed. Code is not properly formatted." && exit 1)
+        
+    - name: Run tests
+      run: clojure -M:test -m datachannel.test-runner
+
+    - name: Auto-merge PR on Success
+      # Only run this if tests pass AND it's a PR
+      if: success() && github.event_name == 'pull_request'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Optional: You can wrap this in an IF statement to only auto-merge if the PR author is Jules
+        gh pr merge ${{ github.event.pull_request.number }} --squash --delete-branch
+
+    - name: Trigger next Jules task
+      if: success() && github.event_name == 'pull_request'
+      env:
+        JULES_API_KEY: ${{ secrets.JULES_API_KEY }} 
+      run: ./trigger.sh
