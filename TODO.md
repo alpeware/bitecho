@@ -1,7 +1,7 @@
 # Bitecho Phase 1: Routing & Gossip State Machine
 
 ## Cryptographic Foundation
-- [ ] Implement `bitecho.crypto` namespace (SHA-256 hashing, Ed25519 keypair generation, signing, and verification).
+- [x] Implement `bitecho.crypto` namespace (SHA-256 hashing, Ed25519 keypair generation, signing, and verification).
 
 ## 1. Basalt (Peer Sampling)
 - [ ] Implement `bitecho.basalt.core` data structures: define the Peer record (IP, port, pubkey, age, hash) and the View initialization logic.
