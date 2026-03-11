@@ -3,7 +3,8 @@
    Accepts `state` and `event` inputs and emits a map of `{:state new-state :commands [...]}`."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.contagion.core :as contagion]
-            [bitecho.murmur.core :as murmur]))
+            [bitecho.murmur.core :as murmur]
+            [bitecho.sieve.core :as sieve]))
 
 (def murmur-k
   "Number of peers to forward gossip messages to."
@@ -23,7 +24,8 @@
   {:basalt-view (basalt/init-view initial-peers)
    :murmur-cache {:set #{} :queue []}
    :sieve-history {}
-   :contagion-known-ids #{}})
+   :contagion-known-ids #{}
+   :messages {}})
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt age updates, views, and Contagion anti-entropy."
@@ -50,9 +52,12 @@
   [state event]
   (let [payload (:payload event)
         rng (:rng event)
+        sieve-message (if (and (:private-key event) (:public-key event))
+                        (sieve/wrap-message payload (:private-key event) (:public-key event))
+                        {:payload payload :sender "local" :signature (byte-array 0)})
         broadcast-result (murmur/initiate-broadcast payload rng (:basalt-view state) murmur-k)
         message-id (:message-id broadcast-result)
-        message {:message-id message-id :payload payload}
+        message (assoc sieve-message :message-id message-id)
         commands (if (seq (:targets broadcast-result))
                    [{:type :send-gossip
                      :targets (:targets broadcast-result)
@@ -62,10 +67,12 @@
         new-cache-set (conj (:set (:murmur-cache state)) message-id)
         new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
         new-cache {:set new-cache-set :queue new-cache-queue}
-        new-known-ids (conj (:contagion-known-ids state) message-id)]
+        new-known-ids (conj (:contagion-known-ids state) message-id)
+        new-messages (assoc (:messages state) message-id message)]
     {:state (assoc state
                    :murmur-cache new-cache
-                   :contagion-known-ids new-known-ids)
+                   :contagion-known-ids new-known-ids
+                   :messages new-messages)
      :commands commands}))
 
 (defn- handle-receive-push-view
@@ -89,6 +96,23 @@
     {:state state
      :commands commands}))
 
+(defn- handle-receive-pull-request
+  "Handles an incoming Contagion lazy pull request.
+   Looks up requested IDs in the local message store and returns
+   individual :send-gossip commands targeting the requester for each found message."
+  [state event]
+  (let [missing-ids (:missing-ids event)
+        requester (:sender event)
+        messages-map (:messages state)
+        found-messages (keep #(get messages-map %) missing-ids)
+        commands (map (fn [msg]
+                        {:type :send-gossip
+                         :target requester
+                         :message msg})
+                      found-messages)]
+    {:state state
+     :commands (vec commands)}))
+
 (defn- handle-receive-gossip
   "Handles an incoming Murmur gossip message."
   [state event]
@@ -100,12 +124,17 @@
                      :targets (:forward-targets gossip-result)
                      :message (:message gossip-result)}]
                    [])
-        new-known-ids (if (:message gossip-result)
+        new-message? (some? (:message gossip-result))
+        new-known-ids (if new-message?
                         (conj (:contagion-known-ids state) (:message-id message))
-                        (:contagion-known-ids state))]
+                        (:contagion-known-ids state))
+        new-messages (if new-message?
+                       (assoc (:messages state) (:message-id message) message)
+                       (:messages state))]
     {:state (assoc state
                    :murmur-cache (:cache gossip-result)
-                   :contagion-known-ids new-known-ids)
+                   :contagion-known-ids new-known-ids
+                   :messages new-messages)
      :commands commands}))
 
 (defn handle-event
@@ -117,5 +146,6 @@
     :broadcast (handle-broadcast state event)
     :receive-push-view (handle-receive-push-view state event)
     :receive-summary (handle-receive-summary state event)
+    :receive-pull-request (handle-receive-pull-request state event)
     :receive-gossip (handle-receive-gossip state event)
     {:state state :commands []}))
