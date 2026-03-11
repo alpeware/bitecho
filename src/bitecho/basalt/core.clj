@@ -36,3 +36,21 @@
               (conj view peer)))
           #{}
           initial-peers))
+
+(defn increment-ages
+  "Increments the age of all peers in the view by 1."
+  [view]
+  (set (map #(update % :age inc) view)))
+
+(defn select-peers
+  "Selects up to k random peers from the view for exchange.
+   To ensure determinism and purity in tests, it accepts a java.util.Random instance
+   and uses it to shuffle the view before taking the first k elements."
+  [^java.util.Random rng view k]
+  (let [view-seq (vec view)
+        size (count view-seq)]
+    (if (zero? size)
+      ()
+      (let [shuffled (java.util.ArrayList. view-seq)]
+        (java.util.Collections/shuffle shuffled rng)
+        (take k shuffled)))))
