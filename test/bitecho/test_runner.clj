@@ -1,6 +1,7 @@
 (ns bitecho.test-runner
   "Test runner for Bitecho"
-  (:require [bitecho.crypto-test]
+  (:require [bitecho.basalt.core-test]
+            [bitecho.crypto-test]
             [clojure.test :as t]))
 
 (defn -main
