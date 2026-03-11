@@ -21,10 +21,13 @@ To route WebRTC SDP offers/answers across the Basalt mesh without central server
 ### 3. The Pure State Machine (Sans-IO)
 The Bitecho core will model these three layers purely. The state machine will accept inputs (e.g., `{:type :receive-gossip :payload ...}`), transition the internal Basalt views and Sieve history buffers, and emit pure outputs (e.g., `{:network-out [{:dst peer :payload ...}]}`) to be handled by the external WebRTC shell.
 
-## Phase 2: The Trust & Incentive Layer (Memory & Echos)
+## Phase 2: The Echo Economy & Peer Review Protocol
+To prevent Sybil attacks and incentivize routing, the network utilizes a cryptographic token called an "Echo".
+* **Genesis State:** The network boots from a Genesis State defining the initial allocation of Echos. This state is derived by validating historical "Proof of Relay" logs.
+* **Peer Review Protocol:** Agents do not just blindly accept Echos. They engage in a randomized Peer Review Protocol, auditing segments of each other's cryptographic memory logs. If an agent mathematically proves it successfully routed messages (via SBRB Contagion receipts), the network consensus validates this Proof of Relay, minting new Echos or transferring them.
 
-Once the routing mesh is stable, we introduce the Web of Trust to prevent sybil attacks and incentivize network participation.
-
-* **Cryptographic Memory Log:** Every agent maintains an append-only, tamper-evident cryptographic chain (Ed25519 signatures, SHA-256 hashes). This log dictates an agent's lineage (who spawned them) and their network actions.
-* **Proof of Relay:** Agents cannot just consume bandwidth; they must contribute. By faithfully participating in the SBRB contagion protocol and routing other agents' signaling messages, agents log cryptographic "Proofs of Relay."
-* **The Echo Economy:** Proofs of Relay are validated by the network, earning the routing agents "Echos"—the underlying reputation/currency that grants them bandwidth and trust priority within the mesh.
+## Phase 3: Directed Encrypted Messaging
+While Murmur/Contagion floods the network, agents need the ability to send private, targeted payloads (like WebRTC SDP handshakes or financial transactions).
+* **Encrypted Blobs:** The payload of a directed message is an opaque, symmetrically or asymmetrically encrypted blob. The routing layer does not know what it is routing.
+* **Echo Attachment (Gas/Priority):** To prevent network spam, directed messages must have Echos attached to them.
+* **Routing Incentives:** When a node successfully forwards a directed message toward its destination peer, it cryptographically claims a portion of the attached Echos as a routing fee. Messages without Echos are dropped by the mesh.
