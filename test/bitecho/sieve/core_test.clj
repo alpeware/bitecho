@@ -52,3 +52,44 @@
           other-keypair (crypto/generate-keypair)
           tampered-message (assoc message :sender (basalt/bytes->hex (:public other-keypair)))]
       (is (nil? (sieve/validate-message tampered-message))))))
+
+(defspec ^{:doc "First message from sender updates history."}
+  check-equivocation-first-message
+  100
+  (prop/for-all [payload gen-bytes]
+                (let [keypair (crypto/generate-keypair)
+                      message (sieve/wrap-message payload (:private keypair) (:public keypair))
+                      empty-history {}
+                      result (sieve/check-equivocation empty-history message)]
+                  (and
+                   (not (:equivocation? result))
+                   (= (basalt/bytes->hex (:signature message))
+                      (get (:history result) (:sender message)))))))
+
+(defspec ^{:doc "Same signature is not an equivocation."}
+  check-equivocation-duplicate-message
+  100
+  (prop/for-all [payload gen-bytes]
+                (let [keypair (crypto/generate-keypair)
+                      message (sieve/wrap-message payload (:private keypair) (:public keypair))
+                      history {(:sender message) (basalt/bytes->hex (:signature message))}
+                      result (sieve/check-equivocation history message)]
+                  (and
+                   (not (:equivocation? result))
+                   (= history (:history result))))))
+
+(defspec ^{:doc "Different signature from the same sender is an equivocation."}
+  check-equivocation-different-message
+  100
+  (prop/for-all [payload1 gen-bytes
+                 payload2 gen-bytes]
+                (let [keypair (crypto/generate-keypair)
+                      msg1 (sieve/wrap-message payload1 (:private keypair) (:public keypair))
+                      msg2 (sieve/wrap-message payload2 (:private keypair) (:public keypair))
+                      history {(:sender msg1) (basalt/bytes->hex (:signature msg1))}
+                      result (sieve/check-equivocation history msg2)]
+                  (if (= (seq payload1) (seq payload2))
+                    true
+                    (and
+                     (:equivocation? result)
+                     (= history (:history result)))))))
