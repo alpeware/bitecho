@@ -3,6 +3,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.contagion.core :as contagion]
             [bitecho.crypto :as crypto]
+            [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -50,3 +51,27 @@
           known-ids #{"id1" "id2"}
           result (contagion/generate-summary rng #{} known-ids)]
       (is (nil? result)))))
+
+(defspec ^{:doc "lazy-pull only requests missing ids"}
+  lazy-pull-requests-missing-only
+  100
+  (prop/for-all [local-known-ids gen-known-ids
+                 remote-summary gen-known-ids]
+                (let [missing (contagion/lazy-pull local-known-ids remote-summary)]
+                  (and
+                   (every? #(contains? remote-summary %) missing)
+                   (every? #(not (contains? local-known-ids %)) missing)
+                   (= missing (set/difference remote-summary local-known-ids))))))
+
+(deftest ^{:doc "Test explicit cases for lazy pull"} test-lazy-pull
+  (testing "returns missing ids"
+    (let [local-known #{"a" "b"}
+          remote-summary #{"b" "c" "d"}
+          missing (contagion/lazy-pull local-known remote-summary)]
+      (is (= #{"c" "d"} missing))))
+
+  (testing "returns empty set when no missing ids"
+    (let [local-known #{"a" "b" "c"}
+          remote-summary #{"b" "c"}
+          missing (contagion/lazy-pull local-known remote-summary)]
+      (is (= #{} missing)))))
