@@ -1,6 +1,7 @@
 (ns bitecho.test-runner
   "Test runner for Bitecho"
   (:require [bitecho.basalt.core-test]
+            [bitecho.contagion.core-test]
             [bitecho.crypto-test]
             [bitecho.murmur.core-test]
             [bitecho.sieve.core-test]
