@@ -1,0 +1,9 @@
+(ns bitecho.test-runner
+  "Test runner for Bitecho"
+  (:require [clojure.test :as t]))
+
+(defn -main
+  "Main entry point for running tests"
+  [& _args]
+  (let [results (t/run-all-tests #"bitecho.*")]
+    (System/exit (+ (:fail results) (:error results)))))
