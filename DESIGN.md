@@ -48,6 +48,8 @@ The game theoretic mechanism here ensures network health: nodes with high Echo b
 ### Programmable UTXOs (Clojure Puzzles)
 To support complex negotiations, UTXOs are no longer simply locked to a static public key. Drawing inspiration from ChiaLisp, Bitecho UTXOs are locked by a "Puzzle"—a pure, deterministic script written in a strictly sandboxed, non-Turing-complete subset of Clojure. To spend a UTXO, the spender must broadcast a transaction containing the "Solution" (arguments) that, when evaluated against the Puzzle by the network's pure state machine, returns `true`.
 
+**The Sandbox (SCI):** Because agents must evaluate untrusted Puzzle scripts broadcast by peers, the network utilizes the Small Clojure Interpreter (`sci`). Puzzles are evaluated in a hermetically sealed, pure-functional sandbox with a strict execution gas limit. All side-effecting functions (like disk I/O, network requests, or `atom` mutations) are completely disabled. If a script exceeds the gas limit or attempts an illegal operation, the transaction is rejected.
+
 ### Off-Chain Payment Channels (Streaming Echos)
 Continuous services (like streaming video or relaying bandwidth) cannot wait for network consensus for every byte. Drawing inspiration from the Bitcoin Lightning Network, agents use the Programmable UTXOs to open a 2-of-2 multisig "Payment Channel" between them. Once the Echo UTXO is locked on-chain, the two agents establish a direct WebRTC DataChannel (discovered via Phase 3 Directed Messaging) and exchange cryptographically signed, off-chain state updates that adjust their respective balances. Either party can close the channel at any time by broadcasting the latest mutually signed state to the Bitecho mesh, which settles the final UTXO balances.
 
