@@ -38,5 +38,5 @@
 ## Bitecho Phase 4: Programmable UTXOs & Payment Channels
 - [x] Implement `bitecho.economy.sci-sandbox`: wrap `sci/eval-string` to create a strictly isolated, pure-functional Clojure interpreter. Disable all I/O and state mutations, and implement a basic instruction counter (or timeout) to prevent infinite loops.
 - [x] Refactor `bitecho.economy.ledger`: update the UTXO schema. Replace `:owner-pubkey` with `:puzzle-hash`. Update `process-transaction` so that instead of just checking an Ed25519 signature, it executes `(sci-sandbox/eval puzzle solution)`. The transaction is only valid if the script returns `true`.
-- [ ] Implement `bitecho.channels.core`: define the pure data structures for a 2-of-2 multisig Payment Channel state. Implement functions to create an initial state, generate a multisig Puzzle, and mutually sign off-chain balance updates.
+- [x] Implement `bitecho.channels.core`: define the pure data structures for a 2-of-2 multisig Payment Channel state. Implement functions to create an initial state, generate a multisig Puzzle, and mutually sign off-chain balance updates.
 - [ ] Implement `bitecho.services.turn`: define the specific pure negotiation protocol (DataChannel messages) for an agent to request a TURN allocation, verify the opening of an off-chain Payment Channel, and issue iterative balance updates per byte relayed.
