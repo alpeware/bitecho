@@ -9,6 +9,7 @@
             [bitecho.message.envelope-test]
             [bitecho.murmur.core-test]
             [bitecho.peer-review.core-test]
+            [bitecho.routing.weighted-test]
             [bitecho.sieve.core-test]
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-test]
