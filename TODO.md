@@ -31,6 +31,6 @@
 - [x] Implement `bitecho.economy.difficulty`: a pure function that calculates the current lottery difficulty target dynamically based on the Contagion `k` fanout parameter and network size estimates.
 
 ## Bitecho Phase 3: Directed Messaging (Stake-Weighted Routing)
-- [ ] Implement `bitecho.message.envelope`: define the pure spec and wrapping logic for a directed message envelope (destination pubkey, encrypted payload blob, attached lottery ticket).
+- [x] Implement `bitecho.message.envelope`: define the pure spec and wrapping logic for a directed message envelope (destination pubkey, encrypted payload blob, attached lottery ticket).
 - [ ] Implement `bitecho.routing.weighted`: pure logic to select a next-hop routing target by weighting the current Basalt view according to each peer's known Echo balance.
 - [ ] Update `bitecho.state-machine`: integrate Phase 2 and 3 into the core reducer. Add handlers for `{:type :route-directed-message}` that validates the attached lottery ticket, claims the fee if it wins, and forwards the envelope via the stake-weighted routing logic.

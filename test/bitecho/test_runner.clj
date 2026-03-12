@@ -6,6 +6,7 @@
             [bitecho.economy.difficulty-test]
             [bitecho.economy.ledger-test]
             [bitecho.lottery.core-test]
+            [bitecho.message.envelope-test]
             [bitecho.murmur.core-test]
             [bitecho.peer-review.core-test]
             [bitecho.sieve.core-test]
