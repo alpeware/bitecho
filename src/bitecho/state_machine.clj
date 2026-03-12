@@ -3,7 +3,10 @@
    Accepts `state` and `event` inputs and emits a map of `{:state new-state :commands [...]}`."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.contagion.core :as contagion]
+            [bitecho.economy.difficulty :as difficulty]
+            [bitecho.economy.ledger :as ledger]
             [bitecho.murmur.core :as murmur]
+            [bitecho.routing.weighted :as weighted]
             [bitecho.sieve.core :as sieve]))
 
 (def murmur-k
@@ -25,7 +28,8 @@
    :murmur-cache {:set #{} :queue []}
    :sieve-history {}
    :contagion-known-ids #{}
-   :messages {}})
+   :messages {}
+   :ledger (ledger/init-ledger)})
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt age updates, views, and Contagion anti-entropy."
@@ -137,6 +141,27 @@
                    :messages new-messages)
      :commands commands}))
 
+(defn- handle-route-directed-message
+  "Handles routing of a directed message. Validates the attached lottery ticket,
+   claims the fee if it wins, and forwards the envelope via stake-weighted routing."
+  [state event]
+  (let [envelope (:envelope event)
+        ticket (:lottery-ticket envelope)
+        claimer-pubkey (:claimer-pubkey event)
+        payout-amount (:payout-amount event)
+        network-size (:network-size event)
+        difficulty-hex (difficulty/calculate-difficulty murmur-k network-size)
+        new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount)
+        rng (:rng event)
+        next-hop (weighted/select-next-hop rng (:basalt-view state) (:balances new-ledger))
+        commands (if next-hop
+                   [{:type :send-directed-message
+                     :target next-hop
+                     :envelope envelope}]
+                   [])]
+    {:state (assoc state :ledger new-ledger)
+     :commands commands}))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
@@ -148,4 +173,5 @@
     :receive-summary (handle-receive-summary state event)
     :receive-pull-request (handle-receive-pull-request state event)
     :receive-gossip (handle-receive-gossip state event)
+    :route-directed-message (handle-route-directed-message state event)
     {:state state :commands []}))
