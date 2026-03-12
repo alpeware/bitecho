@@ -2,11 +2,13 @@
   "The pure root reducer that integrates Basalt, Murmur, Sieve, and Contagion.
    Accepts `state` and `event` inputs and emits a map of `{:state new-state :commands [...]}`."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.channels.core :as channels]
             [bitecho.contagion.core :as contagion]
             [bitecho.economy.difficulty :as difficulty]
             [bitecho.economy.ledger :as ledger]
             [bitecho.murmur.core :as murmur]
             [bitecho.routing.weighted :as weighted]
+            [bitecho.services.turn :as turn]
             [bitecho.sieve.core :as sieve]))
 
 (def murmur-k
@@ -29,7 +31,8 @@
    :sieve-history {}
    :contagion-known-ids #{}
    :messages {}
-   :ledger (ledger/init-ledger)})
+   :ledger (ledger/init-ledger)
+   :channels {}})
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt age updates, views, and Contagion anti-entropy."
@@ -162,6 +165,66 @@
     {:state (assoc state :ledger new-ledger)
      :commands commands}))
 
+(defn- handle-open-channel
+  "Handles a channel open event by storing the initial multisig state."
+  [state event]
+  (let [initial-state (channels/create-initial-state (:pubkey-a event)
+                                                     (:pubkey-b event)
+                                                     (:amount-a event)
+                                                     (:amount-b event))]
+    {:state (assoc-in state [:channels (:channel-id event)] initial-state)
+     :commands []}))
+
+(defn- handle-update-channel
+  "Handles off-chain channel updates by validating mutual signatures."
+  [state event]
+  (let [channel-id (:channel-id event)
+        current-state (get-in state [:channels channel-id])]
+    (if current-state
+      (let [new-state (channels/mutually-sign-update current-state (:update event) (:sig-a event) (:sig-b event))]
+        {:state (assoc-in state [:channels channel-id] new-state)
+         :commands []})
+      {:state state :commands []})))
+
+(defn- handle-settle-channel
+  "Handles settling a channel by submitting the final state to the sci-ledger."
+  [state event]
+  (let [new-ledger (ledger/process-transaction (:ledger state) (:tx event))]
+    (if (not= new-ledger (:ledger state))
+      {:state (-> state
+                  (assoc :ledger new-ledger)
+                  (update :channels dissoc (:channel-id event)))
+       :commands []}
+      {:state state :commands []})))
+
+(defn- handle-turn-allocate-request
+  "Handles a request for TURN relay allocation, responding with granted status and pricing."
+  [state event]
+  (let [client-pubkey (:client-pubkey event)
+        req {:type :turn-allocate-request :client-pubkey client-pubkey}
+        ;; In a real deployment, server-pubkey and price would come from config/state.
+        ;; For the state machine abstraction, we stub the response generation.
+        res (turn/handle-allocation-request req "server-pubkey-stub" 1)]
+    {:state state
+     :commands [{:type :network-out
+                 :target client-pubkey
+                 :payload res}]}))
+
+(defn- handle-turn-relay-request
+  "Handles incoming TURN relay payload wrapped in a micro-payment channel update."
+  [state event]
+  (let [channel-id (:channel-id event)
+        current-state (get-in state [:channels channel-id])]
+    (if current-state
+      (let [res (turn/handle-relay-request (:req event) current-state (:price event) (:server-priv event))]
+        (if (:valid? res)
+          {:state (assoc-in state [:channels channel-id] (:new-state res))
+           :commands [{:type :network-out
+                       :target (:pubkey-a current-state) ;; Echo back to the client or forward. For TURN relay, it forwards data, but we'll assume target is the client for now or a proxy. Let's just use pubkey-a.
+                       :payload (:command res)}]}
+          {:state state :commands []}))
+      {:state state :commands []})))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
@@ -174,4 +237,9 @@
     :receive-pull-request (handle-receive-pull-request state event)
     :receive-gossip (handle-receive-gossip state event)
     :route-directed-message (handle-route-directed-message state event)
+    :open-channel (handle-open-channel state event)
+    :update-channel (handle-update-channel state event)
+    :settle-channel (handle-settle-channel state event)
+    :turn-allocate-request (handle-turn-allocate-request state event)
+    :turn-relay-request (handle-turn-relay-request state event)
     {:state state :commands []}))
