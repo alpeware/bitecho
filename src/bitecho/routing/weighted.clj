@@ -1,15 +1,22 @@
 (ns bitecho.routing.weighted
   "Pure logic to select a next-hop routing target by weighting the current Basalt view
    according to each peer's known Echo balance."
-  (:require [bitecho.basalt.core :as basalt]))
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]))
+
+(defn- expected-puzzle-hash
+  "Helper to compute standard puzzle hash."
+  [pubkey-hex]
+  (basalt/bytes->hex (crypto/sha256 (.getBytes (str "(= \"" pubkey-hex "\" solution)") "UTF-8"))))
 
 (defn- peer-weight
   "Calculates the weight of a peer given its pubkey and the utxos map.
-   Dynamically sums unspent amounts per owner-pubkey.
+   Dynamically sums unspent amounts per puzzle-hash.
    Defaults to 1 if the sum is 0 or unknown."
   [peer utxos]
   (let [pubkey-hex (if (string? (:pubkey peer)) (:pubkey peer) (basalt/bytes->hex (:pubkey peer))) ;; in basalt make-peer, pubkey is ALREADY stored as hex!
-        balance (reduce + (map :amount (filter #(= pubkey-hex (:owner-pubkey %)) (vals utxos))))]
+        expected-hash (expected-puzzle-hash pubkey-hex)
+        balance (reduce + (map :amount (filter #(= expected-hash (:puzzle-hash %)) (vals utxos))))]
     (max 1 balance)))
 
 (defn select-next-hop
