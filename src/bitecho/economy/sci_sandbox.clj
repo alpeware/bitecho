@@ -1,6 +1,8 @@
 (ns bitecho.economy.sci-sandbox
   "Strictly isolated, pure-functional, Turing-incomplete Clojure interpreter utilizing sci."
-  (:require [clojure.edn :as edn]
+  (:require [bitecho.basalt.core]
+            [bitecho.crypto]
+            [clojure.edn :as edn]
             [sci.core :as sci])
   (:import [java.io PushbackReader StringReader]))
 
@@ -97,7 +99,9 @@
                                          'name name
                                          'namespace namespace
 
-                                         'not not}}
+                                         'not not}
+                          'bitecho.crypto {'verify bitecho.crypto/verify}
+                          'bitecho.basalt.core {'hex->bytes bitecho.basalt.core/hex->bytes}}
              :allow []
              :deny ['range 'repeat 'iterate 'cycle 'atom 'reset! 'swap! 'compare-and-set!]}))
 
