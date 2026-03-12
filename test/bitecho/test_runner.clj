@@ -3,6 +3,7 @@
   (:require [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
             [bitecho.crypto-test]
+            [bitecho.lottery.core-test]
             [bitecho.murmur.core-test]
             [bitecho.sieve.core-test]
             [bitecho.state-machine-fuzz-test]
