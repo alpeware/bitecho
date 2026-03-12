@@ -5,6 +5,7 @@
             [bitecho.crypto-test]
             [bitecho.economy.difficulty-test]
             [bitecho.economy.ledger-test]
+            [bitecho.economy.sci-sandbox-test]
             [bitecho.lottery.core-test]
             [bitecho.message.envelope-test]
             [bitecho.murmur.core-test]
