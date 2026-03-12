@@ -34,3 +34,9 @@
 - [x] Implement `bitecho.message.envelope`: define the pure spec and wrapping logic for a directed message envelope (destination pubkey, encrypted payload blob, attached lottery ticket).
 - [x] Implement `bitecho.routing.weighted`: pure logic to select a next-hop routing target by weighting the current Basalt view according to each peer's known Echo balance.
 - [x] Update `bitecho.state-machine`: integrate Phase 2 and 3 into the core reducer. Add handlers for `{:type :route-directed-message}` that validates the attached lottery ticket, claims the fee if it wins, and forwards the envelope via the stake-weighted routing logic.
+
+## Bitecho Phase 4: Programmable UTXOs & Payment Channels
+- [ ] Implement `bitecho.economy.sci-sandbox`: wrap `sci/eval-string` to create a strictly isolated, pure-functional Clojure interpreter. Disable all I/O and state mutations, and implement a basic instruction counter (or timeout) to prevent infinite loops.
+- [ ] Refactor `bitecho.economy.ledger`: update the UTXO schema. Replace `:owner-pubkey` with `:puzzle-hash`. Update `process-transaction` so that instead of just checking an Ed25519 signature, it executes `(sci-sandbox/eval puzzle solution)`. The transaction is only valid if the script returns `true`.
+- [ ] Implement `bitecho.channels.core`: define the pure data structures for a 2-of-2 multisig Payment Channel state. Implement functions to create an initial state, generate a multisig Puzzle, and mutually sign off-chain balance updates.
+- [ ] Implement `bitecho.services.turn`: define the specific pure negotiation protocol (DataChannel messages) for an agent to request a TURN allocation, verify the opening of an off-chain Payment Channel, and issue iterative balance updates per byte relayed.
