@@ -23,3 +23,14 @@
 ## 5. Integration & Fuzzing
 - [x] Implement `bitecho.state-machine`: the root reducer that ties Basalt, Murmur, Sieve, and Contagion into a single pure `(handle-event state event)` function.
 - [x] Write generative state-machine fuzzer (`test.check`) to prove the Bitecho pure core maintains connected Basalt views and reliably delivers messages under simulated network drops.
+
+## Bitecho Phase 2: The Echo Economy (Lottery & Ledger)
+- [ ] Implement `bitecho.lottery.core`: pure functions to generate a cryptographic lottery ticket (payload hash + nonce + signature) and evaluate if `hash(ticket) < difficulty`.
+- [ ] Implement `bitecho.economy.ledger`: define the Genesis state data structure and pure functions to apply valid lottery ticket payouts to an agent's Echo balance.
+- [ ] Implement `bitecho.peer-review.core`: pure logic to validate a "Proof of Relay" (verifying a sequence of Contagion broadcast receipts and Sieve signatures).
+- [ ] Implement `bitecho.economy.difficulty`: a pure function that calculates the current lottery difficulty target dynamically based on the Contagion `k` fanout parameter and network size estimates.
+
+## Bitecho Phase 3: Directed Messaging (Stake-Weighted Routing)
+- [ ] Implement `bitecho.message.envelope`: define the pure spec and wrapping logic for a directed message envelope (destination pubkey, encrypted payload blob, attached lottery ticket).
+- [ ] Implement `bitecho.routing.weighted`: pure logic to select a next-hop routing target by weighting the current Basalt view according to each peer's known Echo balance.
+- [ ] Update `bitecho.state-machine`: integrate Phase 2 and 3 into the core reducer. Add handlers for `{:type :route-directed-message}` that validates the attached lottery ticket, claims the fee if it wins, and forwards the envelope via the stake-weighted routing logic.
