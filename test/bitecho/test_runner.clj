@@ -6,6 +6,7 @@
             [bitecho.economy.ledger-test]
             [bitecho.lottery.core-test]
             [bitecho.murmur.core-test]
+            [bitecho.peer-review.core-test]
             [bitecho.sieve.core-test]
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-test]
