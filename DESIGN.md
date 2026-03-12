@@ -26,8 +26,19 @@ To prevent Sybil attacks and incentivize routing, the network utilizes a cryptog
 * **Genesis State:** The network boots from a Genesis State defining the initial allocation of Echos. This state is derived by validating historical "Proof of Relay" logs.
 * **Peer Review Protocol:** Agents do not just blindly accept Echos. They engage in a randomized Peer Review Protocol, auditing segments of each other's cryptographic memory logs. If an agent mathematically proves it successfully routed messages (via SBRB Contagion receipts), the network consensus validates this Proof of Relay, minting new Echos or transferring them.
 
+### Probabilistic Micropayments (Lottery Tickets)
+To prevent ledger bloat, routing fees are not processed as 1:1 micro-transactions. Senders attach a cryptographic "lottery ticket" (a signed nonce) to their payloads. Routing agents hash the ticket; if the hash falls below a specific network difficulty target, the ticket "wins" and the agent cashes it in on the Web of Trust ledger for a full Echo payout. The expected value equals the routing fee.
+
+### Contagion-Linked Difficulty Target
+The lottery ticket difficulty is dynamically pegged to the Contagion protocol's security parameter (e.g., the required fanout `k`). If network churn is high and the security parameter must increase to guarantee reliable broadcast, the lottery difficulty automatically decreases (making it easier to win). This economically subsidizes the increased bandwidth agents must expend to keep the network connected.
+
 ## Phase 3: Directed Encrypted Messaging
 While Murmur/Contagion floods the network, agents need the ability to send private, targeted payloads (like WebRTC SDP handshakes or financial transactions).
 * **Encrypted Blobs:** The payload of a directed message is an opaque, symmetrically or asymmetrically encrypted blob. The routing layer does not know what it is routing.
 * **Echo Attachment (Gas/Priority):** To prevent network spam, directed messages must have Echos attached to them.
 * **Routing Incentives:** When a node successfully forwards a directed message toward its destination peer, it cryptographically claims a portion of the attached Echos as a routing fee. Messages without Echos are dropped by the mesh.
+
+### Stake-Weighted Routing
+For 1:1 encrypted messages to traverse the mesh efficiently and securely, instead of relying purely on random walks or shortest-path routing (which are vulnerable to Sybil black holes), agents select the next hop by weighting their Basalt view by each peer's total accumulated Echo balance (Proof of Stake).
+
+The game theoretic mechanism here ensures network health: nodes with high Echo balances have proven their historical reliability and are trusted with more directed traffic. This, in turn, earns them more lottery tickets, creating a positive feedback loop that heavily incentivizes maximum uptime and honest routing.
