@@ -3,6 +3,7 @@
    ticket payouts to an agent's Echo balance."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.sci-sandbox :as sci-sandbox]
             [bitecho.lottery.core :as lottery]))
 
 (defn init-ledger
@@ -21,6 +22,12 @@
         input-str (str hash-hex nonce-str pub-key-hex sig-hex)]
     (basalt/bytes->hex (crypto/sha256 (.getBytes input-str "UTF-8")))))
 
+(defn- standard-puzzle-hash
+  "Generates the standard puzzle hash for a public key."
+  [pubkey-hex]
+  (let [puzzle (str "(= \"" pubkey-hex "\" solution)")]
+    (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle "UTF-8")))))
+
 (defn claim-ticket
   "Applies a valid lottery ticket payout to an agent by creating a new UTXO.
    If the ticket wins and hasn't been claimed before, creates the UTXO
@@ -29,45 +36,50 @@
   (let [ticket-hash (hash-ticket ticket)]
     (if (and (lottery/winning-ticket? ticket difficulty-hex)
              (not (contains? (:claimed-tickets ledger) ticket-hash)))
-      (-> ledger
-          (assoc-in [:utxos ticket-hash] {:amount payout-amount :owner-pubkey claimer-pubkey})
-          (update :claimed-tickets conj ticket-hash))
+      (let [puzzle-hash (standard-puzzle-hash claimer-pubkey)]
+        (-> ledger
+            (assoc-in [:utxos ticket-hash] {:amount payout-amount :puzzle-hash puzzle-hash})
+            (update :claimed-tickets conj ticket-hash)))
       ledger)))
 
-(defn- hash-tx-data
-  "Hashes the transaction inputs and outputs to create the payload for signature validation."
-  [inputs outputs]
-  (let [payload-str (pr-str {:inputs inputs :outputs outputs})]
-    (crypto/sha256 (.getBytes payload-str "UTF-8"))))
-
-(defn- valid-tx-signature?
-  "Verifies the transaction signature."
-  [tx]
-  (let [payload (hash-tx-data (:inputs tx) (:outputs tx))
-        pubkey-bytes (basalt/hex->bytes (:sender-pubkey tx))
-        sig-bytes (basalt/hex->bytes (:signature tx))]
-    (crypto/verify pubkey-bytes payload sig-bytes)))
+(defn- valid-puzzle-execution?
+  "Checks if a puzzle hashes to the expected puzzle-hash and evaluates to true."
+  [puzzle solution expected-hash]
+  (let [actual-hash (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle "UTF-8")))]
+    (if (= actual-hash expected-hash)
+      (try
+        (let [script (str "(let [solution " (pr-str solution) "] " puzzle ")")
+              result (sci-sandbox/eval-string script)]
+          (true? result))
+        (catch Exception _
+          false))
+      false)))
 
 (defn process-transaction
   "Processes a transaction by consuming UTXOs and creating new ones.
-   Validates that inputs exist, are unique, belong to the sender,
+   Validates that inputs exist, are unique,
    outputs are strictly positive, have sufficient funds,
-   and the transaction is properly signed.
+   and for each input the provided puzzle hashes to the UTXO's puzzle-hash
+   and the script (sci-sandbox/eval puzzle solution) evaluates to true.
    Returns the updated ledger if valid, or unchanged ledger if invalid."
   [ledger tx]
-  (let [{:keys [inputs outputs sender-pubkey]} tx
+  (let [{:keys [inputs outputs puzzles solutions]} tx
         utxos (:utxos ledger)
         input-utxos (map #(get utxos %) inputs)]
     (if (and (every? some? input-utxos)
              (= (count inputs) (count (set inputs)))
-             (every? #(= sender-pubkey (:owner-pubkey %)) input-utxos)
+             (= (count inputs) (count puzzles))
+             (= (count inputs) (count solutions))
              (every? #(pos? (:amount %)) outputs)
              (>= (reduce + (map :amount input-utxos))
                  (reduce + (map :amount outputs)))
-             (valid-tx-signature? tx))
+             (every? true? (map (fn [utxo puzzle solution]
+                                  (valid-puzzle-execution? puzzle solution (:puzzle-hash utxo)))
+                                input-utxos puzzles solutions)))
       (let [ledger-without-inputs (reduce (fn [l input-id] (update l :utxos dissoc input-id)) ledger inputs)
+            tx-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str tx) "UTF-8")))
             new-outputs-with-ids (map-indexed (fn [idx output]
-                                                [(basalt/bytes->hex (crypto/sha256 (.getBytes (str (:signature tx) idx) "UTF-8")))
+                                                [(basalt/bytes->hex (crypto/sha256 (.getBytes (str tx-hash idx) "UTF-8")))
                                                  output])
                                               outputs)]
         (reduce (fn [l [out-id out]] (assoc-in l [:utxos out-id] out)) ledger-without-inputs new-outputs-with-ids))
