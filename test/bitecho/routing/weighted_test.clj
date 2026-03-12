@@ -16,11 +16,13 @@
           p2 (basalt/make-peer "2.2.2.2" 80 (byte-array [2]))
           p3 (basalt/make-peer "3.3.3.3" 80 (byte-array [3]))
           view #{p1 p2 p3}
+          p1-hex (basalt/bytes->hex (byte-array [1]))
+          p2-hex (basalt/bytes->hex (byte-array [2]))
           ;; Give p1 a huge balance so it is almost always picked
-          balances {(:pubkey p1) 1000000
-                    (:pubkey p2) 0} ; p2 and p3 default to 1
+          utxos {"utxo1" {:amount 1000000 :owner-pubkey p1-hex}
+                 "utxo2" {:amount 0 :owner-pubkey p2-hex}} ; p2 and p3 default to 1
           rng (java.util.Random. 42)
-          selections (repeatedly 1000 #(weighted/select-next-hop rng view balances))
+          selections (repeatedly 1000 #(weighted/select-next-hop rng view utxos))
           freqs (frequencies selections)]
       ;; p1 should be picked overwhelmingly more often
       (is (> (get freqs p1 0) 900))
@@ -32,12 +34,14 @@
     (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array [1]))
           p2 (basalt/make-peer "2.2.2.2" 80 (byte-array [2]))
           view #{p1 p2}
-          balances {(:pubkey p1) 10
-                    (:pubkey p2) 10}
+          p1-hex (basalt/bytes->hex (byte-array [1]))
+          p2-hex (basalt/bytes->hex (byte-array [2]))
+          utxos {"utxo1" {:amount 10 :owner-pubkey p1-hex}
+                 "utxo2" {:amount 10 :owner-pubkey p2-hex}}
           rng1 (java.util.Random. 123)
           rng2 (java.util.Random. 123)
-          sel1 (repeatedly 100 #(weighted/select-next-hop rng1 view balances))
-          sel2 (repeatedly 100 #(weighted/select-next-hop rng2 view balances))]
+          sel1 (repeatedly 100 #(weighted/select-next-hop rng1 view utxos))
+          sel2 (repeatedly 100 #(weighted/select-next-hop rng2 view utxos))]
       (is (= sel1 sel2)))))
 
 (defspec ^{:doc "Generative testing for select-next-hop invariants."} select-next-hop-spec 100
@@ -45,9 +49,9 @@
                  seed gen/int]
                 (let [to-peer (fn [[ip port pubkey]] (basalt/make-peer ip port pubkey))
                       view (set (map to-peer peers-data))
-                      balances {} ; Everyone gets weight 1
+                      utxos {} ; Everyone gets weight 1
                       rng (java.util.Random. seed)
-                      selected (weighted/select-next-hop rng view balances)]
+                      selected (weighted/select-next-hop rng view utxos)]
                   (if (empty? view)
                     (nil? selected)
                     (contains? view selected)))))
