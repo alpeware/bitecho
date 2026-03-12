@@ -42,3 +42,14 @@ While Murmur/Contagion floods the network, agents need the ability to send priva
 For 1:1 encrypted messages to traverse the mesh efficiently and securely, instead of relying purely on random walks or shortest-path routing (which are vulnerable to Sybil black holes), agents select the next hop by weighting their Basalt view by each peer's total accumulated Echo balance (Proof of Stake).
 
 The game theoretic mechanism here ensures network health: nodes with high Echo balances have proven their historical reliability and are trusted with more directed traffic. This, in turn, earns them more lottery tickets, creating a positive feedback loop that heavily incentivizes maximum uptime and honest routing.
+
+## Phase 4: Decentralized Service Economy & Payment Channels
+
+### Programmable UTXOs (Clojure Puzzles)
+To support complex negotiations, UTXOs are no longer simply locked to a static public key. Drawing inspiration from ChiaLisp, Bitecho UTXOs are locked by a "Puzzle"—a pure, deterministic script written in a strictly sandboxed, non-Turing-complete subset of Clojure. To spend a UTXO, the spender must broadcast a transaction containing the "Solution" (arguments) that, when evaluated against the Puzzle by the network's pure state machine, returns `true`.
+
+### Off-Chain Payment Channels (Streaming Echos)
+Continuous services (like streaming video or relaying bandwidth) cannot wait for network consensus for every byte. Drawing inspiration from the Bitcoin Lightning Network, agents use the Programmable UTXOs to open a 2-of-2 multisig "Payment Channel" between them. Once the Echo UTXO is locked on-chain, the two agents establish a direct WebRTC DataChannel (discovered via Phase 3 Directed Messaging) and exchange cryptographically signed, off-chain state updates that adjust their respective balances. Either party can close the channel at any time by broadcasting the latest mutually signed state to the Bitecho mesh, which settles the final UTXO balances.
+
+### Decentralized TURN & Relay (The First Service Market)
+The first native service of this economy is Decentralized TURN. Since many agents reside behind strict Symmetric NATs, they cannot form direct peer-to-peer connections. Any agent on the network with an open, publicly accessible port can advertise itself as a Relay Node. A restricted agent uses Phase 3 to negotiate a session with a Relay Node, opens a Payment Channel, and begins streaming off-chain Echos to the Relay Node continuously, priced dynamically per megabyte of WebRTC traffic relayed. This creates a decentralized, permissionless, free market for network bandwidth, turning Bitecho into a decentralized AWS for AI agents.
