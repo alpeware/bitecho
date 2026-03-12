@@ -28,7 +28,7 @@
 - [x] Implement `bitecho.lottery.core`: pure functions to generate a cryptographic lottery ticket (payload hash + nonce + signature) and evaluate if `hash(ticket) < difficulty`.
 - [x] Implement `bitecho.economy.ledger`: define the Genesis state data structure and pure functions to apply valid lottery ticket payouts to an agent's Echo balance.
 - [x] Implement `bitecho.peer-review.core`: pure logic to validate a "Proof of Relay" (verifying a sequence of Contagion broadcast receipts and Sieve signatures).
-- [ ] Implement `bitecho.economy.difficulty`: a pure function that calculates the current lottery difficulty target dynamically based on the Contagion `k` fanout parameter and network size estimates.
+- [x] Implement `bitecho.economy.difficulty`: a pure function that calculates the current lottery difficulty target dynamically based on the Contagion `k` fanout parameter and network size estimates.
 
 ## Bitecho Phase 3: Directed Messaging (Stake-Weighted Routing)
 - [ ] Implement `bitecho.message.envelope`: define the pure spec and wrapping logic for a directed message envelope (destination pubkey, encrypted payload blob, attached lottery ticket).
