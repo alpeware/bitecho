@@ -44,6 +44,6 @@
 
 ## Bitecho Phase 5: The Shell & Network Genesis
 - [x] Add `org.clojure/core.async {:mvn/version "1.9.829-alpha2"}` to `deps.edn`.
-- [ ] Implement `bitecho.crypto.delegation`: define pure functions to generate, sign, and verify Delegated Agent Certificates (DACs) linking a temporary Node Key to a Parent Key.
+- [x] Implement `bitecho.crypto.delegation`: define pure functions to generate, sign, and verify Delegated Agent Certificates (DACs) linking a temporary Node Key to a Parent Key.
 - [ ] Implement `bitecho.shell.flow`: create the `core.async.flow` topology map and the pure adapter step function that wraps `bitecho.state-machine` reference the guide https://clojure.github.io/core.async/flow-guide.html .
 - [ ] Implement `bitecho.shell.bootstrap` and `bitecho.shell.agent`: define the `-main` entry points for the executables. Stub the datachannel/IO sinks for now, focusing purely on initializing the flow network, the channels, and the Genesis state.
