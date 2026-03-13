@@ -14,6 +14,7 @@
             [bitecho.peer-review.core-test]
             [bitecho.routing.weighted-test]
             [bitecho.services.turn-test]
+            [bitecho.shell.flow-test]
             [bitecho.sieve.core-test]
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-test]
