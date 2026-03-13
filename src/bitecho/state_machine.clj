@@ -220,7 +220,9 @@
         (if (:valid? res)
           {:state (assoc-in state [:channels channel-id] (:new-state res))
            :commands [{:type :network-out
-                       :target (:pubkey-a current-state) ;; Echo back to the client or forward. For TURN relay, it forwards data, but we'll assume target is the client for now or a proxy. Let's just use pubkey-a.
+                       ;; Target is the client or a proxy. For TURN relay, we'll
+                       ;; assume the target is the client for now. Let's use pubkey-a.
+                       :target (:pubkey-a current-state)
                        :payload (:command res)}]}
           {:state state :commands []}))
       {:state state :commands []})))

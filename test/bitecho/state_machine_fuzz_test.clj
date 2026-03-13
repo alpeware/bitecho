@@ -180,11 +180,61 @@
   "Generates a valid sequence of payment channel off-chain updates."
   (gen/vector (gen/tuple (gen/choose 1 10) (gen/choose 1 50)) 1 20))
 
+(defn- apply-channel-updates
+  "Applies a sequence of channel updates, maintaining valid mutual signatures."
+  [initial-state updates priv-a priv-b]
+  (reduce (fn [state [nonce-inc cost]]
+            (let [chan (get-in state [:channels "chan-fuzz"])
+                  new-nonce (+ (:nonce chan) nonce-inc)
+                  ;; ensure we don't overspend to keep valid
+                  actual-cost (min cost (:balance-a chan))
+                  new-balance-a (- (:balance-a chan) actual-cost)
+                  new-balance-b (+ (:balance-b chan) actual-cost)
+
+                  update-map {:nonce new-nonce
+                              :balance-a new-balance-a
+                              :balance-b new-balance-b}
+                  canonical-map (into (sorted-map) update-map)
+                  update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
+
+                  sig-a (basalt/bytes->hex (crypto/sign priv-a update-hash))
+                  sig-b (basalt/bytes->hex (crypto/sign priv-b update-hash))
+
+                  evt {:type :update-channel
+                       :channel-id "chan-fuzz"
+                       :update update-map
+                       :sig-a sig-a
+                       :sig-b sig-b}]
+              (:state (sm/handle-event state evt))))
+          initial-state
+          updates))
+
+(defn- setup-and-settle-channel
+  "Helper to set up ledger funds, construct settlement tx, and settle the channel."
+  [state-after-updates final-chan pub-a init-amt-a]
+  (let [puzzle-a (str "(= \"" pub-a "\" solution)")
+        puzzle-a-hash (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle-a "UTF-8")))
+
+        mock-utxo {:amount init-amt-a :puzzle-hash puzzle-a-hash}
+        ledger-with-funds (assoc-in (:ledger state-after-updates) [:utxos "utxo-1"] mock-utxo)
+        state-with-funds (assoc state-after-updates :ledger ledger-with-funds)
+
+        tx {:inputs ["utxo-1"]
+            :outputs [{:amount (:balance-a final-chan)}
+                      {:amount (:balance-b final-chan)}]
+            :puzzles [puzzle-a]
+            :solutions [pub-a]}
+
+        settle-evt {:type :settle-channel
+                    :channel-id "chan-fuzz"
+                    :tx tx}]
+    (:state (sm/handle-event state-with-funds settle-evt))))
+
 (defspec ^{:doc "Fuzzer property verifying payment channel updates and final settlement."}
   channel-settlement-property 100
   (prop/for-all [updates gen-channel-events
                  seed gen/large-integer]
-    (let [_rng (java.util.Random. seed)
+                (let [_rng (java.util.Random. seed)
           ;; Keys setup
                       client-keys (crypto/generate-keypair)
                       server-keys (crypto/generate-keypair)
@@ -211,66 +261,11 @@
                       state-after-open (:state (sm/handle-event initial-node-state open-evt))
 
           ;; 2. Apply updates iteratively
-          ;; The fuzzer generates tuples of [nonce-increment cost].
-          ;; We must compute cumulative nonces and valid balances to simulate valid mutual signatures.
-                      state-after-updates
-                      (reduce (fn [state [nonce-inc cost]]
-                                (let [chan (get-in state [:channels "chan-fuzz"])
-                                      new-nonce (+ (:nonce chan) nonce-inc)
-                          ;; ensure we don't overspend to keep valid
-                                      actual-cost (min cost (:balance-a chan))
-                                      new-balance-a (- (:balance-a chan) actual-cost)
-                                      new-balance-b (+ (:balance-b chan) actual-cost)
-
-                                      update-map {:nonce new-nonce
-                                                  :balance-a new-balance-a
-                                                  :balance-b new-balance-b}
-                                      canonical-map (into (sorted-map) update-map)
-                                      update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
-
-                                      sig-a (basalt/bytes->hex (crypto/sign priv-a update-hash))
-                                      sig-b (basalt/bytes->hex (crypto/sign priv-b update-hash))
-
-                                      evt {:type :update-channel
-                                           :channel-id "chan-fuzz"
-                                           :update update-map
-                                           :sig-a sig-a
-                                           :sig-b sig-b}]
-                                  (:state (sm/handle-event state evt))))
-                              state-after-open
-                              updates)
-
+                      state-after-updates (apply-channel-updates state-after-open updates priv-a priv-b)
                       final-chan (get-in state-after-updates [:channels "chan-fuzz"])
 
-          ;; 3. Settle (simulate settlement with ledger integration)
-          ;; In reality, a tx would have inputs and evaluate the sci puzzle.
-          ;; But since ledger validation requires the tx hash, signatures, and sci sandbox evaluation,
-          ;; we simply need to construct a valid tx.
-          ;; Our state machine tests stubbed the tx since ledger validation tests its own logic.
-          ;; Wait! The state machine itself doesn't validate signatures on settle!
-          ;; It passes the tx to `ledger/process-transaction`.
-          ;; To test the *state machine's* channel deletion, we just need ANY tx that changes the ledger.
-          ;; Actually, the assignment states "prove channel settlements are secure".
-          ;; If we pass a valid tx, the state machine should delete the channel.
-          ;; Let's make an artificial valid tx using a simple puzzle.
-                      puzzle-a (str "(= \"" pub-a "\" solution)")
-                      puzzle-a-hash (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle-a "UTF-8")))
-
-                      mock-utxo {:amount init-amt-a :puzzle-hash puzzle-a-hash}
-                      ledger-with-funds (assoc-in (:ledger state-after-updates) [:utxos "utxo-1"] mock-utxo)
-                      state-with-funds (assoc state-after-updates :ledger ledger-with-funds)
-
-                      tx {:inputs ["utxo-1"]
-                          :outputs [{:amount (:balance-a final-chan)}
-                                    {:amount (:balance-b final-chan)}]
-                          :puzzles [puzzle-a]
-                          :solutions [pub-a]}
-
-                      settle-evt {:type :settle-channel
-                                  :channel-id "chan-fuzz"
-                                  :tx tx}
-
-                      state-after-settle (:state (sm/handle-event state-with-funds settle-evt))]
+          ;; 3. Settle
+                      state-after-settle (setup-and-settle-channel state-after-updates final-chan pub-a init-amt-a)]
 
                   (and
         ;; Invariants
