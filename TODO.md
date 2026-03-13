@@ -43,7 +43,7 @@
 - [x] Update `bitecho.state-machine` and `state_machine_test.clj`: Integrate Phase 4 by adding event handlers for the Payment Channel lifecycle (e.g., `{:type :open-channel}`, `{:type :update-channel}`, `{:type :settle-channel}`) and TURN service negotiation. Ensure the root reducer correctly transitions these states, updates the SCI-based ledger on settlement, and emits the proper `:network-out` commands. Update the generative tests to fuzz these new state transitions and prove channel settlements are secure.
 
 ## Bitecho Phase 5: The Shell & Network Genesis
-- [ ] Add `org.clojure/core.async {:mvn/version "1.9.829-alpha2"}` to `deps.edn`.
+- [x] Add `org.clojure/core.async {:mvn/version "1.9.829-alpha2"}` to `deps.edn`.
 - [ ] Implement `bitecho.crypto.delegation`: define pure functions to generate, sign, and verify Delegated Agent Certificates (DACs) linking a temporary Node Key to a Parent Key.
 - [ ] Implement `bitecho.shell.flow`: create the `core.async.flow` topology map and the pure adapter step function that wraps `bitecho.state-machine` reference the guide https://clojure.github.io/core.async/flow-guide.html .
 - [ ] Implement `bitecho.shell.bootstrap` and `bitecho.shell.agent`: define the `-main` entry points for the executables. Stub the datachannel/IO sinks for now, focusing purely on initializing the flow network, the channels, and the Genesis state.
