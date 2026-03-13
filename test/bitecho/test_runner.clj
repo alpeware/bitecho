@@ -4,6 +4,7 @@
             [bitecho.channels.core-test]
             [bitecho.contagion.core-test]
             [bitecho.crypto-test]
+            [bitecho.crypto.delegation-test]
             [bitecho.economy.difficulty-test]
             [bitecho.economy.ledger-test]
             [bitecho.economy.sci-sandbox-test]
