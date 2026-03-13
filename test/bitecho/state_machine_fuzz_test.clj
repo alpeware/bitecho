@@ -23,7 +23,11 @@
   "Generates a valid user-initiated cluster event."
   (gen/frequency
    [[5 (gen/return [:tick])]
-    [1 (gen/fmap (fn [payload] [:broadcast payload]) gen-payload)]]))
+    [1 (gen/fmap (fn [payload] [:broadcast payload]) gen-payload)]
+    ;; Introduce minimal churn events for fuzzing coverage.
+    ;; Since full TURN negotiation requires multi-step state transitions and signatures,
+    ;; we simply inject random allocate requests to ensure the state machine doesn't crash.
+    [1 (gen/return [:turn-allocate-request "client-pub-stub"])]]))
 
 (def gen-events
   "Generates a sequence of cluster events to drive the simulation."
@@ -49,14 +53,17 @@
 (defn- extract-node-id
   "Helper to extract a node ID from a peer's hash."
   [peer]
-  (if-let [match (re-find #"hash-(\d+)" (:hash peer))]
-    (Integer/parseInt (second match))
+  (if (map? peer)
+    (if-let [match (re-find #"hash-(\d+)" (str (:hash peer)))]
+      (Integer/parseInt (second match))
+      -1)
     -1))
 
 (defn- resolve-targets
   "Given commands that contain targets (as peers or a single target), map them to node IDs."
   [command]
   (cond
+    (= :network-out (:type command)) [] ;; Ignore network-out for now since it's targeted externally (e.g. client pubkey string instead of peer map)
     (:targets command) (map extract-node-id (:targets command))
     (:target command) [(extract-node-id (:target command))]
     :else []))
@@ -86,6 +93,9 @@
 
         :send-gossip
         [target-id {:type :receive-gossip :message (:message cmd) :rng rng}]
+
+        :turn-allocate-granted nil
+        :relay-data nil
 
         nil))))
 
@@ -118,21 +128,15 @@
   (let [rng (java.util.Random. seed)
         initial-cluster (init-cluster-state n)
         ;; Add a stabilization phase: 100 extra ticks to allow gossip/anti-entropy to converge
-        ;; Note: The true reliable broadcast uses Sieve (signed payloads) and Contagion.
-        ;; Wait! Murmur initiates the broadcast but Sieve requires signatures.
-        ;; Let's look at `state_machine.clj` `handle-broadcast`:
-        ;; `(murmur/initiate-broadcast payload rng (:basalt-view state) murmur-k)`
-        ;; Wait, the state machine itself bypasses Sieve for internally generated broadcasts?
-        ;; Wait, `sieve.core` isn't used in `handle-event` inside `state_machine.clj`?!
-        ;; Ah! Or maybe the Sieve wrap happens somewhere else?
-        ;; Let's give it more ticks just to be sure. Also `max-steps` in process-queue is 500, which is enough.
         all-events (concat events (repeat 500 [:tick]))]
     (reduce (fn [cluster [event-type payload]]
               ;; Randomly select a node to initiate the event
               (let [target-id (.nextInt rng n)
-                    event (if (= event-type :tick)
-                            {:type :tick :rng rng}
-                            {:type :broadcast :payload payload :rng rng})]
+                    event (case event-type
+                            :tick {:type :tick :rng rng}
+                            :broadcast {:type :broadcast :payload payload :rng rng}
+                            :turn-allocate-request {:type :turn-allocate-request :client-pubkey payload}
+                            {:type :tick :rng rng})]
                 (process-queue cluster [[target-id event]] drop-rate rng 5000 0)))
             initial-cluster
             all-events)))
@@ -169,3 +173,106 @@
                        ;; delivery immediately if we don't have enough ticks.
                                    (every? #(contains? known-ids %) expected-ids)))
                                (vals final-cluster))))))
+
+;; --- Payment Channel Settlement Fuzzer ---
+
+(def gen-channel-events
+  "Generates a valid sequence of payment channel off-chain updates."
+  (gen/vector (gen/tuple (gen/choose 1 10) (gen/choose 1 50)) 1 20))
+
+(defn- apply-channel-updates
+  "Applies a sequence of channel updates, maintaining valid mutual signatures."
+  [initial-state updates priv-a priv-b]
+  (reduce (fn [state [nonce-inc cost]]
+            (let [chan (get-in state [:channels "chan-fuzz"])
+                  new-nonce (+ (:nonce chan) nonce-inc)
+                  ;; ensure we don't overspend to keep valid
+                  actual-cost (min cost (:balance-a chan))
+                  new-balance-a (- (:balance-a chan) actual-cost)
+                  new-balance-b (+ (:balance-b chan) actual-cost)
+
+                  update-map {:nonce new-nonce
+                              :balance-a new-balance-a
+                              :balance-b new-balance-b}
+                  canonical-map (into (sorted-map) update-map)
+                  update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
+
+                  sig-a (basalt/bytes->hex (crypto/sign priv-a update-hash))
+                  sig-b (basalt/bytes->hex (crypto/sign priv-b update-hash))
+
+                  evt {:type :update-channel
+                       :channel-id "chan-fuzz"
+                       :update update-map
+                       :sig-a sig-a
+                       :sig-b sig-b}]
+              (:state (sm/handle-event state evt))))
+          initial-state
+          updates))
+
+(defn- setup-and-settle-channel
+  "Helper to set up ledger funds, construct settlement tx, and settle the channel."
+  [state-after-updates final-chan pub-a init-amt-a]
+  (let [puzzle-a (str "(= \"" pub-a "\" solution)")
+        puzzle-a-hash (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle-a "UTF-8")))
+
+        mock-utxo {:amount init-amt-a :puzzle-hash puzzle-a-hash}
+        ledger-with-funds (assoc-in (:ledger state-after-updates) [:utxos "utxo-1"] mock-utxo)
+        state-with-funds (assoc state-after-updates :ledger ledger-with-funds)
+
+        tx {:inputs ["utxo-1"]
+            :outputs [{:amount (:balance-a final-chan)}
+                      {:amount (:balance-b final-chan)}]
+            :puzzles [puzzle-a]
+            :solutions [pub-a]}
+
+        settle-evt {:type :settle-channel
+                    :channel-id "chan-fuzz"
+                    :tx tx}]
+    (:state (sm/handle-event state-with-funds settle-evt))))
+
+(defspec ^{:doc "Fuzzer property verifying payment channel updates and final settlement."}
+  channel-settlement-property 100
+  (prop/for-all [updates gen-channel-events
+                 seed gen/large-integer]
+                (let [_rng (java.util.Random. seed)
+          ;; Keys setup
+                      client-keys (crypto/generate-keypair)
+                      server-keys (crypto/generate-keypair)
+                      pub-a (basalt/bytes->hex (:public client-keys))
+                      pub-b (basalt/bytes->hex (:public server-keys))
+                      priv-a (:private client-keys)
+                      priv-b (:private server-keys)
+
+          ;; Initial amounts
+                      init-amt-a 1000
+                      init-amt-b 0
+
+          ;; Open Channel Event
+                      open-evt {:type :open-channel
+                                :channel-id "chan-fuzz"
+                                :pubkey-a pub-a
+                                :pubkey-b pub-b
+                                :amount-a init-amt-a
+                                :amount-b init-amt-b}
+
+                      initial-node-state (sm/init-state [])
+
+          ;; 1. Open
+                      state-after-open (:state (sm/handle-event initial-node-state open-evt))
+
+          ;; 2. Apply updates iteratively
+                      state-after-updates (apply-channel-updates state-after-open updates priv-a priv-b)
+                      final-chan (get-in state-after-updates [:channels "chan-fuzz"])
+
+          ;; 3. Settle
+                      state-after-settle (setup-and-settle-channel state-after-updates final-chan pub-a init-amt-a)]
+
+                  (and
+        ;; Invariants
+                   (= (+ init-amt-a init-amt-b) (+ (:balance-a final-chan) (:balance-b final-chan)))
+                   (>= (:nonce final-chan) (count updates))
+        ;; Verify channel is closed after settlement
+                   (nil? (get-in state-after-settle [:channels "chan-fuzz"]))
+        ;; Verify the new UTXOs sum up to the original amount
+                   (= (+ init-amt-a init-amt-b)
+                      (reduce + (map :amount (vals (:utxos (:ledger state-after-settle))))))))))
