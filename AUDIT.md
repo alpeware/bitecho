@@ -34,7 +34,63 @@ Inject a strict memory/length limit on string operations within the `sci-sandbox
 
 ---
 
-## 3. HIGH: Transaction Hash Non-Determinism Forking Consensus
+## 3. CRITICAL: Zero-Authorization Theft of Standard UTXOs
+**Component:** `bitecho.economy.ledger/standard-puzzle-hash`
+
+**Description:**
+The standard UTXO puzzle only checks if the solution string matches the pubkey. It completely omits Ed25519 signature verification.
+
+**Impact:**
+An attacker can steal any standard UTXO by simply constructing a solution containing the target's public key as a string, completely bypassing cryptographic authorization. This leads to an immediate, total loss of funds across the network.
+
+**Remediation:**
+Rewrite `standard-puzzle-hash` to generate a script that executes `crypto/verify` using the transaction hash.
+
+---
+
+## 4. CRITICAL: Remote Command Execution via Flow Ingress
+**Component:** `bitecho.shell.flow/state-machine-step`
+
+**Description:**
+`:net-in` routes directly to the pure reducer without filtering. An attacker can send raw EDN payloads specifying highly privileged internal events (like `:settle-channel`).
+
+**Impact:**
+Malicious peers can send crafted network packets containing internal state machine event structures to remotely execute privileged commands (e.g., closing channels, forcing payouts). This breaks the Sans-IO abstraction and leads to full remote compromise of the victim's local node state.
+
+**Remediation:**
+Implement a strict ingress filter that only maps external network messages to a whitelisted subset of events (e.g., `:receive-gossip`).
+
+---
+
+## 5. CRITICAL: Arbitrary Multisig Transaction Forgery
+**Component:** `bitecho.channels.core/generate-multisig-puzzle` & `sci-sandbox/eval-string`
+
+**Description:**
+The 2-of-2 multisig puzzle pulls the `tx-hash` directly from the attacker-controlled `solution` payload rather than the internally computed transaction hash.
+
+**Impact:**
+Attackers can forge multisig spending transactions by replaying previous valid signatures over an attacker-supplied hash within the solution payload. This undermines the payment channel integrity, allowing unauthorized extraction of bonded Echo funds.
+
+**Remediation:**
+The SCI sandbox must inject the internally computed `tx-hash` natively into the binding context; it must never be supplied by the spending solution.
+
+---
+
+## 6. CRITICAL: Unbounded Broadcast Storms (Vector Queue Eviction Bug)
+**Component:** `bitecho.murmur.core/update-cache`
+
+**Description:**
+The Murmur cache initializes `:queue` as a standard vector `[]`. Calling `pop` on a vector removes the newest item, not the oldest, causing the cache to permanently forget new messages once full.
+
+**Impact:**
+Once the bounded Murmur cache fills, `pop` evicts the most recently added message IDs instead of the oldest. This fundamentally breaks duplicate message detection for new gossip, resulting in infinite routing loops and devastating broadcast storms that will partition the P2P network.
+
+**Remediation:**
+Initialize the cache queue using `clojure.lang.PersistentQueue/EMPTY`.
+
+---
+
+## 7. HIGH: Transaction Hash Non-Determinism Forking Consensus
 **Component:** `src/bitecho/economy/ledger.clj` (`process-transaction`)
 
 **Description:**
@@ -52,7 +108,7 @@ Canonicalize the transaction data structure before serialization. Convert the `t
 
 ---
 
-## 4. HIGH: Replay Attacks in TURN Payment Channel Off-Chain Updates
+## 8. HIGH: Replay Attacks in TURN Payment Channel Off-Chain Updates
 **Component:** `src/bitecho/services/turn.clj` (`handle-relay-request`)
 
 **Description:**
@@ -67,3 +123,31 @@ An attacker could replay previously mutually signed payment updates, forcing the
 
 **Remediation:**
 Channel state tracking must enforce monotonic progression independently. The `turn-relay-request` verification must strictly compare the update against the server's latest localized channel state, rejecting any nonce `N` where `N <= current_nonce`.
+
+---
+
+## 9. HIGH: Payment Channel Balance Conservation Bypass
+**Component:** `bitecho.channels.core/mutually-sign-update`
+
+**Description:**
+The channel update logic validates signatures and nonces but fails to assert that the sum of the new balances equals the sum of the original balances.
+
+**Impact:**
+A malicious or compromised channel participant can propose an off-chain update that mints new tokens out of thin air while maintaining valid signatures and nonces. When settled, this violates the global UTXO conservation invariant, inflating the Echo supply.
+
+**Remediation:**
+Add a strict invariant check ensuring `balance-a + balance-b` is conserved.
+
+---
+
+## 10. HIGH: Lottery Ticket Claimer Spoofing
+**Component:** `bitecho.state-machine/handle-route-directed-message`
+
+**Description:**
+The state machine extracts the `claimer-pubkey` directly from the event payload rather than enforcing that the claimer is the local node's actual identity.
+
+**Impact:**
+A peer routing a message can maliciously modify the `claimer-pubkey` field in the payload to redirect the lottery ticket reward to their own pubkey instead of the actual routing node's pubkey, stealing routing incentives from honest nodes.
+
+**Remediation:**
+Derive the `claimer-pubkey` from the node's internal state, not the unverified event payload.
