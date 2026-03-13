@@ -55,3 +55,28 @@ Continuous services (like streaming video or relaying bandwidth) cannot wait for
 
 ### Decentralized TURN & Relay (The First Service Market)
 The first native service of this economy is Decentralized TURN. Since many agents reside behind strict Symmetric NATs, they cannot form direct peer-to-peer connections. Any agent on the network with an open, publicly accessible port can advertise itself as a Relay Node. A restricted agent uses Phase 3 to negotiate a session with a Relay Node, opens a Payment Channel, and begins streaming off-chain Echos to the Relay Node continuously, priced dynamically per megabyte of WebRTC traffic relayed. This creates a decentralized, permissionless, free market for network bandwidth, turning Bitecho into a decentralized AWS for AI agents.
+
+## Phase 5: The Executable Shell & Network Genesis
+
+### A. The Declarative Flow Shell (`core.async.flow`)
+To seamlessly interface the mathematically pure `bitecho.state-machine` with the external IO runtime, we adopt a Declarative Flow Shell using `clojure.core.async.flow`. This architecture perfectly preserves the Sans-IO constraint.
+
+The topology is cleanly bifurcated: a single `:net-in` channel multiplexes all raw external events (network packets, clock ticks, and IO callbacks) and funnels them directly into the pure `:bitecho-core` step function. This step function computes the new state and deterministically yields pure commands to a `:net-out` channel. An entirely separate, "dumb" side-effecting loop consumes `:net-out`, executing the prescribed IO (e.g., transmitting UDP packets, writing to disk) without containing any business logic.
+
+### B. The Genesis State (The 42M Cap)
+An absolute, unbreakable network invariant anchors the Bitecho economy: the total supply is mathematically hard-capped at exactly **42,000,000 Echos**.
+
+The network initializes from a deterministic, cryptographically hashed `genesis.edn` state. At boot, this entire 42M supply is fully minted and allocated into a foundational set of UTXOs. These initial UTXOs are locked by programmatic Clojure Puzzles, staged for controlled distribution, vesting, or direct claim by the founding entities, ensuring verifiable scarcity from block zero.
+
+### C. Agent Birthing & Delegated Cryptography (DACs)
+Deploying AI agents across diverse, potentially vulnerable infrastructure requires a robust security model to prevent the compromise of root cryptographic identity and stake. To solve this, Bitecho employs a Delegated PKI model.
+
+A human operator or orchestrator retains a highly secure **Parent Key** (analogous to a Cold Wallet). Because the actual AI agent operates in a live environment, it generates its own temporary, disposable Ed25519 **Node Key** (Hot Wallet) upon booting.
+
+During the "birthing" process, the Parent Key cryptographically signs a **Delegated Agent Certificate (DAC)**. This DAC securely binds the disposable Node Key to the Parent's primary identity and stake. The active agent subsequently uses its hot Node Key to sign all transient network operations—such as Murmur/Sieve gossip and TURN session negotiations—cryptographically proving its authority and economic stake to the mesh without ever exposing the Parent's root cryptographic materials to the hot environment.
+
+### D. Node Archetypes (Bootstrap vs. Agent)
+The network relies on two distinct execution archetypes:
+
+*   **The Bootstrap Node:** The static anchor of the network. It binds to a publicly accessible, well-known port and is responsible for initializing the Genesis ledger. It operates as a passive, ICE-Lite entry point, serving strictly to help new peers discover the active mesh.
+*   **The Agent Node:** The active, dynamic participant. Upon the birthing sequence, an Agent Node utilizes its DAC to authenticate. It connects to the Bootstrap node, triggers a Contagion pull request to seamlessly sync the ledger state and Basalt peer views, and immediately begins actively participating in the decentralized service economy, routing traffic, and exchanging services.
