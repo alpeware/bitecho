@@ -25,7 +25,10 @@
 (defn- standard-puzzle-hash
   "Generates the standard puzzle hash for a public key."
   [pubkey-hex]
-  (let [puzzle (str "(= \"" pubkey-hex "\" solution)")]
+  (let [puzzle (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" pubkey-hex "\") "
+                    "sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) "
+                    "tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] "
+                    "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))")]
     (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle "UTF-8")))))
 
 (defn claim-ticket

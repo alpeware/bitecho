@@ -15,7 +15,10 @@
 (defn- expected-puzzle-hash
   "Helper to compute standard puzzle hash."
   [pubkey-hex]
-  (basalt/bytes->hex (crypto/sha256 (.getBytes (str "(= \"" pubkey-hex "\" solution)") "UTF-8"))))
+  (basalt/bytes->hex (crypto/sha256 (.getBytes (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" pubkey-hex "\") "
+                                                    "sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) "
+                                                    "tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] "
+                                                    "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))") "UTF-8"))))
 
 (deftest ^{:doc "Genesis ledger should have empty utxos and no claimed tickets"}
   genesis-ledger-initialization
@@ -80,9 +83,18 @@
 
 (defn- create-tx-with-puzzles
   "Helper to create a transaction with puzzles and solutions."
-  [inputs outputs sender-pubkey-hex]
-  (let [puzzles (repeat (count inputs) (str "(= \"" sender-pubkey-hex "\" solution)"))
-        solutions (repeat (count inputs) sender-pubkey-hex)]
+  [inputs outputs sender-pubkey-hex sender-privkey]
+  (let [tx-hash-str "dummy-tx-hash-for-testing"
+        tx-hash-bytes (crypto/sha256 (.getBytes tx-hash-str "UTF-8"))
+        tx-hash-hex (basalt/bytes->hex tx-hash-bytes)
+        sig-bytes (crypto/sign sender-privkey tx-hash-bytes)
+        sig-hex (basalt/bytes->hex sig-bytes)
+        puzzle-str (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" sender-pubkey-hex "\") "
+                        "sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) "
+                        "tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] "
+                        "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))")
+        puzzles (repeat (count inputs) puzzle-str)
+        solutions (repeat (count inputs) {:tx-hash tx-hash-hex :signature sig-hex})]
     {:inputs inputs
      :outputs outputs
      :puzzles puzzles
@@ -108,7 +120,7 @@
                       inputs [utxo1-id utxo2-id]
                       outputs [{:amount 12 :puzzle-hash receiver-puzzle-hash}
                                {:amount 3 :puzzle-hash sender-puzzle-hash}]
-                      tx (create-tx-with-puzzles inputs outputs sender-pubkey)
+                      tx (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   (and
                    ;; Inputs should be consumed
@@ -133,8 +145,8 @@
                       inputs [utxo1-id]
                       outputs [{:amount 10 :puzzle-hash sender-puzzle-hash}]
                       ;; Provide wrong puzzle
-                      tx (assoc (create-tx-with-puzzles inputs outputs sender-pubkey)
-                                :puzzles ["(= \"different\" solution)"])
+                      tx (assoc (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
+                                :puzzles ["(let [pub-bytes (bitecho.basalt.core/hex->bytes \"different\") sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] (bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))"])
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
@@ -153,8 +165,8 @@
                       inputs [utxo1-id]
                       outputs [{:amount 10 :puzzle-hash sender-puzzle-hash}]
                       ;; Wrong solution makes the standard puzzle script evaluate to false
-                      tx (assoc (create-tx-with-puzzles inputs outputs sender-pubkey)
-                                :solutions ["wrong-solution"])
+                      tx (assoc (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
+                                :solutions [{:tx-hash "wrong-hash" :signature "wrong-sig"}])
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
@@ -172,7 +184,7 @@
                                       :claimed-tickets #{}}
                       inputs [utxo1-id utxo1-id]
                       outputs [{:amount 20 :puzzle-hash sender-puzzle-hash}]
-                      tx (create-tx-with-puzzles inputs outputs sender-pubkey)
+                      tx (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
@@ -191,7 +203,7 @@
                       inputs [utxo1-id]
                       outputs [{:amount 100 :puzzle-hash sender-puzzle-hash}
                                {:amount -90 :puzzle-hash sender-puzzle-hash}]
-                      tx (create-tx-with-puzzles inputs outputs sender-pubkey)
+                      tx (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
@@ -211,7 +223,7 @@
                       inputs [utxo1-id missing-id]
                       outputs [{:amount 10 :puzzle-hash sender-puzzle-hash}]
                       ;; Since inputs array length is 2, need 2 puzzles/solutions
-                      tx (create-tx-with-puzzles inputs outputs sender-pubkey)
+                      tx (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
@@ -229,7 +241,7 @@
                                       :claimed-tickets #{}}
                       inputs [utxo1-id]
                       outputs [{:amount 11 :puzzle-hash sender-puzzle-hash}]
-                      tx (create-tx-with-puzzles inputs outputs sender-pubkey)
+                      tx (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
