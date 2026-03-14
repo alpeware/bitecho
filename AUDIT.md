@@ -79,7 +79,7 @@ While the architecture showcases excellent engineering discipline by strictly se
 * **Component:** `bitecho.basalt.core/make-peer`
 * **Description:** Peer IDs are hashed by concatenating `ip`, `port`, and `pubkey` into a `ByteBuffer` without delimiters. `IP: "127.0.0.1" + Port: "80"` creates the exact same byte string prefix as `IP: "127.0.0.18" + Port: "0"`.
 * **Impact:** An attacker can engineer peer-id collisions to mount highly targeted eclipse attacks. By exploiting `merge-views`' preference for younger peers (age 0), the attacker can deterministically overwrite honest nodes in victims' routing tables.
-* **Remediation:** Insert explicit delimiters (e.g., a null byte ` ` or `|`) between fields when constructing the `hash-input` ByteBuffer.
+* **Remediation:** Insert explicit delimiters (e.g., a null byte `\x00` or `|`) between fields when constructing the `hash-input` ByteBuffer.
 
 ### [HIGH-03] Sieve Equivocation Tracker Permanently Blacklists Senders
 
