@@ -28,12 +28,12 @@
 (defn start-node
   "Starts a transparent go-loop wrapping the state machine.
    Returns a map with the internal channels :events-in, :network-in, :net-out, and the loop :stop-ch."
-  [initial-peers]
+  [initial-peers node-pubkey]
   (let [events-in (async/chan 1024)
         network-in (async/chan 1024)
         net-out (async/chan 1024)
         stop-ch (async/chan)]
-    (async/go-loop [state (sm/init-state initial-peers)]
+    (async/go-loop [state (sm/init-state initial-peers node-pubkey)]
       (let [[val port] (async/alts! [events-in network-in stop-ch])]
         (cond
           (= port stop-ch)

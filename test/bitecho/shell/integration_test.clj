@@ -84,10 +84,10 @@
           ;; Bootstrap peer record as seen by agents
           boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
 
-          boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [])
-          a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer])
-          a2-chans (create-node-channels a2-pubkey-hex :agent agent-shell/init-node [boot-peer])
-          a3-chans (create-node-channels a3-pubkey-hex :agent agent-shell/init-node [boot-peer])
+          boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex])
+          a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex])
+          a2-chans (create-node-channels a2-pubkey-hex :agent agent-shell/init-node [boot-peer a2-pubkey-hex])
+          a3-chans (create-node-channels a3-pubkey-hex :agent agent-shell/init-node [boot-peer a3-pubkey-hex])
 
           nodes {boot-pubkey-hex boot-chans
                  a1-pubkey-hex a1-chans

@@ -12,7 +12,7 @@
 (deftest ^{:doc "Tests that init-state returns a correctly shaped state map."} init-state-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
                        {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
-        state (sm/init-state initial-peers)]
+        state (sm/init-state initial-peers "node-pubkey-stub")]
     (is (set? (:basalt-view state)))
     (is (= 2 (count (:basalt-view state))))
     (is (map? (:murmur-cache state)))
@@ -24,7 +24,7 @@
     (is (map? (:channels state)))))
 
 (deftest ^{:doc "Tests handle-event with a :open-channel event."} handle-open-channel-test
-  (let [state (sm/init-state [])
+  (let [state (sm/init-state [] "node-pubkey-stub")
         event {:type :open-channel
                :channel-id "chan-1"
                :pubkey-a "pub-a"
@@ -43,7 +43,7 @@
         priv-a (:private client-keys)
         priv-b (:private server-keys)
         initial-chan (channels/create-initial-state "chan-1" pub-a pub-b 100 0)
-        state (assoc (sm/init-state []) :channels {"chan-1" initial-chan})
+        state (assoc (sm/init-state [] "node-pubkey-stub") :channels {"chan-1" initial-chan})
 
         update-map {:nonce 1 :balance-a 90 :balance-b 10}
         enriched-update-map (assoc update-map :channel-id "chan-1" :pubkey-a pub-a :pubkey-b pub-b)
@@ -69,7 +69,7 @@
         initial-ledger (ledger/init-ledger)
         ;; Actually, since `process-transaction` returns the same ledger if invalid,
         ;; we can just verify the channel is NOT removed if invalid, or removed if valid.
-        state (-> (sm/init-state [])
+        state (-> (sm/init-state [] "node-pubkey-stub")
                   (assoc :channels {"chan-1" {:pubkey-a "a" :pubkey-b "b" :balance-a 10 :balance-b 10}})
                   (assoc :ledger initial-ledger))
         event {:type :settle-channel :channel-id "chan-1" :tx {:inputs [] :outputs [] :puzzles [] :solutions []}}
@@ -82,7 +82,7 @@
     (is (map? result))))
 
 (deftest ^{:doc "Tests handle-event with a :turn-allocate-request event."} handle-turn-allocate-request-test
-  (let [state (sm/init-state [])
+  (let [state (sm/init-state [] "node-pubkey-stub")
         event {:type :turn-allocate-request
                :client-pubkey "client-1"}
         result (sm/handle-event state event)]
@@ -99,7 +99,7 @@
         priv-a (:private client-keys)
         priv-b (:private server-keys)
         initial-chan (channels/create-initial-state "chan-1" pub-a pub-b 100 0)
-        state (assoc (sm/init-state []) :channels {"chan-1" initial-chan})
+        state (assoc (sm/init-state [] "node-pubkey-stub") :channels {"chan-1" initial-chan})
 
         data (.getBytes "hello")
         price 1
@@ -120,7 +120,7 @@
 (deftest ^{:doc "Tests handle-event with a :route-directed-message event."} handle-route-directed-message-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
                        {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
-        state (sm/init-state initial-peers)
+        state (sm/init-state initial-peers "node-pubkey-stub")
         keys (crypto/generate-keypair)
         pub-key (:public keys)
         priv-key (:private keys)
@@ -132,7 +132,7 @@
         event {:type :route-directed-message
                :envelope envelope
                :rng (java.util.Random. 42)
-               :claimer-pubkey "router-pubkey"
+
                :payout-amount 10
                :network-size 10}
         result (sm/handle-event state event)]
@@ -149,7 +149,7 @@
 (deftest ^{:doc "Tests handle-event with a :tick event."} handle-tick-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
                        {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
-        state (sm/init-state initial-peers)
+        state (sm/init-state initial-peers "node-pubkey-stub")
         event {:type :tick :rng (java.util.Random. 42)}
         result (sm/handle-event state event)]
     (is (map? result))
@@ -164,7 +164,7 @@
 
 (deftest ^{:doc "Tests handle-event with a :broadcast event."} handle-broadcast-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}]
-        state (sm/init-state initial-peers)
+        state (sm/init-state initial-peers "node-pubkey-stub")
         payload (.getBytes "hello")
         event {:type :broadcast :payload payload :rng (java.util.Random. 42)}
         result (sm/handle-event state event)]
@@ -178,7 +178,7 @@
       (is (= "A" (:hash (first (:targets (first commands)))))))))
 
 (deftest ^{:doc "Tests handle-event with a :receive-push-view event."} handle-receive-push-view-test
-  (let [state (sm/init-state [])
+  (let [state (sm/init-state [] "node-pubkey-stub")
         received-view #{{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}}
         event {:type :receive-push-view :view received-view}
         result (sm/handle-event state event)]
@@ -186,7 +186,7 @@
     (is (= "A" (:hash (first (:basalt-view (:state result))))))))
 
 (deftest ^{:doc "Tests handle-event with a :receive-summary event."} handle-receive-summary-test
-  (let [state (assoc (sm/init-state []) :contagion-known-ids #{"msg1"})
+  (let [state (assoc (sm/init-state [] "node-pubkey-stub") :contagion-known-ids #{"msg1"})
         event {:type :receive-summary :summary #{"msg1" "msg2"}}
         result (sm/handle-event state event)]
     ;; Should emit a pull request for "msg2"

@@ -6,7 +6,7 @@
 (deftest ^{:doc "Network ingress filters external events correctly"}
   ingress-filter-test
   (testing "Network ingress filters external events correctly"
-    (let [node (core/start-node [])]
+    (let [node (core/start-node [] "node-pubkey-stub")]
       (is (contains? node :network-in))
       ;; Test allowed events
       (async/put! (:network-in node) {:type :receive-gossip})

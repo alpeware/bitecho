@@ -24,9 +24,11 @@
   50)
 
 (defn init-state
-  "Initializes the pure Bitecho state map."
-  [initial-peers]
-  {:basalt-view (basalt/init-view initial-peers)
+  "Initializes the pure Bitecho state map.
+   node-pubkey should be the hex-encoded public key of this node."
+  [initial-peers node-pubkey]
+  {:node-pubkey node-pubkey
+   :basalt-view (basalt/init-view initial-peers)
    :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
    :sieve-history {}
    :contagion-known-ids #{}
@@ -163,7 +165,7 @@
   [state event]
   (let [envelope (:envelope event)
         ticket (:lottery-ticket envelope)
-        claimer-pubkey (:claimer-pubkey event)
+        claimer-pubkey (:node-pubkey state)
         payout-amount (:payout-amount event)
         network-size (:network-size event)
         difficulty-hex (difficulty/calculate-difficulty murmur-k network-size)
