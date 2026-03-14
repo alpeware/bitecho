@@ -33,19 +33,19 @@
                       (when spy-ch (async/put! spy-ch {:to target-pubkey-hex :cmd cmd}))
                       (case (:type cmd)
                         :send-push-view
-                        (async/put! (:events-in target-node) {:type :receive-push-view :view (:view cmd)})
+                        (async/put! (:network-in target-node) {:type :receive-push-view :view (:view cmd)})
                         :send-summary
-                        (async/put! (:events-in target-node) {:type :receive-summary
-                                                              :sender sender-pubkey-hex
-                                                              :summary (:summary cmd)})
+                        (async/put! (:network-in target-node) {:type :receive-summary
+                                                               :sender sender-pubkey-hex
+                                                               :summary (:summary cmd)})
                         :send-pull-request
-                        (async/put! (:events-in target-node) {:type :receive-pull-request
-                                                              :sender sender-pubkey-hex
-                                                              :missing-ids (:missing-ids cmd)})
+                        (async/put! (:network-in target-node) {:type :receive-pull-request
+                                                               :sender sender-pubkey-hex
+                                                               :missing-ids (:missing-ids cmd)})
                         :send-gossip
-                        (async/put! (:events-in target-node) {:type :receive-gossip
-                                                              :message (:message cmd)
-                                                              :rng (java.util.Random.)})
+                        (async/put! (:network-in target-node) {:type :receive-gossip
+                                                               :message (:message cmd)
+                                                               :rng (java.util.Random.)})
                         nil))))))
             (recur)))))
     {:stop-ch stop-ch :delivered-messages delivered-messages}))
@@ -56,6 +56,7 @@
     {:pubkey-hex pubkey-hex
      :type node-type
      :events-in (:events-in node)
+     :network-in (:network-in node)
      :net-out (:net-out node)
      :node node}))
 
@@ -117,9 +118,9 @@
               a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
               a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}
               a3-peer {:ip "127.0.0.1" :port 8003 :pubkey a3-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a3-keys)))}]
-          (async/put! (:events-in (:node a1-chans)) {:type :receive-push-view :view #{boot-peer a2-peer a3-peer}})
-          (async/put! (:events-in (:node a2-chans)) {:type :receive-push-view :view #{boot-peer a1-peer a3-peer}})
-          (async/put! (:events-in (:node a3-chans)) {:type :receive-push-view :view #{boot-peer a1-peer a2-peer}}))
+          (async/put! (:network-in (:node a1-chans)) {:type :receive-push-view :view #{boot-peer a2-peer a3-peer}})
+          (async/put! (:network-in (:node a2-chans)) {:type :receive-push-view :view #{boot-peer a1-peer a3-peer}})
+          (async/put! (:network-in (:node a3-chans)) {:type :receive-push-view :view #{boot-peer a1-peer a2-peer}}))
 
         (async/<!! (async/timeout 50))
 

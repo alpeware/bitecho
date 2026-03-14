@@ -45,7 +45,7 @@
 
 ## Phase 6: Security Audit Remediation
 - [x] **CRIT-01 (Zero-Authorization Theft of Standard UTXOs):** Standard puzzles must enforce Ed25519 signature validation against the transaction hash (e.g., `(crypto/verify pubkey tx-hash signature)`).
-- [ ] **CRIT-02 (Remote Command Execution / State Injection via Flow Topology):** Implement a strict ingress routing boundary. External network messages must be explicitly mapped to a safe, whitelisted subset of allowed network events (e.g., `:receive-gossip`, `:receive-summary`).
+- [x] **CRIT-02 (Remote Command Execution / State Injection via Flow Topology):** Implement a strict ingress routing boundary. External network messages must be explicitly mapped to a safe, whitelisted subset of allowed network events (e.g., `:receive-gossip`, `:receive-summary`).
 - [ ] **CRIT-03 (Arbitrary Multisig Transaction Forgery (Unbound `tx-hash`)):** The SCI sandbox evaluation environment must inject the internally computed `tx-hash` natively as an immutable binding context. It must never be supplied by the spending solution.
 - [ ] **CRIT-04 (SCI Sandbox Resource Exhaustion DoS (Billion Laughs)):** AST blacklisting is fundamentally insufficient. Implement strict instruction-metering limits (gas) natively via SCI's configuration interceptors, and bound memory allocations.
 - [ ] **CRIT-05 (Unbounded Broadcast Storms (Vector Queue Eviction Bug)):** Initialize the cache queue using `clojure.lang.PersistentQueue/EMPTY` instead of a vector.
