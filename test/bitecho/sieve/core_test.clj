@@ -58,38 +58,53 @@
   100
   (prop/for-all [payload gen-bytes]
                 (let [keypair (crypto/generate-keypair)
-                      message (sieve/wrap-message payload (:private keypair) (:public keypair))
+                      message (assoc (sieve/wrap-message payload (:private keypair) (:public keypair)) :message-id "msg-1")
                       empty-history {}
                       result (sieve/check-equivocation empty-history message)]
                   (and
                    (not (:equivocation? result))
                    (= (basalt/bytes->hex (:signature message))
-                      (get (:history result) (:sender message)))))))
+                      (get (:history result) [(:sender message) "msg-1"]))))))
 
 (defspec ^{:doc "Same signature is not an equivocation."}
   check-equivocation-duplicate-message
   100
   (prop/for-all [payload gen-bytes]
                 (let [keypair (crypto/generate-keypair)
-                      message (sieve/wrap-message payload (:private keypair) (:public keypair))
-                      history {(:sender message) (basalt/bytes->hex (:signature message))}
+                      message (assoc (sieve/wrap-message payload (:private keypair) (:public keypair)) :message-id "msg-1")
+                      history {[(:sender message) "msg-1"] (basalt/bytes->hex (:signature message))}
                       result (sieve/check-equivocation history message)]
                   (and
                    (not (:equivocation? result))
                    (= history (:history result))))))
 
-(defspec ^{:doc "Different signature from the same sender is an equivocation."}
+(defspec ^{:doc "Different signature from the same sender for the SAME message-id is an equivocation."}
   check-equivocation-different-message
   100
   (prop/for-all [payload1 gen-bytes
                  payload2 gen-bytes]
                 (let [keypair (crypto/generate-keypair)
-                      msg1 (sieve/wrap-message payload1 (:private keypair) (:public keypair))
-                      msg2 (sieve/wrap-message payload2 (:private keypair) (:public keypair))
-                      history {(:sender msg1) (basalt/bytes->hex (:signature msg1))}
+                      msg1 (assoc (sieve/wrap-message payload1 (:private keypair) (:public keypair)) :message-id "msg-1")
+                      msg2 (assoc (sieve/wrap-message payload2 (:private keypair) (:public keypair)) :message-id "msg-1")
+                      history {[(:sender msg1) "msg-1"] (basalt/bytes->hex (:signature msg1))}
                       result (sieve/check-equivocation history msg2)]
                   (if (= (seq payload1) (seq payload2))
                     true
                     (and
                      (:equivocation? result)
                      (= history (:history result)))))))
+
+(defspec ^{:doc "Different signature from the same sender for DIFFERENT message-ids is NOT an equivocation."}
+  check-equivocation-different-message-ids
+  100
+  (prop/for-all [payload1 gen-bytes
+                 payload2 gen-bytes]
+                (let [keypair (crypto/generate-keypair)
+                      msg1 (assoc (sieve/wrap-message payload1 (:private keypair) (:public keypair)) :message-id "msg-1")
+                      msg2 (assoc (sieve/wrap-message payload2 (:private keypair) (:public keypair)) :message-id "msg-2")
+                      history {[(:sender msg1) "msg-1"] (basalt/bytes->hex (:signature msg1))}
+                      result (sieve/check-equivocation history msg2)]
+                  (and
+                   (not (:equivocation? result))
+                   (= (get (:history result) [(:sender msg2) "msg-2"])
+                      (basalt/bytes->hex (:signature msg2)))))))
