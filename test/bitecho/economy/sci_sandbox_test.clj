@@ -8,9 +8,7 @@
   eval-string-basic-test
   (testing "Basic arithmetic works"
     (is (= 6 (sci-sandbox/eval-string "(+ 1 2 3)")))
-    (is (= 120 (sci-sandbox/eval-string "(* 1 2 3 4 5)"))))
-  (testing "Basic pure core functions work"
-    (is (= [2 3 4] (sci-sandbox/eval-string "(map inc [1 2 3])")))))
+    (is (= 120 (sci-sandbox/eval-string "(* 1 2 3 4 5)")))))
 
 (deftest ^{:doc "Test that side-effecting functions are unavailable or fail"}
   eval-string-isolation-test
@@ -61,3 +59,14 @@
     (is (thrown? Exception (sci-sandbox/eval-string "(repeat 1)"))))
   (testing "iterate is disabled"
     (is (thrown? Exception (sci-sandbox/eval-string "(iterate inc 1)")))))
+
+(deftest ^{:doc "Test sequence and allocation functions are disabled"}
+  eval-string-no-allocations-test
+  (testing "map is disabled"
+    (is (thrown? Exception (sci-sandbox/eval-string "(map inc [1 2 3])"))))
+  (testing "reduce is disabled"
+    (is (thrown? Exception (sci-sandbox/eval-string "(reduce + [1 2 3])"))))
+  (testing "str is disabled"
+    (is (thrown? Exception (sci-sandbox/eval-string "(str \"a\" \"b\")"))))
+  (testing "concat is disabled"
+    (is (thrown? Exception (sci-sandbox/eval-string "(concat [1] [2])")))))
