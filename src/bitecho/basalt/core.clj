@@ -32,11 +32,15 @@
         port-str (str port)
         port-bytes (.getBytes port-str)
         hash-input (byte-array (+ (count ip-bytes)
+                                  1
                                   (count port-bytes)
+                                  1
                                   (count pubkey)))
         bb (java.nio.ByteBuffer/wrap hash-input)]
     (.put bb ip-bytes)
+    (.put bb (byte 124))
     (.put bb port-bytes)
+    (.put bb (byte 124))
     (.put bb pubkey)
     (->Peer ip port (bytes->hex pubkey) 0 (bytes->hex (crypto/sha256 hash-input)))))
 

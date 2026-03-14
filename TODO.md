@@ -51,7 +51,7 @@
 - [x] **CRIT-05 (Unbounded Broadcast Storms (Vector Queue Eviction Bug)):** Initialize the cache queue using `clojure.lang.PersistentQueue/EMPTY` instead of a vector.
 - [x] **CRIT-06 (Complete Bypass of Sieve Cryptographic Verification):** Add `(sieve/validate-message message)` logic to the gossip handler and drop payloads that fail validation. *(Completed in PR #44)*
 - [x] **HIGH-01 (Cross-Channel State Replay Attacks):** Include `channel-id` and participant keys inside the `update-map` before it is converted to a canonical string and hashed.
-- [ ] **HIGH-02 (Basalt Sybil/Eclipse Attack via Deterministic Hash Collision):** Insert explicit delimiters (e.g., a null byte `\x00` or `|`) between fields when constructing the `hash-input` ByteBuffer.
+- [x] **HIGH-02 (Basalt Sybil/Eclipse Attack via Deterministic Hash Collision):** Insert explicit delimiters (e.g., a null byte `\x00` or `|`) between fields when constructing the `hash-input` ByteBuffer.
 - [ ] **HIGH-03 (Sieve Equivocation Tracker Permanently Blacklists Senders):** The equivocation history must track signatures scoped to a specific `message-id` or sequence number, not globally by sender.
 - [ ] **HIGH-04 (Remote DoS via Unhandled Hex Parsing Exceptions):** Add length parity validation to `hex->bytes`. Wrap external input parsing in defensive `try/catch` blocks.
 - [ ] **HIGH-05 (Transaction Hash Non-Determinism Forking Consensus):** Canonicalize the transaction data structure before serialization. Convert the `tx` map to a deterministically ordered collection (e.g., `(into (sorted-map) tx)`) or explicitly sort keys prior to applying `pr-str` and hashing.
