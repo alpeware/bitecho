@@ -90,7 +90,8 @@
                                     (valid-puzzle-execution? puzzle solution (:puzzle-hash utxo) auth-tx-hash))
                                   input-utxos puzzles solutions))))
       (let [ledger-without-inputs (reduce (fn [l input-id] (update l :utxos dissoc input-id)) ledger inputs)
-            tx-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str tx) "UTF-8")))
+            canonical-tx (into (sorted-map) tx)
+            tx-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str canonical-tx) "UTF-8")))
             new-outputs-with-ids (map-indexed (fn [idx output]
                                                 [(basalt/bytes->hex (crypto/sha256 (.getBytes (str tx-hash idx) "UTF-8")))
                                                  output])
