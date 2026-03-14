@@ -35,18 +35,21 @@
   [state update-map sig-a-hex sig-b-hex]
   (if (<= (:nonce update-map) (:nonce state))
     state
-    (let [enriched-update-map (assoc update-map
-                                     :channel-id (:channel-id state)
-                                     :pubkey-a (:pubkey-a state)
-                                     :pubkey-b (:pubkey-b state))
-          canonical-map (into (sorted-map) enriched-update-map)
-          update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
-          pub-a-bytes (basalt/hex->bytes (:pubkey-a state))
-          pub-b-bytes (basalt/hex->bytes (:pubkey-b state))
-          sig-a-bytes (basalt/hex->bytes sig-a-hex)
-          sig-b-bytes (basalt/hex->bytes sig-b-hex)
-          valid-a? (crypto/verify pub-a-bytes update-hash sig-a-bytes)
-          valid-b? (crypto/verify pub-b-bytes update-hash sig-b-bytes)]
-      (if (and valid-a? valid-b?)
-        enriched-update-map
+    (try
+      (let [enriched-update-map (assoc update-map
+                                       :channel-id (:channel-id state)
+                                       :pubkey-a (:pubkey-a state)
+                                       :pubkey-b (:pubkey-b state))
+            canonical-map (into (sorted-map) enriched-update-map)
+            update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
+            pub-a-bytes (basalt/hex->bytes (:pubkey-a state))
+            pub-b-bytes (basalt/hex->bytes (:pubkey-b state))
+            sig-a-bytes (basalt/hex->bytes sig-a-hex)
+            sig-b-bytes (basalt/hex->bytes sig-b-hex)
+            valid-a? (crypto/verify pub-a-bytes update-hash sig-a-bytes)
+            valid-b? (crypto/verify pub-b-bytes update-hash sig-b-bytes)]
+        (if (and valid-a? valid-b?)
+          enriched-update-map
+          state))
+      (catch Exception _
         state))))

@@ -62,3 +62,15 @@
           ;; Minimum difficulty: all 00 bytes, so no hash can be less than this
                       min-difficulty (apply str (repeat 64 "0"))]
                   (not (lottery/winning-ticket? ticket min-difficulty)))))
+
+(deftest ^{:doc "A ticket validation should gracefully return false on invalid hex input."}
+  ticket-fails-invalid-hex-gracefully
+  (let [payload (byte-array [1 2 3 4])
+        nonce 42
+        keypair (crypto/generate-keypair)
+        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+        bad-ticket-odd (assoc ticket :signature "123")
+        bad-ticket-char (assoc ticket :signature "123z")
+        max-difficulty (apply str (repeat 64 "f"))]
+    (is (false? (lottery/winning-ticket? bad-ticket-odd max-difficulty)))
+    (is (false? (lottery/winning-ticket? bad-ticket-char max-difficulty)))))

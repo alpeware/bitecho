@@ -53,7 +53,7 @@
 - [x] **HIGH-01 (Cross-Channel State Replay Attacks):** Include `channel-id` and participant keys inside the `update-map` before it is converted to a canonical string and hashed.
 - [x] **HIGH-02 (Basalt Sybil/Eclipse Attack via Deterministic Hash Collision):** Insert explicit delimiters (e.g., a null byte `\x00` or `|`) between fields when constructing the `hash-input` ByteBuffer.
 - [x] **HIGH-03 (Sieve Equivocation Tracker Permanently Blacklists Senders):** The equivocation history must track signatures scoped to a specific `message-id` or sequence number, not globally by sender.
-- [ ] **HIGH-04 (Remote DoS via Unhandled Hex Parsing Exceptions):** Add length parity validation to `hex->bytes`. Wrap external input parsing in defensive `try/catch` blocks.
+- [x] **HIGH-04 (Remote DoS via Unhandled Hex Parsing Exceptions):** Add length parity validation to `hex->bytes`. Wrap external input parsing in defensive `try/catch` blocks.
 - [ ] **HIGH-05 (Transaction Hash Non-Determinism Forking Consensus):** Canonicalize the transaction data structure before serialization. Convert the `tx` map to a deterministically ordered collection (e.g., `(into (sorted-map) tx)`) or explicitly sort keys prior to applying `pr-str` and hashing.
 - [ ] **HIGH-06 (Replay Attacks in TURN Payment Channel Off-Chain Updates):** Channel state tracking must enforce monotonic progression independently. The `turn-relay-request` verification must strictly compare the update against the server's latest localized channel state, rejecting any nonce `N` where `N <= current_nonce`.
 - [ ] **HIGH-07 (Payment Channel Balance Conservation Bypass):** Add a strict invariant check ensuring `balance-a + balance-b` is conserved.

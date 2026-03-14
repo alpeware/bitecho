@@ -10,18 +10,23 @@
   (apply str (map #(format "%02x" %) ba)))
 
 (defn hex->bytes
-  "Converts a hex string to a byte array."
+  "Converts a hex string to a byte array. Throws IllegalArgumentException on invalid input."
   [^String s]
-  (let [len (.length s)
-        data (byte-array (quot len 2))]
-    (loop [i 0]
-      (if (< i len)
-        (do
-          (aset data (quot i 2)
-                (unchecked-byte (+ (bit-shift-left (Character/digit (.charAt s i) 16) 4)
-                                   (Character/digit (.charAt s (inc i)) 16))))
-          (recur (+ i 2)))
-        data))))
+  (let [len (.length s)]
+    (if (odd? len)
+      (throw (IllegalArgumentException. "Hex string must have an even length"))
+      (let [data (byte-array (quot len 2))]
+        (loop [i 0]
+          (if (< i len)
+            (let [high (Character/digit (.charAt s i) 16)
+                  low  (Character/digit (.charAt s (inc i)) 16)]
+              (if (or (= high -1) (= low -1))
+                (throw (IllegalArgumentException. "Invalid hex character"))
+                (do
+                  (aset data (quot i 2)
+                        (unchecked-byte (+ (bit-shift-left high 4) low)))
+                  (recur (+ i 2)))))
+            data))))))
 
 (defn make-peer
   "Creates a Peer record given IP, port, and a public key byte array.

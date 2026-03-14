@@ -6,6 +6,12 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
+(deftest ^{:doc "Tests invalid hex string parsing handling."} invalid-hex-test
+  (testing "throws IllegalArgumentException on odd-length string"
+    (is (thrown? IllegalArgumentException (basalt/hex->bytes "123"))))
+  (testing "throws IllegalArgumentException on non-hex characters"
+    (is (thrown? IllegalArgumentException (basalt/hex->bytes "123z")))))
+
 (deftest ^{:doc "Tests creation of peer records."} peer-creation-test
   (testing "creates a peer with proper hashed id"
     (let [peer (basalt/make-peer "127.0.0.1" 8080 (byte-array 32))]
