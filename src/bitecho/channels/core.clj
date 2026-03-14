@@ -33,7 +33,9 @@
    Returns the unchanged `state` if the signatures are invalid or if the new
    nonce is not strictly greater than the old nonce."
   [state update-map sig-a-hex sig-b-hex]
-  (if (<= (:nonce update-map) (:nonce state))
+  (if (or (<= (:nonce update-map) (:nonce state))
+          (not= (+ (:balance-a state) (:balance-b state))
+                (+ (:balance-a update-map) (:balance-b update-map))))
     state
     (try
       (let [enriched-update-map (assoc update-map

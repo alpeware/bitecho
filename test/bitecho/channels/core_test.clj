@@ -67,14 +67,18 @@
   100
   (prop/for-all [amount-a gen-amount
                  amount-b gen-amount
-                 new-amount-a gen-amount
-                 new-amount-b gen-amount]
+                 gen-new-amount-a gen-amount]
                 (let [kp-a (crypto/generate-keypair)
                       kp-b (crypto/generate-keypair)
                       pub-a (basalt/bytes->hex (:public kp-a))
                       pub-b (basalt/bytes->hex (:public kp-b))
                       channel-id "chan-1"
                       initial-state (channels/create-initial-state channel-id pub-a pub-b amount-a amount-b)
+
+                      ;; Ensure balance is conserved
+                      total (+ amount-a amount-b)
+                      new-amount-a (min gen-new-amount-a total)
+                      new-amount-b (- total new-amount-a)
 
                       ;; Prepare update data
                       update-map {:balance-a new-amount-a
@@ -120,3 +124,27 @@
                    (= replay-update initial-state)
                    ;; Cross-channel replay returns unchanged initial state
                    (= cross-channel-update other-initial-state)))))
+
+(deftest ^{:doc "Mutually signing an update must conserve balance"}
+  mutually-sign-update-balance-conservation-test
+  (testing "Update is rejected if balance-a + balance-b changes"
+    (let [channel-id "chan-1"
+          kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          amount-a 100
+          amount-b 50
+          state (channels/create-initial-state channel-id pub-a pub-b amount-a amount-b)
+
+          ;; invalid update map (total is 160 instead of 150)
+          update-map {:balance-a 100 :balance-b 60 :nonce 1}
+          enriched-update-map (assoc update-map
+                                     :channel-id (:channel-id state)
+                                     :pubkey-a (:pubkey-a state)
+                                     :pubkey-b (:pubkey-b state))
+          canonical-map (into (sorted-map) enriched-update-map)
+          update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
+          sig-a (basalt/bytes->hex (crypto/sign (:private kp-a) update-hash))
+          sig-b (basalt/bytes->hex (crypto/sign (:private kp-b) update-hash))]
+      (is (= state (channels/mutually-sign-update state update-map sig-a sig-b))))))
