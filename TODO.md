@@ -45,5 +45,6 @@
 ## Bitecho Phase 5: The Shell & Network Genesis
 - [x] Add `org.clojure/core.async {:mvn/version "1.9.829-alpha2"}` to `deps.edn`.
 - [x] Implement `bitecho.crypto.delegation`: define pure functions to generate, sign, and verify Delegated Agent Certificates (DACs) linking a temporary Node Key to a Parent Key.
-- [x] Implement `bitecho.shell.flow`: create the `core.async.flow` topology map and the pure adapter step function that wraps `bitecho.state-machine` reference the guide https://clojure.github.io/core.async/flow-guide.html .
-- [x] Implement `bitecho.shell.bootstrap` and `bitecho.shell.agent`: define the `-main` entry points for the executables. Stub the datachannel/IO sinks for now, focusing purely on initializing the flow network, the channels, and the Genesis state.
+- [x] Implement `bitecho.shell.core`: create a transparent `core.async/go-loop` adapter to wrap `bitecho.state-machine`, managing `:events-in` and `:net-out` channels. *(Note: Pivoted away from `core.async.flow` to favor architectural simplicity).*
+- [x] Implement `bitecho.shell.bootstrap` and `bitecho.shell.agent`: define the `-main` entry points for the executables. Stub the datachannel/IO sinks, focusing purely on initializing the `go-loop` shell, the channels, and the Genesis state.
+- [x] Implement `bitecho.shell.integration-test`: create a mock network router to wire up 4 concurrent node shells in-memory and prove Contagion/Sieve gossip propagates successfully across asynchronous channels.
