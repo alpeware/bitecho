@@ -27,7 +27,7 @@
   "Initializes the pure Bitecho state map."
   [initial-peers]
   {:basalt-view (basalt/init-view initial-peers)
-   :murmur-cache {:set #{} :queue []}
+   :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
    :sieve-history {}
    :contagion-known-ids #{}
    :messages {}
@@ -76,7 +76,13 @@
         ;; We implicitly add our own broadcasts to the known ids and cache
         new-cache-set (conj (:set (:murmur-cache state)) message-id)
         new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
-        new-cache {:set new-cache-set :queue new-cache-queue}
+        new-cache-queue-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                  (pop new-cache-queue)
+                                  new-cache-queue)
+        new-cache-set-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                (disj new-cache-set (peek new-cache-queue))
+                                new-cache-set)
+        new-cache {:set new-cache-set-evicted :queue new-cache-queue-evicted}
         new-known-ids (conj (:contagion-known-ids state) message-id)
         new-messages (assoc (:messages state) message-id message)]
     {:state (assoc state
