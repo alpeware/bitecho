@@ -49,13 +49,16 @@
                   (and
                    ;; Valid solution
                    (true? (sci-sandbox/eval-string
-                           (str "(let [solution {:sig-a \"" sig-a-hex "\" :sig-b \"" sig-b-hex "\" :tx-hash \"" tx-hash-hex "\"}] " puzzle ")")))
+                           (str "(let [solution {:sig-a \"" sig-a-hex "\" :sig-b \"" sig-b-hex "\"}] " puzzle ")")
+                           {'tx-hash tx-hash-hex}))
                    ;; Invalid sig A
                    (false? (sci-sandbox/eval-string
-                            (str "(let [solution {:sig-a \"" bad-sig-hex "\" :sig-b \"" sig-b-hex "\" :tx-hash \"" tx-hash-hex "\"}] " puzzle ")")))
+                            (str "(let [solution {:sig-a \"" bad-sig-hex "\" :sig-b \"" sig-b-hex "\"}] " puzzle ")")
+                            {'tx-hash tx-hash-hex}))
                    ;; Invalid sig B
                    (false? (sci-sandbox/eval-string
-                            (str "(let [solution {:sig-a \"" sig-a-hex "\" :sig-b \"" bad-sig-hex "\" :tx-hash \"" tx-hash-hex "\"}] " puzzle ")")))))))
+                            (str "(let [solution {:sig-a \"" sig-a-hex "\" :sig-b \"" bad-sig-hex "\"}] " puzzle ")")
+                            {'tx-hash tx-hash-hex}))))))
 
 (defspec ^{:doc "Mutually signing an update properly verifies signatures against canonical hash and requires nonce increment"}
   mutually-sign-update-spec
