@@ -15,6 +15,13 @@
       (is (some? (:pubkey peer)))
       (is (= 64 (count (:hash peer)))))))
 
+(deftest ^{:doc "Tests for sybil collision resistance."} peer-sybil-collision-test
+  (testing "hashes are distinct when IP and port strings concatenate identically"
+    (let [pubkey (byte-array 32)
+          peer1 (basalt/make-peer "127.0.0.1" 80 pubkey)
+          peer2 (basalt/make-peer "127.0.0.18" 0 pubkey)]
+      (is (not= (:hash peer1) (:hash peer2))))))
+
 (defspec ^{:doc "Tests view initialization spec."} view-initialization-spec 100
   (prop/for-all [peers (gen/list (gen/tuple
                                   (gen/return "127.0.0.1")
