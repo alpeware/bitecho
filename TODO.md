@@ -56,5 +56,5 @@
 - [x] **HIGH-04 (Remote DoS via Unhandled Hex Parsing Exceptions):** Add length parity validation to `hex->bytes`. Wrap external input parsing in defensive `try/catch` blocks.
 - [x] **HIGH-05 (Transaction Hash Non-Determinism Forking Consensus):** Canonicalize the transaction data structure before serialization. Convert the `tx` map to a deterministically ordered collection (e.g., `(into (sorted-map) tx)`) or explicitly sort keys prior to applying `pr-str` and hashing.
 - [x] **HIGH-06 (Replay Attacks in TURN Payment Channel Off-Chain Updates):** Channel state tracking must enforce monotonic progression independently. The `turn-relay-request` verification must strictly compare the update against the server's latest localized channel state, rejecting any nonce `N` where `N <= current_nonce`.
-- [ ] **HIGH-07 (Payment Channel Balance Conservation Bypass):** Add a strict invariant check ensuring `balance-a + balance-b` is conserved.
+- [x] **HIGH-07 (Payment Channel Balance Conservation Bypass):** Add a strict invariant check ensuring `balance-a + balance-b` is conserved.
 - [ ] **HIGH-08 (Lottery Ticket Claimer Spoofing):** Derive the `claimer-pubkey` from the node's internal state, not the unverified event payload.
