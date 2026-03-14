@@ -53,12 +53,11 @@
   [req initial-state price server-priv]
   (let [{:keys [data update sig-a]} req
         cost (* (count data) price)
-        expected-nonce (inc (:nonce initial-state))
         expected-balance-a (- (:balance-a initial-state) cost)
         expected-balance-b (+ (:balance-b initial-state) cost)]
-    (if (and (= expected-nonce (:nonce update))
-             (= expected-balance-a (:balance-a update))
-             (= expected-balance-b (:balance-b update))
+    (if (and (> (:nonce update) (:nonce initial-state))
+             (<= (:balance-a update) expected-balance-a)
+             (>= (:balance-b update) expected-balance-b)
              (>= (:balance-a update) 0))
       (try
         (let [update-hash (hash-update update initial-state)
