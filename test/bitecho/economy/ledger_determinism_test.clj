@@ -30,7 +30,7 @@
       ;; Prove that our canonicalization logic works.
       (let [canonical-hash1 (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str (into (sorted-map) tx1)) "UTF-8")))
             canonical-hash2 (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str (into (sorted-map) tx2)) "UTF-8")))]
-         (is (= canonical-hash1 canonical-hash2)))
+        (is (= canonical-hash1 canonical-hash2)))
 
       ;; Prove that ledger/process-transaction uses the canonicalization correctly
       (let [initial-ledger {:utxos {"utxo1" {:amount 100 :puzzle-hash "hash1"}}
