@@ -27,7 +27,7 @@
   [pubkey-hex]
   (let [puzzle (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" pubkey-hex "\") "
                     "sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) "
-                    "tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] "
+                    "tx-hash-bytes (bitecho.basalt.core/hex->bytes tx-hash)] "
                     "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))")]
     (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle "UTF-8")))))
 
@@ -46,17 +46,26 @@
       ledger)))
 
 (defn- valid-puzzle-execution?
-  "Checks if a puzzle hashes to the expected puzzle-hash and evaluates to true."
-  [puzzle solution expected-hash]
+  "Checks if a puzzle hashes to the expected puzzle-hash and evaluates to true.
+   Injects the implicitly computed tx-hash as a bound variable into the sandbox."
+  [puzzle solution expected-hash auth-tx-hash]
   (let [actual-hash (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle "UTF-8")))]
     (if (= actual-hash expected-hash)
       (try
         (let [script (str "(let [solution " (pr-str solution) "] " puzzle ")")
-              result (sci-sandbox/eval-string script)]
+              result (sci-sandbox/eval-string script {'tx-hash auth-tx-hash})]
           (true? result))
         (catch Exception _
           false))
       false)))
+
+(defn- compute-tx-auth-hash
+  "Computes the authorization hash for a transaction by canonicalizing it and
+   excluding the spending solutions. This prevents arbitrary transaction forgery
+   since the sandbox uses this hash instead of one supplied by the solution."
+  [tx]
+  (let [canonical-tx (into (sorted-map) (dissoc tx :solutions))]
+    (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str canonical-tx) "UTF-8")))))
 
 (defn process-transaction
   "Processes a transaction by consuming UTXOs and creating new ones.
@@ -76,9 +85,10 @@
              (every? #(pos? (:amount %)) outputs)
              (>= (reduce + (map :amount input-utxos))
                  (reduce + (map :amount outputs)))
-             (every? true? (map (fn [utxo puzzle solution]
-                                  (valid-puzzle-execution? puzzle solution (:puzzle-hash utxo)))
-                                input-utxos puzzles solutions)))
+             (let [auth-tx-hash (compute-tx-auth-hash tx)]
+               (every? true? (map (fn [utxo puzzle solution]
+                                    (valid-puzzle-execution? puzzle solution (:puzzle-hash utxo) auth-tx-hash))
+                                  input-utxos puzzles solutions))))
       (let [ledger-without-inputs (reduce (fn [l input-id] (update l :utxos dissoc input-id)) ledger inputs)
             tx-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str tx) "UTF-8")))
             new-outputs-with-ids (map-indexed (fn [idx output]

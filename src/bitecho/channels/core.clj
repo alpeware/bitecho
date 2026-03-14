@@ -14,14 +14,15 @@
 
 (defn generate-multisig-puzzle
   "Generates a multisig Puzzle string to be evaluated by `sci-sandbox`.
-   The puzzle expects a `solution` map with keys `:sig-a`, `:sig-b`, and `:tx-hash`.
-   It verifies the cryptographic signatures against the transaction hash."
+   The puzzle expects a `solution` map with keys `:sig-a` and `:sig-b`.
+   It relies on the bound `tx-hash` injected by the sandbox environment,
+   verifying the cryptographic signatures against it."
   [pubkey-a pubkey-b]
   (str "(let [pub-a-bytes (bitecho.basalt.core/hex->bytes \"" pubkey-a "\") "
        "pub-b-bytes (bitecho.basalt.core/hex->bytes \"" pubkey-b "\") "
        "sig-a-bytes (bitecho.basalt.core/hex->bytes (:sig-a solution)) "
        "sig-b-bytes (bitecho.basalt.core/hex->bytes (:sig-b solution)) "
-       "tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] "
+       "tx-hash-bytes (bitecho.basalt.core/hex->bytes tx-hash)] "
        "(and (bitecho.crypto/verify pub-a-bytes tx-hash-bytes sig-a-bytes) "
        "(bitecho.crypto/verify pub-b-bytes tx-hash-bytes sig-b-bytes)))"))
 

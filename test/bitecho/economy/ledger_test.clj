@@ -17,7 +17,7 @@
   [pubkey-hex]
   (basalt/bytes->hex (crypto/sha256 (.getBytes (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" pubkey-hex "\") "
                                                     "sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) "
-                                                    "tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] "
+                                                    "tx-hash-bytes (bitecho.basalt.core/hex->bytes tx-hash)] "
                                                     "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))") "UTF-8"))))
 
 (deftest ^{:doc "Genesis ledger should have empty utxos and no claimed tickets"}
@@ -84,21 +84,21 @@
 (defn- create-tx-with-puzzles
   "Helper to create a transaction with puzzles and solutions."
   [inputs outputs sender-pubkey-hex sender-privkey]
-  (let [tx-hash-str "dummy-tx-hash-for-testing"
-        tx-hash-bytes (crypto/sha256 (.getBytes tx-hash-str "UTF-8"))
-        tx-hash-hex (basalt/bytes->hex tx-hash-bytes)
-        sig-bytes (crypto/sign sender-privkey tx-hash-bytes)
-        sig-hex (basalt/bytes->hex sig-bytes)
-        puzzle-str (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" sender-pubkey-hex "\") "
+  (let [puzzle-str (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" sender-pubkey-hex "\") "
                         "sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) "
-                        "tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] "
+                        "tx-hash-bytes (bitecho.basalt.core/hex->bytes tx-hash)] "
                         "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))")
         puzzles (repeat (count inputs) puzzle-str)
-        solutions (repeat (count inputs) {:tx-hash tx-hash-hex :signature sig-hex})]
-    {:inputs inputs
-     :outputs outputs
-     :puzzles puzzles
-     :solutions solutions}))
+        ;; Create the transaction WITHOUT solutions to compute the auth hash
+        tx-base {:inputs inputs
+                 :outputs outputs
+                 :puzzles puzzles}
+        canonical-tx (into (sorted-map) tx-base)
+        tx-hash-bytes (crypto/sha256 (.getBytes (pr-str canonical-tx) "UTF-8"))
+        sig-bytes (crypto/sign sender-privkey tx-hash-bytes)
+        sig-hex (basalt/bytes->hex sig-bytes)
+        solutions (repeat (count inputs) {:signature sig-hex})]
+    (assoc tx-base :solutions solutions)))
 
 (defspec ^{:doc "Processing a valid transaction consumes inputs and creates outputs."}
   process-valid-transaction
@@ -146,7 +146,7 @@
                       outputs [{:amount 10 :puzzle-hash sender-puzzle-hash}]
                       ;; Provide wrong puzzle
                       tx (assoc (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
-                                :puzzles ["(let [pub-bytes (bitecho.basalt.core/hex->bytes \"different\") sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) tx-hash-bytes (bitecho.basalt.core/hex->bytes (:tx-hash solution))] (bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))"])
+                                :puzzles ["(let [pub-bytes (bitecho.basalt.core/hex->bytes \"different\") sig-bytes (bitecho.basalt.core/hex->bytes (:signature solution)) tx-hash-bytes (bitecho.basalt.core/hex->bytes tx-hash)] (bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))"])
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
@@ -166,7 +166,7 @@
                       outputs [{:amount 10 :puzzle-hash sender-puzzle-hash}]
                       ;; Wrong solution makes the standard puzzle script evaluate to false
                       tx (assoc (create-tx-with-puzzles inputs outputs sender-pubkey (:private sender-keypair))
-                                :solutions [{:tx-hash "wrong-hash" :signature "wrong-sig"}])
+                                :solutions [{:signature "wrong-sig"}])
                       new-ledger (ledger/process-transaction initial-ledger tx)]
                   ;; Ledger unchanged
                   (= initial-ledger new-ledger))))
