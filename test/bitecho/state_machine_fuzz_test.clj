@@ -38,17 +38,21 @@
   [n]
   (let [node-ids (range n)
         ;; Pre-generate pubkeys for the mock peers so they have stable identities
+        node-keys (into {}
+                        (for [i node-ids]
+                          [i (bitecho.crypto/generate-keypair)]))
         node-info (into {}
                         (for [i node-ids]
                           [i {:ip (str "127.0.0." i)
                               :port (+ 8000 i)
-                              :pubkey (byte-array 32)
+                              :pubkey (:public (get node-keys i))
                               :age 0
                               :hash (str "hash-" i)}]))]
     (into {}
           (for [i node-ids]
-            (let [initial-peers (map val (dissoc node-info i))]
-              [i (sm/init-state initial-peers)])))))
+            (let [initial-peers (map val (dissoc node-info i))
+                  state (sm/init-state initial-peers)]
+              [i (assoc state :keys (get node-keys i))])))))
 
 (defn- extract-node-id
   "Helper to extract a node ID from a peer's hash."
@@ -134,7 +138,11 @@
               (let [target-id (.nextInt rng n)
                     event (case event-type
                             :tick {:type :tick :rng rng}
-                            :broadcast {:type :broadcast :payload payload :rng rng}
+                            :broadcast {:type :broadcast
+                                        :payload payload
+                                        :private-key (:private (:keys (get cluster target-id)))
+                                        :public-key (:public (:keys (get cluster target-id)))
+                                        :rng rng}
                             :turn-allocate-request {:type :turn-allocate-request :client-pubkey payload}
                             {:type :tick :rng rng})]
                 (process-queue cluster [[target-id event]] drop-rate rng 5000 0)))
