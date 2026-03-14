@@ -42,11 +42,12 @@
         pub-b (basalt/bytes->hex (:public server-keys))
         priv-a (:private client-keys)
         priv-b (:private server-keys)
-        initial-chan (channels/create-initial-state pub-a pub-b 100 0)
+        initial-chan (channels/create-initial-state "chan-1" pub-a pub-b 100 0)
         state (assoc (sm/init-state []) :channels {"chan-1" initial-chan})
 
         update-map {:nonce 1 :balance-a 90 :balance-b 10}
-        canonical-map (into (sorted-map) update-map)
+        enriched-update-map (assoc update-map :channel-id "chan-1" :pubkey-a pub-a :pubkey-b pub-b)
+        canonical-map (into (sorted-map) enriched-update-map)
         update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
         sig-a (basalt/bytes->hex (crypto/sign priv-a update-hash))
         sig-b (basalt/bytes->hex (crypto/sign priv-b update-hash))
@@ -97,7 +98,7 @@
         pub-b (basalt/bytes->hex (:public server-keys))
         priv-a (:private client-keys)
         priv-b (:private server-keys)
-        initial-chan (channels/create-initial-state pub-a pub-b 100 0)
+        initial-chan (channels/create-initial-state "chan-1" pub-a pub-b 100 0)
         state (assoc (sm/init-state []) :channels {"chan-1" initial-chan})
 
         data (.getBytes "hello")

@@ -202,7 +202,11 @@
                   update-map {:nonce new-nonce
                               :balance-a new-balance-a
                               :balance-b new-balance-b}
-                  canonical-map (into (sorted-map) update-map)
+                  enriched-update-map (assoc update-map
+                                             :channel-id "chan-fuzz"
+                                             :pubkey-a (:pubkey-a chan)
+                                             :pubkey-b (:pubkey-b chan))
+                  canonical-map (into (sorted-map) enriched-update-map)
                   update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
 
                   sig-a (basalt/bytes->hex (crypto/sign priv-a update-hash))
