@@ -62,6 +62,8 @@
         sieve-message (if (and (:private-key event) (:public-key event))
                         (sieve/wrap-message payload (:private-key event) (:public-key event))
                         {:payload payload :sender "local" :signature (byte-array 0)})
+        ;; For debugging, make sure there are targets and commands are emitted.
+        ;; When the test fails, print out the targets.
         broadcast-result (murmur/initiate-broadcast payload rng (:basalt-view state) murmur-k)
         message-id (:message-id broadcast-result)
         message (assoc sieve-message :message-id message-id)
@@ -70,6 +72,7 @@
                      :targets (:targets broadcast-result)
                      :message message}]
                    [])
+        _ (when (empty? (:targets broadcast-result)) (println "WARNING: broadcast had no targets! View size:" (count (:basalt-view state))))
         ;; We implicitly add our own broadcasts to the known ids and cache
         new-cache-set (conj (:set (:murmur-cache state)) message-id)
         new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
@@ -121,28 +124,32 @@
      :commands (vec commands)}))
 
 (defn- handle-receive-gossip
-  "Handles an incoming Murmur gossip message."
+  "Handles an incoming Murmur gossip message.
+   Validates the Sieve signature before accepting into the cache."
   [state event]
   (let [message (:message event)
         rng (:rng event)
-        gossip-result (murmur/receive-gossip (:murmur-cache state) message rng (:basalt-view state) murmur-k murmur-max-cache-size)
-        commands (if (seq (:forward-targets gossip-result))
-                   [{:type :send-gossip
-                     :targets (:forward-targets gossip-result)
-                     :message (:message gossip-result)}]
-                   [])
-        new-message? (some? (:message gossip-result))
-        new-known-ids (if new-message?
-                        (conj (:contagion-known-ids state) (:message-id message))
-                        (:contagion-known-ids state))
-        new-messages (if new-message?
-                       (assoc (:messages state) (:message-id message) message)
-                       (:messages state))]
-    {:state (assoc state
-                   :murmur-cache (:cache gossip-result)
-                   :contagion-known-ids new-known-ids
-                   :messages new-messages)
-     :commands commands}))
+        valid-signature? (sieve/validate-message message)]
+    (if valid-signature?
+      (let [gossip-result (murmur/receive-gossip (:murmur-cache state) message rng (:basalt-view state) murmur-k murmur-max-cache-size)
+            commands (if (seq (:forward-targets gossip-result))
+                       [{:type :send-gossip
+                         :targets (:forward-targets gossip-result)
+                         :message (:message gossip-result)}]
+                       [])
+            new-message? (some? (:message gossip-result))
+            new-known-ids (if new-message?
+                            (conj (:contagion-known-ids state) (:message-id message))
+                            (:contagion-known-ids state))
+            new-messages (if new-message?
+                           (assoc (:messages state) (:message-id message) message)
+                           (:messages state))]
+        {:state (assoc state
+                       :murmur-cache (:cache gossip-result)
+                       :contagion-known-ids new-known-ids
+                       :messages new-messages)
+         :commands commands})
+      {:state state :commands []})))
 
 (defn- handle-route-directed-message
   "Handles routing of a directed message. Validates the attached lottery ticket,

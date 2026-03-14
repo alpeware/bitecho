@@ -7,7 +7,8 @@
   test-agent-init
   ;; Test that an agent can configure a topology using a provided bootstrap peer stub.
   (let [bootstrap-peer {:pubkey "0000" :ip "127.0.0.1" :port 8000 :age 0 :hash "1234"}
-        topology (agent/init-node bootstrap-peer)]
-    (is (map? topology))
-    (is (contains? topology :procs))
-    (is (contains? topology :conns))))
+        node (agent/init-node bootstrap-peer)]
+    (is (map? node))
+    (is (contains? node :events-in))
+    (is (contains? node :net-out))
+    (is (contains? node :stop-ch))))

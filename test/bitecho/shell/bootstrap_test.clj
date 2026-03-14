@@ -8,7 +8,8 @@
   ;; Since -main is designed for an actual executable, we might test a core init function.
   ;; For now, we'll verify it returns a topology or starts without error given stubbed args.
   ;; We will call a helper `init-node` rather than `-main` directly to avoid System/exit or blocking.
-  (let [topology (bootstrap/init-node)]
-    (is (map? topology))
-    (is (contains? topology :procs))
-    (is (contains? topology :conns))))
+  (let [node (bootstrap/init-node)]
+    (is (map? node))
+    (is (contains? node :events-in))
+    (is (contains? node :net-out))
+    (is (contains? node :stop-ch))))
