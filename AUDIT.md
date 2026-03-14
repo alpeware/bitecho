@@ -1,4 +1,3 @@
-
 # Comprehensive Security Audit Report
 
 **Project:** Alpeware-Bitecho (Decentralized WebRTC Signaling & Web of Trust)
