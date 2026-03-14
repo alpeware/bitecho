@@ -51,7 +51,7 @@
     (into {}
           (for [i node-ids]
             (let [initial-peers (map val (dissoc node-info i))
-                  state (sm/init-state initial-peers)]
+                  state (sm/init-state initial-peers (basalt/bytes->hex (:public (get node-keys i))))]
               [i (assoc state :keys (get node-keys i))])))))
 
 (defn- extract-node-id
@@ -267,7 +267,7 @@
                                 :amount-a init-amt-a
                                 :amount-b init-amt-b}
 
-                      initial-node-state (sm/init-state [])
+                      initial-node-state (sm/init-state [] (basalt/bytes->hex (:public server-keys)))
 
           ;; 1. Open
                       state-after-open (:state (sm/handle-event initial-node-state open-evt))
