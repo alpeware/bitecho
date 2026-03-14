@@ -35,13 +35,13 @@
           (recur))))))
 
 (def ^:private safe-context-opts
-  "A strictly locked down SCI context options with no I/O, state mutations, or infinite sequence generators."
+  "A strictly locked down SCI context options with no I/O, state mutations, or infinite sequence generators.
+   Provides a highly restricted whitelist of O(1) operations (boolean logic, basic math, extraction, cryptography)
+   to guarantee script execution completes strictly within the bounded max-script-size limit without a dynamic gas meter."
   {:classes {'java.lang.String java.lang.String
              'java.lang.Math java.lang.Math
              'java.lang.Long java.lang.Long
              'java.lang.Double java.lang.Double}
-   ;; Limit available namespaces to a basic clojure.core subset.
-   ;; Infinite lazy sequence generators like range, repeat, cycle, iterate are omitted.
    :namespaces {'clojure.core {'+ +
                                '- -
                                '* *
@@ -65,35 +65,17 @@
                                'pos? pos?
                                'neg? neg?
 
-                               'map map
-                               'reduce reduce
-                               'filter filter
-                               'remove remove
-                               'into into
-                               'concat concat
                                'first first
                                'rest rest
                                'next next
-                               'cons cons
-                               'assoc assoc
-                               'dissoc dissoc
                                'get get
                                'get-in get-in
-                               'update update
-                               'update-in update-in
                                'keys keys
                                'vals vals
-                               'merge merge
-                               'conj conj
                                'count count
                                'empty? empty?
                                'seq seq
-                               'vec vec
-                               'set set
-                               'hash-map hash-map
-                               'list list
 
-                               'str str
                                'keyword keyword
                                'symbol symbol
                                'name name
@@ -103,7 +85,7 @@
                 'bitecho.crypto {'verify bitecho.crypto/verify}
                 'bitecho.basalt.core {'hex->bytes bitecho.basalt.core/hex->bytes}}
    :allow []
-   :deny ['range 'repeat 'iterate 'cycle 'atom 'reset! 'swap! 'compare-and-set!]})
+   :deny ['range 'repeat 'iterate 'cycle 'atom 'reset! 'swap! 'compare-and-set! 'map 'reduce 'filter 'remove 'concat 'str 'into 'vec 'set 'hash-map 'list 'cons 'assoc 'dissoc 'update 'update-in 'merge 'conj]})
 
 (defn eval-string
   "Evaluates a string of Clojure code in a strictly isolated, pure-functional,
