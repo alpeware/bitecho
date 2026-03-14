@@ -17,17 +17,21 @@
     (crypto/sha256 (.getBytes input-str "UTF-8"))))
 
 (defn- verify-ticket-signature?
-  "Verifies that the ticket signature is valid for the given payload hash and nonce."
+  "Verifies that the ticket signature is valid for the given payload hash and nonce.
+   Returns false if any hex strings are invalid."
   [ticket]
-  (let [pub-key (basalt/hex->bytes ^String (:public-key ticket))
-        sig (basalt/hex->bytes ^String (:signature ticket))
-        payload-hash-bytes (basalt/hex->bytes ^String (:payload-hash ticket))
-        nonce-bytes (.getBytes (str (:nonce ticket)) "UTF-8")
-        ;; To sign, we concatenate the payload-hash and nonce bytes
-        message (byte-array (+ (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes)))]
-    (System/arraycopy payload-hash-bytes 0 message 0 (alength ^bytes payload-hash-bytes))
-    (System/arraycopy nonce-bytes 0 message (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes))
-    (crypto/verify pub-key message sig)))
+  (try
+    (let [pub-key (basalt/hex->bytes ^String (:public-key ticket))
+          sig (basalt/hex->bytes ^String (:signature ticket))
+          payload-hash-bytes (basalt/hex->bytes ^String (:payload-hash ticket))
+          nonce-bytes (.getBytes (str (:nonce ticket)) "UTF-8")
+          ;; To sign, we concatenate the payload-hash and nonce bytes
+          message (byte-array (+ (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes)))]
+      (System/arraycopy payload-hash-bytes 0 message 0 (alength ^bytes payload-hash-bytes))
+      (System/arraycopy nonce-bytes 0 message (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes))
+      (crypto/verify pub-key message sig))
+    (catch Exception _
+      false)))
 
 (defn generate-ticket
   "Generates a cryptographic lottery ticket.

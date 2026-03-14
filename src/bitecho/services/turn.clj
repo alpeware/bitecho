@@ -60,15 +60,18 @@
              (= expected-balance-a (:balance-a update))
              (= expected-balance-b (:balance-b update))
              (>= (:balance-a update) 0))
-      (let [update-hash (hash-update update initial-state)
-            pub-a-bytes (basalt/hex->bytes (:pubkey-a initial-state))
-            sig-a-bytes (basalt/hex->bytes sig-a)]
-        (if (crypto/verify pub-a-bytes update-hash sig-a-bytes)
-          (let [sig-b-bytes (crypto/sign server-priv update-hash)
-                sig-b (basalt/bytes->hex sig-b-bytes)
-                new-state (channels/mutually-sign-update initial-state update sig-a sig-b)]
-            {:valid? true
-             :new-state new-state
-             :command {:type :relay-data :data data}})
+      (try
+        (let [update-hash (hash-update update initial-state)
+              pub-a-bytes (basalt/hex->bytes (:pubkey-a initial-state))
+              sig-a-bytes (basalt/hex->bytes sig-a)]
+          (if (crypto/verify pub-a-bytes update-hash sig-a-bytes)
+            (let [sig-b-bytes (crypto/sign server-priv update-hash)
+                  sig-b (basalt/bytes->hex sig-b-bytes)
+                  new-state (channels/mutually-sign-update initial-state update sig-a sig-b)]
+              {:valid? true
+               :new-state new-state
+               :command {:type :relay-data :data data}})
+            {:valid? false}))
+        (catch Exception _
           {:valid? false}))
       {:valid? false})))
