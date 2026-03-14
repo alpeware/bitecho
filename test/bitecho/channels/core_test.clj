@@ -11,16 +11,18 @@
 
 (def gen-amount "Generator for positive amounts" gen/pos-int)
 
-(deftest ^{:doc "Creating an initial channel state should establish correct keys and balances"}
+(deftest ^{:doc "Creating an initial channel state should establish correct keys, balances, and channel-id"}
   create-initial-state-test
-  (testing "Initial state contains pubkeys and 0 nonce"
-    (let [kp-a (crypto/generate-keypair)
+  (testing "Initial state contains pubkeys, channel-id, and 0 nonce"
+    (let [channel-id "chan-1"
+          kp-a (crypto/generate-keypair)
           kp-b (crypto/generate-keypair)
           pub-a (basalt/bytes->hex (:public kp-a))
           pub-b (basalt/bytes->hex (:public kp-b))
           amount-a 100
           amount-b 50
-          state (channels/create-initial-state pub-a pub-b amount-a amount-b)]
+          state (channels/create-initial-state channel-id pub-a pub-b amount-a amount-b)]
+      (is (= channel-id (:channel-id state)))
       (is (= pub-a (:pubkey-a state)))
       (is (= pub-b (:pubkey-b state)))
       (is (= amount-a (:balance-a state)))
@@ -71,13 +73,15 @@
                       kp-b (crypto/generate-keypair)
                       pub-a (basalt/bytes->hex (:public kp-a))
                       pub-b (basalt/bytes->hex (:public kp-b))
-                      initial-state (channels/create-initial-state pub-a pub-b amount-a amount-b)
+                      channel-id "chan-1"
+                      initial-state (channels/create-initial-state channel-id pub-a pub-b amount-a amount-b)
 
                       ;; Prepare update data
                       update-map {:balance-a new-amount-a
                                   :balance-b new-amount-b
                                   :nonce (inc (:nonce initial-state))}
-                      canonical-map (into (sorted-map) update-map)
+                      enriched-update-map (assoc update-map :channel-id channel-id :pubkey-a pub-a :pubkey-b pub-b)
+                      canonical-map (into (sorted-map) enriched-update-map)
                       update-hash (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))
 
                       ;; Signatures
@@ -95,16 +99,24 @@
 
                       ;; Replay attack (same nonce)
                       replay-update-map (assoc update-map :nonce (:nonce initial-state))
-                      replay-canonical-map (into (sorted-map) replay-update-map)
+                      replay-enriched-map (assoc replay-update-map :channel-id channel-id :pubkey-a pub-a :pubkey-b pub-b)
+                      replay-canonical-map (into (sorted-map) replay-enriched-map)
                       replay-hash (crypto/sha256 (.getBytes (pr-str replay-canonical-map) "UTF-8"))
                       replay-sig-a (basalt/bytes->hex (crypto/sign (:private kp-a) replay-hash))
                       replay-sig-b (basalt/bytes->hex (crypto/sign (:private kp-b) replay-hash))
-                      replay-update (channels/mutually-sign-update initial-state replay-update-map replay-sig-a replay-sig-b)]
+                      replay-update (channels/mutually-sign-update initial-state replay-update-map replay-sig-a replay-sig-b)
+
+                      ;; Cross-channel replay attack
+                      other-channel-id "chan-2"
+                      other-initial-state (channels/create-initial-state other-channel-id pub-a pub-b amount-a amount-b)
+                      cross-channel-update (channels/mutually-sign-update other-initial-state update-map sig-a sig-b)]
                   (and
                    ;; Valid update returns new state
-                   (= valid-update (assoc update-map :pubkey-a pub-a :pubkey-b pub-b))
+                   (= valid-update (assoc update-map :channel-id channel-id :pubkey-a pub-a :pubkey-b pub-b))
                    ;; Invalid updates return unchanged initial state
                    (= invalid-update-a initial-state)
                    (= invalid-update-b initial-state)
                    ;; Replay updates return unchanged initial state
-                   (= replay-update initial-state)))))
+                   (= replay-update initial-state)
+                   ;; Cross-channel replay returns unchanged initial state
+                   (= cross-channel-update other-initial-state)))))

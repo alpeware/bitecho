@@ -26,8 +26,12 @@
 
 (defn- hash-update
   "Helper to compute the SHA-256 hash of an update map."
-  [update-map]
-  (let [canonical-map (into (sorted-map) update-map)]
+  [update-map initial-state]
+  (let [enriched-update-map (assoc update-map
+                                   :channel-id (:channel-id initial-state)
+                                   :pubkey-a (:pubkey-a initial-state)
+                                   :pubkey-b (:pubkey-b initial-state))
+        canonical-map (into (sorted-map) enriched-update-map)]
     (crypto/sha256 (.getBytes (pr-str canonical-map) "UTF-8"))))
 
 (defn create-relay-request
@@ -37,7 +41,7 @@
         update-map {:nonce (inc (:nonce initial-state))
                     :balance-a (- (:balance-a initial-state) cost)
                     :balance-b (+ (:balance-b initial-state) cost)}
-        sig-a-bytes (crypto/sign client-priv (hash-update update-map))]
+        sig-a-bytes (crypto/sign client-priv (hash-update update-map initial-state))]
     {:type :turn-relay-request
      :data data
      :update update-map
@@ -56,7 +60,7 @@
              (= expected-balance-a (:balance-a update))
              (= expected-balance-b (:balance-b update))
              (>= (:balance-a update) 0))
-      (let [update-hash (hash-update update)
+      (let [update-hash (hash-update update initial-state)
             pub-a-bytes (basalt/hex->bytes (:pubkey-a initial-state))
             sig-a-bytes (basalt/hex->bytes sig-a)]
         (if (crypto/verify pub-a-bytes update-hash sig-a-bytes)

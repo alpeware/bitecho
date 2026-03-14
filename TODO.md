@@ -50,7 +50,7 @@
 - [x] **CRIT-04 (SCI Sandbox Resource Exhaustion DoS (Billion Laughs)):** AST blacklisting is fundamentally insufficient. Implement strict instruction-metering limits (gas) natively via SCI's configuration interceptors, and bound memory allocations.
 - [x] **CRIT-05 (Unbounded Broadcast Storms (Vector Queue Eviction Bug)):** Initialize the cache queue using `clojure.lang.PersistentQueue/EMPTY` instead of a vector.
 - [x] **CRIT-06 (Complete Bypass of Sieve Cryptographic Verification):** Add `(sieve/validate-message message)` logic to the gossip handler and drop payloads that fail validation. *(Completed in PR #44)*
-- [ ] **HIGH-01 (Cross-Channel State Replay Attacks):** Include `channel-id` and participant keys inside the `update-map` before it is converted to a canonical string and hashed.
+- [x] **HIGH-01 (Cross-Channel State Replay Attacks):** Include `channel-id` and participant keys inside the `update-map` before it is converted to a canonical string and hashed.
 - [ ] **HIGH-02 (Basalt Sybil/Eclipse Attack via Deterministic Hash Collision):** Insert explicit delimiters (e.g., a null byte `\x00` or `|`) between fields when constructing the `hash-input` ByteBuffer.
 - [ ] **HIGH-03 (Sieve Equivocation Tracker Permanently Blacklists Senders):** The equivocation history must track signatures scoped to a specific `message-id` or sequence number, not globally by sender.
 - [ ] **HIGH-04 (Remote DoS via Unhandled Hex Parsing Exceptions):** Add length parity validation to `hex->bytes`. Wrap external input parsing in defensive `try/catch` blocks.

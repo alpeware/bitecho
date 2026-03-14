@@ -181,7 +181,8 @@
 (defn- handle-open-channel
   "Handles a channel open event by storing the initial multisig state."
   [state event]
-  (let [initial-state (channels/create-initial-state (:pubkey-a event)
+  (let [initial-state (channels/create-initial-state (:channel-id event)
+                                                     (:pubkey-a event)
                                                      (:pubkey-b event)
                                                      (:amount-a event)
                                                      (:amount-b event))]
