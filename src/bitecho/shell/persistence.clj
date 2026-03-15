@@ -1,16 +1,16 @@
 (ns bitecho.shell.persistence
-  "Provides pure functions and I/O wrappers for EDN-based snapshotting of the Root State Map.
+  "Provides pure functions and I/O wrappers for snapshotting the Root State Map.
    Ensures unserializable objects like core.async channels or PersistentQueues are safely handled."
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
-            [clojure.walk :as walk]))
+  (:require [clojure.java.io :as io]
+            [clojure.walk :as walk]
+            [taoensso.nippy :as nippy]))
 
 (def default-snapshot-filename
   "The default filename used for saving and loading the state snapshot."
-  "snapshot.edn")
+  "snapshot.bin")
 
 (defn strip-unserializable-state
-  "Transforms the pure state map into a strictly EDN-serializable format.
+  "Transforms the pure state map into a serializable format.
    Strips raw java.util.Random instances, clojure.core.async channels,
    and converts the :murmur-cache :queue (a clojure.lang.PersistentQueue) into a standard vector."
   [state]
@@ -45,7 +45,7 @@
         temp-filepath (str filepath ".tmp")
         file (io/file filepath)
         temp-file (io/file temp-filepath)]
-    (spit temp-filepath (pr-str safe-state))
+    (nippy/freeze-to-file temp-filepath safe-state)
     ;; Atomic rename using java.nio.file.Files/move
     (java.nio.file.Files/move (.toPath temp-file)
                               (.toPath file)
@@ -55,9 +55,9 @@
     true))
 
 (defn load-state-from-disk
-  "Reads an EDN-serialized state map from the specified filepath and restores unserializable types.
+  "Reads a serialized state map from the specified filepath and restores unserializable types.
    Returns the reconstituted state map, or nil if the file does not exist."
   [filepath]
   (when (.exists (io/file filepath))
-    (let [raw-state (edn/read-string (slurp filepath))]
+    (let [raw-state (nippy/thaw-from-file filepath)]
       (restore-unserializable-state raw-state))))

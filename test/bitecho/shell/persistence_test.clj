@@ -28,7 +28,7 @@
 (deftest ^{:doc "Tests that round-trip save and load to disk preserves state"}
   save-and-load-test
   (testing "save-and-load-test to a temporary file"
-    (let [temp-file (java.io.File/createTempFile "bitecho-test" ".edn")
+    (let [temp-file (java.io.File/createTempFile "bitecho-test" ".bin")
           filepath (.getAbsolutePath temp-file)
           queue (into clojure.lang.PersistentQueue/EMPTY [1 2 3])
           state {:murmur-cache {:queue queue :set #{1 2 3}}
