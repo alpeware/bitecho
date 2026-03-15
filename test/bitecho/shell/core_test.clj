@@ -9,6 +9,7 @@
   (testing "Network ingress filters external events correctly"
     (let [node (core/start-node (sm/init-state [] "node-pubkey-stub"))]
       (is (contains? node :network-in))
+      (is (contains? node :app-out))
       ;; Test allowed events
       (async/put! (:network-in node) {:type :receive-gossip})
       (async/put! (:network-in node) {:type :receive-summary})

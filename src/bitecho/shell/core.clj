@@ -32,7 +32,7 @@
 
 (defn start-node
   "Starts a transparent go-loop wrapping the state machine.
-   Returns a map with the internal channels :events-in, :network-in, :net-out, and the loop :stop-ch.
+   Returns a map with the internal channels :events-in, :network-in, :net-out, :app-out, and the loop :stop-ch.
    Periodically snapshots state to disk if an :internal-snapshot event is received."
   ([initial-state]
    (start-node initial-state persistence/default-snapshot-filename))
@@ -40,6 +40,7 @@
    (let [events-in (async/chan 1024)
          network-in (async/chan 1024)
          net-out (async/chan 1024)
+         app-out (async/chan 1024)
          stop-ch (async/chan)]
 
      ;; Snapshot ticker loop
@@ -69,9 +70,10 @@
            (if (valid-network-event? val)
              (let [{:keys [state commands]} (sm/handle-event state val)]
                (doseq [cmd commands]
-                 (if (is-network-command? cmd)
-                   (async/put! net-out cmd)
-                   (async/put! events-in cmd)))
+                 (cond
+                   (= (:type cmd) :app-event) (async/put! app-out cmd)
+                   (is-network-command? cmd) (async/put! net-out cmd)
+                   :else (async/put! events-in cmd)))
                (recur state))
              ;; Drop invalid network events
              (recur state))
@@ -79,13 +81,15 @@
            (= port events-in)
            (let [{:keys [state commands]} (sm/handle-event state val)]
              (doseq [cmd commands]
-               (if (is-network-command? cmd)
-                 (async/put! net-out cmd)
-                 (async/put! events-in cmd)))
+               (cond
+                 (= (:type cmd) :app-event) (async/put! app-out cmd)
+                 (is-network-command? cmd) (async/put! net-out cmd)
+                 :else (async/put! events-in cmd)))
              (recur state)))))
      {:events-in events-in
       :network-in network-in
       :net-out net-out
+      :app-out app-out
       :stop-ch stop-ch})))
 
 (defn stop-node
@@ -94,4 +98,5 @@
   (async/put! (:stop-ch node) true)
   (async/close! (:events-in node))
   (async/close! (:network-in node))
-  (async/close! (:net-out node)))
+  (async/close! (:net-out node))
+  (async/close! (:app-out node)))
