@@ -69,6 +69,11 @@
              ;; Drop invalid network events
              (recur state))
 
+           (and (= port events-in) (= (:type val) :query-state))
+           (do
+             (async/put! (:reply-chan val) state)
+             (recur state))
+
            (= port events-in)
            (let [{new-state :state commands :commands} (sm/handle-event state val)]
              (doseq [cmd commands]
