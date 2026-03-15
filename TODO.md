@@ -58,3 +58,7 @@
 - [x] **HIGH-06 (Replay Attacks in TURN Payment Channel Off-Chain Updates):** Channel state tracking must enforce monotonic progression independently. The `turn-relay-request` verification must strictly compare the update against the server's latest localized channel state, rejecting any nonce `N` where `N <= current_nonce`.
 - [x] **HIGH-07 (Payment Channel Balance Conservation Bypass):** Add a strict invariant check ensuring `balance-a + balance-b` is conserved.
 - [x] **HIGH-08 (Lottery Ticket Claimer Spoofing):** Derive the `claimer-pubkey` from the node's internal state, not the unverified event payload.
+
+## Phase 7: Application API & Network I/O
+- [ ] **State Persistence (Durability):** Implement EDN-based snapshotting to save the Root State Map to disk periodically and reload it on agent startup. Ensure unserializable objects (e.g., raw `java.util.Random` instances, core.async channels) are stripped or safely serialized before writing.
+- [ ] **Application API:** Update the state machine to emit `:app-events` (e.g., `:on-direct-message`, `:on-channel-opened`) and expose public command injection functions (e.g., `bitecho.api/send-direct-message`) to act as the interface for the agent's intelligence layer.
