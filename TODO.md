@@ -62,3 +62,7 @@
 ## Phase 7: Application API & Network I/O
 - [x] **State Persistence (Durability):** Implement binary-based snapshotting (using Nippy) to save the Root State Map to disk automatically via a dedicated I/O sliding buffer when state changes, and reload it on agent startup. Ensure unserializable objects (e.g., raw `java.util.Random` instances, core.async channels) are stripped or safely serialized before writing.
 - [x] **Application API:** Update the state machine to emit `:app-events` (e.g., `:on-direct-message`, `:on-channel-opened`) and expose public command injection functions (e.g., `bitecho.api/send-direct-message`) to act as the interface for the agent's intelligence layer.
+
+## Phase 8: Protocol Hardening (State Equilibrium)
+- [ ] **Gossip TTL & Cache Pruning:** Modify the Contagion/Murmur message caching layer to track insertion timestamps or epoch numbers. Implement a periodic sweep (triggered by the existing `:tick` event) to drop message IDs and payloads older than a defined TTL. This prevents `contagion-known-ids` and `messages` maps from unbounded memory growth.
+- [ ] **Lottery Ticket Expiration:** Update the lottery ticket payload spec and validation logic to enforce a strict expiration window (e.g., tickets older than 24 hours are invalid). Modify the ledger's `claimed-tickets` logic to periodically garbage-collect expired tickets. This closes the replay attack vector while ensuring the ledger state remains mathematically bounded.
