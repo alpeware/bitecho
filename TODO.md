@@ -61,4 +61,4 @@
 
 ## Phase 7: Application API & Network I/O
 - [x] **State Persistence (Durability):** Implement EDN-based snapshotting to save the Root State Map to disk periodically and reload it on agent startup. Ensure unserializable objects (e.g., raw `java.util.Random` instances, core.async channels) are stripped or safely serialized before writing.
-- [ ] **Application API:** Update the state machine to emit `:app-events` (e.g., `:on-direct-message`, `:on-channel-opened`) and expose public command injection functions (e.g., `bitecho.api/send-direct-message`) to act as the interface for the agent's intelligence layer.
+- [x] **Application API:** Update the state machine to emit `:app-events` (e.g., `:on-direct-message`, `:on-channel-opened`) and expose public command injection functions (e.g., `bitecho.api/send-direct-message`) to act as the interface for the agent's intelligence layer.
