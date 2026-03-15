@@ -9,7 +9,8 @@
             [bitecho.murmur.core :as murmur]
             [bitecho.routing.weighted :as weighted]
             [bitecho.services.turn :as turn]
-            [bitecho.sieve.core :as sieve]))
+            [bitecho.sieve.core :as sieve]
+            [clojure.set :as set]))
 
 (def murmur-k
   "Number of peers to forward gossip messages to."
@@ -23,23 +24,30 @@
   "Maximum number of peers to keep in the Basalt view."
   50)
 
+(def gossip-ttl-epochs
+  "Maximum number of epochs to keep a gossip message in the cache."
+  10)
+
 (defn init-state
   "Initializes the pure Bitecho state map.
    node-pubkey should be the hex-encoded public key of this node."
   [initial-peers node-pubkey]
   {:node-pubkey node-pubkey
+   :epoch 0
    :basalt-view (basalt/init-view initial-peers)
    :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
    :sieve-history {}
    :contagion-known-ids #{}
    :messages {}
+   :message-epochs {}
    :ledger (ledger/init-ledger)
    :channels {}})
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt age updates, views, and Contagion anti-entropy."
   [state event]
-  (let [view (:basalt-view state)
+  (let [new-epoch (inc (or (:epoch state) 0))
+        view (:basalt-view state)
         new-view (basalt/increment-ages view)
         rng (:rng event)
         push-targets (basalt/select-peers rng new-view 1)
@@ -52,8 +60,23 @@
                           {:type :send-summary
                            :target (:target summary)
                            :summary (:summary summary)})
-        commands (filterv some? [push-command summary-command])]
-    {:state (assoc state :basalt-view new-view)
+        commands (filterv some? [push-command summary-command])
+        ;; Prune gossip caches based on TTL
+        cutoff-epoch (- new-epoch gossip-ttl-epochs)
+        expired-ids (set (keep (fn [[msg-id epoch]]
+                                 (when (< epoch cutoff-epoch) msg-id))
+                               (or (:message-epochs state) {})))
+        pruned-epochs (apply dissoc (or (:message-epochs state) {}) expired-ids)
+        pruned-messages (apply dissoc (:messages state) expired-ids)
+        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
+        pruned-ledger (ledger/prune-claimed-tickets (:ledger state) new-epoch)]
+    {:state (assoc state
+                   :epoch new-epoch
+                   :basalt-view new-view
+                   :contagion-known-ids pruned-known-ids
+                   :messages pruned-messages
+                   :message-epochs pruned-epochs
+                   :ledger pruned-ledger)
      :commands commands}))
 
 (defn- handle-broadcast
@@ -86,11 +109,13 @@
                                 new-cache-set)
         new-cache {:set new-cache-set-evicted :queue new-cache-queue-evicted}
         new-known-ids (conj (:contagion-known-ids state) message-id)
-        new-messages (assoc (:messages state) message-id message)]
+        new-messages (assoc (:messages state) message-id message)
+        new-epochs (assoc (or (:message-epochs state) {}) message-id (or (:epoch state) 0))]
     {:state (assoc state
                    :murmur-cache new-cache
                    :contagion-known-ids new-known-ids
-                   :messages new-messages)
+                   :messages new-messages
+                   :message-epochs new-epochs)
      :commands commands}))
 
 (defn- handle-receive-push-view
@@ -151,11 +176,15 @@
                             (:contagion-known-ids state))
             new-messages (if new-message?
                            (assoc (:messages state) (:message-id message) message)
-                           (:messages state))]
+                           (:messages state))
+            new-epochs (if new-message?
+                         (assoc (or (:message-epochs state) {}) (:message-id message) (or (:epoch state) 0))
+                         (:message-epochs state))]
         {:state (assoc state
                        :murmur-cache (:cache gossip-result)
                        :contagion-known-ids new-known-ids
-                       :messages new-messages)
+                       :messages new-messages
+                       :message-epochs new-epochs)
          :commands commands})
       {:state state :commands []})))
 
@@ -176,7 +205,8 @@
             payout-amount (:payout-amount event)
             network-size (:network-size event)
             difficulty-hex (difficulty/calculate-difficulty murmur-k network-size)
-            new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount)
+            current-epoch (or (:epoch state) 0)
+            new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)
             rng (:rng event)
             next-hop (weighted/select-next-hop rng (:basalt-view state) (:balances new-ledger))
             commands (if next-hop

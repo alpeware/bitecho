@@ -5,19 +5,24 @@
             [bitecho.crypto :as crypto])
   (:import [java.math BigInteger]))
 
+(def ticket-ttl-epochs
+  "Maximum number of epochs a lottery ticket is valid for."
+  10)
+
 (defn- hash-ticket
   "Computes a hash of the ticket contents.
-   The ticket map must contain :payload-hash, :nonce, :public-key, and :signature."
+   The ticket map must contain :payload-hash, :nonce, :epoch, :public-key, and :signature."
   [ticket]
   (let [hash-hex (:payload-hash ticket)
         nonce-str (str (:nonce ticket))
+        epoch-str (str (:epoch ticket))
         pub-key-hex (:public-key ticket)
         sig-hex (:signature ticket)
-        input-str (str hash-hex nonce-str pub-key-hex sig-hex)]
+        input-str (str hash-hex nonce-str epoch-str pub-key-hex sig-hex)]
     (crypto/sha256 (.getBytes input-str "UTF-8"))))
 
 (defn- verify-ticket-signature?
-  "Verifies that the ticket signature is valid for the given payload hash and nonce.
+  "Verifies that the ticket signature is valid for the given payload hash, nonce, and epoch.
    Returns false if any hex strings are invalid."
   [ticket]
   (try
@@ -25,26 +30,31 @@
           sig (basalt/hex->bytes ^String (:signature ticket))
           payload-hash-bytes (basalt/hex->bytes ^String (:payload-hash ticket))
           nonce-bytes (.getBytes (str (:nonce ticket)) "UTF-8")
-          ;; To sign, we concatenate the payload-hash and nonce bytes
-          message (byte-array (+ (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes)))]
+          epoch-bytes (.getBytes (str (:epoch ticket)) "UTF-8")
+          ;; To sign, we concatenate the payload-hash, nonce, and epoch bytes
+          message (byte-array (+ (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes) (alength ^bytes epoch-bytes)))]
       (System/arraycopy payload-hash-bytes 0 message 0 (alength ^bytes payload-hash-bytes))
       (System/arraycopy nonce-bytes 0 message (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes))
+      (System/arraycopy epoch-bytes 0 message (+ (alength ^bytes payload-hash-bytes) (alength ^bytes nonce-bytes)) (alength ^bytes epoch-bytes))
       (crypto/verify pub-key message sig))
     (catch Exception _
       false)))
 
 (defn generate-ticket
   "Generates a cryptographic lottery ticket.
-   Takes a byte array payload, a long nonce, and the private/public keys."
-  [^bytes payload nonce ^bytes private-key ^bytes public-key]
+   Takes a byte array payload, a long nonce, the private/public keys, and an epoch."
+  [^bytes payload nonce ^bytes private-key ^bytes public-key epoch]
   (let [payload-hash (crypto/sha256 payload)
         nonce-bytes (.getBytes (str nonce) "UTF-8")
-        ;; The message to sign is the concatenation of the payload-hash and nonce
-        message (byte-array (+ (alength ^bytes payload-hash) (alength ^bytes nonce-bytes)))]
+        epoch-bytes (.getBytes (str epoch) "UTF-8")
+        ;; The message to sign is the concatenation of the payload-hash, nonce, and epoch
+        message (byte-array (+ (alength ^bytes payload-hash) (alength ^bytes nonce-bytes) (alength ^bytes epoch-bytes)))]
     (System/arraycopy payload-hash 0 message 0 (alength ^bytes payload-hash))
     (System/arraycopy nonce-bytes 0 message (alength ^bytes payload-hash) (alength ^bytes nonce-bytes))
+    (System/arraycopy epoch-bytes 0 message (+ (alength ^bytes payload-hash) (alength ^bytes nonce-bytes)) (alength ^bytes epoch-bytes))
     {:payload-hash (basalt/bytes->hex payload-hash)
      :nonce nonce
+     :epoch epoch
      :public-key (basalt/bytes->hex public-key)
      :signature (basalt/bytes->hex (crypto/sign private-key message))}))
 
@@ -54,13 +64,17 @@
   (BigInteger. hex-str 16))
 
 (defn winning-ticket?
-  "Evaluates if a ticket is a winning ticket given a target difficulty hex string.
-   A ticket is a winner if its signature is valid and its hash is numerically less than the difficulty."
-  [ticket ^String difficulty-hex]
-  (if (verify-ticket-signature? ticket)
-    (let [ticket-hash (hash-ticket ticket)
-          ticket-hash-hex (basalt/bytes->hex ticket-hash)
-          ticket-val (hex->bigint ticket-hash-hex)
-          difficulty-val (hex->bigint difficulty-hex)]
-      (< (.compareTo ticket-val difficulty-val) 0))
-    false))
+  "Evaluates if a ticket is a winning ticket given a target difficulty hex string and the current epoch.
+   A ticket is a winner if its signature is valid, it has not expired, and its hash is numerically less than the difficulty."
+  [ticket ^String difficulty-hex current-epoch]
+  (let [ticket-epoch (:epoch ticket)]
+    (if (and (number? ticket-epoch)
+             (<= ticket-epoch current-epoch)
+             (<= (- current-epoch ticket-epoch) ticket-ttl-epochs)
+             (verify-ticket-signature? ticket))
+      (let [ticket-hash (hash-ticket ticket)
+            ticket-hash-hex (basalt/bytes->hex ticket-hash)
+            ticket-val (hex->bigint ticket-hash-hex)
+            difficulty-val (hex->bigint difficulty-hex)]
+        (< (.compareTo ticket-val difficulty-val) 0))
+      false)))

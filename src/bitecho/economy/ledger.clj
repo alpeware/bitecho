@@ -10,16 +10,17 @@
   "Initializes the ledger genesis state."
   []
   {:utxos {}
-   :claimed-tickets #{}})
+   :claimed-tickets {}})
 
 (defn- hash-ticket
   "Computes a hex hash of the full ticket contents for tracking claims."
   [ticket]
   (let [hash-hex (:payload-hash ticket)
         nonce-str (str (:nonce ticket))
+        epoch-str (str (:epoch ticket))
         pub-key-hex (:public-key ticket)
         sig-hex (:signature ticket)
-        input-str (str hash-hex nonce-str pub-key-hex sig-hex)]
+        input-str (str hash-hex nonce-str epoch-str pub-key-hex sig-hex)]
     (basalt/bytes->hex (crypto/sha256 (.getBytes input-str "UTF-8")))))
 
 (defn- standard-puzzle-hash
@@ -31,18 +32,28 @@
                     "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))")]
     (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle "UTF-8")))))
 
+(defn prune-claimed-tickets
+  "Removes claimed tickets from the ledger that are older than the TTL."
+  [ledger current-epoch]
+  (let [cutoff-epoch (- current-epoch lottery/ticket-ttl-epochs)
+        expired-hashes (set (keep (fn [[hash epoch]]
+                                    (when (< epoch cutoff-epoch) hash))
+                                  (:claimed-tickets ledger)))
+        pruned-claims (apply dissoc (:claimed-tickets ledger) expired-hashes)]
+    (assoc ledger :claimed-tickets pruned-claims)))
+
 (defn claim-ticket
   "Applies a valid lottery ticket payout to an agent by creating a new UTXO.
    If the ticket wins and hasn't been claimed before, creates the UTXO
    and marks the ticket as claimed. Otherwise, returns the ledger unchanged."
-  [ledger ticket difficulty-hex claimer-pubkey payout-amount]
+  [ledger ticket difficulty-hex claimer-pubkey payout-amount current-epoch]
   (let [ticket-hash (hash-ticket ticket)]
-    (if (and (lottery/winning-ticket? ticket difficulty-hex)
+    (if (and (lottery/winning-ticket? ticket difficulty-hex current-epoch)
              (not (contains? (:claimed-tickets ledger) ticket-hash)))
       (let [puzzle-hash (standard-puzzle-hash claimer-pubkey)]
         (-> ledger
             (assoc-in [:utxos ticket-hash] {:amount payout-amount :puzzle-hash puzzle-hash})
-            (update :claimed-tickets conj ticket-hash)))
+            (assoc-in [:claimed-tickets ticket-hash] (:epoch ticket))))
       ledger)))
 
 (defn- valid-puzzle-execution?

@@ -155,32 +155,26 @@
                  drop-rate gen-drop-rate
                  events gen-events
                  seed gen/large-integer]
-                (let [final-cluster (simulate-network n drop-rate events seed)
-          ;; Extract all the payloads that were broadcast during the simulation
-                      broadcast-payloads (->> events
-                                              (filter #(= :broadcast (first %)))
-                                              (map second)
-                                              set)]
-                  (and (map? final-cluster)
-                       (= n (count final-cluster))
-           ;; Verify every node has a non-empty connected basalt view
-                       (every? (comp seq :basalt-view val) final-cluster)
-           ;; Verify every broadcast payload is in the murmur cache queue of every node
-                       (every? (fn [node-state]
-                                 (let [known-ids (:contagion-known-ids node-state)
-                           ;; Hash the payload exactly as initiate-broadcast does
-                           ;; The crypto namespace should provide the sha256 bytes->hex logic.
-                           ;; Wait, since we are fuzzer, we can just hash it.
-                           ;; The payload is hashed by crypto/sha256 and converted to hex.
-                                       expected-ids (map (fn [p]
-                                                           (basalt/bytes->hex (crypto/sha256 p)))
-                                                         broadcast-payloads)]
-                       ;; Every node should eventually know every broadcasted message ID
-                       ;; Note: Reliable broadcast requires time/ticks to disseminate.
-                       ;; We might drop too many messages. Since we drop up to 0.5, it may not guarantee 100%
-                       ;; delivery immediately if we don't have enough ticks.
-                                   (every? #(contains? known-ids %) expected-ids)))
-                               (vals final-cluster))))))
+                (with-redefs [sm/gossip-ttl-epochs 1000]
+                  (let [final-cluster (simulate-network n drop-rate events seed)
+            ;; Extract all the payloads that were broadcast during the simulation
+                        broadcast-payloads (->> events
+                                                (filter #(= :broadcast (first %)))
+                                                (map second)
+                                                set)]
+                    (and (map? final-cluster)
+                         (= n (count final-cluster))
+             ;; Verify every node has a non-empty connected basalt view
+                         (every? (comp seq :basalt-view val) final-cluster)
+             ;; Verify every broadcast payload is in the murmur cache queue of every node
+                         (every? (fn [node-state]
+                                   (let [known-ids (:contagion-known-ids node-state)
+                                         expected-ids (map (fn [p]
+                                                             (basalt/bytes->hex (crypto/sha256 p)))
+                                                           broadcast-payloads)]
+                         ;; Every node should eventually know every broadcasted message ID
+                                     (every? #(contains? known-ids %) expected-ids)))
+                                 (vals final-cluster)))))))
 
 ;; --- Payment Channel Settlement Fuzzer ---
 

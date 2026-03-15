@@ -33,14 +33,14 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
                       ;; Max difficulty ensures ticket always wins
                       max-difficulty (apply str (repeat 64 "f"))
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
                       payout-amount 10
-                      new-ledger (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount)
-                      ticket-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (str (:payload-hash ticket) (:nonce ticket) (:public-key ticket) (:signature ticket)) "UTF-8")))
+                      new-ledger (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount 0)
+                      ticket-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (str (:payload-hash ticket) (:nonce ticket) (:epoch ticket) (:public-key ticket) (:signature ticket)) "UTF-8")))
                       expected-hash (expected-puzzle-hash claimer-pubkey)]
                   (and
                    ;; UTXO should exist with correct amount and puzzle-hash
@@ -55,13 +55,13 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
                       max-difficulty (apply str (repeat 64 "f"))
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
                       payout-amount 10
-                      ledger-once (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount)
-                      ledger-twice (ledger/claim-ticket ledger-once ticket max-difficulty claimer-pubkey payout-amount)]
+                      ledger-once (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount 0)
+                      ledger-twice (ledger/claim-ticket ledger-once ticket max-difficulty claimer-pubkey payout-amount 0)]
                   ;; UTXOs and state should remain unchanged on the second claim
                   (= ledger-once ledger-twice))))
 
@@ -71,13 +71,13 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
                       ;; Min difficulty ensures ticket always loses
                       min-difficulty (apply str (repeat 64 "0"))
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
                       payout-amount 10
-                      new-ledger (ledger/claim-ticket genesis ticket min-difficulty claimer-pubkey payout-amount)]
+                      new-ledger (ledger/claim-ticket genesis ticket min-difficulty claimer-pubkey payout-amount 0)]
                   ;; The ledger should be completely unchanged
                   (= genesis new-ledger))))
 
