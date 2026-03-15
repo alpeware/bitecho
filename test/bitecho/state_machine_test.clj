@@ -192,3 +192,32 @@
     ;; Should emit a pull request for "msg2"
     (is (some #(= :send-pull-request (:type %)) (:commands result)))
     (is (= #{"msg2"} (:missing-ids (first (:commands result)))))))
+
+(deftest ^{:doc "Tests handle-event emits :app-event for incoming message"} handle-route-directed-message-app-event-test
+  (let [state (sm/init-state [] "my-node")
+        event {:type :route-directed-message
+               :envelope {:destination "my-node" :encrypted-payload (.getBytes "hello")}
+               :payout-amount 10
+               :network-size 100
+               :rng (java.util.Random. 42)}
+        res (sm/handle-event state event)]
+    (is (= 1 (count (:commands res))))
+    (let [cmd (first (:commands res))]
+      (is (= :app-event (:type cmd)))
+      (is (= :on-direct-message (:event-name cmd)))
+      (is (= "my-node" (:destination (:envelope cmd)))))))
+
+(deftest ^{:doc "Tests handle-open-channel emits :on-channel-opened"} handle-open-channel-app-event-test
+  (let [state (sm/init-state [] "my-node")
+        event {:type :open-channel
+               :channel-id "chan-1"
+               :pubkey-a "pub-a"
+               :pubkey-b "pub-b"
+               :amount-a 100
+               :amount-b 50}
+        res (sm/handle-event state event)]
+    (is (= 1 (count (:commands res))))
+    (let [cmd (first (:commands res))]
+      (is (= :app-event (:type cmd)))
+      (is (= :on-channel-opened (:event-name cmd)))
+      (is (= "chan-1" (:channel-id cmd))))))

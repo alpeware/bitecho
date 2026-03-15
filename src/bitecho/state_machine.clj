@@ -161,35 +161,45 @@
 
 (defn- handle-route-directed-message
   "Handles routing of a directed message. Validates the attached lottery ticket,
-   claims the fee if it wins, and forwards the envelope via stake-weighted routing."
+   claims the fee if it wins, and forwards the envelope via stake-weighted routing.
+   If the node itself is the destination, it emits an :app-event instead."
   [state event]
   (let [envelope (:envelope event)
-        ticket (:lottery-ticket envelope)
-        claimer-pubkey (:node-pubkey state)
-        payout-amount (:payout-amount event)
-        network-size (:network-size event)
-        difficulty-hex (difficulty/calculate-difficulty murmur-k network-size)
-        new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount)
-        rng (:rng event)
-        next-hop (weighted/select-next-hop rng (:basalt-view state) (:balances new-ledger))
-        commands (if next-hop
-                   [{:type :send-directed-message
-                     :target next-hop
-                     :envelope envelope}]
-                   [])]
-    {:state (assoc state :ledger new-ledger)
-     :commands commands}))
+        destination (:destination envelope)
+        claimer-pubkey (:node-pubkey state)]
+    (if (= destination claimer-pubkey)
+      {:state state
+       :commands [{:type :app-event
+                   :event-name :on-direct-message
+                   :envelope envelope}]}
+      (let [ticket (:lottery-ticket envelope)
+            payout-amount (:payout-amount event)
+            network-size (:network-size event)
+            difficulty-hex (difficulty/calculate-difficulty murmur-k network-size)
+            new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount)
+            rng (:rng event)
+            next-hop (weighted/select-next-hop rng (:basalt-view state) (:balances new-ledger))
+            commands (if next-hop
+                       [{:type :send-directed-message
+                         :target next-hop
+                         :envelope envelope}]
+                       [])]
+        {:state (assoc state :ledger new-ledger)
+         :commands commands}))))
 
 (defn- handle-open-channel
-  "Handles a channel open event by storing the initial multisig state."
+  "Handles a channel open event by storing the initial multisig state and emitting an :app-event."
   [state event]
-  (let [initial-state (channels/create-initial-state (:channel-id event)
+  (let [channel-id (:channel-id event)
+        initial-state (channels/create-initial-state channel-id
                                                      (:pubkey-a event)
                                                      (:pubkey-b event)
                                                      (:amount-a event)
                                                      (:amount-b event))]
-    {:state (assoc-in state [:channels (:channel-id event)] initial-state)
-     :commands []}))
+    {:state (assoc-in state [:channels channel-id] initial-state)
+     :commands [{:type :app-event
+                 :event-name :on-channel-opened
+                 :channel-id channel-id}]}))
 
 (defn- handle-update-channel
   "Handles off-chain channel updates by validating mutual signatures."
