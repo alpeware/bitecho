@@ -125,7 +125,7 @@
         pub-key (:public keys)
         priv-key (:private keys)
         payload (.getBytes "secret")
-        ticket (lottery/generate-ticket payload 123 priv-key pub-key)
+        ticket (lottery/generate-ticket payload 123 priv-key pub-key 0)
         envelope {:destination "dest-pubkey"
                   :encrypted-payload payload
                   :lottery-ticket ticket}

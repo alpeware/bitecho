@@ -21,10 +21,11 @@
   (let [payload (byte-array [1 2 3 4])
         nonce 42
         keypair (crypto/generate-keypair)
-        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))]
+        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)]
     (is (map? ticket))
     (is (= (basalt/bytes->hex (crypto/sha256 payload)) (:payload-hash ticket)))
     (is (= nonce (:nonce ticket)))
+    (is (= 0 (:epoch ticket)))
     (is (string? (:signature ticket)))
     (is (string? (:public-key ticket)))))
 
@@ -34,10 +35,10 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
           ;; Maximum difficulty: all FF bytes, so any hash will be less than this
                       max-difficulty (apply str (repeat 64 "f"))]
-                  (lottery/winning-ticket? ticket max-difficulty))))
+                  (lottery/winning-ticket? ticket max-difficulty 0))))
 
 (defspec ^{:doc "A ticket should fail validation if its signature is corrupted."}
   ticket-fails-corrupt-signature
@@ -45,12 +46,12 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
           ;; Invalidate signature by appending/prepending or changing chars
                       corrupt-sig (apply str (reverse (:signature ticket)))
                       bad-ticket (assoc ticket :signature corrupt-sig)
                       max-difficulty (apply str (repeat 64 "f"))]
-                  (not (lottery/winning-ticket? bad-ticket max-difficulty)))))
+                  (not (lottery/winning-ticket? bad-ticket max-difficulty 0)))))
 
 (defspec ^{:doc "A ticket should fail validation if its difficulty is minimum (impossible to beat)."}
   ticket-fails-min-difficulty
@@ -58,19 +59,19 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
           ;; Minimum difficulty: all 00 bytes, so no hash can be less than this
                       min-difficulty (apply str (repeat 64 "0"))]
-                  (not (lottery/winning-ticket? ticket min-difficulty)))))
+                  (not (lottery/winning-ticket? ticket min-difficulty 0)))))
 
 (deftest ^{:doc "A ticket validation should gracefully return false on invalid hex input."}
   ticket-fails-invalid-hex-gracefully
   (let [payload (byte-array [1 2 3 4])
         nonce 42
         keypair (crypto/generate-keypair)
-        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair))
+        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
         bad-ticket-odd (assoc ticket :signature "123")
         bad-ticket-char (assoc ticket :signature "123z")
         max-difficulty (apply str (repeat 64 "f"))]
-    (is (false? (lottery/winning-ticket? bad-ticket-odd max-difficulty)))
-    (is (false? (lottery/winning-ticket? bad-ticket-char max-difficulty)))))
+    (is (false? (lottery/winning-ticket? bad-ticket-odd max-difficulty 0)))
+    (is (false? (lottery/winning-ticket? bad-ticket-char max-difficulty 0)))))
