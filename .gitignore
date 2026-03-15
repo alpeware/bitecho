@@ -14,3 +14,6 @@ pom.xml.asc
 .cpcache/
 .clojure-env/
 .clj-kondo/.cache
+
+# Persistence snapshots
+snapshot*.edn

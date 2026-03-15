@@ -1,12 +1,13 @@
 (ns bitecho.shell.core-test
   (:require [bitecho.shell.core :as core]
+            [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]))
 
 (deftest ^{:doc "Network ingress filters external events correctly"}
   ingress-filter-test
   (testing "Network ingress filters external events correctly"
-    (let [node (core/start-node [] "node-pubkey-stub")]
+    (let [node (core/start-node (sm/init-state [] "node-pubkey-stub"))]
       (is (contains? node :network-in))
       ;; Test allowed events
       (async/put! (:network-in node) {:type :receive-gossip})

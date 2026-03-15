@@ -3,13 +3,18 @@
    Connects to a bootstrap node and initializes its flow network."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
-            [bitecho.shell.core :as core]))
+            [bitecho.shell.core :as core]
+            [bitecho.shell.persistence :as persistence]
+            [bitecho.state-machine :as sm]))
 
 (defn init-node
   "Initializes the agent shell given a bootstrap peer."
   [bootstrap-peer node-pubkey]
-  (let [initial-peers [bootstrap-peer]]
-    (core/start-node initial-peers node-pubkey)))
+  (let [initial-peers [bootstrap-peer]
+        snapshot-filename (str "snapshot-" node-pubkey ".edn")
+        initial-state (or (persistence/load-state-from-disk snapshot-filename)
+                          (sm/init-state initial-peers node-pubkey))]
+    (core/start-node initial-state snapshot-filename)))
 
 (defn -main
   "Main executable entry point for the agent node.
