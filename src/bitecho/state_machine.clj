@@ -310,11 +310,66 @@
           {:state state :commands []}))
       {:state state :commands []})))
 
+(defn- handle-ping-peer
+  "Handles a circuit discovery ping request.
+   If this node is the destination, emit a pong command targeting the last hop in the path.
+   If not, route it forward appending this node to the path."
+  [state event]
+  (let [dest (:destination event)
+        path (or (:path event) [])]
+    (if (= dest (:node-pubkey state))
+      ;; Target reached. Send pong back to the last node.
+      (if (seq path)
+        (let [last-hop (peek path)
+              new-path (pop path)]
+          {:state state
+           :commands [{:type :pong-peer
+                       :target last-hop
+                       :path new-path}]})
+        ;; This shouldn't happen unless origin pinged itself, but handle safely
+        {:state state
+         :commands [{:type :app-event
+                     :event-name :on-circuit-locked}]})
+      ;; Forward ping towards destination
+      (let [rng (:rng event)
+            utxos (:utxos (:ledger state))
+            next-hop (weighted/select-next-hop rng (:basalt-view state) utxos)]
+        (if next-hop
+          (let [next-hop-pubkey (if (string? (:pubkey next-hop)) (:pubkey next-hop) (basalt/bytes->hex (:pubkey next-hop)))
+                new-path (conj (vec path) (:node-pubkey state))]
+            {:state state
+             :commands [{:type :ping-peer
+                         :target next-hop-pubkey
+                         :destination dest
+                         :path new-path}]})
+          {:state state :commands []})))))
+
+(defn- handle-pong-peer
+  "Handles a returning circuit discovery pong request.
+   If path is empty, this node is the origin and the circuit is locked.
+   Otherwise, pop the last node from the path and forward the pong."
+  [state event]
+  (let [path (:path event)]
+    (if (empty? path)
+      ;; Origin reached. Circuit locked.
+      {:state state
+       :commands [{:type :app-event
+                   :event-name :on-circuit-locked}]}
+      ;; Forward pong to previous hop
+      (let [last-hop (peek path)
+            new-path (pop path)]
+        {:state state
+         :commands [{:type :pong-peer
+                     :target last-hop
+                     :path new-path}]}))))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
   [state event]
   (case (:type event)
+    :ping-peer (handle-ping-peer state event)
+    :pong-peer (handle-pong-peer state event)
     :tick (handle-tick state event)
     :broadcast (handle-broadcast state event)
     :receive-push-view (handle-receive-push-view state event)
