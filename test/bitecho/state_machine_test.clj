@@ -263,3 +263,51 @@
       (is (= :app-event (:type cmd)))
       (is (= :on-channel-opened (:event-name cmd)))
       (is (= "chan-1" (:channel-id cmd))))))
+
+(deftest ^{:doc "Tests handle-ping-peer targets itself and returns pong."} handle-ping-peer-self-test
+  (let [state (sm/init-state [] "dest-node")
+        event {:type :ping-peer
+               :destination "dest-node"
+               :path ["origin" "hop1"]}
+        res (sm/handle-event state event)]
+    (is (= 1 (count (:commands res))))
+    (let [cmd (first (:commands res))]
+      (is (= :pong-peer (:type cmd)))
+      (is (= "hop1" (:target cmd)))
+      (is (= ["origin"] (:path cmd))))))
+
+(deftest ^{:doc "Tests handle-ping-peer forwards to next hop."} handle-ping-peer-forward-test
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}]
+        state (sm/init-state initial-peers "my-node")
+        event {:type :ping-peer
+               :destination "dest-node"
+               :path ["origin"]
+               :rng (java.util.Random. 42)}
+        res (sm/handle-event state event)]
+    (is (= 1 (count (:commands res))))
+    (let [cmd (first (:commands res))]
+      (is (= :ping-peer (:type cmd)))
+      (is (some? (:target cmd)))
+      (is (= "dest-node" (:destination cmd)))
+      (is (= ["origin" "my-node"] (:path cmd))))))
+
+(deftest ^{:doc "Tests handle-pong-peer arrives at origin."} handle-pong-peer-origin-test
+  (let [state (sm/init-state [] "origin-node")
+        event {:type :pong-peer
+               :path []}
+        res (sm/handle-event state event)]
+    (is (= 1 (count (:commands res))))
+    (let [cmd (first (:commands res))]
+      (is (= :app-event (:type cmd)))
+      (is (= :on-circuit-locked (:event-name cmd))))))
+
+(deftest ^{:doc "Tests handle-pong-peer forwards back to previous hop."} handle-pong-peer-forward-test
+  (let [state (sm/init-state [] "hop1")
+        event {:type :pong-peer
+               :path ["origin" "hop0"]}
+        res (sm/handle-event state event)]
+    (is (= 1 (count (:commands res))))
+    (let [cmd (first (:commands res))]
+      (is (= :pong-peer (:type cmd)))
+      (is (= "hop0" (:target cmd)))
+      (is (= ["origin"] (:path cmd))))))
