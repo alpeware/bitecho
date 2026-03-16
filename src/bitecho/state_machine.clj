@@ -188,6 +188,26 @@
          :commands commands})
       {:state state :commands []})))
 
+(defn- calculate-network-scale
+  "Estimates network scale by summing the Active Network Stake (Echo balances) of all peers
+   currently observed in the basalt-view or contagion caches. Ensures new/stakeless networks
+   default to a scale of 1."
+  [state]
+  (let [utxos (:utxos (:ledger state))
+        ;; Extract known pubkeys from basalt-view
+        view-pubkeys (map :pubkey (:basalt-view state))
+        ;; Extract known pubkeys from contagion messages
+        message-senders (map :sender (vals (:messages state)))
+        ;; Distinct set of all known pubkeys in hex format
+        all-hex-pubkeys (set (concat
+                              (map #(if (string? %) % (basalt/bytes->hex %)) view-pubkeys)
+                              message-senders))
+        ;; Map each hex pubkey to its expected puzzle hash
+        expected-hashes (set (map ledger/standard-puzzle-hash all-hex-pubkeys))
+        ;; Sum the balances of UTXOs matching these puzzle hashes
+        total-stake (reduce + (map :amount (filter #(contains? expected-hashes (:puzzle-hash %)) (vals utxos))))]
+    (max 1 total-stake)))
+
 (defn- handle-route-directed-message
   "Handles routing of a directed message. Validates the attached lottery ticket,
    claims the fee if it wins, and forwards the envelope via stake-weighted routing.
@@ -203,8 +223,8 @@
                    :envelope envelope}]}
       (let [ticket (:lottery-ticket envelope)
             payout-amount (:payout-amount event)
-            network-size (:network-size event)
-            difficulty-hex (difficulty/calculate-difficulty murmur-k network-size)
+            network-scale (calculate-network-scale state)
+            difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
             current-epoch (or (:epoch state) 0)
             new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)
             rng (:rng event)

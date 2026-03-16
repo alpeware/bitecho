@@ -11,16 +11,16 @@
   (BigInteger. max-target-hex 16))
 
 (defn calculate-difficulty
-  "Calculates the dynamic difficulty target based on fanout (k) and network-size.
-   Target = MaxTarget * (k / network-size).
+  "Calculates the dynamic difficulty target based on fanout (k) and network-scale.
+   Target = MaxTarget * (k / network-scale).
    Returns a 64-character 0-padded hex string.
    Bounded by MaxTarget."
-  [k network-size]
+  [k network-scale]
   (let [k-big (BigInteger/valueOf k)
-        n-big (BigInteger/valueOf network-size)
+        n-big (BigInteger/valueOf network-scale)
         ;; max-target * k
         numerator (.multiply max-target k-big)
-        ;; (max-target * k) / network-size
+        ;; (max-target * k) / network-scale
         target (.divide numerator n-big)]
     (if (>= (.compareTo target max-target) 0)
       max-target-hex

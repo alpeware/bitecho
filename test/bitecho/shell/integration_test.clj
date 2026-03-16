@@ -305,7 +305,7 @@
             (is (map? a2-state) "Agent 2 state queried successfully")
             (when a2-state
               (let [a2-ledger (:ledger a2-state)
-                    a2-puzzle-hash (#'ledger/standard-puzzle-hash a2-pubkey-hex)
+                    a2-puzzle-hash (ledger/standard-puzzle-hash a2-pubkey-hex)
                     a2-balance (->> (vals (:utxos a2-ledger))
                                     (filter #(= (:puzzle-hash %) a2-puzzle-hash))
                                     (map :amount)

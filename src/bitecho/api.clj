@@ -6,13 +6,12 @@
 (defn send-direct-message
   "Injects a command to route a directed message to the network.
    Pushes a :route-directed-message event to the shell's :events-in channel."
-  [node destination-pubkey encrypted-payload lottery-ticket payout-amount network-size rng]
+  [node destination-pubkey encrypted-payload lottery-ticket payout-amount rng]
   (let [envelope {:destination destination-pubkey
                   :encrypted-payload encrypted-payload
                   :lottery-ticket lottery-ticket}
         event {:type :route-directed-message
                :envelope envelope
                :payout-amount payout-amount
-               :network-size network-size
                :rng rng}]
     (async/put! (:events-in node) event)))
