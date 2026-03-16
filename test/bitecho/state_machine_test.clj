@@ -126,6 +126,10 @@
         priv-key (:private keys)
         payload (.getBytes "secret")
         ticket (lottery/generate-ticket payload 123 priv-key pub-key 0)
+        ;; Give the sender some stake so it bypasses the 5% trickle
+        pubkey-hex (basalt/bytes->hex pub-key)
+        puzzle-hash (ledger/standard-puzzle-hash pubkey-hex)
+        state-with-stake (assoc-in state [:ledger :utxos "initial-utxo"] {:amount 100 :puzzle-hash puzzle-hash})
         envelope {:destination "dest-pubkey"
                   :encrypted-payload payload
                   :lottery-ticket ticket}
@@ -135,7 +139,7 @@
 
                :payout-amount 10
                :network-size 10}
-        result (sm/handle-event state event)]
+        result (sm/handle-event state-with-stake event)]
     (is (map? result))
     (is (contains? result :state))
     (is (contains? result :commands))
@@ -195,13 +199,28 @@
 
 (deftest ^{:doc "Tests handle-event emits :app-event for incoming message"} handle-route-directed-message-app-event-test
   (let [state (sm/init-state [] "my-node")
+        ;; Make it from a staked user so it admits 100%
+        sender-hex "sender-pubkey"
+        puzzle-hash (ledger/standard-puzzle-hash sender-hex)
+        state-with-stake (assoc-in state [:ledger :utxos "utxo1"] {:amount 50 :puzzle-hash puzzle-hash})
+        ticket {:public-key sender-hex}
         event {:type :route-directed-message
-               :envelope {:destination "my-node" :encrypted-payload (.getBytes "hello")}
+               :envelope {:destination "my-node" :encrypted-payload (.getBytes "hello") :lottery-ticket ticket}
                :payout-amount 10
                :network-size 100
                :rng (java.util.Random. 42)}
-        res (sm/handle-event state event)]
+        res (sm/handle-event state-with-stake event)
+        ;; And test a nil ticket behavior with 5% trickle lane.
+        ;; We will use a predictable seed where we KNOW the trickle admits it.
+        ;; We need a seed that generates < 0.05. seed 4640 generates ~0.049
+        nil-ticket-event {:type :route-directed-message
+                          :envelope {:destination "my-node" :encrypted-payload (.getBytes "hello")}
+                          :payout-amount 10
+                          :network-size 100
+                          :rng (java.util.Random. 4640)}
+        res-nil-ticket (sm/handle-event state nil-ticket-event)]
     (is (= 1 (count (:commands res))))
+    (is (= 1 (count (:commands res-nil-ticket))))
     (let [cmd (first (:commands res))]
       (is (= :app-event (:type cmd)))
       (is (= :on-direct-message (:event-name cmd)))

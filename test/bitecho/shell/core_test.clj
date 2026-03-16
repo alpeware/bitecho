@@ -32,6 +32,6 @@
   (is (#'core/valid-network-event? {:type :turn-allocate-request}))
   (is (#'core/valid-network-event? {:type :turn-relay-request}))
   (is (not (#'core/valid-network-event? {:type :tick})))
-  (is (not (#'core/valid-network-event? {:type :route-directed-message})))
+  (is (#'core/valid-network-event? {:type :route-directed-message}))
   (is (not (#'core/valid-network-event? {:type :open-channel})))
   (is (not (#'core/valid-network-event? {:type :some-malicious-event}))))

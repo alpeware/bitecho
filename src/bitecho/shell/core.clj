@@ -19,7 +19,8 @@
     :receive-pull-request
     :receive-gossip
     :turn-allocate-request
-    :turn-relay-request})
+    :turn-relay-request
+    :route-directed-message})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."

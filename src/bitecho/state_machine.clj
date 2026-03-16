@@ -7,6 +7,7 @@
             [bitecho.economy.difficulty :as difficulty]
             [bitecho.economy.ledger :as ledger]
             [bitecho.murmur.core :as murmur]
+            [bitecho.routing.ingress :as ingress]
             [bitecho.routing.weighted :as weighted]
             [bitecho.services.turn :as turn]
             [bitecho.sieve.core :as sieve]
@@ -211,31 +212,37 @@
 (defn- handle-route-directed-message
   "Handles routing of a directed message. Validates the attached lottery ticket,
    claims the fee if it wins, and forwards the envelope via stake-weighted routing.
-   If the node itself is the destination, it emits an :app-event instead."
+   If the node itself is the destination, it emits an :app-event instead.
+   Applies stake-weighted ingress to drop unstaked messages 95% of the time."
   [state event]
   (let [envelope (:envelope event)
         destination (:destination envelope)
-        claimer-pubkey (:node-pubkey state)]
-    (if (= destination claimer-pubkey)
-      {:state state
-       :commands [{:type :app-event
-                   :event-name :on-direct-message
-                   :envelope envelope}]}
-      (let [ticket (:lottery-ticket envelope)
-            payout-amount (:payout-amount event)
-            network-scale (calculate-network-scale state)
-            difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
-            current-epoch (or (:epoch state) 0)
-            new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)
-            rng (:rng event)
-            next-hop (weighted/select-next-hop rng (:basalt-view state) (:balances new-ledger))
-            commands (if next-hop
-                       [{:type :send-directed-message
-                         :target next-hop
-                         :envelope envelope}]
-                       [])]
-        {:state (assoc state :ledger new-ledger)
-         :commands commands}))))
+        claimer-pubkey (:node-pubkey state)
+        ticket (:lottery-ticket envelope)
+        sender-pubkey (:public-key ticket)
+        utxos (:utxos (:ledger state))
+        rng (:rng event)]
+    (if (ingress/admit-message? rng sender-pubkey utxos)
+      (if (= destination claimer-pubkey)
+        {:state state
+         :commands [{:type :app-event
+                     :event-name :on-direct-message
+                     :envelope envelope}]}
+        (let [payout-amount (:payout-amount event)
+              network-scale (calculate-network-scale state)
+              difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
+              current-epoch (or (:epoch state) 0)
+              new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)
+              next-hop (weighted/select-next-hop rng (:basalt-view state) (:balances new-ledger))
+              commands (if next-hop
+                         [{:type :send-directed-message
+                           :target next-hop
+                           :envelope envelope}]
+                         [])]
+          {:state (assoc state :ledger new-ledger)
+           :commands commands}))
+      ;; Message dropped via ingress filter
+      {:state state :commands []})))
 
 (defn- handle-open-channel
   "Handles a channel open event by storing the initial multisig state and emitting an :app-event."
