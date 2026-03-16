@@ -16,7 +16,6 @@
             [bitecho.services.turn-test]
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]
-            [bitecho.shell.integration-test]
             [bitecho.sieve.core-test]
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-test]
