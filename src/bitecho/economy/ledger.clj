@@ -23,7 +23,7 @@
         input-str (str hash-hex nonce-str epoch-str pub-key-hex sig-hex)]
     (basalt/bytes->hex (crypto/sha256 (.getBytes input-str "UTF-8")))))
 
-(defn- standard-puzzle-hash
+(defn standard-puzzle-hash
   "Generates the standard puzzle hash for a public key."
   [pubkey-hex]
   (let [puzzle (str "(let [pub-bytes (bitecho.basalt.core/hex->bytes \"" pubkey-hex "\") "

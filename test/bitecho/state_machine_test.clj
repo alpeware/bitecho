@@ -207,6 +207,29 @@
       (is (= :on-direct-message (:event-name cmd)))
       (is (= "my-node" (:destination (:envelope cmd)))))))
 
+(deftest ^{:doc "Tests calculate-network-scale properly sums Active Network Stake."} calculate-network-scale-test
+  (let [;; Setup mock peer keys
+        peer1-pub (basalt/bytes->hex (byte-array [1]))
+        peer2-pub (basalt/bytes->hex (byte-array [2]))
+        peer3-pub (basalt/bytes->hex (byte-array [3]))
+
+        ;; Expected puzzle hashes
+        hash1 (ledger/standard-puzzle-hash peer1-pub)
+        hash2 (ledger/standard-puzzle-hash peer2-pub)
+        hash3 (ledger/standard-puzzle-hash peer3-pub)
+
+        ;; Setup state with 1 peer in basalt, 1 in contagion, 1 with no stake
+        state (-> (sm/init-state [] "my-node")
+                  (assoc :basalt-view [{:pubkey peer1-pub}])
+                  (assoc :messages {"msg1" {:sender peer2-pub}})
+                  (assoc-in [:ledger :utxos] {"tx1" {:amount 100 :puzzle-hash hash1}
+                                              "tx2" {:amount 200 :puzzle-hash hash2}
+                                              "tx3" {:amount 500 :puzzle-hash hash3}}))] ;; peer3 not in views
+
+    ;; We need to access the private function calculate-network-scale for testing
+    ;; Should sum peer1 (100) and peer2 (200), ignoring peer3 (500) because peer3 is not known
+    (is (= 300 (#'sm/calculate-network-scale state)))))
+
 (deftest ^{:doc "Tests handle-open-channel emits :on-channel-opened"} handle-open-channel-app-event-test
   (let [state (sm/init-state [] "my-node")
         event {:type :open-channel

@@ -11,7 +11,7 @@
   "Generator for k (fanout), typically a small positive integer."
   (gen/choose 1 100))
 
-(def gen-network-size
+(def gen-network-scale
   "Generator for network size estimates."
   (gen/choose 1 1000000))
 
@@ -21,11 +21,11 @@
   (BigInteger. hex-str 16))
 
 (defspec ^{:doc "Difficulty should scale inversely with network size for a fixed k."}
-  difficulty-scales-inversely-with-network-size
+  difficulty-scales-inversely-with-network-scale
   100
   (prop/for-all [k gen-k
-                 n1 gen-network-size
-                 n2 gen-network-size]
+                 n1 gen-network-scale
+                 n2 gen-network-scale]
                 (if (< n1 n2)
                   (let [diff1 (difficulty/calculate-difficulty k n1)
                         diff2 (difficulty/calculate-difficulty k n2)
@@ -39,7 +39,7 @@
   100
   (prop/for-all [k1 gen-k
                  k2 gen-k
-                 n gen-network-size]
+                 n gen-network-scale]
                 (if (< k1 k2)
                   (let [diff1 (difficulty/calculate-difficulty k1 n)
                         diff2 (difficulty/calculate-difficulty k2 n)
