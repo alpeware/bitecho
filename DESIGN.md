@@ -21,27 +21,35 @@ To route WebRTC SDP offers/answers across the Basalt mesh without central server
 ### 3. The Pure State Machine (Sans-IO)
 The Bitecho core will model these three layers purely. The state machine will accept inputs (e.g., `{:type :receive-gossip :payload ...}`), transition the internal Basalt views and Sieve history buffers, and emit pure outputs (e.g., `{:network-out [{:dst peer :payload ...}]}`) to be handled by the external WebRTC shell.
 
-## Phase 2: The Echo Economy & Peer Review Protocol
-To prevent Sybil attacks and incentivize routing, the network utilizes a cryptographic token called an "Echo".
-* **Genesis State:** The network boots from a Genesis State defining the initial allocation of Echos. This state is derived by validating historical "Proof of Relay" logs.
-* **Peer Review Protocol:** Agents do not just blindly accept Echos. They engage in a randomized Peer Review Protocol, auditing segments of each other's cryptographic memory logs. If an agent mathematically proves it successfully routed messages (via SBRB Contagion receipts), the network consensus validates this Proof of Relay, minting new Echos or transferring them.
+## Phase 2: The Echo Economy & Dual-Ticket Tokenomics
+To prevent Sybil attacks and incentivize routing, the network utilizes a cryptographic token called an "Echo", powered by a zero-latency probabilistic tokenomy.
 
-### Probabilistic Micropayments (Lottery Tickets)
-To prevent ledger bloat, routing fees are not processed as 1:1 micro-transactions. Senders attach a cryptographic "lottery ticket" (a signed nonce) to their payloads. Routing agents hash the ticket; if the hash falls below a specific network difficulty target, the ticket "wins" and the agent cashes it in on the Web of Trust ledger for a full Echo payout. The expected value equals the routing fee.
+### Lottery Ticket (Probabilistic Micropayment)
+To prevent ledger bloat, routing fees are not processed as 1:1 micro-transactions. Senders attach a cryptographically signed "lottery ticket" (a nonce) to their messages. Routing agents hash the ticket; if the hash falls below a specific network difficulty target, the ticket "wins" and the agent cashes it in on the ledger for an Echo payout. The expected value equals the routing fee.
 
-### Contagion-Linked Difficulty Target
-The lottery ticket difficulty is dynamically pegged to the Contagion protocol's security parameter (e.g., the required fanout `k`). If network churn is high and the security parameter must increase to guarantee reliable broadcast, the lottery difficulty automatically decreases (making it easier to win). This economically subsidizes the increased bandwidth agents must expend to keep the network connected.
+### Dual-Ticket Priority Lane
+The network utilizes a Dual-Ticket system to manage the queue and treasury:
+* **Mint Tickets:** Routers hash these to win Echos from the 42M Treasury. These tickets subsidize early network growth without requiring the sender to spend their own balance.
+* **Fee Tickets:** Agents can attach existing UTXOs to a ticket with a lower difficulty. Routers prioritize these in the Stake-Weighted Ingress (SWQoS) queue because they guarantee a higher probability of an immediate payout, creating a direct fast-lane for premium traffic.
 
-## Phase 3: Directed Encrypted Messaging
-While Murmur/Contagion floods the network, agents need the ability to send private, targeted payloads (like WebRTC SDP handshakes or financial transactions).
-* **Encrypted Blobs:** The payload of a directed message is an opaque, symmetrically or asymmetrically encrypted blob. The routing layer does not know what it is routing.
-* **Echo Attachment (Gas/Priority):** To prevent network spam, directed messages must have Echos attached to them.
-* **Routing Incentives:** When a node successfully forwards a directed message toward its destination peer, it cryptographically claims a portion of the attached Echos as a routing fee. Messages without Echos are dropped by the mesh.
+### Activity-Based Logarithmic Decay
+The network treasury dynamically adjusts the difficulty to mint new tokens via an Activity-Based Logarithmic Decay emission curve. The mathematical formula governing this is: `Target = BaseTarget * (TreasuryBalance / 42000000)`. This seamlessly transitions the network from an inflationary bootstrap phase to a pure fee market without requiring a global clock or hard forks. As the treasury depletes, the target shrinks, naturally decaying the emission based on network activity.
 
-### Stake-Weighted Routing
-For 1:1 encrypted messages to traverse the mesh efficiently and securely, instead of relying purely on random walks or shortest-path routing (which are vulnerable to Sybil black holes), agents select the next hop by weighting their Basalt view by each peer's total accumulated Echo balance (Proof of Stake).
+### Quorum Settlement (>50% Stake)
+When a router wins a Mint Ticket, it must broadcast the winning ticket and the proof or relay receipt to nodes representing >50% of the active network stake. Having this accepted into their local ledger establishes a Quorum Settlement, which will unlock the Treasury UTXO and credit the winning router.
 
-The game theoretic mechanism here ensures network health: nodes with high Echo balances have proven their historical reliability and are trusted with more directed traffic. This, in turn, earns them more lottery tickets, creating a positive feedback loop that heavily incentivizes maximum uptime and honest routing.
+## Phase 3: WebRTC Circuit Discovery & Directed Messaging
+
+### The WebRTC ICE Candidate Burst Problem
+Agents cannot just blindly send WebRTC SDP offers or ICE candidates into the void. This results in heavy candidate bursts across unstable routes. To establish a reliable peer-to-peer connection, agents need low-latency, confirmed circuits prior to signaling.
+
+### Circuit Discovery Protocol (Ping/Pong)
+Bitecho replaces blind routing with a zero-latency Circuit Discovery Protocol:
+* **Ping (Route Request):** Agent A sends a stake-weighted Ping to its highest-staked peers. The high-stake "backbone" of the network routes this toward Agent B.
+* **Pong (Circuit Locked):** Agent B receives the Ping containing the physical path (e.g., `[A, Router1, Router4, B]`) and sends a Pong back down the exact circuit. This locks the route for subsequent signaling.
+
+### Transient Proof of Relay
+Routers do not store infinite logs. Instead, Bitecho redefines Proof of Relay as a Transient Receipt. To claim a Lottery Ticket, the edge router *must* successfully complete the Ping/Pong + SDP delivery circuit and obtain transient cryptographic signatures from *both* Agent A and Agent B. This mathematically eliminates black-hole attacks and counterfeiting, forcing a Nash Equilibrium where honest routing is the only profitable strategy. Only edge routers (e.g., Router1 or Router4 in the above path) are eligible to claim the ticket.
 
 ## Phase 4: Decentralized Service Economy & Payment Channels
 
