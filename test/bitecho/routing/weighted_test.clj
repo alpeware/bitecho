@@ -1,17 +1,12 @@
 (ns bitecho.routing.weighted-test
   "Tests for stake-weighted routing logic."
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]
+            [bitecho.economy.ledger :as ledger]
             [bitecho.routing.weighted :as weighted]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
-
-(defn- expected-puzzle-hash
-  "Helper to compute standard puzzle hash."
-  [pubkey-hex]
-  (basalt/bytes->hex (crypto/sha256 (.getBytes (str "(= \"" pubkey-hex "\" solution)") "UTF-8"))))
 
 (deftest ^{:doc "Tests selecting a next hop with stake weighting."} select-next-hop-test
   (testing "returns nil for an empty view"
@@ -24,8 +19,8 @@
           view #{p1 p2 p3}
           p1-hex (basalt/bytes->hex (byte-array [1]))
           p2-hex (basalt/bytes->hex (byte-array [2]))
-          p1-puzzle-hash (expected-puzzle-hash p1-hex)
-          p2-puzzle-hash (expected-puzzle-hash p2-hex)
+          p1-puzzle-hash (ledger/standard-puzzle-hash p1-hex)
+          p2-puzzle-hash (ledger/standard-puzzle-hash p2-hex)
           ;; Give p1 a huge balance so it is almost always picked
           utxos {"utxo1" {:amount 1000000 :puzzle-hash p1-puzzle-hash}
                  "utxo2" {:amount 0 :puzzle-hash p2-puzzle-hash}} ; p2 and p3 default to 1
@@ -44,8 +39,8 @@
           view #{p1 p2}
           p1-hex (basalt/bytes->hex (byte-array [1]))
           p2-hex (basalt/bytes->hex (byte-array [2]))
-          p1-puzzle-hash (expected-puzzle-hash p1-hex)
-          p2-puzzle-hash (expected-puzzle-hash p2-hex)
+          p1-puzzle-hash (ledger/standard-puzzle-hash p1-hex)
+          p2-puzzle-hash (ledger/standard-puzzle-hash p2-hex)
           utxos {"utxo1" {:amount 10 :puzzle-hash p1-puzzle-hash}
                  "utxo2" {:amount 10 :puzzle-hash p2-puzzle-hash}}
           rng1 (java.util.Random. 123)
