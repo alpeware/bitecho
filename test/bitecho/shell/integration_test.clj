@@ -99,10 +99,10 @@
           ;; Bootstrap peer record as seen by agents
           boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
 
-          boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex])
-          a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex])
-          a2-chans (create-node-channels a2-pubkey-hex :agent agent-shell/init-node [boot-peer a2-pubkey-hex])
-          a3-chans (create-node-channels a3-pubkey-hex :agent agent-shell/init-node [boot-peer a3-pubkey-hex])
+          boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex (:private boot-keys)])
+          a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex (:private a1-keys)])
+          a2-chans (create-node-channels a2-pubkey-hex :agent agent-shell/init-node [boot-peer a2-pubkey-hex (:private a2-keys)])
+          a3-chans (create-node-channels a3-pubkey-hex :agent agent-shell/init-node [boot-peer a3-pubkey-hex (:private a3-keys)])
 
           nodes {boot-pubkey-hex boot-chans
                  a1-pubkey-hex a1-chans
@@ -217,10 +217,10 @@
           ;; 4. Initialize nodes with persistence files keyed by pubkey
           boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
 
-          boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex])
-          a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex])
-          a2-chans (create-node-channels a2-pubkey-hex :agent agent-shell/init-node [boot-peer a2-pubkey-hex])
-          a3-chans (create-node-channels a3-pubkey-hex :agent agent-shell/init-node [boot-peer a3-pubkey-hex])
+          boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex (:private boot-keys)])
+          a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex (:private a1-keys)])
+          a2-chans (create-node-channels a2-pubkey-hex :agent agent-shell/init-node [boot-peer a2-pubkey-hex (:private a2-keys)])
+          a3-chans (create-node-channels a3-pubkey-hex :agent agent-shell/init-node [boot-peer a3-pubkey-hex (:private a3-keys)])
 
           nodes {boot-pubkey-hex boot-chans
                  a1-pubkey-hex a1-chans
@@ -267,9 +267,11 @@
                 payload-str "Secret message for C!"
                 payload-bytes (.getBytes payload-str "UTF-8")
                 ticket (lottery/generate-ticket payload-bytes 123 (:private a1-keys) (:public a1-keys) current-epoch)
-                envelope {:destination a3-pubkey-hex
+                envelope {:forward-circuit [a1-pubkey-hex a2-pubkey-hex a3-pubkey-hex]
+                          :return-circuit []
                           :encrypted-payload payload-bytes
-                          :lottery-ticket ticket}]
+                          :lottery-ticket ticket
+                          :proof-of-relay []}]
             (async/put! (:events-in (get nodes a1-pubkey-hex))
                         {:type :route-directed-message
                          :envelope envelope
@@ -280,21 +282,32 @@
 
           (async/<!! (async/timeout 500))
 
-          ;; 7. The Assertion: Synchronously block for Agent 3 to receive the direct message
-          (loop [attempts 0]
-            (let [[msg port] (async/alts!! [(:app-out (:node a3-chans)) (async/timeout 50)])]
-              (if (= port (:app-out (:node a3-chans)))
-                (do
-                  (is (= :on-direct-message (:event-name msg)))
-                  (is (= a3-pubkey-hex (:destination (:envelope msg))))
-                  (is (= "Secret message for C!" (String. ^bytes (:encrypted-payload (:envelope msg)) "UTF-8")))
-                  (is true "Agent 3 received directed message!"))
-                (if (< attempts 20)
+          ;; 7. The Assertion: Wait for Agent 3 to receive the direct message AND Agent 1 to receive ACK
+          (loop [a3-received false
+                 a1-received false
+                 attempts 0]
+            (if (and a3-received a1-received)
+              (is true "Both the directed message and ACK completed successfully!")
+              (let [[msg port] (async/alts!! [(:app-out (:node a3-chans)) (:app-out (:node a1-chans)) (async/timeout 50)])]
+                (cond
+                  (= port (:app-out (:node a3-chans)))
                   (do
-                    (doseq [node (vals nodes)]
-                      (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)}))
-                    (recur (inc attempts)))
-                  (is false "Timeout waiting for directed message to reach Agent 3")))))
+                    (is (= :on-direct-message (:event-name msg)))
+                    (is (= "Secret message for C!" (String. ^bytes (:encrypted-payload (:envelope msg)) "UTF-8")))
+                    (recur true a1-received attempts))
+
+                  (= port (:app-out (:node a1-chans)))
+                  (do
+                    (is (= :on-proof-of-relay-complete (:event-name msg)))
+                    (recur a3-received true attempts))
+
+                  :else
+                  (if (< attempts 30)
+                    (do
+                      (doseq [node (vals nodes)]
+                        (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)}))
+                      (recur a3-received a1-received (inc attempts)))
+                    (is false "Timeout waiting for directed message and ACK"))))))
 
           ;; Wait a little to ensure persistence loop drained
           (async/<!! (async/timeout 500))
@@ -311,7 +324,7 @@
                                     (filter #(= (:puzzle-hash %) a2-puzzle-hash))
                                     (map :amount)
                                     (reduce + 0))]
-                (is (= 100 a2-balance) "Agent 2 successfully claimed the lottery ticket fee"))))
+                (is (= 100 a2-balance) "Agent 2 successfully claimed the lottery ticket fee on the return trip"))))
 
           (finally
             (try (async/close! ticker-stop) (catch Exception _))

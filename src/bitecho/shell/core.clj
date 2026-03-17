@@ -1,6 +1,7 @@
 (ns bitecho.shell.core
   "Provides the transparent go-loop shell wrapping the pure bitecho state machine."
-  (:require [bitecho.shell.persistence :as persistence]
+  (:require [bitecho.crypto :as crypto]
+            [bitecho.shell.persistence :as persistence]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
             [clojure.string :as str]))
@@ -20,7 +21,8 @@
     :receive-gossip
     :turn-allocate-request
     :turn-relay-request
-    :route-directed-message})
+    :route-directed-message
+    :route-directed-ack})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."
@@ -31,9 +33,9 @@
   "Starts a transparent go-loop wrapping the state machine.
    Returns a map with the internal channels :events-in, :network-in, :net-out, :app-out, :persist-ch, and the loop :stop-ch.
    Snapshots state to disk automatically via a dedicated sliding-buffer channel when state changes."
-  ([initial-state]
-   (start-node initial-state persistence/default-snapshot-filename))
-  ([initial-state snapshot-filename]
+  ([initial-state private-key]
+   (start-node initial-state private-key persistence/default-snapshot-filename))
+  ([initial-state private-key snapshot-filename]
    (let [events-in (async/chan 1024)
          network-in (async/chan 1024)
          net-out (async/chan 1024)
@@ -62,6 +64,17 @@
                (doseq [cmd commands]
                  (cond
                    (= (:type cmd) :app-event) (async/put! app-out cmd)
+                   (= (:type cmd) :sign-and-forward)
+                   (let [envelope (:envelope cmd)
+                         ticket (:lottery-ticket envelope)
+                         proof (or (:proof-of-relay envelope) [])
+                         prev-sig (if (empty? proof) (:signature ticket) (:signature (peek proof)))
+                         sig (crypto/sign private-key prev-sig)
+                         receipt {:node (:node-pubkey new-state) :signature sig}
+                         new-envelope (assoc envelope :proof-of-relay (conj proof receipt))]
+                     (async/put! net-out {:type (:out-type cmd :send-directed-message)
+                                          :target (:target cmd)
+                                          :envelope new-envelope}))
                    (is-network-command? cmd) (async/put! net-out cmd)
                    :else (async/put! events-in cmd)))
                (when (not= state new-state)
@@ -80,6 +93,17 @@
              (doseq [cmd commands]
                (cond
                  (= (:type cmd) :app-event) (async/put! app-out cmd)
+                 (= (:type cmd) :sign-and-forward)
+                 (let [envelope (:envelope cmd)
+                       ticket (:lottery-ticket envelope)
+                       proof (or (:proof-of-relay envelope) [])
+                       prev-sig (if (empty? proof) (:signature ticket) (:signature (peek proof)))
+                       sig (crypto/sign private-key prev-sig)
+                       receipt {:node (:node-pubkey new-state) :signature sig}
+                       new-envelope (assoc envelope :proof-of-relay (conj proof receipt))]
+                   (async/put! net-out {:type (:out-type cmd :send-directed-message)
+                                        :target (:target cmd)
+                                        :envelope new-envelope}))
                  (is-network-command? cmd) (async/put! net-out cmd)
                  :else (async/put! events-in cmd)))
              (when (not= state new-state)
