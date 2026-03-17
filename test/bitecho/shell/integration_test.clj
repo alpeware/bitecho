@@ -61,6 +61,19 @@
                                                               :payout-amount (:payout-amount cmd 100)
                                                               :network-size (:network-size cmd 10)
                                                               :rng (java.util.Random.)})
+                        :ping-peer
+                        (async/put! (:events-in target-node) {:type :ping-peer
+                                                              :destination (:destination cmd)
+                                                              :path (:path cmd)
+                                                              :rng (java.util.Random.)})
+                        :pong-peer
+                        (async/put! (:events-in target-node) {:type :pong-peer
+                                                              :path (:path cmd)})
+                        :send-directed-ack
+                        (async/put! (:events-in target-node) {:type :route-directed-ack
+                                                              :envelope (:envelope cmd)
+                                                              :payout-amount (:payout-amount cmd 100)
+                                                              :rng (java.util.Random.)})
                         nil))))))
             (recur)))))
     {:stop-ch stop-ch :delivered-messages delivered-messages}))
@@ -340,3 +353,141 @@
             (try (io/delete-file (str "snapshot-" a1-pubkey-hex ".edn") true) (catch Exception _))
             (try (io/delete-file (str "snapshot-" a2-pubkey-hex ".edn") true) (catch Exception _))
             (try (io/delete-file (str "snapshot-" a3-pubkey-hex ".edn") true) (catch Exception _))))))))
+
+(deftest ^{:doc "Integration test across 3 nodes to ensure Ping/Pong, Directed Messaging, ACK, and Quorum Settlement work."}
+  shell-integration-phase9-test
+  (testing "Phase 9 Complete Flow: Circuit Discovery -> Message -> ACK -> Fee Settlement"
+    (let [;; 1. Generate keys
+          boot-keys (crypto/generate-keypair)
+          a1-keys (crypto/generate-keypair)
+          a2-keys (crypto/generate-keypair)
+
+          ;; 2. Build Hex identities
+          boot-pubkey-hex (basalt/bytes->hex (:public boot-keys))
+          a1-pubkey-hex (basalt/bytes->hex (:public a1-keys))
+          a2-pubkey-hex (basalt/bytes->hex (:public a2-keys))
+
+          ;; 3. Initialize nodes
+          boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
+
+          boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex (:private boot-keys)])
+          a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex (:private a1-keys)])
+          a2-chans (create-node-channels a2-pubkey-hex :agent agent-shell/init-node [boot-peer a2-pubkey-hex (:private a2-keys)])
+
+          nodes {boot-pubkey-hex boot-chans
+                 a1-pubkey-hex a1-chans
+                 a2-pubkey-hex a2-chans}
+
+          ticker-stop (async/chan)
+          spy-ch (async/chan (async/sliding-buffer 1024))
+          router (start-mock-network nodes spy-ch)
+          stop-router (:stop-ch router)]
+
+      (with-redefs [difficulty/calculate-difficulty (constantly (apply str (repeat 64 "f")))
+                    ingress/admit-message? (constantly true)]
+        (try
+          ;; 5. Background ticker
+          (async/go-loop []
+            (let [[_ port] (async/alts! [(async/timeout 20) ticker-stop])]
+              (when (not= port ticker-stop)
+                (doseq [node (vals nodes)]
+                  (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)}))
+                (recur))))
+
+          (async/<!! (async/timeout 500))
+
+          ;; 6. Setup topology: A1 -> Boot -> A2
+          (let [a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
+                a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}]
+            (async/put! (:network-in (:node a1-chans)) {:type :receive-push-view :view #{boot-peer}})
+            (async/put! (:network-in (:node a2-chans)) {:type :receive-push-view :view #{boot-peer}})
+            (async/put! (:network-in (:node boot-chans)) {:type :receive-push-view :view #{a1-peer a2-peer}}))
+
+          (async/<!! (async/timeout 50))
+
+          ;; 7. Initiate Ping from A1 to A2
+          (async/put! (:events-in (:node a1-chans)) {:type :ping-peer
+                                                     :destination a2-pubkey-hex
+                                                     :path []
+                                                     :rng (java.util.Random.)})
+
+          ;; Wait for Circuit Locked
+          (let [[msg port] (async/alts!! [(:app-out (:node a1-chans)) (async/timeout 1000)])]
+            (is (= port (:app-out (:node a1-chans))) "A1 should receive app event")
+            (is (= :on-circuit-locked (:event-name msg)) "A1 should receive circuit locked"))
+
+          ;; 8. Send Directed Message
+          (let [reply-ch (async/chan 1)
+                _ (async/put! (:events-in (:node a1-chans)) {:type :query-state :reply-chan reply-ch})
+                [a1-state _] (async/alts!! [reply-ch (async/timeout 1000)])
+                current-epoch (or (:epoch a1-state) 0)
+                payload-str "Hello via Phase 9!"
+                payload-bytes (.getBytes payload-str "UTF-8")
+                ticket (lottery/generate-ticket :fee payload-bytes 456 (:private a1-keys) (:public a1-keys) current-epoch)
+                envelope {:forward-circuit [a1-pubkey-hex boot-pubkey-hex a2-pubkey-hex]
+                          :return-circuit []
+                          :encrypted-payload payload-bytes
+                          :lottery-ticket ticket
+                          :proof-of-relay []}]
+            (async/put! (:events-in (:node a1-chans))
+                        {:type :route-directed-message
+                         :envelope envelope
+                         :payout-amount 100
+                         :network-size 10
+                         :rng (java.util.Random.)}))
+
+          ;; 9. Wait for A2 to receive message AND A1 to receive ACK
+          (loop [a2-received false
+                 a1-received false
+                 attempts 0]
+            (if (and a2-received a1-received)
+              (is true "Both Directed Message and ACK completed")
+              (let [[msg port] (async/alts!! [(:app-out (:node a2-chans)) (:app-out (:node a1-chans)) (async/timeout 50)])]
+                (cond
+                  (= port (:app-out (:node a2-chans)))
+                  (do
+                    (is (= :on-direct-message (:event-name msg)))
+                    (is (= "Hello via Phase 9!" (String. ^bytes (:encrypted-payload (:envelope msg)) "UTF-8")))
+                    (recur true a1-received attempts))
+
+                  (= port (:app-out (:node a1-chans)))
+                  (do
+                    (is (= :on-proof-of-relay-complete (:event-name msg)))
+                    (recur a2-received true attempts))
+
+                  :else
+                  (if (< attempts 30)
+                    (do
+                      (doseq [node (vals nodes)]
+                        (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)}))
+                      (recur a2-received a1-received (inc attempts)))
+                    (is false "Timeout waiting for directed message and ACK in Phase 9 test"))))))
+
+          ;; Wait a little to ensure persistence loop drained
+          (async/<!! (async/timeout 500))
+
+          ;; 10. Check Boot's ledger for Fee Settlement
+          (let [reply-ch (async/chan 1)
+                _ (async/put! (:events-in (:node boot-chans)) {:type :query-state :reply-chan reply-ch})
+                [boot-state _] (async/alts!! [reply-ch (async/timeout 1000)])]
+            (is (map? boot-state) "Boot state queried successfully")
+            (when boot-state
+              (let [boot-ledger (:ledger boot-state)
+                    boot-puzzle-hash (ledger/standard-puzzle-hash boot-pubkey-hex)
+                    boot-balance (->> (vals (:utxos boot-ledger))
+                                      (filter #(= (:puzzle-hash %) boot-puzzle-hash))
+                                      (map :amount)
+                                      (reduce + 0))]
+                (is (= 100 boot-balance) "Boot successfully claimed the fee ticket on the return trip"))))
+
+          (finally
+            (try (async/close! ticker-stop) (catch Exception _))
+            (async/put! stop-router true)
+            (async/close! stop-router)
+            (shell-core/stop-node (:node boot-chans))
+            (shell-core/stop-node (:node a1-chans))
+            (shell-core/stop-node (:node a2-chans))
+            (async/<!! (async/timeout 100))
+            (try (io/delete-file (str "snapshot-" boot-pubkey-hex ".edn") true) (catch Exception _))
+            (try (io/delete-file (str "snapshot-" a1-pubkey-hex ".edn") true) (catch Exception _))
+            (try (io/delete-file (str "snapshot-" a2-pubkey-hex ".edn") true) (catch Exception _))))))))
