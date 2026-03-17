@@ -5,10 +5,6 @@
             [bitecho.crypto :as crypto])
   (:import [java.math BigInteger]))
 
-(def ticket-ttl-epochs
-  "Maximum number of epochs a lottery ticket is valid for."
-  10)
-
 (defn- hash-ticket
   "Computes a hash of the ticket contents.
    The ticket map must contain :ticket-type, :payload-hash, :nonce, :epoch, :public-key, and :signature."
@@ -70,17 +66,13 @@
   (BigInteger. hex-str 16))
 
 (defn winning-ticket?
-  "Evaluates if a ticket is a winning ticket given a target difficulty hex string and the current epoch.
-   A ticket is a winner if its signature is valid, it has not expired, and its hash is numerically less than the difficulty."
-  [ticket ^String difficulty-hex current-epoch]
-  (let [ticket-epoch (:epoch ticket)]
-    (if (and (number? ticket-epoch)
-             (<= ticket-epoch current-epoch)
-             (<= (- current-epoch ticket-epoch) ticket-ttl-epochs)
-             (verify-ticket-signature? ticket))
-      (let [ticket-hash (hash-ticket ticket)
-            ticket-hash-hex (basalt/bytes->hex ticket-hash)
-            ticket-val (hex->bigint ticket-hash-hex)
-            difficulty-val (hex->bigint difficulty-hex)]
-        (< (.compareTo ticket-val difficulty-val) 0))
-      false)))
+  "Evaluates if a ticket is a winning ticket given a target difficulty hex string.
+   A ticket is a winner if its signature is valid and its hash is numerically less than the difficulty."
+  [ticket ^String difficulty-hex]
+  (if (verify-ticket-signature? ticket)
+    (let [ticket-hash (hash-ticket ticket)
+          ticket-hash-hex (basalt/bytes->hex ticket-hash)
+          ticket-val (hex->bigint ticket-hash-hex)
+          difficulty-val (hex->bigint difficulty-hex)]
+      (< (.compareTo ticket-val difficulty-val) 0))
+    false))

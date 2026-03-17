@@ -34,21 +34,11 @@
                     "(bitecho.crypto/verify pub-bytes tx-hash-bytes sig-bytes))")]
     (basalt/bytes->hex (crypto/sha256 (.getBytes puzzle "UTF-8")))))
 
-(defn prune-claimed-tickets
-  "Removes claimed tickets from the ledger that are older than the TTL."
-  [ledger current-epoch]
-  (let [cutoff-epoch (- current-epoch lottery/ticket-ttl-epochs)
-        expired-hashes (set (keep (fn [[hash epoch]]
-                                    (when (< epoch cutoff-epoch) hash))
-                                  (:claimed-tickets ledger)))
-        pruned-claims (apply dissoc (:claimed-tickets ledger) expired-hashes)]
-    (assoc ledger :claimed-tickets pruned-claims)))
-
 (defn claim-ticket
   "Applies a valid lottery ticket payout to an agent by creating a new UTXO.
    If the ticket wins and hasn't been claimed before, creates the UTXO
    and marks the ticket as claimed. Otherwise, returns the ledger unchanged."
-  [ledger ticket difficulty-hex claimer-pubkey payout-amount current-epoch]
+  [ledger ticket difficulty-hex claimer-pubkey payout-amount]
   (let [ticket-hash (hash-ticket ticket)
         ;; Calculate correct difficulty
         total-staked (reduce + (map :amount (vals (:utxos ledger))))
@@ -56,12 +46,12 @@
         target-diff (if (= :mint (:ticket-type ticket))
                       (difficulty/calculate-mint-difficulty difficulty-hex treasury-balance)
                       difficulty-hex)]
-    (if (and (lottery/winning-ticket? ticket target-diff current-epoch)
+    (if (and (lottery/winning-ticket? ticket target-diff)
              (not (contains? (:claimed-tickets ledger) ticket-hash)))
       (let [puzzle-hash (standard-puzzle-hash claimer-pubkey)]
         (-> ledger
             (assoc-in [:utxos ticket-hash] {:amount payout-amount :puzzle-hash puzzle-hash})
-            (assoc-in [:claimed-tickets ticket-hash] (:epoch ticket))))
+            (assoc-in [:claimed-tickets ticket-hash] true)))
       ledger)))
 
 (defn- valid-puzzle-execution?

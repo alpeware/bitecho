@@ -39,7 +39,7 @@
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
                       payout-amount 10
-                      new-ledger (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount 0)
+                      new-ledger (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount)
                       type-str (name (:ticket-type ticket))
                       ticket-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (str type-str (:payload-hash ticket) (:nonce ticket) (:epoch ticket) (:public-key ticket) (:signature ticket)) "UTF-8")))
                       expected-hash (expected-puzzle-hash claimer-pubkey)]
@@ -61,8 +61,8 @@
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
                       payout-amount 10
-                      ledger-once (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount 0)
-                      ledger-twice (ledger/claim-ticket ledger-once ticket max-difficulty claimer-pubkey payout-amount 0)]
+                      ledger-once (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount)
+                      ledger-twice (ledger/claim-ticket ledger-once ticket max-difficulty claimer-pubkey payout-amount)]
                   ;; UTXOs and state should remain unchanged on the second claim
                   (= ledger-once ledger-twice))))
 
@@ -78,7 +78,7 @@
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
                       payout-amount 10
-                      new-ledger (ledger/claim-ticket genesis ticket min-difficulty claimer-pubkey payout-amount 0)]
+                      new-ledger (ledger/claim-ticket genesis ticket min-difficulty claimer-pubkey payout-amount)]
                   ;; The ledger should be completely unchanged
                   (= genesis new-ledger))))
 
