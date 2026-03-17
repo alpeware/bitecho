@@ -1,6 +1,7 @@
 (ns bitecho.simulator.core
   "The network orchestrator for the Chaos Mesh Simulator."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.simulator.spammer :as spammer]
             [bitecho.crypto :as crypto]
             [bitecho.shell.agent :as agent-shell]
             [bitecho.shell.bootstrap :as boot-shell]
@@ -42,6 +43,18 @@
      :network-in (:network-in node)
      :net-out (:net-out node)
      :app-out (:app-out node)}))
+
+(defn- create-spammer-node
+  [target-hex]
+  (let [node (spammer/init-node target-hex)]
+    {:type :spammer
+     :pubkey-hex (:pubkey-hex node)
+     :keys (:keys node)
+     :node node
+     :events-in nil
+     :network-in nil
+     :net-out (:net-out node)
+     :app-out nil}))
 
 (defn- route-message-to-target
   "Translates a network-out command to a network-in event for the target node."
@@ -116,7 +129,8 @@
     (let [[_ port] (async/alts! [(async/timeout interval-ms) stop-ch])]
       (when (not= port stop-ch)
         (doseq [node (vals nodes)]
-          (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)}))
+          (when (:events-in node)
+            (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)})))
         (recur)))))
 
 (defn start-network
@@ -125,11 +139,14 @@
   [config]
   (let [num-bootstraps (:bootstraps config 1)
         num-agents (:agents config 0)
+        num-spammers (:spammers config 0)
 
         bootstraps (mapv create-bootstrap-node (range num-bootstraps))
         agents (mapv #(create-agent-node % bootstraps) (range num-agents))
+        target-hex (when (seq agents) (:pubkey-hex (rand-nth agents)))
+        spammers (mapv (fn [_] (create-spammer-node target-hex)) (range num-spammers))
 
-        all-nodes (concat bootstraps agents)
+        all-nodes (concat bootstraps agents spammers)
         nodes-map (into {} (map (juxt :pubkey-hex identity) all-nodes))
         stop-ch (async/chan)
         multiplexer (create-multiplexer nodes-map stop-ch)
@@ -148,4 +165,6 @@
     (async/put! stop-ch true)
     (async/close! stop-ch))
   (doseq [node (vals (:nodes network))]
-    (shell-core/stop-node (:node node))))
+    (if (= (:type node) :spammer)
+      (spammer/stop-node (:node node))
+      (shell-core/stop-node (:node node)))))
