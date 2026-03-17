@@ -33,14 +33,15 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+                      ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
                       ;; Max difficulty ensures ticket always wins
                       max-difficulty (apply str (repeat 64 "f"))
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
                       payout-amount 10
                       new-ledger (ledger/claim-ticket genesis ticket max-difficulty claimer-pubkey payout-amount 0)
-                      ticket-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (str (:payload-hash ticket) (:nonce ticket) (:epoch ticket) (:public-key ticket) (:signature ticket)) "UTF-8")))
+                      type-str (name (:ticket-type ticket))
+                      ticket-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (str type-str (:payload-hash ticket) (:nonce ticket) (:epoch ticket) (:public-key ticket) (:signature ticket)) "UTF-8")))
                       expected-hash (expected-puzzle-hash claimer-pubkey)]
                   (and
                    ;; UTXO should exist with correct amount and puzzle-hash
@@ -55,7 +56,7 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+                      ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
                       max-difficulty (apply str (repeat 64 "f"))
                       genesis (ledger/init-ledger)
                       claimer-pubkey (:public-key ticket)
@@ -71,7 +72,7 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+                      ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
                       ;; Min difficulty ensures ticket always loses
                       min-difficulty (apply str (repeat 64 "0"))
                       genesis (ledger/init-ledger)

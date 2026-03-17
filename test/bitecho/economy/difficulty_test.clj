@@ -15,6 +15,10 @@
   "Generator for network size estimates."
   (gen/choose 1 1000000))
 
+(def gen-treasury-balance
+  "Generator for treasury balance."
+  (gen/choose 0 42000000))
+
 (defn- hex->bigint
   "Converts a hex string to a BigInteger."
   [^String hex-str]
@@ -57,5 +61,32 @@
 (deftest ^{:doc "Difficulty is exactly a 64 character hex string."}
   difficulty-is-padded-to-64-chars
   (let [diff (difficulty/calculate-difficulty 1 1000000)]
+    (is (= 64 (count diff)))
+    (is (re-matches #"^[0-9a-f]{64}$" diff))))
+
+(defspec ^{:doc "Mint difficulty should scale proportionally with treasury balance."}
+  mint-difficulty-scales-proportionally-with-treasury-balance
+  100
+  (prop/for-all [base-target-hex (gen/return (apply str (repeat 64 "f")))
+                 b1 gen-treasury-balance
+                 b2 gen-treasury-balance]
+                (if (< b1 b2)
+                  (let [diff1 (difficulty/calculate-mint-difficulty base-target-hex b1)
+                        diff2 (difficulty/calculate-mint-difficulty base-target-hex b2)
+                        val1 (hex->bigint diff1)
+                        val2 (hex->bigint diff2)]
+                    (<= (.compareTo val1 val2) 0)) ;; diff1 (smaller balance) <= diff2 (larger balance)
+                  true)))
+
+(deftest ^{:doc "Mint difficulty is bounded by max-target (all FFs)."}
+  mint-difficulty-is-bounded-by-max-target
+  (let [max-target (apply str (repeat 64 "f"))
+        diff (difficulty/calculate-mint-difficulty max-target 50000000)] ;; test upper bound if balance > 42m
+    (is (= diff max-target))))
+
+(deftest ^{:doc "Mint difficulty is exactly a 64 character hex string."}
+  mint-difficulty-is-padded-to-64-chars
+  (let [max-target (apply str (repeat 64 "f"))
+        diff (difficulty/calculate-mint-difficulty max-target 21000000)]
     (is (= 64 (count diff)))
     (is (re-matches #"^[0-9a-f]{64}$" diff))))

@@ -21,7 +21,7 @@
   (let [payload (byte-array [1 2 3 4])
         nonce 42
         keypair (crypto/generate-keypair)
-        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)]
+        ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)]
     (is (map? ticket))
     (is (= (basalt/bytes->hex (crypto/sha256 payload)) (:payload-hash ticket)))
     (is (= nonce (:nonce ticket)))
@@ -35,7 +35,7 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+                      ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
           ;; Maximum difficulty: all FF bytes, so any hash will be less than this
                       max-difficulty (apply str (repeat 64 "f"))]
                   (lottery/winning-ticket? ticket max-difficulty 0))))
@@ -46,7 +46,7 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+                      ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
           ;; Invalidate signature by appending/prepending or changing chars
                       corrupt-sig (apply str (reverse (:signature ticket)))
                       bad-ticket (assoc ticket :signature corrupt-sig)
@@ -59,7 +59,7 @@
   (prop/for-all [payload gen-payload
                  nonce gen-nonce]
                 (let [keypair (crypto/generate-keypair)
-                      ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+                      ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
           ;; Minimum difficulty: all 00 bytes, so no hash can be less than this
                       min-difficulty (apply str (repeat 64 "0"))]
                   (not (lottery/winning-ticket? ticket min-difficulty 0)))))
@@ -69,7 +69,7 @@
   (let [payload (byte-array [1 2 3 4])
         nonce 42
         keypair (crypto/generate-keypair)
-        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+        ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
         bad-ticket-odd (assoc ticket :signature "123")
         bad-ticket-char (assoc ticket :signature "123z")
         max-difficulty (apply str (repeat 64 "f"))]
