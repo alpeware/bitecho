@@ -10,7 +10,9 @@
   "The maximum difficulty target as a BigInteger."
   (BigInteger. max-target-hex 16))
 
-(def max-supply 42000000)
+(def max-supply
+  "Maximum Echo token supply: 42 Million."
+  42000000)
 
 (defn calculate-mint-difficulty
   "Calculates the dynamic mint difficulty target based on the Activity-Based Logarithmic Decay curve.

@@ -9,7 +9,7 @@
         keypair (crypto/generate-keypair)
         max-difficulty (apply str (repeat 64 "f"))
         ;; Ticket generated now (epoch 0)
-        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+        ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
         ;; Ticket is valid right now (epoch 0)
         valid-now (lottery/winning-ticket? ticket max-difficulty 0)
         ;; Ticket is invalid after expiration (say, epoch 10 if ttl is 10)

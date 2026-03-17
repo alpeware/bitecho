@@ -10,7 +10,7 @@
         keypair (crypto/generate-keypair)
         max-difficulty (apply str (repeat 64 "f"))
         ;; Generate ticket at epoch 0
-        ticket (lottery/generate-ticket payload nonce (:private keypair) (:public keypair) 0)
+        ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
         genesis (ledger/init-ledger)
         claimer-pubkey (:public-key ticket)
         ;; Claim the ticket
