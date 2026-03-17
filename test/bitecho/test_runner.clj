@@ -17,6 +17,7 @@
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]
             [bitecho.sieve.core-test]
+            [bitecho.simulator-config-test]
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-test]
             [clojure.test :as t]))
