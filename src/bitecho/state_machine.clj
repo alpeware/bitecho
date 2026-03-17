@@ -435,11 +435,13 @@
           {:state state
            :commands [{:type :pong-peer
                        :target last-hop
-                       :path new-path}]})
+                       :path new-path
+                       :ping-id (:ping-id event)}]})
         ;; This shouldn't happen unless origin pinged itself, but handle safely
         {:state state
          :commands [{:type :app-event
-                     :event-name :on-circuit-locked}]})
+                     :event-name :on-circuit-locked
+                     :ping-id (:ping-id event)}]})
       ;; Forward ping towards destination
       (let [rng (:rng event)
             utxos (:utxos (:ledger state))
@@ -454,7 +456,9 @@
              :commands [{:type :ping-peer
                          :target next-hop-pubkey
                          :destination dest
-                         :path new-path}]})
+                         :path new-path
+                         :ping-id (:ping-id event)
+                         :rng rng}]})
           {:state new-state :commands []})))))
 
 (defn- handle-pong-peer
@@ -467,14 +471,16 @@
       ;; Origin reached. Circuit locked.
       {:state state
        :commands [{:type :app-event
-                   :event-name :on-circuit-locked}]}
+                   :event-name :on-circuit-locked
+                   :ping-id (:ping-id event)}]}
       ;; Forward pong to previous hop
       (let [last-hop (peek path)
             new-path (pop path)]
         {:state state
          :commands [{:type :pong-peer
                      :target last-hop
-                     :path new-path}]}))))
+                     :path new-path
+                     :ping-id (:ping-id event)}]}))))
 
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
