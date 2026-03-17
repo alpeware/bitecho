@@ -30,6 +30,10 @@
   "Maximum number of epochs to keep a gossip message in the cache."
   10)
 
+(def pending-circuit-ttl
+  "Maximum number of local epochs to track a pending circuit before garbage collecting."
+  50)
+
 (defn init-state
   "Initializes the pure Bitecho state map.
    node-pubkey should be the hex-encoded public key of this node."
@@ -43,7 +47,8 @@
    :messages {}
    :message-epochs {}
    :ledger (ledger/init-ledger)
-   :channels {}})
+   :channels {}
+   :pending-circuits {}})
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt age updates, views, and Contagion anti-entropy."
@@ -70,13 +75,17 @@
                                (or (:message-epochs state) {})))
         pruned-epochs (apply dissoc (or (:message-epochs state) {}) expired-ids)
         pruned-messages (apply dissoc (:messages state) expired-ids)
-        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)]
+        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
+        ;; Prune pending circuits
+        circuit-cutoff-epoch (- new-epoch pending-circuit-ttl)
+        pruned-pending-circuits (into {} (remove (fn [[_ pending]] (< (:epoch pending) circuit-cutoff-epoch)) (or (:pending-circuits state) {})))]
     {:state (assoc state
                    :epoch new-epoch
                    :basalt-view new-view
                    :contagion-known-ids pruned-known-ids
                    :messages pruned-messages
-                   :message-epochs pruned-epochs)
+                   :message-epochs pruned-epochs
+                   :pending-circuits pruned-pending-circuits)
      :commands commands}))
 
 (defn- handle-broadcast
@@ -434,16 +443,19 @@
       ;; Forward ping towards destination
       (let [rng (:rng event)
             utxos (:utxos (:ledger state))
-            next-hop (weighted/select-next-hop rng (:basalt-view state) utxos)]
+            next-hop (weighted/select-next-hop rng (:basalt-view state) utxos)
+            new-state (if (empty? path)
+                        (assoc-in state [:pending-circuits dest] {:epoch (or (:epoch state) 0)})
+                        state)]
         (if next-hop
           (let [next-hop-pubkey (if (string? (:pubkey next-hop)) (:pubkey next-hop) (basalt/bytes->hex (:pubkey next-hop)))
                 new-path (conj (vec path) (:node-pubkey state))]
-            {:state state
+            {:state new-state
              :commands [{:type :ping-peer
                          :target next-hop-pubkey
                          :destination dest
                          :path new-path}]})
-          {:state state :commands []})))))
+          {:state new-state :commands []})))))
 
 (defn- handle-pong-peer
   "Handles a returning circuit discovery pong request.

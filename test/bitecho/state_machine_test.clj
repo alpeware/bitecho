@@ -461,3 +461,24 @@
       (is (= :pong-peer (:type cmd)))
       (is (= "hop0" (:target cmd)))
       (is (= ["origin"] (:path cmd))))))
+
+(deftest ^{:doc "Tests pending circuits garbage collection"} pending-circuits-gc-test
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}]
+        state-0 (sm/init-state initial-peers "node-pubkey-stub")
+        ping-event {:type :ping-peer :destination "dest-node" :rng (java.util.Random. 42)}
+        result-1 (sm/handle-event state-0 ping-event)
+        state-1 (:state result-1)]
+    ;; It should track the pending circuit
+    (is (contains? (:pending-circuits state-1) "dest-node"))
+    (is (= 0 (:epoch (get (:pending-circuits state-1) "dest-node"))))
+
+    ;; Tick 50 times - should not be GC'd yet (older than 50 ticks)
+    (let [tick-event {:type :tick :rng (java.util.Random. 42)}
+          state-50-ticks (reduce (fn [s _] (:state (sm/handle-event s tick-event)))
+                                 state-1
+                                 (range 50))]
+      (is (contains? (:pending-circuits state-50-ticks) "dest-node"))
+
+      ;; Tick 1 more time - should be GC'd
+      (let [state-51-ticks (:state (sm/handle-event state-50-ticks tick-event))]
+        (is (not (contains? (:pending-circuits state-51-ticks) "dest-node")))))))
