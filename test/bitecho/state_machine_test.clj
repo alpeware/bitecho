@@ -7,7 +7,7 @@
             [bitecho.lottery.core :as lottery]
             [bitecho.services.turn :as turn]
             [bitecho.state-machine :as sm]
-            [clojure.test :refer [deftest is]]))
+            [clojure.test :as t :refer [deftest is]]))
 
 (deftest ^{:doc "Tests that init-state returns a correctly shaped state map."} init-state-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
@@ -177,6 +177,98 @@
       (is (= 1 (count commands)))
       (is (= :app-event (:type (first commands))))
       (is (= :on-proof-of-relay-complete (:event-name (first commands)))))))
+
+(deftest ^{:doc "Tests handle-route-directed-ack initiates quorum settlement for mint tickets."} handle-route-directed-ack-quorum-test
+  (let [target-pubkey (basalt/bytes->hex (byte-array 32))
+        initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey target-pubkey :age 0 :hash "next-hop-hash"}]
+        state (sm/init-state initial-peers "router-pubkey")
+        keys (crypto/generate-keypair)
+        pub-key (:public keys)
+        priv-key (:private keys)
+        payload (.getBytes "secret")
+        ;; A :mint ticket that will always win due to mocked difficulty or large enough nonce.
+        ;; For simplicity, we can mock `ledger/claim-ticket` to always succeed or use a known winning combination.
+        ticket (lottery/generate-ticket :mint payload 123 priv-key pub-key 0)
+        envelope {:forward-circuit ["router-pubkey" "next"]
+                  :return-circuit ["prev"]
+                  :encrypted-payload payload
+                  :lottery-ticket ticket
+                  :proof-of-relay []}
+        event {:type :route-directed-ack
+               :envelope envelope
+               :rng (java.util.Random. 42)
+               :payout-amount 10
+               :network-size 10}]
+    (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p _e] (assoc-in ledger [:utxos "new-tx"] {:amount 10 :puzzle-hash "hash"}))]
+      (let [result (sm/handle-event state event)
+            commands (:commands result)]
+        (is (= 2 (count commands)))
+        (let [forward-cmd (first commands)
+              quorum-cmd (second commands)]
+          (is (= :sign-and-forward (:type forward-cmd)))
+          (is (= :send-directed-ack (:out-type forward-cmd)))
+          (is (= :send-quorum-settlement (:type quorum-cmd)))
+          (is (= target-pubkey (:target quorum-cmd)))
+          (is (= ticket (:ticket quorum-cmd)))
+          (is (= "router-pubkey" (:claimer-pubkey quorum-cmd))))))))
+
+(deftest ^{:doc "Tests handle-receive-quorum-settlement processes mint tickets and forwards."} handle-receive-quorum-settlement-test
+  (let [target-pubkey (basalt/bytes->hex (byte-array 32))
+        initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey target-pubkey :age 0 :hash "next-hop-hash"}]
+        state (sm/init-state initial-peers "node-pubkey-stub")
+        keys (crypto/generate-keypair)
+        pub-key (:public keys)
+        priv-key (:private keys)
+        payload (.getBytes "secret")
+        ticket (lottery/generate-ticket :mint payload 123 priv-key pub-key 0)
+        event {:type :receive-quorum-settlement
+               :ticket ticket
+               :proof-of-relay []
+               :claimer-pubkey "claimer-pub"
+               :payout-amount 10
+               :rng (java.util.Random. 42)}]
+    (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p _e] (assoc-in ledger [:utxos "new-tx"] {:amount 10 :puzzle-hash "hash"}))]
+      (let [result (sm/handle-event state event)
+            commands (:commands result)]
+        (is (= 1 (count commands)))
+        (let [cmd (first commands)]
+          (is (= :send-quorum-settlement (:type cmd)))
+          (is (= target-pubkey (:target cmd)))
+          (is (= ticket (:ticket cmd)))
+          (is (= "claimer-pub" (:claimer-pubkey cmd))))
+        ;; Verify state updated with the new ledger
+        (is (contains? (:utxos (:ledger (:state result))) "new-tx"))))))
+
+(deftest ^{:doc "Tests handle-receive-quorum-settlement drops invalid or duplicate tickets."} handle-receive-quorum-settlement-invalid-test
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "next-hop-hash"}]
+        state (sm/init-state initial-peers "node-pubkey-stub")
+        keys (crypto/generate-keypair)
+        pub-key (:public keys)
+        priv-key (:private keys)
+        payload (.getBytes "secret")
+        fee-ticket (lottery/generate-ticket :fee payload 123 priv-key pub-key 0)
+        mint-ticket (lottery/generate-ticket :mint payload 123 priv-key pub-key 0)]
+
+    (t/testing "Drops fee tickets"
+      (let [event {:type :receive-quorum-settlement
+                   :ticket fee-ticket
+                   :proof-of-relay []
+                   :claimer-pubkey "claimer-pub"
+                   :payout-amount 10
+                   :rng (java.util.Random. 42)}
+            result (sm/handle-event state event)]
+        (is (empty? (:commands result)))))
+
+    (t/testing "Drops if ledger claim fails (e.g., duplicate or lost)"
+      (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p _e] ledger)] ; Returns same ledger
+        (let [event {:type :receive-quorum-settlement
+                     :ticket mint-ticket
+                     :proof-of-relay []
+                     :claimer-pubkey "claimer-pub"
+                     :payout-amount 10
+                     :rng (java.util.Random. 42)}
+              result (sm/handle-event state event)]
+          (is (empty? (:commands result))))))))
 
 (deftest ^{:doc "Tests handle-event with a :tick event."} handle-tick-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
