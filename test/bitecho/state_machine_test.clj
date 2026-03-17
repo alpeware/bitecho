@@ -199,7 +199,7 @@
                :rng (java.util.Random. 42)
                :payout-amount 10
                :network-size 10}]
-    (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p _e] (assoc-in ledger [:utxos "new-tx"] {:amount 10 :puzzle-hash "hash"}))]
+    (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p] (assoc-in ledger [:utxos "new-tx"] {:amount 10 :puzzle-hash "hash"}))]
       (let [result (sm/handle-event state event)
             commands (:commands result)]
         (is (= 2 (count commands)))
@@ -227,7 +227,7 @@
                :claimer-pubkey "claimer-pub"
                :payout-amount 10
                :rng (java.util.Random. 42)}]
-    (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p _e] (assoc-in ledger [:utxos "new-tx"] {:amount 10 :puzzle-hash "hash"}))]
+    (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p] (assoc-in ledger [:utxos "new-tx"] {:amount 10 :puzzle-hash "hash"}))]
       (let [result (sm/handle-event state event)
             commands (:commands result)]
         (is (= 1 (count commands)))
@@ -260,7 +260,7 @@
         (is (empty? (:commands result)))))
 
     (t/testing "Drops if ledger claim fails (e.g., duplicate or lost)"
-      (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p _e] ledger)] ; Returns same ledger
+      (with-redefs [ledger/claim-ticket (fn [ledger _t _d _c _p] ledger)] ; Returns same ledger
         (let [event {:type :receive-quorum-settlement
                      :ticket mint-ticket
                      :proof-of-relay []

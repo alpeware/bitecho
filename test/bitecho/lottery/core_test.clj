@@ -38,7 +38,7 @@
                       ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
           ;; Maximum difficulty: all FF bytes, so any hash will be less than this
                       max-difficulty (apply str (repeat 64 "f"))]
-                  (lottery/winning-ticket? ticket max-difficulty 0))))
+                  (lottery/winning-ticket? ticket max-difficulty))))
 
 (defspec ^{:doc "A ticket should fail validation if its signature is corrupted."}
   ticket-fails-corrupt-signature
@@ -51,7 +51,7 @@
                       corrupt-sig (apply str (reverse (:signature ticket)))
                       bad-ticket (assoc ticket :signature corrupt-sig)
                       max-difficulty (apply str (repeat 64 "f"))]
-                  (not (lottery/winning-ticket? bad-ticket max-difficulty 0)))))
+                  (not (lottery/winning-ticket? bad-ticket max-difficulty)))))
 
 (defspec ^{:doc "A ticket should fail validation if its difficulty is minimum (impossible to beat)."}
   ticket-fails-min-difficulty
@@ -62,7 +62,7 @@
                       ticket (lottery/generate-ticket :fee payload nonce (:private keypair) (:public keypair) 0)
           ;; Minimum difficulty: all 00 bytes, so no hash can be less than this
                       min-difficulty (apply str (repeat 64 "0"))]
-                  (not (lottery/winning-ticket? ticket min-difficulty 0)))))
+                  (not (lottery/winning-ticket? ticket min-difficulty)))))
 
 (deftest ^{:doc "A ticket validation should gracefully return false on invalid hex input."}
   ticket-fails-invalid-hex-gracefully
@@ -73,5 +73,5 @@
         bad-ticket-odd (assoc ticket :signature "123")
         bad-ticket-char (assoc ticket :signature "123z")
         max-difficulty (apply str (repeat 64 "f"))]
-    (is (false? (lottery/winning-ticket? bad-ticket-odd max-difficulty 0)))
-    (is (false? (lottery/winning-ticket? bad-ticket-char max-difficulty 0)))))
+    (is (false? (lottery/winning-ticket? bad-ticket-odd max-difficulty)))
+    (is (false? (lottery/winning-ticket? bad-ticket-char max-difficulty)))))

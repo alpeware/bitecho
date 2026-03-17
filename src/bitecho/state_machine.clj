@@ -70,15 +70,13 @@
                                (or (:message-epochs state) {})))
         pruned-epochs (apply dissoc (or (:message-epochs state) {}) expired-ids)
         pruned-messages (apply dissoc (:messages state) expired-ids)
-        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
-        pruned-ledger (ledger/prune-claimed-tickets (:ledger state) new-epoch)]
+        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)]
     {:state (assoc state
                    :epoch new-epoch
                    :basalt-view new-view
                    :contagion-known-ids pruned-known-ids
                    :messages pruned-messages
-                   :message-epochs pruned-epochs
-                   :ledger pruned-ledger)
+                   :message-epochs pruned-epochs)
      :commands commands}))
 
 (defn- handle-broadcast
@@ -258,9 +256,8 @@
   "Attempts to claim a ticket in the local ledger, returning the new ledger."
   [state ticket claimer-pubkey payout-amount]
   (let [network-scale (calculate-network-scale state)
-        difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
-        current-epoch (or (:epoch state) 0)]
-    (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)))
+        difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)]
+    (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount)))
 
 (defn- handle-route-directed-ack
   "Handles the return pass of a directed message along a locked circuit.
