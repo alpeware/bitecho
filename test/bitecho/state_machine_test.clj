@@ -130,25 +130,53 @@
         pubkey-hex (basalt/bytes->hex pub-key)
         puzzle-hash (ledger/standard-puzzle-hash pubkey-hex)
         state-with-stake (assoc-in state [:ledger :utxos "initial-utxo"] {:amount 100 :puzzle-hash puzzle-hash})
-        envelope {:destination "dest-pubkey"
+        envelope {:forward-circuit ["node-pubkey-stub" "dest-pubkey"]
+                  :return-circuit []
                   :encrypted-payload payload
-                  :lottery-ticket ticket}
+                  :lottery-ticket ticket
+                  :proof-of-relay []}
         event {:type :route-directed-message
                :envelope envelope
                :rng (java.util.Random. 42)
-
                :payout-amount 10
                :network-size 10}
         result (sm/handle-event state-with-stake event)]
     (is (map? result))
     (is (contains? result :state))
     (is (contains? result :commands))
-    ;; Since difficulty will be calculated (or easily passable), let's ensure it emits a command
     (let [commands (:commands result)]
       (is (= 1 (count commands)))
-      (is (= :send-directed-message (:type (first commands))))
-      (is (some? (:target (first commands))))
-      (is (= envelope (:envelope (first commands)))))))
+      (is (= :sign-and-forward (:type (first commands))))
+      (is (= "dest-pubkey" (:target (first commands))))
+      (is (= '("dest-pubkey") (:forward-circuit (:envelope (first commands)))))
+      (is (= '("node-pubkey-stub") (:return-circuit (:envelope (first commands))))))))
+
+(deftest ^{:doc "Tests handle-route-directed-ack completes proof of relay."} handle-route-directed-ack-test
+  (let [initial-peers []
+        state (sm/init-state initial-peers "node-pubkey-stub")
+        keys (crypto/generate-keypair)
+        pub-key (:public keys)
+        priv-key (:private keys)
+        payload (.getBytes "secret")
+        ticket (lottery/generate-ticket payload 123 priv-key pub-key 0)
+        envelope {:forward-circuit ["node-pubkey-stub"]
+                  :return-circuit ["dest-pubkey"]
+                  :encrypted-payload payload
+                  :lottery-ticket ticket
+                  :proof-of-relay []}
+        event {:type :route-directed-ack
+               :envelope envelope
+               :rng (java.util.Random. 42)
+               :payout-amount 10
+               :network-size 10}
+        result (sm/handle-event state event)]
+    (is (map? result))
+    (is (contains? result :state))
+    (is (contains? result :commands))
+    (let [commands (:commands result)]
+      (is (= 1 (count commands)))
+      (is (= :app-event (:type (first commands))))
+      (is (= :on-proof-of-relay-complete (:event-name (first commands)))))))
 
 (deftest ^{:doc "Tests handle-event with a :tick event."} handle-tick-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
@@ -205,7 +233,7 @@
         state-with-stake (assoc-in state [:ledger :utxos "utxo1"] {:amount 50 :puzzle-hash puzzle-hash})
         ticket {:public-key sender-hex}
         event {:type :route-directed-message
-               :envelope {:destination "my-node" :encrypted-payload (.getBytes "hello") :lottery-ticket ticket}
+               :envelope {:forward-circuit ["my-node"] :return-circuit ["sender-pubkey"] :encrypted-payload (.getBytes "hello") :lottery-ticket ticket :proof-of-relay []}
                :payout-amount 10
                :network-size 100
                :rng (java.util.Random. 42)}
@@ -214,17 +242,47 @@
         ;; We will use a predictable seed where we KNOW the trickle admits it.
         ;; We need a seed that generates < 0.05. seed 4640 generates ~0.049
         nil-ticket-event {:type :route-directed-message
-                          :envelope {:destination "my-node" :encrypted-payload (.getBytes "hello")}
+                          :envelope {:forward-circuit ["my-node"] :return-circuit ["sender-pubkey"] :encrypted-payload (.getBytes "hello") :proof-of-relay []}
                           :payout-amount 10
                           :network-size 100
                           :rng (java.util.Random. 4640)}
         res-nil-ticket (sm/handle-event state nil-ticket-event)]
-    (is (= 1 (count (:commands res))))
-    (is (= 1 (count (:commands res-nil-ticket))))
-    (let [cmd (first (:commands res))]
+    (is (= 2 (count (:commands res))))
+    (is (= 2 (count (:commands res-nil-ticket))))
+    (let [cmd (first (:commands res))
+          ack (second (:commands res))]
       (is (= :app-event (:type cmd)))
       (is (= :on-direct-message (:event-name cmd)))
-      (is (= "my-node" (:destination (:envelope cmd)))))))
+      (is (= :sign-and-forward (:type ack)))
+      (is (= :send-directed-ack (:out-type ack)))
+      (is (= "sender-pubkey" (:target ack))))))
+
+(deftest ^{:doc "Tests handle-route-directed-message with invalid proof of relay drops message."} handle-route-directed-message-invalid-proof-test
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
+                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
+        state (sm/init-state initial-peers "node-pubkey-stub")
+        keys (crypto/generate-keypair)
+        pub-key (:public keys)
+        priv-key (:private keys)
+        payload (.getBytes "secret")
+        ticket (lottery/generate-ticket payload 123 priv-key pub-key 0)
+        ;; Give the sender some stake so it bypasses the 5% trickle
+        pubkey-hex (basalt/bytes->hex pub-key)
+        puzzle-hash (ledger/standard-puzzle-hash pubkey-hex)
+        state-with-stake (assoc-in state [:ledger :utxos "initial-utxo"] {:amount 100 :puzzle-hash puzzle-hash})
+        envelope {:forward-circuit ["node-pubkey-stub" "dest-pubkey"]
+                  :return-circuit []
+                  :encrypted-payload payload
+                  :lottery-ticket ticket
+                  :proof-of-relay [{:node "tampered-pubkey" :signature (.getBytes "bad-sig")}]}
+        event {:type :route-directed-message
+               :envelope envelope
+               :rng (java.util.Random. 42)
+               :payout-amount 10
+               :network-size 10}
+        result (sm/handle-event state-with-stake event)]
+    (is (empty? (:commands result)))
+    (is (= state-with-stake (:state result)))))
 
 (deftest ^{:doc "Tests calculate-network-scale properly sums Active Network Stake."} calculate-network-scale-test
   (let [;; Setup mock peer keys

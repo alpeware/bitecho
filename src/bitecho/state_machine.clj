@@ -7,6 +7,7 @@
             [bitecho.economy.difficulty :as difficulty]
             [bitecho.economy.ledger :as ledger]
             [bitecho.murmur.core :as murmur]
+            [bitecho.peer-review.core :as peer-review]
             [bitecho.routing.ingress :as ingress]
             [bitecho.routing.weighted :as weighted]
             [bitecho.services.turn :as turn]
@@ -210,38 +211,84 @@
     (max 1 total-stake)))
 
 (defn- handle-route-directed-message
-  "Handles routing of a directed message. Validates the attached lottery ticket,
-   claims the fee if it wins, and forwards the envelope via stake-weighted routing.
-   If the node itself is the destination, it emits an :app-event instead.
-   Applies stake-weighted ingress to drop unstaked messages 95% of the time."
+  "Handles the forward pass of a directed message along a locked circuit.
+   Validates the attached lottery ticket and proof of relay.
+   Requires strict source routing via :forward-circuit.
+   If this node is the destination, emits :on-direct-message and
+   turns the message around to return via :route-directed-ack."
   [state event]
   (let [envelope (:envelope event)
-        destination (:destination envelope)
         claimer-pubkey (:node-pubkey state)
         ticket (:lottery-ticket envelope)
+        proof-of-relay (:proof-of-relay envelope)
         sender-pubkey (:public-key ticket)
         utxos (:utxos (:ledger state))
-        rng (:rng event)]
-    (if (ingress/admit-message? rng sender-pubkey utxos)
-      (if (= destination claimer-pubkey)
-        {:state state
-         :commands [{:type :app-event
-                     :event-name :on-direct-message
-                     :envelope envelope}]}
-        (let [payout-amount (:payout-amount event)
-              network-scale (calculate-network-scale state)
-              difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
-              current-epoch (or (:epoch state) 0)
-              new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)
-              next-hop (weighted/select-next-hop rng (:basalt-view state) (:balances new-ledger))
-              commands (if next-hop
-                         [{:type :send-directed-message
-                           :target next-hop
-                           :envelope envelope}]
-                         [])]
-          {:state (assoc state :ledger new-ledger)
-           :commands commands}))
-      ;; Message dropped via ingress filter
+        rng (:rng event)
+        forward-circuit (or (:forward-circuit envelope) [])
+        return-circuit (or (:return-circuit envelope) [])]
+    (if (and (ingress/admit-message? rng sender-pubkey utxos)
+             (peer-review/validate-proof-of-relay ticket proof-of-relay)
+             (= claimer-pubkey (first forward-circuit)))
+      (let [new-forward (rest forward-circuit)
+            new-return (cons claimer-pubkey return-circuit)]
+        (if (empty? new-forward)
+          ;; We are the destination (Node B). Turnaround.
+          {:state state
+           :commands [{:type :app-event
+                       :event-name :on-direct-message
+                       :envelope envelope}
+                      {:type :sign-and-forward
+                       :target (first return-circuit)
+                       :out-type :send-directed-ack
+                       :envelope (assoc envelope
+                                        :forward-circuit return-circuit
+                                        :return-circuit (list claimer-pubkey))}]}
+          ;; We are a forward router. Pop and push, then forward.
+          {:state state
+           :commands [{:type :sign-and-forward
+                       :target (first new-forward)
+                       :out-type :send-directed-message
+                       :envelope (assoc envelope
+                                        :forward-circuit new-forward
+                                        :return-circuit new-return)}]}))
+      ;; Message dropped (invalid ingress, invalid proof, or not in circuit)
+      {:state state :commands []})))
+
+(defn- handle-route-directed-ack
+  "Handles the return pass of a directed message along a locked circuit.
+   Validates the proof of relay. Edge routers claim the lottery ticket here.
+   If this node is the origin, emits :on-proof-of-relay-complete."
+  [state event]
+  (let [envelope (:envelope event)
+        claimer-pubkey (:node-pubkey state)
+        ticket (:lottery-ticket envelope)
+        proof-of-relay (:proof-of-relay envelope)
+        forward-circuit (or (:forward-circuit envelope) [])
+        return-circuit (or (:return-circuit envelope) [])]
+    (if (and (peer-review/validate-proof-of-relay ticket proof-of-relay)
+             (= claimer-pubkey (first forward-circuit)))
+      (let [new-forward (rest forward-circuit)
+            new-return (cons claimer-pubkey return-circuit)]
+        (if (empty? new-forward)
+          ;; We are the origin (Node A). Proof complete.
+          {:state state
+           :commands [{:type :app-event
+                       :event-name :on-proof-of-relay-complete
+                       :envelope envelope}]}
+          ;; We are an edge router on the return path. Claim ticket and forward.
+          (let [payout-amount (:payout-amount event)
+                network-scale (calculate-network-scale state)
+                difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
+                current-epoch (or (:epoch state) 0)
+                new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)]
+            {:state (assoc state :ledger new-ledger)
+             :commands [{:type :sign-and-forward
+                         :target (first new-forward)
+                         :out-type :send-directed-ack
+                         :envelope (assoc envelope
+                                          :forward-circuit new-forward
+                                          :return-circuit new-return)}]})))
+      ;; Message dropped (invalid proof, or not in circuit)
       {:state state :commands []})))
 
 (defn- handle-open-channel
@@ -377,6 +424,7 @@
     :receive-pull-request (handle-receive-pull-request state event)
     :receive-gossip (handle-receive-gossip state event)
     :route-directed-message (handle-route-directed-message state event)
+    :route-directed-ack (handle-route-directed-ack state event)
     :open-channel (handle-open-channel state event)
     :update-channel (handle-update-channel state event)
     :settle-channel (handle-settle-channel state event)

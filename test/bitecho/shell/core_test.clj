@@ -7,7 +7,7 @@
 (deftest ^{:doc "Network ingress filters external events correctly"}
   ingress-filter-test
   (testing "Network ingress filters external events correctly"
-    (let [node (core/start-node (sm/init-state [] "node-pubkey-stub"))]
+    (let [node (core/start-node (sm/init-state [] "node-pubkey-stub") (byte-array 32))]
       (is (contains? node :network-in))
       (is (contains? node :app-out))
       ;; Test allowed events
@@ -33,5 +33,6 @@
   (is (#'core/valid-network-event? {:type :turn-relay-request}))
   (is (not (#'core/valid-network-event? {:type :tick})))
   (is (#'core/valid-network-event? {:type :route-directed-message}))
+  (is (#'core/valid-network-event? {:type :route-directed-ack}))
   (is (not (#'core/valid-network-event? {:type :open-channel})))
   (is (not (#'core/valid-network-event? {:type :some-malicious-event}))))

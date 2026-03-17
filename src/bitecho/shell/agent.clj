@@ -9,12 +9,12 @@
 
 (defn init-node
   "Initializes the agent shell given a bootstrap peer."
-  [bootstrap-peer node-pubkey]
+  [bootstrap-peer node-pubkey private-key]
   (let [initial-peers [bootstrap-peer]
         snapshot-filename (str "snapshot-" node-pubkey ".edn")
         initial-state (or (persistence/load-state-from-disk snapshot-filename)
                           (sm/init-state initial-peers node-pubkey))]
-    (core/start-node initial-state snapshot-filename)))
+    (core/start-node initial-state private-key snapshot-filename)))
 
 (defn -main
   "Main executable entry point for the agent node.
@@ -26,7 +26,7 @@
         node-pubkey (basalt/bytes->hex (:public node-keys))
         ;; In a real implementation we'd parse this from CLI or config.
         default-bootstrap {:pubkey "0000" :ip "127.0.0.1" :port 8000 :age 0 :hash "1234"}
-        node (init-node default-bootstrap node-pubkey)]
+        node (init-node default-bootstrap node-pubkey (:private node-keys))]
     (println "Agent shell created using bootstrap peer:")
     (println default-bootstrap)
     (println "Node channels:" (keys node))
