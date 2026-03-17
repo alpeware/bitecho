@@ -3,6 +3,7 @@
    ticket payouts to an agent's Echo balance."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.difficulty :as difficulty]
             [bitecho.economy.sci-sandbox :as sci-sandbox]
             [bitecho.lottery.core :as lottery]))
 
@@ -15,12 +16,13 @@
 (defn- hash-ticket
   "Computes a hex hash of the full ticket contents for tracking claims."
   [ticket]
-  (let [hash-hex (:payload-hash ticket)
+  (let [type-str (name (:ticket-type ticket))
+        hash-hex (:payload-hash ticket)
         nonce-str (str (:nonce ticket))
         epoch-str (str (:epoch ticket))
         pub-key-hex (:public-key ticket)
         sig-hex (:signature ticket)
-        input-str (str hash-hex nonce-str epoch-str pub-key-hex sig-hex)]
+        input-str (str type-str hash-hex nonce-str epoch-str pub-key-hex sig-hex)]
     (basalt/bytes->hex (crypto/sha256 (.getBytes input-str "UTF-8")))))
 
 (defn standard-puzzle-hash
@@ -47,8 +49,14 @@
    If the ticket wins and hasn't been claimed before, creates the UTXO
    and marks the ticket as claimed. Otherwise, returns the ledger unchanged."
   [ledger ticket difficulty-hex claimer-pubkey payout-amount current-epoch]
-  (let [ticket-hash (hash-ticket ticket)]
-    (if (and (lottery/winning-ticket? ticket difficulty-hex current-epoch)
+  (let [ticket-hash (hash-ticket ticket)
+        ;; Calculate correct difficulty
+        total-staked (reduce + (map :amount (vals (:utxos ledger))))
+        treasury-balance (- difficulty/max-supply total-staked)
+        target-diff (if (= :mint (:ticket-type ticket))
+                      (difficulty/calculate-mint-difficulty difficulty-hex treasury-balance)
+                      difficulty-hex)]
+    (if (and (lottery/winning-ticket? ticket target-diff current-epoch)
              (not (contains? (:claimed-tickets ledger) ticket-hash)))
       (let [puzzle-hash (standard-puzzle-hash claimer-pubkey)]
         (-> ledger

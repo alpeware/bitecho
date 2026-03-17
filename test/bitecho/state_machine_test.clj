@@ -125,7 +125,7 @@
         pub-key (:public keys)
         priv-key (:private keys)
         payload (.getBytes "secret")
-        ticket (lottery/generate-ticket payload 123 priv-key pub-key 0)
+        ticket (lottery/generate-ticket :fee payload 123 priv-key pub-key 0)
         ;; Give the sender some stake so it bypasses the 5% trickle
         pubkey-hex (basalt/bytes->hex pub-key)
         puzzle-hash (ledger/standard-puzzle-hash pubkey-hex)
@@ -158,7 +158,7 @@
         pub-key (:public keys)
         priv-key (:private keys)
         payload (.getBytes "secret")
-        ticket (lottery/generate-ticket payload 123 priv-key pub-key 0)
+        ticket (lottery/generate-ticket :fee payload 123 priv-key pub-key 0)
         envelope {:forward-circuit ["node-pubkey-stub"]
                   :return-circuit ["dest-pubkey"]
                   :encrypted-payload payload
@@ -265,7 +265,7 @@
         pub-key (:public keys)
         priv-key (:private keys)
         payload (.getBytes "secret")
-        ticket (lottery/generate-ticket payload 123 priv-key pub-key 0)
+        ticket (lottery/generate-ticket :fee payload 123 priv-key pub-key 0)
         ;; Give the sender some stake so it bypasses the 5% trickle
         pubkey-hex (basalt/bytes->hex pub-key)
         puzzle-hash (ledger/standard-puzzle-hash pubkey-hex)

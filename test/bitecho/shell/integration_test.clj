@@ -266,7 +266,7 @@
                 current-epoch (or (:epoch a1-state) 0)
                 payload-str "Secret message for C!"
                 payload-bytes (.getBytes payload-str "UTF-8")
-                ticket (lottery/generate-ticket payload-bytes 123 (:private a1-keys) (:public a1-keys) current-epoch)
+                ticket (lottery/generate-ticket :fee payload-bytes 123 (:private a1-keys) (:public a1-keys) current-epoch)
                 envelope {:forward-circuit [a1-pubkey-hex a2-pubkey-hex a3-pubkey-hex]
                           :return-circuit []
                           :encrypted-payload payload-bytes
