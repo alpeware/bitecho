@@ -89,7 +89,9 @@
                                             :rng (java.util.Random.)})
       :pong-peer
       (async/put! (:events-in target-node) {:type :pong-peer
-                                            :path (:path cmd)})
+                                            :path (:path cmd)
+                                            :ping-id (:ping-id cmd)
+                                            :rng (java.util.Random.)})
       :send-directed-ack
       (async/put! (:events-in target-node) {:type :route-directed-ack
                                             :envelope (:envelope cmd)
