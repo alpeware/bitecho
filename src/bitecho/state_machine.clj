@@ -254,10 +254,19 @@
       ;; Message dropped (invalid ingress, invalid proof, or not in circuit)
       {:state state :commands []})))
 
+(defn- attempt-claim-ticket
+  "Attempts to claim a ticket in the local ledger, returning the new ledger."
+  [state ticket claimer-pubkey payout-amount]
+  (let [network-scale (calculate-network-scale state)
+        difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
+        current-epoch (or (:epoch state) 0)]
+    (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)))
+
 (defn- handle-route-directed-ack
   "Handles the return pass of a directed message along a locked circuit.
    Validates the proof of relay. Edge routers claim the lottery ticket here.
-   If this node is the origin, emits :on-proof-of-relay-complete."
+   If this node is the origin, emits :on-proof-of-relay-complete.
+   If a Mint Ticket is claimed successfully, initiates Quorum Settlement."
   [state event]
   (let [envelope (:envelope event)
         claimer-pubkey (:node-pubkey state)
@@ -277,18 +286,66 @@
                        :envelope envelope}]}
           ;; We are an edge router on the return path. Claim ticket and forward.
           (let [payout-amount (:payout-amount event)
-                network-scale (calculate-network-scale state)
-                difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)
-                current-epoch (or (:epoch state) 0)
-                new-ledger (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount current-epoch)]
+                new-ledger (attempt-claim-ticket state ticket claimer-pubkey payout-amount)
+                ;; Check if we successfully claimed a :mint ticket
+                ticket-claimed? (not= (:ledger state) new-ledger)
+                mint-ticket? (= :mint (:ticket-type ticket))
+                rng (:rng event)
+                utxos (:utxos new-ledger)
+                ;; If we won a mint ticket, we must initiate quorum settlement
+                quorum-target (when (and ticket-claimed? mint-ticket?)
+                                (weighted/select-next-hop rng (:basalt-view state) utxos))
+                forward-command {:type :sign-and-forward
+                                 :target (first new-forward)
+                                 :out-type :send-directed-ack
+                                 :envelope (assoc envelope
+                                                  :forward-circuit new-forward
+                                                  :return-circuit new-return)}
+                quorum-command (when quorum-target
+                                 (let [target-pubkey (if (string? (:pubkey quorum-target)) (:pubkey quorum-target) (basalt/bytes->hex (:pubkey quorum-target)))]
+                                   {:type :send-quorum-settlement
+                                    :target target-pubkey
+                                    :ticket ticket
+                                    :proof-of-relay proof-of-relay
+                                    :claimer-pubkey claimer-pubkey
+                                    :payout-amount payout-amount}))
+                commands (filterv some? [forward-command quorum-command])]
             {:state (assoc state :ledger new-ledger)
-             :commands [{:type :sign-and-forward
-                         :target (first new-forward)
-                         :out-type :send-directed-ack
-                         :envelope (assoc envelope
-                                          :forward-circuit new-forward
-                                          :return-circuit new-return)}]})))
+             :commands commands})))
       ;; Message dropped (invalid proof, or not in circuit)
+      {:state state :commands []})))
+
+(defn- handle-receive-quorum-settlement
+  "Handles an incoming Quorum Settlement message.
+   Validates the proof of relay and attempts to claim the Mint Ticket
+   on behalf of the winning router (claimer-pubkey).
+   If accepted into the local ledger, forwards it to the next hop."
+  [state event]
+  (let [ticket (:ticket event)
+        proof-of-relay (:proof-of-relay event)
+        claimer-pubkey (:claimer-pubkey event)
+        payout-amount (:payout-amount event)]
+    (if (and (= :mint (:ticket-type ticket))
+             (peer-review/validate-proof-of-relay ticket proof-of-relay))
+      (let [new-ledger (attempt-claim-ticket state ticket claimer-pubkey payout-amount)]
+        (if (not= (:ledger state) new-ledger)
+          ;; Successfully accepted into ledger. Forward to continue quorum building.
+          (let [rng (:rng event)
+                utxos (:utxos new-ledger)
+                next-hop (weighted/select-next-hop rng (:basalt-view state) utxos)]
+            (if next-hop
+              (let [target-pubkey (if (string? (:pubkey next-hop)) (:pubkey next-hop) (basalt/bytes->hex (:pubkey next-hop)))]
+                {:state (assoc state :ledger new-ledger)
+                 :commands [{:type :send-quorum-settlement
+                             :target target-pubkey
+                             :ticket ticket
+                             :proof-of-relay proof-of-relay
+                             :claimer-pubkey claimer-pubkey
+                             :payout-amount payout-amount}]})
+              {:state (assoc state :ledger new-ledger) :commands []}))
+          ;; Already known/invalid, do not forward
+          {:state state :commands []}))
+      ;; Invalid ticket or proof
       {:state state :commands []})))
 
 (defn- handle-open-channel
@@ -425,6 +482,7 @@
     :receive-gossip (handle-receive-gossip state event)
     :route-directed-message (handle-route-directed-message state event)
     :route-directed-ack (handle-route-directed-ack state event)
+    :receive-quorum-settlement (handle-receive-quorum-settlement state event)
     :open-channel (handle-open-channel state event)
     :update-channel (handle-update-channel state event)
     :settle-channel (handle-settle-channel state event)
