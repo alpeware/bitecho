@@ -86,6 +86,7 @@
       (async/put! (:events-in target-node) {:type :ping-peer
                                             :destination (:destination cmd)
                                             :path (:path cmd)
+                                            :ping-id (:ping-id cmd)
                                             :rng (java.util.Random.)})
       :pong-peer
       (async/put! (:events-in target-node) {:type :pong-peer
@@ -154,6 +155,10 @@
         multiplexer (create-multiplexer nodes-map stop-ch)
         tick-interval (:tick-interval-ms config 100)
         metronome (create-metronome nodes-map stop-ch tick-interval)]
+
+    (doseq [agent agents]
+      (async/put! (:events-in agent) {:type :receive-push-view
+                                      :view (mapv :peer bootstraps)}))
 
     {:nodes nodes-map
      :stop-ch stop-ch
