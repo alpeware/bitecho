@@ -63,7 +63,8 @@
              (let [{new-state :state commands :commands} (sm/handle-event state val)]
                (doseq [cmd commands]
                  (cond
-                   (= (:type cmd) :app-event) (async/put! app-out cmd)
+                   (= (:type cmd) :app-event)
+                   (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
                    (= (:type cmd) :sign-and-forward)
                    (let [envelope (:envelope cmd)
                          ticket (:lottery-ticket envelope)
@@ -92,7 +93,8 @@
            (let [{new-state :state commands :commands} (sm/handle-event state val)]
              (doseq [cmd commands]
                (cond
-                 (= (:type cmd) :app-event) (async/put! app-out cmd)
+                 (= (:type cmd) :app-event)
+                 (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
                  (= (:type cmd) :sign-and-forward)
                  (let [envelope (:envelope cmd)
                        ticket (:lottery-ticket envelope)
