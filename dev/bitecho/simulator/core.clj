@@ -34,10 +34,16 @@
         pubkey-hex (basalt/bytes->hex (:public keys))
         ;; Pick a random bootstrap to connect to
         boot-peer (:peer (rand-nth bootstraps))
-        node (agent-shell/init-node boot-peer pubkey-hex (:private keys))]
+        node (agent-shell/init-node boot-peer pubkey-hex (:private keys))
+        peer {:ip "127.0.0.1"
+              :port (+ 9000 i)
+              :pubkey pubkey-hex
+              :age 0
+              :hash (basalt/bytes->hex (crypto/sha256 (:public keys)))}]
     {:type :agent
      :pubkey-hex pubkey-hex
      :keys keys
+     :peer peer
      :node node
      :events-in (:events-in node)
      :network-in (:network-in node)
@@ -76,28 +82,23 @@
                                              :message (:message cmd)
                                              :rng (java.util.Random.)})
       :send-directed-message
-      ;; Bypass network filter directly to events-in for the simulator
-      (async/put! (:events-in target-node) {:type :route-directed-message
-                                            :envelope (:envelope cmd)
-                                            :payout-amount (:payout-amount cmd 100)
-                                            :network-size (:network-size cmd 10)
-                                            :rng (java.util.Random.)})
+      (async/put! (:network-in target-node) {:type :receive-directed-message
+                                             :sender sender-hex
+                                             :envelope (:envelope cmd)})
       :ping-peer
-      (async/put! (:events-in target-node) {:type :ping-peer
-                                            :destination (:destination cmd)
-                                            :path (:path cmd)
-                                            :ping-id (:ping-id cmd)
-                                            :rng (java.util.Random.)})
+      (async/put! (:network-in target-node) {:type :receive-ping
+                                             :sender sender-hex
+                                             :path (:path cmd)
+                                             :ping-id (:ping-id cmd)})
       :pong-peer
-      (async/put! (:events-in target-node) {:type :pong-peer
-                                            :path (:path cmd)
-                                            :ping-id (:ping-id cmd)
-                                            :rng (java.util.Random.)})
+      (async/put! (:network-in target-node) {:type :receive-pong
+                                             :sender sender-hex
+                                             :path (:path cmd)
+                                             :ping-id (:ping-id cmd)})
       :send-directed-ack
-      (async/put! (:events-in target-node) {:type :route-directed-ack
-                                            :envelope (:envelope cmd)
-                                            :payout-amount (:payout-amount cmd 100)
-                                            :rng (java.util.Random.)})
+      (async/put! (:network-in target-node) {:type :receive-directed-ack
+                                             :sender sender-hex
+                                             :envelope (:envelope cmd)})
       :send-quorum-settlement
       (async/put! (:events-in target-node) {:type :receive-quorum-settlement
                                             :ticket (:ticket cmd)
@@ -118,7 +119,7 @@
           (do
             (when (map? val)
               (let [cmd val
-                    targets (or (:targets cmd) (when (:target cmd) [(:target cmd)]))
+                    targets (or (:targets cmd) (when (:target cmd) [(:target cmd)]) (when (:destination cmd) [(:destination cmd)]) (when (:next-hop cmd) [(:next-hop cmd)]))
                     sender-hex (some (fn [[k v]] (when (= (:net-out v) port) k)) nodes)]
                 (doseq [t targets]
                   (let [target-hex (if (string? t) t (:pubkey t))]
@@ -154,11 +155,12 @@
         stop-ch (async/chan)
         multiplexer (create-multiplexer nodes-map stop-ch)
         tick-interval (:tick-interval-ms config 100)
-        metronome (create-metronome nodes-map stop-ch tick-interval)]
+        metronome (create-metronome nodes-map stop-ch tick-interval)
+        all-peers (mapv :peer (concat bootstraps agents))]
 
     (doseq [agent agents]
       (async/put! (:events-in agent) {:type :receive-push-view
-                                      :view (mapv :peer bootstraps)}))
+                                      :view all-peers}))
 
     {:nodes nodes-map
      :stop-ch stop-ch
