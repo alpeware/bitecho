@@ -1,6 +1,7 @@
 (ns bitecho.shell.core
   "Provides the transparent go-loop shell wrapping the pure bitecho state machine."
-  (:require [bitecho.crypto :as crypto]
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]
             [bitecho.shell.persistence :as persistence]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
@@ -22,7 +23,11 @@
     :turn-allocate-request
     :turn-relay-request
     :route-directed-message
-    :route-directed-ack})
+    :route-directed-ack
+    :receive-directed-message
+    :receive-directed-ack
+    :receive-ping
+    :receive-pong})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."
@@ -99,7 +104,7 @@
                  (let [envelope (:envelope cmd)
                        ticket (:lottery-ticket envelope)
                        proof (or (:proof-of-relay envelope) [])
-                       prev-sig (if (empty? proof) (:signature ticket) (:signature (peek proof)))
+                       prev-sig (if (empty? proof) (basalt/hex->bytes ^String (:signature ticket)) (:signature (peek proof)))
                        sig (crypto/sign private-key prev-sig)
                        receipt {:node (:node-pubkey new-state) :signature sig}
                        new-envelope (assoc envelope :proof-of-relay (conj proof receipt))]

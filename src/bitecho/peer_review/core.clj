@@ -28,7 +28,9 @@
   [original-message proof-sequence]
   (if (empty? proof-sequence)
     true
-    (let [initial-sig (:signature original-message)]
+    (let [initial-sig (if (string? (:signature original-message))
+                        (basalt/hex->bytes ^String (:signature original-message))
+                        (:signature original-message))]
       (loop [receipts proof-sequence
              prev-sig initial-sig]
         (if (empty? receipts)
