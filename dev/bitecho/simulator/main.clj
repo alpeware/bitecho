@@ -13,23 +13,16 @@
     (format "Undefined (%d successful)" success)
     (format "%.2f : 1" (float (/ dropped success)))))
 
-(defn calculate-circuit-lock-time
-  "Calculates the elapsed time for a circuit lock."
-  [start-time end-time]
-  (- end-time start-time))
-
 (defn- create-telemetry-sink
   "Multiplexes all node :app-out channels and spammers' :net-out channels.
    Calculates and prints real-time metrics periodically."
-  [network ping-state]
+  [network]
   (let [nodes (vals (:nodes network))
         honest-nodes (filter #(not= (:type %) :spammer) nodes)
         spammer-nodes (filter #(= (:type %) :spammer) nodes)
 
         app-out-chans (map :app-out honest-nodes)
-        metrics (atom {:time-to-circuit-lock-sum 0
-                       :circuit-lock-count 0
-                       :successful-deliveries 0
+        metrics (atom {:successful-deliveries 0
                        :byzantine-packets-sent 0})
         stop-ch (async/chan)]
 
@@ -48,20 +41,6 @@
           (do
             (when (map? val)
               (case (:event-name val)
-                :on-circuit-locked
-                (let [ping-id (:ping-id val)
-                      now (System/currentTimeMillis)
-                      state-map @ping-state
-                      start-info (get state-map ping-id)]
-                  (when start-info
-                    (swap! ping-state dissoc ping-id)
-                    (swap! metrics (fn [m]
-                                     (-> m
-                                         (update :time-to-circuit-lock-sum + (calculate-circuit-lock-time (:start-time start-info) now))
-                                         (update :circuit-lock-count inc))))
-                    (when-let [action (:action start-info)]
-                      (action))))
-
                 :on-direct-message
                 (swap! metrics update :successful-deliveries inc)
 
@@ -84,13 +63,9 @@
                         emitted (- 42000000 treasury-bal)
 
                         m @metrics
-                        avg-lock (if (> (:circuit-lock-count m) 0)
-                                   (/ (:time-to-circuit-lock-sum m) (:circuit-lock-count m))
-                                   0)
                         dropped (:byzantine-packets-sent m)
                         success (:successful-deliveries m)]
                     (println "\n--- Telemetry Report ---")
-                    (println (format "Time-to-circuit-lock (avg ms): %.2f" (float avg-lock)))
                     (println (format "Total Treasury Emitted (Echos): %d" emitted))
                     (println (format "Byzantine Dropped vs Honest Delivered: %s" (calculate-ratio dropped success)))
                     (println "------------------------\n"))))))
@@ -98,39 +73,29 @@
     stop-ch))
 
 (defn- run-scenario
-  "Commands honest agents to initiate Ping/Pong sequences and payload deliveries."
-  [network ping-state stop-ch]
+  "Commands honest agents to initiate payload deliveries."
+  [network stop-ch]
   (let [nodes (vals (:nodes network))
         agents (filter #(= (:type %) :agent) nodes)
         targets (filterv #(not= (:type %) :spammer) nodes)]
     (async/go-loop []
-      (let [[_ port] (async/alts! [(async/timeout 2000) stop-ch])]
+      (let [[_ port] (async/alts! [(async/timeout 10) stop-ch])]
         (when (not= port stop-ch)
           (let [sender (rand-nth agents)
                 target (rand-nth targets)]
             (when (and sender target (not= (:pubkey-hex sender) (:pubkey-hex target)))
-              ;; Initiate Ping
-              (let [ping-id (str (java.util.UUID/randomUUID))]
-                (swap! ping-state assoc ping-id {:start-time (System/currentTimeMillis)})
-                (async/put! (:events-in sender) {:type :ping-peer
-                                                 :ping-id ping-id
+              (let [keys (:keys sender)
+                    payload-bytes (.getBytes "payload" "UTF-8")
+                    ticket (lottery/generate-ticket :fee payload-bytes 1 (:private keys) (:public keys) 0)
+                    envelope {:encrypted-payload payload-bytes
+                              :lottery-ticket ticket
+                              :forward-circuit [(:pubkey-hex sender) (:pubkey-hex target)]
+                              :return-circuit []}]
+                (async/put! (:events-in sender) {:type :route-directed-message
+                                                 :envelope envelope
                                                  :destination (:pubkey-hex target)
-                                                 :rng (java.util.Random.)})
-
-                ;; Register the payload transmission callback to execute upon circuit lock.
-                (swap! ping-state assoc-in [ping-id :action]
-                       (fn []
-                         (let [keys (:keys sender)
-                               payload-bytes (.getBytes "payload" "UTF-8")
-                               ticket (lottery/generate-ticket :fee payload-bytes 1 (:private keys) (:public keys) 0)
-                               envelope {:payload "payload"
-                                         :lottery-ticket ticket
-                                         :forward-circuit [(:pubkey-hex sender) (:pubkey-hex target)]
-                                         :return-circuit []}]
-                           (async/put! (:events-in sender) {:type :route-directed-message
-                                                            :envelope envelope
-                                                            :payout-amount 10
-                                                            :rng (java.util.Random.)})))))))
+                                                 :payout-amount 10
+                                                 :rng (java.util.Random.)}))))
           (recur))))))
 
 (defn -main
@@ -141,15 +106,14 @@
                 :agents 15
                 :spammers 3
                 :tick-interval-ms 100}
-        network (sim/start-network config)
-        ping-state (atom {})]
+        network (sim/start-network config)]
 
     (println "Network booted.")
 
-    (let [telemetry-stop-ch (create-telemetry-sink network ping-state)
+    (let [telemetry-stop-ch (create-telemetry-sink network)
           scenario-stop-ch (async/chan)]
 
-      (run-scenario network ping-state scenario-stop-ch)
+      (run-scenario network scenario-stop-ch)
 
       ;; Run for 20 seconds, then shutdown
       (Thread/sleep 20000)

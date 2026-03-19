@@ -84,12 +84,14 @@
       :send-directed-message
       (async/put! (:network-in target-node) {:type :receive-directed-message
                                              :sender sender-hex
-                                             :envelope (:envelope cmd)})
+                                             :envelope (:envelope cmd)
+                                             :rng (java.util.Random.)})
       :ping-peer
       (async/put! (:network-in target-node) {:type :receive-ping
                                              :sender sender-hex
                                              :path (:path cmd)
-                                             :ping-id (:ping-id cmd)})
+                                             :ping-id (:ping-id cmd)
+                                             :rng (java.util.Random.)})
       :pong-peer
       (async/put! (:network-in target-node) {:type :receive-pong
                                              :sender sender-hex
@@ -98,7 +100,8 @@
       :send-directed-ack
       (async/put! (:network-in target-node) {:type :receive-directed-ack
                                              :sender sender-hex
-                                             :envelope (:envelope cmd)})
+                                             :envelope (:envelope cmd)
+                                             :rng (java.util.Random.)})
       :send-quorum-settlement
       (async/put! (:events-in target-node) {:type :receive-quorum-settlement
                                             :ticket (:ticket cmd)
