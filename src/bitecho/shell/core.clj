@@ -12,6 +12,8 @@
   [cmd]
   (let [t (:type cmd)]
     (or (= :network-out t)
+        (= :ping-peer t)
+        (= :pong-peer t)
         (and (keyword? t) (str/starts-with? (name t) "send-"))
         (and (keyword? t) (str/starts-with? (name t) "route-")))))
 

@@ -445,7 +445,10 @@
       ;; Forward ping towards destination
       (let [rng (:rng event)
             utxos (:utxos (:ledger state))
-            next-hop (weighted/select-next-hop rng (:basalt-view state) utxos)
+            view (:basalt-view state)
+            ;; First check if the destination is already in our view
+            direct-peer (some #(when (= dest (if (string? (:pubkey %)) (:pubkey %) (basalt/bytes->hex (:pubkey %)))) %) view)
+            next-hop (or direct-peer (weighted/select-next-hop rng view utxos))
             new-state (if (empty? path)
                         (assoc-in state [:pending-circuits dest] {:epoch (or (:epoch state) 0)})
                         state)]
