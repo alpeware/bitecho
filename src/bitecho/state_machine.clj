@@ -247,6 +247,7 @@
                       {:type :sign-and-forward
                        :target (first return-circuit)
                        :out-type :send-directed-ack
+                       :payout-amount (:payout-amount event)
                        :envelope (assoc envelope
                                         :forward-circuit return-circuit
                                         :return-circuit (list claimer-pubkey))}]}
@@ -255,6 +256,7 @@
            :commands [{:type :sign-and-forward
                        :target (first new-forward)
                        :out-type :send-directed-message
+                       :payout-amount (:payout-amount event)
                        :envelope (assoc envelope
                                         :forward-circuit new-forward
                                         :return-circuit new-return)}]}))
@@ -296,6 +298,8 @@
                 ;; Check if we successfully claimed a :mint ticket
                 ticket-claimed? (not= (:ledger state) new-ledger)
                 mint-ticket? (= :mint (:ticket-type ticket))
+                _ (when ticket-claimed?
+                    (println "WINNING TICKET REGISTERED! Node:" claimer-pubkey))
                 rng (:rng event)
                 utxos (:utxos new-ledger)
                 ;; If we won a mint ticket, we must initiate quorum settlement
@@ -304,6 +308,7 @@
                 forward-command {:type :sign-and-forward
                                  :target (first new-forward)
                                  :out-type :send-directed-ack
+                                 :payout-amount (:payout-amount event)
                                  :envelope (assoc envelope
                                                   :forward-circuit new-forward
                                                   :return-circuit new-return)}

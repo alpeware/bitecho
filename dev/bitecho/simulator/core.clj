@@ -85,6 +85,7 @@
       (async/put! (:network-in target-node) {:type :receive-directed-message
                                              :sender sender-hex
                                              :envelope (:envelope cmd)
+                                             :payout-amount (:payout-amount cmd)
                                              :rng (java.util.Random.)})
       :ping-peer
       (async/put! (:network-in target-node) {:type :receive-ping
@@ -102,14 +103,17 @@
       (async/put! (:network-in target-node) {:type :receive-directed-ack
                                              :sender sender-hex
                                              :envelope (:envelope cmd)
+                                             :payout-amount (:payout-amount cmd)
                                              :rng (java.util.Random.)})
       :send-quorum-settlement
-      (async/put! (:events-in target-node) {:type :receive-quorum-settlement
-                                            :ticket (:ticket cmd)
-                                            :proof-of-relay (:proof-of-relay cmd)
-                                            :claimer-pubkey (:claimer-pubkey cmd)
-                                            :payout-amount (:payout-amount cmd)
-                                            :rng (java.util.Random.)})
+      (do
+        (println "SIMULATOR ROUTING QUORUM SETTLEMENT TO TARGET:" target-hex)
+        (async/put! (:network-in target-node) {:type :receive-quorum-settlement
+                                               :ticket (:ticket cmd)
+                                               :proof-of-relay (:proof-of-relay cmd)
+                                               :claimer-pubkey (:claimer-pubkey cmd)
+                                               :payout-amount (:payout-amount cmd)
+                                               :rng (java.util.Random.)}))
       nil)))
 
 (defn- create-multiplexer
