@@ -29,7 +29,8 @@
     :receive-directed-message
     :receive-directed-ack
     :receive-ping
-    :receive-pong})
+    :receive-pong
+    :receive-quorum-settlement})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."

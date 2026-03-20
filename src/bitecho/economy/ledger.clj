@@ -48,10 +48,14 @@
                       difficulty-hex)]
     (if (and (lottery/winning-ticket? ticket target-diff)
              (not (contains? (:claimed-tickets ledger) ticket-hash)))
-      (let [puzzle-hash (standard-puzzle-hash claimer-pubkey)]
+      (let [puzzle-hash (standard-puzzle-hash claimer-pubkey)
+            treasury-hash "0000000000000000000000000000000000000000000000000000000000000000"
+            new-treasury-bal (- (or (:amount (get-in ledger [:utxos treasury-hash])) treasury-balance) payout-amount)]
+        (println "Ledger mutating: Agent UTXO created for" claimer-pubkey "amount" payout-amount)
         (-> ledger
             (assoc-in [:utxos ticket-hash] {:amount payout-amount :puzzle-hash puzzle-hash})
-            (assoc-in [:claimed-tickets ticket-hash] true)))
+            (assoc-in [:claimed-tickets ticket-hash] true)
+            (assoc-in [:utxos treasury-hash] {:amount new-treasury-bal :puzzle-hash treasury-hash})))
       ledger)))
 
 (defn- valid-puzzle-execution?

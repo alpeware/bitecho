@@ -122,7 +122,11 @@
                        (fn []
                          (let [keys (:keys sender)
                                payload-bytes (.getBytes "payload" "UTF-8")
-                               ticket (lottery/generate-ticket :fee payload-bytes 1 (:private keys) (:public keys) 0)
+                               ticket (loop [nonce 0]
+                                        (let [t (lottery/generate-ticket :mint payload-bytes nonce (:private keys) (:public keys) 0)]
+                                          (if (lottery/winning-ticket? t "00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+                                            t
+                                            (recur (inc nonce)))))
                                envelope {:payload "payload"
                                          :lottery-ticket ticket
                                          :forward-circuit [(:pubkey-hex sender) (:pubkey-hex target)]
