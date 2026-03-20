@@ -7,7 +7,7 @@
             [clojure.core.async :as async]))
 
 ;; Configuration
-(def total-nodes 50)
+(def total-nodes 55)
 (def byzantine-nodes 5)
 (def honest-nodes (- total-nodes byzantine-nodes))
 (def tick-interval-ms 20)

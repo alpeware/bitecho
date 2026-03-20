@@ -24,7 +24,7 @@
 
 (def basalt-max-view-size
   "Maximum number of peers to keep in the Basalt view."
-  50)
+  200)
 
 (def gossip-ttl-epochs
   "Maximum number of epochs to keep a gossip message in the cache."
