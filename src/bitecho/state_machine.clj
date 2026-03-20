@@ -127,6 +127,13 @@
                    :message-epochs new-epochs)
      :commands commands}))
 
+(defn- handle-contagion-broadcast
+  "Handles an internal request to broadcast a payload, specifically emitting :on-deliver for simulator E2E."
+  [state event]
+  (let [{new-state :state commands :commands} (handle-broadcast state (assoc event :type :broadcast))]
+    {:state new-state
+     :commands (conj commands {:type :app-event :event-name :on-deliver :payload (:payload event)})}))
+
 (defn- handle-receive-push-view
   "Handles an incoming Basalt view exchange."
   [state event]
@@ -180,6 +187,9 @@
                          :message (:message gossip-result)}]
                        [])
             new-message? (some? (:message gossip-result))
+            commands (if new-message?
+                       (conj commands {:type :app-event :event-name :on-deliver :payload (:payload message)})
+                       commands)
             new-known-ids (if new-message?
                             (conj (:contagion-known-ids state) (:message-id message))
                             (:contagion-known-ids state))
@@ -495,6 +505,7 @@
    returns a map with :state (new state) and :commands (side-effects to perform)."
   [state event]
   (case (:type event)
+    :contagion-broadcast (handle-contagion-broadcast state event)
     :ping-peer (handle-ping-peer state event)
     :pong-peer (handle-pong-peer state event)
     :tick (handle-tick state event)

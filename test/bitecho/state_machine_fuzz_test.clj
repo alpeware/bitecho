@@ -98,6 +98,8 @@
         :send-gossip
         [target-id {:type :receive-gossip :message (:message cmd) :rng rng}]
 
+        :app-event nil
+
         :turn-allocate-granted nil
         :relay-data nil
 
@@ -138,7 +140,7 @@
               (let [target-id (.nextInt rng n)
                     event (case event-type
                             :tick {:type :tick :rng rng}
-                            :broadcast {:type :broadcast
+                            :broadcast {:type :contagion-broadcast
                                         :payload payload
                                         :private-key (:private (:keys (get cluster target-id)))
                                         :public-key (:public (:keys (get cluster target-id)))
