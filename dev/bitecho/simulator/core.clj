@@ -89,6 +89,7 @@
       :ping-peer
       (async/put! (:network-in target-node) {:type :receive-ping
                                              :sender sender-hex
+                                             :destination (:destination cmd)
                                              :path (:path cmd)
                                              :ping-id (:ping-id cmd)
                                              :rng (java.util.Random.)})
