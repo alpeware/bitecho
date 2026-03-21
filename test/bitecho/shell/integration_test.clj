@@ -110,7 +110,7 @@
 
           ;; 4. Initialize nodes
           ;; Bootstrap peer record as seen by agents
-          boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
+          boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
 
           boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex (:private boot-keys)])
           a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex (:private a1-keys)])
@@ -142,10 +142,10 @@
 
         ;; 6. The Action: Inject Broadcast to Agent 1
         ;; Manually connect the views to ensure they are fully populated before broadcast
-        (let [boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
-              a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
-              a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}
-              a3-peer {:ip "127.0.0.1" :port 8003 :pubkey a3-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a3-keys)))}]
+        (let [boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
+              a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
+              a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}
+              a3-peer {:ip "127.0.0.1" :port 8003 :pubkey a3-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a3-keys)))}]
           (async/put! (:network-in (:node a1-chans)) {:type :receive-push-view :view #{boot-peer a2-peer a3-peer}})
           (async/put! (:network-in (:node a2-chans)) {:type :receive-push-view :view #{boot-peer a1-peer a3-peer}})
           (async/put! (:network-in (:node a3-chans)) {:type :receive-push-view :view #{boot-peer a1-peer a2-peer}}))
@@ -228,7 +228,7 @@
           _a3-dac (delegation/generate-dac boot-pubkey-hex (:private boot-keys) a3-pubkey-hex)
 
           ;; 4. Initialize nodes with persistence files keyed by pubkey
-          boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
+          boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
 
           boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex (:private boot-keys)])
           a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex (:private a1-keys)])
@@ -262,9 +262,9 @@
           (async/<!! (async/timeout 100))
 
           ;; 6. The Action: Inject Directed Message to Agent 1 targeted at Agent 3
-          (let [a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
-                a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}
-                a3-peer {:ip "127.0.0.1" :port 8003 :pubkey a3-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a3-keys)))}]
+          (let [a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
+                a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}
+                a3-peer {:ip "127.0.0.1" :port 8003 :pubkey a3-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a3-keys)))}]
             ;; Note: select-next-hop falls back to unweighted random if balances are missing/zero.
             ;; So A1 routes to A2. A2 routes to A3.
             (async/put! (:network-in (:node a1-chans)) {:type :receive-push-view :view #{a2-peer}})
@@ -368,7 +368,7 @@
           a2-pubkey-hex (basalt/bytes->hex (:public a2-keys))
 
           ;; 3. Initialize nodes
-          boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
+          boot-peer {:ip "127.0.0.1" :port 8000 :pubkey boot-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public boot-keys)))}
 
           boot-chans (create-node-channels boot-pubkey-hex :bootstrap boot-shell/init-node [boot-pubkey-hex (:private boot-keys)])
           a1-chans (create-node-channels a1-pubkey-hex :agent agent-shell/init-node [boot-peer a1-pubkey-hex (:private a1-keys)])
@@ -397,8 +397,8 @@
           (async/<!! (async/timeout 500))
 
           ;; 6. Setup topology: A1 -> Boot -> A2
-          (let [a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
-                a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :age 0 :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}]
+          (let [a1-peer {:ip "127.0.0.1" :port 8001 :pubkey a1-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a1-keys)))}
+                a2-peer {:ip "127.0.0.1" :port 8002 :pubkey a2-pubkey-hex :hash (basalt/bytes->hex (crypto/sha256 (:public a2-keys)))}]
             (async/put! (:network-in (:node a1-chans)) {:type :receive-push-view :view #{boot-peer}})
             (async/put! (:network-in (:node a2-chans)) {:type :receive-push-view :view #{boot-peer}})
             (async/put! (:network-in (:node boot-chans)) {:type :receive-push-view :view #{a1-peer a2-peer}}))

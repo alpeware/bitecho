@@ -20,7 +20,7 @@
     (basalt/make-peer ip port pubkey)))
 
 (def ^{:doc "Generator for Basalt views"} gen-view
-  (gen/fmap basalt/init-view (gen/vector gen-peer 0 10)))
+  (gen/vector gen-peer 0 10))
 
 (def ^{:doc "Generator for byte array payloads"} gen-payload
   (gen/fmap byte-array (gen/vector gen/byte)))
@@ -35,7 +35,7 @@
                 (let [rng (java.util.Random. seed)
                       result (murmur/initiate-broadcast payload rng view k)
                       expected-id (basalt/bytes->hex (crypto/sha256 payload))
-                      expected-target-count (min k (count view))]
+                      expected-target-count (min k (count (set view)))]
                   (and
                    (= expected-id (:message-id result))
                    (= (seq payload) (seq (:payload result)))
@@ -63,11 +63,12 @@
                 (let [rng (java.util.Random. seed)
                       empty-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
                       result (murmur/receive-gossip empty-cache msg rng view k max-cache-size)
-                      expected-target-count (min k (count view))]
+                      expected-target-count (min k (count (set view)))]
                   (and
                    (contains? (-> result :cache :set) (:message-id msg))
                    (= msg (:message result))
                    (= expected-target-count (count (:forward-targets result)))
+                   (= (set (:forward-targets result)) (set (take expected-target-count (:forward-targets result))))
                    (set/subset? (set (:forward-targets result)) (set view))))))
 
 (defspec ^{:doc "receive-gossip drops seen messages"}
@@ -96,12 +97,13 @@
 
   (testing "k greater than view size returns all view elements"
     (let [rng (java.util.Random. 42)
-          view (basalt/init-view [(basalt/make-peer "127.0.0.1" 8080 (:public (crypto/generate-keypair)))
-                                  (basalt/make-peer "127.0.0.1" 8081 (:public (crypto/generate-keypair)))])
+          peers [(basalt/make-peer "127.0.0.1" 8080 (:public (crypto/generate-keypair)))
+                 (basalt/make-peer "127.0.0.1" 8081 (:public (crypto/generate-keypair)))]
+          view peers
           payload (.getBytes "hello")
           result (murmur/initiate-broadcast payload rng view 5)]
       (is (= 2 (count (:targets result))))
-      (is (= view (set (:targets result)))))))
+      (is (= (set view) (set (:targets result)))))))
 
 (deftest ^{:doc "Test cache eviction in receive-gossip"} test-receive-gossip-cache
   (testing "cache evicts oldest element when max-cache-size is exceeded"

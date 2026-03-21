@@ -32,7 +32,7 @@
           filepath (.getAbsolutePath temp-file)
           queue (into clojure.lang.PersistentQueue/EMPTY [1 2 3])
           state {:murmur-cache {:queue queue :set #{1 2 3}}
-                 :basalt-view #{{:pubkey "abc" :age 1}}
+                 :basalt-view #{{:pubkey "abc"}}
                  :contagion-known-ids #{"a" "b"}
                  :channels {"chan1" {:pubkey-a "a" :balance-a 100}}}
           _ (persistence/save-state-to-disk filepath state)
@@ -40,7 +40,7 @@
       (is (instance? clojure.lang.PersistentQueue (get-in loaded [:murmur-cache :queue])))
       (is (= '(1 2 3) (seq (get-in loaded [:murmur-cache :queue]))))
       (is (= #{1 2 3} (get-in loaded [:murmur-cache :set])))
-      (is (= #{{:pubkey "abc" :age 1}} (:basalt-view loaded)))
+      (is (= #{{:pubkey "abc"}} (:basalt-view loaded)))
       (is (= #{"a" "b"} (:contagion-known-ids loaded)))
       (is (= 100 (get-in loaded [:channels "chan1" :balance-a])))
       (.delete temp-file))))

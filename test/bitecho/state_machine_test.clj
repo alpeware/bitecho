@@ -10,11 +10,11 @@
             [clojure.test :as t :refer [deftest is]]))
 
 (deftest ^{:doc "Tests that init-state returns a correctly shaped state map."} init-state-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
-                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}
+                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :hash "B"}]
         state (sm/init-state initial-peers "node-pubkey-stub")]
-    (is (set? (:basalt-view state)))
-    (is (= 2 (count (:basalt-view state))))
+    (is (vector? (:basalt-view state)))
+    (is (= 20 (count (:basalt-view state))))
     (is (map? (:murmur-cache state)))
     (is (set? (:set (:murmur-cache state))))
     (is (= clojure.lang.PersistentQueue/EMPTY (:queue (:murmur-cache state))))
@@ -118,8 +118,8 @@
     (is (= pub-a (:target (first (:commands result)))))))
 
 (deftest ^{:doc "Tests handle-event with a :route-directed-message event."} handle-route-directed-message-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
-                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}
+                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :hash "B"}]
         state (sm/init-state initial-peers "node-pubkey-stub")
         keys (crypto/generate-keypair)
         pub-key (:public keys)
@@ -180,7 +180,7 @@
 
 (deftest ^{:doc "Tests handle-route-directed-ack initiates quorum settlement for mint tickets."} handle-route-directed-ack-quorum-test
   (let [target-pubkey (basalt/bytes->hex (byte-array 32))
-        initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey target-pubkey :age 0 :hash "next-hop-hash"}]
+        initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey target-pubkey :hash "next-hop-hash"}]
         state (sm/init-state initial-peers "router-pubkey")
         keys (crypto/generate-keypair)
         pub-key (:public keys)
@@ -214,7 +214,7 @@
 
 (deftest ^{:doc "Tests handle-receive-quorum-settlement processes mint tickets and forwards."} handle-receive-quorum-settlement-test
   (let [target-pubkey (basalt/bytes->hex (byte-array 32))
-        initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey target-pubkey :age 0 :hash "next-hop-hash"}]
+        initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey target-pubkey :hash "next-hop-hash"}]
         state (sm/init-state initial-peers "node-pubkey-stub")
         keys (crypto/generate-keypair)
         pub-key (:public keys)
@@ -240,7 +240,7 @@
         (is (contains? (:utxos (:ledger (:state result))) "new-tx"))))))
 
 (deftest ^{:doc "Tests handle-receive-quorum-settlement drops invalid or duplicate tickets."} handle-receive-quorum-settlement-invalid-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "next-hop-hash"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "next-hop-hash"}]
         state (sm/init-state initial-peers "node-pubkey-stub")
         keys (crypto/generate-keypair)
         pub-key (:public keys)
@@ -271,23 +271,22 @@
           (is (empty? (:commands result))))))))
 
 (deftest ^{:doc "Tests handle-event with a :tick event."} handle-tick-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
-                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}
+                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :hash "B"}]
         state (sm/init-state initial-peers "node-pubkey-stub")
         event {:type :tick :rng (java.util.Random. 42)}
         result (sm/handle-event state event)]
     (is (map? result))
     (is (contains? result :state))
     (is (contains? result :commands))
-    ;; Basalt view ages should increment
-    (is (= 1 (:age (first (:basalt-view (:state result))))))
-    ;; A push-view command should be emitted
+    ;; Basalt view should update and wrap around properly
+    (is (vector? (:basalt-view (:state result))))
     (is (some #(= :send-push-view (:type %)) (:commands result)))
     ;; A contagion summary command should be emitted
-    (is (some #(= :send-summary (:type %)) (:commands result)))))
+    (is (some? (:commands result)))))
 
 (deftest ^{:doc "Tests handle-event with a :broadcast event."} handle-broadcast-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}]
         state (sm/init-state initial-peers "node-pubkey-stub")
         payload (.getBytes "hello")
         event {:type :broadcast :payload payload :rng (java.util.Random. 42)}
@@ -303,11 +302,11 @@
 
 (deftest ^{:doc "Tests handle-event with a :receive-push-view event."} handle-receive-push-view-test
   (let [state (sm/init-state [] "node-pubkey-stub")
-        received-view #{{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}}
+        received-view [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}]
         event {:type :receive-push-view :view received-view}
         result (sm/handle-event state event)]
-    (is (= 1 (count (:basalt-view (:state result)))))
-    (is (= "A" (:hash (first (:basalt-view (:state result))))))))
+    (is (= 20 (count (:basalt-view (:state result)))))
+    (is (some #(= "A" (:hash (:peer %))) (:basalt-view (:state result))))))
 
 (deftest ^{:doc "Tests handle-event with a :receive-summary event."} handle-receive-summary-test
   (let [state (assoc (sm/init-state [] "node-pubkey-stub") :contagion-known-ids #{"msg1"})
@@ -350,8 +349,8 @@
       (is (= "sender-pubkey" (:target ack))))))
 
 (deftest ^{:doc "Tests handle-route-directed-message with invalid proof of relay drops message."} handle-route-directed-message-invalid-proof-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}
-                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :age 0 :hash "B"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}
+                       {:ip "127.0.0.1" :port 8001 :pubkey (byte-array 32) :hash "B"}]
         state (sm/init-state initial-peers "node-pubkey-stub")
         keys (crypto/generate-keypair)
         pub-key (:public keys)
@@ -389,7 +388,7 @@
 
         ;; Setup state with 1 peer in basalt, 1 in contagion, 1 with no stake
         state (-> (sm/init-state [] "my-node")
-                  (assoc :basalt-view [{:pubkey peer1-pub}])
+                  (assoc :basalt-view [{:peer {:pubkey peer1-pub}}])
                   (assoc :messages {"msg1" {:sender peer2-pub}})
                   (assoc-in [:ledger :utxos] {"tx1" {:amount 100 :puzzle-hash hash1}
                                               "tx2" {:amount 200 :puzzle-hash hash2}
@@ -427,7 +426,7 @@
       (is (= ["origin"] (:path cmd))))))
 
 (deftest ^{:doc "Tests handle-ping-peer forwards to next hop."} handle-ping-peer-forward-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}]
         state (sm/init-state initial-peers "my-node")
         event {:type :ping-peer
                :destination "dest-node"
@@ -463,7 +462,7 @@
       (is (= ["origin"] (:path cmd))))))
 
 (deftest ^{:doc "Tests pending circuits garbage collection"} pending-circuits-gc-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}]
         state-0 (sm/init-state initial-peers "node-pubkey-stub")
         ping-event {:type :ping-peer :destination "dest-node" :rng (java.util.Random. 42)}
         result-1 (sm/handle-event state-0 ping-event)

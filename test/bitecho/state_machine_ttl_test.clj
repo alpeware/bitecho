@@ -3,7 +3,7 @@
             [clojure.test :refer [deftest is]]))
 
 (deftest ^{:doc "Tests that old messages are pruned from contagion-known-ids and messages maps based on TTL"} gossip-ttl-pruning-test
-  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :age 0 :hash "A"}]
+  (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}]
         state-0 (sm/init-state initial-peers "node-pubkey-stub")
         ;; Broadcast a message to insert it
         broadcast-event {:type :broadcast :payload (.getBytes "hello") :rng (java.util.Random. 42)}
