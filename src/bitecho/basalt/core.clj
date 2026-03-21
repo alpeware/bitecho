@@ -2,7 +2,7 @@
   "Core logic for Basalt peer sampling protocol."
   (:require [bitecho.crypto :as crypto]))
 
-(defrecord Peer [ip port pubkey age hash])
+(defrecord Peer [ip port pubkey hash])
 
 (defn bytes->hex
   "Converts a byte array to a hex string."
@@ -47,54 +47,95 @@
     (.put bb port-bytes)
     (.put bb (byte 124))
     (.put bb pubkey)
-    (->Peer ip port (bytes->hex pubkey) 0 (bytes->hex (crypto/sha256 hash-input)))))
+    (->Peer ip port (bytes->hex pubkey) (bytes->hex (crypto/sha256 hash-input)))))
+
+(defn rank
+  "Calculates the cryptographic rank of a peer for a given slot seed.
+   Concatenates the slot seed and the peer's hash, computes SHA-256,
+   and returns the hex string representation."
+  [^String seed ^String peer-hash]
+  (let [seed-bytes (.getBytes seed "UTF-8")
+        hash-bytes (.getBytes peer-hash "UTF-8")
+        input (byte-array (+ (count seed-bytes) (count hash-bytes)))
+        bb (java.nio.ByteBuffer/wrap input)]
+    (.put bb seed-bytes)
+    (.put bb hash-bytes)
+    (bytes->hex (crypto/sha256 input))))
+
+(defn update-view
+  "Performs greedy optimization on the view.
+   For each slot in the view, and for each received peer, evaluates the rank.
+   If the slot is empty or the new rank is strictly less than the current peer's rank,
+   the slot's peer is replaced."
+  [view received-peers]
+  (reduce (fn [v peer]
+            (mapv (fn [slot]
+                    (let [new-rank (rank (:seed slot) (:hash peer))]
+                      (if (or (nil? (:peer slot))
+                              (let [current-rank (rank (:seed slot) (:hash (:peer slot)))]
+                                (neg? (compare new-rank current-rank))))
+                        (assoc slot :peer peer)
+                        slot)))
+                  v))
+          view
+          received-peers))
 
 (defn init-view
-  "Initializes a new Basalt view (a set of peers) from an initial collection of peer records.
-   Removes duplicate peers based on hash."
-  [initial-peers]
-  (reduce (fn [view peer]
-            (if (some #(= (:hash %) (:hash peer)) view)
-              view
-              (conj view peer)))
-          #{}
-          initial-peers))
+  "Initializes a new Basalt view (a vector of v slots) from an initial collection of peers.
+   Generates view-size random seeds and immediately populates slots via update-view."
+  [initial-peers view-size ^java.util.Random rng]
+  (let [slots (vec (repeatedly view-size
+                               #(let [seed-bytes (byte-array 32)]
+                                  (.nextBytes rng seed-bytes)
+                                  {:seed (bytes->hex seed-bytes) :peer nil})))]
+    (if (empty? initial-peers)
+      slots
+      (update-view slots initial-peers))))
 
-(defn increment-ages
-  "Increments the age of all peers in the view by 1."
+(defn extract-peers
+  "Extracts all distinct, non-nil peers currently held in the view's slots."
   [view]
-  (set (map #(update % :age inc) view)))
+  (->> view
+       (map :peer)
+       (remove nil?)
+       (reduce (fn [acc peer]
+                 (if (some #(= (:hash %) (:hash peer)) acc)
+                   acc
+                   (conj acc peer)))
+               [])))
+
+(defn reset-slots
+  "Resets k slots starting at index r (with wrap-around).
+   Yields the previous peers from those slots, generates new random seeds,
+   and repopulates the empty slots using all remaining peers in the view.
+   Returns {:view updated-view :samples extracted-peers :next-r new-r}."
+  [view ^java.util.Random rng r k]
+  (let [size (count view)
+        indices (map #(mod (+ r %) size) (range k))
+        samples (keep :peer (map #(get view %) indices))
+        cleared-view (reduce (fn [v idx]
+                               (let [seed-bytes (byte-array 32)]
+                                 (.nextBytes rng seed-bytes)
+                                 (assoc v idx {:seed (bytes->hex seed-bytes) :peer nil})))
+                             view
+                             indices)
+        remaining-peers (extract-peers cleared-view)
+        updated-view (update-view cleared-view remaining-peers)]
+    {:view updated-view
+     :samples samples
+     :next-r (mod (+ r k) size)}))
 
 (defn select-peers
   "Selects up to k random peers from the view for exchange.
    To ensure determinism and purity in tests, it accepts a java.util.Random instance
-   and uses it to shuffle the view before taking the first k elements."
+   and uses it to shuffle the extracted peers before taking the first k elements."
   [^java.util.Random rng view k]
-  (let [view-seq (vec view)
-        size (count view-seq)]
+  (let [peers (if (and (vector? view) (some #(contains? % :seed) view))
+                (extract-peers view)
+                (seq view))
+        size (count peers)]
     (if (zero? size)
       ()
-      (let [shuffled (java.util.ArrayList. view-seq)]
+      (let [shuffled (java.util.ArrayList. peers)]
         (java.util.Collections/shuffle shuffled rng)
         (take k shuffled)))))
-
-(defn- dedup-peers
-  "Deduplicates a collection of peers by hash, keeping the peer with the minimum age."
-  [peers]
-  (vals (reduce (fn [acc peer]
-                  (let [existing (get acc (:hash peer))]
-                    (if (or (nil? existing) (< (:age peer) (:age existing)))
-                      (assoc acc (:hash peer) peer)
-                      acc)))
-                {}
-                peers)))
-
-(defn merge-views
-  "Merges the local view and received view. Removes duplicates by keeping the youngest.
-   Sorts by age and hash, and keeps up to max-size elements."
-  [local-view received-view max-size]
-  (let [all-peers (concat local-view received-view)
-        deduped (dedup-peers all-peers)
-        sorted (sort-by (juxt :age :hash) deduped)
-        selected (take max-size sorted)]
-    (set selected)))

@@ -46,7 +46,7 @@
                           [i {:ip (str "127.0.0." i)
                               :port (+ 8000 i)
                               :pubkey (:public (get node-keys i))
-                              :age 0
+
                               :hash (str "hash-" i)}]))]
     (into {}
           (for [i node-ids]

@@ -12,7 +12,7 @@
         targets (basalt/select-peers rng view k)]
     {:message-id message-id
      :payload payload
-     :targets targets}))
+     :targets (distinct targets)}))
 
 (defn- update-cache
   "Adds a message-id to the cache and evicts the oldest if max-size is exceeded.
@@ -43,5 +43,5 @@
       (let [new-cache (update-cache seen-cache message-id max-cache-size)
             targets (basalt/select-peers rng view k)]
         {:cache new-cache
-         :forward-targets targets
+         :forward-targets (distinct targets)
          :message message}))))

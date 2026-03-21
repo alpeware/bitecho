@@ -16,7 +16,6 @@
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
-              :age 0
               :hash (basalt/bytes->hex (crypto/sha256 (:public keys)))}]
     {:type :bootstrap
      :pubkey-hex pubkey-hex
@@ -38,7 +37,6 @@
         peer {:ip "127.0.0.1"
               :port (+ 9000 i)
               :pubkey pubkey-hex
-              :age 0
               :hash (basalt/bytes->hex (crypto/sha256 (:public keys)))}]
     {:type :agent
      :pubkey-hex pubkey-hex

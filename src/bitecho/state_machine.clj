@@ -40,7 +40,8 @@
   [initial-peers node-pubkey]
   {:node-pubkey node-pubkey
    :epoch 0
-   :basalt-view (basalt/init-view initial-peers)
+   :basalt-index 0
+   :basalt-view (basalt/init-view initial-peers basalt-max-view-size (java.util.Random. 42))
    :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
    :sieve-history {}
    :contagion-known-ids #{}
@@ -51,18 +52,21 @@
    :pending-circuits {}})
 
 (defn- handle-tick
-  "Handles a periodic tick event to drive Basalt age updates, views, and Contagion anti-entropy."
+  "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
   (let [new-epoch (inc (or (:epoch state) 0))
         view (:basalt-view state)
-        new-view (basalt/increment-ages view)
         rng (:rng event)
+        reset-result (basalt/reset-slots view rng (:basalt-index state) 1)
+        new-view (:view reset-result)
+        new-index (:next-r reset-result)
+        extracted-peers (basalt/extract-peers new-view)
         push-targets (basalt/select-peers rng new-view 1)
         push-command (when (seq push-targets)
                        {:type :send-push-view
                         :targets push-targets
-                        :view new-view})
-        summary (contagion/generate-summary rng new-view (:contagion-known-ids state))
+                        :view extracted-peers})
+        summary (contagion/generate-summary rng extracted-peers (:contagion-known-ids state))
         summary-command (when summary
                           {:type :send-summary
                            :target (:target summary)
@@ -85,6 +89,7 @@
     {:state (assoc state
                    :epoch new-epoch
                    :basalt-view new-view
+                   :basalt-index new-index
                    :murmur-cache pruned-murmur-cache
                    :contagion-known-ids pruned-known-ids
                    :messages pruned-messages
@@ -97,12 +102,13 @@
   [state event]
   (let [payload (:payload event)
         rng (:rng event)
+        extracted-peers (basalt/extract-peers (:basalt-view state))
         sieve-message (if (and (:private-key event) (:public-key event))
                         (sieve/wrap-message payload (:private-key event) (:public-key event))
                         {:payload payload :sender "local" :signature (byte-array 0)})
         ;; For debugging, make sure there are targets and commands are emitted.
         ;; When the test fails, print out the targets.
-        broadcast-result (murmur/initiate-broadcast payload rng (:basalt-view state) murmur-k)
+        broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
         message-id (:message-id broadcast-result)
         message (assoc sieve-message :message-id message-id)
         commands (if (seq (:targets broadcast-result))
@@ -110,7 +116,7 @@
                      :targets (:targets broadcast-result)
                      :message message}]
                    [])
-        _ (when (empty? (:targets broadcast-result)) (println "WARNING: broadcast had no targets! View size:" (count (:basalt-view state))))
+        _ (when (empty? (:targets broadcast-result)) (println "WARNING: broadcast had no targets! View size:" (count extracted-peers)))
         ;; We implicitly add our own broadcasts to the known ids and cache
         new-cache-set (conj (:set (:murmur-cache state)) message-id)
         new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
@@ -141,8 +147,8 @@
 (defn- handle-receive-push-view
   "Handles an incoming Basalt view exchange."
   [state event]
-  (let [received-view (:view event)
-        new-view (basalt/merge-views (:basalt-view state) received-view basalt-max-view-size)]
+  (let [received-peers (:view event)
+        new-view (basalt/update-view (:basalt-view state) received-peers)]
     {:state (assoc state :basalt-view new-view)
      :commands []}))
 
@@ -184,7 +190,8 @@
         rng (:rng event)
         valid-signature? (sieve/validate-message message)]
     (if valid-signature?
-      (let [gossip-result (murmur/receive-gossip (:murmur-cache state) message rng (:basalt-view state) murmur-k murmur-max-cache-size)
+      (let [extracted-peers (basalt/extract-peers (:basalt-view state))
+            gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
             commands (if (seq (:forward-targets gossip-result))
                        [{:type :send-gossip
                          :targets (:forward-targets gossip-result)
@@ -218,7 +225,7 @@
   [state]
   (let [utxos (:utxos (:ledger state))
         ;; Extract known pubkeys from basalt-view
-        view-pubkeys (map :pubkey (:basalt-view state))
+        view-pubkeys (map :pubkey (basalt/extract-peers (:basalt-view state)))
         ;; Extract known pubkeys from contagion messages
         message-senders (map :sender (vals (:messages state)))
         ;; Distinct set of all known pubkeys in hex format
@@ -318,7 +325,7 @@
                 utxos (:utxos new-ledger)
                 ;; If we won a mint ticket, we must initiate quorum settlement
                 quorum-target (when (and ticket-claimed? mint-ticket?)
-                                (weighted/select-next-hop rng (:basalt-view state) utxos))
+                                (weighted/select-next-hop rng (basalt/extract-peers (:basalt-view state)) utxos))
                 forward-command {:type :sign-and-forward
                                  :target (first new-forward)
                                  :out-type :send-directed-ack
@@ -357,7 +364,7 @@
           ;; Successfully accepted into ledger. Forward to continue quorum building.
           (let [rng (:rng event)
                 utxos (:utxos new-ledger)
-                next-hop (weighted/select-next-hop rng (:basalt-view state) utxos)]
+                next-hop (weighted/select-next-hop rng (basalt/extract-peers (:basalt-view state)) utxos)]
             (if next-hop
               (let [target-pubkey (if (string? (:pubkey next-hop)) (:pubkey next-hop) (basalt/bytes->hex (:pubkey next-hop)))]
                 {:state (assoc state :ledger new-ledger)
@@ -464,10 +471,10 @@
       ;; Forward ping towards destination
       (let [rng (:rng event)
             utxos (:utxos (:ledger state))
-            view (:basalt-view state)
+            view-peers (basalt/extract-peers (:basalt-view state))
             ;; First check if the destination is already in our view
-            direct-peer (some #(when (= dest (if (string? (:pubkey %)) (:pubkey %) (basalt/bytes->hex (:pubkey %)))) %) view)
-            next-hop (or direct-peer (weighted/select-next-hop rng view utxos))
+            direct-peer (some #(when (= dest (if (string? (:pubkey %)) (:pubkey %) (basalt/bytes->hex (:pubkey %)))) %) view-peers)
+            next-hop (or direct-peer (weighted/select-next-hop rng view-peers utxos))
             new-state (if (empty? path)
                         (assoc-in state [:pending-circuits dest] {:epoch (or (:epoch state) 0)})
                         state)]
