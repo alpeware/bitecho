@@ -20,7 +20,8 @@
     (basalt/make-peer ip port pubkey)))
 
 (def ^{:doc "Generator for Basalt views"} gen-view
-  (gen/fmap basalt/init-view (gen/vector gen-peer 0 10)))
+  (gen/fmap (fn [peers] (basalt/init-view peers 10 (java.util.Random. 42)))
+            (gen/vector gen-peer 0 10)))
 
 (def ^{:doc "Generator for byte array payloads"} gen-payload
   (gen/fmap byte-array (gen/vector gen/byte)))
@@ -38,12 +39,13 @@
                  known-ids gen-known-ids
                  seed gen/nat]
                 (let [rng (java.util.Random. seed)
-                      result (contagion/generate-summary rng view known-ids)]
-                  (if (empty? view)
+                      result (contagion/generate-summary rng view known-ids)
+                      extracted (basalt/extract-peers view)]
+                  (if (empty? extracted)
                     (nil? result)
                     (and
                      (= known-ids (:summary result))
-                     (contains? view (:target result)))))))
+                     (some #(= % (:target result)) extracted))))))
 
 (deftest ^{:doc "Test edge cases for generate summary"} test-generate-summary
   (testing "empty view returns nil"

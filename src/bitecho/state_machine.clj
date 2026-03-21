@@ -41,7 +41,7 @@
   {:node-pubkey node-pubkey
    :epoch 0
    :basalt-index 0
-   :basalt-view (basalt/init-view initial-peers basalt-max-view-size (java.util.Random. 42))
+   :basalt-view (basalt/init-view initial-peers basalt-max-view-size (java.util.Random.))
    :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
    :sieve-history {}
    :contagion-known-ids #{}
