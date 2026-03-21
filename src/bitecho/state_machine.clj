@@ -16,7 +16,7 @@
 
 (def murmur-k
   "Number of peers to forward gossip messages to."
-  3)
+  5)
 
 (def murmur-max-cache-size
   "Maximum number of seen message IDs to keep in the cache."
@@ -24,7 +24,7 @@
 
 (def basalt-max-view-size
   "Maximum number of peers to keep in the Basalt view."
-  200)
+  20)
 
 (def gossip-ttl-epochs
   "Maximum number of epochs to keep a gossip message in the cache."
@@ -76,12 +76,16 @@
         pruned-epochs (apply dissoc (or (:message-epochs state) {}) expired-ids)
         pruned-messages (apply dissoc (:messages state) expired-ids)
         pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
+        pruned-murmur-cache-set (set/difference (:set (:murmur-cache state)) expired-ids)
+        pruned-murmur-cache-queue (into clojure.lang.PersistentQueue/EMPTY (remove expired-ids (:queue (:murmur-cache state))))
+        pruned-murmur-cache {:set pruned-murmur-cache-set :queue pruned-murmur-cache-queue}
         ;; Prune pending circuits
         circuit-cutoff-epoch (- new-epoch pending-circuit-ttl)
         pruned-pending-circuits (into {} (remove (fn [[_ pending]] (< (:epoch pending) circuit-cutoff-epoch)) (or (:pending-circuits state) {})))]
     {:state (assoc state
                    :epoch new-epoch
                    :basalt-view new-view
+                   :murmur-cache pruned-murmur-cache
                    :contagion-known-ids pruned-known-ids
                    :messages pruned-messages
                    :message-epochs pruned-epochs
