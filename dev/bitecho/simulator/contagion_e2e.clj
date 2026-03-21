@@ -7,10 +7,10 @@
             [clojure.core.async :as async]))
 
 ;; Configuration
-(def total-nodes 55)
-(def byzantine-nodes 5)
+(def total-nodes 100)
+(def byzantine-nodes 10)
 (def honest-nodes (- total-nodes byzantine-nodes))
-(def tick-interval-ms 20)
+(def tick-interval-ms 100)
 
 ;; Metrics
 (def broadcasts-initiated (atom 0))
@@ -137,7 +137,7 @@
     ;; Push an omniscient view to all honest nodes
     (doseq [node h-nodes]
       (async/put! (:events-in node) {:type :receive-push-view
-                                     :view all-peers}))
+                                     :view (take 20 (shuffle all-peers))}))
 
     {:nodes nodes-map
      :h-nodes h-nodes
@@ -176,17 +176,21 @@
                     payload-map (clojure.edn/read-string payload-str)
                     broadcast-id (:id payload-map)
                     pubkey (some (fn [[k v]] (when (= (:app-out v) port) k)) (:nodes network))]
-                (swap! delivery-tracker update broadcast-id (fnil conj #{}) pubkey)
-                (let [current-deliveries (count (get @delivery-tracker broadcast-id))]
-                  (when (= current-deliveries honest-nodes)
-                    (swap! broadcasts-delivered inc)
-                    (let [end-time (System/currentTimeMillis)
-                          start-time (get @broadcast-start-times broadcast-id)
-                          duration (- end-time start-time)]
-                      (swap! total-consensus-time + duration)
-                      (println (format "✅ Broadcast %s delivered to ALL %d honest nodes in %d ms" broadcast-id honest-nodes duration))
-                      (when (>= @broadcasts-delivered 10)
-                        (async/put! done-ch true)))))))
+                (let [tracker @delivery-tracker
+                      already-delivered? (contains? (get tracker broadcast-id #{}) pubkey)]
+                  (swap! delivery-tracker update broadcast-id (fnil conj #{}) pubkey)
+                  (let [current-deliveries (count (get @delivery-tracker broadcast-id))]
+                    (when (and (not already-delivered?) (zero? (mod current-deliveries 10)))
+                      (println (format "Broadcast %s reached %d nodes" broadcast-id current-deliveries)))
+                    (when (and (= current-deliveries honest-nodes) (not already-delivered?))
+                      (swap! broadcasts-delivered inc)
+                      (let [end-time (System/currentTimeMillis)
+                            start-time (get @broadcast-start-times broadcast-id)
+                            duration (- end-time start-time)]
+                        (swap! total-consensus-time + duration)
+                        (println (format "✅ Broadcast %s delivered to ALL %d honest nodes in %d ms" broadcast-id honest-nodes duration))
+                        (when (>= @broadcasts-delivered 10)
+                          (async/put! done-ch true))))))))
             (recur)))))
 
     ;; Scenario Loop
@@ -204,7 +208,7 @@
                                               :rng (java.util.Random.)
                                               :private-key (:private (:keys initiator))
                                               :public-key (:public (:keys initiator))}))
-        (async/<! (async/timeout 1000))
+        (async/<! (async/timeout 3000))
         (recur (inc iteration))))
 
     ;; Wait for completion
