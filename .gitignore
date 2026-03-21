@@ -17,3 +17,5 @@ pom.xml.asc
 
 # Persistence snapshots
 snapshot*.edn
+*.pid
+*.log
