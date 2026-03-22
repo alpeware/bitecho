@@ -34,6 +34,13 @@
   "Maximum number of local epochs to track a pending circuit before garbage collecting."
   50)
 
+(def E-size "Sieve echo sample size" 10)
+(def E-hat "Sieve echo delivery threshold" 7)
+(def R-size "Contagion ready sample size" 10)
+(def R-hat "Contagion ready threshold" 3)
+(def D-size "Contagion delivery sample size" 10)
+(def D-hat "Contagion final delivery threshold" 8)
+
 (defn init-state
   "Initializes the pure Bitecho state map.
    node-pubkey should be the hex-encoded public key of this node."
@@ -43,13 +50,20 @@
    :basalt-index 0
    :basalt-view (basalt/init-view initial-peers basalt-max-view-size (java.util.Random.))
    :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
-   :sieve-history {}
    :contagion-known-ids #{}
    :messages {}
    :message-epochs {}
    :ledger (ledger/init-ledger)
    :channels {}
-   :pending-circuits {}})
+   :pending-circuits {}
+   :echo-samples {}
+   :ready-samples {}
+   :delivery-samples {}
+   :received-echoes {}
+   :received-readies {}
+   :sieve-delivered-set #{}
+   :local-ready-set #{}
+   :delivered-set #{}})
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
@@ -83,6 +97,16 @@
         pruned-murmur-cache-set (set/difference (:set (:murmur-cache state)) expired-ids)
         pruned-murmur-cache-queue (into clojure.lang.PersistentQueue/EMPTY (remove expired-ids (:queue (:murmur-cache state))))
         pruned-murmur-cache {:set pruned-murmur-cache-set :queue pruned-murmur-cache-queue}
+
+        pruned-echo-samples (apply dissoc (or (:echo-samples state) {}) expired-ids)
+        pruned-ready-samples (apply dissoc (or (:ready-samples state) {}) expired-ids)
+        pruned-delivery-samples (apply dissoc (or (:delivery-samples state) {}) expired-ids)
+        pruned-received-echoes (apply dissoc (or (:received-echoes state) {}) expired-ids)
+        pruned-received-readies (apply dissoc (or (:received-readies state) {}) expired-ids)
+        pruned-sieve-delivered-set (set/difference (:sieve-delivered-set state) expired-ids)
+        pruned-local-ready-set (set/difference (:local-ready-set state) expired-ids)
+        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)
+
         ;; Prune pending circuits
         circuit-cutoff-epoch (- new-epoch pending-circuit-ttl)
         pruned-pending-circuits (into {} (remove (fn [[_ pending]] (< (:epoch pending) circuit-cutoff-epoch)) (or (:pending-circuits state) {})))]
@@ -94,7 +118,15 @@
                    :contagion-known-ids pruned-known-ids
                    :messages pruned-messages
                    :message-epochs pruned-epochs
-                   :pending-circuits pruned-pending-circuits)
+                   :pending-circuits pruned-pending-circuits
+                   :echo-samples pruned-echo-samples
+                   :ready-samples pruned-ready-samples
+                   :delivery-samples pruned-delivery-samples
+                   :received-echoes pruned-received-echoes
+                   :received-readies pruned-received-readies
+                   :sieve-delivered-set pruned-sieve-delivered-set
+                   :local-ready-set pruned-local-ready-set
+                   :delivered-set pruned-delivered-set)
      :commands commands}))
 
 (defn- handle-broadcast
@@ -184,7 +216,8 @@
 
 (defn- handle-receive-gossip
   "Handles an incoming Murmur gossip message.
-   Validates the Sieve signature before accepting into the cache."
+   Validates the Sieve signature before accepting into the cache.
+   If new, initializes Sieve and Contagion sampling."
   [state event]
   (let [message (:message event)
         rng (:rng event)
@@ -192,30 +225,138 @@
     (if valid-signature?
       (let [extracted-peers (basalt/extract-peers (:basalt-view state))
             gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
-            commands (if (seq (:forward-targets gossip-result))
-                       [{:type :send-gossip
-                         :targets (:forward-targets gossip-result)
-                         :message (:message gossip-result)}]
-                       [])
+            gossip-commands (if (seq (:forward-targets gossip-result))
+                              [{:type :send-gossip
+                                :targets (:forward-targets gossip-result)
+                                :message (:message gossip-result)}]
+                              [])
             new-message? (some? (:message gossip-result))
+            message-id (:message-id message)
+
+            ;; If new message, set up Sieve and Contagion samples
+            sieve-targets (when new-message? (basalt/select-peers rng (:basalt-view state) murmur-k))
+            sieve-echo-command (when new-message?
+                                 {:type :send-sieve-echo
+                                  :targets sieve-targets
+                                  :message-id message-id})
+
             commands (if new-message?
-                       (conj commands {:type :app-event :event-name :on-deliver :payload (:payload message)})
-                       commands)
+                       (into gossip-commands [sieve-echo-command])
+                       gossip-commands)
+
+            echo-samples (if new-message?
+                           (assoc (:echo-samples state) message-id (set (map #(if (string? (:pubkey %)) (:pubkey %) (basalt/bytes->hex (:pubkey %))) (basalt/select-peers rng (:basalt-view state) E-size))))
+                           (:echo-samples state))
+
+            ready-samples (if new-message?
+                            (assoc (:ready-samples state) message-id (set (map #(if (string? (:pubkey %)) (:pubkey %) (basalt/bytes->hex (:pubkey %))) (basalt/select-peers rng (:basalt-view state) R-size))))
+                            (:ready-samples state))
+
+            delivery-samples (if new-message?
+                               (assoc (:delivery-samples state) message-id (set (map #(if (string? (:pubkey %)) (:pubkey %) (basalt/bytes->hex (:pubkey %))) (basalt/select-peers rng (:basalt-view state) D-size))))
+                               (:delivery-samples state))
+
             new-known-ids (if new-message?
-                            (conj (:contagion-known-ids state) (:message-id message))
+                            (conj (:contagion-known-ids state) message-id)
                             (:contagion-known-ids state))
             new-messages (if new-message?
-                           (assoc (:messages state) (:message-id message) message)
+                           (assoc (:messages state) message-id message)
                            (:messages state))
             new-epochs (if new-message?
-                         (assoc (or (:message-epochs state) {}) (:message-id message) (or (:epoch state) 0))
+                         (assoc (or (:message-epochs state) {}) message-id (or (:epoch state) 0))
                          (:message-epochs state))]
         {:state (assoc state
                        :murmur-cache (:cache gossip-result)
                        :contagion-known-ids new-known-ids
                        :messages new-messages
-                       :message-epochs new-epochs)
+                       :message-epochs new-epochs
+                       :echo-samples echo-samples
+                       :ready-samples ready-samples
+                       :delivery-samples delivery-samples)
          :commands commands})
+      {:state state :commands []})))
+
+(defn- handle-receive-sieve-echo
+  "Handles an incoming Sieve Echo message.
+   Records the vote if the sender is in the echo-samples.
+   If E-hat is reached, transitions to Sieve-Delivered and broadcasts Contagion Ready."
+  [state event]
+  (let [sender (:sender event)
+        message-id (:message-id event)
+        echo-samples (get (:echo-samples state) message-id #{})
+        received-echoes (get (:received-echoes state) message-id #{})
+        sieve-delivered-set (:sieve-delivered-set state)]
+    (if (and (contains? echo-samples sender)
+             (not (contains? received-echoes sender)))
+      (let [new-received-echoes (conj received-echoes sender)
+            state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)]
+        (if (and (>= (count new-received-echoes) E-hat)
+                 (not (contains? sieve-delivered-set message-id)))
+          ;; Threshold reached, transition to Sieve-Delivered
+          (let [rng (:rng event)
+                state-sieve-delivered (update state-with-echo :sieve-delivered-set conj message-id)
+                ;; Rule 1 (Becoming Ready): we are Sieve-Delivered, so we become Ready.
+                local-ready-set (:local-ready-set state-sieve-delivered)]
+            (if (not (contains? local-ready-set message-id))
+              (let [state-ready (update state-sieve-delivered :local-ready-set conj message-id)
+                    ;; Broadcast Ready to murmur-k peers
+                    ready-targets (basalt/select-peers rng (:basalt-view state) murmur-k)
+                    ready-command {:type :send-contagion-ready
+                                   :targets ready-targets
+                                   :message-id message-id}]
+                {:state state-ready :commands [ready-command]})
+              {:state state-sieve-delivered :commands []}))
+          {:state state-with-echo :commands []}))
+      {:state state :commands []})))
+
+(defn- handle-receive-contagion-ready
+  "Handles an incoming Contagion Ready message.
+   Records the vote if the sender is in the ready-samples or delivery-samples.
+   If R-hat is reached, transitions to Ready and broadcasts Contagion Ready.
+   If D-hat is reached, transitions to Delivered and emits :on-deliver."
+  [state event]
+  (let [sender (:sender event)
+        message-id (:message-id event)
+        ready-samples (get (:ready-samples state) message-id #{})
+        delivery-samples (get (:delivery-samples state) message-id #{})
+        received-readies (get (:received-readies state) message-id #{})]
+    (if (and (not (contains? received-readies sender))
+             (or (contains? ready-samples sender)
+                 (contains? delivery-samples sender)))
+      (let [new-received-readies (conj received-readies sender)
+            state-with-ready (assoc-in state [:received-readies message-id] new-received-readies)
+
+            ;; Check R-hat for Ready transition
+            ready-votes (count (clojure.set/intersection new-received-readies ready-samples))
+            state-checked-ready (if (and (>= ready-votes R-hat)
+                                         (not (contains? (:local-ready-set state-with-ready) message-id)))
+                                  (update state-with-ready :local-ready-set conj message-id)
+                                  state-with-ready)
+            ready-commands (if (and (>= ready-votes R-hat)
+                                    (not (contains? (:local-ready-set state-with-ready) message-id)))
+                             (let [rng (:rng event)
+                                   ready-targets (basalt/select-peers rng (:basalt-view state) murmur-k)]
+                               [{:type :send-contagion-ready
+                                 :targets ready-targets
+                                 :message-id message-id}])
+                             [])
+
+            ;; Check D-hat for Final Delivery transition
+            delivery-votes (count (clojure.set/intersection new-received-readies delivery-samples))
+            state-checked-delivery (if (and (>= delivery-votes D-hat)
+                                            (not (contains? (:delivered-set state-checked-ready) message-id)))
+                                     (update state-checked-ready :delivered-set conj message-id)
+                                     state-checked-ready)
+
+            delivery-commands (if (and (>= delivery-votes D-hat)
+                                       (not (contains? (:delivered-set state-checked-ready) message-id)))
+                                (let [message (get (:messages state) message-id)]
+                                  (if message
+                                    [{:type :app-event :event-name :on-deliver :payload (:payload message)}]
+                                    []))
+                                [])
+            commands (into ready-commands delivery-commands)]
+        {:state state-checked-delivery :commands commands})
       {:state state :commands []})))
 
 (defn- calculate-network-scale
@@ -525,6 +666,8 @@
     :receive-summary (handle-receive-summary state event)
     :receive-pull-request (handle-receive-pull-request state event)
     :receive-gossip (handle-receive-gossip state event)
+    :receive-sieve-echo (handle-receive-sieve-echo state event)
+    :receive-contagion-ready (handle-receive-contagion-ready state event)
     :route-directed-message (handle-route-directed-message state event)
     :receive-directed-message (handle-route-directed-message state event)
     :route-directed-ack (handle-route-directed-ack state event)

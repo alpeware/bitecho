@@ -22,6 +22,8 @@
     :receive-summary
     :receive-pull-request
     :receive-gossip
+    :receive-sieve-echo
+    :receive-contagion-ready
     :turn-allocate-request
     :turn-relay-request
     :route-directed-message

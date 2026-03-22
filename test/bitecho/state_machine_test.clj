@@ -18,7 +18,6 @@
     (is (map? (:murmur-cache state)))
     (is (set? (:set (:murmur-cache state))))
     (is (= clojure.lang.PersistentQueue/EMPTY (:queue (:murmur-cache state))))
-    (is (map? (:sieve-history state)))
     (is (set? (:contagion-known-ids state)))
     (is (map? (:ledger state)))
     (is (map? (:channels state)))))
