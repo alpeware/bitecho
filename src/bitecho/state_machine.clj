@@ -297,26 +297,26 @@
     (if (and (contains? echo-samples sender)
              (not (contains? received-echoes sender)))
       (let [new-received-echoes (conj received-echoes sender)
-            state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)]
-        (let [current-E-hat (min-delivery-threshold E-hat (:basalt-view state))]
-          (if (and (>= (count new-received-echoes) current-E-hat)
-                   (not (contains? sieve-delivered-set message-id)))
+            state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)
+            current-E-hat (min-delivery-threshold E-hat (:basalt-view state))]
+        (if (and (>= (count new-received-echoes) current-E-hat)
+                 (not (contains? sieve-delivered-set message-id)))
           ;; Threshold reached, transition to Sieve-Delivered
           (let [rng (:rng event)
                 state-sieve-delivered (update state-with-echo :sieve-delivered-set conj message-id)
                 ;; Rule 1 (Becoming Ready): we are Sieve-Delivered, so we become Ready.
                 local-ready-set (:local-ready-set state-sieve-delivered)]
-              (if (not (contains? local-ready-set message-id))
-                (let [state-ready (update state-sieve-delivered :local-ready-set conj message-id)
-                      ;; Broadcast Ready to murmur-k peers
-                      ready-targets (basalt/select-peers rng (:basalt-view state) murmur-k)
-                      ready-command {:type :send-contagion-ready
-                                     :targets ready-targets
-                                     :message-id message-id}]
-                  {:state state-ready :commands [ready-command]})
-                {:state state-sieve-delivered :commands []}))
-            {:state state-with-echo :commands []})))
-        {:state state :commands []})))
+            (if (not (contains? local-ready-set message-id))
+              (let [state-ready (update state-sieve-delivered :local-ready-set conj message-id)
+                    ;; Broadcast Ready to murmur-k peers
+                    ready-targets (basalt/select-peers rng (:basalt-view state) murmur-k)
+                    ready-command {:type :send-contagion-ready
+                                   :targets ready-targets
+                                   :message-id message-id}]
+                {:state state-ready :commands [ready-command]})
+              {:state state-sieve-delivered :commands []}))
+          {:state state-with-echo :commands []}))
+      {:state state :commands []})))
 
 (defn- handle-receive-contagion-ready
   "Handles an incoming Contagion Ready message.
