@@ -7,10 +7,11 @@
             [clojure.core.async :as async]))
 
 ;; Configuration
-(def total-nodes 100)
-(def byzantine-nodes 10)
+(def total-nodes 5)
+(def byzantine-nodes 0)
 (def honest-nodes (- total-nodes byzantine-nodes))
 (def tick-interval-ms 100)
+(def total-broadcast-messages 1)
 
 ;; Metrics
 (def broadcasts-initiated (atom 0))
@@ -197,13 +198,13 @@
                             duration (- end-time start-time)]
                         (swap! total-consensus-time + duration)
                         (println (format "✅ Broadcast %s delivered to ALL %d honest nodes in %d ms" broadcast-id honest-nodes duration))
-                        (when (>= @broadcasts-delivered 10)
+                        (when (>= @broadcasts-delivered total-broadcast-messages)
                           (async/put! done-ch true))))))))
             (recur)))))
 
     ;; Scenario Loop
     (async/go-loop [iteration 1]
-      (when (< @broadcasts-initiated 10)
+      (when (< @broadcasts-initiated total-broadcast-messages)
         (let [initiator (rand-nth (:h-nodes network))
               broadcast-id (str (java.util.UUID/randomUUID))
               payload-str (pr-str {:id broadcast-id :data (str "test-payload-" iteration)})

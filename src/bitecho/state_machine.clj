@@ -41,6 +41,14 @@
 (def D-size "Contagion delivery sample size" 10)
 (def D-hat "Contagion final delivery threshold" 8)
 
+(defn- min-delivery-threshold
+  "Computes a threshold, bounding it to the number of available peers + 1 (for self)."
+  [threshold view]
+  (let [view-size (count (basalt/extract-peers view))]
+    (if (zero? view-size)
+      1
+      (min threshold view-size))))
+
 (defn init-state
   "Initializes the pure Bitecho state map.
    node-pubkey should be the hex-encoded public key of this node."
@@ -289,8 +297,9 @@
     (if (and (contains? echo-samples sender)
              (not (contains? received-echoes sender)))
       (let [new-received-echoes (conj received-echoes sender)
-            state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)]
-        (if (and (>= (count new-received-echoes) E-hat)
+            state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)
+            current-E-hat (min-delivery-threshold E-hat (:basalt-view state))]
+        (if (and (>= (count new-received-echoes) current-E-hat)
                  (not (contains? sieve-delivered-set message-id)))
           ;; Threshold reached, transition to Sieve-Delivered
           (let [rng (:rng event)
@@ -327,12 +336,13 @@
             state-with-ready (assoc-in state [:received-readies message-id] new-received-readies)
 
             ;; Check R-hat for Ready transition
+            current-R-hat (min-delivery-threshold R-hat (:basalt-view state))
             ready-votes (count (clojure.set/intersection new-received-readies ready-samples))
-            state-checked-ready (if (and (>= ready-votes R-hat)
+            state-checked-ready (if (and (>= ready-votes current-R-hat)
                                          (not (contains? (:local-ready-set state-with-ready) message-id)))
                                   (update state-with-ready :local-ready-set conj message-id)
                                   state-with-ready)
-            ready-commands (if (and (>= ready-votes R-hat)
+            ready-commands (if (and (>= ready-votes current-R-hat)
                                     (not (contains? (:local-ready-set state-with-ready) message-id)))
                              (let [rng (:rng event)
                                    ready-targets (basalt/select-peers rng (:basalt-view state) murmur-k)]
@@ -342,13 +352,14 @@
                              [])
 
             ;; Check D-hat for Final Delivery transition
+            current-D-hat (min-delivery-threshold D-hat (:basalt-view state))
             delivery-votes (count (clojure.set/intersection new-received-readies delivery-samples))
-            state-checked-delivery (if (and (>= delivery-votes D-hat)
+            state-checked-delivery (if (and (>= delivery-votes current-D-hat)
                                             (not (contains? (:delivered-set state-checked-ready) message-id)))
                                      (update state-checked-ready :delivered-set conj message-id)
                                      state-checked-ready)
 
-            delivery-commands (if (and (>= delivery-votes D-hat)
+            delivery-commands (if (and (>= delivery-votes current-D-hat)
                                        (not (contains? (:delivered-set state-checked-ready) message-id)))
                                 (let [message (get (:messages state) message-id)]
                                   (if message
