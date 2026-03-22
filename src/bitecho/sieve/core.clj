@@ -27,18 +27,3 @@
     (catch Exception _
       nil)))
 
-(defn check-equivocation
-  "Checks if a message is an equivocation based on the sender's history.
-   Returns a map with :equivocation? (boolean) and :history (updated history).
-   History is a map of [sender (hex) message-id] to signature (hex)."
-  [history message]
-  (let [sender (:sender message)
-        message-id (:message-id message)
-        sender-msg-key [sender message-id]
-        sig-hex (basalt/bytes->hex (:signature message))
-        existing-sig-hex (get history sender-msg-key)]
-    (if existing-sig-hex
-      (if (= existing-sig-hex sig-hex)
-        {:equivocation? false :history history}
-        {:equivocation? true :history history})
-      {:equivocation? false :history (assoc history sender-msg-key sig-hex)})))

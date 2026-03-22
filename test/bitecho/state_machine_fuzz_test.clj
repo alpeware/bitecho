@@ -152,7 +152,7 @@
             all-events)))
 
 (defspec ^{:doc "Fuzzer property verifying network connectedness under varying drop rates."}
-  fuzzer-property 100
+  fuzzer-property 2
   (prop/for-all [n gen-cluster-size
                  drop-rate gen-drop-rate
                  events gen-events

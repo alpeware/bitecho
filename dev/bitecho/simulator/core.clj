@@ -79,6 +79,16 @@
       (async/put! (:network-in target-node) {:type :receive-gossip
                                              :message (:message cmd)
                                              :rng (java.util.Random.)})
+      :send-sieve-echo
+      (async/put! (:network-in target-node) {:type :receive-sieve-echo
+                                             :sender sender-hex
+                                             :message-id (:message-id cmd)
+                                             :rng (java.util.Random.)})
+      :send-contagion-ready
+      (async/put! (:network-in target-node) {:type :receive-contagion-ready
+                                             :sender sender-hex
+                                             :message-id (:message-id cmd)
+                                             :rng (java.util.Random.)})
       :send-directed-message
       (async/put! (:network-in target-node) {:type :receive-directed-message
                                              :sender sender-hex
