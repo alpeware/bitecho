@@ -4,6 +4,8 @@
 
 (defrecord Peer [ip port pubkey hash])
 
+(declare extract-peers)
+
 (defn bytes->hex
   "Converts a byte array to a hex string."
   [^bytes ba]
@@ -63,22 +65,36 @@
     (bytes->hex (crypto/sha256 input))))
 
 (defn update-view
-  "Performs greedy optimization on the view.
-   For each slot in the view, and for each received peer, evaluates the rank.
-   If the slot is empty or the new rank is strictly less than the current peer's rank,
-   the slot's peer is replaced."
+  "Performs greedy optimization on the view without allowing duplicates.
+   Extracts all unique peers from the current view and the received peers,
+   then assigns each to at most one slot where it minimizes the cryptographic rank,
+   ensuring the view is populated with as many distinct optimal peers as possible."
   [view received-peers]
-  (reduce (fn [v peer]
-            (mapv (fn [slot]
-                    (let [new-rank (rank (:seed slot) (:hash peer))]
-                      (if (or (nil? (:peer slot))
-                              (let [current-rank (rank (:seed slot) (:hash (:peer slot)))]
-                                (neg? (compare new-rank current-rank))))
-                        (assoc slot :peer peer)
-                        slot)))
-                  v))
-          view
-          received-peers))
+  (let [initial-candidates (reduce (fn [acc peer]
+                                     (if (some #(= (:hash %) (:hash peer)) acc)
+                                       acc
+                                       (conj acc peer)))
+                                   (extract-peers view)
+                                   received-peers)]
+    (loop [v []
+           remaining-slots view
+           candidates initial-candidates]
+      (if (empty? remaining-slots)
+        v
+        (let [slot (first remaining-slots)
+              best-candidate (when (seq candidates)
+                               (reduce (fn [min-peer peer]
+                                         (if (neg? (compare (rank (:seed slot) (:hash peer))
+                                                            (rank (:seed slot) (:hash min-peer))))
+                                           peer
+                                           min-peer))
+                                       (first candidates)
+                                       (rest candidates)))]
+          (recur (conj v (assoc slot :peer best-candidate))
+                 (rest remaining-slots)
+                 (if best-candidate
+                   (remove #(= (:hash %) (:hash best-candidate)) candidates)
+                   candidates)))))))
 
 (defn init-view
   "Initializes a new Basalt view (a vector of v slots) from an initial collection of peers.
