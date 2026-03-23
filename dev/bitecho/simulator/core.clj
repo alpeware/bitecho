@@ -1,7 +1,6 @@
 (ns bitecho.simulator.core
   "The network orchestrator for the Chaos Mesh Simulator."
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.simulator.spammer :as spammer]
             [bitecho.crypto :as crypto]
             [bitecho.shell.agent :as agent-shell]
             [bitecho.shell.bootstrap :as boot-shell]
@@ -12,7 +11,7 @@
   [i]
   (let [keys (crypto/generate-keypair)
         pubkey-hex (basalt/bytes->hex (:public keys))
-        node (boot-shell/init-node pubkey-hex (:private keys))
+        node (boot-shell/init-node pubkey-hex)
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
@@ -33,7 +32,7 @@
         pubkey-hex (basalt/bytes->hex (:public keys))
         ;; Pick a random bootstrap to connect to
         boot-peer (:peer (rand-nth bootstraps))
-        node (agent-shell/init-node boot-peer pubkey-hex (:private keys))
+        node (agent-shell/init-node boot-peer pubkey-hex)
         peer {:ip "127.0.0.1"
               :port (+ 9000 i)
               :pubkey pubkey-hex
@@ -47,18 +46,6 @@
      :network-in (:network-in node)
      :net-out (:net-out node)
      :app-out (:app-out node)}))
-
-(defn- create-spammer-node
-  [target-hex]
-  (let [node (spammer/init-node target-hex)]
-    {:type :spammer
-     :pubkey-hex (:pubkey-hex node)
-     :keys (:keys node)
-     :node node
-     :events-in nil
-     :network-in nil
-     :net-out (:net-out node)
-     :app-out nil}))
 
 (defn- route-message-to-target
   "Translates a network-out command to a network-in event for the target node."
@@ -89,39 +76,6 @@
                                              :sender sender-hex
                                              :message-id (:message-id cmd)
                                              :rng (java.util.Random.)})
-      :send-directed-message
-      (async/put! (:network-in target-node) {:type :receive-directed-message
-                                             :sender sender-hex
-                                             :envelope (:envelope cmd)
-                                             :payout-amount (:payout-amount cmd)
-                                             :rng (java.util.Random.)})
-      :ping-peer
-      (async/put! (:network-in target-node) {:type :receive-ping
-                                             :sender sender-hex
-                                             :destination (:destination cmd)
-                                             :path (:path cmd)
-                                             :ping-id (:ping-id cmd)
-                                             :rng (java.util.Random.)})
-      :pong-peer
-      (async/put! (:network-in target-node) {:type :receive-pong
-                                             :sender sender-hex
-                                             :path (:path cmd)
-                                             :ping-id (:ping-id cmd)})
-      :send-directed-ack
-      (async/put! (:network-in target-node) {:type :receive-directed-ack
-                                             :sender sender-hex
-                                             :envelope (:envelope cmd)
-                                             :payout-amount (:payout-amount cmd)
-                                             :rng (java.util.Random.)})
-      :send-quorum-settlement
-      (do
-        (println "SIMULATOR ROUTING QUORUM SETTLEMENT TO TARGET:" target-hex)
-        (async/put! (:network-in target-node) {:type :receive-quorum-settlement
-                                               :ticket (:ticket cmd)
-                                               :proof-of-relay (:proof-of-relay cmd)
-                                               :claimer-pubkey (:claimer-pubkey cmd)
-                                               :payout-amount (:payout-amount cmd)
-                                               :rng (java.util.Random.)}))
       nil)))
 
 (defn- create-multiplexer
@@ -159,14 +113,11 @@
   [config]
   (let [num-bootstraps (:bootstraps config 1)
         num-agents (:agents config 0)
-        num-spammers (:spammers config 0)
 
         bootstraps (mapv create-bootstrap-node (range num-bootstraps))
         agents (mapv #(create-agent-node % bootstraps) (range num-agents))
-        target-hex (when (seq agents) (:pubkey-hex (rand-nth agents)))
-        spammers (mapv (fn [_] (create-spammer-node target-hex)) (range num-spammers))
 
-        all-nodes (concat bootstraps agents spammers)
+        all-nodes (concat bootstraps agents)
         nodes-map (into {} (map (juxt :pubkey-hex identity) all-nodes))
         stop-ch (async/chan)
         multiplexer (create-multiplexer nodes-map stop-ch)
@@ -190,6 +141,4 @@
     (async/put! stop-ch true)
     (async/close! stop-ch))
   (doseq [node (vals (:nodes network))]
-    (if (= (:type node) :spammer)
-      (spammer/stop-node (:node node))
-      (shell-core/stop-node (:node node)))))
+    (shell-core/stop-node (:node node))))

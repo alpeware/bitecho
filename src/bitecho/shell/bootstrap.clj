@@ -9,12 +9,12 @@
 
 (defn init-node
   "Initializes the bootstrap shell."
-  [node-pubkey private-key]
+  [node-pubkey]
   (let [snapshot-filename (str "snapshot-" node-pubkey ".edn")
         ;; Load state from disk if available, otherwise init genesis state
         initial-state (or (persistence/load-state-from-disk snapshot-filename)
                           (sm/init-state [] node-pubkey))]
-    (core/start-node initial-state private-key snapshot-filename)))
+    (core/start-node initial-state snapshot-filename)))
 
 (defn -main
   "Main executable entry point for the bootstrap node.
@@ -25,7 +25,7 @@
   (let [;; Generate a node key for this instance.
         node-keys (crypto/generate-keypair)
         node-pubkey (basalt/bytes->hex (:public node-keys))
-        node (init-node node-pubkey (:private node-keys))]
+        node (init-node node-pubkey)]
     (println "Bootstrap shell created:")
     (println (keys node))
     (println "Bootstrap initialization complete (IO sinks stubbed).")))

@@ -1,8 +1,6 @@
 (ns bitecho.shell.core
   "Provides the transparent go-loop shell wrapping the pure bitecho state machine."
-  (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]
-            [bitecho.shell.persistence :as persistence]
+  (:require [bitecho.shell.persistence :as persistence]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
             [clojure.string :as str]))
@@ -12,10 +10,7 @@
   [cmd]
   (let [t (:type cmd)]
     (or (= :network-out t)
-        (= :ping-peer t)
-        (= :pong-peer t)
-        (and (keyword? t) (str/starts-with? (name t) "send-"))
-        (and (keyword? t) (str/starts-with? (name t) "route-")))))
+        (and (keyword? t) (str/starts-with? (name t) "send-")))))
 
 (def ^:private allowed-network-events
   #{:receive-push-view
@@ -23,16 +18,7 @@
     :receive-pull-request
     :receive-gossip
     :receive-sieve-echo
-    :receive-contagion-ready
-    :turn-allocate-request
-    :turn-relay-request
-    :route-directed-message
-    :route-directed-ack
-    :receive-directed-message
-    :receive-directed-ack
-    :receive-ping
-    :receive-pong
-    :receive-quorum-settlement})
+    :receive-contagion-ready})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."
@@ -43,9 +29,9 @@
   "Starts a transparent go-loop wrapping the state machine.
    Returns a map with the internal channels :events-in, :network-in, :net-out, :app-out, :persist-ch, and the loop :stop-ch.
    Snapshots state to disk automatically via a dedicated sliding-buffer channel when state changes."
-  ([initial-state private-key]
-   (start-node initial-state private-key persistence/default-snapshot-filename))
-  ([initial-state private-key snapshot-filename]
+  ([initial-state]
+   (start-node initial-state persistence/default-snapshot-filename))
+  ([initial-state snapshot-filename]
    (let [events-in (async/chan 1024)
          network-in (async/chan 1024)
          net-out (async/chan 1024)
@@ -75,17 +61,6 @@
                  (cond
                    (= (:type cmd) :app-event)
                    (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
-                   (= (:type cmd) :sign-and-forward)
-                   (let [envelope (:envelope cmd)
-                         ticket (:lottery-ticket envelope)
-                         proof (or (:proof-of-relay envelope) [])
-                         prev-sig (if (empty? proof) (:signature ticket) (:signature (peek proof)))
-                         sig (crypto/sign private-key prev-sig)
-                         receipt {:node (:node-pubkey new-state) :signature sig}
-                         new-envelope (assoc envelope :proof-of-relay (conj proof receipt))]
-                     (async/put! net-out {:type (:out-type cmd :send-directed-message)
-                                          :target (:target cmd)
-                                          :envelope new-envelope}))
                    (is-network-command? cmd) (async/put! net-out cmd)
                    :else (async/put! events-in cmd)))
                (when (not= state new-state)
@@ -105,17 +80,6 @@
                (cond
                  (= (:type cmd) :app-event)
                  (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
-                 (= (:type cmd) :sign-and-forward)
-                 (let [envelope (:envelope cmd)
-                       ticket (:lottery-ticket envelope)
-                       proof (or (:proof-of-relay envelope) [])
-                       prev-sig (if (empty? proof) (basalt/hex->bytes ^String (:signature ticket)) (:signature (peek proof)))
-                       sig (crypto/sign private-key prev-sig)
-                       receipt {:node (:node-pubkey new-state) :signature sig}
-                       new-envelope (assoc envelope :proof-of-relay (conj proof receipt))]
-                   (async/put! net-out {:type (:out-type cmd :send-directed-message)
-                                        :target (:target cmd)
-                                        :envelope new-envelope}))
                  (is-network-command? cmd) (async/put! net-out cmd)
                  :else (async/put! events-in cmd)))
              (when (not= state new-state)
