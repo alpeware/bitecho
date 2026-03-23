@@ -1,8 +1,6 @@
 (ns bitecho.state-machine-test
   "Tests for the pure state machine integrating Basalt, Murmur, Sieve, and Contagion."
-  (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]
-            [bitecho.state-machine :as sm]
+  (:require [bitecho.state-machine :as sm]
             [clojure.test :as t :refer [deftest is]]))
 
 (deftest ^{:doc "Tests that init-state returns a correctly shaped state map."} init-state-test

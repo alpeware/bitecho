@@ -11,7 +11,7 @@
   [i]
   (let [keys (crypto/generate-keypair)
         pubkey-hex (basalt/bytes->hex (:public keys))
-        node (boot-shell/init-node pubkey-hex (:private keys))
+        node (boot-shell/init-node pubkey-hex)
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
@@ -32,7 +32,7 @@
         pubkey-hex (basalt/bytes->hex (:public keys))
         ;; Pick a random bootstrap to connect to
         boot-peer (:peer (rand-nth bootstraps))
-        node (agent-shell/init-node boot-peer pubkey-hex (:private keys))
+        node (agent-shell/init-node boot-peer pubkey-hex)
         peer {:ip "127.0.0.1"
               :port (+ 9000 i)
               :pubkey pubkey-hex
