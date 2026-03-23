@@ -2,15 +2,8 @@
   "The pure root reducer that integrates Basalt, Murmur, Sieve, and Contagion.
    Accepts `state` and `event` inputs and emits a map of `{:state new-state :commands [...]}`."
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.channels.core :as channels]
             [bitecho.contagion.core :as contagion]
-            [bitecho.economy.difficulty :as difficulty]
-            [bitecho.economy.ledger :as ledger]
             [bitecho.murmur.core :as murmur]
-            [bitecho.peer-review.core :as peer-review]
-            [bitecho.routing.ingress :as ingress]
-            [bitecho.routing.weighted :as weighted]
-            [bitecho.services.turn :as turn]
             [bitecho.sieve.core :as sieve]
             [clojure.set :as set]))
 
@@ -29,10 +22,6 @@
 (def gossip-ttl-epochs
   "Maximum number of epochs to keep a gossip message in the cache."
   10)
-
-(def pending-circuit-ttl
-  "Maximum number of local epochs to track a pending circuit before garbage collecting."
-  50)
 
 (def E-size "Sieve echo sample size" 10)
 (def E-hat "Sieve echo delivery threshold" 7)
@@ -53,9 +42,6 @@
    :contagion-known-ids #{}
    :messages {}
    :message-epochs {}
-   :ledger (ledger/init-ledger)
-   :channels {}
-   :pending-circuits {}
    :global-echo-sample #{}
    :global-ready-sample #{}
    :global-delivery-sample #{}
@@ -145,11 +131,7 @@
         pruned-received-readies (apply dissoc (or (:received-readies state) {}) expired-ids)
         pruned-sieve-delivered-set (set/difference (:sieve-delivered-set state) expired-ids)
         pruned-local-ready-set (set/difference (:local-ready-set state) expired-ids)
-        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)
-
-        ;; Prune pending circuits
-        circuit-cutoff-epoch (- new-epoch pending-circuit-ttl)
-        pruned-pending-circuits (into {} (remove (fn [[_ pending]] (< (:epoch pending) circuit-cutoff-epoch)) (or (:pending-circuits state) {})))]
+        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)]
     {:state (assoc state
                    :epoch new-epoch
                    :basalt-view new-view
@@ -158,7 +140,6 @@
                    :contagion-known-ids pruned-known-ids
                    :messages pruned-messages
                    :message-epochs pruned-epochs
-                   :pending-circuits pruned-pending-circuits
                    :global-echo-sample updated-echo-sample
                    :global-ready-sample updated-ready-sample
                    :global-delivery-sample updated-delivery-sample
@@ -409,307 +390,12 @@
         {:state state-checked-delivery :commands commands})
       {:state state :commands []})))
 
-(defn- calculate-network-scale
-  "Estimates network scale by summing the Active Network Stake (Echo balances) of all peers
-   currently observed in the basalt-view or contagion caches. Ensures new/stakeless networks
-   default to a scale of 1."
-  [state]
-  (let [utxos (:utxos (:ledger state))
-        ;; Extract known pubkeys from basalt-view
-        view-pubkeys (map :pubkey (basalt/extract-peers (:basalt-view state)))
-        ;; Extract known pubkeys from contagion messages
-        message-senders (map :sender (vals (:messages state)))
-        ;; Distinct set of all known pubkeys in hex format
-        all-hex-pubkeys (set (concat
-                              (map #(if (string? %) % (basalt/bytes->hex %)) view-pubkeys)
-                              message-senders))
-        ;; Map each hex pubkey to its expected puzzle hash
-        expected-hashes (set (map ledger/standard-puzzle-hash all-hex-pubkeys))
-        ;; Sum the balances of UTXOs matching these puzzle hashes
-        total-stake (reduce + (map :amount (filter #(contains? expected-hashes (:puzzle-hash %)) (vals utxos))))]
-    (max 1 total-stake)))
-
-(defn- handle-route-directed-message
-  "Handles the forward pass of a directed message along a locked circuit.
-   Validates the attached lottery ticket and proof of relay.
-   Requires strict source routing via :forward-circuit.
-   If this node is the destination, emits :on-direct-message and
-   turns the message around to return via :route-directed-ack."
-  [state event]
-  (let [envelope (:envelope event)
-        claimer-pubkey (:node-pubkey state)
-        ticket (:lottery-ticket envelope)
-        proof-of-relay (:proof-of-relay envelope)
-        sender-pubkey (:public-key ticket)
-        utxos (:utxos (:ledger state))
-        rng (:rng event)
-        forward-circuit (or (:forward-circuit envelope) [])
-        return-circuit (or (:return-circuit envelope) [])]
-    (if (and (ingress/admit-message? rng sender-pubkey utxos)
-             (peer-review/validate-proof-of-relay ticket proof-of-relay)
-             (= claimer-pubkey (first forward-circuit)))
-      (let [new-forward (rest forward-circuit)
-            new-return (cons claimer-pubkey return-circuit)]
-        (if (empty? new-forward)
-          ;; We are the destination (Node B). Turnaround.
-          {:state state
-           :commands [{:type :app-event
-                       :event-name :on-direct-message
-                       :envelope envelope}
-                      {:type :sign-and-forward
-                       :target (first return-circuit)
-                       :out-type :send-directed-ack
-                       :payout-amount (:payout-amount event)
-                       :envelope (assoc envelope
-                                        :forward-circuit return-circuit
-                                        :return-circuit (list claimer-pubkey))}]}
-          ;; We are a forward router. Pop and push, then forward.
-          {:state state
-           :commands [{:type :sign-and-forward
-                       :target (first new-forward)
-                       :out-type :send-directed-message
-                       :payout-amount (:payout-amount event)
-                       :envelope (assoc envelope
-                                        :forward-circuit new-forward
-                                        :return-circuit new-return)}]}))
-      ;; Message dropped (invalid ingress, invalid proof, or not in circuit)
-      {:state state :commands []})))
-
-(defn- attempt-claim-ticket
-  "Attempts to claim a ticket in the local ledger, returning the new ledger."
-  [state ticket claimer-pubkey payout-amount]
-  (let [network-scale (calculate-network-scale state)
-        difficulty-hex (difficulty/calculate-difficulty murmur-k network-scale)]
-    (ledger/claim-ticket (:ledger state) ticket difficulty-hex claimer-pubkey payout-amount)))
-
-(defn- handle-route-directed-ack
-  "Handles the return pass of a directed message along a locked circuit.
-   Validates the proof of relay. Edge routers claim the lottery ticket here.
-   If this node is the origin, emits :on-proof-of-relay-complete.
-   If a Mint Ticket is claimed successfully, initiates Quorum Settlement."
-  [state event]
-  (let [envelope (:envelope event)
-        claimer-pubkey (:node-pubkey state)
-        ticket (:lottery-ticket envelope)
-        proof-of-relay (:proof-of-relay envelope)
-        forward-circuit (or (:forward-circuit envelope) [])
-        return-circuit (or (:return-circuit envelope) [])]
-    (if (and (peer-review/validate-proof-of-relay ticket proof-of-relay)
-             (= claimer-pubkey (first forward-circuit)))
-      (let [new-forward (rest forward-circuit)
-            new-return (cons claimer-pubkey return-circuit)]
-        (if (empty? new-forward)
-          ;; We are the origin (Node A). Proof complete.
-          {:state state
-           :commands [{:type :app-event
-                       :event-name :on-proof-of-relay-complete
-                       :envelope envelope}]}
-          ;; We are an edge router on the return path. Claim ticket and forward.
-          (let [payout-amount (:payout-amount event)
-                new-ledger (attempt-claim-ticket state ticket claimer-pubkey payout-amount)
-                ;; Check if we successfully claimed a :mint ticket
-                ticket-claimed? (not= (:ledger state) new-ledger)
-                mint-ticket? (= :mint (:ticket-type ticket))
-                _ (when ticket-claimed?
-                    (println "WINNING TICKET REGISTERED! Node:" claimer-pubkey))
-                rng (:rng event)
-                utxos (:utxos new-ledger)
-                ;; If we won a mint ticket, we must initiate quorum settlement
-                quorum-target (when (and ticket-claimed? mint-ticket?)
-                                (weighted/select-next-hop rng (basalt/extract-peers (:basalt-view state)) utxos))
-                forward-command {:type :sign-and-forward
-                                 :target (first new-forward)
-                                 :out-type :send-directed-ack
-                                 :payout-amount (:payout-amount event)
-                                 :envelope (assoc envelope
-                                                  :forward-circuit new-forward
-                                                  :return-circuit new-return)}
-                quorum-command (when quorum-target
-                                 (let [target-pubkey (if (string? (:pubkey quorum-target)) (:pubkey quorum-target) (basalt/bytes->hex (:pubkey quorum-target)))]
-                                   {:type :send-quorum-settlement
-                                    :target target-pubkey
-                                    :ticket ticket
-                                    :proof-of-relay proof-of-relay
-                                    :claimer-pubkey claimer-pubkey
-                                    :payout-amount payout-amount}))
-                commands (filterv some? [forward-command quorum-command])]
-            {:state (assoc state :ledger new-ledger)
-             :commands commands})))
-      ;; Message dropped (invalid proof, or not in circuit)
-      {:state state :commands []})))
-
-(defn- handle-receive-quorum-settlement
-  "Handles an incoming Quorum Settlement message.
-   Validates the proof of relay and attempts to claim the Mint Ticket
-   on behalf of the winning router (claimer-pubkey).
-   If accepted into the local ledger, forwards it to the next hop."
-  [state event]
-  (let [ticket (:ticket event)
-        proof-of-relay (:proof-of-relay event)
-        claimer-pubkey (:claimer-pubkey event)
-        payout-amount (:payout-amount event)]
-    (if (and (= :mint (:ticket-type ticket))
-             (peer-review/validate-proof-of-relay ticket proof-of-relay))
-      (let [new-ledger (attempt-claim-ticket state ticket claimer-pubkey payout-amount)]
-        (if (not= (:ledger state) new-ledger)
-          ;; Successfully accepted into ledger. Forward to continue quorum building.
-          (let [rng (:rng event)
-                utxos (:utxos new-ledger)
-                next-hop (weighted/select-next-hop rng (basalt/extract-peers (:basalt-view state)) utxos)]
-            (if next-hop
-              (let [target-pubkey (if (string? (:pubkey next-hop)) (:pubkey next-hop) (basalt/bytes->hex (:pubkey next-hop)))]
-                {:state (assoc state :ledger new-ledger)
-                 :commands [{:type :send-quorum-settlement
-                             :target target-pubkey
-                             :ticket ticket
-                             :proof-of-relay proof-of-relay
-                             :claimer-pubkey claimer-pubkey
-                             :payout-amount payout-amount}]})
-              {:state (assoc state :ledger new-ledger) :commands []}))
-          ;; Already known/invalid, do not forward
-          {:state state :commands []}))
-      ;; Invalid ticket or proof
-      {:state state :commands []})))
-
-(defn- handle-open-channel
-  "Handles a channel open event by storing the initial multisig state and emitting an :app-event."
-  [state event]
-  (let [channel-id (:channel-id event)
-        initial-state (channels/create-initial-state channel-id
-                                                     (:pubkey-a event)
-                                                     (:pubkey-b event)
-                                                     (:amount-a event)
-                                                     (:amount-b event))]
-    {:state (assoc-in state [:channels channel-id] initial-state)
-     :commands [{:type :app-event
-                 :event-name :on-channel-opened
-                 :channel-id channel-id}]}))
-
-(defn- handle-update-channel
-  "Handles off-chain channel updates by validating mutual signatures."
-  [state event]
-  (let [channel-id (:channel-id event)
-        current-state (get-in state [:channels channel-id])]
-    (if current-state
-      (let [new-state (channels/mutually-sign-update current-state (:update event) (:sig-a event) (:sig-b event))]
-        {:state (assoc-in state [:channels channel-id] new-state)
-         :commands []})
-      {:state state :commands []})))
-
-(defn- handle-settle-channel
-  "Handles settling a channel by submitting the final state to the sci-ledger."
-  [state event]
-  (let [new-ledger (ledger/process-transaction (:ledger state) (:tx event))]
-    (if (not= new-ledger (:ledger state))
-      {:state (-> state
-                  (assoc :ledger new-ledger)
-                  (update :channels dissoc (:channel-id event)))
-       :commands []}
-      {:state state :commands []})))
-
-(defn- handle-turn-allocate-request
-  "Handles a request for TURN relay allocation, responding with granted status and pricing."
-  [state event]
-  (let [client-pubkey (:client-pubkey event)
-        req {:type :turn-allocate-request :client-pubkey client-pubkey}
-        ;; In a real deployment, server-pubkey and price would come from config/state.
-        ;; For the state machine abstraction, we stub the response generation.
-        res (turn/handle-allocation-request req "server-pubkey-stub" 1)]
-    {:state state
-     :commands [{:type :network-out
-                 :target client-pubkey
-                 :payload res}]}))
-
-(defn- handle-turn-relay-request
-  "Handles incoming TURN relay payload wrapped in a micro-payment channel update."
-  [state event]
-  (let [channel-id (:channel-id event)
-        current-state (get-in state [:channels channel-id])]
-    (if current-state
-      (let [res (turn/handle-relay-request (:req event) current-state (:price event) (:server-priv event))]
-        (if (:valid? res)
-          {:state (assoc-in state [:channels channel-id] (:new-state res))
-           :commands [{:type :network-out
-                       ;; Target is the client or a proxy. For TURN relay, we'll
-                       ;; assume the target is the client for now. Let's use pubkey-a.
-                       :target (:pubkey-a current-state)
-                       :payload (:command res)}]}
-          {:state state :commands []}))
-      {:state state :commands []})))
-
-(defn- handle-ping-peer
-  "Handles a circuit discovery ping request.
-   If this node is the destination, emit a pong command targeting the last hop in the path.
-   If not, route it forward appending this node to the path."
-  [state event]
-  (let [dest (:destination event)
-        path (or (:path event) [])]
-    (if (= dest (:node-pubkey state))
-      ;; Target reached. Send pong back to the last node.
-      (if (seq path)
-        (let [last-hop (peek path)
-              new-path (pop path)]
-          {:state state
-           :commands [{:type :pong-peer
-                       :target last-hop
-                       :path new-path
-                       :ping-id (:ping-id event)}]})
-        ;; This shouldn't happen unless origin pinged itself, but handle safely
-        {:state state
-         :commands [{:type :app-event
-                     :event-name :on-circuit-locked
-                     :ping-id (:ping-id event)}]})
-      ;; Forward ping towards destination
-      (let [rng (:rng event)
-            utxos (:utxos (:ledger state))
-            view-peers (basalt/extract-peers (:basalt-view state))
-            ;; First check if the destination is already in our view
-            direct-peer (some #(when (= dest (if (string? (:pubkey %)) (:pubkey %) (basalt/bytes->hex (:pubkey %)))) %) view-peers)
-            next-hop (or direct-peer (weighted/select-next-hop rng view-peers utxos))
-            new-state (if (empty? path)
-                        (assoc-in state [:pending-circuits dest] {:epoch (or (:epoch state) 0)})
-                        state)]
-        (if next-hop
-          (let [next-hop-pubkey (if (string? (:pubkey next-hop)) (:pubkey next-hop) (basalt/bytes->hex (:pubkey next-hop)))
-                new-path (conj (vec path) (:node-pubkey state))]
-            {:state new-state
-             :commands [{:type :ping-peer
-                         :target next-hop-pubkey
-                         :destination dest
-                         :path new-path
-                         :ping-id (:ping-id event)
-                         :rng rng}]})
-          {:state new-state :commands []})))))
-
-(defn- handle-pong-peer
-  "Handles a returning circuit discovery pong request.
-   If path is empty, this node is the origin and the circuit is locked.
-   Otherwise, pop the last node from the path and forward the pong."
-  [state event]
-  (let [path (:path event)]
-    (if (empty? path)
-      ;; Origin reached. Circuit locked.
-      {:state state
-       :commands [{:type :app-event
-                   :event-name :on-circuit-locked
-                   :ping-id (:ping-id event)}]}
-      ;; Forward pong to previous hop
-      (let [last-hop (peek path)
-            new-path (pop path)]
-        {:state state
-         :commands [{:type :pong-peer
-                     :target last-hop
-                     :path new-path
-                     :ping-id (:ping-id event)}]}))))
-
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
   [state event]
   (case (:type event)
     :contagion-broadcast (handle-contagion-broadcast state event)
-    :ping-peer (handle-ping-peer state event)
-    :pong-peer (handle-pong-peer state event)
     :tick (handle-tick state event)
     :broadcast (handle-broadcast state event)
     :receive-push-view (handle-receive-push-view state event)
@@ -719,16 +405,4 @@
     :receive-gossip (handle-receive-gossip state event)
     :receive-sieve-echo (handle-receive-sieve-echo state event)
     :receive-contagion-ready (handle-receive-contagion-ready state event)
-    :route-directed-message (handle-route-directed-message state event)
-    :receive-directed-message (handle-route-directed-message state event)
-    :route-directed-ack (handle-route-directed-ack state event)
-    :receive-directed-ack (handle-route-directed-ack state event)
-    :receive-ping (handle-ping-peer state event)
-    :receive-pong (handle-pong-peer state event)
-    :receive-quorum-settlement (handle-receive-quorum-settlement state event)
-    :open-channel (handle-open-channel state event)
-    :update-channel (handle-update-channel state event)
-    :settle-channel (handle-settle-channel state event)
-    :turn-allocate-request (handle-turn-allocate-request state event)
-    :turn-relay-request (handle-turn-relay-request state event)
     {:state state :commands []}))
