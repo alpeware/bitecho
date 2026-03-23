@@ -82,6 +82,10 @@
         (async/put! (:network-in target-node) {:type :receive-summary
                                                :sender sender-hex
                                                :summary (:summary cmd)})
+        :send-subscribe
+        (async/put! (:network-in target-node) {:type :receive-subscribe
+                                               :sender sender-hex
+                                               :roles (:roles cmd)})
         :send-pull-request
         (async/put! (:network-in target-node) {:type :receive-pull-request
                                                :sender sender-hex
@@ -204,6 +208,10 @@
 
     ;; Scenario Loop
     (async/go-loop [iteration 1]
+      ;; Wait to establish subscription graphs before starting
+      (when (= iteration 1)
+        (async/<! (async/timeout 1500)))
+
       (when (< @broadcasts-initiated total-broadcast-messages)
         (let [initiator (rand-nth (:h-nodes network))
               broadcast-id (str (java.util.UUID/randomUUID))
