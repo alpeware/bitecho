@@ -67,9 +67,9 @@
                       extracted (basalt/extract-peers updated-view)]
                   (and
                     ;; 1. The number of extracted peers should equal the minimum of view-size and unique peers
-                    (= (count extracted) (min view-size (count peers)))
+                   (= (count extracted) (min view-size (count peers)))
                     ;; 2. All extracted peers should be unique
-                    (= (count extracted) (count (set (map :hash extracted))))))))
+                   (= (count extracted) (count (set (map :hash extracted))))))))
 
 (deftest ^{:doc "Tests selection of random peers for exchange."} select-peers-test
   (testing "selects up to k random peers from view"
