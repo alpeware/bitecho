@@ -20,7 +20,16 @@
     (is (= clojure.lang.PersistentQueue/EMPTY (:queue (:murmur-cache state))))
     (is (set? (:contagion-known-ids state)))
     (is (map? (:ledger state)))
-    (is (map? (:channels state)))))
+    (is (map? (:channels state)))
+    (is (set? (:global-echo-sample state)))
+    (is (set? (:global-ready-sample state)))
+    (is (set? (:global-delivery-sample state)))
+    (is (set? (:echo-subscribers state)))
+    (is (set? (:ready-subscribers state)))
+    (is (set? (:delivery-subscribers state)))
+    (is (not (contains? state :echo-samples)))
+    (is (not (contains? state :ready-samples)))
+    (is (not (contains? state :delivery-samples)))))
 
 (deftest ^{:doc "Tests handle-event with a :open-channel event."} handle-open-channel-test
   (let [state (sm/init-state [] "node-pubkey-stub")
