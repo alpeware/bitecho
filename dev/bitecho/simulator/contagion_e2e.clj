@@ -7,7 +7,7 @@
             [clojure.core.async :as async]))
 
 ;; Configuration
-(def total-nodes 5)
+(def total-nodes 15)
 (def byzantine-nodes 0)
 (def honest-nodes (- total-nodes byzantine-nodes))
 (def tick-interval-ms 100)
@@ -210,7 +210,7 @@
     (async/go-loop [iteration 1]
       ;; Wait to establish subscription graphs before starting
       (when (= iteration 1)
-        (async/<! (async/timeout 1500)))
+        (async/<! (async/timeout 3000)))
 
       (when (< @broadcasts-initiated total-broadcast-messages)
         (let [initiator (rand-nth (:h-nodes network))

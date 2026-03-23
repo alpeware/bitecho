@@ -54,30 +54,29 @@
                   state (sm/init-state initial-peers (basalt/bytes->hex (:public (get node-keys i))))]
               [i (assoc state :keys (get node-keys i))])))))
 
-(defn- extract-node-id
-  "Helper to extract a node ID from a peer's hash."
-  [peer]
-  (if (map? peer)
-    (if-let [match (re-find #"hash-(\d+)" (str (:hash peer)))]
-      (Integer/parseInt (second match))
-      -1)
-    -1))
+(defn- build-pubkey-map [cluster-state]
+  (into {} (map (fn [[id state]] [(:node-pubkey state) id]) cluster-state)))
 
 (defn- resolve-targets
-  "Given commands that contain targets (as peers or a single target), map them to node IDs."
-  [command]
-  (cond
-    (= :network-out (:type command)) [] ;; Ignore network-out for now since it's targeted externally (e.g. client pubkey string instead of peer map)
-    (:targets command) (map extract-node-id (:targets command))
-    (:target command) [(extract-node-id (:target command))]
-    :else []))
+  [command pubkey-map]
+  (let [extract (fn [t]
+                  (if (string? t)
+                    (get pubkey-map t -1)
+                    (if-let [match (re-find #"hash-(\d+)" (str (:hash t)))]
+                      (Integer/parseInt (second match))
+                      -1)))]
+    (cond
+      (= :network-out (:type command)) []
+      (:targets command) (map extract (:targets command))
+      (:target command) [(extract (:target command))]
+      :else [])))
 
 (defn- dispatch-commands
   "Takes emitted commands from `sender-id`, maps them to network events,
    and randomly drops messages based on `drop-rate`."
-  [sender-id commands drop-rate rng]
+  [sender-id commands drop-rate rng pubkey-map sender-hex]
   (let [events (mapcat (fn [cmd]
-                         (let [target-ids (resolve-targets cmd)]
+                         (let [target-ids (resolve-targets cmd pubkey-map)]
                            (for [tid target-ids]
                              [tid cmd])))
                        commands)]
@@ -97,6 +96,15 @@
 
         :send-gossip
         [target-id {:type :receive-gossip :message (:message cmd) :rng rng}]
+
+        :send-subscribe
+        [target-id {:type :receive-subscribe :sender sender-hex :roles (:roles cmd)}]
+
+        :send-sieve-echo
+        [target-id {:type :receive-sieve-echo :sender sender-hex :message-id (:message-id cmd) :rng rng}]
+
+        :send-contagion-ready
+        [target-id {:type :receive-contagion-ready :sender sender-hex :message-id (:message-id cmd) :rng rng}]
 
         :app-event nil
 
@@ -118,11 +126,12 @@
     (let [[target-id event] (first queue)
           node-state (get cluster-state target-id)]
       (if (nil? node-state)
-        ;; Node might not exist if extract-node-id failed, just skip
         (recur cluster-state (rest queue) drop-rate rng max-steps (inc step))
         (let [{:keys [state commands]} (sm/handle-event node-state event)
               new-cluster (assoc cluster-state target-id state)
-              new-events (clean-dispatched (dispatch-commands target-id commands drop-rate rng))
+              pubkey-map (build-pubkey-map new-cluster)
+              sender-hex (:node-pubkey node-state)
+              new-events (clean-dispatched (dispatch-commands target-id commands drop-rate rng pubkey-map sender-hex))
               ;; Add newly generated network events to the back of the queue (BFS simulation)
               new-queue (into (vec (rest queue)) new-events)]
           ;; (println "Queue size:" (count new-queue) "Step:" step)
@@ -134,7 +143,7 @@
   (let [rng (java.util.Random. seed)
         initial-cluster (init-cluster-state n)
         ;; Add a stabilization phase: 100 extra ticks to allow gossip/anti-entropy to converge
-        all-events (concat events (repeat 500 [:tick]))]
+        all-events (concat (repeat 100 [:tick]) events (repeat 400 [:tick]))]
     (reduce (fn [cluster [event-type payload]]
               ;; Randomly select a node to initiate the event
               (let [target-id (.nextInt rng n)
