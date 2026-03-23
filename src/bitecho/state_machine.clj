@@ -336,7 +336,7 @@
              (not (contains? received-echoes sender)))
       (let [new-received-echoes (conj received-echoes sender)
             state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)
-            current-E-hat (min E-hat (max 1 (count echo-sample)))]
+            current-E-hat E-hat]
         (if (and (>= (count new-received-echoes) current-E-hat)
                  (not (contains? sieve-delivered-set message-id)))
           ;; Threshold reached, transition to Sieve-Delivered
@@ -374,7 +374,7 @@
             state-with-ready (assoc-in state [:received-readies message-id] new-received-readies)
 
             ;; Check R-hat for Ready transition
-            current-R-hat (min R-hat (max 1 (count ready-sample)))
+            current-R-hat R-hat
             ready-votes (count (clojure.set/intersection new-received-readies ready-sample))
             state-checked-ready (if (and (>= ready-votes current-R-hat)
                                          (not (contains? (:local-ready-set state-with-ready) message-id)))
@@ -391,7 +391,7 @@
                              [])
 
             ;; Check D-hat for Final Delivery transition
-            current-D-hat (min D-hat (max 1 (count delivery-sample)))
+            current-D-hat D-hat
             delivery-votes (count (clojure.set/intersection new-received-readies delivery-sample))
             state-checked-delivery (if (and (>= delivery-votes current-D-hat)
                                             (not (contains? (:delivered-set state-checked-ready) message-id)))
