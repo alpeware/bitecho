@@ -54,7 +54,7 @@
       (is (some #(= p1 %) extracted))
       (is (some #(= p2 %) extracted)))))
 
-(defspec ^{:doc "Tests that update-view minimizes rank."} update-view-spec 100
+(defspec ^{:doc "Tests that update-view maximizes distinct participants."} update-view-spec 100
   (prop/for-all [peers-data (gen/list (gen/tuple (gen/return "127.0.0.1") gen/nat (gen/return (byte-array 32))))
                  view-size (gen/choose 1 20)]
                 (let [peers (vals (reduce (fn [acc peer] (assoc acc (:hash peer) peer)) {}
@@ -63,16 +63,13 @@
                       empty-view (vec (repeatedly view-size #(let [sb (byte-array 32)]
                                                                (.nextBytes rng sb)
                                                                {:seed (basalt/bytes->hex sb) :peer nil})))
-                      updated-view (basalt/update-view empty-view peers)]
-                  (every? (fn [slot]
-                            (if (nil? (:peer slot))
-                              (empty? peers)
-                              (let [slot-rank (basalt/rank (:seed slot) (:hash (:peer slot)))]
-                                (every? (fn [p]
-                                          (let [p-rank (basalt/rank (:seed slot) (:hash p))]
-                                            (not (neg? (compare p-rank slot-rank)))))
-                                        peers))))
-                          updated-view))))
+                      updated-view (basalt/update-view empty-view peers)
+                      extracted (basalt/extract-peers updated-view)]
+                  (and
+                    ;; 1. The number of extracted peers should equal the minimum of view-size and unique peers
+                    (= (count extracted) (min view-size (count peers)))
+                    ;; 2. All extracted peers should be unique
+                    (= (count extracted) (count (set (map :hash extracted))))))))
 
 (deftest ^{:doc "Tests selection of random peers for exchange."} select-peers-test
   (testing "selects up to k random peers from view"
@@ -114,4 +111,4 @@
       (is (not= "seed3" (:seed (nth updated-view 3))))
       (is (not= "seed0" (:seed (nth updated-view 0))))
       ;; Remaining peers (p2, p3) should repopulate empty slots, so slot 0 and 3 should have peers, possibly p2 or p3
-      (is (every? #(some? (:peer %)) updated-view)))))
+      (is (= 2 (count (remove #(nil? (:peer %)) updated-view)))))))
