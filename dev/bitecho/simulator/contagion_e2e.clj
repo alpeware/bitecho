@@ -25,7 +25,7 @@
         pubkey-hex (basalt/bytes->hex (:public keys))
         initial-state (sm/init-state [] pubkey-hex)
         snapshot-filename (str "/tmp/snapshot-" pubkey-hex ".bin")
-        node (shell-core/start-node initial-state (:private keys) snapshot-filename)
+        node (shell-core/start-node initial-state snapshot-filename)
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
@@ -229,7 +229,9 @@
         (recur (inc iteration))))
 
     ;; Wait for completion
-    (async/<!! done-ch)
+    (let [[_ port] (async/alts!! [done-ch (async/timeout 15000)])]
+      (when (not= port done-ch)
+        (throw (ex-info "Contagion broadcast failed to reach all honest nodes within 15 seconds" {}))))
     (println "\n========================================")
     (println "SIMULATION COMPLETE")
     (println "========================================")
