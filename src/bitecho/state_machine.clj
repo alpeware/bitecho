@@ -2,62 +2,49 @@
   "The pure root reducer that integrates Basalt, Murmur, Sieve, and Contagion.
    Accepts `state` and `event` inputs and emits a map of `{:state new-state :commands [...]}`."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
             [bitecho.murmur.core :as murmur]
             [bitecho.sieve.core :as sieve]
             [clojure.set :as set]))
 
-(def murmur-k
-  "Number of peers to forward gossip messages to."
-  5)
-
-(def murmur-max-cache-size
-  "Maximum number of seen message IDs to keep in the cache."
-  1000)
-
-(def basalt-max-view-size
-  "Maximum number of peers to keep in the Basalt view."
-  20)
-
-(def gossip-ttl-epochs
-  "Maximum number of epochs to keep a gossip message in the cache."
-  10)
-
-(def E-size "Sieve echo sample size" 10)
-(def E-hat "Sieve echo delivery threshold" 7)
-(def R-size "Contagion ready sample size" 10)
-(def R-hat "Contagion ready threshold" 3)
-(def D-size "Contagion delivery sample size" 10)
-(def D-hat "Contagion final delivery threshold" 8)
-
 (defn init-state
   "Initializes the pure Bitecho state map.
-   node-pubkey should be the hex-encoded public key of this node."
-  [initial-peers node-pubkey]
-  {:node-pubkey node-pubkey
-   :epoch 0
-   :basalt-index 0
-   :basalt-view (basalt/init-view initial-peers basalt-max-view-size (java.util.Random.))
-   :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
-   :contagion-known-ids #{}
-   :messages {}
-   :message-epochs {}
-   :global-echo-sample #{}
-   :global-ready-sample #{}
-   :global-delivery-sample #{}
-   :echo-subscribers #{}
-   :ready-subscribers #{}
-   :delivery-subscribers #{}
-   :received-echoes {}
-   :received-readies {}
-   :sieve-delivered-set #{}
-   :local-ready-set #{}
-   :delivered-set #{}})
+   node-pubkey should be the hex-encoded public key of this node.
+   config is an optional protocol-parameter map (defaults to `config/default-config`)."
+  ([initial-peers node-pubkey]
+   (init-state initial-peers node-pubkey config/default-config))
+  ([initial-peers node-pubkey cfg]
+   {:node-pubkey node-pubkey
+    :config cfg
+    :epoch 0
+    :basalt-index 0
+    :basalt-view (basalt/init-view initial-peers (:basalt-max-view-size cfg) (java.util.Random.))
+    :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
+    :contagion-known-ids #{}
+    :messages {}
+    :message-epochs {}
+    :global-echo-sample #{}
+    :global-ready-sample #{}
+    :global-delivery-sample #{}
+    :echo-subscribers #{}
+    :ready-subscribers #{}
+    :delivery-subscribers #{}
+    :received-echoes {}
+    :received-readies {}
+    :sieve-delivered-set #{}
+    :local-ready-set #{}
+    :delivered-set #{}}))
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
-  (let [new-epoch (inc (or (:epoch state) 0))
+  (let [cfg (:config state)
+        E-size (:echo-sample-size cfg)
+        R-size (:ready-sample-size cfg)
+        D-size (:delivery-sample-size cfg)
+        gossip-ttl-epochs (:gossip-ttl-epochs cfg)
+        new-epoch (inc (or (:epoch state) 0))
         view (:basalt-view state)
         rng (:rng event)
         reset-result (basalt/reset-slots view rng (:basalt-index state) 1)
@@ -153,14 +140,15 @@
 (defn- handle-broadcast
   "Handles an internal request to broadcast a payload."
   [state event]
-  (let [payload (:payload event)
+  (let [cfg (:config state)
+        murmur-k (:murmur-k cfg)
+        murmur-max-cache-size (:murmur-max-cache-size cfg)
+        payload (:payload event)
         rng (:rng event)
         extracted-peers (basalt/extract-peers (:basalt-view state))
         sieve-message (if (and (:private-key event) (:public-key event))
                         (sieve/wrap-message payload (:private-key event) (:public-key event))
                         {:payload payload :sender "local" :signature (byte-array 0)})
-        ;; For debugging, make sure there are targets and commands are emitted.
-        ;; When the test fails, print out the targets.
         broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
         message-id (:message-id broadcast-result)
         message (assoc sieve-message :message-id message-id)
@@ -261,7 +249,10 @@
    Validates the Sieve signature before accepting into the cache.
    If new, initializes Sieve and Contagion sampling."
   [state event]
-  (let [message (:message event)
+  (let [cfg (:config state)
+        murmur-k (:murmur-k cfg)
+        murmur-max-cache-size (:murmur-max-cache-size cfg)
+        message (:message event)
         rng (:rng event)
         valid-signature? (sieve/validate-message message)]
     (if valid-signature?
@@ -308,7 +299,9 @@
    Records the vote if the sender is in the global-echo-sample.
    If E-hat is reached, transitions to Sieve-Delivered and broadcasts Contagion Ready."
   [state event]
-  (let [sender (:sender event)
+  (let [cfg (:config state)
+        E-hat (:echo-threshold cfg)
+        sender (:sender event)
         message-id (:message-id event)
         echo-sample (:global-echo-sample state)
         received-echoes (get (:received-echoes state) message-id #{})
@@ -316,9 +309,8 @@
     (if (and (contains? echo-sample sender)
              (not (contains? received-echoes sender)))
       (let [new-received-echoes (conj received-echoes sender)
-            state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)
-            current-E-hat E-hat]
-        (if (and (>= (count new-received-echoes) current-E-hat)
+            state-with-echo (assoc-in state [:received-echoes message-id] new-received-echoes)]
+        (if (and (>= (count new-received-echoes) E-hat)
                  (not (contains? sieve-delivered-set message-id)))
           ;; Threshold reached, transition to Sieve-Delivered
           (let [state-sieve-delivered (update state-with-echo :sieve-delivered-set conj message-id)
@@ -343,7 +335,10 @@
    If R-hat is reached, transitions to Ready and broadcasts Contagion Ready.
    If D-hat is reached, transitions to Delivered and emits :on-deliver."
   [state event]
-  (let [sender (:sender event)
+  (let [cfg (:config state)
+        R-hat (:ready-threshold cfg)
+        D-hat (:delivery-threshold cfg)
+        sender (:sender event)
         message-id (:message-id event)
         ready-sample (:global-ready-sample state)
         delivery-sample (:global-delivery-sample state)
@@ -355,13 +350,12 @@
             state-with-ready (assoc-in state [:received-readies message-id] new-received-readies)
 
             ;; Check R-hat for Ready transition
-            current-R-hat R-hat
             ready-votes (count (clojure.set/intersection new-received-readies ready-sample))
-            state-checked-ready (if (and (>= ready-votes current-R-hat)
+            state-checked-ready (if (and (>= ready-votes R-hat)
                                          (not (contains? (:local-ready-set state-with-ready) message-id)))
                                   (update state-with-ready :local-ready-set conj message-id)
                                   state-with-ready)
-            ready-commands (if (and (>= ready-votes current-R-hat)
+            ready-commands (if (and (>= ready-votes R-hat)
                                     (not (contains? (:local-ready-set state-with-ready) message-id)))
                              (let [ready-targets (set/union (:ready-subscribers state) (:delivery-subscribers state))]
                                (if (seq ready-targets)
@@ -372,14 +366,13 @@
                              [])
 
             ;; Check D-hat for Final Delivery transition
-            current-D-hat D-hat
             delivery-votes (count (clojure.set/intersection new-received-readies delivery-sample))
-            state-checked-delivery (if (and (>= delivery-votes current-D-hat)
+            state-checked-delivery (if (and (>= delivery-votes D-hat)
                                             (not (contains? (:delivered-set state-checked-ready) message-id)))
                                      (update state-checked-ready :delivered-set conj message-id)
                                      state-checked-ready)
 
-            delivery-commands (if (and (>= delivery-votes current-D-hat)
+            delivery-commands (if (and (>= delivery-votes D-hat)
                                        (not (contains? (:delivered-set state-checked-ready) message-id)))
                                 (let [message (get (:messages state) message-id)]
                                   (if message

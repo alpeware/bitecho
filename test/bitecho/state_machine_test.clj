@@ -21,5 +21,5 @@
     (is (set? (:delivery-subscribers state)))
     (is (not (contains? state :echo-samples)))
     (is (not (contains? state :ready-samples)))
-    (is (not (contains? state :delivery-samples)))))
-
+    (is (not (contains? state :delivery-samples)))
+    (is (map? (:config state)) "State should contain the protocol config map")))

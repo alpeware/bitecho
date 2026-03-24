@@ -13,8 +13,8 @@
     (is (contains? (:contagion-known-ids state-1) message-id))
     (is (contains? (:messages state-1) message-id))
 
-    ;; Tick N times to exceed the TTL
-    (let [ttl 10
+    ;; Tick N times to exceed the TTL (default gossip-ttl-epochs = 10)
+    (let [ttl (:gossip-ttl-epochs (:config state-1))
           tick-event {:type :tick :rng (java.util.Random. 42)}
           state-after-ticks (reduce (fn [s _] (:state (sm/handle-event s tick-event)))
                                     state-1
