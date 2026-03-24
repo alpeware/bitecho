@@ -136,7 +136,13 @@
                              view
                              indices)
         remaining-peers (extract-peers cleared-view)
-        updated-view (update-view cleared-view remaining-peers)]
+        all-peers (reduce (fn [acc peer]
+                            (if (some #(= (:hash %) (:hash peer)) acc)
+                              acc
+                              (conj acc peer)))
+                          remaining-peers
+                          samples)
+        updated-view (update-view cleared-view all-peers)]
     {:view updated-view
      :samples samples
      :next-r (mod (+ r k) size)}))

@@ -110,5 +110,5 @@
       ;; Seeds for 3 and 0 should be different from original
       (is (not= "seed3" (:seed (nth updated-view 3))))
       (is (not= "seed0" (:seed (nth updated-view 0))))
-      ;; Remaining peers (p2, p3) should repopulate empty slots, so slot 0 and 3 should have peers, possibly p2 or p3
-      (is (= 2 (count (remove #(nil? (:peer %)) updated-view)))))))
+      ;; All peers (including displaced p4, p1) should be reassigned into new slots
+      (is (= 4 (count (remove #(nil? (:peer %)) updated-view)))))))
