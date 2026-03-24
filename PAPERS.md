@@ -28,6 +28,16 @@ Contagion proposes a scalable, probabilistic Byzantine reliable broadcast algori
 - **Adversary Decorators:** A novel analytical technique introduced to reason about the optimal strategy of a Byzantine adversary without making additional assumptions, allowing rigorous derivation of failure probability bounds.
 - **Threshold Contagion:** A model of message propagation through a system containing Byzantine processes, analyzing how information spreads when a certain threshold of confirmation is required to forward a message.
 
+### 1. Summary of SBRB Algorithms Detailed in the Paper
+The paper *"Scalable Byzantine Reliable Broadcast"* introduces a highly scalable approach to bypass the $O(N)$ communication bottleneck of traditional quorum-based Byzantine consensus, reducing per-process communication to $O(\log N)$ by relying on probabilistic stochastic samples. It builds the broadcast stack in three distinct layers:
+
+*   **Murmur (Probabilistic Broadcast):** A foundational epidemic gossip layer. A designated sender signs and broadcasts a message to a random sample of peers. Correct nodes verify the signature, deliver it upon first receipt, and forward it to their own random gossip sample ($G$). It guarantees *Validity* and *Totality* but **not** *Consistency* (a Byzantine sender can equivocate and cause different nodes to deliver validly signed but conflicting payloads).
+*   **Sieve (Probabilistic Consistent Broadcast):** Upgrades Murmur to guarantee *Consistency* (no two correct nodes deliver different messages). Upon initialization, nodes select an **Echo Sample ($E$)** and **subscribe** to those peers. When a node receives a Murmur message, it sends an `Echo` strictly to its subscribers. A node only "Sieve-delivers" the message if it receives $\hat{E}$ matching Echoes from its chosen sample.
+*   **Contagion (Probabilistic Reliable Broadcast):** Upgrades Sieve to guarantee *Totality* (preventing the network from stalling). Nodes select a **Ready Sample ($R$)** and a **Delivery Sample ($D$)** and subscribe to them. It uses a viral, epidemiological feedback loop:
+    *   **Rule 1 (Infection):** If a node Sieve-delivers a message OR observes $\hat{R}$ "Ready" messages from its Ready Sample, it becomes "Ready" itself and notifies its subscribers.
+    *   **Rule 2 (Delivery):** If a node observes $\hat{D}$ "Ready" messages from its Delivery Sample, it finalizes delivery to the application.
+    *   Because $\hat{R}/R < \hat{D}/D$, the math guarantees that if even *one* honest node observes enough readiness to deliver, the entire honest network will eventually become infected by the "Ready" state and cascade into delivery.
+
 ## The Consensus Number of a Cryptocurrency
 
 **Overview:**
