@@ -210,7 +210,13 @@
     (async/go-loop [iteration 1]
       ;; Wait to establish subscription graphs before starting
       (when (= iteration 1)
-        (async/<! (async/timeout 3000)))
+        (println "Running stabilization ticks to build subscription graphs...")
+        (dotimes [i 100]
+          (doseq [node (vals (:nodes network))]
+            (when (:events-in node)
+              (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)})))
+          (async/<! (async/timeout 100)))
+        (async/<! (async/timeout 1000)))
 
       (when (< @broadcasts-initiated total-broadcast-messages)
         (let [initiator (rand-nth (:h-nodes network))

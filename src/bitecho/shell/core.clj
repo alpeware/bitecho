@@ -18,7 +18,8 @@
     :receive-pull-request
     :receive-gossip
     :receive-sieve-echo
-    :receive-contagion-ready})
+    :receive-contagion-ready
+    :receive-subscribe})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."
