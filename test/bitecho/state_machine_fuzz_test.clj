@@ -1,6 +1,7 @@
 (ns bitecho.state-machine-fuzz-test
   "Generative state-machine fuzzer."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.state-machine :as sm]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -31,7 +32,7 @@
 
 (defn- init-cluster-state
   "Initializes a cluster of `n` nodes, establishing a fully connected initial topology."
-  [n]
+  [n cfg]
   (let [node-ids (range n)
         ;; Pre-generate pubkeys for the mock peers so they have stable identities
         node-keys (into {}
@@ -47,7 +48,7 @@
     (into {}
           (for [i node-ids]
             (let [initial-peers (map val (dissoc node-info i))
-                  state (sm/init-state initial-peers (basalt/bytes->hex (:public (get node-keys i))))]
+                  state (sm/init-state initial-peers (basalt/bytes->hex (:public (get node-keys i))) cfg)]
               [i (assoc state :keys (get node-keys i))])))))
 
 (defn- build-pubkey-map [cluster-state]
@@ -137,7 +138,9 @@
   "Runs the simulation over a series of top-level user events."
   [n drop-rate events seed]
   (let [rng (java.util.Random. seed)
-        initial-cluster (init-cluster-state n)
+        ;; Use a high TTL so messages survive the full fuzz run
+        cfg (config/make-config {:gossip-ttl-epochs 1000})
+        initial-cluster (init-cluster-state n cfg)
         ;; Add a stabilization phase: 100 extra ticks to allow gossip/anti-entropy to converge
         all-events (concat (repeat 100 [:tick]) events (repeat 400 [:tick]))]
     (reduce (fn [cluster [event-type payload]]
@@ -161,23 +164,22 @@
                  drop-rate gen-drop-rate
                  events gen-events
                  seed gen/large-integer]
-                (with-redefs [sm/gossip-ttl-epochs 1000]
-                  (let [final-cluster (simulate-network n drop-rate events seed)
+                (let [final-cluster (simulate-network n drop-rate events seed)
             ;; Extract all the payloads that were broadcast during the simulation
-                        broadcast-payloads (->> events
-                                                (filter #(= :broadcast (first %)))
-                                                (map second)
-                                                set)]
-                    (and (map? final-cluster)
-                         (= n (count final-cluster))
-             ;; Verify every node has a non-empty connected basalt view
-                         (every? (comp seq :basalt-view val) final-cluster)
-             ;; Verify every broadcast payload is in the murmur cache queue of every node
-                         (every? (fn [node-state]
-                                   (let [known-ids (:contagion-known-ids node-state)
-                                         expected-ids (map (fn [p]
-                                                             (basalt/bytes->hex (crypto/sha256 p)))
-                                                           broadcast-payloads)]
-                         ;; Every node should eventually know every broadcasted message ID
-                                     (every? #(contains? known-ids %) expected-ids)))
-                                 (vals final-cluster)))))))
+                      broadcast-payloads (->> events
+                                              (filter #(= :broadcast (first %)))
+                                              (map second)
+                                              set)]
+                  (and (map? final-cluster)
+                       (= n (count final-cluster))
+              ;; Verify every node has a non-empty connected basalt view
+                       (every? (comp seq :basalt-view val) final-cluster)
+              ;; Verify every broadcast payload is in the murmur cache queue of every node
+                       (every? (fn [node-state]
+                                 (let [known-ids (:contagion-known-ids node-state)
+                                       expected-ids (map (fn [p]
+                                                           (basalt/bytes->hex (crypto/sha256 p)))
+                                                         broadcast-payloads)]
+                          ;; Every node should eventually know every broadcasted message ID
+                                   (every? #(contains? known-ids %) expected-ids)))
+                               (vals final-cluster))))))

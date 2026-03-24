@@ -1,17 +1,21 @@
 (ns bitecho.simulator.sieve-e2e
   "Isolated integration test proving that Sieve echoes correctly track E-hat thresholds and emit :send-contagion-ready."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]))
 
-(def total-nodes 15)
+(def sim-config
+  "Simulation parameters for the Sieve E2E test."
+  {:total-nodes 15
+   :protocol    config/default-config})
 
 (defn- create-node
-  [i]
+  [i cfg]
   (let [keys (crypto/generate-keypair)
         pubkey-hex (basalt/bytes->hex (:public keys))
-        initial-state (sm/init-state [] pubkey-hex)
+        initial-state (sm/init-state [] pubkey-hex (:protocol cfg))
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
@@ -87,61 +91,68 @@
 (defn -main
   "Starts the isolated Sieve simulation, verifying E-hat thresholds are met."
   []
-  (println "Starting Sieve E2E Simulator...")
-  (let [nodes (mapv create-node (range total-nodes))
-        nodes-map (into {} (map (juxt :pubkey-hex identity) nodes))
-        stop-ch (async/chan)
-        _router (route-events nodes-map stop-ch)
-        all-peers (mapv :peer nodes)
-        nodes-ready (atom #{})
-        payload-bytes (.getBytes "test-sieve-payload" "UTF-8")]
+  (let [cfg sim-config
+        total-nodes (:total-nodes cfg)
+        view-size (get-in cfg [:protocol :basalt-max-view-size])]
+    (println "Starting Sieve E2E Simulator...")
+    (println (format "Config: %d nodes, E-size=%d, E-hat=%d"
+                     total-nodes
+                     (get-in cfg [:protocol :echo-sample-size])
+                     (get-in cfg [:protocol :echo-threshold])))
+    (let [nodes (mapv #(create-node % cfg) (range total-nodes))
+          nodes-map (into {} (map (juxt :pubkey-hex identity) nodes))
+          stop-ch (async/chan)
+          _router (route-events nodes-map stop-ch)
+          all-peers (mapv :peer nodes)
+          nodes-ready (atom #{})
+          payload-bytes (.getBytes "test-sieve-payload" "UTF-8")]
 
-    ;; Run node loops
-    (doseq [node nodes]
-      (run-node-loop node stop-ch nodes-ready))
-
-    ;; Bootstrap: push omniscient view
-    (doseq [node nodes]
-      (let [initial-view (take 20 (shuffle all-peers))]
-        (async/put! (:in-ch node) {:type :receive-push-view :view initial-view})))
-
-    ;; Wait for initial views to process
-    (async/<!! (async/timeout 100))
-
-    ;; Network Stabilization: Ticks for subscription building
-    (println "Running stabilization ticks to build subscription graphs...")
-    (dotimes [i 100]
+      ;; Run node loops
       (doseq [node nodes]
-        (async/put! (:in-ch node) {:type :tick :rng (java.util.Random.)}))
-      (async/<!! (async/timeout 100)))
+        (run-node-loop node stop-ch nodes-ready))
 
-    ;; Inject Sieve Broadcast
-    (let [initiator (rand-nth nodes)]
-      (println (format "Injecting Sieve :contagion-broadcast via node %s..." (subs (:pubkey-hex initiator) 0 8)))
-      (async/put! (:in-ch initiator) {:type :contagion-broadcast
-                                      :payload payload-bytes
-                                      :rng (java.util.Random.)
-                                      :private-key (:private (:keys initiator))
-                                      :public-key (:public (:keys initiator))}))
+      ;; Bootstrap: push omniscient view
+      (doseq [node nodes]
+        (let [initial-view (take view-size (shuffle all-peers))]
+          (async/put! (:in-ch node) {:type :receive-push-view :view initial-view})))
 
-    ;; Wait for Sieve echoes and ready transitions
-    (println "Waiting for Sieve echoes to propagate and reach E-hat thresholds...")
-    (async/<!! (async/timeout 3000))
+      ;; Wait for initial views to process
+      (async/<!! (async/timeout 100))
 
-    ;; Stop network
-    (async/close! stop-ch)
+      ;; Network Stabilization: Ticks for subscription building
+      (println "Running stabilization ticks to build subscription graphs...")
+      (dotimes [_i 100]
+        (doseq [node nodes]
+          (async/put! (:in-ch node) {:type :tick :rng (java.util.Random.)}))
+        (async/<!! (async/timeout 100)))
 
-    ;; Analyze Sieve reach
-    (let [ready-count (count @nodes-ready)
-          majority (Math/ceil (/ total-nodes 2.0))]
-      (println (format "Nodes emitting :send-contagion-ready: %d/%d (majority threshold: %d)" ready-count total-nodes (int majority)))
-      (if (>= ready-count majority)
-        (do
-          (println "✅ Sieve correctly tracked E-hat thresholds and emitted ready.")
-          (System/exit 0))
-        (do
-          (println "❌ Sieve echoes failed to reach E-hat or failed to emit ready!")
-          (throw (ex-info "Sieve threshold tracking failed"
-                          {:ready-count ready-count
-                           :majority majority}))
-          (System/exit 1))))))
+      ;; Inject Sieve Broadcast
+      (let [initiator (rand-nth nodes)]
+        (println (format "Injecting Sieve :contagion-broadcast via node %s..." (subs (:pubkey-hex initiator) 0 8)))
+        (async/put! (:in-ch initiator) {:type :contagion-broadcast
+                                        :payload payload-bytes
+                                        :rng (java.util.Random.)
+                                        :private-key (:private (:keys initiator))
+                                        :public-key (:public (:keys initiator))}))
+
+      ;; Wait for Sieve echoes and ready transitions
+      (println "Waiting for Sieve echoes to propagate and reach E-hat thresholds...")
+      (async/<!! (async/timeout 3000))
+
+      ;; Stop network
+      (async/close! stop-ch)
+
+      ;; Analyze Sieve reach
+      (let [ready-count (count @nodes-ready)
+            majority (Math/ceil (/ total-nodes 2.0))]
+        (println (format "Nodes emitting :send-contagion-ready: %d/%d (majority threshold: %d)" ready-count total-nodes (int majority)))
+        (if (>= ready-count majority)
+          (do
+            (println "✅ Sieve correctly tracked E-hat thresholds and emitted ready.")
+            (System/exit 0))
+          (do
+            (println "❌ Sieve echoes failed to reach E-hat or failed to emit ready!")
+            (throw (ex-info "Sieve threshold tracking failed"
+                            {:ready-count ready-count
+                             :majority majority}))
+            (System/exit 1)))))))

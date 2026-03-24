@@ -1,19 +1,23 @@
 (ns bitecho.simulator.basalt-e2e
   "Isolated integration test proving that Basalt peer sampling converges."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]))
 
-(def total-nodes 15)
-(def tick-interval-ms 100)
-(def total-ticks 50)
+(def sim-config
+  "Simulation parameters for the Basalt E2E test."
+  {:total-nodes      15
+   :tick-interval-ms 100
+   :total-ticks      50
+   :protocol         config/default-config})
 
 (defn- create-node
-  [i]
+  [i cfg]
   (let [keys (crypto/generate-keypair)
         pubkey-hex (basalt/bytes->hex (:public keys))
-        initial-state (sm/init-state [] pubkey-hex)
+        initial-state (sm/init-state [] pubkey-hex (:protocol cfg))
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
@@ -55,45 +59,49 @@
         (recur)))))
 
 (defn -main []
-  (println "Starting Basalt E2E Simulator...")
-  (let [nodes (mapv create-node (range total-nodes))
-        nodes-map (into {} (map (juxt :pubkey-hex identity) nodes))
-        stop-ch (async/chan)
-        router (route-events nodes-map stop-ch)
-        node-loops (mapv #(run-node-loop % stop-ch) nodes)
-        all-peers (mapv :peer nodes)]
+  (let [cfg sim-config
+        total-nodes (:total-nodes cfg)
+        view-size (get-in cfg [:protocol :basalt-max-view-size])]
+    (println "Starting Basalt E2E Simulator...")
+    (println (format "Config: %d nodes, view-size=%d" total-nodes view-size))
+    (let [nodes (mapv #(create-node % cfg) (range total-nodes))
+          nodes-map (into {} (map (juxt :pubkey-hex identity) nodes))
+          stop-ch (async/chan)
+          _router (route-events nodes-map stop-ch)
+          _node-loops (mapv #(run-node-loop % stop-ch) nodes)
+          all-peers (mapv :peer nodes)]
 
-    ;; Bootstrap: push omniscient view
-    (doseq [node nodes]
-      (let [initial-view (take 20 (shuffle all-peers))]
-        (async/put! (:in-ch node) {:type :receive-push-view :view initial-view})))
-
-    ;; Wait for initial views to process
-    (async/<!! (async/timeout 100))
-
-    ;; Tick loop
-    (dotimes [i total-ticks]
+      ;; Bootstrap: push omniscient view
       (doseq [node nodes]
-        (async/put! (:in-ch node) {:type :tick :rng (java.util.Random.)}))
-      (async/<!! (async/timeout tick-interval-ms)))
+        (let [initial-view (take view-size (shuffle all-peers))]
+          (async/put! (:in-ch node) {:type :receive-push-view :view initial-view})))
 
-    ;; Wait a bit for final events
-    (println "Waiting for events to drain...")
-    (async/<!! (async/timeout 3000))
+      ;; Wait for initial views to process
+      (async/<!! (async/timeout 100))
 
-    ;; Stop network
-    (async/put! stop-ch true)
+      ;; Tick loop
+      (dotimes [_i (:total-ticks cfg)]
+        (doseq [node nodes]
+          (async/put! (:in-ch node) {:type :tick :rng (java.util.Random.)}))
+        (async/<!! (async/timeout (:tick-interval-ms cfg))))
 
-    ;; Analyze topology
-    (let [view-sizes (map #(count (basalt/extract-peers (:basalt-view @(:state %)))) nodes)
-          min-view (apply min view-sizes)
-          max-view (apply max view-sizes)
-          avg-view (float (/ (reduce + view-sizes) total-nodes))]
-      (println (format "View sizes: min=%d, max=%d, avg=%.2f" min-view max-view avg-view))
-      (if (>= min-view 10)
-        (do
-          (println "✅ Basalt topology converged successfully.")
-          (System/exit 0))
-        (do
-          (println "❌ Basalt topology failed to converge! Views are too small.")
-          (System/exit 1))))))
+      ;; Wait a bit for final events
+      (println "Waiting for events to drain...")
+      (async/<!! (async/timeout 3000))
+
+      ;; Stop network
+      (async/put! stop-ch true)
+
+      ;; Analyze topology
+      (let [view-sizes (map #(count (basalt/extract-peers (:basalt-view @(:state %)))) nodes)
+            min-view (apply min view-sizes)
+            max-view (apply max view-sizes)
+            avg-view (float (/ (reduce + view-sizes) total-nodes))]
+        (println (format "View sizes: min=%d, max=%d, avg=%.2f" min-view max-view avg-view))
+        (if (>= min-view 10)
+          (do
+            (println "✅ Basalt topology converged successfully.")
+            (System/exit 0))
+          (do
+            (println "❌ Basalt topology failed to converge! Views are too small.")
+            (System/exit 1)))))))
