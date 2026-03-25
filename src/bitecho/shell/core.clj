@@ -33,10 +33,10 @@
   ([initial-state]
    (start-node initial-state persistence/default-snapshot-filename))
   ([initial-state snapshot-filename]
-   (let [events-in (async/chan 1024)
-         network-in (async/chan 1024)
-         net-out (async/chan 1024)
-         app-out (async/chan 1024)
+   (let [events-in (async/chan 8192)
+         network-in (async/chan 8192)
+         net-out (async/chan 8192)
+         app-out (async/chan 8192)
          persist-ch (async/chan (async/sliding-buffer 1))
          stop-ch (async/chan)]
 
