@@ -110,7 +110,7 @@
         pubkey-hex (basalt/bytes->hex (:public keys))
         initial-state (sm/init-state [] pubkey-hex (:protocol cfg))
         snapshot-filename (str "/tmp/snapshot-" pubkey-hex ".bin")
-        node (shell-core/start-node initial-state snapshot-filename)
+        node (shell-core/start-node initial-state snapshot-filename {:persist? false})
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
@@ -358,7 +358,7 @@
               (swap! broadcasts-initiated inc)
               (swap! broadcast-start-times assoc message-id (System/currentTimeMillis))
               (println (format "Injecting broadcast %s via honest node %s..."
-                               broadcast-id (subs (:pubkey-hex initiator) 0 8)))
+                               broadcast-id (subs (:pubkey-hex initiator) (- (count (:pubkey-hex initiator)) 8))))
               (async/put! (:events-in initiator) {:type :contagion-broadcast
                                                   :payload payload-bytes
                                                   :rng (java.util.Random.)
@@ -374,6 +374,95 @@
           (doseq [bid (enumeration-seq (.keys delivery-chm))]
             (let [^java.util.Set s (.get delivery-chm bid)]
               (println (format "  Broadcast %s: %d/%d delivered" bid (.size s) honest-nodes))))
+
+          ;; ─── Diagnostic state dump ───────────────────────────────────
+          (println "\n🔍 Querying state of undelivered nodes...")
+          (let [delivered-pubkeys (into #{}
+                                       (mapcat (fn [bid]
+                                                 (let [^java.util.Set s (.get delivery-chm bid)]
+                                                   (iterator-seq (.iterator s))))
+                                               (enumeration-seq (.keys delivery-chm))))
+                undelivered-nodes (filterv #(not (contains? delivered-pubkeys (:pubkey-hex %)))
+                                          (:h-nodes network))
+                protocol-cfg (:protocol cfg)
+                E-hat (:echo-threshold protocol-cfg)
+                D-hat (:delivery-threshold protocol-cfg)
+                ;; Query state for all undelivered nodes (with short timeout)
+                node-states (doall
+                              (keep (fn [n]
+                                      (when-let [state (shell-core/query-node-state (:node n) :timeout-ms 2000)]
+                                        {:pubkey (let [pk (:pubkey-hex n)] (subs pk (- (count pk) 8)))
+                                         :state state}))
+                                    undelivered-nodes))
+                ;; Find the broadcast message-id(s)
+                broadcast-ids (into #{} (enumeration-seq (.keys delivery-chm)))
+
+                classify-node
+                (fn [{:keys [pubkey state]}]
+                  (let [known-ids (:contagion-known-ids state)
+                        echo-sample (:global-echo-sample state)
+                        ready-sample (:global-ready-sample state)
+                        delivery-sample (:global-delivery-sample state)
+                        echo-subs (:echo-subscribers state)
+                        ready-subs (:ready-subscribers state)
+                        delivery-subs (:delivery-subscribers state)
+                        ;; Check per broadcast message
+                        bid (first broadcast-ids)
+                        has-message? (and bid (contains? known-ids bid))
+                        echo-votes (get-in state [:echo-vote-counts bid] 0)
+                        ready-votes (get-in state [:ready-vote-counts bid] 0)
+                        delivery-votes (get-in state [:delivery-vote-counts bid] 0)
+                        sieve-delivered? (and bid (contains? (:sieve-delivered-set state) bid))
+                        local-ready? (and bid (contains? (:local-ready-set state) bid))]
+                    {:pubkey pubkey
+                     :group (cond
+                              (empty? echo-sample)                           :no-echo-sample
+                              (empty? echo-subs)                             :no-echo-subscribers
+                              (empty? ready-subs)                            :no-ready-subscribers
+                              (empty? delivery-subs)                         :no-delivery-subscribers
+                              (not has-message?)                             :no-message
+                              (and has-message? (not sieve-delivered?)
+                                   (< echo-votes E-hat))                    :awaiting-sieve-echo
+                              (and sieve-delivered? (not local-ready?))       :sieve-delivered-not-ready
+                              (and local-ready?
+                                   (< delivery-votes D-hat))                 :ready-awaiting-delivery
+                              :else                                          :unknown)
+                     :echo-sample-size (count echo-sample)
+                     :ready-sample-size (count ready-sample)
+                     :delivery-sample-size (count delivery-sample)
+                     :echo-sub-count (count echo-subs)
+                     :ready-sub-count (count ready-subs)
+                     :delivery-sub-count (count delivery-subs)
+                     :echo-votes echo-votes
+                     :ready-votes ready-votes
+                     :delivery-votes delivery-votes
+                     :basalt-view-size (count (basalt/extract-peers (:basalt-view state)))
+                     :epoch (:epoch state)
+                     :has-message? has-message?
+                     :sieve-delivered? sieve-delivered?
+                     :local-ready? local-ready?}))
+
+                classified (mapv classify-node node-states)
+                groups (group-by :group classified)]
+
+            (println (format "\n📊 Diagnostic Summary: %d undelivered nodes (queried %d, %d timed out)"
+                            (count undelivered-nodes) (count node-states)
+                            (- (count undelivered-nodes) (count node-states))))
+            (println "════════════════════════════════════════════════════════════")
+            (doseq [[group nodes] (sort-by (comp - count second) groups)]
+              (let [sample (first nodes)]
+                (println (format "\n  %-30s  %d nodes" (name group) (count nodes)))
+                (println (format "    Sample node:  %s" (:pubkey sample)))
+                (println (format "    Basalt view:  %d peers, epoch %d" (:basalt-view-size sample) (:epoch sample)))
+                (println (format "    Samples:      E=%d  R=%d  D=%d" (:echo-sample-size sample) (:ready-sample-size sample) (:delivery-sample-size sample)))
+                (println (format "    Subscribers:  echo=%d  ready=%d  delivery=%d" (:echo-sub-count sample) (:ready-sub-count sample) (:delivery-sub-count sample)))
+                (println (format "    Has message:  %s  Sieve-delivered: %s  Ready: %s" (:has-message? sample) (:sieve-delivered? sample) (:local-ready? sample)))
+                (println (format "    Votes:        echo=%d/%d  ready=%d  delivery=%d/%d"
+                                (:echo-votes sample) E-hat
+                                (:ready-votes sample)
+                                (:delivery-votes sample) D-hat))))
+            (println "\n════════════════════════════════════════════════════════════"))
+
           (throw (ex-info "Contagion broadcast failed to reach all honest nodes within timeout"
                           {:timeout-ms (:completion-timeout-ms cfg)}))))
 
