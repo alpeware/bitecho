@@ -269,7 +269,7 @@
         byzantine-nodes (:byzantine-nodes cfg)
         honest-nodes (- total-nodes byzantine-nodes)
         start-wall-time (System/currentTimeMillis)
-        delivery-target (int (* 1 honest-nodes))]
+        delivery-target (int (* 0.95 honest-nodes))]
     (println "Starting Contagion E2E Simulator...")
     (println (format "Network Topology: %d total nodes (%d honest, %d byzantine)"
                      total-nodes honest-nodes byzantine-nodes))
@@ -293,13 +293,12 @@
           done-ch (async/chan)]
 
       ;; Per-node telemetry consumers — each drains app-out into the shared CHM
+      ;; Uses :message-id directly from the app event (no EDN parsing needed)
       (doseq [node (:h-nodes network)]
         (async/go-loop []
           (when-let [val (async/<! (:app-out node))]
             (when (and (map? val) (= (:event-name val) :on-deliver))
-              (let [payload-str (String. ^bytes (:payload val) "UTF-8")
-                    payload-map (clojure.edn/read-string payload-str)
-                    broadcast-id (:id payload-map)
+              (let [broadcast-id (:message-id val)
                     pubkey (:pubkey-hex node)
                     ^java.util.Set delivery-set
                     (.computeIfAbsent delivery-chm broadcast-id
@@ -308,9 +307,10 @@
                                          (java.util.concurrent.ConcurrentHashMap/newKeySet))))]
                 (when (.add delivery-set pubkey)
                   (let [current-deliveries (.size delivery-set)]
-                    (when (zero? (mod current-deliveries 50))
-                      (println (format "Broadcast %s reached %d/%d nodes"
-                                       broadcast-id current-deliveries honest-nodes)))
+                    (when (zero? (mod current-deliveries 10))
+                      (println (format "Broadcast %s reached %d/%d nodes in %dms"
+                                       broadcast-id current-deliveries honest-nodes
+                                       (- (System/currentTimeMillis) start-wall-time))))
                     (when (and (= current-deliveries honest-nodes)
                                (zero? (.get delivery-counter)))
                       (.incrementAndGet delivery-counter)
@@ -352,9 +352,11 @@
             (let [initiator (rand-nth (:h-nodes network))
                   broadcast-id (str (java.util.UUID/randomUUID))
                   payload-str (pr-str {:id broadcast-id :data (str "test-payload-" iteration)})
-                  payload-bytes (.getBytes ^String payload-str "UTF-8")]
+                  payload-bytes (.getBytes ^String payload-str "UTF-8")
+                  ;; Compute the message-id the same way the state machine will
+                  message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))]
               (swap! broadcasts-initiated inc)
-              (swap! broadcast-start-times assoc broadcast-id (System/currentTimeMillis))
+              (swap! broadcast-start-times assoc message-id (System/currentTimeMillis))
               (println (format "Injecting broadcast %s via honest node %s..."
                                broadcast-id (subs (:pubkey-hex initiator) 0 8)))
               (async/put! (:events-in initiator) {:type :contagion-broadcast

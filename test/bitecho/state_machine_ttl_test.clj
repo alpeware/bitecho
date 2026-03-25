@@ -20,4 +20,7 @@
                                     state-1
                                     (range (inc ttl)))]
       (is (not (contains? (:contagion-known-ids state-after-ticks) message-id)))
-      (is (not (contains? (:messages state-after-ticks) message-id))))))
+      (is (not (contains? (:messages state-after-ticks) message-id)))
+      ;; Verify epoch-to-messages index is also pruned
+      (is (every? (fn [[_epoch ids]] (not (contains? ids message-id)))
+                  (:epoch-to-messages state-after-ticks))))))
