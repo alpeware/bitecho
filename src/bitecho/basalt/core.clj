@@ -70,31 +70,30 @@
    then assigns each to at most one slot where it minimizes the cryptographic rank,
    ensuring the view is populated with as many distinct optimal peers as possible."
   [view received-peers]
-  (let [initial-candidates (reduce (fn [acc peer]
-                                     (if (some #(= (:hash %) (:hash peer)) acc)
-                                       acc
-                                       (conj acc peer)))
-                                   (extract-peers view)
-                                   received-peers)]
+  (let [initial-candidates (vals (reduce #(assoc %1 (:hash %2) %2) {}
+                                         (concat (extract-peers view)
+                                                 received-peers)))]
     (loop [v []
            remaining-slots view
-           candidates initial-candidates]
+           candidates initial-candidates
+           used-hashes #{}]
       (if (empty? remaining-slots)
         v
         (let [slot (first remaining-slots)
-              best-candidate (when (seq candidates)
-                               (reduce (fn [min-peer peer]
+              avail (remove #(contains? used-hashes (:hash %)) candidates)
+              best-candidate (when (seq avail)
+                               (reduce (fn [best peer]
                                          (if (neg? (compare (rank (:seed slot) (:hash peer))
-                                                            (rank (:seed slot) (:hash min-peer))))
+                                                            (rank (:seed slot) (:hash best))))
                                            peer
-                                           min-peer))
-                                       (first candidates)
-                                       (rest candidates)))]
+                                           best))
+                                       (first avail) (rest avail)))]
           (recur (conj v (assoc slot :peer best-candidate))
                  (rest remaining-slots)
+                 candidates
                  (if best-candidate
-                   (remove #(= (:hash %) (:hash best-candidate)) candidates)
-                   candidates)))))))
+                   (conj used-hashes (:hash best-candidate))
+                   used-hashes)))))))
 
 (defn init-view
   "Initializes a new Basalt view (a vector of v slots) from an initial collection of peers.
@@ -111,14 +110,14 @@
 (defn extract-peers
   "Extracts all distinct, non-nil peers currently held in the view's slots."
   [view]
-  (->> view
-       (map :peer)
-       (remove nil?)
-       (reduce (fn [acc peer]
-                 (if (some #(= (:hash %) (:hash peer)) acc)
-                   acc
-                   (conj acc peer)))
-               [])))
+  (let [peers (remove nil? (map :peer view))]
+    (loop [result [] seen #{} remaining peers]
+      (if-let [p (first remaining)]
+        (let [h (:hash p)]
+          (if (contains? seen h)
+            (recur result seen (rest remaining))
+            (recur (conj result p) (conj seen h) (rest remaining))))
+        result))))
 
 (defn reset-slots
   "Resets k slots starting at index r (with wrap-around).
