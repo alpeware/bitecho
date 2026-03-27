@@ -13,6 +13,8 @@
 ;; Simulation Configuration
 ;; ---------------------------------------------------------------------------
 
+(def total-nodes 500)
+
 (defn calculate-protocol-params
   "Dynamically scales Contagion parameters based on network size to maintain O(log N) guarantees.
    Mode can be :lean (fast simulations) or :secure (paper-accurate, high fault tolerance)."
@@ -56,18 +58,18 @@
 (def sim-config
   "Simulation parameters for 1000-node Contagion E2E.
    Protocol parameters use default-config with bumped view/TTL for N=1000."
-  {:total-nodes             1000
+  {:total-nodes             total-nodes
    :byzantine-nodes         0
-   :tick-interval-ms        500
+   :tick-interval-ms        (* 10 500)
    :total-broadcast-messages 1
-   :stabilization-ticks     40
+   :stabilization-ticks     60
    :stabilization-tick-pause-ms 500
-   :post-stabilization-pause-ms 15000
+   :post-stabilization-pause-ms 30000
    :broadcast-pause-ms      5000
    :completion-timeout-ms   600000
    :channel-buffer-size     8192
    :protocol                (merge config/default-config 
-                                   (calculate-protocol-params 1000 :mode :lean))
+                                   (calculate-protocol-params total-nodes :mode :lean))
    #_(merge config/default-config
             {:murmur-k 8
              :basalt-max-view-size 40
@@ -269,7 +271,7 @@
         byzantine-nodes (:byzantine-nodes cfg)
         honest-nodes (- total-nodes byzantine-nodes)
         start-wall-time (System/currentTimeMillis)
-        delivery-target (int (* 0.95 honest-nodes))]
+        delivery-target (int (* 1 honest-nodes))]
     (println "Starting Contagion E2E Simulator...")
     (println (format "Network Topology: %d total nodes (%d honest, %d byzantine)"
                      total-nodes honest-nodes byzantine-nodes))
@@ -332,6 +334,16 @@
                                          broadcast-id current-deliveries honest-nodes duration)))
                       (async/put! done-ch true))))))
             (recur))))
+
+      ;; Background ticker — drives anti-entropy during broadcast dissemination
+      (let [tick-stop-ch (async/chan)]
+        (async/go-loop []
+          (let [[_ port] (async/alts! [(async/timeout (:tick-interval-ms cfg)) tick-stop-ch])]
+            (when (not= port tick-stop-ch)
+              (doseq [node (:h-nodes network)]
+                (when (:events-in node)
+                  (async/put! (:events-in node) {:type :tick :rng (java.util.Random.)})))
+              (recur)))))
 
       ;; Scenario Loop — stabilize then broadcast
       (let [nodes-map (:nodes network)]
