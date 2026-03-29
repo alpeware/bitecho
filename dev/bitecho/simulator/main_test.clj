@@ -1,6 +1,6 @@
 (ns bitecho.simulator.main-test
-  (:require [clojure.test :refer [deftest is testing]]
-            [bitecho.simulator.main :as sim-main]))
+  (:require [bitecho.simulator.main :as sim-main]
+            [clojure.test :refer [deftest is testing]]))
 
 (deftest calculate-ratio-test
   (testing "Ratio of dropped Byzantine packets vs successful honest deliveries"

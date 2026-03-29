@@ -58,7 +58,9 @@
               (async/put! (:out-ch node) cmd))))
         (recur)))))
 
-(defn -main []
+(defn -main
+  "Main function for the Basalt E2E test."
+  []
   (let [cfg sim-config
         total-nodes (:total-nodes cfg)
         view-size (get-in cfg [:protocol :basalt-max-view-size])]

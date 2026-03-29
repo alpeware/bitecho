@@ -13,38 +13,40 @@
 ;; Simulation Configuration
 ;; ---------------------------------------------------------------------------
 
-(def total-nodes 500)
+(def total-nodes
+  "Total nodes in simulation."
+  500)
 
 (defn calculate-protocol-params
   "Dynamically scales Contagion parameters based on network size to maintain O(log N) guarantees.
    Mode can be :lean (fast simulations) or :secure (paper-accurate, high fault tolerance)."
   [total-nodes & {:keys [mode] :or {mode :lean}}]
   (let [ln-n (Math/log total-nodes)
-        
+
         ;; Multipliers based on desired security margin
         scale-factor (if (= mode :secure) 12.0 3.0)
         murmur-mult  (if (= mode :secure) 3.0 1.5)
-        
+
         ;; Logarithmic scaling
         murmur-k    (max 5 (int (Math/ceil (* murmur-mult ln-n))))
         base-sample (int (Math/ceil (* scale-factor ln-n)))
-        
+
         ;; Sizing (Uniform sample sizes mapped to S)
         E base-sample
         R base-sample
         D base-sample
-        
+
         ;; Thresholds (Maintaining the strict R/R < D/D invariant)
         ;; Echo: ~70%, Ready: ~35%, Delivery: ~80%
         E-thresh (int (Math/ceil (* 0.70 E)))
         R-thresh (int (Math/ceil (* 0.35 R)))
         D-thresh (int (Math/ceil (* 0.80 D)))
-        
+
         ;; Auxiliary network params
         view-size (int (Math/ceil (* 2.5 base-sample)))
         ;; Safely over-estimating the theoretical diameter of O(log N / log log N)
         ttl (int (Math/ceil (* 3.0 ln-n)))]
-    
+
     {:murmur-k murmur-k
      :basalt-max-view-size view-size
      :echo-sample-size E
@@ -68,7 +70,7 @@
    :broadcast-pause-ms      5000
    :completion-timeout-ms   600000
    :channel-buffer-size     8192
-   :protocol                (merge config/default-config 
+   :protocol                (merge config/default-config
                                    (calculate-protocol-params total-nodes :mode :lean))
    #_(merge config/default-config
             {:murmur-k 8
@@ -89,17 +91,27 @@
 ;; Metrics (contention-free via ConcurrentHashMap/AtomicLong)
 ;; ---------------------------------------------------------------------------
 
-(def broadcasts-initiated (atom 0))
-(def broadcast-start-times (atom {}))
-(def total-consensus-time (atom 0))
+(def broadcasts-initiated
+  "Number of broadcasts initiated."
+  (atom 0))
+(def broadcast-start-times
+  "Map of broadcast start times."
+  (atom {}))
+(def total-consensus-time
+  "Total time to consensus."
+  (atom 0))
 
-(def ^ConcurrentHashMap cmd-counters (ConcurrentHashMap.))
-(def ^AtomicLong total-routed (AtomicLong. 0))
+(def ^ConcurrentHashMap cmd-counters
+  "Counters for commands."
+  (ConcurrentHashMap.))
+(def ^AtomicLong total-routed
+  "Total routed commands."
+  (AtomicLong. 0))
 
 (defn- inc-cmd-counter! [cmd-type]
   (let [^AtomicLong counter (.computeIfAbsent cmd-counters (name cmd-type)
-                                               (reify java.util.function.Function
-                                                 (apply [_ _k] (AtomicLong. 0))))]
+                                              (reify java.util.function.Function
+                                                (apply [_ _k] (AtomicLong. 0))))]
     (.incrementAndGet counter)))
 
 ;; ---------------------------------------------------------------------------
@@ -173,30 +185,30 @@
       (async/put! target-ch {:type :receive-push-view :view (:view cmd)})
       :send-summary
       (async/put! target-ch {:type :receive-summary
-                              :sender sender-hex
-                              :summary (:summary cmd)})
+                             :sender sender-hex
+                             :summary (:summary cmd)})
       :send-subscribe
       (async/put! target-ch {:type :receive-subscribe
-                              :sender sender-hex
-                              :roles (:roles cmd)})
+                             :sender sender-hex
+                             :roles (:roles cmd)})
       :send-pull-request
       (async/put! target-ch {:type :receive-pull-request
-                              :sender sender-hex
-                              :missing-ids (:missing-ids cmd)})
+                             :sender sender-hex
+                             :missing-ids (:missing-ids cmd)})
       :send-gossip
       (async/put! target-ch {:type :receive-gossip
-                              :message (:message cmd)
-                              :rng (java.util.Random.)})
+                             :message (:message cmd)
+                             :rng (java.util.Random.)})
       :send-sieve-echo
       (async/put! target-ch {:type :receive-sieve-echo
-                              :sender sender-hex
-                              :message-id (:message-id cmd)
-                              :rng (java.util.Random.)})
+                             :sender sender-hex
+                             :message-id (:message-id cmd)
+                             :rng (java.util.Random.)})
       :send-contagion-ready
       (async/put! target-ch {:type :receive-contagion-ready
-                              :sender sender-hex
-                              :message-id (:message-id cmd)
-                              :rng (java.util.Random.)})
+                             :sender sender-hex
+                             :message-id (:message-id cmd)
+                             :rng (java.util.Random.)})
       nil)))
 
 (defn- create-direct-routers
@@ -265,7 +277,9 @@
 ;; Main
 ;; ---------------------------------------------------------------------------
 
-(defn -main []
+(defn -main
+  "Main function for the Contagion E2E simulator."
+  []
   (let [cfg sim-config
         total-nodes (:total-nodes cfg)
         byzantine-nodes (:byzantine-nodes cfg)
@@ -304,9 +318,9 @@
                     pubkey (:pubkey-hex node)
                     ^java.util.Set delivery-set
                     (.computeIfAbsent delivery-chm broadcast-id
-                                     (reify java.util.function.Function
-                                       (apply [_ _k]
-                                         (java.util.concurrent.ConcurrentHashMap/newKeySet))))]
+                                      (reify java.util.function.Function
+                                        (apply [_ _k]
+                                          (java.util.concurrent.ConcurrentHashMap/newKeySet))))]
                 (when (.add delivery-set pubkey)
                   (let [current-deliveries (.size delivery-set)]
                     (when (zero? (mod current-deliveries 10))
@@ -390,22 +404,22 @@
           ;; ─── Diagnostic state dump ───────────────────────────────────
           (println "\n🔍 Querying state of undelivered nodes...")
           (let [delivered-pubkeys (into #{}
-                                       (mapcat (fn [bid]
-                                                 (let [^java.util.Set s (.get delivery-chm bid)]
-                                                   (iterator-seq (.iterator s))))
-                                               (enumeration-seq (.keys delivery-chm))))
+                                        (mapcat (fn [bid]
+                                                  (let [^java.util.Set s (.get delivery-chm bid)]
+                                                    (iterator-seq (.iterator s))))
+                                                (enumeration-seq (.keys delivery-chm))))
                 undelivered-nodes (filterv #(not (contains? delivered-pubkeys (:pubkey-hex %)))
-                                          (:h-nodes network))
+                                           (:h-nodes network))
                 protocol-cfg (:protocol cfg)
                 E-hat (:echo-threshold protocol-cfg)
                 D-hat (:delivery-threshold protocol-cfg)
                 ;; Query state for all undelivered nodes (with short timeout)
                 node-states (doall
-                              (keep (fn [n]
-                                      (when-let [state (shell-core/query-node-state (:node n) :timeout-ms 2000)]
-                                        {:pubkey (let [pk (:pubkey-hex n)] (subs pk (- (count pk) 8)))
-                                         :state state}))
-                                    undelivered-nodes))
+                             (keep (fn [n]
+                                     (when-let [state (shell-core/query-node-state (:node n) :timeout-ms 2000)]
+                                       {:pubkey (let [pk (:pubkey-hex n)] (subs pk (- (count pk) 8)))
+                                        :state state}))
+                                   undelivered-nodes))
                 ;; Find the broadcast message-id(s)
                 broadcast-ids (into #{} (enumeration-seq (.keys delivery-chm)))
 
@@ -458,8 +472,8 @@
                 groups (group-by :group classified)]
 
             (println (format "\n📊 Diagnostic Summary: %d undelivered nodes (queried %d, %d timed out)"
-                            (count undelivered-nodes) (count node-states)
-                            (- (count undelivered-nodes) (count node-states))))
+                             (count undelivered-nodes) (count node-states)
+                             (- (count undelivered-nodes) (count node-states))))
             (println "════════════════════════════════════════════════════════════")
             (doseq [[group nodes] (sort-by (comp - count second) groups)]
               (let [sample (first nodes)]
@@ -470,9 +484,9 @@
                 (println (format "    Subscribers:  echo=%d  ready=%d  delivery=%d" (:echo-sub-count sample) (:ready-sub-count sample) (:delivery-sub-count sample)))
                 (println (format "    Has message:  %s  Sieve-delivered: %s  Ready: %s" (:has-message? sample) (:sieve-delivered? sample) (:local-ready? sample)))
                 (println (format "    Votes:        echo=%d/%d  ready=%d  delivery=%d/%d"
-                                (:echo-votes sample) E-hat
-                                (:ready-votes sample)
-                                (:delivery-votes sample) D-hat))))
+                                 (:echo-votes sample) E-hat
+                                 (:ready-votes sample)
+                                 (:delivery-votes sample) D-hat))))
             (println "\n════════════════════════════════════════════════════════════"))
 
           (throw (ex-info "Contagion broadcast failed to reach all honest nodes within timeout"
