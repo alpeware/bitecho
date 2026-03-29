@@ -29,22 +29,28 @@
 (defn start-node
   "Starts a transparent go-loop wrapping the state machine.
    Returns a map with the internal channels :events-in, :network-in, :net-out, :app-out, :persist-ch, and the loop :stop-ch.
-   Snapshots state to disk automatically via a dedicated sliding-buffer channel when state changes."
+   Snapshots state to disk automatically via a dedicated sliding-buffer channel when state changes.
+   Accepts an optional opts map:
+     :persist?  — when false, disables persistence entirely (default true)"
   ([initial-state]
    (start-node initial-state persistence/default-snapshot-filename))
   ([initial-state snapshot-filename]
-   (let [events-in (async/chan 8192)
+   (start-node initial-state snapshot-filename {}))
+  ([initial-state snapshot-filename opts]
+   (let [persist? (get opts :persist? true)
+         events-in (async/chan 8192)
          network-in (async/chan 8192)
          net-out (async/chan 8192)
          app-out (async/chan 8192)
-         persist-ch (async/chan (async/sliding-buffer 1))
+         persist-ch (when persist? (async/chan (async/sliding-buffer 1)))
          stop-ch (async/chan)]
 
-     ;; Dedicated I/O loop for persistence
-     (async/go-loop []
-       (when-let [state-to-save (async/<! persist-ch)]
-         (persistence/save-state-to-disk snapshot-filename state-to-save)
-         (recur)))
+     ;; Dedicated I/O loop for persistence (only when enabled)
+     (when persist?
+       (async/go-loop []
+         (when-let [state-to-save (async/<! persist-ch)]
+           (persistence/save-state-to-disk snapshot-filename state-to-save)
+           (recur))))
 
      (async/go-loop [state initial-state]
        (let [[val port] (async/alts! [events-in network-in stop-ch])]
@@ -64,7 +70,7 @@
                    (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
                    (is-network-command? cmd) (async/put! net-out cmd)
                    :else (async/put! events-in cmd)))
-               (when (not= state new-state)
+               (when (and persist? (not= state new-state))
                  (async/put! persist-ch new-state))
                (recur new-state))
              ;; Drop invalid network events
@@ -83,7 +89,7 @@
                  (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
                  (is-network-command? cmd) (async/put! net-out cmd)
                  :else (async/put! events-in cmd)))
-             (when (not= state new-state)
+             (when (and persist? (not= state new-state))
                (async/put! persist-ch new-state))
              (recur new-state)))))
      {:events-in events-in
@@ -101,4 +107,14 @@
   (async/close! (:network-in node))
   (async/close! (:net-out node))
   (async/close! (:app-out node))
-  (async/close! (:persist-ch node)))
+  (when (:persist-ch node)
+    (async/close! (:persist-ch node))))
+
+(defn query-node-state
+  "Queries the current pure state of a running shell node.
+   Sends a :query-state event and blocks until a reply arrives or timeout-ms elapses.
+   Returns the state map, or nil on timeout."
+  [node & {:keys [timeout-ms] :or {timeout-ms 5000}}]
+  (let [reply-ch (async/chan 1)]
+    (async/put! (:events-in node) {:type :query-state :reply-chan reply-ch})
+    (first (async/alts!! [reply-ch (async/timeout timeout-ms)]))))

@@ -119,7 +119,19 @@
                                     :roles roles})
                                  new-roles-by-peer)
 
-        commands (filterv some? (concat [push-command summary-command] subscribe-commands))
+        ;; Sieve-echo anti-entropy: re-send echoes for messages not yet sieve-delivered
+        echo-subs (:echo-subscribers state)
+        pending-echo-ids (set/difference (:contagion-known-ids state)
+                                         (:sieve-delivered-set state))
+        echo-ae-commands (when (seq echo-subs)
+                           (mapv (fn [mid]
+                                   {:type :send-sieve-echo
+                                    :targets echo-subs
+                                    :message-id mid})
+                                 pending-echo-ids))
+
+        commands (into (filterv some? (concat [push-command summary-command] subscribe-commands))
+                       echo-ae-commands)
 
         ;; Epoch-indexed GC: collect expired epoch keys, union their message IDs
         cutoff-epoch (- new-epoch gossip-ttl-epochs)
