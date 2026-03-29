@@ -4,10 +4,7 @@
         com.taoensso/nippy {:mvn/version "3.6.0"}}
  :aliases {:simulate {:extra-paths ["dev"]
                       :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"
-                                 "-Dclojure.core.async.pool-size=32"
-                                 "-XX:+UseZGC"
-                                 "-XX:+AlwaysPreTouch"
-                                 "-XX:-OmitStackTraceInFastThrow"]}
+                                 "-Dclojure.core.async.pool-size=32"]}
            :test {:extra-paths ["test"]
                   :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}
                   :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"]}

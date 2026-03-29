@@ -17,7 +17,9 @@
 ;; Simulation Configuration
 ;; ---------------------------------------------------------------------------
 
-(def total-nodes 1000)
+(def total-nodes 200)
+(def byzantine-pct 0.2)
+(def broadcast-messages 10)
 
 (defn calculate-protocol-params
   "Dynamically scales Contagion parameters based on network size.
@@ -31,11 +33,12 @@
         E base-sample
         R base-sample
         D base-sample
-        E-thresh (int (Math/ceil (* 0.70 E)))
-        R-thresh (int (Math/ceil (* 0.35 R)))
-        D-thresh (int (Math/ceil (* 0.80 D)))
+        E-thresh (int (Math/ceil (* 0.60 E)))
+        R-thresh (int (Math/ceil (* 0.30 R)))
+        D-thresh (int (Math/ceil (* 0.60 D)))
         view-size (int (Math/ceil (* 2.5 base-sample)))
-        ttl (int (Math/ceil (* 3.0 ln-n)))]
+        ttl-multiplier (if (= mode :secure) 10.0 3.0)
+        ttl (int (Math/ceil (* ttl-multiplier ln-n)))]
     {:murmur-k murmur-k
      :basalt-max-view-size view-size
      :echo-sample-size E
@@ -48,16 +51,13 @@
 
 (def sim-config
   {:total-nodes             total-nodes
-   :byzantine-nodes         0
-   :tick-interval-ms        5000
-   :total-broadcast-messages 1
-   :stabilization-ticks     60
-   :stabilization-tick-pause-ms 500
-   :post-stabilization-pause-ms 30000
-   :broadcast-pause-ms      5000
-   :completion-timeout-ms   (* 12 600000)
+   :byzantine-nodes         (int (* byzantine-pct total-nodes))
+   :total-broadcast-messages broadcast-messages
+   :stabilization-ticks     20
+   :max-epoch-jitter        3
+   :completion-max-epochs   35
    :protocol                (merge config/default-config
-                                   (calculate-protocol-params total-nodes :mode :lean))})
+                                   (calculate-protocol-params total-nodes :mode #_:lean :secure))})
 
 ;; ---------------------------------------------------------------------------
 ;; Global pool & registry
@@ -84,10 +84,12 @@
 ;; Telemetry globals — reset by -main before simulation starts
 (def ^ConcurrentHashMap delivery-chm (ConcurrentHashMap.))
 (def ^AtomicInteger delivery-counter (AtomicInteger. 0))
+(def ^ConcurrentHashMap completed-broadcasts (ConcurrentHashMap.))
 (def ^AtomicLong done-flag (AtomicLong. 0))
 (def honest-count (atom 0))
 (def broadcast-start-times (atom {}))
 (def total-consensus-time (atom 0))
+(def total-broadcast-count (atom 1))
 
 ;; ---------------------------------------------------------------------------
 ;; Dummy crypto
@@ -116,11 +118,13 @@
 ;; ---------------------------------------------------------------------------
 
 (declare send-event!)
+(declare node-epoch)
 
 ;; ---------------------------------------------------------------------------
-;; Constants
+;; Batch size range for chaotic interleaving
 ;; ---------------------------------------------------------------------------
-(def ^:private ^:const BATCH-SIZE 128)
+(def ^:private ^:const MIN-BATCH 1)
+(def ^:private ^:const MAX-BATCH 64)
 
 ;; ---------------------------------------------------------------------------
 ;; Side-effect handlers called from inside the drain loop
@@ -136,6 +140,7 @@
   (when (= (:event-name cmd) :on-deliver)
     (let [message-id (:message-id cmd)
           pubkey (:pubkey-hex node)
+          current-epoch (node-epoch node)
           ^java.util.Set delivery-set
           (.computeIfAbsent delivery-chm message-id
                             (reify java.util.function.Function
@@ -145,17 +150,20 @@
         (let [current (.size delivery-set)
               hn @honest-count]
           (when (zero? (mod current 10))
-            (println (format "Broadcast %s reached %d/%d nodes"
-                             message-id current hn)))
-          (when (and (>= current hn)
-                     (.compareAndSet delivery-counter 0 1))
-            (let [end-time (System/currentTimeMillis)
-                  start-time (get @broadcast-start-times message-id)
-                  duration (- end-time start-time)]
-              (swap! total-consensus-time + duration)
-              (println (format "✅ Broadcast %s delivered to ALL %d honest nodes in %d ms"
-                               message-id hn duration)))
-            (.set done-flag 1)))))))
+            (println (format "Broadcast %s reached %d/%d nodes at epoch %d"
+                             message-id current hn current-epoch)))
+          (when (>= current hn)
+            ;; putIfAbsent returns nil on first insert (= this thread wins)
+            (when (nil? (.putIfAbsent completed-broadcasts message-id true))
+              (let [end-time (System/currentTimeMillis)
+                    start-time (get @broadcast-start-times message-id)
+                    duration (- end-time start-time)
+                    completed (.incrementAndGet delivery-counter)]
+                (swap! total-consensus-time + duration)
+                (println (format "✅ Broadcast %s delivered to ALL %d honest nodes in %d ms (%d/%d)"
+                                 message-id hn duration completed @total-broadcast-count))
+                (when (>= completed @total-broadcast-count)
+                  (.set done-flag 1))))))))))
 
 (defn- route-command!
   "Translates a network-out command to a network-in event for target node(s).
@@ -204,17 +212,21 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- drain-node!
-  "Drains up to BATCH-SIZE events from the node's inbox, processes each through
-   the pure state machine, routes resulting commands, then re-schedules if the
-   inbox is non-empty."
+  "Drains a random number (1–64) of events from the node's inbox, processes each
+   through the pure state machine, routes resulting commands, then re-schedules
+   if the inbox is non-empty.  Decrements :pending-ticks when a :tick is consumed."
   [node]
   (let [^ConcurrentLinkedQueue inbox (:inbox node)
         ^AtomicBoolean sched (:scheduled? node)
-        state-vol (:state-vol node)]
+        ^AtomicInteger pending (:pending-ticks node)
+        state-vol (:state-vol node)
+        batch-limit (+ MIN-BATCH (rand-int MAX-BATCH))]
     (try
-      (loop [remaining BATCH-SIZE]
+      (loop [remaining batch-limit]
         (when (pos? remaining)
           (when-let [event (.poll inbox)]
+            (when (= (:type event) :tick)
+              (.decrementAndGet pending))
             (let [{new-state :state commands :commands}
                   (sm/handle-event @state-vol event)]
               (vreset! state-vol new-state)
@@ -238,10 +250,12 @@
    ForkJoinPool if the node isn't already scheduled."
   [node event]
   (let [^ConcurrentLinkedQueue inbox (:inbox node)
-        ^AtomicBoolean sched (:scheduled? node)]
-    (.add inbox event)
-    (when (.compareAndSet sched false true)
-      (.execute pool ^Runnable (fn [] (drain-node! node))))))
+        ^AtomicBoolean sched (:scheduled? node)
+        type (:type node)]
+    (when (= type :honest)
+      (.add inbox event)
+      (when (.compareAndSet sched false true)
+        (.execute pool ^Runnable (fn [] (drain-node! node)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Node creation
@@ -262,7 +276,8 @@
      :peer peer
      :state-vol (volatile! initial-state)
      :inbox (ConcurrentLinkedQueue.)
-     :scheduled? (AtomicBoolean. false)}))
+     :scheduled? (AtomicBoolean. false)
+     :pending-ticks (AtomicInteger. 0)}))
 
 (defn- create-byzantine-node
   [i _cfg]
@@ -279,7 +294,8 @@
      :peer peer
      :state-vol (volatile! nil)
      :inbox (ConcurrentLinkedQueue.)
-     :scheduled? (AtomicBoolean. false)}))
+     :scheduled? (AtomicBoolean. false)
+     :pending-ticks (AtomicInteger. 0)}))
 
 ;; ---------------------------------------------------------------------------
 ;; Network lifecycle
@@ -310,15 +326,45 @@
      :honest-nodes honest}))
 
 ;; ---------------------------------------------------------------------------
-;; Synchronous helpers
+;; Virtual-time tick injection
 ;; ---------------------------------------------------------------------------
 
-(defn- tick-all-nodes!
-  "Sends a :tick event to every honest node."
+(defn- node-epoch
+  "Returns the current epoch of a node from its volatile state."
+  [node]
+  (or (:epoch @(:state-vol node)) 0))
+
+(defn- min-epoch
+  "Returns the minimum epoch across all honest nodes."
   [h-nodes]
-  (doseq [node h-nodes]
-    (when (= (:type node) :honest)
-      (send-event! node {:type :tick :rng (java.util.concurrent.ThreadLocalRandom/current)}))))
+  (reduce (fn [acc node] (min acc (node-epoch node))) Long/MAX_VALUE h-nodes))
+
+(defn- inject-tick!
+  "Enqueues a :tick event into a node's inbox and increments its pending-ticks."
+  [node]
+  (let [^AtomicInteger pending (:pending-ticks node)]
+    (.incrementAndGet pending)
+    (send-event! node {:type :tick :rng (java.util.concurrent.ThreadLocalRandom/current)})))
+
+(defn- start-tick-injector!
+  "Starts a daemon thread that continuously injects :tick events into nodes whose
+   virtual epoch (epoch + pending-ticks) is within a random jitter of the minimum
+   epoch across the network.  Returns the AtomicBoolean control flag and the Thread."
+  [h-nodes max-jitter]
+  (let [running (AtomicBoolean. true)
+        thread (Thread.
+                (fn []
+                  (while (.get running)
+                    (let [me (min-epoch h-nodes)]
+                      (doseq [node h-nodes]
+                        (let [^AtomicInteger pending (:pending-ticks node)
+                              virtual-epoch (+ (node-epoch node) (.get pending))
+                              jitter (+ 1 (rand-int max-jitter))]
+                          (when (< virtual-epoch (+ me jitter))
+                            (inject-tick! node))))))))]
+    (.setDaemon thread true)
+    (.start thread)
+    {:running running :thread thread}))
 
 (defn- await-quiescence!
   "Busy-waits until the ForkJoinPool has no queued/active tasks."
@@ -345,12 +391,14 @@
       ;; Reset global mutable state
       (.clear delivery-chm)
       (.set delivery-counter 0)
+      (.clear completed-broadcasts)
       (.set done-flag 0)
       (.set total-routed 0)
       (.clear cmd-counters)
       (reset! honest-count honest)
       (reset! broadcast-start-times {})
       (reset! total-consensus-time 0)
+      (reset! total-broadcast-count (:total-broadcast-messages cfg))
 
       (println "Starting Contagion Pure E2E Simulator (ForkJoinPool, no core.async)...")
       (println (format "Network Topology: %d total nodes (%d honest, %d byzantine)"
@@ -370,31 +418,22 @@
       (let [network (start-network cfg)
             h-nodes (:h-nodes network)]
 
-        ;; ── Stabilization phase ──────────────────────────────────────────
-        (println (format "Running %d stabilization ticks to build subscription graphs..."
-                         (:stabilization-ticks cfg)))
-        (dotimes [i (:stabilization-ticks cfg)]
-          (tick-all-nodes! h-nodes)
-          (Thread/sleep (:stabilization-tick-pause-ms cfg))
-          (when (zero? (mod (inc i) 10))
-            (println (format "  Stabilization tick %d/%d complete"
-                             (inc i) (:stabilization-ticks cfg)))))
+        ;; ── Start virtual-time tick injector ─────────────────────────────
+        (let [max-jitter (:max-epoch-jitter cfg)
+              ticker (start-tick-injector! h-nodes max-jitter)]
 
-        ;; Let the pool drain before post-stabilization pause
-        (await-quiescence!)
-        (println (format "Running %d ms post-stabilization pause..."
-                         (:post-stabilization-pause-ms cfg)))
-        (Thread/sleep (:post-stabilization-pause-ms cfg))
-
-        ;; ── Background ticker ────────────────────────────────────────────
-        (let [tick-running (AtomicBoolean. true)
-              tick-thread (Thread.
-                           (fn []
-                             (while (.get tick-running)
-                               (tick-all-nodes! h-nodes)
-                               (Thread/sleep (:tick-interval-ms cfg)))))]
-          (.setDaemon tick-thread true)
-          (.start tick-thread)
+          ;; ── Stabilization phase ──────────────────────────────────────────
+          (println (format "Waiting for min-epoch to reach %d (stabilization)..."
+                           (:stabilization-ticks cfg)))
+          (loop [last-printed 0]
+            (let [me (min-epoch h-nodes)]
+              (when (< me (:stabilization-ticks cfg))
+                (when (>= (- me last-printed) 10)
+                  (println (format "  Stabilization: min-epoch %d/%d"
+                                   me (:stabilization-ticks cfg))))
+                (Thread/sleep 10)
+                (recur (if (>= (- me last-printed) 10) me last-printed)))))
+          (println "  Stabilization complete.")
 
           ;; ── Broadcast phase ──────────────────────────────────────────────
           (dotimes [iteration (:total-broadcast-messages cfg)]
@@ -412,19 +451,21 @@
                                       :payload payload-bytes
                                       :rng (java.util.concurrent.ThreadLocalRandom/current)
                                       :private-key (:private (:keys initiator))
-                                      :public-key (:public (:keys initiator))}))
-            (Thread/sleep (:broadcast-pause-ms cfg)))
+                                      :public-key (:public (:keys initiator))})))
 
-          ;; ── Wait for completion ──────────────────────────────────────────
-          (let [deadline (+ (System/currentTimeMillis) (:completion-timeout-ms cfg))]
+          ;; ── Wait for completion (epoch-bounded) ──────────────────────────
+          (let [broadcast-epoch (min-epoch h-nodes)
+                max-epochs (:completion-max-epochs cfg)]
             (loop []
               (when (and (zero? (.get done-flag))
-                         (< (System/currentTimeMillis) deadline))
-                (Thread/sleep 500)
+                         (< (- (min-epoch h-nodes) broadcast-epoch) max-epochs))
+                (Thread/sleep 10)
                 (recur)))
 
             (when (zero? (.get done-flag))
-              (println "\n⚠️  Delivery status at timeout:")
+              (println "\n⚠️  Delivery status at epoch limit:")
+              (println (format "  Current min-epoch: %d  (started broadcast at epoch %d, limit %d)"
+                               (min-epoch h-nodes) broadcast-epoch max-epochs))
               (doseq [bid (enumeration-seq (.keys delivery-chm))]
                 (let [^java.util.Set s (.get delivery-chm bid)]
                   (println (format "  Broadcast %s: %d/%d delivered" bid (.size s) honest))))
@@ -511,11 +552,12 @@
                                      (:delivery-votes sample) D-hat))))
                 (println "\n════════════════════════════════════════════════════════════"))
 
-              (throw (ex-info "Contagion broadcast failed to reach all honest nodes within timeout"
-                              {:timeout-ms (:completion-timeout-ms cfg)}))))
+              (throw (ex-info "Contagion broadcast failed to reach all honest nodes within epoch limit"
+                              {:max-epochs max-epochs
+                               :current-min-epoch (min-epoch h-nodes)}))))
 
-          ;; Stop background ticker
-          (.set tick-running false))
+          ;; Stop tick injector
+          (.set ^AtomicBoolean (:running ticker) false))
 
         ;; ── Summary ──────────────────────────────────────────────────────
         (let [wall-time (- (System/currentTimeMillis) start-wall-time)
@@ -526,6 +568,7 @@
           (println "========================================")
           (println "Network commands processed          " (->> cmd-stats (sort-by second) (reverse)))
           (println "Total messages routed:              " (.get total-routed))
+          (println "Epoch:                              " (min-epoch h-nodes))
           (println "Broadcasts Delivered:               " (.get delivery-counter))
           (println "Wall-clock time:                    " wall-time "ms")
           (when (pos? (.get delivery-counter))
