@@ -17,9 +17,15 @@
 ;; Simulation Configuration
 ;; ---------------------------------------------------------------------------
 
-(def total-nodes 200)
-(def byzantine-pct 0.2)
-(def broadcast-messages 10)
+(def total-nodes
+  "Total nodes in simulation."
+  200)
+(def byzantine-pct
+  "Percentage of byzantine nodes."
+  0.2)
+(def broadcast-messages
+  "Number of broadcast messages."
+  10)
 
 (defn calculate-protocol-params
   "Dynamically scales Contagion parameters based on network size.
@@ -50,6 +56,7 @@
      :gossip-ttl-epochs ttl}))
 
 (def sim-config
+  "Simulation configuration."
   {:total-nodes             total-nodes
    :byzantine-nodes         (int (* byzantine-pct total-nodes))
    :total-broadcast-messages broadcast-messages
@@ -63,33 +70,57 @@
 ;; Global pool & registry
 ;; ---------------------------------------------------------------------------
 
-(def ^ForkJoinPool pool (ForkJoinPool/commonPool))
+(def ^ForkJoinPool pool
+  "ForkJoinPool for simulation."
+  (ForkJoinPool/commonPool))
 
 ;; pubkey-hex -> node map.  Populated by start-network before events flow.
-(def registry (atom {}))
+(def registry
+  "Node registry map."
+  (atom {}))
 
 ;; ---------------------------------------------------------------------------
 ;; Metrics (contention-free via ConcurrentHashMap/AtomicLong)
 ;; ---------------------------------------------------------------------------
 
-(def ^ConcurrentHashMap cmd-counters (ConcurrentHashMap.))
-(def ^AtomicLong total-routed (AtomicLong. 0))
+(def ^ConcurrentHashMap cmd-counters
+  "Counters for commands."
+  (ConcurrentHashMap.))
+(def ^AtomicLong total-routed
+  "Total routed commands."
+  (AtomicLong. 0))
 
 (defn- inc-cmd-counter! [cmd-type]
   (let [^AtomicLong counter (.computeIfAbsent cmd-counters (name cmd-type)
-                                               (reify java.util.function.Function
-                                                 (apply [_ _k] (AtomicLong. 0))))]
+                                              (reify java.util.function.Function
+                                                (apply [_ _k] (AtomicLong. 0))))]
     (.incrementAndGet counter)))
 
 ;; Telemetry globals — reset by -main before simulation starts
-(def ^ConcurrentHashMap delivery-chm (ConcurrentHashMap.))
-(def ^AtomicInteger delivery-counter (AtomicInteger. 0))
-(def ^ConcurrentHashMap completed-broadcasts (ConcurrentHashMap.))
-(def ^AtomicLong done-flag (AtomicLong. 0))
-(def honest-count (atom 0))
-(def broadcast-start-times (atom {}))
-(def total-consensus-time (atom 0))
-(def total-broadcast-count (atom 1))
+(def ^ConcurrentHashMap delivery-chm
+  "Delivery map."
+  (ConcurrentHashMap.))
+(def ^AtomicInteger delivery-counter
+  "Delivery counter."
+  (AtomicInteger. 0))
+(def ^ConcurrentHashMap completed-broadcasts
+  "Completed broadcasts map."
+  (ConcurrentHashMap.))
+(def ^AtomicLong done-flag
+  "Done flag."
+  (AtomicLong. 0))
+(def honest-count
+  "Honest node count."
+  (atom 0))
+(def broadcast-start-times
+  "Map of broadcast start times."
+  (atom {}))
+(def total-consensus-time
+  "Total time to consensus."
+  (atom 0))
+(def total-broadcast-count
+  "Total broadcast count."
+  (atom 1))
 
 ;; ---------------------------------------------------------------------------
 ;; Dummy crypto
@@ -100,15 +131,15 @@
    Returns a byte array to satisfy the existing bytes->hex contract."
   [^bytes b]
   ;; Converting to a vec to use Clojure's collection hashing
-  (let [h (hash (vec b))] 
+  (let [h (hash (vec b))]
     (.getBytes (str h) "UTF-8")))
 
-(defn dummy-verify 
+(defn dummy-verify
   "Blindly accepts all signatures as valid during the simulation."
   [_pubkey _message _signature]
   true)
 
-(defn dummy-sign 
+(defn dummy-sign
   "Returns an empty 64-byte array to simulate the shape of an Ed25519 signature."
   [_privkey _message]
   (byte-array 64))
@@ -366,19 +397,21 @@
     (.start thread)
     {:running running :thread thread}))
 
-(defn- await-quiescence!
-  "Busy-waits until the ForkJoinPool has no queued/active tasks."
+;; (defn- await-quiescence!
+;;   "Busy-waits until the ForkJoinPool has no queued/active tasks."
+;;   []
+;;   (loop []
+;;     (when-not (.isQuiescent pool)
+;;       (Thread/sleep 1)
+;;       (recur))))
+;;
+;; ;; ---------------------------------------------------------------------------
+;; ;; Main
+;; ---------------------------------------------------------------------------
+
+(defn -main
+  "Main function for the Contagion pure E2E simulator."
   []
-  (loop []
-    (when-not (.isQuiescent pool)
-      (Thread/sleep 1)
-      (recur))))
-
-;; ---------------------------------------------------------------------------
-;; Main
-;; ---------------------------------------------------------------------------
-
-(defn -main []
   (with-redefs [crypto/sha256 fast-dummy-sha256
                 crypto/verify dummy-verify
                 crypto/sign   dummy-sign]
