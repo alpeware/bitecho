@@ -71,7 +71,7 @@ For complex, multi-party negotiations (escrow, compute bounties), Bitecho uses t
 
 ## Phase 5: The Executable Shell & Network Genesis
 
-### A. The Declarative Flow Shell (`core.async.flow`)
+### A. The Declarative Flow Shell
 The topology is bifurcated: a `:net-in` channel multiplexes all raw external events into the pure `:bitecho-core` step function. This function computes the new state and deterministically yields pure commands to a `:net-out` channel. An entirely separate, "dumb" side-effecting IO loop consumes `:net-out` to transmit UDP packets or write to disk.
 
 ### B. The 42 Billion Genesis Allocation
