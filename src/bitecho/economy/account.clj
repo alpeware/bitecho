@@ -1,5 +1,6 @@
 (ns bitecho.economy.account
-  (:require [bitecho.crypto :as crypto]))
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]))
 
 (defrecord AccountState [balance seq deps])
 
@@ -25,3 +26,27 @@
       (and valid-seq? valid-deps? valid-balance? valid-signature?))
     (catch Exception _
       false)))
+
+(defn apply-transfer
+  "Applies a transfer to the given ledger (a map of pubkeys to AccountState).
+   Validates the transfer against the sender's current state.
+   If valid, decrements the sender's balance, increments the sender's seq,
+   updates the sender's deps to the transfer hash, and increments the receiver's balance.
+   If invalid, returns the ledger unmodified."
+  [ledger transfer]
+  (let [sender (:sender transfer)
+        receiver (:receiver transfer)
+        sender-state (get ledger sender)
+        amount (:amount transfer)]
+    (if (and sender-state (validate-transfer sender-state transfer))
+      (let [safe-transfer (assoc (into {} transfer) :signature (basalt/bytes->hex (:signature transfer)))
+            transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))
+            new-sender-state (map->AccountState
+                              {:balance (- (:balance sender-state) amount)
+                               :seq (:seq transfer)
+                               :deps [transfer-hash]})
+            ledger-after-send (assoc ledger sender new-sender-state)
+            receiver-state (get ledger-after-send receiver (map->AccountState {:balance 0 :seq 0 :deps []}))
+            new-receiver-state (assoc receiver-state :balance (+ (:balance receiver-state) amount))]
+        (assoc ledger-after-send receiver new-receiver-state))
+      ledger)))
