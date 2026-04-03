@@ -30,7 +30,7 @@
 
 ### Part A: Asynchronous Account-Based Settlement
 - [x] Implement `bitecho.economy.account` data structures: define pure records for `AccountState` (balance, seq, deps) and `Transfer` (sender, receiver, amount, seq, deps, signature).
-- [ ] Implement `bitecho.economy.account` validation: pure function `(validate-transfer current-state transfer)`. Must enforce `seq` increments by exactly 1, causal dependencies match, balance >= 0, and signature is valid.
+- [x] Implement `bitecho.economy.account` validation: pure function `(validate-transfer current-state transfer)`. Must enforce `seq` increments by exactly 1, causal dependencies match, balance >= 0, and signature is valid.
 - [ ] Implement `bitecho.economy.account` transition logic: pure function `(apply-transfer state transfer)` that decrements sender, increments receiver, and updates local causal history.
 - [ ] Write generative fuzz tests (`test.check`) for account state transitions to prove double-spending is impossible without global consensus.
 - [ ] **Account Isolation Simulator:** Create `dev/bitecho/simulator/account_e2e.clj`. Simulate asynchronous account transfers across the SBRB mesh. Inject malicious double-spend attempts and prove that honest nodes correctly reject invalid sequence increments and independently converge on the correct ledger state.
