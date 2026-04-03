@@ -3,6 +3,7 @@
   (:require [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
             [bitecho.crypto-test]
+            [bitecho.economy.account-test]
             [bitecho.murmur.core-test]
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]

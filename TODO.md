@@ -29,7 +29,7 @@
 ## Phase 2: The Echo Economy & Tokenomics
 
 ### Part A: Asynchronous Account-Based Settlement
-- [ ] Implement `bitecho.economy.account` data structures: define pure records for `AccountState` (balance, seq, deps) and `Transfer` (sender, receiver, amount, seq, deps, signature).
+- [x] Implement `bitecho.economy.account` data structures: define pure records for `AccountState` (balance, seq, deps) and `Transfer` (sender, receiver, amount, seq, deps, signature).
 - [ ] Implement `bitecho.economy.account` validation: pure function `(validate-transfer current-state transfer)`. Must enforce `seq` increments by exactly 1, causal dependencies match, balance >= 0, and signature is valid.
 - [ ] Implement `bitecho.economy.account` transition logic: pure function `(apply-transfer state transfer)` that decrements sender, increments receiver, and updates local causal history.
 - [ ] Write generative fuzz tests (`test.check`) for account state transitions to prove double-spending is impossible without global consensus.
