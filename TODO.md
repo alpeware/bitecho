@@ -18,7 +18,7 @@
 - [x] Implement `bitecho.state-machine`: the root reducer that ties Basalt, Murmur, Sieve, and Contagion into a single pure `(handle-event state event)` function.
 - [x] Write generative state-machine fuzzer (`test.check`) to prove the Bitecho pure core maintains connected Basalt views and reliably delivers messages under simulated network drops.
 
-## Phase 2: SBRB Layer Isolation & Verification
+## Verify Phase 1: SBRB Layer Isolation & Verification
 
 - [x] **Enforce E2E Timeout:** Update `dev/bitecho/simulator/contagion_e2e.clj`. Replace the indefinite `(async/<!! done-ch)` block at the end of `-main` with an `async/alts!!` that races `done-ch` against an `(async/timeout 15000)`. If the timeout wins, throw an `ex-info` stating "Contagion broadcast failed to reach all honest nodes within 15 seconds" to fail the CI loop.
 - [x] **Basalt Isolation Simulator:** Create `dev/bitecho/simulator/basalt_e2e.clj`. Write a simulation where 15 nodes boot, but ONLY process `:tick` and `:receive-push-view` events. Prove that after N ticks, the network topology converges (i.e., every node's Basalt view contains a healthy, randomized mix of the network, preventing network partitions). Fix any pure logic bugs in `basalt.core` or `state-machine` if this fails.
