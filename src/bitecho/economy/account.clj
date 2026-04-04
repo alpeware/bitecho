@@ -20,11 +20,21 @@
           valid-deps? (= (:deps transfer) (:deps current-state))
           valid-balance? (>= (:balance current-state) (:amount transfer))
 
-          unsigned-transfer (into {} (dissoc transfer :signature))
+          unsigned-transfer (into (sorted-map) (dissoc transfer :signature))
           payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
-          valid-signature? (crypto/verify (:sender transfer) payload-bytes (:signature transfer))]
+          sig-bytes (if (coll? (:signature transfer))
+                      (byte-array (map byte (:signature transfer)))
+                      (:signature transfer))
+          valid-signature? (crypto/verify (:sender transfer) payload-bytes sig-bytes)]
+
+      (when-not valid-seq? (println "validate-transfer failed: invalid seq." "expected:" (inc (:seq current-state)) "got:" (:seq transfer)))
+      (when-not valid-deps? (println "validate-transfer failed: invalid deps." "expected:" (:deps current-state) "got:" (:deps transfer)))
+      (when-not valid-balance? (println "validate-transfer failed: invalid balance." "current:" (:balance current-state) "transfer amount:" (:amount transfer)))
+      (when-not valid-signature? (println "validate-transfer failed: invalid signature."))
+
       (and valid-seq? valid-deps? valid-balance? valid-signature?))
-    (catch Exception _
+    (catch Exception e
+      (println "validate-transfer threw exception:" e)
       false)))
 
 (defn apply-transfer
@@ -39,7 +49,8 @@
         sender-state (get ledger sender)
         amount (:amount transfer)]
     (if (and sender-state (validate-transfer sender-state transfer))
-      (let [safe-transfer (assoc (into {} transfer) :signature (basalt/bytes->hex (:signature transfer)))
+      (let [;; Ensure signature is converted from whatever byte seq/array it is into hex representation for consistent stringification hashing
+            safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))
             transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))
             new-sender-state (map->AccountState
                               {:balance (- (:balance sender-state) amount)
@@ -48,5 +59,8 @@
             ledger-after-send (assoc ledger sender new-sender-state)
             receiver-state (get ledger-after-send receiver (map->AccountState {:balance 0 :seq 0 :deps []}))
             new-receiver-state (assoc receiver-state :balance (+ (:balance receiver-state) amount))]
+        (println "✅ apply-transfer executed successfully for seq:" (:seq transfer) "hash generated:" transfer-hash)
         (assoc ledger-after-send receiver new-receiver-state))
-      ledger)))
+      (do
+        (println "❌ apply-transfer rejected seq:" (:seq transfer))
+        ledger))))

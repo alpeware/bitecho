@@ -33,19 +33,19 @@
 - [x] Implement `bitecho.economy.account` validation: pure function `(validate-transfer current-state transfer)`. Must enforce `seq` increments by exactly 1, causal dependencies match, balance >= 0, and signature is valid.
 - [x] Implement `bitecho.economy.account` transition logic: pure function `(apply-transfer state transfer)` that decrements sender, increments receiver, and updates local causal history.
 - [x] Write generative fuzz tests (`test.check`) for account state transitions to prove double-spending is impossible without global consensus.
-- [ ] **Account Isolation Simulator:** Create `dev/bitecho/simulator/account_e2e.clj`. Simulate asynchronous account transfers across the SBRB mesh. Inject malicious double-spend attempts and prove that honest nodes correctly reject invalid sequence increments and independently converge on the correct ledger state.
+- [x] **Account Isolation Simulator:** Create `dev/bitecho/simulator/account_e2e.clj`. Simulate asynchronous account transfers across the SBRB mesh. Inject malicious double-spend attempts and prove that honest nodes correctly reject invalid sequence increments and independently converge on the correct ledger state.
 
 ### Part B: Burn-and-Mint & Proof of Delivery
-- [ ] Implement `bitecho.economy.burn` logic: pure function `(deduct-routing-fee state transfer)` that burns the ECHO micro-fee by removing it from the total supply.
-- [ ] Implement `bitecho.economy.receipt` generation: pure function to create a probabilistic cryptographic "Proof of Delivery" receipt when an Agent successfully receives routed data.
-- [ ] Implement `bitecho.economy.bundle` logic: pure functions for a Full Node to buffer validated micro-transfers and bundle them into a single array payload for Murmur broadcast.
-- [ ] **Bundling Isolation Simulator:** Create `dev/bitecho/simulator/bundle_e2e.clj`. Simulate Light Nodes streaming high-frequency micro-transactions to a Full Node. Prove the Full Node correctly batches them, respecting a time-based interval, and emits a single, compressed Murmur broadcast to optimize egress bandwidth.
+- [x] Implement `bitecho.economy.burn` logic: pure function `(deduct-routing-fee state transfer)` that burns the ECHO micro-fee by removing it from the total supply.
+- [x] Implement `bitecho.economy.receipt` generation: pure function to create a probabilistic cryptographic "Proof of Delivery" receipt when an Agent successfully receives routed data.
+- [x] Implement `bitecho.economy.bundle` logic: pure functions for a Full Node to buffer validated micro-transfers and bundle them into a single array payload for Murmur broadcast.
+- [x] **Bundling Isolation Simulator:** Create `dev/bitecho/simulator/bundle_e2e.clj`. Simulate Light Nodes streaming high-frequency micro-transactions to a Full Node. Prove the Full Node correctly batches them, respecting a time-based interval, and emits a single, compressed Murmur broadcast to optimize egress bandwidth.
 
 ### Part C: Streamlet BFT Treasury (k-Shared Asset Transfer)
-- [ ] Implement `bitecho.streamlet.core` data structures: define pure records for `Block` (epoch, parent-hash, payload, proposer) and `Vote` (block-hash, epoch, voter-signature).
-- [ ] Implement `bitecho.streamlet.core` propose-vote paradigm: pure functions `(propose-block state epoch)` and `(cast-vote state block)`.
-- [ ] Implement `bitecho.streamlet.core` notarization logic: pure function to track vote accumulations and transition a block to `notarized` when it reaches the 2n/3 threshold.
-- [ ] Implement `bitecho.streamlet.core` finalization logic: pure function to scan the notarized chain and finalize a prefix when three adjacent blocks have consecutive epoch numbers.
-- [ ] Write generative state-machine fuzzer (`test.check`) for Streamlet to prove safety (consistency) and liveness under simulated adversarial network delays.
-- [ ] Implement `bitecho.economy.treasury` integration: pure logic to accept finalized Streamlet blocks of Proof of Delivery receipts, assign a sequence number, and emit a payout transfer command.
-- [ ] **Streamlet Isolation Simulator:** Create `dev/bitecho/simulator/streamlet_e2e.clj`. Simulate an isolated cluster of `k` Genesis Partners running the Streamlet BFT consensus. Introduce extreme network jitter and partitions. Prove that the cluster maintains safety (no conflicting finalizations) and regains liveness to finalize Proof-of-Delivery payouts when synchrony is restored.
+- [x] Implement `bitecho.streamlet.core` data structures: define pure records for `Block` (epoch, parent-hash, payload, proposer) and `Vote` (block-hash, epoch, voter-signature).
+- [x] Implement `bitecho.streamlet.core` propose-vote paradigm: pure functions `(propose-block state epoch)` and `(cast-vote state block)`.
+- [x] Implement `bitecho.streamlet.core` notarization logic: pure function to track vote accumulations and transition a block to `notarized` when it reaches the 2n/3 threshold.
+- [x] Implement `bitecho.streamlet.core` finalization logic: pure function to scan the notarized chain and finalize a prefix when three adjacent blocks have consecutive epoch numbers.
+- [x] Write generative state-machine fuzzer (`test.check`) for Streamlet to prove safety (consistency) and liveness under simulated adversarial network delays.
+- [x] Implement `bitecho.economy.treasury` integration: pure logic to accept finalized Streamlet blocks of Proof of Delivery receipts, assign a sequence number, and emit a payout transfer command.
+- [x] **Streamlet Isolation Simulator:** Create `dev/bitecho/simulator/streamlet_e2e.clj`. Simulate an isolated cluster of `k` Genesis Partners running the Streamlet BFT consensus. Introduce extreme network jitter and partitions. Prove that the cluster maintains safety (no conflicting finalizations) and regains liveness to finalize Proof-of-Delivery payouts when synchrony is restored.
