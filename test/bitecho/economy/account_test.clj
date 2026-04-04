@@ -40,9 +40,9 @@
                              :amount 50
                              :seq 6
                              :deps ["hash1" "hash2"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
           signature (crypto/sign privkey payload-bytes)
-          transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
+          transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature)))]
       (is (true? (account/validate-transfer state transfer)))))
 
   (testing "Invalid seq - not incremented by 1"
@@ -157,11 +157,11 @@
                              :amount 40
                              :seq 6
                              :deps ["hash1"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
           signature (crypto/sign sender-privkey payload-bytes)
-          transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))
+          transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature)))
           updated-ledger (account/apply-transfer ledger transfer)
-          safe-transfer (assoc (into {} transfer) :signature (basalt/bytes->hex signature))
+          safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))
           transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))]
       (is (= 60 (:balance (get updated-ledger sender-pubkey))))
       (is (= 6 (:seq (get updated-ledger sender-pubkey))))
@@ -199,9 +199,9 @@
                              :amount 40
                              :seq 6
                              :deps ["hash1"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
           signature (crypto/sign sender-privkey payload-bytes)
-          transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))
+          transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature)))
           updated-ledger (account/apply-transfer ledger transfer)]
       (is (= 60 (:balance (get updated-ledger sender-pubkey))))
       (is (= 90 (:balance (get updated-ledger receiver-pubkey))))
@@ -219,11 +219,11 @@
                              :amount 40
                              :seq 6
                              :deps ["hash1"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
           signature (crypto/sign (:private keys1) payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))
           updated-ledger (account/apply-transfer ledger transfer)
-          safe-transfer (assoc (into {} transfer) :signature (basalt/bytes->hex signature))
+          safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex signature))
           transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))]
       ;; The balance should be (100 - 40) + 40 = 100
       (is (= 100 (:balance (get updated-ledger sender-pubkey))))
