@@ -73,3 +73,50 @@
           (update state-with-vote :notarized-blocks (fnil conj #{}) block-hash)
           state-with-vote))
       state)))
+
+(defn- get-ancestors
+  "Recursively retrieves the sequence of ancestors for a given block hash."
+  [blocks block-hash]
+  (loop [curr-hash block-hash
+         acc []]
+    (let [block (get blocks curr-hash)]
+      (if (or (nil? block) (= "genesis" (:parent-hash block)))
+        acc
+        (recur (:parent-hash block) (conj acc (:parent-hash block)))))))
+
+(defn- find-consecutive-epoch-head
+  "Finds the middle block's hash of any 3 consecutive notarized blocks.
+   Returns a sequence of such hashes."
+  [notarized-blocks blocks]
+  (let [notarized-block-maps (keep #(when-let [b (get blocks %)] (assoc b :hash %)) notarized-blocks)
+        ;; For each notarized block, trace back its ancestors to see if we have 3 consecutive epochs
+        consecutive-heads
+        (keep (fn [{:keys [epoch parent-hash]}]
+                (let [parent-block (get blocks parent-hash)
+                      parent-epoch (:epoch parent-block)]
+                  (when (and parent-block
+                             (contains? notarized-blocks parent-hash)
+                             (= epoch (inc parent-epoch)))
+                    (let [grandparent-hash (:parent-hash parent-block)
+                          grandparent-block (get blocks grandparent-hash)
+                          grandparent-epoch (:epoch grandparent-block)]
+                      (when (and grandparent-block
+                                 (contains? notarized-blocks grandparent-hash)
+                                 (= parent-epoch (inc grandparent-epoch)))
+                        parent-hash)))))
+              notarized-block-maps)]
+    consecutive-heads))
+
+(defn finalize-prefix
+  "Scans the notarized chain. If three adjacent blocks have consecutive epoch numbers,
+   finalizes the prefix of blocks starting from the middle block."
+  [state]
+  (let [blocks (get state :blocks {})
+        notarized-blocks (get state :notarized-blocks #{})
+        heads (find-consecutive-epoch-head notarized-blocks blocks)
+        new-finalized (reduce (fn [acc head-hash]
+                                (let [ancestors (get-ancestors blocks head-hash)]
+                                  (into acc (conj ancestors head-hash))))
+                              #{}
+                              heads)]
+    (update state :finalized-blocks (fnil into #{}) new-finalized)))

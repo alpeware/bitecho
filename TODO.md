@@ -45,7 +45,7 @@
 - [x] Implement `bitecho.streamlet.core` data structures: define pure records for `Block` (epoch, parent-hash, payload, proposer) and `Vote` (block-hash, epoch, voter-signature).
 - [x] Implement `bitecho.streamlet.core` propose-vote paradigm: pure functions `(propose-block state epoch)` and `(cast-vote state block)`.
 - [x] Implement `bitecho.streamlet.core` notarization logic: pure function to track vote accumulations and transition a block to `notarized` when it reaches the 2n/3 threshold.
-- [ ] Implement `bitecho.streamlet.core` finalization logic: pure function to scan the notarized chain and finalize a prefix when three adjacent blocks have consecutive epoch numbers.
+- [x] Implement `bitecho.streamlet.core` finalization logic: pure function to scan the notarized chain and finalize a prefix when three adjacent blocks have consecutive epoch numbers.
 - [ ] Write generative state-machine fuzzer (`test.check`) for Streamlet to prove safety (consistency) and liveness under simulated adversarial network delays.
 - [ ] Implement `bitecho.economy.treasury` integration: pure logic to accept finalized Streamlet blocks of Proof of Delivery receipts, assign a sequence number, and emit a payout transfer command.
 - [ ] **Streamlet Isolation Simulator:** Create `dev/bitecho/simulator/streamlet_e2e.clj`. Simulate an isolated cluster of `k` Genesis Partners running the Streamlet BFT consensus. Introduce extreme network jitter and partitions. Prove that the cluster maintains safety (no conflicting finalizations) and regains liveness to finalize Proof-of-Delivery payouts when synchrony is restored. Model after `bitecho.simulator.account-e2e`.
