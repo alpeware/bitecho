@@ -15,6 +15,7 @@
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-test]
             [bitecho.streamlet.core-test]
+            [bitecho.streamlet.fuzz-test]
             [clojure.test :as t]))
 
 (defn -main
