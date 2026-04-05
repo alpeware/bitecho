@@ -394,6 +394,53 @@
           {:state state-with-echo :commands []}))
       {:state state :commands []})))
 
+
+(defn- apply-payload-to-ledger
+  "Attempts to parse a payload and apply any transfer to the ledger.
+   Returns the updated state if successful, or the original state on failure."
+  [state payload-bytes]
+  (let [payload-str (try (String. ^bytes payload-bytes "UTF-8") (catch Exception _ nil))
+        payload-edn (try (when payload-str
+                           (edn/read-string {:default tagged-literal
+                                             :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                       'bitecho.economy.account.AccountState account/map->AccountState}} payload-str))
+                         (catch Exception _ nil))]
+    (if (and (map? payload-edn) (:transfer payload-edn))
+      (try
+        (let [raw-transfer (:transfer payload-edn)
+              transfer-map (if (instance? clojure.lang.TaggedLiteral raw-transfer)
+                             (:form raw-transfer)
+                             (if (map? raw-transfer)
+                               (into {} raw-transfer)
+                               (into {} raw-transfer)))
+              transfer-map (if (vector? (:signature transfer-map))
+                             (assoc transfer-map :signature (byte-array (map byte (:signature transfer-map))))
+                             transfer-map)
+              transfer-map (if (string? (:signature transfer-map))
+                             (assoc transfer-map :signature (.getBytes ^String (:signature transfer-map) "UTF-8"))
+                             transfer-map)
+              transfer-map (if (and (seqable? (:signature transfer-map))
+                                    (every? number? (:signature transfer-map)))
+                             (assoc transfer-map :signature (byte-array (map byte (:signature transfer-map))))
+                             transfer-map)
+              transfer-map (if (not (bytes? (:signature transfer-map)))
+                             (assoc transfer-map :signature (byte-array 0))
+                             transfer-map)
+              transfer (account/map->Transfer transfer-map)
+              ledger (or (:ledger state) {})
+              ledger (if (and (:sender transfer) (not (contains? ledger (:sender transfer))))
+                       (assoc ledger (:sender transfer) (account/map->AccountState {:balance 1000 :seq 0 :deps []}))
+                       ledger)
+              ledger (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
+                       (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                       ledger)
+              new-ledger (account/apply-transfer ledger transfer)]
+          (assoc state :ledger new-ledger))
+        (catch Exception e
+          (println "Error applying transfer" e)
+          state))
+      state)))
+
 (defn- handle-receive-contagion-ready
   "Handles an incoming Contagion Ready message.
    Records the vote if the sender is in the global-ready-sample or global-delivery-sample.
@@ -443,65 +490,8 @@
             state-with-applied-ledger (if (and (>= new-delivery-votes D-hat)
                                                (not (contains? (:delivered-set state-checked-ready) message-id)))
                                         (let [message (get (:messages state) message-id)
-                                              payload-bytes (or (:payload message) (byte-array 0))
-                                              payload-str (try (String. ^bytes payload-bytes "UTF-8") (catch Exception _ nil))
-                                              payload-edn (try (when payload-str
-                                                                 (edn/read-string {:default tagged-literal
-                                                                                   :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                                                             'bitecho.economy.account.AccountState account/map->AccountState}} payload-str))
-                                                               (catch Exception _ nil))]
-                                          (if (and (map? payload-edn) (:transfer payload-edn))
-                                            (try
-                                              (let [raw-transfer (:transfer payload-edn)
-                                                    transfer-map (if (instance? clojure.lang.TaggedLiteral raw-transfer)
-                                                                   (:form raw-transfer)
-                                                                   (if (map? raw-transfer)
-                                                                     (into {} raw-transfer)
-                                                                     ;; If it's already a Transfer record it will act as map
-                                                                     (into {} raw-transfer)))
-                                                    ;; In tests signature might be a Vector instead of byte array since it gets passed around via pr-str and parsed via EDN,
-                                                    ;; let's ensure it's a byte-array to prevent classcast errors in validate-transfer
-                                                    transfer-map (if (vector? (:signature transfer-map))
-                                                                   (assoc transfer-map :signature (byte-array (map byte (:signature transfer-map))))
-                                                                   transfer-map)
-                                                    ;; If it is a string representation of bytes in a tagged literal (via tests), force stringification for the sig check mock
-                                                    transfer-map (if (string? (:signature transfer-map))
-                                                                   (assoc transfer-map :signature (.getBytes ^String (:signature transfer-map) "UTF-8"))
-                                                                   transfer-map)
-                                                    ;; EDN parsing from tagged literal sometimes converts into an array of Long/Long numbers when reading into native Maps
-                                                    ;; So let's force the signature map back into a byte array again if it was a sequence of java.lang.Long
-                                                    transfer-map (if (and (seqable? (:signature transfer-map))
-                                                                          (every? number? (:signature transfer-map)))
-                                                                   (assoc transfer-map :signature (byte-array (map byte (:signature transfer-map))))
-                                                                   transfer-map)
-                                                    ;; Ensure signature is always a byte array (mock signers return strings etc sometimes)
-                                                    transfer-map (if (not (bytes? (:signature transfer-map)))
-                                                                   (assoc transfer-map :signature (byte-array 0))
-                                                                   transfer-map)
-                                                    ;; Re-hydrate the transfer structure carefully avoiding tagged-literals
-                                                    transfer (account/map->Transfer transfer-map)
-                                                    ;; The root state initializes the ledger with our own balance.
-                                                    ;; We need to ensure sender and receiver exist in the ledger before apply-transfer so it can validate.
-                                                    ;; By default apply-transfer handles missing receivers, but if sender is missing it fails validation.
-                                                    ;; In a real network, genesis balances cover this. For simulation, lazily initialize sender with 1000 if missing.
-                                                    ledger (or (:ledger state-checked-ready) {})
-                                                    ;; ONLY initialize if they don't exist at all, meaning they aren't the local node and haven't transacted.
-                                                    ;; If receiver is local node, it already has an account initialized to 1000. We MUST NOT overwrite that balance logic.
-                                                    ;; Since local nodes start with 1000 balance, receiving 100 makes it 1100!
-                                                    ;; Wait! That perfectly explains why node receiver balance is 1100 sometimes!
-                                                    ledger (if (and (:sender transfer) (not (contains? ledger (:sender transfer))))
-                                                             (assoc ledger (:sender transfer) (account/map->AccountState {:balance 1000 :seq 0 :deps []}))
-                                                             ledger)
-                                                    ledger (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
-                                                             (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                                             ledger)
-                                                    new-ledger (account/apply-transfer ledger transfer)]
-                                                (assoc state-checked-ready :ledger new-ledger))
-                                              (catch Exception e
-                                                (println "Error applying transfer" e)
-                                                ;; In case applying the transfer fails due to invalid structures
-                                                state-checked-ready))
-                                            state-checked-ready))
+                                              payload-bytes (or (:payload message) (byte-array 0))]
+                                          (apply-payload-to-ledger state-checked-ready payload-bytes))
                                         state-checked-ready)
 
             delivery-commands (if (and (>= new-delivery-votes D-hat)
