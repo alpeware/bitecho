@@ -55,3 +55,55 @@
                   (:public keypair)
                   (.getBytes ^String (:block-hash vote) "UTF-8")
                   (core/hex->bytes (:voter-signature vote))))))))
+
+(deftest test-quorum-threshold
+  (testing "quorum-threshold calculates 2n/3 properly"
+    (is (= 1 (core/quorum-threshold 1)))
+    (is (= 2 (core/quorum-threshold 2)))
+    (is (= 2 (core/quorum-threshold 3)))
+    (is (= 3 (core/quorum-threshold 4)))
+    (is (= 4 (core/quorum-threshold 5)))
+    (is (= 4 (core/quorum-threshold 6)))
+    (is (= 7 (core/quorum-threshold 10)))))
+
+(deftest test-accumulate-vote
+  (let [keypair1 (crypto/generate-keypair)
+        pub1 (:public keypair1)
+        priv1 (:private keypair1)
+
+        keypair2 (crypto/generate-keypair)
+        pub2 (:public keypair2)
+        priv2 (:private keypair2)
+
+        block-hash "test-block-hash"
+
+        ;; valid vote from pub1
+        sig1 (crypto/sign priv1 (.getBytes block-hash "UTF-8"))
+        vote1 (core/->Vote block-hash 1 (#'core/bytes->hex sig1))
+
+        ;; valid vote from pub2
+        sig2 (crypto/sign priv2 (.getBytes block-hash "UTF-8"))
+        vote2 (core/->Vote block-hash 1 (#'core/bytes->hex sig2))
+
+        ;; invalid vote (wrong signature)
+        invalid-sig (crypto/sign priv2 (.getBytes "wrong-hash" "UTF-8"))
+        invalid-vote (core/->Vote block-hash 1 (#'core/bytes->hex invalid-sig))]
+
+    (testing "accumulate-vote rejects invalid signatures"
+      (let [state {:block-votes {} :notarized-blocks #{}}
+            new-state (core/accumulate-vote state invalid-vote pub1 3)]
+        (is (= state new-state))))
+
+    (testing "accumulate-vote accepts valid signature but no notarization below threshold"
+      (let [state {:block-votes {} :notarized-blocks #{}}
+            new-state (core/accumulate-vote state vote1 pub1 3)]
+        (is (= #{(#'core/bytes->hex pub1)} (get-in new-state [:block-votes block-hash])))
+        (is (= #{} (:notarized-blocks new-state)))))
+
+    (testing "accumulate-vote notarizes block when threshold is reached"
+      (let [state {:block-votes {block-hash #{(#'core/bytes->hex pub1)}}
+                   :notarized-blocks #{}}
+            ;; threshold for n=3 is 2
+            new-state (core/accumulate-vote state vote2 pub2 3)]
+        (is (= #{(#'core/bytes->hex pub1) (#'core/bytes->hex pub2)} (get-in new-state [:block-votes block-hash])))
+        (is (= #{block-hash} (:notarized-blocks new-state)))))))
