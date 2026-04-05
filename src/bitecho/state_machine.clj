@@ -228,16 +228,20 @@
                    :epoch-to-messages new-epoch-to-messages)
      :commands commands}))
 
+(declare handle-event)
+
 (defn- handle-contagion-broadcast
   "Handles an internal request to broadcast a payload, specifically emitting :on-deliver for simulator E2E."
   [state event]
   (let [{new-state :state commands :commands} (handle-broadcast state (assoc event :type :broadcast))
         ;; Find the message-id just created (last added to known-ids)
         message-id (first (set/difference (:contagion-known-ids new-state)
-                                          (:contagion-known-ids state)))]
-    {:state new-state
-     :commands (conj commands {:type :app-event :event-name :on-deliver
-                               :payload (:payload event) :message-id message-id})}))
+                                          (:contagion-known-ids state)))
+        delivery-result (handle-event new-state {:type :on-deliver
+                                                 :payload (:payload event)
+                                                 :message-id message-id})]
+    {:state (:state delivery-result)
+     :commands (into commands (:commands delivery-result))}))
 
 (defn- handle-receive-push-view
   "Handles an incoming Basalt view exchange."
@@ -394,7 +398,6 @@
           {:state state-with-echo :commands []}))
       {:state state :commands []})))
 
-
 (defn- apply-payload-to-ledger
   "Attempts to parse a payload and apply any transfer to the ledger.
    Returns the updated state if successful, or the original state on failure."
@@ -486,32 +489,36 @@
                                  []))
                              [])
 
-            ;; If payload contains a transfer, try to apply it to the ledger upon delivery.
-            state-with-applied-ledger (if (and (>= new-delivery-votes D-hat)
-                                               (not (contains? (:delivered-set state-checked-ready) message-id)))
-                                        (let [message (get (:messages state) message-id)
-                                              payload-bytes (or (:payload message) (byte-array 0))]
-                                          (apply-payload-to-ledger state-checked-ready payload-bytes))
-                                        state-checked-ready)
-
-            delivery-commands (if (and (>= new-delivery-votes D-hat)
-                                       (not (contains? (:delivered-set state-checked-ready) message-id)))
-                                (let [message (get (:messages state) message-id)]
-                                  (if message
-                                    [{:type :app-event :event-name :on-deliver
-                                      :payload (:payload message) :message-id message-id}]
-                                    []))
-                                [])
-
-            ;; Check D-hat for Final Delivery transition (must happen AFTER ledger apply and command generation so we don't block them)
+            ;; Check D-hat for Final Delivery transition
             state-checked-delivery (if (and (>= new-delivery-votes D-hat)
                                             (not (contains? (:delivered-set state-checked-ready) message-id)))
-                                     (update state-with-applied-ledger :delivered-set conj message-id)
-                                     state-with-applied-ledger)
+                                     (update state-checked-ready :delivered-set conj message-id)
+                                     state-checked-ready)
 
-            commands (into ready-commands delivery-commands)]
-        {:state state-checked-delivery :commands commands})
+            delivery-result (if (and (>= new-delivery-votes D-hat)
+                                     (not (contains? (:delivered-set state-checked-ready) message-id)))
+                              (let [message (get (:messages state) message-id)]
+                                (if message
+                                  (handle-event state-checked-delivery
+                                                {:type :on-deliver
+                                                 :payload (:payload message)
+                                                 :message-id message-id})
+                                  {:state state-checked-delivery :commands []}))
+                              {:state state-checked-delivery :commands []})
+
+            commands (into ready-commands (:commands delivery-result))]
+        {:state (:state delivery-result) :commands commands})
       {:state state :commands []})))
+
+(defn- handle-on-deliver
+  "Handles the internal delivery event, updating the ledger with the payload and emitting an app-event."
+  [state event]
+  (let [payload-bytes (or (:payload event) (byte-array 0))
+        message-id (:message-id event)
+        state-with-applied-ledger (apply-payload-to-ledger state payload-bytes)]
+    {:state state-with-applied-ledger
+     :commands [{:type :app-event :event-name :on-deliver
+                 :payload (:payload event) :message-id message-id}]}))
 
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
@@ -528,4 +535,5 @@
     :receive-gossip (handle-receive-gossip state event)
     :receive-sieve-echo (handle-receive-sieve-echo state event)
     :receive-contagion-ready (handle-receive-contagion-ready state event)
+    :on-deliver (handle-on-deliver state event)
     {:state state :commands []}))
