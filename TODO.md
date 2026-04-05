@@ -39,7 +39,7 @@
 - [x] Implement `bitecho.economy.burn` logic: pure function `(deduct-routing-fee state transfer)` that burns the ECHO micro-fee by removing it from the total supply.
 - [x] Implement `bitecho.economy.receipt` generation: pure function to create a probabilistic cryptographic "Proof of Delivery" receipt when an Agent successfully receives routed data.
 - [x] Implement `bitecho.economy.bundle` logic: pure functions for a Full Node to buffer validated micro-transfers and bundle them into a single array payload for Murmur broadcast.
-- [ ] **Bundling Isolation Simulator:** Create `dev/bitecho/simulator/bundle_e2e.clj`. Simulate Light Nodes streaming high-frequency micro-transactions to a Full Node. Prove the Full Node correctly batches them, respecting a time-based interval, and emits a single, compressed Murmur broadcast to optimize egress bandwidth. Model after `bitecho.simulator.account-e2e`.
+- [x] **Bundling Isolation Simulator:** Create `dev/bitecho/simulator/bundle_e2e.clj`. Simulate Light Nodes streaming high-frequency micro-transactions to a Full Node. Prove the Full Node correctly batches them, respecting a time-based interval, and emits a single, compressed Murmur broadcast to optimize egress bandwidth. Model after `bitecho.simulator.account-e2e`.
 
 ### Part C: Streamlet BFT Treasury (k-Shared Asset Transfer)
 - [ ] Implement `bitecho.streamlet.core` data structures: define pure records for `Block` (epoch, parent-hash, payload, proposer) and `Vote` (block-hash, epoch, voter-signature).
