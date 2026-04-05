@@ -43,7 +43,7 @@
 
 ### Part C: Streamlet BFT Treasury (k-Shared Asset Transfer)
 - [x] Implement `bitecho.streamlet.core` data structures: define pure records for `Block` (epoch, parent-hash, payload, proposer) and `Vote` (block-hash, epoch, voter-signature).
-- [ ] Implement `bitecho.streamlet.core` propose-vote paradigm: pure functions `(propose-block state epoch)` and `(cast-vote state block)`.
+- [x] Implement `bitecho.streamlet.core` propose-vote paradigm: pure functions `(propose-block state epoch)` and `(cast-vote state block)`.
 - [ ] Implement `bitecho.streamlet.core` notarization logic: pure function to track vote accumulations and transition a block to `notarized` when it reaches the 2n/3 threshold.
 - [ ] Implement `bitecho.streamlet.core` finalization logic: pure function to scan the notarized chain and finalize a prefix when three adjacent blocks have consecutive epoch numbers.
 - [ ] Write generative state-machine fuzzer (`test.check`) for Streamlet to prove safety (consistency) and liveness under simulated adversarial network delays.
