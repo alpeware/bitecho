@@ -42,7 +42,7 @@
 - [x] **Bundling Isolation Simulator:** Create `dev/bitecho/simulator/bundle_e2e.clj`. Simulate Light Nodes streaming high-frequency micro-transactions to a Full Node. Prove the Full Node correctly batches them, respecting a time-based interval, and emits a single, compressed Murmur broadcast to optimize egress bandwidth. Model after `bitecho.simulator.account-e2e`.
 
 ### Part C: Streamlet BFT Treasury (k-Shared Asset Transfer)
-- [ ] Implement `bitecho.streamlet.core` data structures: define pure records for `Block` (epoch, parent-hash, payload, proposer) and `Vote` (block-hash, epoch, voter-signature).
+- [x] Implement `bitecho.streamlet.core` data structures: define pure records for `Block` (epoch, parent-hash, payload, proposer) and `Vote` (block-hash, epoch, voter-signature).
 - [ ] Implement `bitecho.streamlet.core` propose-vote paradigm: pure functions `(propose-block state epoch)` and `(cast-vote state block)`.
 - [ ] Implement `bitecho.streamlet.core` notarization logic: pure function to track vote accumulations and transition a block to `notarized` when it reaches the 2n/3 threshold.
 - [ ] Implement `bitecho.streamlet.core` finalization logic: pure function to scan the notarized chain and finalize a prefix when three adjacent blocks have consecutive epoch numbers.
