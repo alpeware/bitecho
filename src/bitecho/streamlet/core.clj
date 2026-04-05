@@ -51,3 +51,25 @@
             private-key (get-in state [:keypair :private])
             sig-bytes (crypto/sign private-key (.getBytes ^String b-hash "UTF-8"))]
         (->Vote b-hash epoch (bytes->hex sig-bytes))))))
+
+(defn quorum-threshold
+  "Calculates the 2n/3 quorum threshold for a network of size n."
+  [n]
+  (int (Math/ceil (/ (* 2.0 n) 3))))
+
+(defn accumulate-vote
+  "Validates a vote and accumulates it into the block's vote set.
+   If the accumulated valid votes reach the 2n/3 threshold, adds the block to the :notarized-blocks set."
+  [state vote voter-pubkey-bytes n]
+  (let [{:keys [block-hash voter-signature]} vote]
+    (if (crypto/verify voter-pubkey-bytes
+                       (.getBytes ^String block-hash "UTF-8")
+                       (hex->bytes voter-signature))
+      (let [pubkey-hex (bytes->hex voter-pubkey-bytes)
+            current-votes (get-in state [:block-votes block-hash] #{})
+            new-votes (conj current-votes pubkey-hex)
+            state-with-vote (assoc-in state [:block-votes block-hash] new-votes)]
+        (if (>= (count new-votes) (quorum-threshold n))
+          (update state-with-vote :notarized-blocks (fnil conj #{}) block-hash)
+          state-with-vote))
+      state)))
