@@ -1,5 +1,5 @@
-(ns bitecho.simulator.account-e2e
-  "Pure Contagion E2E simulation — bypasses core.async entirely.
+(ns bitecho.simulator.streamlet-e2e
+  "Pure Streamlet E2E simulation — bypasses core.async entirely.
    Each node is a map with a ConcurrentLinkedQueue inbox, an AtomicBoolean
    scheduler flag, and state held in a volatile!.  Events are drained in
    batches by tasks submitted to ForkJoinPool/commonPool, guaranteeing
