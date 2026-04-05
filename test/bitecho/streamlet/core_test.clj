@@ -1,7 +1,10 @@
 (ns bitecho.streamlet.core-test
   (:require [bitecho.crypto :as crypto]
             [bitecho.streamlet.core :as core]
-            [clojure.test :refer [deftest is testing]]))
+            [clojure.test :refer [deftest is testing]]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]))
 
 (deftest test-streamlet-records
   (testing "Block record can be instantiated"
@@ -107,3 +110,68 @@
             new-state (core/accumulate-vote state vote2 pub2 3)]
         (is (= #{(#'core/bytes->hex pub1) (#'core/bytes->hex pub2)} (get-in new-state [:block-votes block-hash])))
         (is (= #{block-hash} (:notarized-blocks new-state)))))))
+
+(defn- build-test-chain
+  "Builds a chain of blocks from a list of epochs."
+  [epochs]
+  (reduce (fn [acc epoch]
+            (let [parent-hash (if (empty? acc) "genesis" (:hash (last acc)))
+                  block (core/->Block epoch parent-hash [] "proposer")
+                  b-hash (core/hash-block block)]
+              (conj acc (assoc block :hash b-hash))))
+          []
+          epochs))
+
+(deftest test-finalize-prefix-unit
+  (testing "finalize-prefix finalizes nothing if no consecutive epochs"
+    (let [chain (build-test-chain [1 3 5])
+          blocks-map (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) chain))
+          notarized (set (keys blocks-map))
+          state {:blocks blocks-map
+                 :notarized-blocks notarized
+                 :finalized-blocks #{}}
+          new-state (core/finalize-prefix state)]
+      (is (= #{} (:finalized-blocks new-state)))))
+
+  (testing "finalize-prefix finalizes middle block and ancestors on 3 consecutive epochs"
+    (let [chain (build-test-chain [1 2 4 5 6 8])
+          blocks-map (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) chain))
+          notarized (set (keys blocks-map))
+          state {:blocks blocks-map
+                 :notarized-blocks notarized
+                 :finalized-blocks #{}}
+          new-state (core/finalize-prefix state)
+          b1 (:hash (nth chain 0))
+          b2 (:hash (nth chain 1))
+          b4 (:hash (nth chain 2))
+          b5 (:hash (nth chain 3))]
+      ;; chain of 4, 5, 6 means 5 and its ancestors (4, 2, 1) should be finalized
+      (is (contains? (:finalized-blocks new-state) b1))
+      (is (contains? (:finalized-blocks new-state) b2))
+      (is (contains? (:finalized-blocks new-state) b4))
+      (is (contains? (:finalized-blocks new-state) b5))
+      (is (not (contains? (:finalized-blocks new-state) (:hash (nth chain 4))))))))
+
+(defspec ^{:doc "Property: any chain with a 3-consecutive epoch sequence finalizes up to the middle block."}
+  prop-finalize-prefix 100
+  (prop/for-all [epochs (gen/not-empty (gen/vector (gen/choose 1 100)))]
+                (let [sorted-epochs (vec (distinct (sort epochs)))
+                      chain (build-test-chain sorted-epochs)
+                      blocks-map (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) chain))
+                      notarized (set (keys blocks-map))
+                      state {:blocks blocks-map
+                             :notarized-blocks notarized
+                             :finalized-blocks #{}}
+                      new-state (core/finalize-prefix state)
+                      finalized (:finalized-blocks new-state)
+
+                      triplets (partition 3 1 chain)
+                      consecutive-triplets (filter (fn [[b1 b2 b3]]
+                                                     (and (= (:epoch b2) (inc (:epoch b1)))
+                                                          (= (:epoch b3) (inc (:epoch b2)))))
+                                                   triplets)
+                      expected-finalized (set (mapcat (fn [[_ b2 _]]
+                                                        (map :hash (take-while #(not= (:hash %) (:hash b2)) chain)))
+                                                      consecutive-triplets))
+                      expected-finalized (into expected-finalized (map (comp :hash second) consecutive-triplets))]
+                  (= finalized expected-finalized))))
