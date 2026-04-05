@@ -5,6 +5,7 @@
             [bitecho.crypto-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]
+            [bitecho.economy.receipt-test]
             [bitecho.murmur.core-test]
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]
