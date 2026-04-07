@@ -500,84 +500,84 @@
         honest (- total byz)
         start-wall-time (System/currentTimeMillis)]
 
-      (.set total-routed 0)
-      (.clear cmd-counters)
-      (reset! partition-mode false)
+    (.set total-routed 0)
+    (.clear cmd-counters)
+    (reset! partition-mode false)
 
-      (println "Starting Streamlet Pure E2E Simulator (ForkJoinPool)...")
-      (println (format "Network Topology: %d total nodes (%d honest, %d byzantine)"
-                       total honest byz))
-      (println (format "Quorum Threshold: %d" (streamlet/quorum-threshold total)))
+    (println "Starting Streamlet Pure E2E Simulator (ForkJoinPool)...")
+    (println (format "Network Topology: %d total nodes (%d honest, %d byzantine)"
+                     total honest byz))
+    (println (format "Quorum Threshold: %d" (streamlet/quorum-threshold total)))
 
-      (let [network (start-network cfg)
-            h-nodes (:h-nodes network)
+    (let [network (start-network cfg)
+          h-nodes (:h-nodes network)
             ;; Populate registry-map for all nodes to easily loop through them
-            registry-map @registry]
-        (doseq [node h-nodes]
-          (vswap! (:state-vol node) assoc :registry-map registry-map))
+          registry-map @registry]
+      (doseq [node h-nodes]
+        (vswap! (:state-vol node) assoc :registry-map registry-map))
 
-        (println "\n── Phase 1: Full Synchrony (20 Epochs) ─────────────────")
+      (println "\n── Phase 1: Full Synchrony (20 Epochs) ─────────────────")
+      (dotimes [_ 20]
+        (inject-tick-to-all! h-nodes))
+
+      (let [finalized-sets (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes)
+            max-finalized (apply max finalized-sets)]
+        (println "Finalized blocks per node:" finalized-sets)
+        (when (zero? max-finalized)
+          (throw (ex-info "Liveness failure: No blocks finalized during synchrony" {}))))
+
+      (println "\n── Phase 2: Extreme Network Partition (20 Epochs) ──────")
+      (reset! partition-mode true)
+      (let [pre-partition-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
         (dotimes [_ 20]
           (inject-tick-to-all! h-nodes))
+        (let [post-partition-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
+          (println "Finalized blocks per node before partition:" pre-partition-finalized)
+          (println "Finalized blocks per node after partition:" post-partition-finalized)
+          (when (> post-partition-finalized pre-partition-finalized)
+            (throw (ex-info "Safety/Logic failure: Blocks finalized during strict partition without quorum" {})))))
 
-        (let [finalized-sets (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes)
-              max-finalized (apply max finalized-sets)]
-          (println "Finalized blocks per node:" finalized-sets)
-          (when (zero? max-finalized)
-            (throw (ex-info "Liveness failure: No blocks finalized during synchrony" {}))))
+      (println "\n── Phase 3: Partition Resolved & Anti-Entropy ──────────")
+      (reset! partition-mode false)
+      (let [global-blocks (apply merge (mapv #(:blocks @(:state-vol %)) h-nodes))
+            global-notarized (apply set/union (mapv #(:notarized-blocks @(:state-vol %)) h-nodes))
+            global-finalized (apply set/union (mapv #(:finalized-blocks @(:state-vol %)) h-nodes))]
+        (doseq [node h-nodes]
+          (vswap! (:state-vol node)
+                  (fn [state]
+                    (-> state
+                        (update :blocks merge global-blocks)
+                        (update :notarized-blocks set/union global-notarized)
+                        (update :finalized-blocks set/union global-finalized))))))
 
-        (println "\n── Phase 2: Extreme Network Partition (20 Epochs) ──────")
-        (reset! partition-mode true)
-        (let [pre-partition-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
-          (dotimes [_ 20]
-            (inject-tick-to-all! h-nodes))
-          (let [post-partition-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
-            (println "Finalized blocks per node before partition:" pre-partition-finalized)
-            (println "Finalized blocks per node after partition:" post-partition-finalized)
-            (when (> post-partition-finalized pre-partition-finalized)
-              (throw (ex-info "Safety/Logic failure: Blocks finalized during strict partition without quorum" {})))))
-
-        (println "\n── Phase 3: Partition Resolved & Anti-Entropy ──────────")
-        (reset! partition-mode false)
-        (let [global-blocks (apply merge (mapv #(:blocks @(:state-vol %)) h-nodes))
-              global-notarized (apply set/union (mapv #(:notarized-blocks @(:state-vol %)) h-nodes))
-              global-finalized (apply set/union (mapv #(:finalized-blocks @(:state-vol %)) h-nodes))]
-          (doseq [node h-nodes]
-            (vswap! (:state-vol node)
-                    (fn [state]
-                      (-> state
-                          (update :blocks merge global-blocks)
-                          (update :notarized-blocks set/union global-notarized)
-                          (update :finalized-blocks set/union global-finalized))))))
-
-        (println "\n── Phase 4: Restored Synchrony (20 Epochs) ─────────────")
-        (let [pre-recovery-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
-          (dotimes [_ 20]
-            (inject-tick-to-all! h-nodes))
-          (let [finalized-sets (mapv #(:finalized-blocks @(:state-vol %)) h-nodes)
-                post-recovery-finalized (count (first finalized-sets))]
-            (println "Finalized blocks per node before recovery:" pre-recovery-finalized)
-            (println "Finalized blocks per node after recovery:" (mapv count finalized-sets))
-            (when-not (apply = finalized-sets)
-              (throw (ex-info "Safety failure: Nodes have divergent finalized block prefixes" {})))
-            (when (<= post-recovery-finalized pre-recovery-finalized)
-              (throw (ex-info "Liveness failure: Nodes did not finalize new blocks after synchrony was restored" {})))))
+      (println "\n── Phase 4: Restored Synchrony (20 Epochs) ─────────────")
+      (let [pre-recovery-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
+        (dotimes [_ 20]
+          (inject-tick-to-all! h-nodes))
+        (let [finalized-sets (mapv #(:finalized-blocks @(:state-vol %)) h-nodes)
+              post-recovery-finalized (count (first finalized-sets))]
+          (println "Finalized blocks per node before recovery:" pre-recovery-finalized)
+          (println "Finalized blocks per node after recovery:" (mapv count finalized-sets))
+          (when-not (apply = finalized-sets)
+            (throw (ex-info "Safety failure: Nodes have divergent finalized block prefixes" {})))
+          (when (<= post-recovery-finalized pre-recovery-finalized)
+            (throw (ex-info "Liveness failure: Nodes did not finalize new blocks after synchrony was restored" {})))))
 
         ;; ── Summary ──────────────────────────────────────────────────────
-        (let [wall-time (- (System/currentTimeMillis) start-wall-time)
-              cmd-stats (into {} (map (fn [k] [(keyword k) (.get ^AtomicLong (.get cmd-counters k))])
-                                      (enumeration-seq (.keys cmd-counters))))]
-          (println "\n========================================")
-          (println "SIMULATION COMPLETE")
-          (println "========================================")
-          (println "Network commands processed          " (->> cmd-stats (sort-by second) (reverse)))
-          (println "Total messages routed:              " (.get total-routed))
-          (println "Epoch:                              " (min-epoch h-nodes))
-          (println "Broadcasts Delivered:               " (.get delivery-counter))
-          (println "Wall-clock time:                    " wall-time "ms")
-          (when (pos? (.get delivery-counter))
-            (println "Time to Delivery:                 "
-                     (int (/ @total-consensus-time (.get delivery-counter))) "ms"))
-          (println "========================================"))
+      (let [wall-time (- (System/currentTimeMillis) start-wall-time)
+            cmd-stats (into {} (map (fn [k] [(keyword k) (.get ^AtomicLong (.get cmd-counters k))])
+                                    (enumeration-seq (.keys cmd-counters))))]
+        (println "\n========================================")
+        (println "SIMULATION COMPLETE")
+        (println "========================================")
+        (println "Network commands processed          " (->> cmd-stats (sort-by second) (reverse)))
+        (println "Total messages routed:              " (.get total-routed))
+        (println "Epoch:                              " (min-epoch h-nodes))
+        (println "Broadcasts Delivered:               " (.get delivery-counter))
+        (println "Wall-clock time:                    " wall-time "ms")
+        (when (pos? (.get delivery-counter))
+          (println "Time to Delivery:                 "
+                   (int (/ @total-consensus-time (.get delivery-counter))) "ms"))
+        (println "========================================"))
 
-        (System/exit 0))))
+      (System/exit 0))))
