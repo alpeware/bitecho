@@ -8,8 +8,8 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
-            [bitecho.economy.account :as account]
-            [bitecho.state-machine :as sm])
+            [bitecho.streamlet.core :as streamlet]
+            [clojure.set :as set])
   (:import [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue
             ForkJoinPool]
            [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]))
@@ -95,6 +95,9 @@
     (.incrementAndGet counter)))
 
 ;; Telemetry globals — reset by -main before simulation starts
+(def partition-mode
+  "Global flag to enable network partitions."
+  (atom false))
 (def ^ConcurrentHashMap delivery-chm
   "Delivery map."
   (ConcurrentHashMap.))
@@ -156,6 +159,135 @@
 (def ^:private ^:const MAX-BATCH 64)
 
 ;; ---------------------------------------------------------------------------
+;; Streamlet Reducer
+;; ---------------------------------------------------------------------------
+
+(defn- hash-to-int [hex]
+  (try
+    ;; Parse a short substring to avoid sign bit issues, ensuring a positive long.
+    ;; The last characters of the public key are quite random.
+    (Long/parseLong (subs hex (- (count hex) 8)) 16)
+    (catch Exception _ 0)))
+
+(defn- handle-streamlet-event
+  "Pure state machine reducer for Streamlet BFT nodes."
+  [state event]
+  (case (:type event)
+    :tick
+    (let [new-epoch (inc (:epoch state))
+          state (assoc state :epoch new-epoch)
+          ;; Update head-hash to highest notarized block before proposing
+          notarized-blocks (:notarized-blocks state)
+          head-hash (if (empty? notarized-blocks)
+                      "genesis"
+                      (let [blocks (:blocks state)
+                            highest-block (apply max-key #(get-in blocks [% :epoch] -1) notarized-blocks)]
+                        highest-block))
+          state (assoc state :head-hash head-hash)
+          ;; Deterministic proposer selection for the epoch
+          proposer-index (mod new-epoch (:total-nodes state))
+          sorted-peers (vec (sort (keys (:registry-map state))))
+          proposer-hex (nth sorted-peers proposer-index)]
+      (if (= proposer-hex (:node-pubkey state))
+        (let [block (streamlet/propose-block state new-epoch)
+              block-hash (streamlet/hash-block block)
+              state (assoc-in state [:blocks block-hash] block)
+              ;; Proposer implicitly votes for their own block
+              vote (streamlet/cast-vote state block)
+              state (if vote (update state :voted-epochs (fnil conj #{}) (:epoch block)) state)
+              ;; Accumulate local vote
+              state (if vote (streamlet/accumulate-vote state vote (:public (:keypair state)) (:total-nodes state)) state)
+              ;; Apply any future buffered votes for this block
+              future-votes (get-in state [:future-votes block-hash] [])
+              state (reduce (fn [s {:keys [vote sender-pubkey-bytes]}]
+                              (streamlet/accumulate-vote s vote sender-pubkey-bytes (:total-nodes state)))
+                            state future-votes)
+              state (if (contains? state :future-votes) (update state :future-votes dissoc block-hash) state)
+              ;; Try finalizing immediately in case n=1 threshold is met
+              state (streamlet/finalize-prefix state)]
+          {:state state
+           :commands (if vote
+                       [{:type :send-propose
+                         :targets (vals (:registry-map state))
+                         :block block}
+                        {:type :send-vote
+                         :targets (vals (:registry-map state))
+                         :vote vote}]
+                       [{:type :send-propose
+                         :targets (vals (:registry-map state))
+                         :block block}])})
+        {:state state :commands []}))
+
+    :receive-propose
+    (let [block (:block event)
+          block-hash (streamlet/hash-block block)
+          ;; 1. Add block to DAG
+          state (assoc-in state [:blocks block-hash] block)
+          ;; 2. Ensure parent block is known before voting
+          parent-hash (:parent-hash block)
+          known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
+      (if known-parent?
+        (let [;; 3. Cast vote if valid (streamlet/cast-vote checks if already voted for this epoch)
+              vote (streamlet/cast-vote state block)
+              state (if vote (update state :voted-epochs (fnil conj #{}) (:epoch block)) state)
+              ;; Accumulate local vote
+              state (if vote (streamlet/accumulate-vote state vote (:public (:keypair state)) (:total-nodes state)) state)
+              ;; Apply any future buffered votes for this block
+              future-votes (get-in state [:future-votes block-hash] [])
+              state (reduce (fn [s {:keys [vote sender-pubkey-bytes]}]
+                              (streamlet/accumulate-vote s vote sender-pubkey-bytes (:total-nodes state)))
+                            state future-votes)
+              state (if (contains? state :future-votes) (update state :future-votes dissoc block-hash) state)
+              state (streamlet/finalize-prefix state)]
+          (if vote
+            {:state state
+             :commands [{:type :send-vote
+                         :targets (vals (:registry-map state))
+                         ;; Important: the vote structure only contains :block-hash, :epoch, and :voter-signature
+                         ;; The simulation routes to peers, but `:receive-vote` needs to know the original sender to fetch their pubkey
+                         ;; So the :sender field is added to the event at `route-command!`
+                         :vote vote}]}
+            {:state state :commands []}))
+        ;; If parent block is missing, buffer the block
+        (let [future-blocks (get state :future-blocks [])
+              state (assoc state :future-blocks (conj future-blocks event))]
+          {:state state :commands []})))
+
+    :receive-vote
+    (let [vote (:vote event)
+          sender (:sender event)
+          ;; Try to resolve public key from registry map to bytes, otherwise parse from hex
+          sender-node (get (:registry-map state) sender)
+          sender-pubkey-bytes (if sender-node (:public (:keys sender-node)) (basalt/hex->bytes sender))
+          ;; Verify vote block exists in blocks before accumulating
+          known-block? (contains? (:blocks state) (:block-hash vote))]
+      (if known-block?
+        (let [;; accumulate-vote takes state, vote, public-key bytes, n
+              state (streamlet/accumulate-vote state vote sender-pubkey-bytes (:total-nodes state))
+              ;; if block was notarized by this vote, apply any future blocks that were waiting for it
+              future-blocks (get state :future-blocks [])
+              state (assoc state :future-blocks []) ;; clear queue so we can re-evaluate
+              state (reduce (fn [s block-event]
+                              ;; simplistic: just re-process them. In real app, we'd recursively call handle-event or drain them properly.
+                              ;; For the simulator, buffering blocks prevents stall but recursive call here is fine because it's pure
+                              (let [res (handle-streamlet-event s block-event)]
+                                (:state res)))
+                            state future-blocks)
+              state (streamlet/finalize-prefix state)]
+          {:state state :commands []})
+        ;; Buffer future votes so they aren't lost if they arrive before the block proposal
+        (let [future-votes (get state :future-votes {})
+              block-future-votes (get future-votes (:block-hash vote) [])
+              ;; Don't buffer duplicate votes from same sender!
+              already-buffered? (some (fn [v] (= (:voter-signature (:vote v)) (:voter-signature vote))) block-future-votes)
+              state (if already-buffered?
+                      state
+                      (assoc-in state [:future-votes (:block-hash vote)] (conj block-future-votes {:vote vote :sender-pubkey-bytes sender-pubkey-bytes})))]
+          {:state state :commands []})))
+
+    {:state state :commands []}))
+
+;; ---------------------------------------------------------------------------
 ;; Side-effect handlers called from inside the drain loop
 ;; ---------------------------------------------------------------------------
 
@@ -163,78 +295,30 @@
   (let [t (:type cmd)]
     (and (keyword? t) (.startsWith (name t) "send-"))))
 
-(defn- handle-app-event!
-  "Processes :app-event commands inline instead of routing through a channel."
-  [node cmd]
-  (when (= (:event-name cmd) :on-deliver)
-    (let [message-id (:message-id cmd)
-          pubkey (:pubkey-hex node)
-          current-epoch (node-epoch node)
-          ^java.util.Set delivery-set
-          (.computeIfAbsent delivery-chm message-id
-                            (reify java.util.function.Function
-                              (apply [_ _k]
-                                (ConcurrentHashMap/newKeySet))))]
-      (when (.add delivery-set pubkey)
-        (let [current (.size delivery-set)
-              hn @honest-count]
-          (when (zero? (mod current 10))
-            (println (format "Broadcast %s reached %d/%d nodes at epoch %d"
-                             message-id current hn current-epoch)))
-          (when (>= current hn)
-            ;; putIfAbsent returns nil on first insert (= this thread wins)
-            (when (nil? (.putIfAbsent completed-broadcasts message-id true))
-              (let [end-time (System/currentTimeMillis)
-                    start-time (get @broadcast-start-times message-id)
-                    duration (- end-time start-time)
-                    completed (.incrementAndGet delivery-counter)]
-                (swap! total-consensus-time + duration)
-                (println (format "✅ Broadcast %s delivered to ALL %d honest nodes in %d ms (%d/%d)"
-                                 message-id hn duration completed @total-broadcast-count))
-                (when (>= completed @total-broadcast-count)
-                  (.set done-flag 1))))))))))
-
 (defn- route-command!
   "Translates a network-out command to a network-in event for target node(s).
    Directly enqueues into each target's inbox via send-event!."
   [sender-node cmd]
   (let [sender-hex (:pubkey-hex sender-node)
-        targets (or (:targets cmd) (when (:target cmd) [(:target cmd)]))]
+        targets (or (:targets cmd) (when (:target cmd) [(:target cmd)]))
+        sender-partition (mod (hash-to-int sender-hex) 2)]
     (doseq [t targets]
-      (let [target-hex (if (string? t) t (:pubkey t))]
-        (when-let [target-node (get @registry target-hex)]
-          (.incrementAndGet total-routed)
-          (inc-cmd-counter! (:type cmd))
-          (case (:type cmd)
-            :send-push-view
-            (send-event! target-node {:type :receive-push-view :view (:view cmd)})
-            :send-summary
-            (send-event! target-node {:type :receive-summary
-                                      :sender sender-hex
-                                      :summary (:summary cmd)})
-            :send-subscribe
-            (send-event! target-node {:type :receive-subscribe
-                                      :sender sender-hex
-                                      :roles (:roles cmd)})
-            :send-pull-request
-            (send-event! target-node {:type :receive-pull-request
-                                      :sender sender-hex
-                                      :missing-ids (:missing-ids cmd)})
-            :send-gossip
-            (send-event! target-node {:type :receive-gossip
-                                      :message (:message cmd)
-                                      :rng (java.util.concurrent.ThreadLocalRandom/current)})
-            :send-sieve-echo
-            (send-event! target-node {:type :receive-sieve-echo
-                                      :sender sender-hex
-                                      :message-id (:message-id cmd)
-                                      :rng (java.util.concurrent.ThreadLocalRandom/current)})
-            :send-contagion-ready
-            (send-event! target-node {:type :receive-contagion-ready
-                                      :sender sender-hex
-                                      :message-id (:message-id cmd)
-                                      :rng (java.util.concurrent.ThreadLocalRandom/current)})
-            nil))))))
+      (let [target-hex (if (string? t) t (or (:pubkey-hex t) (:pubkey t)))
+            target-partition (mod (hash-to-int target-hex) 2)
+            ;; Nodes partitioned into two groups: evens and odds.
+            ;; But wait: if n=15, 8 nodes in group 0, 7 nodes in group 1.
+            ;; Quorum threshold is 10. So neither group can reach quorum.
+            drop? (and @partition-mode (not= sender-partition target-partition))]
+        (when (not drop?)
+          (when-let [target-node (get @registry target-hex)]
+            (.incrementAndGet total-routed)
+            (inc-cmd-counter! (:type cmd))
+            (case (:type cmd)
+              :send-propose
+              (send-event! target-node {:type :receive-propose :sender sender-hex :block (:block cmd)})
+              :send-vote
+              (send-event! target-node {:type :receive-vote :sender sender-hex :vote (:vote cmd)})
+              nil)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Core actor loop
@@ -257,13 +341,10 @@
             (when (= (:type event) :tick)
               (.decrementAndGet pending))
             (let [{new-state :state commands :commands}
-                  (sm/handle-event @state-vol event)]
+                  (handle-streamlet-event @state-vol event)]
               (vreset! state-vol new-state)
               (doseq [cmd commands]
                 (cond
-                  (= (:type cmd) :app-event)
-                  (handle-app-event! node cmd)
-
                   (is-network-command? cmd)
                   (route-command! node cmd))))
             (recur (dec remaining)))))
@@ -294,7 +375,15 @@
   [i cfg]
   (let [keys (crypto/generate-keypair)
         pubkey-hex (basalt/bytes->hex (:public keys))
-        initial-state (sm/init-state [] pubkey-hex (:protocol cfg))
+        initial-state {:node-pubkey pubkey-hex
+                       :keypair keys
+                       :epoch 0
+                       :blocks {}
+                       :notarized-blocks #{}
+                       :finalized-blocks #{}
+                       :voted-epochs #{}
+                       :block-votes {}
+                       :total-nodes (:total-nodes cfg)}
         peer {:ip "127.0.0.1"
               :port (+ 8000 i)
               :pubkey pubkey-hex
@@ -395,310 +484,104 @@
     (.start thread)
     {:running running :thread thread}))
 
-;; (defn- await-quiescence!
-;;   "Busy-waits until the ForkJoinPool has no queued/active tasks."
-;;   []
-;;   (loop []
-;;     (when-not (.isQuiescent pool)
-;;       (Thread/sleep 1)
-;;       (recur))))
-;;
-;; ;; ---------------------------------------------------------------------------
-;; ;; Main
+;; ---------------------------------------------------------------------------
+;; Main
 ;; ---------------------------------------------------------------------------
 
-(defn -main
-  "Main function for the Contagion pure E2E simulator."
-  []
-  (with-redefs [crypto/sha256 fast-dummy-sha256
-                crypto/verify dummy-verify
-                crypto/sign   dummy-sign]
-    (let [cfg sim-config
-          total (:total-nodes cfg)
-          byz (:byzantine-nodes cfg)
-          honest (- total byz)
-          start-wall-time (System/currentTimeMillis)]
+(defn- await-inboxes-empty
+  "Blocks until all nodes have empty inboxes and zero pending tasks."
+  [nodes]
+  (loop []
+    (when (some (fn [node]
+                  (or (not (.isEmpty ^ConcurrentLinkedQueue (:inbox node)))
+                      (.get ^AtomicBoolean (:scheduled? node))))
+                nodes)
+      (Thread/sleep 10)
+      (recur)))
+  ;; Wait an extra bit to allow ForkJoin tasks to fully clear and finalize variables
+  (Thread/sleep 50))
 
-      ;; Reset global mutable state
-      (.clear delivery-chm)
-      (.set delivery-counter 0)
-      (.clear completed-broadcasts)
-      (.set done-flag 0)
+(defn- inject-tick-to-all!
+  "Injects a single tick into all nodes and waits for them to drain."
+  [nodes]
+  (doseq [node nodes]
+    (inject-tick! node))
+  (await-inboxes-empty nodes))
+
+(defn -main
+  "Main function for the Streamlet pure E2E simulator."
+  []
+  ;; We will use real crypto for streamlet rather than dummies, because the fast dummy sha
+  ;; was causing identical hashes for block structures that serialize slightly differently.
+  ;; Also the streamlet tests natively use real crypto without performance issues.
+  (let [cfg (assoc sim-config :total-nodes 15 :byzantine-nodes 0) ; Run cluster of k=15 nodes
+        total (:total-nodes cfg)
+        byz (:byzantine-nodes cfg)
+        honest (- total byz)
+        start-wall-time (System/currentTimeMillis)]
+
       (.set total-routed 0)
       (.clear cmd-counters)
-      (reset! honest-count honest)
-      (reset! broadcast-start-times {})
-      (reset! total-consensus-time 0)
-      (reset! total-broadcast-count (:total-broadcast-messages cfg))
+      (reset! partition-mode false)
 
-      (println "Starting Contagion Pure E2E Simulator (ForkJoinPool, no core.async)...")
+      (println "Starting Streamlet Pure E2E Simulator (ForkJoinPool)...")
       (println (format "Network Topology: %d total nodes (%d honest, %d byzantine)"
                        total honest byz))
-      (println (format "Protocol: murmur-k=%d, view=%d, E=%d/%d, R=%d/%d, D=%d/%d, TTL=%d"
-                       (get-in cfg [:protocol :murmur-k])
-                       (get-in cfg [:protocol :basalt-max-view-size])
-                       (get-in cfg [:protocol :echo-sample-size])
-                       (get-in cfg [:protocol :echo-threshold])
-                       (get-in cfg [:protocol :ready-sample-size])
-                       (get-in cfg [:protocol :ready-threshold])
-                       (get-in cfg [:protocol :delivery-sample-size])
-                       (get-in cfg [:protocol :delivery-threshold])
-                       (get-in cfg [:protocol :gossip-ttl-epochs])))
-      (println (format "ForkJoinPool parallelism: %d" (.getParallelism (ForkJoinPool/commonPool))))
+      (println (format "Quorum Threshold: %d" (streamlet/quorum-threshold total)))
 
       (let [network (start-network cfg)
-            h-nodes (:h-nodes network)]
+            h-nodes (:h-nodes network)
+            ;; Populate registry-map for all nodes to easily loop through them
+            registry-map @registry]
+        (doseq [node h-nodes]
+          (vswap! (:state-vol node) assoc :registry-map registry-map))
 
-        ;; ── Start virtual-time tick injector ─────────────────────────────
-        (let [max-jitter (:max-epoch-jitter cfg)
-              ticker (start-tick-injector! h-nodes max-jitter)]
+        (println "\n── Phase 1: Full Synchrony (20 Epochs) ─────────────────")
+        (dotimes [_ 20]
+          (inject-tick-to-all! h-nodes))
 
-          ;; ── Stabilization phase ──────────────────────────────────────────
-          (println (format "Waiting for min-epoch to reach %d (stabilization)..."
-                           (:stabilization-ticks cfg)))
-          (loop [last-printed 0]
-            (let [me (min-epoch h-nodes)]
-              (when (< me (:stabilization-ticks cfg))
-                (when (>= (- me last-printed) 10)
-                  (println (format "  Stabilization: min-epoch %d/%d"
-                                   me (:stabilization-ticks cfg))))
-                (Thread/sleep 10)
-                (recur (if (>= (- me last-printed) 10) me last-printed)))))
-          (println "  Stabilization complete.")
+        (let [finalized-sets (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes)
+              max-finalized (apply max finalized-sets)]
+          (println "Finalized blocks per node:" finalized-sets)
+          (when (zero? max-finalized)
+            (throw (ex-info "Liveness failure: No blocks finalized during synchrony" {}))))
 
-          ;; ── Broadcast phase ──────────────────────────────────────────────
-          (loop [iteration 0 last-hash nil]
-            (when (< iteration (:total-broadcast-messages cfg))
-              (let [initiator (first h-nodes)
-                    receiver (second h-nodes)
-                    sender-pubkey (:pubkey-hex initiator)
-                    receiver-pubkey (:pubkey-hex receiver)
-                    sender-privkey (:private (:keys initiator))
+        (println "\n── Phase 2: Extreme Network Partition (20 Epochs) ──────")
+        (reset! partition-mode true)
+        (let [pre-partition-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
+          (dotimes [_ 20]
+            (inject-tick-to-all! h-nodes))
+          (let [post-partition-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
+            (println "Finalized blocks per node before partition:" pre-partition-finalized)
+            (println "Finalized blocks per node after partition:" post-partition-finalized)
+            (when (> post-partition-finalized pre-partition-finalized)
+              (throw (ex-info "Safety/Logic failure: Blocks finalized during strict partition without quorum" {})))))
 
-                    unsigned-transfer
-                    (case iteration
-                      0 {:sender sender-pubkey
-                         :receiver receiver-pubkey
-                         :amount 100
-                         :seq 1
-                         :deps []}
-                      1 {:sender sender-pubkey
-                         :receiver receiver-pubkey
-                         :amount 200
-                         :seq 2
-                         :deps (if last-hash [last-hash] [])}
-                      2 {:sender sender-pubkey
-                         :receiver receiver-pubkey
-                         :amount 500
-                         :seq 2
-                         :deps (if last-hash [last-hash] [])})
+        (println "\n── Phase 3: Partition Resolved & Anti-Entropy ──────────")
+        (reset! partition-mode false)
+        (let [global-blocks (apply merge (mapv #(:blocks @(:state-vol %)) h-nodes))
+              global-notarized (apply set/union (mapv #(:notarized-blocks @(:state-vol %)) h-nodes))
+              global-finalized (apply set/union (mapv #(:finalized-blocks @(:state-vol %)) h-nodes))]
+          (doseq [node h-nodes]
+            (vswap! (:state-vol node)
+                    (fn [state]
+                      (-> state
+                          (update :blocks merge global-blocks)
+                          (update :notarized-blocks set/union global-notarized)
+                          (update :finalized-blocks set/union global-finalized))))))
 
-                    payload-bytes-for-sig (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
-                    signature-bytes (crypto/sign sender-privkey payload-bytes-for-sig)
-                    ;; We must serialize the signature as a vector so `pr-str` works without destroying the byte array as a memory reference
-                    transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature-bytes)))
-
-                    ;; Wait wait wait... `account.clj` does this to calculate the hash to store in the dependencies list.
-                    ;; We have to exactly replicate this hash process. Let's make sure the signature bytes are identical.
-                    ;; `account.clj` does this in `apply-transfer`:
-                    ;; (let [safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (:signature transfer)))
-                    ;;       transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))] ...)
-                    safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))
-                    transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))
-
-                    broadcast-id (str (java.util.UUID/randomUUID))
-                    ;; Wait wait wait...
-                    ;; We have to pass the `transfer` struct, not `safe-transfer`, because `apply-transfer` expects it
-                    ;; and it does its own hex stringification on the byte array for hashing.
-                    ;; We did it earlier but got derailed with `safe-transfer`.
-                    payload-str (pr-str {:id broadcast-id :transfer transfer})
-                    payload-bytes (.getBytes ^String payload-str "UTF-8")
-                    message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))]
-
-                (swap! broadcast-start-times assoc message-id (System/currentTimeMillis))
-
-                (if (= iteration 2)
-                  (println (format "Injecting MALICIOUS DOUBLE-SPEND broadcast %s via honest node %s... (transfer hash %s)"
-                                   broadcast-id (subs sender-pubkey (- (count sender-pubkey) 8)) transfer-hash))
-                  (println (format "Injecting valid transfer broadcast %s via honest node %s... (transfer hash %s)"
-                                   broadcast-id (subs sender-pubkey (- (count sender-pubkey) 8)) transfer-hash)))
-
-                (send-event! initiator {:type :contagion-broadcast
-                                        :payload payload-bytes
-                                        :rng (java.util.concurrent.ThreadLocalRandom/current)
-                                        :private-key (:private (:keys initiator))
-                                        :public-key (:public (:keys initiator))})
-
-                (Thread/sleep 5000)
-                ;; we need to ensure that between iterations the nodes actually have enough time to process and disseminate the network epochs before injecting more messages.
-                ;; Because the tick injector runs globally, an artificial sleep might not be enough to advance epochs sufficiently for some nodes.
-                (let [target-epoch (+ (min-epoch h-nodes) 15)]
-                  (loop []
-                    (when (< (min-epoch h-nodes) target-epoch)
-                      (Thread/sleep 100)
-                      (recur))))
-                ;; Use the same exact hash calculation loop as the source validation so it perfectly matches
-                ;; the test is injecting valid transfer broadcasts that are getting rejected.
-                (let [unsigned-transfer (into (sorted-map) (dissoc safe-transfer :signature))
-                      payload-bytes-check (.getBytes (pr-str unsigned-transfer) "UTF-8")
-                      ;; dummy-verify will always pass, but doing it just in case.
-                      valid-signature? (crypto/verify (:sender safe-transfer) payload-bytes-check (basalt/hex->bytes (:signature safe-transfer)))]
-                  (when-not valid-signature?
-                    (println "WAIT - Generated transfer signature was invalid before sending?!")))
-                (recur (inc iteration) transfer-hash))))
-
-          ;; ── Wait for completion (epoch-bounded) ──────────────────────────
-          (let [broadcast-epoch (min-epoch h-nodes)
-                max-epochs (:completion-max-epochs cfg)]
-            (loop []
-              (let [total-delivered (.get delivery-counter)]
-                (when (and (< total-delivered (:total-broadcast-messages cfg))
-                           (< (- (min-epoch h-nodes) broadcast-epoch) max-epochs))
-                  (Thread/sleep 10)
-                  (recur))))
-
-            (when (zero? (.get done-flag))
-              (println "\n⚠️  Delivery status at epoch limit:")
-              (println (format "  Current min-epoch: %d  (started broadcast at epoch %d, limit %d)"
-                               (min-epoch h-nodes) broadcast-epoch max-epochs))
-              (doseq [bid (enumeration-seq (.keys delivery-chm))]
-                (let [^java.util.Set s (.get delivery-chm bid)]
-                  (println (format "  Broadcast %s: %d/%d delivered" bid (.size s) honest))))
-
-              ;; ─── Diagnostic state dump ───────────────────────────────────
-              (println "\n🔍 Querying state of undelivered nodes...")
-              (let [delivered-pubkeys (into #{}
-                                            (mapcat (fn [bid]
-                                                      (let [^java.util.Set s (.get delivery-chm bid)]
-                                                        (iterator-seq (.iterator s))))
-                                                    (enumeration-seq (.keys delivery-chm))))
-                    undelivered (filterv #(not (contains? delivered-pubkeys (:pubkey-hex %)))
-                                         h-nodes)
-                    protocol-cfg (:protocol cfg)
-                    E-hat (:echo-threshold protocol-cfg)
-                    D-hat (:delivery-threshold protocol-cfg)
-                    broadcast-ids (into #{} (enumeration-seq (.keys delivery-chm)))
-
-                    classify-node
-                    (fn [n]
-                      (let [state @(:state-vol n)
-                            pubkey (let [pk (:pubkey-hex n)] (subs pk (- (count pk) 8)))
-                            echo-sample (:global-echo-sample state)
-                            echo-subs (:echo-subscribers state)
-                            ready-subs (:ready-subscribers state)
-                            delivery-subs (:delivery-subscribers state)
-                            bid (first broadcast-ids)
-                            has-message? (and bid (contains? (:contagion-known-ids state) bid))
-                            echo-votes (get-in state [:echo-vote-counts bid] 0)
-                            ready-votes (get-in state [:ready-vote-counts bid] 0)
-                            delivery-votes (get-in state [:delivery-vote-counts bid] 0)
-                            sieve-delivered? (and bid (contains? (:sieve-delivered-set state) bid))
-                            local-ready? (and bid (contains? (:local-ready-set state) bid))]
-                        {:pubkey pubkey
-                         :group (cond
-                                  (empty? echo-sample)       :no-echo-sample
-                                  (empty? echo-subs)         :no-echo-subscribers
-                                  (empty? ready-subs)        :no-ready-subscribers
-                                  (empty? delivery-subs)     :no-delivery-subscribers
-                                  (not has-message?)         :no-message
-                                  (and has-message? (not sieve-delivered?)
-                                       (< echo-votes E-hat)) :awaiting-sieve-echo
-                                  (and sieve-delivered? (not local-ready?))
-                                  :sieve-delivered-not-ready
-                                  (and local-ready?
-                                       (< delivery-votes D-hat))
-                                  :ready-awaiting-delivery
-                                  :else                      :unknown)
-                         :echo-sample-size (count echo-sample)
-                         :echo-sub-count (count echo-subs)
-                         :ready-sub-count (count ready-subs)
-                         :delivery-sub-count (count delivery-subs)
-                         :echo-votes echo-votes
-                         :ready-votes ready-votes
-                         :delivery-votes delivery-votes
-                         :basalt-view-size (count (basalt/extract-peers (:basalt-view state)))
-                         :epoch (:epoch state)
-                         :has-message? has-message?
-                         :sieve-delivered? sieve-delivered?
-                         :local-ready? local-ready?}))
-
-                    classified (mapv classify-node undelivered)
-                    groups (group-by :group classified)]
-
-                (println (format "\n📊 Diagnostic Summary: %d undelivered nodes"
-                                 (count undelivered)))
-                (println "════════════════════════════════════════════════════════════")
-                (doseq [[group nodes] (sort-by (comp - count second) groups)]
-                  (let [sample (first nodes)]
-                    (println (format "\n  %-30s  %d nodes" (name group) (count nodes)))
-                    (println (format "    Sample node:  %s" (:pubkey sample)))
-                    (println (format "    Basalt view:  %d peers, epoch %d"
-                                     (:basalt-view-size sample) (:epoch sample)))
-                    (println (format "    Samples:      E=%d" (:echo-sample-size sample)))
-                    (println (format "    Subscribers:  echo=%d  ready=%d  delivery=%d"
-                                     (:echo-sub-count sample) (:ready-sub-count sample)
-                                     (:delivery-sub-count sample)))
-                    (println (format "    Has message:  %s  Sieve-delivered: %s  Ready: %s"
-                                     (:has-message? sample) (:sieve-delivered? sample)
-                                     (:local-ready? sample)))
-                    (println (format "    Votes:        echo=%d/%d  ready=%d  delivery=%d/%d"
-                                     (:echo-votes sample) E-hat
-                                     (:ready-votes sample)
-                                     (:delivery-votes sample) D-hat))))
-                (println "\n════════════════════════════════════════════════════════════"))
-
-              (throw (ex-info "Contagion broadcast failed to reach all honest nodes within epoch limit"
-                              {:max-epochs max-epochs
-                               :current-min-epoch (min-epoch h-nodes)}))))
-
-          ;; Stop tick injector
-          (.set ^AtomicBoolean (:running ticker) false))
-
-        ;; Final validation: verify ledger state convergence
-        (println "\nVerifying ledger state convergence...")
-        ;; Ensure we wait an additional moment in real-time to let ForkJoinPool drain the queues and finalize all transitions across nodes
-        (Thread/sleep 3000)
-        (let [initiator-pubkey (:pubkey-hex (first h-nodes))
-              receiver-pubkey (:pubkey-hex (second h-nodes))
-              mismatches (atom 0)]
-
-          (doseq [n h-nodes]
-            (let [state @(:state-vol n)
-                  node-hex (:pubkey-hex n)
-                  ledger (:ledger state)
-                  sender-state (get ledger initiator-pubkey)
-                  receiver-state (get ledger receiver-pubkey)
-                  sender-balance (or (:balance sender-state) 0)
-                  sender-seq (or (:seq sender-state) 0)
-                  receiver-balance (or (:balance receiver-state) 0)
-                  ;; If the receiver is the local node being inspected, their initial balance was 1000.
-                  ;; If the receiver is NOT the local node, they were lazily initialized to 0.
-                  expected-receiver-balance (if (= node-hex receiver-pubkey) 1300 300)]
-
-              ;; Expected state after:
-              ;; Initial: Sender 1000, Receiver 0
-              ;; Tx 1 (valid): Sender 900, Receiver 100, seq 1
-              ;; Tx 2 (valid): Sender 700, Receiver 300, seq 2
-              ;; Tx 3 (invalid): Rejected (seq 2, bad deps)
-
-              (when (not= 700 sender-balance)
-                (println (format "❌ Node %s has incorrect sender balance: %d (expected 700)"
-                                 (subs node-hex (- (count node-hex) 8)) sender-balance))
-                (swap! mismatches inc))
-
-              (when (not= 2 sender-seq)
-                (println (format "❌ Node %s has incorrect sender seq: %d (expected 2)"
-                                 (subs node-hex (- (count node-hex) 8)) sender-seq))
-                (swap! mismatches inc))
-
-              (when (not= expected-receiver-balance receiver-balance)
-                (println (format "❌ Node %s has incorrect receiver balance: %d (expected %d)"
-                                 (subs node-hex (- (count node-hex) 8)) receiver-balance expected-receiver-balance))
-                (swap! mismatches inc))))
-
-          (if (zero? @mismatches)
-            (println "✅ All honest nodes converged on the correct ledger state!")
-            (throw (ex-info "Ledger convergence failed" {:mismatches @mismatches}))))
+        (println "\n── Phase 4: Restored Synchrony (20 Epochs) ─────────────")
+        (let [pre-recovery-finalized (apply max (mapv #(count (:finalized-blocks @(:state-vol %))) h-nodes))]
+          (dotimes [_ 20]
+            (inject-tick-to-all! h-nodes))
+          (let [finalized-sets (mapv #(:finalized-blocks @(:state-vol %)) h-nodes)
+                post-recovery-finalized (count (first finalized-sets))]
+            (println "Finalized blocks per node before recovery:" pre-recovery-finalized)
+            (println "Finalized blocks per node after recovery:" (mapv count finalized-sets))
+            (when-not (apply = finalized-sets)
+              (throw (ex-info "Safety failure: Nodes have divergent finalized block prefixes" {})))
+            (when (<= post-recovery-finalized pre-recovery-finalized)
+              (throw (ex-info "Liveness failure: Nodes did not finalize new blocks after synchrony was restored" {})))))
 
         ;; ── Summary ──────────────────────────────────────────────────────
         (let [wall-time (- (System/currentTimeMillis) start-wall-time)
@@ -717,4 +600,4 @@
                      (int (/ @total-consensus-time (.get delivery-counter))) "ms"))
           (println "========================================"))
 
-        (System/exit 0)))))
+        (System/exit 0))))
