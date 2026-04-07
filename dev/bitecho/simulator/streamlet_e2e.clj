@@ -464,26 +464,6 @@
     (.incrementAndGet pending)
     (send-event! node {:type :tick :rng (java.util.concurrent.ThreadLocalRandom/current)})))
 
-(defn- start-tick-injector!
-  "Starts a daemon thread that continuously injects :tick events into nodes whose
-   virtual epoch (epoch + pending-ticks) is within a random jitter of the minimum
-   epoch across the network.  Returns the AtomicBoolean control flag and the Thread."
-  [h-nodes max-jitter]
-  (let [running (AtomicBoolean. true)
-        thread (Thread.
-                (fn []
-                  (while (.get running)
-                    (let [me (min-epoch h-nodes)]
-                      (doseq [node h-nodes]
-                        (let [^AtomicInteger pending (:pending-ticks node)
-                              virtual-epoch (+ (node-epoch node) (.get pending))
-                              jitter (+ 1 (rand-int max-jitter))]
-                          (when (< virtual-epoch (+ me jitter))
-                            (inject-tick! node))))))))]
-    (.setDaemon thread true)
-    (.start thread)
-    {:running running :thread thread}))
-
 ;; ---------------------------------------------------------------------------
 ;; Main
 ;; ---------------------------------------------------------------------------
