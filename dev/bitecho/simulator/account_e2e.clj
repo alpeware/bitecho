@@ -493,24 +493,10 @@
                          :seq 2
                          :deps (if last-hash [last-hash] [])})
 
-                    payload-bytes-for-sig (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
-                    signature-bytes (crypto/sign sender-privkey payload-bytes-for-sig)
-                    ;; We must serialize the signature as a vector so `pr-str` works without destroying the byte array as a memory reference
-                    transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature-bytes)))
-
-                    ;; Wait wait wait... `account.clj` does this to calculate the hash to store in the dependencies list.
-                    ;; We have to exactly replicate this hash process. Let's make sure the signature bytes are identical.
-                    ;; `account.clj` does this in `apply-transfer`:
-                    ;; (let [safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (:signature transfer)))
-                    ;;       transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))] ...)
-                    safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))
-                    transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))
+                    transfer (account/create-transfer sender-privkey unsigned-transfer)
+                    transfer-hash (account/transfer-hash transfer)
 
                     broadcast-id (str (java.util.UUID/randomUUID))
-                    ;; Wait wait wait...
-                    ;; We have to pass the `transfer` struct, not `safe-transfer`, because `apply-transfer` expects it
-                    ;; and it does its own hex stringification on the byte array for hashing.
-                    ;; We did it earlier but got derailed with `safe-transfer`.
                     payload-str (pr-str {:id broadcast-id :transfer transfer})
                     payload-bytes (.getBytes ^String payload-str "UTF-8")
                     message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))]
@@ -539,10 +525,10 @@
                       (recur))))
                 ;; Use the same exact hash calculation loop as the source validation so it perfectly matches
                 ;; the test is injecting valid transfer broadcasts that are getting rejected.
-                (let [unsigned-transfer (into (sorted-map) (dissoc safe-transfer :signature))
+                (let [unsigned-transfer (into (sorted-map) (dissoc transfer :signature))
                       payload-bytes-check (.getBytes (pr-str unsigned-transfer) "UTF-8")
                       ;; dummy-verify will always pass, but doing it just in case.
-                      valid-signature? (crypto/verify (:sender safe-transfer) payload-bytes-check (basalt/hex->bytes (:signature safe-transfer)))]
+                      valid-signature? (crypto/verify (:sender transfer) payload-bytes-check (byte-array (map byte (:signature transfer))))]
                   (when-not valid-signature?
                     (println "WAIT - Generated transfer signature was invalid before sending?!")))
                 (recur (inc iteration) transfer-hash))))
