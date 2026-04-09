@@ -6,6 +6,19 @@
 
 (defrecord Transfer [sender receiver amount seq deps signature])
 
+(defn create-transfer
+  "Creates and signs a transfer, ensuring byte-level consistency with validate-transfer."
+  [privkey unsigned-transfer]
+  (let [payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
+        signature-bytes (crypto/sign privkey payload-bytes)]
+    (map->Transfer (assoc unsigned-transfer :signature (vec signature-bytes)))))
+
+(defn transfer-hash
+  "Calculates the SHA-256 hash of a transfer, ensuring consistent signature stringification."
+  [transfer]
+  (let [safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))]
+    (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))))
+
 (defn validate-transfer
   "Validates a transfer against a current account state.
    Returns true if valid, false otherwise.
@@ -49,9 +62,7 @@
         sender-state (get ledger sender)
         amount (:amount transfer)]
     (if (and sender-state (validate-transfer sender-state transfer))
-      (let [;; Ensure signature is converted from whatever byte seq/array it is into hex representation for consistent stringification hashing
-            safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))
-            transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))
+      (let [transfer-hash (transfer-hash transfer)
             new-sender-state (map->AccountState
                               {:balance (- (:balance sender-state) amount)
                                :seq (:seq transfer)
