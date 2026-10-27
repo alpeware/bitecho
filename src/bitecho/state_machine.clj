@@ -397,8 +397,8 @@
             rng (:rng event)
             extracted-peers (basalt/extract-peers (:basalt-view state))
             sieve-message (if (and (:private-key event) (:public-key event))
-                            (sieve/wrap-message payload (:private-key event) (:public-key event))
-                            {:payload payload :sender "local" :signature (byte-array 0)})
+                            (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
+                            {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
             broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
             message-id (:message-id broadcast-result)
             message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
@@ -507,66 +507,79 @@
     {:state state
      :commands (vec commands)}))
 
+(defn- record-accepted-gossip
+  "Constructs updated state and outgoing commands for an accepted gossip message."
+  [state message gossip-result new-message? current-epoch]
+  (let [gossip-commands (if (seq (:forward-targets gossip-result))
+                          [{:type :send-gossip
+                            :targets (:forward-targets gossip-result)
+                            :message (:message gossip-result)}]
+                          [])
+        message-id (:message-id message)
+        sieve-targets (:echo-subscribers state)
+        sieve-echo-command (when (and new-message? (seq sieve-targets))
+                             (attach-control-frame-signature
+                              state
+                              {:type :send-sieve-echo
+                               :targets sieve-targets
+                               :message-id message-id}
+                              :sieve-echo
+                              message-id))
+        commands (if new-message?
+                   (filterv some? (into gossip-commands [sieve-echo-command]))
+                   gossip-commands)
+        new-known-ids (if new-message?
+                        (conj (:contagion-known-ids state) message-id)
+                        (:contagion-known-ids state))
+        new-messages (if new-message?
+                       (assoc (:messages state) message-id message)
+                       (:messages state))
+        new-epochs (if new-message?
+                     (assoc (or (:message-epochs state) {}) message-id current-epoch)
+                     (:message-epochs state))
+        new-epoch-to-messages (if new-message?
+                                (update (or (:epoch-to-messages state) {})
+                                        current-epoch (fnil conj #{}) message-id)
+                                (or (:epoch-to-messages state) {}))]
+    {:state (assoc state
+                   :murmur-cache (:cache gossip-result)
+                   :contagion-known-ids new-known-ids
+                   :messages new-messages
+                   :message-epochs new-epochs
+                   :epoch-to-messages new-epoch-to-messages)
+     :commands commands}))
+
 (defn- handle-receive-gossip
   "Handles an incoming Murmur gossip message.
    Validates Sieve signature and burn-amount before accepting into the cache.
-   If new, initializes Sieve and Contagion sampling."
+   If new, initializes Sieve and Contagion sampling and deducts burn from funded sender."
   [state event]
   (let [cfg (:config state)
         murmur-k (:murmur-k cfg)
         murmur-max-cache-size (:murmur-max-cache-size cfg)
         message (:message event)
         rng (:rng event)
-        burn-amt (or (:burn-amount message) burn/min-signaling-burn)
-        valid-burn? (>= burn-amt burn/min-signaling-burn)
+        burn-amt (:burn-amount message)
+        valid-burn? (and (number? burn-amt) (>= burn-amt burn/min-signaling-burn))
         valid-signature? (when valid-burn? (sieve/validate-message message))]
     (if (and valid-burn? valid-signature?)
       (let [extracted-peers (basalt/extract-peers (:basalt-view state))
             gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
-            gossip-commands (if (seq (:forward-targets gossip-result))
-                              [{:type :send-gossip
-                                :targets (:forward-targets gossip-result)
-                                :message (:message gossip-result)}]
-                              [])
             new-message? (some? (:message gossip-result))
-            message-id (:message-id message)
-
-            ;; If new message, send Sieve Echo to our echo subscribers
-            sieve-targets (:echo-subscribers state)
-            sieve-echo-command (when (and new-message? (seq sieve-targets))
-                                 (attach-control-frame-signature
-                                  state
-                                  {:type :send-sieve-echo
-                                   :targets sieve-targets
-                                   :message-id message-id}
-                                  :sieve-echo
-                                  message-id))
-
-            commands (if new-message?
-                       (filterv some? (into gossip-commands [sieve-echo-command]))
-                       gossip-commands)
-
-            current-epoch (or (:epoch state) 0)
-            new-known-ids (if new-message?
-                            (conj (:contagion-known-ids state) message-id)
-                            (:contagion-known-ids state))
-            new-messages (if new-message?
-                           (assoc (:messages state) message-id message)
-                           (:messages state))
-            new-epochs (if new-message?
-                         (assoc (or (:message-epochs state) {}) message-id current-epoch)
-                         (:message-epochs state))
-            new-epoch-to-messages (if new-message?
-                                    (update (or (:epoch-to-messages state) {})
-                                            current-epoch (fnil conj #{}) message-id)
-                                    (or (:epoch-to-messages state) {}))]
-        {:state (assoc state
-                       :murmur-cache (:cache gossip-result)
-                       :contagion-known-ids new-known-ids
-                       :messages new-messages
-                       :message-epochs new-epochs
-                       :epoch-to-messages new-epoch-to-messages)
-         :commands commands})
+            sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
+            node-pk (when-let [np (:node-pubkey state)] (if (string? np) np (basalt/bytes->hex np)))
+            sender-in-ledger? (and sender (get-in state [:ledger sender]))
+            burn-deduction (when (and new-message? sender-in-ledger? (not= sender node-pk))
+                             (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
+        (if (and new-message? sender-in-ledger? (not= sender node-pk) (nil? burn-deduction))
+          {:state state :commands []}
+          (let [current-epoch (or (:epoch state) 0)
+                state-with-burn (if burn-deduction
+                                  (-> state
+                                      (assoc :ledger (:ledger burn-deduction))
+                                      (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt))
+                                  state)]
+            (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch))))
       {:state state :commands []})))
 
 (defn- transition-to-ready

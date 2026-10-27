@@ -51,5 +51,38 @@
           message (sieve/wrap-message payload (:private keypair) (:public keypair))
           other-keypair (crypto/generate-keypair)
           tampered-message (assoc message :sender (basalt/bytes->hex (:public other-keypair)))]
-      (is (nil? (sieve/validate-message tampered-message))))))
+      (is (nil? (sieve/validate-message tampered-message)))))
+
+  (testing "4-arity wrap-message binds :burn-amount and tampering invalidates signature"
+    (let [payload (.getBytes "hello burn bound" "UTF-8")
+          kp (crypto/generate-keypair)
+          priv (:private kp)
+          pub (:public kp)
+          burn-amt 150
+          msg-4 (sieve/wrap-message payload priv pub burn-amt)]
+      (is (= burn-amt (:burn-amount msg-4)))
+      (is (some? (sieve/validate-message msg-4)))
+      (testing "Tampered burn-amount returns nil"
+        (is (nil? (sieve/validate-message (assoc msg-4 :burn-amount 200)))))
+      (testing "Removed burn-amount returns nil"
+        (is (nil? (sieve/validate-message (dissoc msg-4 :burn-amount)))))
+      (testing "Attaching burn-amount to 3-arity message returns nil"
+        (let [msg-3 (sieve/wrap-message payload priv pub)]
+          (is (some? (sieve/validate-message msg-3)))
+          (is (nil? (sieve/validate-message (assoc msg-3 :burn-amount 150)))))))))
+
+(defspec ^{:doc "Property: 4-arity wrap-message cryptographically binds burn-amount; tampering drops message"}
+  prop-burn-bound-signature-integrity 50
+  (prop/for-all [payload gen-bytes
+                 burn-amt (gen/choose 100 10000)
+                 tamper-burn? gen/boolean]
+                (let [kp (crypto/generate-keypair)
+                      msg (sieve/wrap-message payload (:private kp) (:public kp) burn-amt)]
+                  (if tamper-burn?
+                    (let [tampered (assoc msg :burn-amount (+ burn-amt 1))]
+                      (nil? (sieve/validate-message tampered)))
+                    (let [val-res (sieve/validate-message msg)]
+                      (and (some? val-res)
+                           (= burn-amt (:burn-amount val-res))
+                           (= (seq payload) (seq (:payload val-res)))))))))
 
