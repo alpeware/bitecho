@@ -78,6 +78,8 @@
       :delivered-set #{}
       :total-minted 0
       :minted-epochs #{}
+      :mint-dust 0
+      :epoch-mint-dust {}
       :frozen-epoch-messages {}
       :fault-strikes {}
       :home-sets {}
@@ -103,7 +105,9 @@
      :custody-pubkey custody-pk
      :custody-privkey custody-sk
      :custody-allocations (or (:custody-allocations state) (:custody-allocations cfg))
-     :bootstrap-sunset-epoch (or (:bootstrap-sunset-epoch state) (:bootstrap-sunset-epoch cfg))
+     :bootstrap-sunset-epoch (or (:bootstrap-sunset-epoch state)
+                                 (:bootstrap-sunset-epoch cfg)
+                                 treasury/default-bootstrap-sunset-epoch)
      :treasury-pubkey (or (:treasury-pubkey state) (:treasury-pubkey cfg))
      :treasury-privkey (or (:treasury-privkey state) (:treasury-privkey cfg))}))
 
@@ -157,20 +161,31 @@
         treasury-ctx (build-tick-treasury-ctx state new-epoch cfg)
         res (treasury/process-treasury-epoch treasury-ctx)
         actual-minted (or (:actual-minted res) 0)
+        epoch-mint (or (:epoch-mint res) 0)
+        mint-dust (or (:mint-dust res) 0)
         all-mint-shares (or (:all-mint-shares res) {})
         state-with-custody (if-let [l (:ledger res)]
                              (assoc state :ledger l)
                              state)
         t-priv (or (:treasury-privkey state) (get-in state [:config :treasury-privkey]))
         t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
-    (if (and (seq all-mint-shares) (pos? actual-minted) t-priv t-pub)
+    (cond
+      (and (seq all-mint-shares) (pos? actual-minted) t-priv t-pub)
       (let [sig (treasury/sign-epoch-mint t-priv new-epoch all-mint-shares)]
         (treasury/apply-epoch-mint state-with-custody
                                    {:epoch new-epoch
-                                    :epoch-gate (:epoch-mint res)
+                                    :epoch-gate epoch-mint
+                                    :mint-dust mint-dust
                                     :allocations all-mint-shares
                                     :treasury-pubkey t-pub
                                     :signature sig}))
+
+      (and (pos? epoch-mint) (zero? actual-minted) t-priv t-pub)
+      (-> state-with-custody
+          (update :mint-dust (fnil + 0) mint-dust)
+          (assoc-in [:epoch-mint-dust new-epoch] mint-dust))
+
+      :else
       state-with-custody)))
 
 (defn- block->hash-str
@@ -847,6 +862,42 @@
            :commands []}
           {:state state :commands []})))))
 
+(defn- handle-settle-intent
+  "Handles an internal or external request to settle a payment intent with protocol take.
+   Accepts {:type :settle-intent :payer payer :receiver receiver :amount amount :take-bps optional-bps}.
+   Validates payer, receiver, amount (positive integer), and payer balance >= amount.
+   Deducts amount from payer, credits (- amount take-amt) to receiver,
+   and records take-amt in [:epoch-settlement-takes current-epoch]."
+  [state event]
+  (let [payer (:payer event)
+        receiver (:receiver event)
+        amount (:amount event)
+        payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
+        receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
+        payer-acct (when payer-hex (get-in state [:ledger payer-hex]))
+        payer-bal (or (:balance payer-acct) 0)]
+    (if (and payer-hex
+             receiver-hex
+             (integer? amount)
+             (pos? amount)
+             payer-acct
+             (>= payer-bal amount))
+      (let [take-amt (burn/calculate-settlement-take amount (:take-bps event))
+            net-amt (- amount take-amt)
+            current-epoch (or (:epoch event) (:epoch state) 0)
+            receiver-acct (get-in state [:ledger receiver-hex]
+                                  (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+            new-payer (assoc payer-acct :balance (- payer-bal amount))
+            new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+            new-ledger (assoc (:ledger state)
+                              payer-hex new-payer
+                              receiver-hex new-receiver)]
+        {:state (-> state
+                    (assoc :ledger new-ledger)
+                    (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
+         :commands []})
+      {:state state :commands []})))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
@@ -856,6 +907,7 @@
     :tick (handle-tick state event)
     :broadcast (handle-broadcast state event)
     :signaling-burn (handle-signaling-burn state event)
+    :settle-intent (handle-settle-intent state event)
     :epoch-mint (handle-epoch-mint state event)
     :apply-epoch-mint (handle-epoch-mint state event)
     :submit-transcript (handle-submit-transcript state event)

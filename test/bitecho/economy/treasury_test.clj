@@ -15,7 +15,8 @@
     (is (= 5000 treasury/default-k-bps))
     (is (= 5000 treasury/max-k-bps))
     (is (= 20 treasury/streamlet-share-pct))
-    (is (= 80 treasury/mesh-share-pct))))
+    (is (= 80 treasury/mesh-share-pct))
+    (is (= 26280 treasury/default-bootstrap-sunset-epoch))))
 
 (deftest calculate-trailing-revenue-test
   (testing "Calculates average trailing burn over N epochs"
@@ -94,11 +95,14 @@
       (is (= 2 (count (:commands res))))
       (is (= 12 (:seq res))))
 
-    (testing "Rejects or caps allocations exceeding available custody balance"
+    (testing "Fails closed: skips allocations exceeding available custody balance without partial-filling"
       (let [over-ctx (assoc ctx :custody-balance 400)
             over-res (treasury/process-bootstrap-custody over-ctx)]
-        (is (>= (:remaining-balance over-res) 0))
-        (is (<= (reduce + (map :amount (:commands over-res))) 400))))))
+        (is (= 200 (:remaining-balance over-res)))
+        (is (= 1 (count (:commands over-res))))
+        (is (= 200 (reduce + (map :amount (:commands over-res)))))
+        (is (= 11 (:seq over-res)))
+        (is (= ["hash-0"] (:deps (first (:commands over-res)))))))))
 
 (deftest process-treasury-epoch-test
   (let [treasury-kp (crypto/generate-keypair)
@@ -271,6 +275,19 @@
                                                        :signature sig})]
         (is (= 998 (:total-minted res)))
         (is (= 998 (reduce + 0 (map :balance (vals (:ledger res))))))))
+
+    (testing "apply-epoch-mint persists :mint-dust in state and :epoch-mint-dust per epoch"
+      (let [allocs {"node1" 490 "node2" 490}
+            sig (treasury/sign-epoch-mint t-priv 7 allocs)
+            res (treasury/apply-epoch-mint base-state {:epoch 7
+                                                       :epoch-gate 1000
+                                                       :mint-dust 20
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig})]
+        (is (= 980 (:total-minted res)))
+        (is (= 20 (:mint-dust res)))
+        (is (= 20 (get-in res [:epoch-mint-dust 7])))))
 
     (testing "Double-mint of same epoch is rejected in full"
       (let [allocs {"node1" 100}
@@ -495,6 +512,53 @@
                        (<= (+ minted-so-far actual-minted) treasury/max-conditional-mint-supply)
                        (>= mint-dust 0)
                        (>= actual-minted 0)))))
+
+(defspec ^{:doc "Property: process-bootstrap-custody fails closed: allocations exceeding rem-balance are skipped, never partial-filled"}
+  prop-fail-closed-custody 50
+  (prop/for-all [custody-bal (gen/choose 100 1000)
+                 alloc-amts (gen/vector (gen/choose 50 600) 1 5)]
+                (let [custody-kp (crypto/generate-keypair)
+                      allocs (mapv (fn [i amt] {:receiver (str "rcv-" i) :amount amt})
+                                   (range (count alloc-amts))
+                                   alloc-amts)
+                      ctx {:custody-pubkey (:public custody-kp)
+                           :custody-privkey (:private custody-kp)
+                           :custody-balance custody-bal
+                           :allocations allocs
+                           :start-seq 0
+                           :start-deps []}
+                      res (treasury/process-bootstrap-custody ctx)
+                      executed-amts (mapv :amount (:commands res))]
+                  (and (>= (:remaining-balance res) 0)
+                       (= (:remaining-balance res) (- custody-bal (reduce + 0 executed-amts)))
+                       ;; Every executed command matches its requested allocation exactly (no partials)
+                       (every? (fn [cmd] (some #(= (:amount cmd) (:amount %)) allocs)) (:commands res))))))
+
+(defspec ^{:doc "Property: apply-epoch-mint strictly updates :mint-dust and records in [:epoch-mint-dust epoch]"}
+  prop-apply-mint-dust-invariants 50
+  (prop/for-all [gate (gen/choose 100 2000)
+                 alloc-pct (gen/choose 10 90)
+                 prior-dust (gen/choose 0 500)]
+                (let [t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (:private t-kp)
+                      amt (quot (* gate alloc-pct) 100)
+                      dust (- gate amt)
+                      allocs {"node1" amt}
+                      sig (treasury/sign-epoch-mint t-priv 1 allocs)
+                      base-state {:ledger {}
+                                  :total-minted 0
+                                  :minted-epochs #{}
+                                  :mint-dust prior-dust
+                                  :treasury-pubkey t-pub}
+                      res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                                 :epoch-gate gate
+                                                                 :allocations allocs
+                                                                 :treasury-pubkey t-pub
+                                                                 :signature sig})]
+                  (and (= (+ prior-dust dust) (:mint-dust res))
+                       (= dust (get-in res [:epoch-mint-dust 1]))
+                       (= amt (:total-minted res))))))
 
 
 

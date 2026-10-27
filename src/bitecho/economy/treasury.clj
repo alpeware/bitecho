@@ -21,6 +21,10 @@
   "Percentage of demand-gated mint allocated to attested mesh routing nodes (80%)."
   80)
 
+(def default-bootstrap-sunset-epoch
+  "Default 3-year hard sunset in 1-hour epochs (3 * 365 * 24 = 26,280)."
+  26280)
+
 (def hard-cap
   "Canonical v2.1 hard supply cap: 42,000,000,000 ECHO."
   42000000000)
@@ -125,7 +129,8 @@
 (defn process-bootstrap-custody
   "Draws down the pre-allocated finite Genesis Bootstrap custody account balance
    to satisfy allocation transfers without creating new money or increasing M_t.
-   Accepts a single custody-ctx map."
+   Fails closed: allocations exceeding remaining balance (or non-positive) are skipped
+   without partial-filling. Accepts a single custody-ctx map."
   [custody-ctx]
   (let [custody-pub (:custody-pubkey custody-ctx)
         custody-priv (:custody-privkey custody-ctx)
@@ -144,14 +149,13 @@
          :deps deps
          :commands commands}
         (let [{:keys [receiver amount]} (first rem-allocs)
-              req-amt (max 0 (or amount 0))
-              drawn (min rem-balance req-amt)]
-          (if (pos? drawn)
+              req-amt (or amount 0)]
+          (if (and (integer? req-amt) (pos? req-amt) (<= req-amt rem-balance))
             (let [next-seq (inc seq-num)
                   receiver-hex (if (string? receiver) receiver (basalt/bytes->hex receiver))
                   unsigned-tx {:sender custody-pub
                                :receiver receiver-hex
-                               :amount drawn
+                               :amount req-amt
                                :seq next-seq
                                :deps deps}
                   payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-tx)) "UTF-8")
@@ -160,7 +164,7 @@
                   safe-tx (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex signature))
                   tx-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-tx) "UTF-8")))]
               (recur (rest rem-allocs)
-                     (- rem-balance drawn)
+                     (- rem-balance req-amt)
                      next-seq
                      [tx-hash]
                      (conj commands transfer)))
@@ -199,6 +203,36 @@
    ledger
    commands))
 
+(defn- resolve-epoch-custody
+  "Processes custody drawdown and sunset burns for the epoch."
+  [treasury-ctx custody-pub effective-custody-bal sunset?]
+  (let [ledger (:ledger treasury-ctx)
+        start-seq (or (when (and ledger custody-pub) (get-in ledger [custody-pub :seq]))
+                      (:start-seq treasury-ctx)
+                      0)
+        start-deps (or (when (and ledger custody-pub) (get-in ledger [custody-pub :deps]))
+                       (:start-deps treasury-ctx)
+                       [])
+        custody-ctx (assoc treasury-ctx
+                           :custody-pubkey custody-pub
+                           :custody-balance effective-custody-bal
+                           :allocations (if sunset? [] (:custody-allocations treasury-ctx))
+                           :start-seq start-seq
+                           :start-deps start-deps)
+        custody-res (if (and custody-pub
+                             (:custody-privkey custody-ctx)
+                             (seq (:allocations custody-ctx)))
+                      (process-bootstrap-custody custody-ctx)
+                      {:remaining-balance effective-custody-bal
+                       :seq start-seq
+                       :deps start-deps
+                       :commands []})
+        updated-ledger (when ledger
+                         (let [l (if sunset? (burn-unspent-bootstrap-custody ledger custody-pub) ledger)]
+                           (apply-custody-transfers-to-ledger l (:commands custody-res))))]
+    {:custody-res custody-res
+     :updated-ledger (or updated-ledger ledger)}))
+
 (defn process-treasury-epoch
   "Processes an epoch's demand-gated treasury minting, 20/80 split, and Genesis custody drawdowns.
    Caps mint by remaining conditional mint room under the 23.1B cap.
@@ -232,29 +266,8 @@
         sunset-epoch (:bootstrap-sunset-epoch treasury-ctx)
         sunset? (and (some? sunset-epoch) (some? epoch) (>= epoch sunset-epoch))
         effective-custody-bal (if sunset? 0 custody-bal)
-        start-seq (or (when (and ledger custody-pub) (get-in ledger [custody-pub :seq]))
-                      (:start-seq treasury-ctx)
-                      0)
-        start-deps (or (when (and ledger custody-pub) (get-in ledger [custody-pub :deps]))
-                       (:start-deps treasury-ctx)
-                       [])
-        custody-ctx (assoc treasury-ctx
-                           :custody-pubkey custody-pub
-                           :custody-balance effective-custody-bal
-                           :allocations (if sunset? [] (:custody-allocations treasury-ctx))
-                           :start-seq start-seq
-                           :start-deps start-deps)
-        custody-res (if (and custody-pub
-                             (:custody-privkey custody-ctx)
-                             (seq (:allocations custody-ctx)))
-                      (process-bootstrap-custody custody-ctx)
-                      {:remaining-balance effective-custody-bal
-                       :seq start-seq
-                       :deps start-deps
-                       :commands []})
-        updated-ledger (when ledger
-                         (let [l (if sunset? (burn-unspent-bootstrap-custody ledger custody-pub) ledger)]
-                           (apply-custody-transfers-to-ledger l (:commands custody-res))))]
+        custody-state (resolve-epoch-custody treasury-ctx custody-pub effective-custody-bal sunset?)
+        custody-res (:custody-res custody-state)]
     {:r-trailing r-trailing
      :epoch-mint m-t
      :actual-minted actual-minted
@@ -269,7 +282,7 @@
      :custody-commands (:commands custody-res)
      :commands (:commands custody-res)
      :remaining-custody-balance (:remaining-balance custody-res)
-     :ledger (or updated-ledger ledger)}))
+     :ledger (:updated-ledger custody-state)}))
 
 (def genesis-custody-shares
   "Standard 45% Genesis custody allocations (18.9B ECHO total)."
@@ -320,6 +333,21 @@
     (seqable? x) (empty? x)
     :else false))
 
+(defn- verify-mint-signature
+  "Cryptographically verifies the treasury signature on epoch mint allocations."
+  [expected-pub sig epoch allocations]
+  (try
+    (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
+          sig-bytes (cond
+                      (string? sig) (basalt/hex->bytes sig)
+                      (bytes? sig) sig
+                      :else (byte-array (map byte sig)))
+          sorted-allocs (into (sorted-map) allocations)
+          payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
+      (boolean (crypto/verify pub-bytes payload-bytes sig-bytes)))
+    (catch Exception _
+      false)))
+
 (defn apply-epoch-mint
   "Applies an authorized, capped epoch demand-gated mint to state.
    Requires cryptographic verification against the authoritative treasury public key.
@@ -360,17 +388,7 @@
       state
 
       ;; 5. Cryptographic signature verification against [epoch (sorted-map allocs)]
-      (try
-        (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
-              sig-bytes (cond
-                          (string? sig) (basalt/hex->bytes sig)
-                          (bytes? sig) sig
-                          :else (byte-array (map byte sig)))
-              sorted-allocs (into (sorted-map) allocations)
-              payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
-          (not (crypto/verify pub-bytes payload-bytes sig-bytes)))
-        (catch Exception _
-          true))
+      (not (verify-mint-signature expected-pub sig epoch allocations))
       state
 
       :else
@@ -388,10 +406,14 @@
 
           ;; Valid: credit allocations to ledger
           :else
-          (let [new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
+          (let [dust (or (:mint-dust mint-ctx)
+                         (if epoch-gate (max 0 (- epoch-gate actual-minted)) 0))
+                new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
             (-> state
                 (assoc :ledger new-ledger)
                 (assoc :total-minted (+ total-minted actual-minted))
-                (update :minted-epochs (fnil conj #{}) epoch))))))))
+                (update :minted-epochs (fnil conj #{}) epoch)
+                (update :mint-dust (fnil + 0) dust)
+                (assoc-in [:epoch-mint-dust epoch] dust))))))))
 
 

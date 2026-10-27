@@ -45,9 +45,10 @@
   (reduce + 0 (map #(or (:balance %) 0) (vals ledger))))
 
 (defn- compute-total-burned
-  "Sums all burned tokens recorded across all epochs in state."
+  "Sums all burned tokens recorded across all epochs in state (both signaling burns and settlement takes)."
   [state]
-  (reduce + 0 (vals (or (:epoch-burns state) {}))))
+  (+ (reduce + 0 (vals (or (:epoch-burns state) {})))
+     (reduce + 0 (vals (or (:epoch-settlement-takes state) {})))))
 
 (defn- assert-epoch-conservation
   "Asserts exact Tokenomics v2 conservation invariants at an epoch boundary."
@@ -66,7 +67,11 @@
     (is (<= total-minted treasury/max-conditional-mint-supply)
         "Total minted must never exceed max-conditional-mint-supply (23.1B)")
     (is (<= (+ treasury/genesis-custody-supply total-minted) treasury/hard-cap)
-        "Cumulative supply must never exceed the 42B hard cap")))
+        "Cumulative supply must never exceed the 42B hard cap")
+    (is (number? (or (:mint-dust state) 0))
+        ":mint-dust must be tracked in state")
+    (is (map? (or (:epoch-mint-dust state) {}))
+        ":epoch-mint-dust must be tracked in state")))
 
 (defn- build-scenario-state
   "Initializes the pure root state machine with default Genesis custody and initial balances."
@@ -228,6 +233,7 @@
 (defspec ^{:doc "Property: Exact Tokenomics v2 ledger conservation invariant holds across randomized multi-epoch schedules"}
   prop-tokenomics-v2-multi-epoch-supply-conservation 30
   (prop/for-all [burn-amount (gen/choose 100 1000)
+                 settle-amt (gen/choose 100 1000)
                  voucher-count (gen/choose 1 5)
                  custody-amt (gen/choose 1000 50000)]
                 (let [actors (make-scenario-actors)
@@ -240,15 +246,20 @@
                       home-hex (:pubkey-hex (:home actors))
                       ;; 1. Burn
                       s-burn (:state (sm/handle-event init-state {:type :signaling-burn :sender caller-hex :burn burn-amount}))
-                      ;; 2. Vouchers
-                      s-reg (:state (sm/handle-event s-burn {:type :register-home-set
-                                                             :callee callee-hex
-                                                             :epoch 0
-                                                             :candidates [{:node-id home-hex :price 10}
-                                                                          {:node-id "extra-h2" :price 10}
-                                                                          {:node-id "extra-h3" :price 10}]
-                                                             :price 10
-                                                             :price-max 10}))
+                      ;; 2. Settle Intent
+                      s-settle (:state (sm/handle-event s-burn {:type :settle-intent
+                                                                :payer caller-hex
+                                                                :receiver callee-hex
+                                                                :amount settle-amt}))
+                      ;; 3. Vouchers
+                      s-reg (:state (sm/handle-event s-settle {:type :register-home-set
+                                                               :callee callee-hex
+                                                               :epoch 0
+                                                               :candidates [{:node-id home-hex :price 10}
+                                                                            {:node-id "extra-h2" :price 10}
+                                                                            {:node-id "extra-h3" :price 10}]
+                                                               :price 10
+                                                               :price-max 10}))
                       s-vouchers (reduce (fn [st seq-n]
                                            (:state (sm/handle-event st {:type :receive-offer-header
                                                                         :caller caller-hex
@@ -259,7 +270,7 @@
                                                                         :seq seq-n})))
                                          s-reg
                                          (range 1 (inc voucher-count)))
-                      ;; 3. Epoch Tick
+                      ;; 4. Epoch Tick
                       block (streamlet/->Block 1 "genesis" [] (:pubkey-hex (:validator actors)))
                       s-tick (:state (sm/handle-event s-vouchers {:type :tick :latest-finalized-block block :rng (java.util.Random. 99)}))
                       ledger (:ledger s-tick)

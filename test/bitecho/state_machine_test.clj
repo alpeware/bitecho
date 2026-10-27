@@ -624,6 +624,14 @@
     (let [state (sm/init-state [] "my-node")]
       (is (= {} (:epoch-settlement-takes state)))))
 
+  (testing "init-state initializes :mint-dust to 0 and :epoch-mint-dust to {}"
+    (let [state (sm/init-state [] "my-node")]
+      (is (= 0 (:mint-dust state)))
+      (is (= {} (:epoch-mint-dust state)))))
+
+  (testing "default-config has :bootstrap-sunset-epoch 26280"
+    (is (= 26280 (:bootstrap-sunset-epoch config/default-config))))
+
   (testing "handle-tick processes epoch boundary: calculates trailing revenue with zero-padding, mints 20/80 split"
     (let [val-pub "validator-node-1"
           mesh-pub "mesh-routing-node-1"
@@ -732,6 +740,156 @@
                        (<= (:total-minted new-state) treasury/max-conditional-mint-supply)
                        (= (- 20000 custody-amt) (:balance (get-in new-state [:ledger custody-pub])))
                        (= custody-amt (:balance (get-in new-state [:ledger "grantee-y"])))))))
+
+(deftest test-state-machine-settle-intent
+  (let [payer "payer-node"
+        receiver "receiver-node"
+        cfg (assoc config/default-config
+                   :genesis-ledger {payer (account/map->AccountState {:balance 10000 :seq 0 :deps []})})
+        state (assoc (sm/init-state [] "my-node" cfg) :epoch 0)]
+    (testing "Valid settle-intent deducts amount from payer, credits net to receiver, and records take in epoch-settlement-takes"
+      ;; Amount 1000 with default 50 bps take: take = 5, net = 995
+      (let [res (sm/handle-event state {:type :settle-intent
+                                        :payer payer
+                                        :receiver receiver
+                                        :amount 1000})
+            new-state (:state res)]
+        (is (= 9000 (:balance (get-in new-state [:ledger payer]))))
+        (is (= 995 (:balance (get-in new-state [:ledger receiver]))))
+        (is (= 5 (get-in new-state [:epoch-settlement-takes 0])))
+        (is (empty? (:commands res)))
+        ;; Net ledger balance decreased by exactly the burned protocol take (5)
+        (is (= (- 10000 5)
+               (+ (:balance (get-in new-state [:ledger payer]))
+                  (:balance (get-in new-state [:ledger receiver])))))))
+
+    (testing "Valid settle-intent with custom take-bps"
+      ;; Amount 1000 with 100 bps take (1%): take = 10, net = 990
+      (let [res (sm/handle-event state {:type :settle-intent
+                                        :payer payer
+                                        :receiver receiver
+                                        :amount 1000
+                                        :take-bps 100})
+            new-state (:state res)]
+        (is (= 9000 (:balance (get-in new-state [:ledger payer]))))
+        (is (= 990 (:balance (get-in new-state [:ledger receiver]))))
+        (is (= 10 (get-in new-state [:epoch-settlement-takes 0])))))
+
+    (testing "Fails closed on unknown payer"
+      (let [res (sm/handle-event state {:type :settle-intent
+                                        :payer "unknown-node"
+                                        :receiver receiver
+                                        :amount 1000})]
+        (is (= state (:state res)))
+        (is (empty? (:commands res)))))
+
+    (testing "Fails closed on insufficient payer balance"
+      (let [res (sm/handle-event state {:type :settle-intent
+                                        :payer payer
+                                        :receiver receiver
+                                        :amount 20000})]
+        (is (= state (:state res)))
+        (is (empty? (:commands res)))))
+
+    (testing "Fails closed on non-positive or non-integer amount"
+      (let [res-zero (sm/handle-event state {:type :settle-intent :payer payer :receiver receiver :amount 0})
+            res-neg (sm/handle-event state {:type :settle-intent :payer payer :receiver receiver :amount -500})
+            res-float (sm/handle-event state {:type :settle-intent :payer payer :receiver receiver :amount 100.5})]
+        (is (= state (:state res-zero)))
+        (is (= state (:state res-neg)))
+        (is (= state (:state res-float)))))
+
+    (testing "Fails closed on missing receiver"
+      (let [res (sm/handle-event state {:type :settle-intent :payer payer :amount 1000})]
+        (is (= state (:state res)))))))
+
+(deftest test-settle-intent-drives-demand-gated-mint-on-tick
+  (testing "Settlement takes in epoch 0 feed trailing revenue on epoch 1 tick and drive demand-gated mint"
+    (let [val-pub "validator-node-1"
+          mesh-pub "mesh-routing-node-1"
+          payer "payer-node"
+          receiver "receiver-node"
+          t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          cfg (assoc config/default-config
+                     :treasury-pubkey t-pub
+                     :treasury-privkey t-priv
+                     :treasury-trailing-epochs 1
+                     :validators [val-pub]
+                     :mesh-nodes {mesh-pub 1.0}
+                     :genesis-ledger {payer (account/map->AccountState {:balance 100000 :seq 0 :deps []})})
+          state (assoc (sm/init-state [] "my-node" cfg) :epoch 0)
+          ;; Settle intent for 40,000 with 50 bps take: take = 200, net = 39,800
+          settle-res (sm/handle-event state {:type :settle-intent
+                                             :payer payer
+                                             :receiver receiver
+                                             :amount 40000})
+          s-settled (:state settle-res)
+          ;; Advance to epoch 1 via :tick
+          tick-res (sm/handle-event s-settled {:type :tick :rng (java.util.Random. 42)})
+          s-tick (:state tick-res)]
+      (is (= 200 (get-in s-settled [:epoch-settlement-takes 0])))
+      (is (= 1 (:epoch s-tick)))
+      ;; Trailing revenue for n=1 is 200 (from epoch 0 settlement take)
+      ;; Demand-gated mint M_t = 200 * 50% = 100
+      ;; Split: 20% Streamlet (20), 80% Mesh (80)
+      (is (= 100 (:total-minted s-tick)))
+      (is (= 20 (:balance (get-in s-tick [:ledger val-pub]))))
+      (is (= 80 (:balance (get-in s-tick [:ledger mesh-pub])))))))
+
+(deftest test-tick-persists-mint-dust
+  (testing "handle-tick persists :mint-dust in state and :epoch-mint-dust across epochs"
+    (let [val-pub1 "v1"
+          val-pub2 "v2"
+          val-pub3 "v3"
+          mesh-pub "m1"
+          t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          cfg (assoc config/default-config
+                     :treasury-pubkey t-pub
+                     :treasury-privkey t-priv
+                     :treasury-trailing-epochs 1
+                     :validators [val-pub1 val-pub2 val-pub3]
+                     :mesh-nodes {mesh-pub 1.0})
+          ;; Trailing burn 1000 -> M_t = 500. Split: Streamlet 100, Mesh 400.
+          ;; 3 validators share 100 -> 33 each = 99. 1 dust!
+          state (assoc (sm/init-state [] "my-node" cfg)
+                       :epoch 0
+                       :epoch-burns {0 1000})
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)]
+      (is (= 1 (:epoch new-state)))
+      (is (= 499 (:total-minted new-state)))
+      (is (= 1 (:mint-dust new-state)))
+      (is (= 1 (get-in new-state [:epoch-mint-dust 1]))))))
+
+(defspec ^{:doc "Property: Settle intent strictly conserves ledger supply minus protocol take and records protocol take"}
+  prop-settle-intent-conservation 50
+  (prop/for-all [initial-payer-bal (gen/choose 1000 50000)
+                 settle-amt (gen/choose 100 2000)
+                 take-bps (gen/choose 0 200)]
+                (let [payer "payer-node"
+                      receiver "receiver-node"
+                      cfg (assoc config/default-config
+                                 :genesis-ledger {payer (account/map->AccountState {:balance initial-payer-bal :seq 0 :deps []})})
+                      state (assoc (sm/init-state [] "local-node" cfg) :epoch 2)
+                      res (sm/handle-event state {:type :settle-intent
+                                                  :payer payer
+                                                  :receiver receiver
+                                                  :amount settle-amt
+                                                  :take-bps take-bps})
+                      new-state (:state res)
+                      new-ledger (:ledger new-state)
+                      take-amt (burn/calculate-settlement-take settle-amt take-bps)
+                      net-amt (- settle-amt take-amt)]
+                  (and (= (- initial-payer-bal settle-amt) (:balance (get new-ledger payer)))
+                       (= net-amt (:balance (get new-ledger receiver)))
+                       (= take-amt (get-in new-state [:epoch-settlement-takes 2]))
+                       (= (- initial-payer-bal take-amt)
+                          (+ (:balance (get new-ledger payer))
+                             (:balance (get new-ledger receiver))))))))
 
 (deftest test-state-machine-frozen-messages-and-strikes
   (testing "init-state initializes :frozen-epoch-messages to {} and :fault-strikes to {}"
