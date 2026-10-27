@@ -10,6 +10,7 @@
             [bitecho.economy.burn-test]
             [bitecho.economy.treasury-test]
             [bitecho.murmur.core-test]
+            [bitecho.rendezvous.core-test]
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]
             [bitecho.sieve.core-test]

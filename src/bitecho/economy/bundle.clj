@@ -33,3 +33,17 @@
        :state (assoc state :buffer [] :bundle-start-time nil)}
       {:bundle nil
        :state state})))
+
+(defn compact-vouchers
+  "Compacts vouchers for current-epoch, discarding non-current epochs and retaining
+   only the highest :seq DeliveryAck per [callee home-node epoch] channel tuple."
+  [vouchers current-epoch]
+  (if (empty? vouchers)
+    []
+    (->> vouchers
+         (filter #(= current-epoch (:epoch %)))
+         (group-by (juxt :callee :home-node :epoch))
+         vals
+         (mapv #(apply max-key :seq %))
+         (sort-by (juxt :callee :home-node :seq))
+         vec)))

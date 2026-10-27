@@ -62,3 +62,49 @@
                   (if (empty? txs)
                     (nil? (:bundle result))
                     (= txs (:bundle result))))))
+
+(deftest compact-vouchers-test
+  (testing "Rejects vouchers from prior epochs and retains only the highest-seq voucher per channel in current epoch"
+    (let [current-epoch 5
+          vouchers [{:callee "callee-b" :home-node "home-1" :epoch 5 :seq 1 :cumulative-debit 10}
+                    {:callee "callee-b" :home-node "home-1" :epoch 5 :seq 3 :cumulative-debit 30}
+                    {:callee "callee-b" :home-node "home-1" :epoch 5 :seq 2 :cumulative-debit 20}
+                    {:callee "callee-b" :home-node "home-1" :epoch 4 :seq 9 :cumulative-debit 90}
+                    {:callee "callee-b" :home-node "home-2" :epoch 5 :seq 1 :cumulative-debit 15}
+                    {:callee "callee-c" :home-node "home-1" :epoch 3 :seq 5 :cumulative-debit 50}]
+          compacted (bundle/compact-vouchers vouchers current-epoch)]
+      (is (= 2 (count compacted)))
+      (is (every? #(= current-epoch (:epoch %)) compacted))
+      (let [h1-voucher (first (filter #(= "home-1" (:home-node %)) compacted))
+            h2-voucher (first (filter #(= "home-2" (:home-node %)) compacted))]
+        (is (= 3 (:seq h1-voucher)))
+        (is (= 30 (:cumulative-debit h1-voucher)))
+        (is (= 1 (:seq h2-voucher)))
+        (is (= 15 (:cumulative-debit h2-voucher))))))
+
+  (testing "Safe boundary handling"
+    (is (= [] (bundle/compact-vouchers [] 5)))
+    (is (= [] (bundle/compact-vouchers nil 5)))
+    (is (= [] (bundle/compact-vouchers [{:callee "b" :home-node "h" :epoch 4 :seq 1}] 5)))))
+
+(defspec ^{:doc "Property: compact-vouchers retains exactly the maximum-seq voucher per channel in current epoch"}
+  prop-compact-vouchers-soundness 50
+  (prop/for-all [current-epoch (gen/choose 1 10)
+                 callees (gen/vector (gen/elements ["callee-1" "callee-2"]) 10)
+                 home-nodes (gen/vector (gen/elements ["home-1" "home-2"]) 10)
+                 epochs (gen/vector (gen/choose 1 12) 10)
+                 seqs (gen/vector (gen/choose 1 50) 10)]
+                (let [vouchers (mapv (fn [c h ep s]
+                                       {:callee c :home-node h :epoch ep :seq s :cumulative-debit (* s 10)})
+                                     callees home-nodes epochs seqs)
+                      compacted (bundle/compact-vouchers vouchers current-epoch)
+                      valid-vouchers (filter #(= current-epoch (:epoch %)) vouchers)
+                      expected-keys (set (map (fn [v] [(:callee v) (:home-node v) (:epoch v)]) valid-vouchers))]
+                  (and (every? #(= current-epoch (:epoch %)) compacted)
+                       (= (count expected-keys) (count compacted))
+                       (every? (fn [v]
+                                 (let [k [(:callee v) (:home-node v) (:epoch v)]
+                                       matching (filter #(= k [(:callee %) (:home-node %) (:epoch %)]) valid-vouchers)
+                                       max-seq (apply max (map :seq matching))]
+                                   (= (:seq v) max-seq)))
+                               compacted)))))
