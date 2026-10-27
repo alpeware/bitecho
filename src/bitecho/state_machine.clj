@@ -5,6 +5,7 @@
             [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
             [bitecho.economy.account :as account]
+            [bitecho.economy.attestation :as attestation]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.treasury :as treasury]
             [bitecho.murmur.core :as murmur]
@@ -61,6 +62,8 @@
       :delivered-set #{}
       :total-minted 0
       :minted-epochs #{}
+      :frozen-epoch-messages {}
+      :fault-strikes {}
       :ledger (or genesis-ledger {})})))
 
 (defn- build-tick-treasury-ctx
@@ -198,6 +201,11 @@
         commands (into (filterv some? (concat [push-command summary-command] subscribe-commands))
                        echo-ae-commands)
 
+        ;; Snapshot closing epoch's message set before TTL pruning touches anything
+        closing-epoch (or (:epoch state) 0)
+        closing-messages (get (:epoch-to-messages state) closing-epoch #{})
+        frozen-epoch-messages (assoc (or (:frozen-epoch-messages state) {}) closing-epoch closing-messages)
+
         ;; Epoch-indexed GC: collect expired epoch keys, union their message IDs
         cutoff-epoch (- new-epoch gossip-ttl-epochs)
         epoch-to-messages (or (:epoch-to-messages state) {})
@@ -233,6 +241,8 @@
                           :messages pruned-messages
                           :message-epochs pruned-epochs
                           :epoch-to-messages pruned-epoch-to-messages
+                          :frozen-epoch-messages frozen-epoch-messages
+                          :fault-strikes (or (:fault-strikes state) {})
                           :global-echo-sample updated-echo-sample
                           :global-ready-sample updated-ready-sample
                           :global-delivery-sample updated-delivery-sample
@@ -628,6 +638,27 @@
   (let [new-state (treasury/apply-epoch-mint state event)]
     {:state new-state :commands []}))
 
+(defn- handle-submit-transcript
+  "Handles bilateral transcript submission and dispute resolution.
+   Evaluates the transcript against the frozen epoch message set,
+   and records faults in :fault-strikes if a counterparty has faulted."
+  [state event]
+  (let [transcript (or (:transcript event) (:payload event) event)
+        epoch (:epoch transcript)
+        frozen-msgs (get-in state [:frozen-epoch-messages epoch] #{})
+        frozen-log-roles (or (:frozen-log-roles event)
+                             (attestation/reconcile-message-roles
+                              frozen-msgs
+                              frozen-msgs
+                              (or (:message-roles transcript) (:roles transcript) [])))
+        dispute-res (attestation/evaluate-transcript-dispute transcript frozen-log-roles)
+        strike-peer (:strike dispute-res)
+        new-strikes (if strike-peer
+                      (update (or (:fault-strikes state) {}) strike-peer (fnil inc 0))
+                      (or (:fault-strikes state) {}))]
+    {:state (assoc state :fault-strikes new-strikes)
+     :commands []}))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
@@ -639,6 +670,7 @@
     :signaling-burn (handle-signaling-burn state event)
     :epoch-mint (handle-epoch-mint state event)
     :apply-epoch-mint (handle-epoch-mint state event)
+    :submit-transcript (handle-submit-transcript state event)
     :receive-push-view (handle-receive-push-view state event)
     :receive-summary (handle-receive-summary state event)
     :receive-subscribe (handle-receive-subscribe state event)

@@ -1,15 +1,16 @@
 (ns bitecho.economy.attestation
   "Bilateral epoch transcript attestations and deterministic node weight calculation."
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]))
+            [bitecho.crypto :as crypto]
+            [clojure.set :as set]))
 
 (def max-stake-multiplier
   "Maximum multiplier allowed for stake weighting (4.0x)."
   4.0)
 
 (def default-min-stake
-  "Default minimum baseline stake (S_min) for weight calculation."
-  1000)
+  "Default minimum baseline stake (S_min) for weight calculation (250,000 ECHO testnet floor)."
+  250000)
 
 (defrecord EpochTranscript [epoch peer-a peer-b message-roles digest sig-a sig-b])
 
@@ -33,24 +34,41 @@
                   (.getBytes ^String x "UTF-8"))
     :else (byte-array 0)))
 
-(defn- canonicalize-message-roles
-  "Sorts message-role entries deterministically."
+(defn canonicalize-message-roles
+  "Sorts message-role entries deterministically into a vector of [message-id role]."
   [message-roles]
-  (vec (sort-by pr-str (or message-roles []))))
+  (cond
+    (nil? message-roles) []
+    (map? message-roles)
+    (vec (sort-by (comp str first) (mapv (fn [[k v]] [(str k) v]) message-roles)))
+    (coll? message-roles)
+    (vec (sort-by (comp str first)
+                  (mapv (fn [item]
+                          (cond
+                            (map? item) [(str (or (:message-id item) (:id item))) (:role item)]
+                            (sequential? item) [(str (first item)) (second item)]
+                            :else [(str item) :seen]))
+                        message-roles)))
+    :else []))
+
+(def canonical-digest-format
+  "Canonical format for exchange digest byte concatenation per v2.1 §4."
+  "SHA-256(epoch_e || peer_a || peer_b || pr-str(sorted_vec_of_[message_id, role]))")
 
 (defn compute-exchange-digest
-  "Computes a deterministic SHA-256 hex digest over a bilateral exchange transcript:
-   (epoch, peer-a, peer-b, sorted-message-roles).
-   Bilateral symmetry is enforced by sorting peer public keys canonically."
+  "Computes a deterministic SHA-256 hex digest over a bilateral exchange transcript
+   using raw UTF-8 byte concatenation per v2.1 §4:
+     SHA-256(epoch_e || peer_a || peer_b || pr-str(sorted_vec_of_[message_id, role]))
+   Bilateral symmetry is enforced by sorting peer public keys lexicographically."
   [epoch peer-a peer-b message-roles]
   (let [[p1 p2] (sort [(to-hex peer-a) (to-hex peer-b)])
-        canonical-map (into (sorted-map)
-                            {:epoch (int epoch)
-                             :peer-a p1
-                             :peer-b p2
-                             :roles (canonicalize-message-roles message-roles)})
-        payload-bytes (.getBytes (pr-str canonical-map) "UTF-8")]
-    (basalt/bytes->hex (crypto/sha256 payload-bytes))))
+        roles-vec (canonicalize-message-roles message-roles)
+        baos (java.io.ByteArrayOutputStream.)]
+    (.write baos (.getBytes (str (int epoch)) "UTF-8"))
+    (.write baos (.getBytes ^String p1 "UTF-8"))
+    (.write baos (.getBytes ^String p2 "UTF-8"))
+    (.write baos (.getBytes (pr-str roles-vec) "UTF-8"))
+    (basalt/bytes->hex (crypto/sha256 (.toByteArray baos)))))
 
 (defn create-transcript
   "Creates an EpochTranscript.
@@ -142,14 +160,60 @@
 (defn calculate-node-weight
   "Calculates node weight using the formula:
      w_i = participation_i * min(4.0, stake_i / S_min)
+   Enforces < S_min cliff: returns 0.0 when stake < S_min.
    Handles boundary conditions (s-min <= 0, zero or negative participation/stake) safely."
   ([participation stake]
    (calculate-node-weight participation stake default-min-stake))
   ([participation stake s-min]
    (if (or (nil? s-min) (not (number? s-min)) (<= s-min 0)
            (nil? participation) (not (number? participation)) (<= participation 0)
-           (nil? stake) (not (number? stake)) (<= stake 0))
+           (nil? stake) (not (number? stake)) (<= stake 0)
+           (< (double stake) (double s-min)))
      0.0
      (let [stake-ratio (/ (double stake) (double s-min))
            multiplier (min max-stake-multiplier (max 0.0 stake-ratio))]
        (* (double participation) multiplier)))))
+
+(defn reconcile-message-roles
+  "Filters `roles` to only those whose message-id is present in the intersection
+   of `frozen-ids-a` and `frozen-ids-b`. Returns a deterministically sorted vector of [message-id role]."
+  [frozen-ids-a frozen-ids-b roles]
+  (let [common-ids (set/intersection (set (or frozen-ids-a #{}))
+                                     (set (or frozen-ids-b #{})))
+        canonical (canonicalize-message-roles roles)]
+    (filterv (fn [[mid _]] (contains? common-ids mid)) canonical)))
+
+(defn verify-transcript-against-log
+  "Verifies that a transcript is validly signed and that its digest matches
+   the recomputed exchange digest derived from the frozen log message roles."
+  [transcript frozen-log-roles]
+  (try
+    (if (verify-transcript transcript)
+      (let [expected-digest (compute-exchange-digest (:epoch transcript)
+                                                     (:peer-a transcript)
+                                                     (:peer-b transcript)
+                                                     frozen-log-roles)]
+        (= expected-digest (:digest transcript)))
+      false)
+    (catch Exception _
+      false)))
+
+(defn evaluate-transcript-dispute
+  "Evaluates a bilateral transcript against the local frozen log snapshot.
+   - If transcript does not verify against frozen log -> {:status :rejected :credit #{} :strike nil}
+   - If mutually-signed -> {:status :settled :credit #{peer-a peer-b} :strike nil}
+   - If half-signed -> {:status :half-signed-fault :credit #{peer-a} :strike peer-b}"
+  [transcript frozen-log-roles]
+  (if (not (verify-transcript-against-log transcript frozen-log-roles))
+    {:status :rejected :credit #{} :strike nil}
+    (let [p-a (:peer-a transcript)
+          p-b (:peer-b transcript)]
+      (cond
+        (mutually-signed? transcript)
+        {:status :settled :credit #{p-a p-b} :strike nil}
+
+        (half-signed? transcript)
+        {:status :half-signed-fault :credit #{p-a} :strike p-b}
+
+        :else
+        {:status :rejected :credit #{} :strike nil}))))

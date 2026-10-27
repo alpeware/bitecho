@@ -23,6 +23,7 @@
    ;; Treasury / Tokenomics parameters
    :epoch-length-ms       3600000
    :treasury-trailing-epochs 168
+   :min-node-stake        250000
    ;; Murmur — epidemic gossip fanout (G in the paper)
    :murmur-k              5
    ;; Maximum number of seen message IDs kept in the Murmur cache

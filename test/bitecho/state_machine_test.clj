@@ -4,6 +4,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.economy.attestation :as attestation]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.treasury :as treasury]
             [bitecho.state-machine :as sm]
@@ -502,5 +503,77 @@
                        (<= (:total-minted new-state) treasury/max-conditional-mint-supply)
                        (= (- 20000 custody-amt) (:balance (get-in new-state [:ledger custody-pub])))
                        (= custody-amt (:balance (get-in new-state [:ledger "grantee-y"])))))))
+
+(deftest test-state-machine-frozen-messages-and-strikes
+  (testing "init-state initializes :frozen-epoch-messages to {} and :fault-strikes to {}"
+    (let [state (sm/init-state [] "my-node")]
+      (is (= {} (:frozen-epoch-messages state)))
+      (is (= {} (:fault-strikes state)))))
+
+  (testing "handle-tick snapshots closing epoch messages before TTL pruning, immune to later pruning"
+    (let [cfg (assoc config/default-config :gossip-ttl-epochs 2)
+          state (assoc (sm/init-state [] "my-node" cfg)
+                       :epoch 0
+                       :epoch-to-messages {0 #{"msg-a" "msg-b"}})
+          res-ep1 (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          state-ep1 (:state res-ep1)]
+      (is (= 1 (:epoch state-ep1)))
+      (is (= #{"msg-a" "msg-b"} (get-in state-ep1 [:frozen-epoch-messages 0])))
+
+      ;; Advance multiple epochs past TTL (cutoff-epoch = new-epoch - 2)
+      (let [state-ep5 (loop [s state-ep1
+                             step 1]
+                        (if (>= step 5)
+                          s
+                          (recur (:state (sm/handle-event s {:type :tick :rng (java.util.Random. 42)}))
+                                 (inc step))))]
+        (is (= 5 (:epoch state-ep5)))
+        (is (nil? (get-in state-ep5 [:epoch-to-messages 0])) "Epoch 0 was pruned from active message store")
+        (is (= #{"msg-a" "msg-b"} (get-in state-ep5 [:frozen-epoch-messages 0]))
+            "Frozen snapshot is permanently retained and immune to TTL pruning!"))))
+
+  (testing "handle-event :submit-transcript protects honest peers from fabricated unilateral strikes"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          honest-roles [["m1" :echo]]
+          valid-half (attestation/create-transcript 0 pub-a pub-b honest-roles (:private kp-a))
+          fabricated-half (attestation/create-transcript 0 pub-a pub-b [["invented-fake" :seen]] (:private kp-a))
+          state (assoc (sm/init-state [] "my-node")
+                       :frozen-epoch-messages {0 #{"m1"}})]
+      (testing "Fabricated unilateral report is rejected and does NOT strike peer B"
+        (let [res (sm/handle-event state {:type :submit-transcript :transcript fabricated-half})
+              new-state (:state res)]
+          (is (= {} (:fault-strikes new-state)) "Honest peer B was NOT struck")))
+
+      (testing "Log-verified half-signed transcript credits peer A and records a strike on peer B"
+        (let [res (sm/handle-event state {:type :submit-transcript
+                                          :transcript valid-half
+                                          :frozen-log-roles honest-roles})
+              new-state (:state res)]
+          (is (= 1 (get-in new-state [:fault-strikes pub-b])) "Peer B was struck for withholding signature"))))))
+
+(defspec ^{:doc "Property: Frozen epoch message snapshots remain immutable across arbitrary subsequent ticks"}
+  prop-state-machine-frozen-messages-ttl-immunity 50
+  (prop/for-all [extra-ticks (gen/choose 3 15)]
+                (let [cfg (assoc config/default-config :gossip-ttl-epochs 2)
+                      init-msgs #{"snapshot-m1" "snapshot-m2"}
+                      state (assoc (sm/init-state [] "my-node" cfg)
+                                   :epoch 0
+                                   :epoch-to-messages {0 init-msgs})
+                      ;; First tick closes epoch 0
+                      res-1 (sm/handle-event state {:type :tick :rng (java.util.Random. 11)})
+                      state-after-ep0 (:state res-1)
+                      ;; Advance extra ticks
+                      final-state (loop [s state-after-ep0
+                                         t 0]
+                                    (if (>= t extra-ticks)
+                                      s
+                                      (recur (:state (sm/handle-event s {:type :tick :rng (java.util.Random. 22)}))
+                                             (inc t))))]
+                  (and (= init-msgs (get-in state-after-ep0 [:frozen-epoch-messages 0]))
+                       (= init-msgs (get-in final-state [:frozen-epoch-messages 0]))))))
+
 
 

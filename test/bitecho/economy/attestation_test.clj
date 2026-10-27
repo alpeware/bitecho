@@ -75,13 +75,23 @@
         (is (false? (attestation/half-signed? cosigned)))))))
 
 (deftest calculate-node-weight-test
-  (testing "Calculates node weight using w_i = participation_i * min(4.0, stake_i / S_min)"
-    (is (= 50.0 (attestation/calculate-node-weight 100 500 1000)))
+  (testing "Calculates node weight using w_i = participation_i * min(4.0, stake_i / S_min) with < S_min cliff"
+    (is (= 0.0 (attestation/calculate-node-weight 100 500 1000))
+        "Cliff: stake < S_min returns 0.0")
     (is (= 100.0 (attestation/calculate-node-weight 100 1000 1000)))
     (is (= 200.0 (attestation/calculate-node-weight 100 2000 1000)))
     (is (= 400.0 (attestation/calculate-node-weight 100 4000 1000)))
     (is (= 400.0 (attestation/calculate-node-weight 100 8000 1000))
         "Caps stake multiplier at 4.0"))
+
+  (testing "Ratified default S_min is 250,000 with cliff"
+    (is (= 250000 attestation/default-min-stake))
+    (is (= 0.0 (attestation/calculate-node-weight 100 249999))
+        "Below default S_min returns 0.0")
+    (is (= 100.0 (attestation/calculate-node-weight 100 250000))
+        "At default S_min multiplier is 1.0")
+    (is (= 400.0 (attestation/calculate-node-weight 100 1000000))
+        "At 4x default S_min multiplier is 4.0"))
 
   (testing "Zero and boundary inputs return 0.0 without division by zero errors"
     (is (= 0.0 (attestation/calculate-node-weight 0 5000 1000)))
@@ -135,3 +145,104 @@
                        (if (>= stake (* 4 s-min))
                          (<= (Math/abs (- weight max-allowed)) 1e-9)
                          true)))))
+
+(deftest canonical-exchange-digest-byte-concatenation-test
+  (let [epoch 1
+        peer-a "0101010101010101010101010101010101010101010101010101010101010101"
+        peer-b "0202020202020202020202020202020202020202020202020202020202020202"
+        roles [["msg-1" :echo] ["msg-2" :ready]]
+        expected-roles-vec [["msg-1" :echo] ["msg-2" :ready]]
+        baos (java.io.ByteArrayOutputStream.)
+        _ (do
+            (.write baos (.getBytes (str (int epoch)) "UTF-8"))
+            (.write baos (.getBytes peer-a "UTF-8"))
+            (.write baos (.getBytes peer-b "UTF-8"))
+            (.write baos (.getBytes (pr-str expected-roles-vec) "UTF-8")))
+        expected-digest (basalt/bytes->hex (crypto/sha256 (.toByteArray baos)))
+        actual-digest (attestation/compute-exchange-digest epoch peer-a peer-b roles)]
+    (testing "Exchange digest matches raw UTF-8 byte concatenation of epoch || peer_a || peer_b || pr-str(sorted_vec)"
+      (is (= expected-digest actual-digest)))
+    (testing "Bilateral symmetry: swapping peers and reversing roles preserves exact byte-concatenated digest"
+      (is (= expected-digest (attestation/compute-exchange-digest epoch peer-b peer-a (reverse roles)))))))
+
+(deftest reconcile-message-roles-test
+  (testing "reconcile-message-roles keeps only message IDs present in both frozen sets"
+    (let [frozen-a #{"m1" "m2" "m3"}
+          frozen-b #{"m2" "m3" "m4"}
+          roles [["m1" :echo] ["m2" :ready] ["m3" :seen] ["m4" :delivery] ["m5" :seen]]
+          reconciled (attestation/reconcile-message-roles frozen-a frozen-b roles)]
+      (is (= [["m2" :ready] ["m3" :seen]] reconciled)))))
+
+(deftest verify-transcript-against-log-test
+  (let [kp-a (crypto/generate-keypair)
+        kp-b (crypto/generate-keypair)
+        pub-a (basalt/bytes->hex (:public kp-a))
+        pub-b (basalt/bytes->hex (:public kp-b))
+        honest-roles [["m1" :echo] ["m2" :ready]]
+        transcript (attestation/create-transcript 1 pub-a pub-b honest-roles [(:private kp-a) (:private kp-b)])
+        fabricated-roles [["fake-m99" :delivery]]
+        fabricated-tx (attestation/create-transcript 1 pub-a pub-b fabricated-roles [(:private kp-a) (:private kp-b)])]
+    (testing "Verifies successfully when transcript digest matches frozen log roles"
+      (is (true? (attestation/verify-transcript-against-log transcript honest-roles))))
+
+    (testing "Rejects fabricated self-consistent transcript with valid signatures but invented roles"
+      (is (true? (attestation/verify-transcript fabricated-tx)) "Self-consistent signatures are valid")
+      (is (false? (attestation/verify-transcript-against-log fabricated-tx honest-roles))
+          "Must fail against real frozen log!"))))
+
+(deftest evaluate-transcript-dispute-test
+  (let [kp-a (crypto/generate-keypair)
+        kp-b (crypto/generate-keypair)
+        pub-a (basalt/bytes->hex (:public kp-a))
+        pub-b (basalt/bytes->hex (:public kp-b))
+        frozen-roles [["m1" :echo] ["m2" :ready]]
+        valid-mutual (attestation/create-transcript 1 pub-a pub-b frozen-roles [(:private kp-a) (:private kp-b)])
+        valid-half (attestation/create-transcript 1 pub-a pub-b frozen-roles (:private kp-a))
+        fabricated-half (attestation/create-transcript 1 pub-a pub-b [["invented" :echo]] (:private kp-a))]
+    (testing "Mutually signed transcript matching frozen log settles with credit to both and no strikes"
+      (let [res (attestation/evaluate-transcript-dispute valid-mutual frozen-roles)]
+        (is (= :settled (:status res)))
+        (is (= #{pub-a pub-b} (:credit res)))
+        (is (nil? (:strike res)))))
+
+    (testing "Log-verified half-signed transcript credits reporting peer A and strikes non-signing peer B"
+      (let [res (attestation/evaluate-transcript-dispute valid-half frozen-roles)]
+        (is (= :half-signed-fault (:status res)))
+        (is (= #{pub-a} (:credit res)))
+        (is (= pub-b (:strike res)))))
+
+    (testing "Fabricated unilateral report earns no credit and NEVER strikes the honest counterparty"
+      (let [res (attestation/evaluate-transcript-dispute fabricated-half frozen-roles)]
+        (is (= :rejected (:status res)))
+        (is (= #{} (:credit res)))
+        (is (nil? (:strike res)) "Honest peer B is protected from false strike!")))))
+
+(defspec ^{:doc "Property: Fabricated transcripts never strike counterparty and only log-verified digests can credit/strike"}
+  prop-transcript-dispute-safety 50
+  (prop/for-all [epoch (gen/choose 1 500)
+                 fabricated? gen/boolean
+                 mutual? gen/boolean]
+                (let [kp-a (crypto/generate-keypair)
+                      kp-b (crypto/generate-keypair)
+                      pub-a (basalt/bytes->hex (:public kp-a))
+                      pub-b (basalt/bytes->hex (:public kp-b))
+                      frozen-roles [["log-msg-1" :echo] ["log-msg-2" :ready]]
+                      tx-roles (if fabricated?
+                                 [["invented-msg-x" :echo]]
+                                 frozen-roles)
+                      tx (if mutual?
+                           (attestation/create-transcript epoch pub-a pub-b tx-roles [(:private kp-a) (:private kp-b)])
+                           (attestation/create-transcript epoch pub-a pub-b tx-roles (:private kp-a)))
+                      res (attestation/evaluate-transcript-dispute tx frozen-roles)]
+                  (if fabricated?
+                    (and (= :rejected (:status res))
+                         (= #{} (:credit res))
+                         (nil? (:strike res)))
+                    (if mutual?
+                      (and (= :settled (:status res))
+                           (= #{pub-a pub-b} (:credit res))
+                           (nil? (:strike res)))
+                      (and (= :half-signed-fault (:status res))
+                           (= #{pub-a} (:credit res))
+                           (= pub-b (:strike res))))))))
+
