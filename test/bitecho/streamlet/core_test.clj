@@ -270,3 +270,257 @@
                        (= (+ chain-len 1) (:epoch valid-vote))
                        (nil? stale-genesis-vote)
                        shorter-ancestor-ok?))))
+
+(defn- test-bytes->hex [^bytes ba]
+  (apply str (map #(format "%02x" %) ba)))
+
+(defn- setup-test-nodes [n]
+  (let [pairs (repeatedly n crypto/generate-keypair)
+        sorted-pairs (vec (sort-by (fn [kp] (test-bytes->hex (:public kp))) pairs))
+        peer-hexes (mapv #(test-bytes->hex (:public %)) sorted-pairs)
+        peers-map (into {} (map (fn [kp] [(test-bytes->hex (:public kp)) (:public kp)]) sorted-pairs))]
+    {:pairs sorted-pairs
+     :peer-hexes peer-hexes
+     :peers-map peers-map}))
+
+(deftest test-handle-streamlet-event-tick-proposer
+  (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+        proposer-idx (mod 1 3)
+        proposer-kp (nth pairs proposer-idx)
+        proposer-hex (nth peer-hexes proposer-idx)
+        state {:epoch 0
+               :node-pubkey proposer-hex
+               :keypair proposer-kp
+               :peers-map peers-map
+               :total-nodes 3
+               :blocks {}
+               :notarized-blocks #{}
+               :head-hash "genesis"}
+        event {:type :tick}
+        result (core/handle-streamlet-event state event)
+        new-state (:state result)
+        commands (:commands result)]
+    (testing "proposer node increments epoch and updates head-hash"
+      (is (= 1 (:epoch new-state)))
+      (is (= "genesis" (:head-hash new-state))))
+    (testing "proposer creates block and adds to :blocks"
+      (let [block-hashes (keys (:blocks new-state))]
+        (is (= 1 (count block-hashes)))
+        (let [b (first (vals (:blocks new-state)))]
+          (is (= 1 (:epoch b)))
+          (is (= "genesis" (:parent-hash b)))
+          (is (= proposer-hex (:proposer b))))))
+    (testing "proposer votes for own block and accumulates its vote"
+      (is (contains? (:voted-epochs new-state) 1))
+      (let [b-hash (first (keys (:blocks new-state)))]
+        (is (contains? (get-in new-state [:block-votes b-hash]) proposer-hex))))
+    (testing "proposer emits send-propose and send-vote commands"
+      (is (= 2 (count commands)))
+      (let [cmd-types (set (map :type commands))]
+        (is (contains? cmd-types :send-propose))
+        (is (contains? cmd-types :send-vote))
+        (let [vote-cmd (first (filter #(= (:type %) :send-vote) commands))
+              vote (:vote vote-cmd)]
+          (is (= 1 (:epoch vote)))
+          (is (true? (crypto/verify (:public proposer-kp)
+                                    (.getBytes ^String (:block-hash vote) "UTF-8")
+                                    (core/hex->bytes (:voter-signature vote))))))))))
+
+(deftest test-handle-streamlet-event-tick-non-proposer
+  (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+        proposer-idx (mod 1 3)
+        non-proposer-idx (if (zero? proposer-idx) 1 0)
+        kp (nth pairs non-proposer-idx)
+        hex-pk (nth peer-hexes non-proposer-idx)
+        state {:epoch 0
+               :node-pubkey hex-pk
+               :keypair kp
+               :peers-map peers-map
+               :total-nodes 3
+               :blocks {}
+               :notarized-blocks #{}
+               :head-hash "genesis"}
+        event {:type :tick}
+        result (core/handle-streamlet-event state event)
+        new-state (:state result)
+        commands (:commands result)]
+    (testing "non-proposer increments epoch but proposes nothing"
+      (is (= 1 (:epoch new-state)))
+      (is (empty? (:blocks new-state)))
+      (is (empty? (:voted-epochs new-state)))
+      (is (empty? commands)))))
+
+(deftest test-handle-streamlet-event-receive-propose
+  (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+        kp0 (first pairs)
+        hex0 (first peer-hexes)
+        hex1 (second peer-hexes)
+        state {:epoch 1
+               :node-pubkey hex0
+               :keypair kp0
+               :peers-map peers-map
+               :total-nodes 3
+               :blocks {}
+               :notarized-blocks #{}
+               :head-hash "genesis"}
+        block (core/->Block 1 "genesis" ["tx1"] hex1)
+        b-hash (core/hash-block block)]
+
+    (testing "valid proposal with known parent triggers vote"
+      (let [event {:type :receive-propose :block block :sender hex1}
+            result (core/handle-streamlet-event state event)
+            new-state (:state result)
+            commands (:commands result)]
+        (is (contains? (:blocks new-state) b-hash))
+        (is (contains? (:voted-epochs new-state) 1))
+        (is (contains? (get-in new-state [:block-votes b-hash]) hex0))
+        (is (= 1 (count commands)))
+        (let [cmd (first commands)]
+          (is (= :send-vote (:type cmd)))
+          (is (= b-hash (:block-hash (:vote cmd))))
+          (is (true? (crypto/verify (:public kp0)
+                                    (.getBytes ^String b-hash "UTF-8")
+                                    (core/hex->bytes (:voter-signature (:vote cmd)))))))))
+
+    (testing "proposal with unknown parent buffers into future-blocks"
+      (let [orphan-block (core/->Block 2 "unknown-parent-hash" ["tx2"] hex1)
+            event {:type :receive-propose :block orphan-block :sender hex1}
+            result (core/handle-streamlet-event state event)
+            new-state (:state result)
+            commands (:commands result)]
+        (is (empty? commands))
+        (is (= 1 (count (:future-blocks new-state))))
+        (is (= orphan-block (:block (first (:future-blocks new-state)))))))
+
+    (testing "duplicate proposal for already voted epoch does not vote again"
+      (let [already-voted-state (assoc state :voted-epochs #{1})
+            event {:type :receive-propose :block block :sender hex1}
+            result (core/handle-streamlet-event already-voted-state event)
+            commands (:commands result)]
+        (is (empty? commands))))))
+
+(deftest test-handle-streamlet-event-receive-vote
+  (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+        kp0 (nth pairs 0)
+        hex0 (nth peer-hexes 0)
+        kp1 (nth pairs 1)
+        hex1 (nth peer-hexes 1)
+        kp2 (nth pairs 2)
+        hex2 (nth peer-hexes 2)
+        block (core/->Block 1 "genesis" [] hex0)
+        b-hash (core/hash-block block)
+        state {:epoch 1
+               :node-pubkey hex0
+               :keypair kp0
+               :peers-map peers-map
+               :total-nodes 3
+               :blocks {b-hash block}
+               :block-votes {b-hash #{hex0}}
+               :notarized-blocks #{}
+               :voted-epochs #{1}}]
+
+    (testing "receiving valid vote accumulates and notarizes at quorum (2 of 3)"
+      (let [sig1 (core/bytes->hex (crypto/sign (:private kp1) (.getBytes ^String b-hash "UTF-8")))
+            vote1 (core/->Vote b-hash 1 sig1)
+            event {:type :receive-vote :vote vote1 :sender hex1}
+            result (core/handle-streamlet-event state event)
+            new-state (:state result)]
+        (is (contains? (get-in new-state [:block-votes b-hash]) hex1))
+        (is (contains? (:notarized-blocks new-state) b-hash))))
+
+    (testing "receiving vote for unknown block buffers into future-votes"
+      (let [unknown-hash "some-unseen-block-hash"
+            sig2 (core/bytes->hex (crypto/sign (:private kp2) (.getBytes ^String unknown-hash "UTF-8")))
+            vote2 (core/->Vote unknown-hash 1 sig2)
+            event {:type :receive-vote :vote vote2 :sender hex2}
+            result (core/handle-streamlet-event state event)
+            new-state (:state result)]
+        (is (= 1 (count (get-in new-state [:future-votes unknown-hash]))))
+        (is (empty? (:commands result)))))))
+
+(deftest test-handle-streamlet-event-unknown-type
+  (let [state {:epoch 0 :blocks {}}
+        event {:type :unknown-foo}
+        result (core/handle-streamlet-event state event)]
+    (is (= state (:state result)))
+    (is (= [] (:commands result)))))
+
+(defspec ^{:doc "Property: Streamlet reducer achieves consensus and notarization across honest nodes without double-voting."}
+  prop-streamlet-reducer-lifecycle 50
+  (prop/for-all [node-count (gen/choose 3 6)]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes node-count)
+                      init-nodes (into {} (map-indexed
+                                           (fn [idx hex-pk]
+                                             [hex-pk {:epoch 0
+                                                      :node-pubkey hex-pk
+                                                      :keypair (nth pairs idx)
+                                                      :peers-map peers-map
+                                                      :total-nodes node-count
+                                                      :blocks {}
+                                                      :block-votes {}
+                                                      :notarized-blocks #{}
+                                                      :voted-epochs #{}
+                                                      :head-hash "genesis"}])
+                                           peer-hexes))
+                      proposer-idx (mod 1 node-count)
+                      proposer-hex (nth peer-hexes proposer-idx)
+
+                      proposer-res (core/handle-streamlet-event (get init-nodes proposer-hex) {:type :tick})
+                      proposer-state (:state proposer-res)
+                      proposer-cmds (:commands proposer-res)
+                      prop-cmd (first (filter #(= (:type %) :send-propose) proposer-cmds))
+                      proposed-block (:block prop-cmd)
+                      b-hash (core/hash-block proposed-block)
+                      proposer-vote-cmd (first (filter #(= (:type %) :send-vote) proposer-cmds))
+                      proposer-vote (:vote proposer-vote-cmd)
+
+                      ;; 2. Deliver proposal to all other nodes and collect their emitted votes
+                      proposals-and-votes
+                      (mapv (fn [[pk st]]
+                              (if (= pk proposer-hex)
+                                {:pk pk :state proposer-state :vote proposer-vote}
+                                (let [res (core/handle-streamlet-event st {:type :receive-propose :block proposed-block :sender proposer-hex})
+                                      vote-cmd (first (filter #(= (:type %) :send-vote) (:commands res)))]
+                                  {:pk pk :state (:state res) :vote (:vote vote-cmd)})))
+                            init-nodes)
+
+                      nodes-after-propose
+                      (into {} (map (fn [item] [(:pk item) (:state item)]) proposals-and-votes))
+
+                      all-votes
+                      (vec (keep :vote proposals-and-votes))
+
+                      ;; 3. Deliver enough votes to reach quorum to every node
+                      quorum (core/quorum-threshold node-count)
+                      quorum-votes (take quorum all-votes)
+                      final-nodes
+                      (into {}
+                            (map (fn [[pk st]]
+                                   (let [final-st (reduce (fn [s v]
+                                                            (let [sender-pk (first (filter (fn [hex]
+                                                                                             (crypto/verify (get peers-map hex)
+                                                                                                            (.getBytes ^String b-hash "UTF-8")
+                                                                                                            (core/hex->bytes (:voter-signature v))))
+                                                                                           peer-hexes))]
+                                                              (:state (core/handle-streamlet-event s {:type :receive-vote :vote v :sender sender-pk}))))
+                                                          st quorum-votes)]
+                                     [pk final-st]))
+                                 nodes-after-propose))
+
+                      ;; 4. Invariant check:
+                      ;; - Every node notarized the proposed block
+                      ;; - Every node voted in epoch 1 exactly once
+                      ;; - A duplicate proposal for epoch 1 yields NO votes
+                      all-notarized? (every? (fn [[_ st]] (contains? (:notarized-blocks st) b-hash)) final-nodes)
+                      single-vote? (every? (fn [[_ st]] (= #{1} (:voted-epochs st))) final-nodes)
+                      no-double-vote? (every? (fn [[_ st]]
+                                                (let [dup-block (core/->Block 1 "genesis" ["rogue"] proposer-hex)
+                                                      dup-res (core/handle-streamlet-event st {:type :receive-propose :block dup-block :sender proposer-hex})]
+                                                  (empty? (:commands dup-res))))
+                                              final-nodes)]
+                  (and (not (nil? prop-cmd))
+                       (not (nil? proposer-vote))
+                       (= 1 (:epoch proposed-block))
+                       all-notarized?
+                       single-vote?
+                       no-double-vote?))))
