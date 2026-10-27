@@ -154,10 +154,62 @@
         (is (= (:seed (nth updated-view 1)) (basalt/derive-slot-seed entropy pubkey 1)))
         (is (= (:seed (nth updated-view 1)) (:seed (nth init-view 1))))))
 
-    (testing "reset-slots accepts both parameter orderings for deterministic reset"
-      (let [res1 (basalt/reset-slots init-view entropy pubkey 2 1)
-            res2 (basalt/reset-slots init-view 2 1 entropy pubkey)]
+    (testing "reset-slots-deterministic and clean delegator reset-slots match"
+      (let [res1 (basalt/reset-slots-deterministic init-view entropy pubkey 2 1)
+            res2 (basalt/reset-slots init-view entropy pubkey 2 1)]
         (is (= (:seed (nth (:view res1) 2)) (:seed (nth (:view res2) 2))))))))
+
+(deftest ^{:doc "Tests deterministic reset-slots entry points and explicit RNG entry point."}
+  reset-slots-explicit-entry-points-test
+  (let [entropy "epoch-entropy-fixed"
+        pubkey "node-pubkey-fixed"
+        init-view (basalt/init-view [] 4 entropy pubkey)]
+    (testing "reset-slots-deterministic yields identical seeds across repeated runs"
+      (let [res1 (basalt/reset-slots-deterministic init-view entropy pubkey 0 2)
+            res2 (basalt/reset-slots-deterministic init-view entropy pubkey 0 2)]
+        (is (= (:view res1) (:view res2)))
+        (is (= (:samples res1) (:samples res2)))
+        (is (= (:next-r res1) (:next-r res2)))
+        (is (= (:seed (nth (:view res1) 0)) (basalt/derive-slot-seed entropy pubkey 0)))
+        (is (= (:seed (nth (:view res1) 1)) (basalt/derive-slot-seed entropy pubkey 1)))))
+
+    (testing "reset-slots-rng yields deterministic results given seeded RNG"
+      (let [res1 (basalt/reset-slots-rng init-view (java.util.Random. 42) 0 2)
+            res2 (basalt/reset-slots-rng init-view (java.util.Random. 42) 0 2)]
+        (is (= (:view res1) (:view res2)))
+        (is (= (:next-r res1) (:next-r res2)))))
+
+    (testing "reset-slots clean delegator routes 4-arity to RNG and 5-arity to deterministic"
+      (let [res-rng (basalt/reset-slots init-view (java.util.Random. 42) 0 2)
+            expected-rng (basalt/reset-slots-rng init-view (java.util.Random. 42) 0 2)
+            res-det (basalt/reset-slots init-view entropy pubkey 0 2)
+            expected-det (basalt/reset-slots-deterministic init-view entropy pubkey 0 2)]
+        (is (= (:view res-rng) (:view expected-rng)))
+        (is (= (:view res-det) (:view expected-det)))))))
+
+(deftest ^{:doc "Tests deterministic rank-based peer selection."}
+  select-peers-deterministic-test
+  (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array 32))
+        p2 (basalt/make-peer "2.2.2.2" 80 (byte-array 32))
+        p3 (basalt/make-peer "3.3.3.3" 80 (byte-array 32))
+        peers [p1 p2 p3]
+        entropy "entropy-test"
+        pubkey "pubkey-test"]
+    (testing "select-peers-deterministic returns identical peers in identical order across runs"
+      (let [sel1 (basalt/select-peers-deterministic entropy pubkey peers 2)
+            sel2 (basalt/select-peers-deterministic entropy pubkey peers 2)]
+        (is (= 2 (count sel1)))
+        (is (= sel1 sel2))))
+
+    (testing "select-peers 4-arity delegates to select-peers-deterministic"
+      (let [sel-del (basalt/select-peers entropy pubkey peers 2)
+            sel-det (basalt/select-peers-deterministic entropy pubkey peers 2)]
+        (is (= sel-del sel-det))))
+
+    (testing "select-peers with string seed delegates to deterministic selection"
+      (let [sel-seed (basalt/select-peers entropy peers 2)
+            sel-det (basalt/select-peers-deterministic entropy "select" peers 2)]
+        (is (= sel-seed sel-det))))))
 
 (defspec ^{:doc "Property: Slot seeds are strictly deterministic and invariant to RNG state."}
   prop-deterministic-slot-seeding 50
@@ -168,7 +220,33 @@
                       slot-idx (mod 7 view-size)
                       expected-seed (basalt/derive-slot-seed entropy pubkey slot-idx)
                       actual-init-seed (:seed (nth init-view slot-idx))
-                      reset-result (basalt/reset-slots init-view entropy pubkey slot-idx 1)
+                      reset-result (basalt/reset-slots-deterministic init-view entropy pubkey slot-idx 1)
                       actual-reset-seed (:seed (nth (:view reset-result) slot-idx))]
                   (and (= actual-init-seed expected-seed)
                        (= actual-reset-seed expected-seed)))))
+
+(defspec ^{:doc "Property: reset-slots-deterministic is strictly pure and repeatable"}
+  prop-reset-slots-deterministic-purity 50
+  (prop/for-all [entropy (gen/not-empty gen/string-alphanumeric)
+                 pubkey (gen/not-empty gen/string-alphanumeric)
+                 view-size (gen/choose 2 20)]
+                (let [init-view (basalt/init-view [] view-size entropy pubkey)
+                      r (mod 3 view-size)
+                      k (max 1 (quot view-size 2))
+                      res1 (basalt/reset-slots-deterministic init-view entropy pubkey r k)
+                      res2 (basalt/reset-slots-deterministic init-view entropy pubkey r k)]
+                  (= res1 res2))))
+
+(defspec ^{:doc "Property: select-peers-deterministic is strictly pure and repeatable"}
+  prop-select-peers-deterministic-purity 50
+  (prop/for-all [entropy (gen/not-empty gen/string-alphanumeric)
+                 pubkey (gen/not-empty gen/string-alphanumeric)
+                 k (gen/choose 1 3)]
+                (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array 32))
+                      p2 (basalt/make-peer "2.2.2.2" 80 (byte-array 32))
+                      p3 (basalt/make-peer "3.3.3.3" 80 (byte-array 32))
+                      peers [p1 p2 p3]
+                      sel1 (basalt/select-peers-deterministic entropy pubkey peers k)
+                      sel2 (basalt/select-peers-deterministic entropy pubkey peers k)]
+                  (and (= sel1 sel2)
+                       (= (count sel1) k)))))

@@ -12,8 +12,10 @@
             [bitecho.murmur.core :as murmur]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.sieve.core :as sieve]
+            [bitecho.streamlet.core :as streamlet]
             [clojure.edn :as edn]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [clojure.string :as string]))
 
 (defn- peer-hex
   "Normalizes a peer's pubkey to a hex string."
@@ -166,6 +168,43 @@
                                   :allocations all-mint-shares})
       state-with-custody)))
 
+(defn- block->hash-str
+  "Extracts or computes the SHA-256 hash string of a block, hash string, or map."
+  [b]
+  (cond
+    (and (string? b) (not (string/blank? b))) b
+    (bytes? b) (basalt/bytes->hex b)
+    (map? b) (or (when (and (string? (:hash b)) (not (string/blank? (:hash b)))) (:hash b))
+                 (streamlet/hash-block b))
+    :else nil))
+
+(defn derive-epoch-entropy
+  "Derives the epoch entropy string strictly from finalized block hashes, state, or config.
+   Prioritizes :latest-finalized-block-hash, then :latest-finalized-block,
+   then latest from :finalized-blocks (hashing block maps if needed),
+   falling back to :epoch-entropy in state or cfg, or 'genesis'.
+   Guarantees a valid non-empty string is returned without ever stringifying a map."
+  [state cfg]
+  (let [cand (or (when-let [h (:latest-finalized-block-hash state)]
+                   (block->hash-str h))
+                 (when-let [b (:latest-finalized-block state)]
+                   (block->hash-str b))
+                 (when-let [fb (seq (:finalized-blocks state))]
+                   (let [sorted-blocks (sort-by (fn [x]
+                                                  (if (map? x)
+                                                    (or (:epoch x) 0)
+                                                    x))
+                                                fb)]
+                     (block->hash-str (last sorted-blocks))))
+                 (when-let [e (:epoch-entropy state)]
+                   (when-not (and (string? e) (string/blank? e)) (str e)))
+                 (when-let [e (:epoch-entropy cfg)]
+                   (when-not (and (string? e) (string/blank? e)) (str e)))
+                 "genesis")]
+    (if (and (string? cand) (not (string/blank? cand)))
+      cand
+      "genesis")))
+
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
@@ -175,17 +214,10 @@
         D-size (:delivery-sample-size cfg)
         gossip-ttl-epochs (:gossip-ttl-epochs cfg)
         new-epoch (inc (or (:epoch state) 0))
-        epoch-entropy (or (:latest-finalized-block state)
-                          (when (seq (:finalized-blocks state))
-                            (if (coll? (:finalized-blocks state))
-                              (last (sort (:finalized-blocks state)))
-                              (:finalized-blocks state)))
-                          (:epoch-entropy state)
-                          (:epoch-entropy cfg)
-                          "genesis")
+        epoch-entropy (derive-epoch-entropy state cfg)
         view (:basalt-view state)
         rng (:rng event)
-        reset-result (basalt/reset-slots view epoch-entropy (:node-pubkey state) (:basalt-index state) 1)
+        reset-result (basalt/reset-slots-deterministic view epoch-entropy (:node-pubkey state) (:basalt-index state) 1)
         new-view (:view reset-result)
         new-index (:next-r reset-result)
         extracted-peers (basalt/extract-peers new-view)

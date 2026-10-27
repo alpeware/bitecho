@@ -112,19 +112,19 @@
                    used-hashes)))))))
 
 (defn init-view
-  "Initializes a new Basalt view (a vector of v slots) from an initial collection of peers.
-   If epoch-entropy and node-pubkey are provided, generates deterministic slot seeds using derive-slot-seed.
-   For backward compatibility, if a Random instance is provided, generates random seeds."
-  ([initial-peers view-size rng]
-   (if (instance? java.util.Random rng)
-     (let [slots (vec (repeatedly view-size
-                                  #(let [seed-bytes (byte-array 32)]
-                                     (.nextBytes ^java.util.Random rng seed-bytes)
-                                     {:seed (bytes->hex seed-bytes) :peer nil})))]
-       (if (empty? initial-peers)
-         slots
-         (update-view slots initial-peers)))
-     (init-view initial-peers view-size (str rng) "genesis")))
+  "Initializes a new Basalt view (a vector of view-size slots) from initial peers.
+   Accepts an explicit java.util.Random instance:
+     (init-view initial-peers view-size ^java.util.Random rng)
+   Or deterministic epoch-entropy and node-pubkey:
+     (init-view initial-peers view-size epoch-entropy node-pubkey)"
+  ([initial-peers view-size ^java.util.Random rng]
+   (let [slots (vec (repeatedly view-size
+                                #(let [seed-bytes (byte-array 32)]
+                                   (.nextBytes rng seed-bytes)
+                                   {:seed (bytes->hex seed-bytes) :peer nil})))]
+     (if (empty? initial-peers)
+       slots
+       (update-view slots initial-peers))))
   ([initial-peers view-size epoch-entropy node-pubkey]
    (let [slots (vec (map-indexed
                      (fn [idx _]
@@ -147,7 +147,11 @@
             (recur (conj result p) (conj seen h) (rest remaining))))
         result))))
 
-(defn- reset-slots-rng
+(defn reset-slots-rng
+  "Resets k slots starting at index r (with wrap-around) using explicit java.util.Random.
+   Yields previous peers, generates new random 32-byte seeds via rng,
+   and repopulates slots using remaining and sampled peers.
+   Returns {:view updated-view :samples samples :next-r new-r}."
   [view ^java.util.Random rng r k]
   (let [size (count view)
         indices (map #(mod (+ r %) size) (range k))
@@ -170,7 +174,11 @@
      :samples samples
      :next-r (mod (+ r k) size)}))
 
-(defn- reset-slots-deterministic
+(defn reset-slots-deterministic
+  "Resets k slots starting at index r (with wrap-around) deterministically using epoch-entropy and node-pubkey.
+   Yields previous peers, generates deterministic slot seeds via derive-slot-seed,
+   and repopulates slots using remaining and sampled peers.
+   Returns {:view updated-view :samples samples :next-r new-r}."
   [view epoch-entropy node-pubkey r k]
   (let [size (count view)
         indices (map #(mod (+ r %) size) (range k))
@@ -194,29 +202,46 @@
 
 (defn reset-slots
   "Resets k slots starting at index r (with wrap-around).
-   Yields the previous peers from those slots, generates new seeds,
-   and repopulates the empty slots using all remaining peers in the view.
-   Supports deterministic seeding via epoch-entropy and node-pubkey,
-   or legacy rng-based seeding.
-   Returns {:view updated-view :samples extracted-peers :next-r new-r}."
+   Delegates to reset-slots-rng when passed an explicit java.util.Random instance:
+     (reset-slots view rng r k)
+   Delegates to reset-slots-deterministic when passed epoch-entropy and node-pubkey:
+     (reset-slots view epoch-entropy node-pubkey r k)
+   Returns {:view updated-view :samples samples :next-r new-r}."
   ([view ^java.util.Random rng r k]
    (reset-slots-rng view rng r k))
-  ([view a b c d]
-   (if (number? a)
-     (reset-slots-deterministic view c d a b)
-     (reset-slots-deterministic view a b c d))))
+  ([view epoch-entropy node-pubkey r k]
+   (reset-slots-deterministic view epoch-entropy node-pubkey r k)))
 
-(defn select-peers
-  "Selects up to k random peers from the view for exchange.
-   To ensure determinism and purity in tests, it accepts a java.util.Random instance
-   and uses it to shuffle the extracted peers before taking the first k elements."
-  [^java.util.Random rng view k]
+(defn select-peers-deterministic
+  "Selects up to k peers from the view deterministically using cryptographic ranking.
+   Derives a selection seed from epoch-entropy and node-pubkey, calculates the rank
+   for each distinct peer, and returns the top k peers sorted by rank."
+  [epoch-entropy node-pubkey view k]
   (let [peers (if (and (vector? view) (some #(contains? % :seed) view))
                 (extract-peers view)
-                (seq view))
-        size (count peers)]
-    (if (zero? size)
-      ()
-      (let [shuffled (java.util.ArrayList. peers)]
-        (java.util.Collections/shuffle shuffled rng)
-        (take k shuffled)))))
+                (distinct (remove nil? view)))
+        seed (derive-slot-seed epoch-entropy node-pubkey "select")]
+    (take k (sort-by #(rank seed (:hash %)) peers))))
+
+(defn select-peers
+  "Selects up to k peers from the view for exchange.
+   Supports explicit RNG-based shuffling when passed a java.util.Random instance:
+     (select-peers ^java.util.Random rng view k)
+   Supports deterministic rank-based selection when passed epoch-entropy and node-pubkey:
+     (select-peers epoch-entropy node-pubkey view k)
+   Or when passed a string/bytes seed as the first argument:
+     (select-peers seed view k)"
+  ([^java.util.Random rng view k]
+   (if (instance? java.util.Random rng)
+     (let [peers (if (and (vector? view) (some #(contains? % :seed) view))
+                   (extract-peers view)
+                   (seq view))
+           size (count peers)]
+       (if (zero? size)
+         ()
+         (let [shuffled (java.util.ArrayList. peers)]
+           (java.util.Collections/shuffle shuffled rng)
+           (take k shuffled))))
+     (select-peers-deterministic rng "select" view k)))
+  ([epoch-entropy node-pubkey view k]
+   (select-peers-deterministic epoch-entropy node-pubkey view k)))

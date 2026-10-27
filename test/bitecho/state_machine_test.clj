@@ -10,6 +10,8 @@
             [bitecho.rendezvous.core :as rdv]
             [bitecho.sieve.core :as sieve]
             [bitecho.state-machine :as sm]
+            [bitecho.streamlet.core :as streamlet]
+            [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -946,6 +948,58 @@
                          (zero? total-burned)
                          (empty? (:messages new-state))
                          (empty? (:commands res)))))))
+
+(deftest ^{:doc "Tests derive-epoch-entropy strictly derives hash strings and never stringifies maps"}
+  derive-epoch-entropy-test
+  (testing "extracts :latest-finalized-block-hash directly"
+    (let [state {:latest-finalized-block-hash "deadbeef0123456789abcdef"}
+          entropy (sm/derive-epoch-entropy state {})]
+      (is (= "deadbeef0123456789abcdef" entropy))))
+
+  (testing "extracts :latest-finalized-block when string hash"
+    (let [state {:latest-finalized-block "cafebabe0123456789abcdef"}
+          entropy (sm/derive-epoch-entropy state {})]
+      (is (= "cafebabe0123456789abcdef" entropy))))
+
+  (testing "hashes Block map/record when present in :latest-finalized-block"
+    (let [block (streamlet/->Block 5 "genesis" [] "proposer-pubkey")
+          state {:latest-finalized-block block}
+          entropy (sm/derive-epoch-entropy state {})]
+      (is (string? entropy))
+      (is (= 64 (count entropy)))
+      (is (not (.contains entropy "{")))
+      (is (not (.contains entropy ":epoch")))
+      (is (= (streamlet/hash-block block) entropy))))
+
+  (testing "hashes latest Block from :finalized-blocks collection"
+    (let [b1 (streamlet/->Block 1 "genesis" [] "p1")
+          b2 (streamlet/->Block 2 (streamlet/hash-block b1) [] "p2")
+          state {:finalized-blocks [b1 b2]}
+          entropy (sm/derive-epoch-entropy state {})]
+      (is (string? entropy))
+      (is (= 64 (count entropy)))
+      (is (= (streamlet/hash-block b2) entropy))))
+
+  (testing "falls back to :epoch-entropy in state, cfg, or genesis"
+    (is (= "state-entropy" (sm/derive-epoch-entropy {:epoch-entropy "state-entropy"} {})))
+    (is (= "cfg-entropy" (sm/derive-epoch-entropy {} {:epoch-entropy "cfg-entropy"})))
+    (is (= "genesis" (sm/derive-epoch-entropy {} {})))))
+
+(defspec ^{:doc "Property: derive-epoch-entropy strictly outputs non-empty hash string, never a stringified Clojure map"}
+  prop-derive-epoch-entropy-never-stringifies-maps 50
+  (prop/for-all [epoch (gen/choose 1 1000)
+                 proposer gen/string-alphanumeric]
+                (let [block (streamlet/->Block epoch "genesis" [] proposer)
+                      state {:finalized-blocks #{block}
+                             :latest-finalized-block block}
+                      entropy (sm/derive-epoch-entropy state {})]
+                  (and (string? entropy)
+                       (not (string/blank? entropy))
+                       (= 64 (count entropy))
+                       (not (.contains entropy "{"))
+                       (not (.contains entropy "}"))
+                       (not (.contains entropy ":epoch"))
+                       (= (streamlet/hash-block block) entropy)))))
 
 
 
