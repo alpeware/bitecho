@@ -18,7 +18,9 @@
 
 (def default-config
   "Default protocol parameters for small / test networks."
-  {;; Murmur — epidemic gossip fanout (G in the paper)
+  {;; Genesis ledger (hex pubkey -> AccountState)
+   :genesis-ledger        {}
+   ;; Murmur — epidemic gossip fanout (G in the paper)
    :murmur-k              5
    ;; Maximum number of seen message IDs kept in the Murmur cache
    :murmur-max-cache-size 1000

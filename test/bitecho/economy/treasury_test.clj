@@ -1,6 +1,7 @@
 (ns bitecho.economy.treasury-test
   "Tests for demand-gated treasury minting, 20/80 split, and Genesis Bootstrap custody."
-  (:require [bitecho.crypto :as crypto]
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]
             [bitecho.economy.attestation :as attestation]
             [bitecho.economy.treasury :as treasury]
             [clojure.test :refer [deftest is testing]]
@@ -184,3 +185,51 @@
                        (= (:remaining-balance res) (- custody-bal drawn-amt))
                        (<= drawn-amt alloc-amt)
                        (<= drawn-amt custody-bal)))))
+
+(deftest default-genesis-ledger-test
+  (testing "default-genesis-ledger builds exact 45% Genesis custody ledger (18,900,000,000 ECHO total)"
+    (let [custody-keys {:bootstrap "custody-bootstrap-pub"
+                        :team "custody-team-pub"
+                        :partners "custody-partners-pub"
+                        :ecosystem "custody-ecosystem-pub"}
+          ledger (treasury/default-genesis-ledger custody-keys)]
+      (is (= 4 (count ledger)))
+      (is (= 4200000000 (:balance (get ledger "custody-bootstrap-pub"))))
+      (is (= 6300000000 (:balance (get ledger "custody-team-pub"))))
+      (is (= 4200000000 (:balance (get ledger "custody-partners-pub"))))
+      (is (= 4200000000 (:balance (get ledger "custody-ecosystem-pub"))))
+      (is (= 18900000000 (reduce + (map :balance (vals ledger)))))
+      (is (every? #(instance? bitecho.economy.account.AccountState %) (vals ledger)))
+      (is (every? #(= 0 (:seq %)) (vals ledger)))
+      (is (every? #(= [] (:deps %)) (vals ledger)))))
+
+  (testing "Handles byte-array pubkeys and subsets of custody keys"
+    (let [kp (crypto/generate-keypair)
+          pub-hex (basalt/bytes->hex (:public kp))
+          custody-keys {:bootstrap (:public kp)
+                        :team "team-hex"}
+          ledger (treasury/default-genesis-ledger custody-keys)]
+      (is (= 2 (count ledger)))
+      (is (= 4200000000 (:balance (get ledger pub-hex))))
+      (is (= 6300000000 (:balance (get ledger "team-hex"))))
+      (is (= 10500000000 (reduce + (map :balance (vals ledger))))))))
+
+(defspec ^{:doc "Property: default-genesis-ledger conserves 45% 18.9B total when all 4 roles are provided"}
+  prop-default-genesis-ledger-invariants 50
+  (prop/for-all [b-suffix (gen/choose 1 1000)
+                 t-suffix (gen/choose 1001 2000)
+                 p-suffix (gen/choose 2001 3000)
+                 e-suffix (gen/choose 3001 4000)]
+                (let [custody-keys {:bootstrap (str "bootstrap-" b-suffix)
+                                    :team (str "team-" t-suffix)
+                                    :partners (str "partners-" p-suffix)
+                                    :ecosystem (str "ecosystem-" e-suffix)}
+                      ledger (treasury/default-genesis-ledger custody-keys)]
+                  (and (= 4 (count ledger))
+                       (= 18900000000 (reduce + (map :balance (vals ledger))))
+                       (= 4200000000 (:balance (get ledger (str "bootstrap-" b-suffix))))
+                       (= 6300000000 (:balance (get ledger (str "team-" t-suffix))))
+                       (= 4200000000 (:balance (get ledger (str "partners-" p-suffix))))
+                       (= 4200000000 (:balance (get ledger (str "ecosystem-" e-suffix))))
+                       (every? #(and (= 0 (:seq %)) (= [] (:deps %))) (vals ledger))))))
+

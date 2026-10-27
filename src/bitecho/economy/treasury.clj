@@ -202,3 +202,25 @@
      :custody-commands (:commands custody-res)
      :commands (into (:commands mint-res) (:commands custody-res))
      :remaining-custody-balance (:remaining-balance custody-res)}))
+
+(def genesis-custody-shares
+  "Standard 45% Genesis custody allocations (18.9B ECHO total)."
+  {:bootstrap 4200000000
+   :team 6300000000
+   :partners 4200000000
+   :ecosystem 4200000000})
+
+(defn default-genesis-ledger
+  "Builds the 45% Genesis custody ledger (18,900,000,000 ECHO total) from a map
+   of custody pubkeys {:bootstrap pub1 :team pub2 :partners pub3 :ecosystem pub4}.
+   Returns a map of {pubkey-hex -> AccountState} with :seq 0 and :deps []."
+  [custody-pubkeys]
+  (reduce-kv
+   (fn [m role amount]
+     (if-let [pk (get custody-pubkeys role)]
+       (let [pk-hex (if (string? pk) pk (basalt/bytes->hex pk))]
+         (assoc m pk-hex (account/map->AccountState {:balance amount :seq 0 :deps []})))
+       m))
+   {}
+   genesis-custody-shares))
+

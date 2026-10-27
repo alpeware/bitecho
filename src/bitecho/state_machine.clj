@@ -57,8 +57,7 @@
       :sieve-delivered-set #{}
       :local-ready-set #{}
       :delivered-set #{}
-      :ledger (merge {node-pubkey (account/map->AccountState {:balance 1000 :seq 0 :deps []})}
-                     genesis-ledger)})))
+      :ledger (or genesis-ledger {})})))
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
@@ -471,11 +470,15 @@
                              transfer-map)
               transfer (account/map->Transfer transfer-map)
               ledger (or (:ledger state) {})
-              ledger (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
-                       (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                       ledger)
-              new-ledger (account/apply-transfer ledger transfer)]
-          (assoc state :ledger new-ledger))
+              sender (:sender transfer)
+              sender-state (get ledger sender)]
+          (if (and sender-state (account/validate-transfer sender-state transfer))
+            (let [ledger-with-receiver (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
+                                         (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                         ledger)
+                  new-ledger (account/apply-transfer ledger-with-receiver transfer)]
+              (assoc state :ledger new-ledger))
+            state))
         (catch Exception _
           state))
       state)))

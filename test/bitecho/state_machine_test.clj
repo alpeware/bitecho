@@ -55,6 +55,41 @@
       (is (= initial-ledger (:ledger (:state result))))
       (is (nil? (get-in result [:state :ledger unknown-sender]))))))
 
+(deftest init-state-default-ledger-empty-test
+  (testing "init-state with default config yields an empty ledger {}"
+    (let [state (sm/init-state [] "node-pub-1")]
+      (is (= {} (:ledger state))))))
+
+(deftest init-state-genesis-ledger-authoritative-test
+  (testing "init-state with a :genesis-ledger entry yields only that entry, not granting 1000 ECHO to node-pubkey"
+    (let [kp (crypto/generate-keypair)
+          genesis-pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/default-config :genesis-ledger {genesis-pub (account/map->AccountState {:balance 500 :seq 0 :deps []})})
+          state (sm/init-state [] "node-pub-1" cfg)]
+      (is (= {genesis-pub (account/map->AccountState {:balance 500 :seq 0 :deps []})}
+             (:ledger state)))
+      (is (nil? (get-in state [:ledger "node-pub-1"]))))))
+
+(deftest un-funded-node-transfer-rejected-test
+  (testing "A transfer from node-pubkey itself when absent from genesis-ledger is rejected and changes nothing"
+    (let [node-kp (crypto/generate-keypair)
+          node-pub (basalt/bytes->hex (:public node-kp))
+          state (sm/init-state [] node-pub)
+          receiver-kp (crypto/generate-keypair)
+          receiver-pub (basalt/bytes->hex (:public receiver-kp))
+          unsigned-tx {:sender node-pub
+                       :receiver receiver-pub
+                       :amount 100
+                       :seq 1
+                       :deps []}
+          tx (account/create-transfer (:private node-kp) unsigned-tx)
+          payload (.getBytes (pr-str {:id "msg-unfunded" :transfer tx}) "UTF-8")
+          res (sm/handle-event state {:type :on-deliver :payload payload :message-id "msg-unfunded"})]
+      (is (= (:ledger state) (:ledger (:state res))))
+      (is (= {} (:ledger (:state res))))
+      (is (nil? (get-in res [:state :ledger node-pub])))
+      (is (nil? (get-in res [:state :ledger receiver-pub]))))))
+
 (deftest genesis-ledger-transfer-success-test
   (testing "Transfer from account seeded via (:genesis-ledger cfg) succeeds"
     (let [kp (crypto/generate-keypair)
@@ -76,7 +111,7 @@
         (is (= 300 (:balance (get updated-ledger sender-pub))))
         (is (= 1 (:seq (get updated-ledger sender-pub)))))
       (testing "Receiver balance is incremented"
-        (is (= 1200 (:balance (get updated-ledger "node-pubkey-1"))))))))
+        (is (= 200 (:balance (get updated-ledger "node-pubkey-1"))))))))
 
 (defspec ^{:doc "Property: Transfers from unseeded accounts cannot create money or alter ledger, while transfers from genesis-seeded accounts conserve total supply."}
   prop-no-unauthorized-money-creation 100
@@ -121,7 +156,7 @@
           ;; Invariant: total supply conserved, sender decremented, receiver incremented
                       (and (= initial-total-supply final-total-supply)
                            (= (- genesis-bal transfer-amt) (:balance (get final-ledger genesis-pub)))
-                           (= (+ 1000 transfer-amt) (:balance (get final-ledger node-pub)))))))))
+                           (= transfer-amt (:balance (get final-ledger node-pub)))))))))
 
 (deftest init-state-epoch-entropy-test
   (testing "init-state initializes default :epoch-entropy to genesis and seeds basalt-view deterministically"
@@ -184,7 +219,7 @@
       (is (= 750 (:balance (get-in new-state [:ledger sender]))))
       (is (= 250 (get-in new-state [:epoch-burns 0])))
       (is (empty? (:commands res)))
-      (is (= 1000 (:balance (get-in new-state [:ledger "node-pub-1"])))
+      (is (nil? (get-in new-state [:ledger "node-pub-1"]))
           "No receiver account was credited with the burned amount")))
 
   (testing "Direct :signaling-burn with default burn amount when not specified"
@@ -283,3 +318,18 @@
                   (and (= initial-total-supply (+ final-ledger-supply total-burned))
                        (= (- initial-balance burn-amount) (:balance (get final-ledger sender)))
                        (= burn-amount (get-in final-state [:epoch-burns 0]))))))
+
+(defspec ^{:doc "Property: init-state ledger strictly mirrors genesis-ledger with no un-allocated balances"}
+  prop-genesis-ledger-authoritative 50
+  (prop/for-all [balances (gen/vector (gen/choose 10 1000) 1 5)
+                 node-id (gen/elements ["node-alpha" "node-beta" "node-gamma"])]
+                (let [entries (into {} (map-indexed (fn [i b]
+                                                      [(str "genesis-pub-" i)
+                                                       (account/map->AccountState {:balance b :seq 0 :deps []})])
+                                                    balances))
+                      cfg (assoc config/default-config :genesis-ledger entries)
+                      state (sm/init-state [] node-id cfg)]
+                  (and (= entries (:ledger state))
+                       (if (contains? entries node-id)
+                         (some? (get (:ledger state) node-id))
+                         (nil? (get (:ledger state) node-id)))))))
