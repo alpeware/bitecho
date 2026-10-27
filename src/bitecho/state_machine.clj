@@ -27,12 +27,15 @@
                           (into {} (map (fn [[k v]] [k (if (instance? bitecho.economy.account.AccountState v)
                                                          v
                                                          (account/map->AccountState v))]))
-                                gl))]
+                                gl))
+         epoch-entropy (or (:epoch-entropy cfg) "genesis")
+         view-size (:basalt-max-view-size cfg)]
      {:node-pubkey node-pubkey
       :config cfg
       :epoch 0
+      :epoch-entropy epoch-entropy
       :basalt-index 0
-      :basalt-view (basalt/init-view initial-peers (:basalt-max-view-size cfg) (java.util.Random.))
+      :basalt-view (basalt/init-view initial-peers view-size epoch-entropy node-pubkey)
       :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
       :contagion-known-ids #{}
       :messages {}
@@ -64,9 +67,17 @@
         D-size (:delivery-sample-size cfg)
         gossip-ttl-epochs (:gossip-ttl-epochs cfg)
         new-epoch (inc (or (:epoch state) 0))
+        epoch-entropy (or (:latest-finalized-block state)
+                          (when (seq (:finalized-blocks state))
+                            (if (coll? (:finalized-blocks state))
+                              (last (sort (:finalized-blocks state)))
+                              (:finalized-blocks state)))
+                          (:epoch-entropy state)
+                          (:epoch-entropy cfg)
+                          "genesis")
         view (:basalt-view state)
         rng (:rng event)
-        reset-result (basalt/reset-slots view rng (:basalt-index state) 1)
+        reset-result (basalt/reset-slots view epoch-entropy (:node-pubkey state) (:basalt-index state) 1)
         new-view (:view reset-result)
         new-index (:next-r reset-result)
         extracted-peers (basalt/extract-peers new-view)
@@ -169,6 +180,7 @@
         pruned-delivered-set (set/difference (:delivered-set state) expired-ids)]
     {:state (assoc state
                    :epoch new-epoch
+                   :epoch-entropy epoch-entropy
                    :basalt-view new-view
                    :basalt-index new-index
                    :murmur-cache pruned-murmur-cache

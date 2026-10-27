@@ -112,3 +112,63 @@
       (is (not= "seed0" (:seed (nth updated-view 0))))
       ;; All peers (including displaced p4, p1) should be reassigned into new slots
       (is (= 4 (count (remove #(nil? (:peer %)) updated-view)))))))
+
+(deftest ^{:doc "Tests deterministic slot seed derivation."} derive-slot-seed-test
+  (testing "determinism: identical inputs produce identical slot seeds"
+    (let [s1 (basalt/derive-slot-seed "genesis" "pubkey-1" 0)
+          s2 (basalt/derive-slot-seed "genesis" "pubkey-1" 0)]
+      (is (= s1 s2))
+      (is (string? s1))
+      (is (= 64 (count s1)))))
+
+  (testing "sensitivity: different slot index, pubkey, or epoch entropy produce different seeds"
+    (let [s-base (basalt/derive-slot-seed "genesis" "pubkey-1" 0)
+          s-diff-idx (basalt/derive-slot-seed "genesis" "pubkey-1" 1)
+          s-diff-pk (basalt/derive-slot-seed "genesis" "pubkey-2" 0)
+          s-diff-entropy (basalt/derive-slot-seed "block-hash-1" "pubkey-1" 0)]
+      (is (not= s-base s-diff-idx))
+      (is (not= s-base s-diff-pk))
+      (is (not= s-base s-diff-entropy))))
+
+  (testing "polymorphic inputs: string vs byte-array inputs yield identical results"
+    (let [s-str (basalt/derive-slot-seed "genesis" "pubkey-1" 0)
+          s-bytes (basalt/derive-slot-seed (.getBytes "genesis" "UTF-8")
+                                           (.getBytes "pubkey-1" "UTF-8")
+                                           0)]
+      (is (= s-str s-bytes)))))
+
+(deftest ^{:doc "Tests deterministic view initialization and slot reset."} deterministic-init-and-reset-slots-test
+  (let [entropy "epoch-entropy-xyz"
+        pubkey "node-pubkey-abc"
+        init-view (basalt/init-view [] 4 entropy pubkey)]
+    (testing "init-view generates slots matching derive-slot-seed for each slot index"
+      (is (= 4 (count init-view)))
+      (is (= (:seed (nth init-view 0)) (basalt/derive-slot-seed entropy pubkey 0)))
+      (is (= (:seed (nth init-view 1)) (basalt/derive-slot-seed entropy pubkey 1)))
+      (is (= (:seed (nth init-view 2)) (basalt/derive-slot-seed entropy pubkey 2)))
+      (is (= (:seed (nth init-view 3)) (basalt/derive-slot-seed entropy pubkey 3))))
+
+    (testing "reset-slots with deterministic entropy matches init-view seed for that index"
+      (let [result (basalt/reset-slots init-view entropy pubkey 1 1)
+            updated-view (:view result)]
+        (is (= (:seed (nth updated-view 1)) (basalt/derive-slot-seed entropy pubkey 1)))
+        (is (= (:seed (nth updated-view 1)) (:seed (nth init-view 1))))))
+
+    (testing "reset-slots accepts both parameter orderings for deterministic reset"
+      (let [res1 (basalt/reset-slots init-view entropy pubkey 2 1)
+            res2 (basalt/reset-slots init-view 2 1 entropy pubkey)]
+        (is (= (:seed (nth (:view res1) 2)) (:seed (nth (:view res2) 2))))))))
+
+(defspec ^{:doc "Property: Slot seeds are strictly deterministic and invariant to RNG state."}
+  prop-deterministic-slot-seeding 50
+  (prop/for-all [entropy (gen/not-empty gen/string-alphanumeric)
+                 pubkey (gen/not-empty gen/string-alphanumeric)
+                 view-size (gen/choose 1 20)]
+                (let [init-view (basalt/init-view [] view-size entropy pubkey)
+                      slot-idx (mod 7 view-size)
+                      expected-seed (basalt/derive-slot-seed entropy pubkey slot-idx)
+                      actual-init-seed (:seed (nth init-view slot-idx))
+                      reset-result (basalt/reset-slots init-view entropy pubkey slot-idx 1)
+                      actual-reset-seed (:seed (nth (:view reset-result) slot-idx))]
+                  (and (= actual-init-seed expected-seed)
+                       (= actual-reset-seed expected-seed)))))

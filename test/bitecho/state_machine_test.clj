@@ -120,3 +120,54 @@
                       (and (= initial-total-supply final-total-supply)
                            (= (- genesis-bal transfer-amt) (:balance (get final-ledger genesis-pub)))
                            (= (+ 1000 transfer-amt) (:balance (get final-ledger node-pub)))))))))
+
+(deftest init-state-epoch-entropy-test
+  (testing "init-state initializes default :epoch-entropy to genesis and seeds basalt-view deterministically"
+    (let [state (sm/init-state [] "my-node-pubkey")
+          expected-seed-0 (basalt/derive-slot-seed "genesis" "my-node-pubkey" 0)]
+      (is (= "genesis" (:epoch-entropy state)))
+      (is (= expected-seed-0 (:seed (first (:basalt-view state)))))))
+
+  (testing "init-state uses custom :epoch-entropy from cfg if provided"
+    (let [cfg (assoc config/default-config :epoch-entropy "custom-entropy-123")
+          state (sm/init-state [] "my-node-pubkey" cfg)
+          expected-seed-0 (basalt/derive-slot-seed "custom-entropy-123" "my-node-pubkey" 0)]
+      (is (= "custom-entropy-123" (:epoch-entropy state)))
+      (is (= expected-seed-0 (:seed (first (:basalt-view state))))))))
+
+(deftest handle-tick-deterministic-slot-reset-test
+  (testing "handle-tick threads epoch-entropy into basalt/reset-slots deterministically"
+    (let [state (sm/init-state [] "my-node-pubkey")
+          idx (:basalt-index state)
+          expected-seed (basalt/derive-slot-seed "genesis" "my-node-pubkey" idx)
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)
+          new-view (:basalt-view new-state)]
+      (is (= "genesis" (:epoch-entropy new-state)))
+      (is (= expected-seed (:seed (nth new-view idx))))))
+
+  (testing "handle-tick updates epoch-entropy when new finalized block is present"
+    (let [state (assoc (sm/init-state [] "my-node-pubkey")
+                       :finalized-blocks ["block-final-hash-99"])
+          idx (:basalt-index state)
+          expected-seed (basalt/derive-slot-seed "block-final-hash-99" "my-node-pubkey" idx)
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)
+          new-view (:basalt-view new-state)]
+      (is (= "block-final-hash-99" (:epoch-entropy new-state)))
+      (is (= expected-seed (:seed (nth new-view idx)))))))
+
+(defspec ^{:doc "Property: State machine basalt slot seeds are deterministic across differing RNG instances."}
+  prop-state-machine-deterministic-entropy 50
+  (prop/for-all [node-pub (gen/not-empty gen/string-alphanumeric)
+                 entropy (gen/not-empty gen/string-alphanumeric)]
+                (let [cfg (assoc config/default-config :epoch-entropy entropy)
+                      state (sm/init-state [] node-pub cfg)
+                      res1 (sm/handle-event state {:type :tick :rng (java.util.Random. 1111)})
+                      res2 (sm/handle-event state {:type :tick :rng (java.util.Random. 9999)})
+                      view1 (:basalt-view (:state res1))
+                      view2 (:basalt-view (:state res2))
+                      seeds1 (mapv :seed view1)
+                      seeds2 (mapv :seed view2)]
+                  ;; The slot seeds must be 100% identical regardless of different RNG seeds!
+                  (= seeds1 seeds2))))

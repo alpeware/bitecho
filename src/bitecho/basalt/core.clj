@@ -51,17 +51,33 @@
     (.put bb pubkey)
     (->Peer ip port (bytes->hex pubkey) (bytes->hex (crypto/sha256 hash-input)))))
 
+(defn derive-slot-seed
+  "Deterministically computes SHA-256(epoch-entropy || node-pubkey || slot-idx).
+   Returns the 64-character lowercase hex string representation.
+   Supports epoch-entropy and node-pubkey as either string or byte array."
+  [epoch-entropy node-pubkey slot-idx]
+  (let [e-bytes (if (bytes? epoch-entropy) epoch-entropy (.getBytes ^String (str epoch-entropy) "UTF-8"))
+        p-bytes (if (bytes? node-pubkey) node-pubkey (.getBytes ^String (str node-pubkey) "UTF-8"))
+        s-bytes (.getBytes ^String (str slot-idx) "UTF-8")
+        total-len (+ (count e-bytes) (count p-bytes) (count s-bytes))
+        bb (java.nio.ByteBuffer/wrap (byte-array total-len))]
+    (.put bb ^bytes e-bytes)
+    (.put bb ^bytes p-bytes)
+    (.put bb ^bytes s-bytes)
+    (bytes->hex (crypto/sha256 (.array bb)))))
+
 (defn rank
   "Calculates the cryptographic rank of a peer for a given slot seed.
    Concatenates the slot seed and the peer's hash, computes SHA-256,
-   and returns the hex string representation."
-  [^String seed ^String peer-hash]
-  (let [seed-bytes (.getBytes seed "UTF-8")
-        hash-bytes (.getBytes peer-hash "UTF-8")
+   and returns the hex string representation.
+   Supports slot seed and peer-hash as either string or byte array."
+  [seed peer-hash]
+  (let [seed-bytes (if (bytes? seed) seed (.getBytes ^String (str seed) "UTF-8"))
+        hash-bytes (if (bytes? peer-hash) peer-hash (.getBytes ^String (str peer-hash) "UTF-8"))
         input (byte-array (+ (count seed-bytes) (count hash-bytes)))
         bb (java.nio.ByteBuffer/wrap input)]
-    (.put bb seed-bytes)
-    (.put bb hash-bytes)
+    (.put bb ^bytes seed-bytes)
+    (.put bb ^bytes hash-bytes)
     (bytes->hex (crypto/sha256 input))))
 
 (defn update-view
@@ -97,15 +113,27 @@
 
 (defn init-view
   "Initializes a new Basalt view (a vector of v slots) from an initial collection of peers.
-   Generates view-size random seeds and immediately populates slots via update-view."
-  [initial-peers view-size ^java.util.Random rng]
-  (let [slots (vec (repeatedly view-size
-                               #(let [seed-bytes (byte-array 32)]
-                                  (.nextBytes rng seed-bytes)
-                                  {:seed (bytes->hex seed-bytes) :peer nil})))]
-    (if (empty? initial-peers)
-      slots
-      (update-view slots initial-peers))))
+   If epoch-entropy and node-pubkey are provided, generates deterministic slot seeds using derive-slot-seed.
+   For backward compatibility, if a Random instance is provided, generates random seeds."
+  ([initial-peers view-size rng]
+   (if (instance? java.util.Random rng)
+     (let [slots (vec (repeatedly view-size
+                                  #(let [seed-bytes (byte-array 32)]
+                                     (.nextBytes ^java.util.Random rng seed-bytes)
+                                     {:seed (bytes->hex seed-bytes) :peer nil})))]
+       (if (empty? initial-peers)
+         slots
+         (update-view slots initial-peers)))
+     (init-view initial-peers view-size (str rng) "genesis")))
+  ([initial-peers view-size epoch-entropy node-pubkey]
+   (let [slots (vec (map-indexed
+                     (fn [idx _]
+                       {:seed (derive-slot-seed epoch-entropy node-pubkey idx)
+                        :peer nil})
+                     (range view-size)))]
+     (if (empty? initial-peers)
+       slots
+       (update-view slots initial-peers)))))
 
 (defn extract-peers
   "Extracts all distinct, non-nil peers currently held in the view's slots."
@@ -119,11 +147,7 @@
             (recur (conj result p) (conj seen h) (rest remaining))))
         result))))
 
-(defn reset-slots
-  "Resets k slots starting at index r (with wrap-around).
-   Yields the previous peers from those slots, generates new random seeds,
-   and repopulates the empty slots using all remaining peers in the view.
-   Returns {:view updated-view :samples extracted-peers :next-r new-r}."
+(defn- reset-slots-rng
   [view ^java.util.Random rng r k]
   (let [size (count view)
         indices (map #(mod (+ r %) size) (range k))
@@ -145,6 +169,42 @@
     {:view updated-view
      :samples samples
      :next-r (mod (+ r k) size)}))
+
+(defn- reset-slots-deterministic
+  [view epoch-entropy node-pubkey r k]
+  (let [size (count view)
+        indices (map #(mod (+ r %) size) (range k))
+        samples (keep :peer (map #(get view %) indices))
+        cleared-view (reduce (fn [v idx]
+                               (let [seed (derive-slot-seed epoch-entropy node-pubkey idx)]
+                                 (assoc v idx {:seed seed :peer nil})))
+                             view
+                             indices)
+        remaining-peers (extract-peers cleared-view)
+        all-peers (reduce (fn [acc peer]
+                            (if (some #(= (:hash %) (:hash peer)) acc)
+                              acc
+                              (conj acc peer)))
+                          remaining-peers
+                          samples)
+        updated-view (update-view cleared-view all-peers)]
+    {:view updated-view
+     :samples samples
+     :next-r (mod (+ r k) size)}))
+
+(defn reset-slots
+  "Resets k slots starting at index r (with wrap-around).
+   Yields the previous peers from those slots, generates new seeds,
+   and repopulates the empty slots using all remaining peers in the view.
+   Supports deterministic seeding via epoch-entropy and node-pubkey,
+   or legacy rng-based seeding.
+   Returns {:view updated-view :samples extracted-peers :next-r new-r}."
+  ([view ^java.util.Random rng r k]
+   (reset-slots-rng view rng r k))
+  ([view a b c d]
+   (if (number? a)
+     (reset-slots-deterministic view c d a b)
+     (reset-slots-deterministic view a b c d))))
 
 (defn select-peers
   "Selects up to k random peers from the view for exchange.
