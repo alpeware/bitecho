@@ -527,8 +527,10 @@
                 ;; the test is injecting valid transfer broadcasts that are getting rejected.
                 (let [unsigned-transfer (into (sorted-map) (dissoc transfer :signature))
                       payload-bytes-check (.getBytes (pr-str unsigned-transfer) "UTF-8")
-                      ;; dummy-verify will always pass, but doing it just in case.
-                      valid-signature? (crypto/verify (:sender transfer) payload-bytes-check (byte-array (map byte (:signature transfer))))]
+                      sender-bytes (if (string? (:sender transfer))
+                                     (basalt/hex->bytes (:sender transfer))
+                                     (:sender transfer))
+                      valid-signature? (crypto/verify sender-bytes payload-bytes-check (byte-array (map byte (:signature transfer))))]
                   (when-not valid-signature?
                     (println "WAIT - Generated transfer signature was invalid before sending?!")))
                 (recur (inc iteration) transfer-hash))))

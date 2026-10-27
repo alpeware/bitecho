@@ -29,7 +29,11 @@
    4. The transfer's signature must be valid."
   [current-state transfer]
   (try
-    (let [valid-seq? (= (:seq transfer) (inc (:seq current-state)))
+    (let [sender (:sender transfer)
+          sender-bytes (if (string? sender)
+                         (basalt/hex->bytes sender)
+                         sender)
+          valid-seq? (= (:seq transfer) (inc (:seq current-state)))
           valid-deps? (= (:deps transfer) (:deps current-state))
           valid-balance? (>= (:balance current-state) (:amount transfer))
 
@@ -38,16 +42,10 @@
           sig-bytes (if (coll? (:signature transfer))
                       (byte-array (map byte (:signature transfer)))
                       (:signature transfer))
-          valid-signature? (crypto/verify (:sender transfer) payload-bytes sig-bytes)]
-
-      (when-not valid-seq? (println "validate-transfer failed: invalid seq." "expected:" (inc (:seq current-state)) "got:" (:seq transfer)))
-      (when-not valid-deps? (println "validate-transfer failed: invalid deps." "expected:" (:deps current-state) "got:" (:deps transfer)))
-      (when-not valid-balance? (println "validate-transfer failed: invalid balance." "current:" (:balance current-state) "transfer amount:" (:amount transfer)))
-      (when-not valid-signature? (println "validate-transfer failed: invalid signature."))
+          valid-signature? (crypto/verify sender-bytes payload-bytes sig-bytes)]
 
       (and valid-seq? valid-deps? valid-balance? valid-signature?))
-    (catch Exception e
-      (println "validate-transfer threw exception:" e)
+    (catch Exception _
       false)))
 
 (defn apply-transfer
@@ -70,8 +68,5 @@
             ledger-after-send (assoc ledger sender new-sender-state)
             receiver-state (get ledger-after-send receiver (map->AccountState {:balance 0 :seq 0 :deps []}))
             new-receiver-state (assoc receiver-state :balance (+ (:balance receiver-state) amount))]
-        (println "✅ apply-transfer executed successfully for seq:" (:seq transfer) "hash generated:" transfer-hash)
         (assoc ledger-after-send receiver new-receiver-state))
-      (do
-        (println "❌ apply-transfer rejected seq:" (:seq transfer))
-        ledger))))
+      ledger)))
