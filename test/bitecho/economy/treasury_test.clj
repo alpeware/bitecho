@@ -2,12 +2,21 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
-            [bitecho.economy.receipt :as receipt]
             [bitecho.economy.treasury :as treasury]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
+
+(defn- create-test-pod-payload
+  [^bytes agent-pub ^bytes agent-priv ^bytes node-pub ^String payload-id]
+  (let [unsigned-claim (into (sorted-map)
+                             {:agent (vec agent-pub)
+                              :node (vec node-pub)
+                              :payload-id payload-id})
+        payload-bytes (.getBytes (pr-str unsigned-claim) "UTF-8")
+        sig (crypto/sign agent-priv payload-bytes)]
+    (assoc unsigned-claim :signature (vec sig))))
 
 (deftest test-process-finalized-blocks-empty
   (testing "Processing an empty list of blocks returns no transfers"
@@ -20,7 +29,7 @@
       (is (empty? (:commands result))))))
 
 (deftest test-process-finalized-blocks-with-receipts
-  (testing "Processing blocks containing PoD receipts generates valid payout transfers"
+  (testing "Processing blocks containing PoD routing claims generates valid payout transfers"
     (let [treasury-kp (crypto/generate-keypair)
           t-pubkey (:public treasury-kp)
           t-privkey (:private treasury-kp)
@@ -35,14 +44,14 @@
           node-kp2 (crypto/generate-keypair)
           node-pub2 (:public node-kp2)
 
-          ;; Create some valid receipts
-          receipt1 (receipt/create-receipt agent-pub agent-priv node-pub1 "payload-1")
-          receipt2 (receipt/create-receipt agent-pub agent-priv node-pub2 "payload-2")
+          ;; Create some valid routing claims
+          claim1 (create-test-pod-payload agent-pub agent-priv node-pub1 "payload-1")
+          claim2 (create-test-pod-payload agent-pub agent-priv node-pub2 "payload-2")
 
-          ;; Create blocks with these receipts as payloads
+          ;; Create blocks with these claims as payloads
           ;; We only care about the :payload field in treasury logic
-          block1 {:epoch 1 :payload [receipt1]}
-          block2 {:epoch 2 :payload [receipt2]}
+          block1 {:epoch 1 :payload [claim1]}
+          block2 {:epoch 2 :payload [claim2]}
           blocks [block1 block2]
 
           start-seq 100
@@ -87,7 +96,7 @@
 
 (defspec ^{:doc "Property: Generated treasury payouts are always valid Account transfers."}
   prop-treasury-payouts-valid 50
-  (prop/for-all [num-receipts (gen/choose 0 10)
+  (prop/for-all [num-claims (gen/choose 0 10)
                  start-seq (gen/choose 1 1000)
                  payout-amount (gen/choose 1 100)]
                 (let [treasury-kp (crypto/generate-keypair)
@@ -98,23 +107,23 @@
                       agent-pub (:public agent-kp)
                       agent-priv (:private agent-kp)
 
-                      node-kps (repeatedly num-receipts crypto/generate-keypair)
-                      receipts (map-indexed (fn [i kp]
-                                              (receipt/create-receipt agent-pub agent-priv (:public kp) (str "payload-" i)))
-                                            node-kps)
-                      ;; distribute receipts somewhat randomly into blocks
-                      blocks (map (fn [rcpts] {:payload rcpts})
-                                  (partition-all 3 receipts))
+                      node-kps (repeatedly num-claims crypto/generate-keypair)
+                      claims (map-indexed (fn [i kp]
+                                            (create-test-pod-payload agent-pub agent-priv (:public kp) (str "payload-" i)))
+                                          node-kps)
+          ;; distribute claims somewhat randomly into blocks
+                      blocks (map (fn [clms] {:payload clms})
+                                  (partition-all 3 claims))
 
                       start-deps ["initial-hash"]
 
                       result (treasury/process-finalized-blocks t-pubkey t-privkey start-seq start-deps blocks payout-amount)
 
-                      ;; Validate sequence increments correctly
-                      expected-end-seq (+ start-seq num-receipts)]
+          ;; Validate sequence increments correctly
+                      expected-end-seq (+ start-seq num-claims)]
                   (and (= expected-end-seq (:seq result))
-                       (= num-receipts (count (:commands result)))
-                       ;; Each generated command should be a valid account transfer if applied to a ledger
+                       (= num-claims (count (:commands result)))
+           ;; Each generated command should be a valid account transfer if applied to a ledger
                        (let [initial-ledger {t-pubkey (account/map->AccountState {:balance 1000000 :seq start-seq :deps start-deps})}
                              final-ledger (reduce account/apply-transfer initial-ledger (:commands result))]
                          (= expected-end-seq (:seq (get final-ledger t-pubkey))))))))
