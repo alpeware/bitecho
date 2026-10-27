@@ -6,6 +6,7 @@
             [bitecho.contagion.core :as contagion]
             [bitecho.economy.account :as account]
             [bitecho.economy.burn :as burn]
+            [bitecho.economy.treasury :as treasury]
             [bitecho.murmur.core :as murmur]
             [bitecho.sieve.core :as sieve]
             [clojure.edn :as edn]
@@ -57,6 +58,8 @@
       :sieve-delivered-set #{}
       :local-ready-set #{}
       :delivered-set #{}
+      :total-minted 0
+      :minted-epochs #{}
       :ledger (or genesis-ledger {})})))
 
 (defn- handle-tick
@@ -481,7 +484,9 @@
             state))
         (catch Exception _
           state))
-      state)))
+      (if (and (map? payload-edn) (or (:mint payload-edn) (= :epoch-mint (:type payload-edn))))
+        (treasury/apply-epoch-mint state (or (:mint payload-edn) payload-edn))
+        state))))
 
 (defn- handle-receive-contagion-ready
   "Handles an incoming Contagion Ready message.
@@ -575,6 +580,12 @@
          :commands []})
       {:state state :commands []})))
 
+(defn- handle-epoch-mint
+  "Handles an authorized epoch mint event, applying demand-gated mint allocations."
+  [state event]
+  (let [new-state (treasury/apply-epoch-mint state event)]
+    {:state new-state :commands []}))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
@@ -584,6 +595,8 @@
     :tick (handle-tick state event)
     :broadcast (handle-broadcast state event)
     :signaling-burn (handle-signaling-burn state event)
+    :epoch-mint (handle-epoch-mint state event)
+    :apply-epoch-mint (handle-epoch-mint state event)
     :receive-push-view (handle-receive-push-view state event)
     :receive-summary (handle-receive-summary state event)
     :receive-subscribe (handle-receive-subscribe state event)

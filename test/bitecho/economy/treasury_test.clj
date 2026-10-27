@@ -233,3 +233,115 @@
                        (= 4200000000 (:balance (get ledger (str "ecosystem-" e-suffix))))
                        (every? #(and (= 0 (:seq %)) (= [] (:deps %))) (vals ledger))))))
 
+(deftest supply-constants-test
+  (testing "Canonical v2.1 supply constants match hard cap and split"
+    (is (= 42000000000 treasury/hard-cap))
+    (is (= 18900000000 treasury/genesis-custody-supply))
+    (is (= 23100000000 treasury/max-conditional-mint-supply))
+    (is (= treasury/hard-cap (+ treasury/genesis-custody-supply treasury/max-conditional-mint-supply)))))
+
+(deftest apply-epoch-mint-test
+  (let [t-kp (crypto/generate-keypair)
+        t-pub (basalt/bytes->hex (:public t-kp))
+        t-priv (:private t-kp)
+        base-state {:ledger {}
+                    :total-minted 0
+                    :minted-epochs #{}}]
+    (testing "Applies valid epoch mint and increments :total-minted by exact distributed sum"
+      (let [allocs {"node1" 500 "node2" 300}
+            res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                       :epoch-gate 1000
+                                                       :allocations allocs})]
+        (is (= 800 (:total-minted res)))
+        (is (contains? (:minted-epochs res) 1))
+        (is (= 500 (:balance (get-in res [:ledger "node1"]))))
+        (is (= 300 (:balance (get-in res [:ledger "node2"]))))))
+
+    (testing "Rounding dust: only actual distributed sum is minted, never phantom gate amount"
+      (let [allocs {"node1" 499 "node2" 499}
+            res (treasury/apply-epoch-mint base-state {:epoch 2
+                                                       :epoch-gate 1000
+                                                       :allocations allocs})]
+        (is (= 998 (:total-minted res)))
+        (is (= 998 (reduce + 0 (map :balance (vals (:ledger res))))))))
+
+    (testing "Double-mint of same epoch is rejected in full"
+      (let [state-epoch-1 (assoc base-state :minted-epochs #{1} :total-minted 500)
+            res (treasury/apply-epoch-mint state-epoch-1 {:epoch 1
+                                                          :epoch-gate 1000
+                                                          :allocations {"node1" 100}})]
+        (is (= state-epoch-1 res))))
+
+    (testing "Rejects mint exceeding epoch demand gate M_t"
+      (let [res (treasury/apply-epoch-mint base-state {:epoch 3
+                                                       :epoch-gate 500
+                                                       :allocations {"node1" 600}})]
+        (is (= base-state res))))
+
+    (testing "Rejects mint exceeding max-conditional-mint-supply (23.1B hard cap limit)"
+      (let [state-near-cap (assoc base-state :total-minted (- treasury/max-conditional-mint-supply 100))
+            res (treasury/apply-epoch-mint state-near-cap {:epoch 4
+                                                           :epoch-gate 200
+                                                           :allocations {"node1" 150}})]
+        (is (= state-near-cap res))))
+
+    (testing "Rejects when any allocation amount is negative"
+      (let [res (treasury/apply-epoch-mint base-state {:epoch 5
+                                                       :epoch-gate 1000
+                                                       :allocations {"node1" 500 "node2" -50}})]
+        (is (= base-state res))))
+
+    (testing "Verifies cryptographic signature when treasury-pubkey and signature are provided"
+      (let [allocs {"node1" 400}
+            sig (treasury/sign-epoch-mint t-priv 6 allocs)
+            valid-ctx {:epoch 6
+                       :epoch-gate 500
+                       :allocations allocs
+                       :treasury-pubkey t-pub
+                       :signature sig}
+            valid-res (treasury/apply-epoch-mint base-state valid-ctx)]
+        (is (= 400 (:total-minted valid-res)))
+        (is (contains? (:minted-epochs valid-res) 6))
+        (is (= 400 (:balance (get-in valid-res [:ledger "node1"])))))
+
+      (testing "Rejects when signature is tampered"
+        (let [allocs {"node1" 400}
+              sig (treasury/sign-epoch-mint t-priv 6 allocs)
+              tampered-sig (str "ff" (subs sig 2))
+              invalid-ctx {:epoch 6
+                           :epoch-gate 500
+                           :allocations allocs
+                           :treasury-pubkey t-pub
+                           :signature tampered-sig}
+              invalid-res (treasury/apply-epoch-mint base-state invalid-ctx)]
+          (is (= base-state invalid-res)))))))
+
+(defspec ^{:doc "Property: apply-epoch-mint strictly respects demand gate, hard cap, and never phantom-mints rounding dust"}
+  prop-apply-epoch-mint-invariants 50
+  (prop/for-all [epoch (gen/choose 1 1000)
+                 gate (gen/choose 100 5000)
+                 alloc-pct-1 (gen/choose 10 40)
+                 alloc-pct-2 (gen/choose 10 40)
+                 attempt-overflow? gen/boolean]
+                (let [base-state {:ledger {}
+                                  :total-minted 0
+                                  :minted-epochs #{}}
+                      amt-1 (quot (* gate alloc-pct-1) 100)
+                      amt-2 (quot (* gate alloc-pct-2) 100)
+                      allocs (if attempt-overflow?
+                               {"n1" (+ gate 100)}
+                               {"n1" amt-1 "n2" amt-2})
+                      ctx {:epoch epoch
+                           :epoch-gate gate
+                           :allocations allocs}
+                      res (treasury/apply-epoch-mint base-state ctx)]
+                  (if attempt-overflow?
+                    (= base-state res)
+                    (let [actual-sum (+ amt-1 amt-2)]
+                      (and (<= (:total-minted res) gate)
+                           (<= (:total-minted res) treasury/max-conditional-mint-supply)
+                           (= actual-sum (:total-minted res))
+                           (= actual-sum (reduce + 0 (map :balance (vals (:ledger res)))))
+                           (contains? (:minted-epochs res) epoch)))))))
+
+

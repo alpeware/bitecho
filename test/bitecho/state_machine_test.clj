@@ -333,3 +333,87 @@
                        (if (contains? entries node-id)
                          (some? (get (:ledger state) node-id))
                          (nil? (get (:ledger state) node-id)))))))
+
+(deftest test-state-machine-mint-and-custody
+  (testing "init-state initializes :total-minted to 0 and :minted-epochs to #{}"
+    (let [state (sm/init-state [] "my-node")]
+      (is (= 0 (:total-minted state)))
+      (is (= #{} (:minted-epochs state)))))
+
+  (testing "State machine processes :epoch-mint event and credits receivers"
+    (let [state (sm/init-state [] "my-node")
+          event {:type :epoch-mint
+                 :epoch 1
+                 :epoch-gate 1000
+                 :allocations {"node1" 600 "node2" 400}}
+          res (sm/handle-event state event)
+          new-state (:state res)]
+      (is (= 1000 (:total-minted new-state)))
+      (is (= #{1} (:minted-epochs new-state)))
+      (is (= 600 (:balance (get-in new-state [:ledger "node1"]))))
+      (is (= 400 (:balance (get-in new-state [:ledger "node2"]))))))
+
+  (testing "State machine rejects duplicate :epoch-mint event for same epoch"
+    (let [state (assoc (sm/init-state [] "my-node")
+                       :total-minted 1000
+                       :minted-epochs #{1})
+          event {:type :epoch-mint
+                 :epoch 1
+                 :epoch-gate 1000
+                 :allocations {"node1" 500}}
+          res (sm/handle-event state event)]
+      (is (= state (:state res)))))
+
+  (testing "Custody drawdown via transfer debits custody balance and never increments :total-minted"
+    (let [custody-kp (crypto/generate-keypair)
+          custody-pub (basalt/bytes->hex (:public custody-kp))
+          receiver-pub "partner-pub"
+          genesis-ledger {custody-pub (account/map->AccountState {:balance 5000 :seq 0 :deps []})}
+          cfg (assoc config/default-config :genesis-ledger genesis-ledger)
+          state (sm/init-state [] "my-node" cfg)
+          unsigned-tx {:sender custody-pub
+                       :receiver receiver-pub
+                       :amount 1500
+                       :seq 1
+                       :deps []}
+          tx (account/create-transfer (:private custody-kp) unsigned-tx)
+          payload (.getBytes (pr-str {:id "custody-tx" :transfer tx}) "UTF-8")
+          res (sm/handle-event state {:type :on-deliver :payload payload :message-id "custody-tx"})
+          new-state (:state res)]
+      (is (= 3500 (:balance (get-in new-state [:ledger custody-pub]))))
+      (is (= 1500 (:balance (get-in new-state [:ledger receiver-pub]))))
+      (is (= 0 (:total-minted new-state)))
+      (is (= #{} (:minted-epochs new-state))))))
+
+(defspec ^{:doc "Property: Custody drawdowns never increment :total-minted while valid mints increment :total-minted by exact distributed sum"}
+  prop-mint-and-custody-conservation 50
+  (prop/for-all [custody-bal (gen/choose 1000 50000)
+                 drawdown-amt (gen/choose 100 1000)
+                 mint-amt (gen/choose 100 2000)]
+                (let [custody-kp (crypto/generate-keypair)
+                      custody-pub (basalt/bytes->hex (:public custody-kp))
+                      receiver-pub "partner-node"
+                      cfg (assoc config/default-config
+                                 :genesis-ledger {custody-pub (account/map->AccountState {:balance custody-bal :seq 0 :deps []})})
+                      state (sm/init-state [] "my-node" cfg)
+                      unsigned-tx {:sender custody-pub
+                                   :receiver receiver-pub
+                                   :amount drawdown-amt
+                                   :seq 1
+                                   :deps []}
+                      tx (account/create-transfer (:private custody-kp) unsigned-tx)
+                      payload (.getBytes (pr-str {:id "tx-drawdown" :transfer tx}) "UTF-8")
+                      res-drawdown (sm/handle-event state {:type :on-deliver :payload payload :message-id "tx-drawdown"})
+                      state-after-drawdown (:state res-drawdown)
+                      mint-event {:type :epoch-mint
+                                  :epoch 1
+                                  :epoch-gate (* mint-amt 2)
+                                  :allocations {"mesh-node" mint-amt}}
+                      res-mint (sm/handle-event state-after-drawdown mint-event)
+                      final-state (:state res-mint)]
+                  (and (= 0 (:total-minted state-after-drawdown))
+                       (= (- custody-bal drawdown-amt) (:balance (get-in state-after-drawdown [:ledger custody-pub])))
+                       (= mint-amt (:total-minted final-state))
+                       (= mint-amt (:balance (get-in final-state [:ledger "mesh-node"])))
+                       (contains? (:minted-epochs final-state) 1)))))
+

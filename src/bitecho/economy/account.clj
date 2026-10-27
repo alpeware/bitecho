@@ -70,3 +70,30 @@
             new-receiver-state (assoc receiver-state :balance (+ (:balance receiver-state) amount))]
         (assoc ledger-after-send receiver new-receiver-state))
       ledger)))
+
+(defn apply-mint
+  "Applies mint allocations to the given ledger.
+   Can accept [ledger receiver amount] for a single credit,
+   or [ledger allocations] where allocations is a map of {receiver -> amount}.
+   Credits receivers (creating zero-balance AccountState if absent).
+   If any amount is negative, returns the ledger unmodified."
+  ([ledger receiver amount]
+   (if (and (string? receiver) (integer? amount) (not (neg? amount)))
+     (if (zero? amount)
+       ledger
+       (let [curr-state (get ledger receiver (map->AccountState {:balance 0 :seq 0 :deps []}))
+             new-state (assoc curr-state :balance (+ (:balance curr-state) amount))]
+         (assoc ledger receiver new-state)))
+     ledger))
+  ([ledger allocations]
+   (if (some (fn [[_ amt]] (or (not (integer? amt)) (neg? amt))) allocations)
+     ledger
+     (reduce-kv
+      (fn [l recv amt]
+        (if (pos? amt)
+          (let [curr-state (get l recv (map->AccountState {:balance 0 :seq 0 :deps []}))]
+            (assoc l recv (assoc curr-state :balance (+ (:balance curr-state) amt))))
+          l))
+      ledger
+      allocations))))
+

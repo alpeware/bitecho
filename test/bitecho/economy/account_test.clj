@@ -324,3 +324,47 @@
                    (let [tampered-amount-tx (assoc tx :amount (inc transfer-amount))]
                      (and (false? (account/validate-transfer sender-state tampered-amount-tx))
                           (= ledger (account/apply-transfer ledger tampered-amount-tx))))))))
+
+(deftest apply-mint-test
+  (testing "apply-mint credits receiver without requiring a funded sender"
+    (let [ledger {}
+          res (account/apply-mint ledger "recv1" 500)]
+      (is (= 500 (:balance (get res "recv1"))))
+      (is (= 0 (:seq (get res "recv1"))))
+      (is (= [] (:deps (get res "recv1"))))))
+
+  (testing "apply-mint increments existing account balance without altering seq or deps"
+    (let [ledger {"recv1" (account/map->AccountState {:balance 300 :seq 2 :deps ["tx-1"]})}
+          res (account/apply-mint ledger "recv1" 200)]
+      (is (= 500 (:balance (get res "recv1"))))
+      (is (= 2 (:seq (get res "recv1"))))
+      (is (= ["tx-1"] (:deps (get res "recv1"))))))
+
+  (testing "apply-mint accepts multi-recipient allocation map"
+    (let [ledger {"recv1" (account/map->AccountState {:balance 100 :seq 0 :deps []})}
+          res (account/apply-mint ledger {"recv1" 50 "recv2" 200})]
+      (is (= 150 (:balance (get res "recv1"))))
+      (is (= 200 (:balance (get res "recv2"))))))
+
+  (testing "apply-mint rejects negative or non-integer amounts and leaves ledger unchanged"
+    (let [ledger {"recv1" (account/map->AccountState {:balance 100 :seq 0 :deps []})}]
+      (is (= ledger (account/apply-mint ledger "recv1" -50)))
+      (is (= ledger (account/apply-mint ledger {"recv1" 50 "recv2" -10}))))))
+
+(defspec ^{:doc "Property: apply-mint strictly increases ledger balances by exact allocation amounts without creating or destroying funds elsewhere"}
+  prop-apply-mint-invariants 50
+  (prop/for-all [initial-bal (gen/choose 0 5000)
+                 mint-amt-1 (gen/choose 1 1000)
+                 mint-amt-2 (gen/choose 1 1000)]
+                (let [ledger {"recv1" (account/map->AccountState {:balance initial-bal :seq 1 :deps ["dep1"]})}
+                      allocs {"recv1" mint-amt-1 "recv2" mint-amt-2}
+                      updated (account/apply-mint ledger allocs)]
+                  (and (= (+ initial-bal mint-amt-1) (:balance (get updated "recv1")))
+                       (= mint-amt-2 (:balance (get updated "recv2")))
+                       (= (+ initial-bal mint-amt-1 mint-amt-2)
+                          (reduce + 0 (map :balance (vals updated))))
+                       (= 1 (:seq (get updated "recv1")))
+                       (= ["dep1"] (:deps (get updated "recv1")))
+                       (= 0 (:seq (get updated "recv2")))
+                       (= [] (:deps (get updated "recv2")))))))
+

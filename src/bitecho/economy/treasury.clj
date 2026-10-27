@@ -20,6 +20,18 @@
   "Percentage of demand-gated mint allocated to attested mesh routing nodes (80%)."
   80)
 
+(def hard-cap
+  "Canonical v2.1 hard supply cap: 42,000,000,000 ECHO."
+  42000000000)
+
+(def genesis-custody-supply
+  "Canonical v2.1 Genesis custody supply: 18,900,000,000 ECHO (45% pre-minted)."
+  18900000000)
+
+(def max-conditional-mint-supply
+  "Canonical v2.1 maximum conditional mintable supply: 23,100,000,000 ECHO (55% conditional mint)."
+  23100000000)
+
 (defn calculate-trailing-revenue
   "Calculates average trailing burn revenue over N epochs:
      R_trailing = (quot (reduce + trailing-N-burns) N)
@@ -223,4 +235,74 @@
        m))
    {}
    genesis-custody-shares))
+
+(defn sign-epoch-mint
+  "Cryptographically signs an epoch mint context using the treasury private key."
+  [treasury-priv epoch allocations]
+  (let [sorted-allocs (into (sorted-map) allocations)
+        payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")
+        priv-bytes (if (string? treasury-priv) (basalt/hex->bytes treasury-priv) treasury-priv)
+        sig-bytes (crypto/sign priv-bytes payload-bytes)]
+    (basalt/bytes->hex sig-bytes)))
+
+(defn apply-epoch-mint
+  "Applies an authorized, capped epoch demand-gated mint to state.
+   Rejects in full (leaving :ledger, :total-minted, and :minted-epochs unchanged) if:
+     - epoch is already in :minted-epochs (double-mint rejected);
+     - total requested mint exceeds epoch-gate (M_t);
+     - total-minted + actual-minted exceeds max-conditional-mint-supply (23.1B);
+     - any allocation amount is negative or signature is invalid when signature verification is required.
+   Increments :total-minted by the actual distributed sum (excluding rounding dust),
+   credits receivers in :ledger (creating zero-balance AccountState if absent),
+   and records epoch in :minted-epochs."
+  ([state mint-ctx]
+   (let [epoch (:epoch mint-ctx)
+         minted-epochs (or (:minted-epochs state) #{})
+         allocations-raw (or (:allocations mint-ctx) {})
+         allocations (if (map? allocations-raw)
+                       allocations-raw
+                       (into {} (map (fn [item] [(:receiver item) (:amount item)]) allocations-raw)))
+         epoch-gate (:epoch-gate mint-ctx)
+         total-minted (or (:total-minted state) 0)
+         pubkey (:treasury-pubkey mint-ctx)
+         sig (:signature mint-ctx)]
+     (cond
+       ;; 1. Epoch must be present and not already minted
+       (or (nil? epoch) (contains? minted-epochs epoch))
+       state
+
+       ;; 2. Allocations must be valid integers and non-negative
+       (some (fn [[_ amt]] (or (not (integer? amt)) (neg? amt))) allocations)
+       state
+
+       ;; 3. Check signature authorization if signature is provided
+       (and pubkey sig
+            (let [pub-bytes (if (string? pubkey) (basalt/hex->bytes pubkey) pubkey)
+                  sig-bytes (if (string? sig) (basalt/hex->bytes sig) (byte-array (map byte sig)))
+                  sorted-allocs (into (sorted-map) allocations)
+                  payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
+              (not (crypto/verify pub-bytes payload-bytes sig-bytes))))
+       state
+
+       :else
+       (let [actual-minted (reduce + 0 (vals allocations))]
+         (cond
+           ;; 4. Check epoch gate M_t
+           (and (some? epoch-gate) (> actual-minted epoch-gate))
+           state
+
+           ;; 5. Check hard supply cap (max-conditional-mint-supply)
+           (> (+ total-minted actual-minted) max-conditional-mint-supply)
+           state
+
+           ;; Valid: apply mint allocations
+           :else
+           (let [new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
+             (-> state
+                 (assoc :ledger new-ledger)
+                 (assoc :total-minted (+ total-minted actual-minted))
+                 (update :minted-epochs (fnil conj #{}) epoch))))))))
+  ([state epoch epoch-gate allocations]
+   (apply-epoch-mint state {:epoch epoch :epoch-gate epoch-gate :allocations allocations})))
+
 
