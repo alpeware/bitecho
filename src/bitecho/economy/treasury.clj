@@ -265,15 +265,23 @@
                            :custody-pubkey custody-pub
                            :custody-balance effective-custody-bal
                            :allocations (if sunset? [] (:custody-allocations treasury-ctx))
-                           :start-seq (:seq mint-res)
-                           :start-deps (:deps mint-res))
+                           :start-seq (if (and ledger custody-pub)
+                                        (get-in ledger [custody-pub :seq] 0)
+                                        (:seq mint-res))
+                           :start-deps (if (and ledger custody-pub)
+                                         (get-in ledger [custody-pub :deps] [])
+                                         (:deps mint-res)))
         custody-res (if (and custody-pub
                              (:custody-privkey custody-ctx)
                              (seq (:allocations custody-ctx)))
                       (process-bootstrap-custody custody-ctx)
                       {:remaining-balance effective-custody-bal
-                       :seq (:seq mint-res)
-                       :deps (:deps mint-res)
+                       :seq (if (and ledger custody-pub)
+                              (get-in ledger [custody-pub :seq] 0)
+                              (:seq mint-res))
+                       :deps (if (and ledger custody-pub)
+                               (get-in ledger [custody-pub :deps] [])
+                               (:deps mint-res))
                        :commands []})
         updated-ledger (when ledger
                          (let [l (if sunset? (burn-unspent-bootstrap-custody ledger custody-pub) ledger)]

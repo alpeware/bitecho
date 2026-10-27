@@ -19,6 +19,7 @@
             [bitecho.state-machine-test]
             [bitecho.streamlet.core-test]
             [bitecho.streamlet.fuzz-test]
+            [bitecho.tokenomics-v2-e2e-test]
             [clojure.test :as t]))
 
 (defn -main
