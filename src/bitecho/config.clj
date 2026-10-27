@@ -20,6 +20,9 @@
   "Default protocol parameters for small / test networks."
   {;; Genesis ledger (hex pubkey -> AccountState)
    :genesis-ledger        {}
+   ;; Treasury / Tokenomics parameters
+   :epoch-length-ms       3600000
+   :treasury-trailing-epochs 168
    ;; Murmur — epidemic gossip fanout (G in the paper)
    :murmur-k              5
    ;; Maximum number of seen message IDs kept in the Murmur cache

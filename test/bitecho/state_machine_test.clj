@@ -5,6 +5,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
             [bitecho.economy.burn :as burn]
+            [bitecho.economy.treasury :as treasury]
             [bitecho.state-machine :as sm]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -416,4 +417,90 @@
                        (= mint-amt (:total-minted final-state))
                        (= mint-amt (:balance (get-in final-state [:ledger "mesh-node"])))
                        (contains? (:minted-epochs final-state) 1)))))
+
+(deftest test-state-machine-tick-treasury-epoch
+  (testing "init-state initializes :epoch-settlement-takes to {}"
+    (let [state (sm/init-state [] "my-node")]
+      (is (= {} (:epoch-settlement-takes state)))))
+
+  (testing "handle-tick processes epoch boundary: calculates trailing revenue with zero-padding, mints 20/80 split"
+    (let [val-pub "validator-node-1"
+          mesh-pub "mesh-routing-node-1"
+          cfg (assoc config/default-config
+                     :treasury-trailing-epochs 168
+                     :validators [val-pub]
+                     :mesh-nodes {mesh-pub 1.0})
+          state (assoc (sm/init-state [] "my-node" cfg)
+                       :epoch 0
+                       :epoch-burns {0 16800}
+                       :epoch-settlement-takes {})
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)]
+      (is (= 1 (:epoch new-state)))
+      ;; Trailing revenue over 168 epochs with zero-padding is 16800 / 168 = 100.
+      ;; Demand-gated mint M_t = 100 * 50% = 50.
+      ;; Split: 20% Streamlet (10), 80% Mesh (40).
+      (is (= 50 (:total-minted new-state)))
+      (is (contains? (:minted-epochs new-state) 1))
+      (is (= 10 (:balance (get-in new-state [:ledger val-pub]))))
+      (is (= 40 (:balance (get-in new-state [:ledger mesh-pub]))))))
+
+  (testing "handle-tick executes custody drawdowns from :ledger without increasing :total-minted"
+    (let [custody-kp (crypto/generate-keypair)
+          custody-pub (basalt/bytes->hex (:public custody-kp))
+          custody-priv (:private custody-kp)
+          cfg (assoc config/default-config
+                     :genesis-ledger {custody-pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})}
+                     :custody-pubkey custody-pub
+                     :custody-privkey custody-priv
+                     :custody-allocations [{:receiver "grantee-x" :amount 2500}])
+          state (sm/init-state [] "my-node" cfg)
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)]
+      (is (= 7500 (:balance (get-in new-state [:ledger custody-pub]))))
+      (is (= 2500 (:balance (get-in new-state [:ledger "grantee-x"]))))
+      (is (= 0 (:total-minted new-state)))))
+
+  (testing "handle-tick executes bootstrap sunset burn when reaching bootstrap-sunset-epoch"
+    (let [custody-pub "sunset-custody-pub"
+          cfg (assoc config/default-config
+                     :genesis-ledger {custody-pub (account/map->AccountState {:balance 5000 :seq 0 :deps []})}
+                     :custody-pubkey custody-pub
+                     :bootstrap-sunset-epoch 3)
+          state (assoc (sm/init-state [] "my-node" cfg) :epoch 2)
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)]
+      (is (= 3 (:epoch new-state)))
+      (is (= 0 (:balance (get-in new-state [:ledger custody-pub]))))
+      (is (= 0 (:total-minted new-state))))))
+
+(defspec ^{:doc "Property: Across state machine ticks and burns, total-minted is bounded by max-conditional-mint-supply and custody releases never increase total-minted"}
+  prop-state-machine-epoch-tick-invariants 50
+  (prop/for-all [burn-amt (gen/choose 1000 50000)
+                 custody-amt (gen/choose 500 5000)]
+                (let [custody-kp (crypto/generate-keypair)
+                      custody-pub (basalt/bytes->hex (:public custody-kp))
+                      custody-priv (:private custody-kp)
+                      cfg (assoc config/default-config
+                                 :treasury-trailing-epochs 10
+                                 :validators ["v-node"]
+                                 :mesh-nodes {"m-node" 1.0}
+                                 :genesis-ledger {custody-pub (account/map->AccountState {:balance 20000 :seq 0 :deps []})}
+                                 :custody-pubkey custody-pub
+                                 :custody-privkey custody-priv
+                                 :custody-allocations [{:receiver "grantee-y" :amount custody-amt}])
+                      state (assoc (sm/init-state [] "my-node" cfg)
+                                   :epoch 0
+                                   :epoch-burns {0 burn-amt})
+                      res (sm/handle-event state {:type :tick :rng (java.util.Random. 123)})
+                      new-state (:state res)
+                      r-trailing (quot burn-amt 10)
+                      expected-mint (quot (* r-trailing 5000) 10000)]
+                  (and (= 1 (:epoch new-state))
+                       (contains? (:minted-epochs new-state) 1)
+                       (<= (:total-minted new-state) expected-mint)
+                       (<= (:total-minted new-state) treasury/max-conditional-mint-supply)
+                       (= (- 20000 custody-amt) (:balance (get-in new-state [:ledger custody-pub])))
+                       (= custody-amt (:balance (get-in new-state [:ledger "grantee-y"])))))))
+
 

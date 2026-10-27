@@ -2,6 +2,7 @@
   "Tests for demand-gated treasury minting, 20/80 split, and Genesis Bootstrap custody."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.account :as account]
             [bitecho.economy.attestation :as attestation]
             [bitecho.economy.treasury :as treasury]
             [clojure.test :refer [deftest is testing]]
@@ -343,5 +344,118 @@
                            (= actual-sum (:total-minted res))
                            (= actual-sum (reduce + 0 (map :balance (vals (:ledger res)))))
                            (contains? (:minted-epochs res) epoch)))))))
+
+(deftest extract-trailing-revenues-test
+  (testing "extract-trailing-revenues extracts N preceding epochs with zero-padding"
+    (let [state {:epoch-burns {0 1000 1 2000}
+                 :epoch-settlement-takes {1 500}
+                 :config {:treasury-trailing-epochs 3}}
+          revs (treasury/extract-trailing-revenues state 2 3)]
+      ;; For current-epoch 2 and n 3: preceding epochs are -1 (pad 0), 0 (1000), 1 (2500)
+      (is (= [0 1000 2500] revs))
+      (is (= 1166 (treasury/calculate-trailing-revenue revs 3)))))
+
+  (testing "Zero-padded initial window prevents single revenue spike from minting above N-epoch gate"
+    (let [state {:epoch-burns {0 16800}
+                 :epoch-settlement-takes {}
+                 :config {:treasury-trailing-epochs 168}}
+          revs (treasury/extract-trailing-revenues state 1 168)
+          r-trailing (treasury/calculate-trailing-revenue revs 168)
+          m-t (treasury/calculate-demand-gated-mint r-trailing)]
+      (is (= 168 (count revs)))
+      (is (= 16800 (last revs)))
+      (is (every? zero? (butlast revs)))
+      (is (= 100 r-trailing) "Average over 168 epochs with zero-padding is 100, not 16800")
+      (is (= 50 m-t) "Mint is capped at 50 ECHO (0.5 * 100), preventing spike exploit"))))
+
+(deftest burn-unspent-bootstrap-custody-test
+  (let [custody-pub "custody-bootstrap-pub"
+        other-pub "other-node-pub"
+        ledger {custody-pub (account/map->AccountState {:balance 50000 :seq 10 :deps ["h1"]})
+                other-pub (account/map->AccountState {:balance 2000 :seq 1 :deps ["h0"]})}]
+    (testing "Zeroes out unspent bootstrap custody balance in ledger without touching other accounts"
+      (let [new-ledger (treasury/burn-unspent-bootstrap-custody ledger custody-pub)]
+        (is (= 0 (:balance (get new-ledger custody-pub))))
+        (is (= 10 (:seq (get new-ledger custody-pub))))
+        (is (= 2000 (:balance (get new-ledger other-pub))))))
+
+    (testing "Safely handles missing or zero balance custody account"
+      (is (= ledger (treasury/burn-unspent-bootstrap-custody ledger "non-existent-pub")))
+      (let [zero-ledger (assoc-in ledger [custody-pub :balance] 0)]
+        (is (= zero-ledger (treasury/burn-unspent-bootstrap-custody zero-ledger custody-pub)))))))
+
+(deftest process-treasury-epoch-v2-test
+  (testing "Caps epoch mint by remaining conditional mint room"
+    (let [near-cap (- treasury/max-conditional-mint-supply 300)
+          ctx {:trailing-burns [20000 20000]
+               :n-epochs 2
+               :total-minted near-cap
+               :validators ["val1"]
+               :mesh-nodes {"mesh1" 1.0}}
+          res (treasury/process-treasury-epoch ctx)]
+      (is (= 10000 (treasury/calculate-demand-gated-mint (:r-trailing res))))
+      (is (= 300 (:epoch-mint res)) "Capped by remaining 300 ECHO to hard cap")
+      (is (= 60 (:m-streamlet res)))
+      (is (= 240 (:m-mesh res)))))
+
+  (testing "Explicit dust accounting: actual-minted + mint-dust == epoch-mint"
+    (let [ctx {:trailing-burns [1000]
+               :n-epochs 1
+               ;; m-t will be 500. Split: streamlet 100, mesh 400.
+               ;; 3 validators share 100 -> 33 each (99 total, 1 dust).
+               ;; 3 mesh nodes share 400 -> 133 each (399 total, 1 dust).
+               :validators ["v1" "v2" "v3"]
+               :mesh-nodes ["m1" "m2" "m3"]}
+          res (treasury/process-treasury-epoch ctx)]
+      (is (= 500 (:epoch-mint res)))
+      (is (= 498 (:actual-minted res)))
+      (is (= 2 (:mint-dust res)))
+      (is (= (:epoch-mint res) (+ (:actual-minted res) (:mint-dust res))))))
+
+  (testing "Reads custody balance directly from :ledger and applies custody transfers to :ledger"
+    (let [custody-kp (crypto/generate-keypair)
+          c-pub (basalt/bytes->hex (:public custody-kp))
+          c-priv (:private custody-kp)
+          ledger {c-pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})}
+          ctx {:ledger ledger
+               :custody-pubkey c-pub
+               :custody-privkey c-priv
+               :custody-allocations [{:receiver "grantee-1" :amount 2500}]}
+          res (treasury/process-treasury-epoch ctx)
+          res-ledger (:ledger res)]
+      (is (= 7500 (:remaining-custody-balance res)))
+      (is (= 7500 (:balance (get res-ledger c-pub))))
+      (is (= 2500 (:balance (get res-ledger "grantee-1"))))))
+
+  (testing "Applies bootstrap sunset burn when epoch reaches or exceeds bootstrap-sunset-epoch"
+    (let [custody-pub "custody-sunset-pub"
+          ledger {custody-pub (account/map->AccountState {:balance 8000 :seq 0 :deps []})}
+          ctx {:epoch 100
+               :bootstrap-sunset-epoch 100
+               :ledger ledger
+               :custody-pubkey custody-pub}
+          res (treasury/process-treasury-epoch ctx)]
+      (is (= 0 (:balance (get (:ledger res) custody-pub))))
+      (is (= 0 (:remaining-custody-balance res))))))
+
+(defspec ^{:doc "Property: Rounding dust and hard cap are strictly conserved: actual-minted + mint-dust == epoch-mint and total-minted + actual-minted <= max-conditional-mint-supply"}
+  prop-dust-and-cap-conservation 50
+  (prop/for-all [burns (gen/vector (gen/choose 0 10000) 1 10)
+                 minted-so-far (gen/choose (- treasury/max-conditional-mint-supply 10000)
+                                           treasury/max-conditional-mint-supply)]
+                (let [ctx {:trailing-burns burns
+                           :n-epochs (count burns)
+                           :total-minted minted-so-far
+                           :validators ["val1" "val2" "val3"]
+                           :mesh-nodes {"m1" 1.0 "m2" 2.0}}
+                      res (treasury/process-treasury-epoch ctx)
+                      actual-minted (:actual-minted res)
+                      mint-dust (:mint-dust res)
+                      epoch-mint (:epoch-mint res)]
+                  (and (= epoch-mint (+ actual-minted mint-dust))
+                       (<= (+ minted-so-far actual-minted) treasury/max-conditional-mint-supply)
+                       (>= mint-dust 0)
+                       (>= actual-minted 0)))))
+
 
 

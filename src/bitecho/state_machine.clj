@@ -37,6 +37,7 @@
       :epoch 0
       :epoch-entropy epoch-entropy
       :epoch-burns {}
+      :epoch-settlement-takes {}
       :basalt-index 0
       :basalt-view (basalt/init-view initial-peers view-size epoch-entropy node-pubkey)
       :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
@@ -61,6 +62,46 @@
       :total-minted 0
       :minted-epochs #{}
       :ledger (or genesis-ledger {})})))
+
+(defn- build-tick-treasury-ctx
+  "Extracts trailing revenues and builds the treasury context for an epoch tick boundary."
+  [state new-epoch cfg]
+  (let [n (or (:treasury-trailing-epochs cfg) 168)
+        trailing-revs (treasury/extract-trailing-revenues state new-epoch n)
+        custody-pk (or (:custody-pubkey state) (:custody-pubkey cfg))
+        custody-sk (or (:custody-privkey state) (:custody-privkey cfg))]
+    {:epoch new-epoch
+     :n-epochs n
+     :trailing-burns trailing-revs
+     :total-minted (or (:total-minted state) 0)
+     :ledger (or (:ledger state) {})
+     :validators (or (:validators state) (:validators cfg))
+     :mesh-nodes (or (:mesh-nodes state) (:mesh-nodes cfg))
+     :custody-pubkey custody-pk
+     :custody-privkey custody-sk
+     :custody-allocations (or (:custody-allocations state) (:custody-allocations cfg))
+     :bootstrap-sunset-epoch (or (:bootstrap-sunset-epoch state) (:bootstrap-sunset-epoch cfg))
+     :treasury-pubkey (or (:treasury-pubkey state) (:treasury-pubkey cfg))
+     :treasury-privkey (or (:treasury-privkey state) (:treasury-privkey cfg))}))
+
+(defn- apply-epoch-treasury-boundary
+  "Executes treasury epoch boundary calculations, applying demand-gated mint
+   and custody drawdowns or sunset burns to the state."
+  [state new-epoch]
+  (let [cfg (:config state)
+        treasury-ctx (build-tick-treasury-ctx state new-epoch cfg)
+        res (treasury/process-treasury-epoch treasury-ctx)
+        actual-minted (or (:actual-minted res) 0)
+        all-mint-shares (or (:all-mint-shares res) {})
+        state-with-custody (if-let [l (:ledger res)]
+                             (assoc state :ledger l)
+                             state)]
+    (if (and (seq all-mint-shares) (pos? actual-minted))
+      (treasury/apply-epoch-mint state-with-custody
+                                 {:epoch new-epoch
+                                  :epoch-gate (:epoch-mint res)
+                                  :allocations all-mint-shares})
+      state-with-custody)))
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
@@ -181,28 +222,29 @@
         pruned-delivery-vote-counts (reduce dissoc (or (:delivery-vote-counts state) {}) expired-ids)
         pruned-sieve-delivered-set (set/difference (:sieve-delivered-set state) expired-ids)
         pruned-local-ready-set (set/difference (:local-ready-set state) expired-ids)
-        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)]
-    {:state (assoc state
-                   :epoch new-epoch
-                   :epoch-entropy epoch-entropy
-                   :basalt-view new-view
-                   :basalt-index new-index
-                   :murmur-cache pruned-murmur-cache
-                   :contagion-known-ids pruned-known-ids
-                   :messages pruned-messages
-                   :message-epochs pruned-epochs
-                   :epoch-to-messages pruned-epoch-to-messages
-                   :global-echo-sample updated-echo-sample
-                   :global-ready-sample updated-ready-sample
-                   :global-delivery-sample updated-delivery-sample
-                   :received-echoes pruned-received-echoes
-                   :received-readies pruned-received-readies
-                   :echo-vote-counts pruned-echo-vote-counts
-                   :ready-vote-counts pruned-ready-vote-counts
-                   :delivery-vote-counts pruned-delivery-vote-counts
-                   :sieve-delivered-set pruned-sieve-delivered-set
-                   :local-ready-set pruned-local-ready-set
-                   :delivered-set pruned-delivered-set)
+        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)
+        tick-state (assoc state
+                          :epoch new-epoch
+                          :epoch-entropy epoch-entropy
+                          :basalt-view new-view
+                          :basalt-index new-index
+                          :murmur-cache pruned-murmur-cache
+                          :contagion-known-ids pruned-known-ids
+                          :messages pruned-messages
+                          :message-epochs pruned-epochs
+                          :epoch-to-messages pruned-epoch-to-messages
+                          :global-echo-sample updated-echo-sample
+                          :global-ready-sample updated-ready-sample
+                          :global-delivery-sample updated-delivery-sample
+                          :received-echoes pruned-received-echoes
+                          :received-readies pruned-received-readies
+                          :echo-vote-counts pruned-echo-vote-counts
+                          :ready-vote-counts pruned-ready-vote-counts
+                          :delivery-vote-counts pruned-delivery-vote-counts
+                          :sieve-delivered-set pruned-sieve-delivered-set
+                          :local-ready-set pruned-local-ready-set
+                          :delivered-set pruned-delivered-set)]
+    {:state (apply-epoch-treasury-boundary tick-state new-epoch)
      :commands commands}))
 
 (defn- apply-broadcast-burn

@@ -35,6 +35,9 @@
 (defn calculate-trailing-revenue
   "Calculates average trailing burn revenue over N epochs:
      R_trailing = (quot (reduce + trailing-N-burns) N)
+   When called with explicit N, dividing the sum by N naturally implements the
+   zero-padding rule for initial windows (t <= N): epochs prior to genesis or
+   missing epochs contribute 0 to the sum while the divisor remains the fixed window N.
    Safely returns 0 when N <= 0, trailing-burns is empty, or input is nil."
   ([trailing-burns]
    (calculate-trailing-revenue trailing-burns (count trailing-burns)))
@@ -44,6 +47,24 @@
      (let [safe-burns (map #(max 0 (or % 0)) trailing-burns)
            total-burn (reduce + 0 safe-burns)]
        (quot total-burn (long n))))))
+
+(defn extract-trailing-revenues
+  "Extracts the trailing revenue sequence for the `n` epochs preceding `current-epoch`
+   from `state`. For each epoch `ep` in the preceding window (`current-epoch - n` to `current-epoch - 1`),
+   sums `(+ (get-in state [:epoch-burns ep] 0) (get-in state [:epoch-settlement-takes ep] 0))`.
+   Terms with `ep < 0` (prior to genesis) or missing contribute `0` (zero-padding).
+   Returns a vector of length `n`."
+  ([state current-epoch]
+   (extract-trailing-revenues state current-epoch (get-in state [:config :treasury-trailing-epochs] 168)))
+  ([state current-epoch n]
+   (let [safe-n (max 0 (or n 0))]
+     (mapv (fn [j]
+             (let [ep (- current-epoch j)]
+               (if (neg? ep)
+                 0
+                 (+ (get-in state [:epoch-burns ep] 0)
+                    (get-in state [:epoch-settlement-takes ep] 0)))))
+           (range safe-n 0 -1)))))
 
 (defn calculate-demand-gated-mint
   "Calculates the demand-gated mint M_t = (quot (* R_trailing k-bps) 10000).
@@ -171,21 +192,58 @@
         (recur (rest entries) next-seq [tx-hash] (conj transfers transfer)))
       {:seq seq-num :deps deps :commands transfers})))
 
+(defn burn-unspent-bootstrap-custody
+  "Burns any unspent balance in the Bootstrap custody account directly in the ledger
+   at or after the bootstrap sunset epoch.
+   Sets the custody account balance to 0 in :ledger without increasing :total-minted.
+   Returns the updated ledger, or unchanged ledger if custody account is missing or zero."
+  [ledger custody-pubkey]
+  (if-let [pk (when custody-pubkey (if (string? custody-pubkey) custody-pubkey (basalt/bytes->hex custody-pubkey)))]
+    (if-let [acct (get ledger pk)]
+      (if (pos? (:balance acct))
+        (assoc ledger pk (assoc acct :balance 0))
+        ledger)
+      ledger)
+    ledger))
+
+(defn- apply-custody-transfers-to-ledger
+  "Applies executed custody drawdown transfers to the ledger without increasing :total-minted."
+  [ledger commands]
+  (reduce
+   (fn [acc-ledger tx]
+     (if (and (get acc-ledger (:sender tx))
+              (account/validate-transfer (get acc-ledger (:sender tx)) tx))
+       (let [l-with-rec (if (contains? acc-ledger (:receiver tx))
+                          acc-ledger
+                          (assoc acc-ledger (:receiver tx) (account/map->AccountState {:balance 0 :seq 0 :deps []})))]
+         (account/apply-transfer l-with-rec tx))
+       acc-ledger))
+   ledger
+   commands))
+
 (defn process-treasury-epoch
   "Processes an epoch's demand-gated treasury minting, 20/80 split, and Genesis custody drawdowns.
-   Accepts a single treasury-ctx map."
+   Caps mint by remaining conditional mint room under the 23.1B cap.
+   Accounts for rounding dust explicitly (:actual-minted + :mint-dust == :epoch-mint).
+   Reads custody balance from :ledger when provided, and executes any custody transfers
+   or bootstrap sunset burns directly against :ledger without increasing :total-minted."
   [treasury-ctx]
   (let [trailing-burns (or (:trailing-burns treasury-ctx) [])
         n (or (:n-epochs treasury-ctx) (count trailing-burns))
         r-trailing (calculate-trailing-revenue trailing-burns n)
         k-bps (or (:k-bps treasury-ctx) default-k-bps)
-        m-t (calculate-demand-gated-mint r-trailing k-bps)
+        demand-gate (calculate-demand-gated-mint r-trailing k-bps)
+        total-minted (or (:total-minted treasury-ctx) 0)
+        cap-room (max 0 (- max-conditional-mint-supply total-minted))
+        m-t (min demand-gate cap-room)
         split (split-mint m-t)
         m-streamlet (:streamlet split)
         m-mesh (:mesh split)
         streamlet-shares (distribute-shares m-streamlet (:validators treasury-ctx))
         mesh-shares (distribute-shares m-mesh (:mesh-nodes treasury-ctx))
         all-mint-shares (merge-with + streamlet-shares mesh-shares)
+        actual-minted (reduce + 0 (vals all-mint-shares))
+        mint-dust (- m-t actual-minted)
         t-pub (:treasury-pubkey treasury-ctx)
         t-priv (:treasury-privkey treasury-ctx)
         start-seq (or (:start-seq treasury-ctx) 0)
@@ -193,27 +251,49 @@
         mint-res (if (and t-pub t-priv (seq all-mint-shares))
                    (build-mint-transfers t-pub t-priv all-mint-shares start-seq start-deps)
                    {:seq start-seq :deps start-deps :commands []})
-        custody-res (if (and (:custody-pubkey treasury-ctx)
-                             (:custody-privkey treasury-ctx)
-                             (seq (:custody-allocations treasury-ctx)))
-                      (process-bootstrap-custody (assoc treasury-ctx
-                                                        :allocations (:custody-allocations treasury-ctx)
-                                                        :start-seq (:seq mint-res)
-                                                        :start-deps (:deps mint-res)))
-                      {:remaining-balance (:custody-balance treasury-ctx)
+        c-pk-raw (:custody-pubkey treasury-ctx)
+        custody-pub (when c-pk-raw (if (string? c-pk-raw) c-pk-raw (basalt/bytes->hex c-pk-raw)))
+        ledger (:ledger treasury-ctx)
+        custody-bal (if (and ledger custody-pub)
+                      (get-in ledger [custody-pub :balance] 0)
+                      (or (:custody-balance treasury-ctx) 0))
+        epoch (:epoch treasury-ctx)
+        sunset-epoch (:bootstrap-sunset-epoch treasury-ctx)
+        sunset? (and (some? sunset-epoch) (some? epoch) (>= epoch sunset-epoch))
+        effective-custody-bal (if sunset? 0 custody-bal)
+        custody-ctx (assoc treasury-ctx
+                           :custody-pubkey custody-pub
+                           :custody-balance effective-custody-bal
+                           :allocations (if sunset? [] (:custody-allocations treasury-ctx))
+                           :start-seq (:seq mint-res)
+                           :start-deps (:deps mint-res))
+        custody-res (if (and custody-pub
+                             (:custody-privkey custody-ctx)
+                             (seq (:allocations custody-ctx)))
+                      (process-bootstrap-custody custody-ctx)
+                      {:remaining-balance effective-custody-bal
                        :seq (:seq mint-res)
                        :deps (:deps mint-res)
-                       :commands []})]
+                       :commands []})
+        updated-ledger (when ledger
+                         (let [l (if sunset? (burn-unspent-bootstrap-custody ledger custody-pub) ledger)]
+                           (apply-custody-transfers-to-ledger l (:commands custody-res))))]
     {:r-trailing r-trailing
      :epoch-mint m-t
+     :actual-minted actual-minted
+     :mint-dust mint-dust
      :m-streamlet m-streamlet
      :m-mesh m-mesh
+     :streamlet-shares streamlet-shares
+     :mesh-shares mesh-shares
+     :all-mint-shares all-mint-shares
      :seq (:seq custody-res)
      :deps (:deps custody-res)
      :mint-commands (:commands mint-res)
      :custody-commands (:commands custody-res)
      :commands (into (:commands mint-res) (:commands custody-res))
-     :remaining-custody-balance (:remaining-balance custody-res)}))
+     :remaining-custody-balance (:remaining-balance custody-res)
+     :ledger (or updated-ledger ledger)}))
 
 (def genesis-custody-shares
   "Standard 45% Genesis custody allocations (18.9B ECHO total)."
