@@ -1,168 +1,222 @@
-# **Bitecho Tokenomics & The Echo Economy**
+# Echo Tokenomics v2.1 Specification
 
-This document defines the economic architecture, incentive structures, and mathematical parameters of the $ECHO token network. Designed specifically to facilitate high-frequency micro-transactions for autonomous AI agents without relying on global consensus bottlenecks, Bitecho's economic model executes across a distinct two-phase lifecycle:
+**Authoritative Tokenomics Architecture for Bitecho**  
+*Supersedes the legacy v1 Burn-and-Mint / Probabilistic Receipt Lottery model.*  
+*Aligned with the ratified clean-sheet consensus and Phase 5 codebase.*
 
-* **Phase 1: Bootstrap (Burn-and-Mint Equilibrium):** A subsidized growth phase utilizing a probabilistic Treasury lottery and localized free-market burning to aggressively incentivize routing infrastructure and drive early adoption.  
-* **Phase 2: Maturity (Asynchronous Direct Settlement):** A self-sustaining, steady-state endgame where the network sheds the BME complexity in favor of zero-latency, direct peer-to-peer payments and a simple stake-weighted tail emission.
+---
 
-## **1\. Macro-Economy & Genesis Allocation**
+## 1. Executive Summary & Core Design Objectives
 
-The network enforces a deterministic hard cap of **42,000,000,000 (42 Billion) $ECHO**. The system initializes from a pure genesis.edn state with the following allocations:
+Bitecho is a decentralized, permissionless WebRTC signaling network and cryptographic Web of Trust engineered specifically for sovereign AI agents. In an economy dominated by autonomous agents, signaling is a zero-marginal-cost commodity: in competitive equilibrium, signaling costs trend toward physical bandwidth limits ($p \to 0$).
 
-* **50% (21.0B): Decentralized Routing Treasury (Yield Pool).** Locked in a ![][image1]\-shared Streamlet BFT smart contract. Emitted via an Activity-Based Logarithmic Decay curve to subsidize routing infrastructure.  
-* **20% (8.4B): Federated Genesis Partners.** Subsidizes the enterprise backbone of initial Full Nodes (1-year cliff, 3-year vest).  
-* **15% (6.3B): Agent Ecosystem & Developer Grants.** Bootstrapping funds for developer adoption.  
-* **15% (6.3B): Core Architecture & Protocol Security.** Bootstrapping funds for the core protocol (4-year vest).
+Tokenomics v2.1 embodies a foundational structural axiom: **Do not attempt to extract rents at the signaling layer; capture protocol value at the intent settlement layer.** Signaling serves as the public-good infrastructure (analogous to IP packet transit); adversarial settlement of machine-executable intents (`sci` contracts) provides the value engine.
 
-## **2\. Asynchronous Settlement (Consensus Number 1\)**
+### Core Objectives
+1. **Permissionless Global Signaling**: Any node can serve and any agent can be reached without gatekeepers, centralized WebSocket infrastructure, or price-gouging.
+2. **Backbone of the Intent Economy**: The $ECHO token structurally captures a non-waivable slice of autonomous agent commerce at the settlement layer.
+3. **Nash Implementability**: Honest protocol execution is the strict best response for every actor; unilateral deviation (spamming, faking traffic, withholding signatures, or price-gouging) is provably penalized.
+4. **Graceful Degradation**: Eliminates death spirals. Private-good services (relays, bandwidth) operate on real market pricing and survive irrespective of token price fluctuations.
 
-To enable zero-latency streaming payments for WebRTC signaling and TURN relay, Bitecho leverages the academic principle that single-owner accounts have a Consensus Number of 1\.
+---
 
-* **No Global Ordering:** Micro-transfers are not sequenced in a global blockchain.  
-* **Local State Execution:** AI Agents (Light Nodes) maintain a local, strictly incrementing sequence number (seq\[q\]) and cryptographic causal history.  
-* **Instant Validation:** The receiving Full Node locally validates the signature, the \+1 sequence increment, and a balance \>= 0\. Services (like bandwidth relay) are provided immediately upon local validation.
+## 2. Macro-Economy & Supply Architecture
 
-## **3\. The Localized Free Market & The Burn**
+### 2.1 The 42 Billion Hard Cap
+The network enforces an unalterable hard cap of **42,000,000,000 ECHO (42 Billion ECHO)**. This supply scale ensures that base protocol fees and signaling burns operate on clean integer arithmetic ($\ge 100$ base units), completely avoiding floating-point rounding errors and fractional dust exploits.
 
-The network decouples the "cost to use" from the "reward to route." Full Nodes do not collect the micro-fees paid by the agents; instead, those fees are strictly **burned** (removed from circulation).
+```
+Total Supply Hard Cap: 42,000,000,000 ECHO (100%)
+├── Genesis Custody Allocation: 18,900,000,000 ECHO (45%)
+│   ├── Bootstrap Reserve:      4,200,000,000 ECHO (10%) [3-yr decay + sunset burn]
+│   ├── Core Team:              6,300,000,000 ECHO (15%) [4-yr vest, 1-yr cliff]
+│   ├── Genesis Partners:       4,200,000,000 ECHO (10%) [1-yr cliff, 3-yr vest, SLA-gated]
+│   └── Ecosystem & Grants:     4,200,000,000 ECHO (10%) [Milestone-gated]
+└── Unminted Conditional Supply: 23,100,000,000 ECHO (55%) [Demand-gated mint only]
+```
 
-* **Node-Advertised Pricing:** Full Nodes advertise their "Minimum Burn Requirement" via their Bloom filter routing broadcasts across the SBRB mesh.  
-* **The Race to Zero:** Because Full Nodes earn their yield from the Treasury (not the user fee), they are incentivized to lower their Burn Requirement to attract maximum agent traffic. This localized free market pushes the cost of agent routing as close to zero as the spam-deterrence threshold allows.  
-* **The Sybil Shield:** The burn mathematically prevents wash-routing. An attacker cannot route fake traffic through their own node to farm Treasury yield without destroying their own capital in the process.
+### 2.2 Genesis Custody vs. Unminted Conditional Supply
+A strict separation is enforced between pre-allocated Genesis custody and the unminted conditional supply:
 
-## **4\. The Treasury Engine: Probabilistic Nanopayments**
+1. **45% Genesis Allocation (18,900,000,000 ECHO)**: Minted at genesis into non-circulating, Treasury-custodied lockup accounts (`:genesis-ledger` in `bitecho.state-machine`):
+   - **10% Bootstrap Reserve (4,200,000,000 ECHO)**: Dedicated to early peer-attested mesh public goods and early demand-side rebates. Features algorithmic 3-year decay and a **hard sunset burn** at Year 3. Any unspent balance in the Bootstrap custody account at the sunset epoch is permanently burned directly from custody via `burn-unspent-bootstrap-custody` in `bitecho.economy.treasury`, permanently reducing the eventual circulating supply.
+   - **15% Core Architecture & Protocol Security (6,300,000,000 ECHO)**: 4-year linear vesting with a 1-year cliff.
+   - **10% Federated Genesis Partners (4,200,000,000 ECHO)**: Subsidizes enterprise backbone Full Nodes. 1-year cliff followed by 3-year linear vesting, strictly SLA-gated (vesting pauses automatically upon SLA breach).
+   - **10% Agent Ecosystem & Developer Grants (4,200,000,000 ECHO)**: Released strictly via milestone-gated Treasury votes; automatic time-based cliffs are prohibited.
+2. **55% Unminted Conditional Supply (23,100,000,000 ECHO)**: Does not exist at genesis. Tokens are minted into existence if and only if authorized by the demand-gated emission engine.
 
-To prevent the Streamlet BFT from being overwhelmed by millions of micro-receipts, the Treasury utilizes stake-weighted probabilistic payouts (lottery tickets).
+---
 
-### **A. The "Proof of Delivery" Receipt**
+## 3. The Monetary Engine: Demand-Gated Minting ($k \le 0.5$)
 
-When a Full Node successfully relays an SDP offer to facilitate WebRTC Circuit Discovery & Client-to-Rendezvous Routing, the AI Agent signs a "Proof of Delivery" receipt.
+### 3.1 Mathematical Formulation
+Calendar-based block emissions (which suffer from runaway inflation during market downturns) are abolished. In every epoch $t$, new conditional minting $M_t$ is strictly bounded by trailing burned protocol revenue over an $N$-epoch window:
 
-*(Note: Continuous network services, such as TURN streaming, are settled via direct peer-to-peer micro-transfers between nodes and do not generate Treasury receipts.)*
+$$R_{\text{trailing},t} = \left\lfloor \frac{1}{N} \sum_{j=1}^{N} R_{t-j} \right\rfloor$$
 
-Most receipts expire worthless. Only winning receipts are submitted to the Streamlet cluster for payout.
+$$M_t \le \left\lfloor \frac{R_{\text{trailing},t} \times k_{\text{bps}}}{10,000} \right\rfloor$$
 
-### **B. The Entropy Source**
+Where:
+- **Ratified Discount Factor**: $k = 0.5$ (`default-k-bps = 5000`, contract-capped at `max-k-bps = 5000`).
+- **Trailing Window**: $N = 168$ epochs (1-hour epochs = 7-day rolling window).
+- **Initial-Window Zero-Padding**: For epochs $t \le N$, terms $R_{t-j}$ with $t - j \le 0$ are treated as $0$ (`extract-trailing-revenues` in `bitecho.economy.treasury`), ensuring early minting is conservative and preventing undefined historical lookbacks.
+- **Protocol Revenue $R_t$**: Sum of 100% of signaling burns (`:epoch-burns`) + 100% of `sci` intent settlement takes (`:epoch-settlement-takes`).
+- **Supply Cap Constraint**: $M_t \le \max(0, 23,100,000,000 - \text{total-minted})$.
+- **Explicit Dust Accounting**: Any fractional remainder from integer share distribution is recorded in `:mint-dust` and left unminted, strictly conserving $M_t = \text{actual-minted} + \text{mint-dust}$.
 
-The randomness required to determine if a receipt is a "winner" is derived internally from the consensus layer, requiring no external oracles.
+### 3.2 The Cycle Deflation Theorem
+Because 100% of protocol revenue $R_t$ is permanently burned immediately upon collection, while minting $M_t$ tracks trailing burned revenue discounted by $k = 0.5$, the cumulative monetary change across any complete economic cycle or horizon $T \gg N$ satisfies:
 
-* The entropy seed is the **Hash of the Last Finalized Streamlet Block**.  
-* Because finalization requires three consecutive notarized blocks, the hash is unpredictable at the time the agent signs the receipt.
+$$\sum_{t=1}^{T} (M_t - R_t) \le (k - 1) \sum_{t=1}^{T} R_t = -0.5 \sum_{t=1}^{T} R_t \le 0$$
 
-### **C. The Winning Condition**
+The demand-gated engine guarantees **net deflationary tokenomics** over any full cycle. During the initial bootstrap and vesting periods, circulating supply changes equal $(M_t - R_t) + \text{Bootstrap\_Release}_t + \text{Vesting\_Release}_t$. Once Genesis custody finishes vesting and unspent bootstrap tokens burn at Year 3, circulating supply is governed purely by cycle deflation ($M_t - R_t \le 0$).
 
-A receipt is valid and eligible for payout if and only if it satisfies the following pure-functional cryptographic check:
+---
 
-;; Jules: Implement this in the pure state machine  
-(\< (hash (concat receipt-signature finalized-block-hash)) current-target-difficulty)
+## 4. Mint Partitioning: Exact 20/80 Distribution
 
-### **D. Algorithmic Difficulty Adjustment (Emission Targeting)**
+Every epoch's demand-gated mint $M_t$ is split cleanly across consensus security and physical mesh operation via `split-mint` in `bitecho.economy.treasury`:
 
-Similar to Bitcoin's hash difficulty, Bitecho adjusts the current-target-difficulty every epoch. However, Bitecho targets the Treasury's emission schedule, not a block time.
+```
+Demand-Gated Mint (M_t)
+├── 20%: Streamlet Consensus Validators (M_streamlet = 0.20 * M_t)
+└── 80%: Full Node Mesh Rewards         (M_mesh      = 0.80 * M_t)
+```
 
-* ![][image2]: The predetermined number of $ECHO to emit this epoch (based on the logarithmic decay curve).  
-* ![][image3]: The fixed $ECHO reward paid out per winning receipt.  
-* ![][image4]: The target number of winning receipts (![][image5]).  
-* ![][image6]: The estimated total network receipts generated, inferred from the previous epoch.
+1. **20% Streamlet Validator Rewards ($M_{\text{streamlet},t} = \lfloor 0.20 \times M_t \rfloor$)**: Distributed pro-rata by stake across the Streamlet BFT consensus committee (`:validators`). Streamlet operators sequence intent settlements and custody the Treasury. Equivocation triggers deterministic slashing.
+2. **80% Full Node Mesh Rewards ($M_{\text{mesh},t} = M_t - M_{\text{streamlet},t}$)**: Distributed pro-rata by third-party-attested node weight $w_i$ across active mesh nodes (`:mesh-nodes`).
+3. **Custody Separation**: Scheduled releases from Genesis Bootstrap custody are transfers of pre-minted ledger balances (`apply-custody-transfers-to-ledger`), never increasing `:total-minted` or confounding the demand gate.
 
-At the end of each epoch, the Streamlet BFT calculates the new difficulty target:
+---
 
-New Target \= Old Target \* (W\_target / Actual\_Winners\_Last\_Epoch)
+## 5. Peer-Attested Mesh Rewards & Bilateral Epoch Transcripts
 
-*If an attacker wash-routes and spikes the network activity, the target difficulty algorithmically tightens, exponentially decaying the attacker's win probability while their burn cost remains linear.*
+The v1 probabilistic lottery has been completely deleted. Node rewards are computed from **cryptographically verifiable bilateral mesh participation**:
 
-## **5\. Stake-Weighted Probabilities**
+### 5.1 Deterministic Epoch Entropy
+Each epoch $e$, a node's Basalt peer sampling is deterministically seeded from the finalized Streamlet block hash:
 
-To further defend against Sybil attacks and align economic incentives, a Full Node's probability of winning is modified by its staked $ECHO.
+$$\text{slot\_seed}(\text{node}_i, e, r) = \text{SHA256}(\text{finalized\_block\_hash}_e \parallel \text{pubkey}_i \parallel r)$$
 
-* The current-target-difficulty for a specific node is positively scaled by a function of their locked stake.  
-* To capture meaningful routing volume and Treasury yield, an operator must lock significant capital, directly tying the network's security to the token's market capitalization.
-
-## **6\. Decentralizing the Streamlet Treasury**
-
-The 21 Billion Yield Pool is a ![][image1]\-shared asset governed by the Streamlet BFT cluster.
-
-* **Phase 1 (Permissioned):** The cluster is strictly operated by the Federated Genesis Partners to ensure high performance and stability during the bootstrap phase.  
-* **Phase 2 (Dynamic Decentralization):** The protocol allows permissionless entry into the Streamlet cluster. To prevent early whales from achieving a permanent monopoly, the required stake to become a Genesis Partner is dynamically calculated as a fixed percentage of the **Circulating Supply**, rather than a static integer.
-
-## **7\. Four-Year Vesting & Emission Modeling (Genesis to Year 4\)**
-
-To project network economics through the end of the 4-year vesting period, we assume the following constants:
-
-* **Treasury Target Emission:** \~17 Billion $ECHO released by Year 4 (logarithmic decay).  
-* **Payout Per Winning Ticket (![][image3]):** 10,000 $ECHO.  
-* **Target Winning Tickets (![][image4]):** \~1,700,000 tickets across 4 years (avg. \~1,164/day).  
-* **Vesting Unlocks:** 8.4B (Partners), 6.3B (Core), 6.3B (Ecosystem) fully unlocked by Year 4\.  
-* **Total Emitted & Vested by Year 4:** \~38 Billion $ECHO (Gross Supply before Burns).
-
-We target an optimal hardware ratio of roughly **100,000 AI Agents to 1 Full Node**.
-
-### **Scenario A: Low Adoption (The Private Swarm Baseline)**
-
-*Network is utilized primarily by a small number of solopreneurs and enterprise orchestrators running private agent fleets.*
-
-* **Active Agents:** 1,000,000 scaling to 5,000,000 by Year 4\.  
-* **Full Nodes:** 10 scaling to 50\.  
-* **Network Activity:** Agents average 10 connections/day. Total 4-year receipts generated: **\~40 Billion**.  
-* **Treasury Difficulty Adjustment:** With lower volume, the algorithm expands the target hash. Winning probability settles around **1 in 23,500** per receipt.  
-* **The Burn Rate:** Free-market competition is low; burn fee averages **0.01 $ECHO**.  
-* **Net Tokenomics:** 40B receipts \* 0.01 \= **400 Million $ECHO burned**.  
-* **Year 4 Circulating Supply:** \~37.6 Billion $ECHO. (Highly Inflationary; Nodes enjoy high probability yields).
-
-### **Scenario B: Medium Adoption (B2B Enterprise Integration)**
-
-*Network achieves strong product-market fit among enterprise SaaS and autonomous customer service sectors.*
-
-* **Active Agents:** 10,000,000 scaling to 50,000,000 by Year 4\.  
-* **Full Nodes:** 100 scaling to 500\.  
-* **Network Activity:** Agents average 50 connections/day. Total 4-year receipts generated: **\~1.5 Trillion**.  
-* **Treasury Difficulty Adjustment:** The algorithm tightens the target hash. Winning probability drops to **1 in \~880,000**.  
-* **The Burn Rate:** Increased node competition drives the free-market burn fee down to **0.005 $ECHO**.  
-* **Net Tokenomics:** 1.5T receipts \* 0.005 \= **7.5 Billion $ECHO burned**.  
-* **Year 4 Circulating Supply:** \~30.5 Billion $ECHO. (Approaching equilibrium; deflationary pressure begins to offset emissions).
-
-### **Scenario C: High Adoption (The Global Agent Standard)**
-
-*Bitecho becomes the default P2P signaling layer for Web3 and mainstream AI agents globally.*
-
-* **Active Agents:** 50,000,000 scaling to 500,000,000 by Year 4\.  
-* **Full Nodes:** 500 scaling to 5,000.  
-* **Network Activity:** Agents average 100 connections/day (high-frequency streams/negotiations). Total 4-year receipts generated: **\~15 Trillion**.  
-* **Treasury Difficulty Adjustment:** Network volume explodes. Target hash tightens severely. Winning probability plummets to **1 in 8.8 Million**.  
-* **The Burn Rate:** Hyper-competition among 5,000 nodes racing to capture volume drives the burn requirement down to **0.001 $ECHO**.  
-* **Net Tokenomics:** 15T receipts \* 0.001 \= **15 Billion $ECHO burned**.  
-* **Year 4 Circulating Supply:** \~23 Billion $ECHO. (Deflationary Singularity: Massive burn rates neutralize vesting schedules and Treasury emissions, driving extreme capital scarcity).
-
-## **8\. The Steady State Transition (Phase 2: Maturity)**
-
-The network is architected with a two-phase lifecycle. Once the primary Treasury emission schedule exhausts, the network drops the complexity of the Burn-and-Mint Equilibrium and drops into a purely asynchronous, direct-payment mesh network.
-
-### **A. The Asynchronous Endgame (Direct Payments)**
-
-Based on the "Consensus Number of a Cryptocurrency" model, AI agents are the sole owners and authors of their local state (their balance and strictly incrementing sequence number). Transferring that local value to a node requires a consensus number of 1\.
-
-* **Zero Global State:** The Streamlet cluster is no longer needed to order these routing micro-transactions.  
-* **Pure Local Execution:** The receiving Full Node simply evaluates a pure-functional state transition: validating the signature, ensuring seq\[q\] \== last\_seq \+ 1, and verifying sufficient balance. If successful, the WebRTC signaling is executed immediately.
-
-### **B. Dissolution of the Sybil Threat**
-
-The original Burn-and-Mint Equilibrium and probabilistic lottery mechanisms were specifically designed to protect the Treasury from being drained by wash-routing. Once the Treasury exhausts, there is no "free money" to farm. If a node operator spins up fake agents to route traffic through their own node, they are simply paying themselves and losing capital to standard network friction. Direct peer-to-peer payments inherently neutralize the Sybil threat.
-
-### **C. Stake-Weighted Tail Emission**
-
-To maintain an economic floor and offset deflationary pressure in maturity, the probabilistic receipt lottery is replaced with a simple, periodic stake-weighted tail emission.
-
-* **Computational Simplicity:** Instead of calculating cryptographic hashes against target difficulties for every micro-transaction, the network simply snapshots the staked balances at the end of an epoch and distributes the tail emission proportionally.  
-* **Economic Floor:** This acts as a baseline "Proof of Stake" yield. It incentivizes Full Nodes to lock up capital and keep their high-bandwidth routing infrastructure online, even during periods of low local network activity.
-
-[image1]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAsAAAAYCAYAAAAs7gcTAAAA7ElEQVR4XmNgGMJASkqKS05OzkVeXv6/goLCIXR5DABUbA1SDMTN6HIYAKioBqQYqMkGXQ4DABXuBuI3QCYzuhwKALkZqPA7EK8G8YGmlwHxBqD7NwFpQRTFQAFXqHuzVFRU2IF0CogNxD+BOBBdcRtUsREQrwGJgUwFsj/KysoqoygGCh4HKQZq2gmkNVEkkQHQhACoqUlQfgRQUzmIraysLAZ0Fh9cMVBRL0ixjIyMCpRvBcRZUI2bpKWlZeCKgQKngJJ3YXxFRUV9oMkhQKwFFF8MVwgCQIGbQNyEJvYEiPcBNYoji48C2gMAWkM4Ay7/cRIAAAAASUVORK5CYII=>
-
-[image2]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADQAAAAZCAYAAAB+Sg0DAAACuElEQVR4Xu2XS2hTQRSGb1Nf+EQ0RvO4kxfEBnGRiOBOBBdalIq7LhTtQkR8NYIvEMGdxceioKW0iBspKOJGUUEXou50reBGJFYQBIWCFKnfaWbo3CEoaAj3Qn74mXP+OTNz5s7J3BvP66CDDlqJmFLqO5z5G7PZ7BN3cGihk/5crVbni18sFhfm83kfreL7/j74Ed5yhoUXekN7bY0NVI3N6Zyhf8DuDzVIdpoTWWF8NrMS7bXVfzCXy202fqiRyWQ2kPBLS5rHiUygXbG06IDEj+iSC5BT2uXGRgIkf4cT6cOMUVa4ql82ZJdgpEDy9WQyudr4hUJhDdor43PjLVdRKT9OZKOchqMl0HYYH/sUrFn+TmO3G/I6cbUA+J0cdzdkI5FILCHmfSqVWmU0FbxA2oZ0Op2SanH1AEju3h821EXfGBy3RX5vF22/XWDdA64WQLlcXkCyk802hNZjNsu1vklre+BTOSEmH7Fie+FteJnTvED7SOtX4TNYk3j6HiPH9LAu/KMSQ3sdnrbmG8S/STskxM7rdb9IWyqVlplYM2ALnFJNruomfGuPJbH1dh3Tvw1+oyTT2h+Go2LLwtiTjDkE92N/QO6WPpI8pr8NpQrq+pYV/Qb+ebHlckJ/0Fhpdu5Pxm4ZWOCk7bPIC3nClv8c9mu7An8wZtHcCM+Lx+NL5SEofbnQzvCQ4lIJ2D+lpOFheAJmJUY+w+j7as/TEjDpfd2uo+mm/UUiu0XT1/u09KElpYywHwYm8GaT244+ZTaqdBWoxgv+TTC6AfRB4idkXrfvv8DEQ/L0eG8t1n6vnBDaWewBeBeOSQnS1mHFnUMgydE3ythryvooxq7BcThMzIgpZew+1fhN98zNEkKQ6NrIfpEI5GR5yu/YyFbxsc85IdGCflVISV2S1o/Sn8YO/hG/AWgwxI4U99x8AAAAAElFTkSuQmCC>
-
-[image3]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADkAAAAZCAYAAACLtIazAAACp0lEQVR4Xu2XW4iNURTHx8y4FEo4js5tf+eiM50H5JRSlPKglMuLSF7kUqMmilGmBsk1oRS5hkkOyqQGD8ibEi+eyBNlklJjKA+88FvzrX3adjxNydb3r9Xa+/9f+7L2Xt/3ndPSkiBBgn8ZrcaYz9iPP9hwFEVXU6nUJH9gcCCZedjrWq02znIkNwFukyb7GKrdGRIe5LawNT4vIMFXkmihUNjia0GBJN6S5EyfLxaLxpZuNpvN+XowyOVysyQJnxeQ+FFNstfXggIJbPSTLJfLM+B6sG8kut3VggTP2hVbko59wk5RrrP9+CBBMoP+Tf5X4KaqenODvhYC2PcL7CPNVl9rQj4LmuR5XwsB7L+Ld8Ytn/8FJHddk1znayGAfT8iyU6fd9FG0JAmWfRFB2PQD2APOblt+D4mjkTg81Ohfwn+ML4hn6NKpTJe4+9hyyTOnjb+JrbPTsy45friOyY8vl++x/gTsh62E/4c/q4dIzpjbsCdwb6jd1itCci5iF+N90b14yyYcAljFhNzm/ZlmVSSkzcv3HN8WuP2oC2F685kMtPx9+HWi0b7oMbskk3beeGH8vl8RmMuwp3E91Sr1cmiEbtBH6mXEqP8G1lHx7wTP2rIJvR25NYXWJ72gIlvtwu/g4VXCY+POISpcF849WnKjWyKA5lD/GYd/wQ77sz3lLVWyK8sbD794Xq9PtbqGrOfuZ45/T5XHxXY2EJZlGab5eh/YMGVTlgTevoD0pYSTqfTE6VNfGepVCrQbDdxBY2UsxyGiUtvisbtZo47zQkV8A+wI7ZPzGpbCaMGG2hgW11On8drUfzTr4FfazUpYRM/M71s5JCcOH6vuyG5NVueJv63049dEA3//nc/RFijgzFndc1u7DTzLPLjEiRIkOCv4yfTacFL7nmklAAAAABJRU5ErkJggg==>
-
-[image4]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADgAAAAZCAYAAABkdu2NAAADAklEQVR4Xu2XXYiMURjHd9ol3ynGtPP1mpllay+42IgLSmJDKLnBhbJ7QYstbL5KSok2XPlYtJH2hqwkN7SubCRtLtRya2tD2kibrMTvmfd5Z585TZmbYSbzr6dzzv95znnOf87He6ampooqqvjn8DxvCPtlTfl1Lo99nQ/En0gkMtaXTCb35Q1cTmDOm3WiL10f3HP1tRM3pYC/Kx6PL3D5soKsiq7CO8vrKn0RHyF7rE8Af8vlyhINDQ2zdJXGLI+obkRfVoFHrQ9uOdwZy5U1mPAPERKNRqdJO5VKraXdJsJUfJcJD9F+EA6HZxiuvMGEh0VIJpNJNDU1TUbYzRpfSLsK7DGxu/DvNN3LH0x6UISwcosoOymXKr9dBd6VNnyEel9+7woAk+5XIauwq4YPPhf92u7l8lky0bNCICskQrhUtmLpgJeVVIGDci7xXbH9LNi2LbK9Xb7UKCqvrJoI0bOXQzqdXqgCR7AnXEJzrT8AcUn83yORyHTXV2oUlRdhZ1XIe8vzCQkrX/BbGMDzL55HLv83UFRego6okL2OqxbuJ/aKep3jCx4Dj7GP2Gup87KZKj6280bZEXBd1E8IF4vF4rTPa58D+LspH5ohQ8R2yFGAv2jmIzd6J3ZJxzttcuflLQgSbSPoKdVa1wf/hsFWuLyBJB9hjGUBwQRWw43SLypt6te1PKYPi1GsFWvDhky/Ds8XLGN+or1G+12jfljr9d7ETR6yeUsCuVVJ+IFqKOBoD2DnTPuZlFxUnsZ/di+GxsbGmcKLKFYjRn1cHhMigPo3ypPYbvz75cxLH73Rc3lLApIfxHq1Xk9R5/nbfb1wbMs5nr/NxZc9Dth9M0QWcC3EjDU3N0+i3IENCO/5D/0XbrxAcmuZHbskYPAt2B2sNfhnwS+7iV/6Atxxz9+G93glzdP4EVZycf4oPvD16bkcwzYY/hDW4/nnUs5hVpDmzuWtGDDp8T9e/ZUEeeQj6i0ru1LarOJtN6aiIReObsFTbO0bCJztxlTxv+E3423kvzsMQn8AAAAASUVORK5CYII=>
-
-[image5]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAHYAAAAZCAYAAADkBdqeAAAFZUlEQVR4Xu2Za4ydQxjHz7Z1v1/W6t7m7IVNt0hlJUJ8IErTILQSDR+oa9a1aUtZy6pe2F5SUWWF7pZg49qG0hZLIq0mbIIP0i/tIhJFfSBEmtXI+v2dZ9oxPefQbLM5r77/5Mk8z/+ZmXee88zMO/OeTCZFihQpUqQYOTjnFsbcgYJRBP8bMvQfZHXcuNTBmK/Mw52ZJ7ZQfkDmUbUsbps4KKDa2tpvUUfLbmxsPKSurs7BtWSz2evxf4/eFTUrabS0tBzU3Nx8cMx7EFer4qZ81XPV1dXHwy20BC8P6ycSFuDlIVdTU3OW10nqQ/ivDv2lDsb7VsyFIOatlsC6kK+vrz/GeMm5oS9xIIDBpqamo7zd0NBwEsn8yNua3azgM7xd6iCesUh/zHsomZa4gdinCW6+7ZhjYn9iwPZzephEbWEEtcYl+OBBctoY/x0x74H/OiWPuJ+LfXDvWmKnxr5EgQBut0D+IQR4UVw3IShj/Fu0pcYOD/zPKEadHzzHBD8FrgfZgVwS1k8kCO4VC2QUepaEXov9R0VFxRFx3SSA8U9k/C/EfAj8A+EkNvkGmV9VVVUd108idN35KXq/1sB96G0CPYF8d3q71KGkktwLY96DQ2GDJXJH5v9wpckHZ3e6kGNLqgq3YfztJPbWwJ7s9ZEG45gUcyHsRLs1UyRh+G+wxPbGviSA32ACY/8lU+xgRwJnxIkNwX32aPzbVHoOe1NYZ6SgLZJn74r5EATdisyN+RA6MFlib4p9SUH2X65yStLrRRKrQ8iLyIqQ1J02tEcKttL6Yj4E/s36sBLzIfQhRjFT1se+pIDEzoy53dDXJZc7Ae6VWN5Dp9H4Tfmki0OfiryPbEKesqo6cM3EfhZZhizxKwZ9Mvrz/ICPoK9EX+T71zsd+3H4+cgTyNueR18uH+2eppxm70Q9V2P9stChjm34VPwfxHyIbG4bG3K5O2pB6HVk8fQhs13uFL0OVxm+RvSVjO9Rl5v44/SFi74fVh34y9QH9hUq4bqRpb5v/Jfqd4FbrEVC+Y7Vy/s8+Wy36qV+l8v9xhN8f7uB4xxkp9v7VJhPPo7ajtM919s8qANuY8b2e/QtWftChb4AGaTOeMoeylW+ncvdk9ul6x6tZ1lSN9P+fOv7POwl1kS7x3euyJcg2nVmg+tLCPq6xeKJZX1cV6CfNhvPj2qrftG3ZXKHzX7sk1UPvV2JROZUVlaeiL0W33Tz9ajEd6ezUzrlBcjP/uStyetskRR6nvFf6TnW5mbx0vcbssEWgH4sDxx0dpG3AexiK6yQbd+aN/j6Hkoc9XaqvdnTkE/h7lYwKml3F1xreXn5kaqD3eKKn2L1gw8UWs37Cv+dnD5/1c4W+uD6ND7K2dk9q7IO7jjK3/XVzrivVWonwTfDuI3ojwV9yb5KeqHn1eZW9RfeRl8W+vcL6HSNlfpkp9k35D8EaEZhf8bMPTzg5oTtBeos4Ad5L7BXaLDUfbnQoOFnuSKnWBJxMf7umB8OGON99Lk25uGmxJygleRsB7Ar498HPfqZzviaUEfD/anfyXgtjCFNBMqxRZ633u3ZuWT3q35YZ9igw6XIbWyfh5n9IAOaSzlPgVlydNgqQx+fyXMkt39QNDglc5WCE6fVid2lGS0e6aDvQ9WGOlOQ11yek6xdcT6P+eGCPrdn87zL4F+C76TsRa7xPCutHPtJ5AFkscu9hzvCw5ySqvjw3Y/ciLyBdHOOqCz0PE2K2tx5YxHlvfbbTIzrlRT0wzDIT2J+X0DAk+jnnphPMYIgCWeThAH70jUGfR0yK66XImGwd89qEtzGSt2g90rG/txPkSJFigMHfwGUeKqKOLXDaQAAAABJRU5ErkJggg==>
-
-[image6]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEsAAAAZCAYAAAB5CNMWAAADY0lEQVR4Xu2XTUhUURTHHaXvLyOmSWecN+MMDAkVMS0KJZSIhFpEbYK+lb6kIqmQiCwjXJRWUFH0sZAsCpOgiD501YfUpoVBYES1sYhatSiwhf1O3ht3bk/Mmhb13h8O99z/Ofec9/7vvjd3cnJ8+PDh4x+G4zjvsH4X64vFYvcYV9prPA0RB2G6TS4SiYyB26OEu2TGPA0lyHIXfrqx02bbcU9C7ax8m49Go/VKqDY75knE43FHvk0mV1xcPAluCyL1Ya3hcHiKGfcs2D2rjFfth4mAxBba+Z4GwpxFlAV6nk6nR8B1wt0tLCwca+Z6HgjzyhaFXbVO7bCtJu9pFBUVJUQUm4fbKzy764wdGy44gszgGxg1OR5GOfV7cHNNPhtw6zcUuJYm7rXO5jNAUtUgYt1UYjXaseGCOs8Rp9LkmE+j9mqTyxbc+v0CAqybZ5MZIOHiIGL1KrG2yzyVSk1gXmDnDQWecpJ1n0Oh0Dg79jfwu/24zzKGPJs3kUfht4OI9Vh4OcHLXF5HbKOKnVB2jvgKvQY/BneIvP2MR6ByGXuU8B3wpclkchRpB/DvwC1W6yqZn2Zehb8Du4Ffzbg5NnB86WBca/SphTuPNUsfqSc8frvdTz1k1+slvgHuNnZYRs1ngKS08/NR4bWZwxMKy68h/DPskTSDDkhzGparOmXwzXoN/i3ObDMRZCL+e/LyGVtjSnAB/iY5sylBahTXwLpZzCtUnWXYB0f9YxDR8K8bNe7nqF2A3+0Y/13tfsy73K4XrtasA/9Gr8kaKLoT2yWvp9yEiGfE2kQkYscTicRUxX3UNy1gjey+AuwLogaFk0Mxa7YZdWS3tBhrWuCalC8P4PvfMrVrvko9lSo7OaMf/kv7etW6T7oOscmOy9v1x6DhVZsTsFsi3HSIpjXYNaxTeMZehoD8I9DHE7jdUkd2mBYb7rKuhf8wqj7+JSUlI0UA8ufKbsevkFoSI2cJ86dSVzh+2efY/cg5putqqB3Wr+tQeyncCz3PGoLB4HgaHcUu0KCeRqOFFwGY12GN+K26Mf4DuDXkLdI1ogOv9ym49TJH5JSjXgP8+fhdRm4p9gSuXcQSjnUNYnDVxK4wnoQOwMmuzegXHfgWul3vPuygrNV1pIbu68OHDx8+/nN8A1TYC24RZnySAAAAAElFTkSuQmCC>
+Because the seed derives from finalized BFT state, neither peer can grind or manipulate sample assignments.
+
+### 5.2 Canonical Exchange Digest
+For each assigned peer pair $\{\text{peer}_a, \text{peer}_b\}$ (ordered lexicographically such that $\text{peer}_a < \text{peer}_b$), nodes record all valid Sieve and Contagion frames exchanged. At epoch close, peers reconcile boundary messages against the frozen epoch message set (`:frozen-epoch-messages`) and compute the deterministic digest via `bitecho.economy.attestation`:
+
+$$\text{exchange\_digest} = \text{SHA256}(e \parallel \text{peer}_a \parallel \text{peer}_b \parallel \text{pr-str}(\text{sorted\_vec\_of\_}[\text{message\_id}, \text{role}]))$$
+
+### 5.3 Bilateral Transcript Swap & Dispute Safety
+1. **Mutually-Signed Transcripts**: Sampled peers sign the exchange digest to produce an `EpochTranscript(epoch, peer_a, peer_b, exchange_digest, sig_a, sig_b)`. Both nodes receive full credit.
+2. **Half-Signed Transcripts & Withholding Penalties**: If $\text{peer}_b$ withholds its signature, $\text{peer}_a$ submits a half-signed transcript $(\dots, \text{sig}_a, \text{nil})$ alongside its frozen log.
+3. **Log-Recomputed Dispute Verification**: To close the spite loophole, the Treasury evaluates half-signed transcripts by recomputing the digest directly from the finalized frozen epoch log. If $\text{peer}_a$'s transcript matches the recomputed log, $\text{peer}_b$ earns zero credit and incurs a non-response strike (`:fault-strikes`). If $\text{peer}_a$ fabricated a fake transcript, recomputation rejects the dispute and honest $\text{peer}_b$ is never struck.
+4. **Three-Strike Penalty**: Accumulating 3 fault strikes triggers an automatic stake freeze.
+
+### 5.4 Node Weight Formulation
+A node's reward weight $w_i$ in `calculate-node-weight` combines proven participation and bounded capital:
+
+$$w_i = \text{participation}_i \times \min\left(4.0, \frac{\text{stake}_i}{S_{\min}}\right) \quad (\text{for } \text{stake}_i \ge S_{\min}, \text{ else } 0)$$
+
+- **Minimum Stake**: $S_{\min} = 250,000$ ECHO (`default-s-min`).
+- **Maximum Multiplier**: $S_{\max} = 4.0$ (ratified cap).
+- **Sybil Resistance**: Capital efficiency is linear on $[S_{\min}, 4 \times S_{\min}]$ and flat above $4 \times S_{\min}$. Splitting capital above $4 \times S_{\min}$ is constrained by hardware costs, operational overhead, and `/24` IPv4 (`/48` IPv6) subnet deduplication in Basalt views.
+
+---
+
+## 6. Callee-Pays Multi-Homed Rendezvous
+
+### 6.1 The Terminating Monopoly Solution
+In peer-to-peer signaling, the Callee's home node (FNB) occupies a terminating monopoly over incoming traffic. Under sender-pays models, a callee can collude with its node to gouge callers.
+
+Tokenomics v2.1 solves this via **Receiver-Pays with Multi-Homing and Uniform Pricing**:
+- Callee B benefits from being reachable, so **Callee B pays for rendezvous hosting**. Caller A pays only its own signaling spam burn.
+- Callee B multi-homes across $m \ge 3$ Full Nodes at a **single uniform price $p_B$**.
+- Because every home node charges B the identical price $p_B$, Caller A's client automatically selects the lowest-latency responsive node from B's home set without user intervention and without inflating B's costs.
+
+```
+Caller A                                      Home Node (FNB)                             Callee B
+   |                                                 |                                       |
+   |--- 1. Offer Header + Signaling Burn ----------->|                                       |
+   |    (caller_pubkey, burn_hash, offer_hash)       |--- 2. Offer Header Push ------------->|
+   |                                                 |    (caller, burn_hash, epoch)         |
+   |                                                 |<-- 3. Signed DeliveryAck Voucher -----|
+   |                                                 |    (seq, cumulative_debit = seq*p_B)  |
+   |                                                 |--- 4. Reveal Encrypted SDP Body ----->|
+   |<-- 5. Relay SDP Answer & ICE -------------------|                                       |
+   |<==================== 6. Direct P2P WebRTC Liftoff =====================================>|
+```
+
+### 6.2 The Protocol Algorithm (`bitecho.rendezvous.core`)
+1. **Registration (Callee B)**: B registers with $m \ge 3$ Full Nodes at price $p_B$. If fewer than 3 nodes accept at $p_{B,\text{init}}$, B's client automatically steps up within its reservation range $[p_{B,\text{init}}, p_{B,\max}]$ until $m \ge 3$ nodes accept. If $1 \le m < 3$ accept at $p_{B,\max}$, the client operates in an explicitly flagged degraded mode.
+2. **Two-Phase Header Push & Policy Gate**: FNB receives A's offer and verifies A's signaling burn ($\ge 100$ ECHO). FNB pushes *only* the Offer Header to B. B verifies caller allowlists and burn requirements.
+3. **Sequential `DeliveryAck` Vouchers**: If policy passes, B signs a monotonic voucher:
+   $$\text{DeliveryAck}(\text{callee}, \text{home\_node}, \text{epoch}, \text{offer\_hash}, \text{seq}, \text{cumulative\_debit})$$
+   Where $\text{cumulative\_debit} = \text{seq} \times p_B$. Upon receiving the voucher, FNB reveals the full encrypted SDP body.
+4. **Epoch Settlement & Compaction**: At epoch close, FNB submits its vouchers via `compact-vouchers` in `bitecho.economy.bundle`. Only the highest sequence voucher for each $(\text{callee}, \text{home}, \text{epoch})$ tuple is settled in the ledger. Replayed tuples or mismatched debits are rejected. Failed or rejected calls produce no voucher and cost Callee B zero tokens.
+5. **Private-Good Separation**: WebRTC data transfer and TURN bandwidth relay are private goods paid directly by users at spot market rates; they are never subsidized by the Treasury.
+
+---
+
+## 7. Intent Settlement & The Edge FX Layer
+
+### 7.1 Mandatory $\tau = 0.5\%$ Settlement Take
+- Ephemeral Streamlet quorums evaluating `sci` intent contracts require a deterministic unit of account.
+- Every `sci` settlement contract pays a non-waivable protocol take $\tau = 0.5\%$ (50 bps, bounded $[0, 200]$ bps).
+- All takes are collected in or converted to ECHO and **100% burned**, directly expanding the trailing revenue base $R_{\text{trailing}}$ and driving demand-gated minting.
+
+### 7.2 Universal Edge Payment Acceptance
+Agents hold diverse assets across multiple ecosystems. Rather than burdening the consensus core with cross-chain complexity:
+- **Full Nodes Act as Principals**: Full Nodes advertise supported payment rails (Base, Solana, Bitcoin) and quote spot exchange rates to agents.
+- **Reference Launch Rails**:
+  - **Base (EVM L2)**: Parameterized EIP-712 + Permit2 execution, JIT liquidity routing via Uniswap v4.
+  - **Solana**: High-throughput Ed25519 message signing, Jupiter DEX aggregation.
+  - **Bitcoin**: Address-per-quote watching, wrapped routing (tBTC/cbBTC) or principal desk execution.
+- **Settlement Security**:
+  - **Escrow-First (Mandatory at Launch)**: Node locks ECHO in the quorum; agent transfers asset; quorum releases upon cryptographic proof of transfer. Zero unsecured credit.
+  - **Commitment-First**: Explicitly **disabled** at testnet launch. Deferred to Phase 2 bond slicing to prevent double-spending across parallel unpartitioned quorums.
+
+---
+
+## 8. Open Market-Structure Decisions (D9)
+
+Per Architecture Decision **D9** (§15, item 8 of the v2.1 specification):
+- **Market-maker and exchange listing sequencing is deliberately omitted from this tokenomics specification.**
+- Liquidity provision and secondary market listing are market-structure decisions that are strictly gated on settled real-world demand ($R_t$ protocol revenues existing to gate minting against).
+- Baking exchange listings or low-float/high-FDV market-maker contracts into the protocol specification would reintroduce the speculative death-spiral dynamics that Tokenomics v2 explicitly eliminates. This remains an open operational decision for governance once sustained intent settlement volume is achieved.
+
+---
+
+## 9. Historical Comparison: What Was Deleted from v1
+
+The table below catalogs every deprecated v1 mechanism that has been removed, alongside its Tokenomics v2.1 replacement:
+
+| Component | Version 1 Mechanism (Deleted) | Version 2.1 Mechanism (Authoritative) | Architectural Rationale |
+| :--- | :--- | :--- | :--- |
+| **Routing Rewards** | Probabilistic Receipt Lottery (`1 in 23,500` winning receipts submitted to Streamlet) | Peer-Attested Bilateral Epoch Transcripts (`EpochTranscript` with frozen log verification) | Eliminates Streamlet BFT overload, wash-routing exploits, and fake receipt generation. |
+| **Signaling Fees** | Per-hop sender micro-burns | Callee-Pays Multi-Homed Rendezvous (uniform $p_B$) + mandatory signaling burn ($\ge 100$ ECHO) | Solves the terminating monopoly holdup and sender griefing. |
+| **Monetary Engine** | Uncapped 5-year emission curve / 50% Treasury pre-mine | Demand-Gated Mint $M_t \le 0.5 \times R_{\text{trailing}}$ with 42B hard cap (45% Genesis custody, 55% conditional unminted) | Mathematically enforces net cycle deflation ($\sum (M_t - R_t) \le 0$) and eliminates unbacked inflation. |
+| **Mint Distribution** | Ad-hoc dual minting and receipt claiming | Exact 20/80 split of $M_t$ (20% Streamlet consensus validators, 80% Full Node mesh rewards) | Game-theoretically aligns consensus security with physical routing capacity. |
+| **Relay / Bandwidth** | Subsidized by Treasury yield pool | User-paid private good at spot market prices (USD-denominated) | Protects Treasury from bandwidth exhaustion; decouples physical costs from token volatility. |
+| **Callee Reachability** | Single-relay inbox (FNB chosen unilaterally by caller) | Multi-homed home set ($m \ge 3$) with uniform price $p_B$ and sequential `DeliveryAck` vouchers | Provides high-availability censorship resistance with fail-closed security. |
+| **Cross-Chain FX** | Commitment-first default | Escrow-first mandatory at launch; commitment-first disabled until Phase 2 bond slicing | Prevents concurrent double-spend attacks across parallel `sci` quorums. |
+
+---
+
+## 10. Ratified Parameters Reference
+
+| Parameter | Ratified Value | Code Symbol / Implementation |
+| :--- | :--- | :--- |
+| **Hard Cap** | `42,000,000,000` ECHO | `treasury/hard-cap` |
+| **Genesis Custody Supply** | `18,900,000,000` ECHO (45%) | `treasury/genesis-custody-supply` |
+| **Unminted Conditional Supply** | `23,100,000,000` ECHO (55%) | `treasury/max-conditional-mint-supply` |
+| **Bootstrap Allocation** | `4,200,000,000` ECHO (10%) | `treasury/genesis-custody-shares :bootstrap` |
+| **Team Allocation** | `6,300,000,000` ECHO (15%) | `treasury/genesis-custody-shares :team` |
+| **Genesis Partners Allocation** | `4,200,000,000` ECHO (10%) | `treasury/genesis-custody-shares :partners` |
+| **Ecosystem Grants Allocation** | `4,200,000,000` ECHO (10%) | `treasury/genesis-custody-shares :ecosystem` |
+| **Demand Gate Discount Factor ($k$)** | `0.5` (5,000 bps) | `treasury/default-k-bps` |
+| **Trailing Window Length ($N$)** | `168` epochs (1-hour epochs) | `config/default-config :treasury-trailing-epochs` |
+| **Intent Settlement Take ($\tau$)** | `0.5%` (50 bps, bounds: $[0, 200]$ bps) | `burn/default-settlement-take-bps` |
+| **Minimum Signaling Spam Burn** | `100` ECHO | `burn/min-signaling-burn` |
+| **Mint Split (Validators / Mesh)** | `20%` / `80%` | `treasury/streamlet-share-pct` |
+| **Minimum Node Stake ($S_{\min}$)** | `250,000` ECHO | `attestation/default-s-min` |
+| **Maximum Stake Multiplier ($S_{\max}$)** | `4.0` | `attestation/default-s-max` |
+| **Minimum Multi-Home Redundancy ($m$)** | $\ge 3$ nodes | `rendezvous/register-home-set` |
