@@ -398,10 +398,9 @@
 
     (let [network (start-network cfg)
           h-nodes (:h-nodes network)
-            ;; Populate registry-map for all nodes to easily loop through them
-          registry-map @registry]
+          peers-map (into {} (map (fn [n] [(:pubkey-hex n) (:public (:keys n))]) (vals @registry)))]
       (doseq [node h-nodes]
-        (vswap! (:state-vol node) assoc :registry-map registry-map))
+        (vswap! (:state-vol node) assoc :peers-map peers-map))
 
       (println "\n── Phase 1: Full Synchrony (20 Epochs) ─────────────────")
       (dotimes [_ 20]

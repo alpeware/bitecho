@@ -162,26 +162,12 @@
                               heads)]
     (update state :finalized-blocks (fnil into #{}) new-finalized)))
 
-(defn- peer->hex
-  "Normalizes a peer representation (string or map) to a public key hex string."
-  [peer]
-  (cond
-    (string? peer) peer
-    (map? peer) (or (:pubkey-hex peer) (:pubkey peer) (:node-pubkey peer))
-    :else nil))
-
 (defn- extract-peer-hexes
   "Extracts a sorted vector of peer public key hex strings from state."
   [state]
   (cond
     (seq (:peers-map state))
     (vec (sort (keys (:peers-map state))))
-
-    (seq (:registry-map state))
-    (vec (sort (keys (:registry-map state))))
-
-    (seq (:peers state))
-    (vec (sort (keep peer->hex (:peers state))))
 
     (:node-pubkey state)
     [(:node-pubkey state)]
@@ -197,13 +183,12 @@
       1))
 
 (defn- extract-targets
-  "Determines target destinations for outgoing network commands."
+  "Determines target destinations for outgoing network commands.
+   Prefers explicit :targets override, otherwise falls back to keys of :peers-map."
   [state]
   (cond
     (:targets state) (:targets state)
-    (:registry-map state) (vals (:registry-map state))
     (:peers-map state) (keys (:peers-map state))
-    (:peers state) (:peers state)
     :else []))
 
 (defn- extract-local-pubkey-bytes
@@ -215,7 +200,7 @@
         (try (hex->bytes hex) (catch Exception _ nil)))))
 
 (defn- extract-sender-pubkey-bytes
-  "Resolves the sender's public key bytes from event or state registries."
+  "Resolves the sender's public key bytes from event or :peers-map in state."
   [state event]
   (or (:sender-pubkey-bytes event)
       (when-let [sender (:sender event)]
@@ -227,11 +212,7 @@
           (let [entry (get-in state [:peers-map sender])]
             (if (bytes? entry)
               entry
-              (or (:public (:keys entry)) (:public entry) (:pubkey entry))))
-
-          (contains? (:registry-map state) sender)
-          (let [node (get-in state [:registry-map sender])]
-            (or (:public (:keys node)) (:public node)))
+              (try (hex->bytes entry) (catch Exception _ nil))))
 
           (string? sender)
           (try (hex->bytes sender) (catch Exception _ nil))
@@ -248,7 +229,7 @@
         valid-heads (filterv #(pos? (chain-length blocks %)) notarized)
         head-hash (if (empty? valid-heads)
                     "genesis"
-                    (apply max-key (fn [h] [(chain-length blocks h) (get-in blocks [h :epoch] -1)]) valid-heads))]
+                    (last (sort-by (fn [h] [(chain-length blocks h) (get-in blocks [h :epoch] -1)]) valid-heads)))]
     (assoc state :head-hash head-hash)))
 
 (defn- apply-future-votes
