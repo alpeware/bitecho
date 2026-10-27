@@ -39,10 +39,11 @@ Total Supply Hard Cap: 42,000,000,000 ECHO (100%)
 A strict separation is enforced between pre-allocated Genesis custody and the unminted conditional supply:
 
 1. **45% Genesis Allocation (18,900,000,000 ECHO)**: Minted at genesis into non-circulating, Treasury-custodied lockup accounts (`:genesis-ledger` in `bitecho.state-machine`):
-   - **10% Bootstrap Reserve (4,200,000,000 ECHO)**: Dedicated to early peer-attested mesh public goods and early demand-side rebates. Features algorithmic 3-year decay and a **hard sunset burn** at Year 3. Any unspent balance in the Bootstrap custody account at the sunset epoch is permanently burned directly from custody via `burn-unspent-bootstrap-custody` in `bitecho.economy.treasury`, permanently reducing the eventual circulating supply.
+   - **10% Bootstrap Reserve (4,200,000,000 ECHO)**: Dedicated to early peer-attested mesh public goods and early demand-side rebates. Features algorithmic 3-year decay and a **hard sunset burn** at Year 3 (epoch `26,280`). Fail-closed Bootstrap custody drawdown (`process-bootstrap-custody`) and the Year-3 hard sunset burn (`burn-unspent-bootstrap-custody` at epoch `26,280`) are enforced directly in the Phase 5 state machine per tick. Any unspent balance in the Bootstrap custody account at or after the sunset epoch is permanently burned directly from custody, reducing the eventual circulating supply.
    - **15% Core Architecture & Protocol Security (6,300,000,000 ECHO)**: 4-year linear vesting with a 1-year cliff.
    - **10% Federated Genesis Partners (4,200,000,000 ECHO)**: Subsidizes enterprise backbone Full Nodes. 1-year cliff followed by 3-year linear vesting, strictly SLA-gated (vesting pauses automatically upon SLA breach).
    - **10% Agent Ecosystem & Developer Grants (4,200,000,000 ECHO)**: Released strictly via milestone-gated Treasury votes; automatic time-based cliffs are prohibited.
+   - *Vesting & Custody Governance Scope*: While Bootstrap Reserve drawdown and sunset burns are automated in the protocol state machine, the release schedules for the Team (4yr/1yr cliff), Genesis Partners (SLA-gated), and Ecosystem Grants (milestone-gated) allocations are enforced via external Treasury custody governance and lockup contracts rather than automatic per-tick state-machine rules.
 2. **55% Unminted Conditional Supply (23,100,000,000 ECHO)**: Does not exist at genesis. Tokens are minted into existence if and only if authorized by the demand-gated emission engine.
 
 ---
@@ -112,13 +113,14 @@ $$\text{exchange\_digest} = \text{SHA256}(e \parallel \text{peer}_a \parallel \t
 4. **Three-Strike Penalty**: Accumulating 3 fault strikes triggers an automatic stake freeze.
 
 ### 5.4 Node Weight Formulation
-A node's reward weight $w_i$ in `calculate-node-weight` combines proven participation and bounded capital:
+A node's reward weight $w_i$ in `calculate-node-weight` combines proven participation and bounded capital via continuous linear scaling:
 
-$$w_i = \text{participation}_i \times \min\left(4.0, \frac{\text{stake}_i}{S_{\min}}\right) \quad (\text{for } \text{stake}_i \ge S_{\min}, \text{ else } 0)$$
+$$w_i = \text{participation}_i \times \min\left(4.0, \frac{\text{stake}_i}{S_{\min}}\right)$$
 
-- **Minimum Stake**: $S_{\min} = 250,000$ ECHO (`default-s-min`).
-- **Maximum Multiplier**: $S_{\max} = 4.0$ (ratified cap).
-- **Sybil Resistance**: Capital efficiency is linear on $[S_{\min}, 4 \times S_{\min}]$ and flat above $4 \times S_{\min}$. Splitting capital above $4 \times S_{\min}$ is constrained by hardware costs, operational overhead, and `/24` IPv4 (`/48` IPv6) subnet deduplication in Basalt views.
+- **Reference Unit Stake**: $S_{\min} = 250,000$ ECHO (`attestation/default-min-stake`).
+- **Maximum Multiplier**: $S_{\max} = 4.0$ (`attestation/max-stake-multiplier`).
+- **Continuous Linear Scaling**: Node weight scales continuously and linearly with stake from $0$ up to $4 \times S_{\min}$ (capped at $S_{\max} = 4.0$). There is no discontinuous threshold or cliff at $S_{\min}$.
+- **Sybil Resistance**: Capital efficiency is linear on $[0, 4 \times S_{\min}]$ and flat above $4 \times S_{\min}$. Splitting capital above $4 \times S_{\min}$ is constrained by hardware costs, operational overhead, and `/24` IPv4 (`/48` IPv6) subnet deduplication in Basalt views.
 
 ---
 
@@ -180,8 +182,8 @@ Agents hold diverse assets across multiple ecosystems. Rather than burdening the
 
 Per Architecture Decision **D9** (§15, item 8 of the v2.1 specification):
 - **Market-maker and exchange listing sequencing is deliberately omitted from this tokenomics specification.**
-- Liquidity provision and secondary market listing are market-structure decisions that are strictly gated on settled real-world demand ($R_t$ protocol revenues existing to gate minting against).
-- Baking exchange listings or low-float/high-FDV market-maker contracts into the protocol specification would reintroduce the speculative death-spiral dynamics that Tokenomics v2 explicitly eliminates. This remains an open operational decision for governance once sustained intent settlement volume is achieved.
+- Market-maker and exchange listing sequencing — including the *liquidity-after-demand* vs. *price-first* sequencing fork (§15, item 8) — is an open market-structure decision outside the core protocol specification and is not settled by this document.
+- Whether secondary market liquidity precedes or follows sustained intent settlement volume ($R_t$) remains an operational governance decision to be evaluated independently of the core consensus and economic rules.
 
 ---
 
@@ -212,11 +214,12 @@ The table below catalogs every deprecated v1 mechanism that has been removed, al
 | **Team Allocation** | `6,300,000,000` ECHO (15%) | `treasury/genesis-custody-shares :team` |
 | **Genesis Partners Allocation** | `4,200,000,000` ECHO (10%) | `treasury/genesis-custody-shares :partners` |
 | **Ecosystem Grants Allocation** | `4,200,000,000` ECHO (10%) | `treasury/genesis-custody-shares :ecosystem` |
+| **Bootstrap Sunset Epoch** | `26,280` epochs (3 years) | `treasury/default-bootstrap-sunset-epoch` |
 | **Demand Gate Discount Factor ($k$)** | `0.5` (5,000 bps) | `treasury/default-k-bps` |
 | **Trailing Window Length ($N$)** | `168` epochs (1-hour epochs) | `config/default-config :treasury-trailing-epochs` |
 | **Intent Settlement Take ($\tau$)** | `0.5%` (50 bps, bounds: $[0, 200]$ bps) | `burn/default-settlement-take-bps` |
 | **Minimum Signaling Spam Burn** | `100` ECHO | `burn/min-signaling-burn` |
 | **Mint Split (Validators / Mesh)** | `20%` / `80%` | `treasury/streamlet-share-pct` |
-| **Minimum Node Stake ($S_{\min}$)** | `250,000` ECHO | `attestation/default-s-min` |
-| **Maximum Stake Multiplier ($S_{\max}$)** | `4.0` | `attestation/default-s-max` |
+| **Minimum Node Stake ($S_{\min}$)** | `250,000` ECHO | `attestation/default-min-stake` |
+| **Maximum Stake Multiplier ($S_{\max}$)** | `4.0` | `attestation/max-stake-multiplier` |
 | **Minimum Multi-Home Redundancy ($m$)** | $\ge 3$ nodes | `rendezvous/register-home-set` |

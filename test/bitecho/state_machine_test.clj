@@ -200,20 +200,61 @@
       (is (= "block-final-hash-99" (:epoch-entropy new-state)))
       (is (= expected-seed (:seed (nth new-view idx)))))))
 
-(defspec ^{:doc "Property: State machine basalt slot seeds are deterministic across differing RNG instances."}
+(deftest handle-tick-deterministic-peer-selection-test
+  (testing "handle-tick uses basalt/select-peers-deterministic for push targets and background sampling"
+    (let [node-pub "node-pub-test"
+          entropy "entropy-test-123"
+          cfg (assoc config/default-config :epoch-entropy entropy)
+          peers (mapv (fn [i] {:address (str "10.0.0." i)
+                               :port (+ 8000 i)
+                               :pubkey (str "peer-pubkey-" i)
+                               :hash (str "peer-hash-" i)})
+                      (range 1 15))
+          state (sm/init-state peers node-pub cfg)
+          res1 (sm/handle-event state {:type :tick :rng (java.util.Random. 12345)})
+          res2 (sm/handle-event state {:type :tick :rng (java.util.Random. 67890)})
+          s1 (:state res1)
+          s2 (:state res2)
+          push1 (first (filter #(= :send-push-view (:type %)) (:commands res1)))
+          push2 (first (filter #(= :send-push-view (:type %)) (:commands res2)))]
+      ;; Slot seeds are identical across differing RNGs
+      (is (= (mapv :seed (:basalt-view s1))
+             (mapv :seed (:basalt-view s2))))
+      ;; Push targets are identical across differing RNGs
+      (is (some? (:targets push1)))
+      (is (= (:targets push1) (:targets push2)))
+      ;; Global role samples are non-empty and identical across differing RNGs
+      (is (seq (:global-echo-sample s1)))
+      (is (= (:global-echo-sample s1) (:global-echo-sample s2)))
+      (is (seq (:global-ready-sample s1)))
+      (is (= (:global-ready-sample s1) (:global-ready-sample s2)))
+      (is (seq (:global-delivery-sample s1)))
+      (is (= (:global-delivery-sample s1) (:global-delivery-sample s2))))))
+
+(defspec ^{:doc "Property: State machine basalt slot seeds, push targets, and background role samples are deterministic across differing RNG instances."}
   prop-state-machine-deterministic-entropy 50
   (prop/for-all [node-pub (gen/not-empty gen/string-alphanumeric)
                  entropy (gen/not-empty gen/string-alphanumeric)]
                 (let [cfg (assoc config/default-config :epoch-entropy entropy)
-                      state (sm/init-state [] node-pub cfg)
+                      peers (mapv (fn [i] {:address (str "10.0.0." i)
+                                           :port (+ 8000 i)
+                                           :pubkey (str "peer-pubkey-" i)
+                                           :hash (str "peer-hash-" i)})
+                                  (range 1 12))
+                      state (sm/init-state peers node-pub cfg)
                       res1 (sm/handle-event state {:type :tick :rng (java.util.Random. 1111)})
                       res2 (sm/handle-event state {:type :tick :rng (java.util.Random. 9999)})
-                      view1 (:basalt-view (:state res1))
-                      view2 (:basalt-view (:state res2))
-                      seeds1 (mapv :seed view1)
-                      seeds2 (mapv :seed view2)]
-                  ;; The slot seeds must be 100% identical regardless of different RNG seeds!
-                  (= seeds1 seeds2))))
+                      s1 (:state res1)
+                      s2 (:state res2)
+                      seeds1 (mapv :seed (:basalt-view s1))
+                      seeds2 (mapv :seed (:basalt-view s2))
+                      push-targets1 (:targets (first (filter #(= :send-push-view (:type %)) (:commands res1))))
+                      push-targets2 (:targets (first (filter #(= :send-push-view (:type %)) (:commands res2))))]
+                  (and (= seeds1 seeds2)
+                       (= push-targets1 push-targets2)
+                       (= (:global-echo-sample s1) (:global-echo-sample s2))
+                       (= (:global-ready-sample s1) (:global-ready-sample s2))
+                       (= (:global-delivery-sample s1) (:global-delivery-sample s2))))))
 
 (deftest signaling-burn-state-machine-test
   (testing "Direct :signaling-burn event decrements sender ledger balance and increments [:epoch-burns current-epoch]"

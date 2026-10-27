@@ -36,7 +36,7 @@ Based on the academic proof that single-owner accounts have a Consensus Number o
 
 ### 2. Supply Architecture: 42 Billion Hard Cap
 The network enforces an absolute hard cap of **42,000,000,000 ECHO (42 Billion ECHO)**:
-* **45% Genesis Custody Allocation (18,900,000,000 ECHO)**: Initialized in the authoritative `:genesis-ledger` in `bitecho.state-machine`. Allocated to 10% Bootstrap Reserve (4.2B), 15% Core Team (6.3B), 10% Genesis Partners (4.2B), and 10% Ecosystem Grants (4.2B).
+* **45% Genesis Custody Allocation (18,900,000,000 ECHO)**: Initialized in the authoritative `:genesis-ledger` in `bitecho.state-machine`. Allocated to 10% Bootstrap Reserve (4.2B), 15% Core Team (6.3B), 10% Genesis Partners (4.2B), and 10% Ecosystem Grants (4.2B). Fail-closed Bootstrap custody drawdown (`process-bootstrap-custody`) and the Year-3 hard sunset burn (`burn-unspent-bootstrap-custody` at epoch `26,280`) are enforced directly by the state machine per tick. Team (4yr/1yr cliff), Genesis Partners (SLA-gated), and Ecosystem Grants (milestone-gated) schedules are administered via external Treasury custody governance and lockup contracts rather than automated per-tick state-machine rules.
 * **55% Unminted Conditional Supply (23,100,000,000 ECHO)**: Does not exist at genesis. Tokens are only brought into existence via demand-gated emission.
 
 ### 3. Signaling Fee Burn (`bitecho.economy.burn`)
@@ -50,13 +50,13 @@ The v1 probabilistic receipt lottery has been completely deleted. Treasury rewar
 * **Canonical Exchange Digest**: Peers compute a deterministic digest over all valid messages exchanged across their link: $\text{exchange\_digest} = \text{SHA256}(e \parallel \text{peer}_a \parallel \text{peer}_b \parallel \text{pr-str}(\text{sorted\_vec}))$.
 * **Frozen Epoch Message Logs**: Message reconciliation is evaluated against the frozen epoch message set (`:frozen-epoch-messages`) before TTL pruning.
 * **Bilateral Transcripts & Dispute Recomputation**: Sampled peers exchange signatures to form an `EpochTranscript`. If a counterparty withholds its signature, a half-signed transcript is evaluated against the frozen epoch log. If honest, the withholding peer incurs a fault strike (`:fault-strikes`); fabricated transcripts fail log recomputation and never strike honest peers. Accumulating 3 strikes locks node stake.
-* **Bounded Node Weight**: Node weight is $w_i = \text{participation}_i \times \min(4.0, \text{stake}_i / S_{\min})$ with ratified $S_{\min} = 250,000$ ECHO ($0$ below $S_{\min}$).
+* **Bounded Node Weight**: Node weight scales continuously and linearly with stake: $w_i = \text{participation}_i \times \min(4.0, \text{stake}_i / S_{\min})$ using reference unit stake $S_{\min} = 250,000$ ECHO (`attestation/default-min-stake`) and maximum multiplier $S_{\max} = 4.0$ (`attestation/max-stake-multiplier`), with continuous scaling and no discontinuous cliff at $S_{\min}$.
 
 ### 5. Demand-Gated Treasury Mint & Bootstrap Custody (`bitecho.economy.treasury`)
 * **Demand-Gated Mint Formula**: In epoch $t$, new conditional minting $M_t \le 0.5 \times R_{\text{trailing},t}$ over a rolling $N = 168$ epoch window (zero-padded for $t \le N$). Total revenue $R_t$ consists of 100% of signaling burns + 100% of `sci` intent settlement takes.
 * **Cycle Deflation**: Because 100% of $R_t$ is burned while minting is discounted by $k = 0.5$, cumulative net issuance satisfies $\sum (M_t - R_t) \le -0.5 \sum R_t \le 0$ over any full economic cycle.
 * **Exact 20/80 Mint Partition**: $M_t$ is partitioned 20% to Streamlet consensus validators and 80% to Full Node mesh nodes.
-* **Bootstrap Custody Decay & Hard Sunset**: The 10% Bootstrap Reserve decays over ~3 years. At Year 3, any unspent bootstrap balance is permanently burned directly from custody via `burn-unspent-bootstrap-custody`, reducing total eventual supply.
+* **Bootstrap Custody Decay & Hard Sunset**: The 10% Bootstrap Reserve decays over ~3 years. At Year 3 (epoch `26,280`), any unspent bootstrap balance is permanently burned directly from custody via `burn-unspent-bootstrap-custody`, reducing total eventual supply.
 
 ---
 
@@ -126,10 +126,10 @@ The system topology is bifurcated: a `:net-in` channel multiplexes all raw exter
 ### B. The 42 Billion Genesis Allocation
 The network initializes from a deterministic `genesis.edn` state, hard-capping supply at 42,000,000,000 ECHO:
 * **45% Genesis Custody (18.9B ECHO)**:
-  - 10% Bootstrap Reserve (4.2B ECHO, 3-yr decay + sunset burn via `burn-unspent-bootstrap-custody`).
-  - 15% Core Team (6.3B ECHO, 4-yr vest, 1-yr cliff).
-  - 10% Genesis Partners (4.2B ECHO, 1-yr cliff, 3-yr vest, SLA-gated).
-  - 10% Ecosystem & Grants (4.2B ECHO, milestone-gated).
+  - 10% Bootstrap Reserve (4.2B ECHO, 3-yr decay + sunset burn via `burn-unspent-bootstrap-custody` at epoch `26,280` in the protocol state machine).
+  - 15% Core Team (6.3B ECHO, 4-yr vest, 1-yr cliff via external custody governance).
+  - 10% Genesis Partners (4.2B ECHO, 1-yr cliff, 3-yr vest, SLA-gated via external custody governance).
+  - 10% Ecosystem & Grants (4.2B ECHO, milestone-gated via external custody governance).
 * **55% Unminted Conditional Supply (23.1B ECHO)**: Minted strictly through demand-gated emission ($M_t \le 0.5 \times R_{\text{trailing}}$).
 
 ### C. Agent Birthing & Delegated Cryptography (DACs)

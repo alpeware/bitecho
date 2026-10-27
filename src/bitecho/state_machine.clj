@@ -230,8 +230,9 @@
       "genesis")))
 
 (defn- sample-peer-roles
-  "Selects background peer samples for echo, ready, and delivery roles, returning updated sets and subscribe commands."
-  [state cfg rng extracted-peers]
+  "Selects background peer samples for echo, ready, and delivery roles deterministically,
+   returning updated sets and subscribe commands."
+  [state cfg epoch-entropy new-epoch extracted-peers]
   (let [E-size (:echo-sample-size cfg)
         R-size (:ready-sample-size cfg)
         D-size (:delivery-sample-size cfg)
@@ -247,15 +248,15 @@
                                  (range (count extracted-peers))))
         echo-avail-idxs (avail-idx-for (:global-echo-sample state))
         echo-avail-peers (mapv #(nth extracted-peers %) echo-avail-idxs)
-        new-echo-peers (basalt/select-peers rng echo-avail-peers needed-echo)
+        new-echo-peers (basalt/select-peers-deterministic (str epoch-entropy ":echo:" new-epoch) my-pubkey echo-avail-peers needed-echo)
         new-echo-hexes (set (mapv peer-hex new-echo-peers))
         ready-avail-idxs (avail-idx-for (:global-ready-sample state))
         ready-avail-peers (mapv #(nth extracted-peers %) ready-avail-idxs)
-        new-ready-peers (basalt/select-peers rng ready-avail-peers needed-ready)
+        new-ready-peers (basalt/select-peers-deterministic (str epoch-entropy ":ready:" new-epoch) my-pubkey ready-avail-peers needed-ready)
         new-ready-hexes (set (mapv peer-hex new-ready-peers))
         delivery-avail-idxs (avail-idx-for (:global-delivery-sample state))
         delivery-avail-peers (mapv #(nth extracted-peers %) delivery-avail-idxs)
-        new-delivery-peers (basalt/select-peers rng delivery-avail-peers needed-delivery)
+        new-delivery-peers (basalt/select-peers-deterministic (str epoch-entropy ":delivery:" new-epoch) my-pubkey delivery-avail-peers needed-delivery)
         new-delivery-hexes (set (mapv peer-hex new-delivery-peers))
         updated-echo-sample (set/union (:global-echo-sample state) new-echo-hexes)
         updated-ready-sample (set/union (:global-ready-sample state) new-ready-hexes)
@@ -329,7 +330,7 @@
         new-view (:view reset-result)
         new-index (:next-r reset-result)
         extracted-peers (basalt/extract-peers new-view)
-        push-targets (basalt/select-peers rng new-view 1)
+        push-targets (basalt/select-peers-deterministic (str epoch-entropy ":push:" new-epoch) (:node-pubkey state) new-view 1)
         push-command (when (seq push-targets)
                        {:type :send-push-view
                         :targets push-targets
@@ -339,7 +340,7 @@
                           {:type :send-summary
                            :target (:target summary)
                            :summary (:summary summary)})
-        sampling-res (sample-peer-roles state cfg rng extracted-peers)
+        sampling-res (sample-peer-roles state cfg epoch-entropy new-epoch extracted-peers)
         echo-subs (:echo-subscribers state)
         pending-echo-ids (set/difference (:contagion-known-ids state)
                                          (:sieve-delivered-set state))
