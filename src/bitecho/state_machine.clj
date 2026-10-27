@@ -6,9 +6,11 @@
             [bitecho.contagion.core :as contagion]
             [bitecho.economy.account :as account]
             [bitecho.economy.attestation :as attestation]
+            [bitecho.economy.bundle :as bundle]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.treasury :as treasury]
             [bitecho.murmur.core :as murmur]
+            [bitecho.rendezvous.core :as rendezvous]
             [bitecho.sieve.core :as sieve]
             [clojure.edn :as edn]
             [clojure.set :as set]))
@@ -64,6 +66,10 @@
       :minted-epochs #{}
       :frozen-epoch-messages {}
       :fault-strikes {}
+      :home-sets {}
+      :voucher-seqs {}
+      :pending-vouchers []
+      :settled-voucher-tuples #{}
       :ledger (or genesis-ledger {})})))
 
 (defn- build-tick-treasury-ctx
@@ -86,6 +92,48 @@
      :bootstrap-sunset-epoch (or (:bootstrap-sunset-epoch state) (:bootstrap-sunset-epoch cfg))
      :treasury-pubkey (or (:treasury-pubkey state) (:treasury-pubkey cfg))
      :treasury-privkey (or (:treasury-privkey state) (:treasury-privkey cfg))}))
+
+(defn- settle-single-voucher
+  "Settles a single compacted DeliveryAck voucher against state, updating ledger and settled tuples."
+  [acc ack closing-epoch]
+  (let [callee (:callee ack)
+        home-node (:home-node ack)
+        tuple [callee home-node closing-epoch]
+        reg-set (get-in acc [:home-sets [callee closing-epoch]])
+        reg-price (:price reg-set)
+        v-res (rendezvous/verify-ack-for-settlement
+               ack
+               {:settlement-epoch closing-epoch
+                :registered-price reg-price
+                :settled-tuples (:settled-voucher-tuples acc)})]
+    (if (:valid? v-res)
+      (let [debit (:debit v-res)
+            ledger (:ledger acc)
+            callee-st (get ledger callee (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+            callee-bal (or (:balance callee-st) 0)
+            transfer-amt (min callee-bal debit)
+            home-st (get ledger home-node (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+            new-callee (assoc callee-st :balance (- callee-bal transfer-amt))
+            new-home (assoc home-st :balance (+ (or (:balance home-st) 0) transfer-amt))
+            new-ledger (assoc ledger callee new-callee home-node new-home)]
+        (-> acc
+            (assoc :ledger new-ledger)
+            (update :settled-voucher-tuples conj tuple)))
+      acc)))
+
+(defn- apply-epoch-voucher-settlement
+  "Compacts and settles pending DeliveryAck vouchers for the closing epoch."
+  [state closing-epoch]
+  (let [pending (or (:pending-vouchers state) [])
+        compacted (bundle/compact-vouchers pending closing-epoch)
+        settled-tuples (or (:settled-voucher-tuples state) #{})
+        ledger (or (:ledger state) {})
+        init-acc (assoc state :settled-voucher-tuples settled-tuples :ledger ledger)
+        final-acc (reduce (fn [acc ack] (settle-single-voucher acc ack closing-epoch))
+                          init-acc
+                          compacted)
+        remaining-pending (filterv #(not= closing-epoch (:epoch %)) pending)]
+    (assoc final-acc :pending-vouchers remaining-pending)))
 
 (defn- apply-epoch-treasury-boundary
   "Executes treasury epoch boundary calculations, applying demand-gated mint
@@ -253,8 +301,9 @@
                           :delivery-vote-counts pruned-delivery-vote-counts
                           :sieve-delivered-set pruned-sieve-delivered-set
                           :local-ready-set pruned-local-ready-set
-                          :delivered-set pruned-delivered-set)]
-    {:state (apply-epoch-treasury-boundary tick-state new-epoch)
+                          :delivered-set pruned-delivered-set)
+        tick-state-settled (apply-epoch-voucher-settlement tick-state closing-epoch)]
+    {:state (apply-epoch-treasury-boundary tick-state-settled new-epoch)
      :commands commands}))
 
 (defn- apply-broadcast-burn
@@ -659,6 +708,68 @@
     {:state (assoc state :fault-strikes new-strikes)
      :commands []}))
 
+(defn- handle-register-home-set
+  "Registers a home set of nodes for Callee B for an epoch.
+   Enforces fixed price p_B per (callee, epoch): mid-epoch re-registration
+   at a different price is rejected unless targeting a new epoch."
+  [state event]
+  (let [callee (:callee event)
+        epoch (or (:epoch event) (:epoch state) 0)
+        candidates (or (:candidates event) [])
+        p-b (or (:price event) (:p-b event) 0)
+        p-b-max (or (:price-max event) (:p-b-max event) p-b)
+        tuple [callee epoch]
+        existing (get-in state [:home-sets tuple])]
+    (if (and existing (some? (:price existing)) (not= (:price existing) p-b))
+      {:state state :commands []}
+      (let [reg-result (rendezvous/register-home-set candidates p-b p-b-max)]
+        {:state (assoc-in state [:home-sets tuple] reg-result)
+         :commands []}))))
+
+(defn- node-in-home-set?
+  "Checks if a home-node is present in the registered home set."
+  [home-node home-set]
+  (let [nodes (:home-nodes home-set)]
+    (boolean
+     (some (fn [n]
+             (let [id (cond
+                        (map? n) (or (:node-id n) (:pubkey n) (:id n) (:address n))
+                        :else n)]
+               (= id home-node)))
+           nodes))))
+
+(defn- handle-receive-offer-header
+  "Processes an incoming offer header, validating home set membership and
+   sequence monotonicity, and appending the generated DeliveryAck to pending vouchers."
+  [state event]
+  (let [callee (:callee event)
+        home-node (:home-node event)
+        current-epoch (or (:epoch event) (:epoch state) 0)
+        home-set (get-in state [:home-sets [callee current-epoch]])
+        tuple [callee home-node current-epoch]
+        last-seq (get-in state [:voucher-seqs tuple] 0)
+        seq-num (:seq event)
+        expected-seq (inc last-seq)]
+    (if (or (nil? home-set)
+            (= :rejected (:status home-set))
+            (not (node-in-home-set? home-node home-set))
+            (not= seq-num expected-seq))
+      {:state state :commands []}
+      (let [price (:price home-set)
+            cum-debit (* seq-num price)
+            offer-ctx (assoc event
+                             :last-seq last-seq
+                             :p-b price
+                             :cumulative-debit cum-debit
+                             :epoch current-epoch)
+            res (rendezvous/process-offer-header offer-ctx)]
+        (if (= :ok (:status res))
+          {:state (-> state
+                      (assoc-in [:voucher-seqs tuple] seq-num)
+                      (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
+           :commands []}
+          {:state state :commands []})))))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
@@ -671,6 +782,8 @@
     :epoch-mint (handle-epoch-mint state event)
     :apply-epoch-mint (handle-epoch-mint state event)
     :submit-transcript (handle-submit-transcript state event)
+    :register-home-set (handle-register-home-set state event)
+    :receive-offer-header (handle-receive-offer-header state event)
     :receive-push-view (handle-receive-push-view state event)
     :receive-summary (handle-receive-summary state event)
     :receive-subscribe (handle-receive-subscribe state event)

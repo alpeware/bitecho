@@ -69,33 +69,44 @@
     (is (nil? (rdv/select-home-node [{:node-id "n1" :latency 10 :responsive? false}])))))
 
 (deftest process-offer-header-test
-  (let [home-kp (crypto/generate-keypair)
-        home-pub (basalt/bytes->hex (:public home-kp))
-        home-priv (:private home-kp)
-        callee "callee-pub-b"
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        callee-priv (:private callee-kp)
+        home-node "home-node-pub-h"
         caller "caller-pub-a"
         offer-hash "hash-offer-123"
         base-ctx {:caller caller
-                  :callee callee
-                  :home-node home-pub
-                  :home-node-privkey home-priv
+                  :callee callee-pub
+                  :callee-privkey callee-priv
+                  :home-node home-node
                   :epoch 5
                   :offer-hash offer-hash
                   :seq 1
-                  :cumulative-debit 100
+                  :p-b 100
                   :burn 150
                   :allowlist #{caller "other-caller"}
                   :min-burn 100}]
-    (testing "Produces valid signed DeliveryAck bound to epoch when caller passes allowlist and min-burn"
+    (testing "Produces valid signed DeliveryAck bound to epoch when caller passes allowlist and min-burn (signed by callee)"
       (let [res (rdv/process-offer-header base-ctx)
             ack (:delivery-ack res)]
+        (is (= :ok (:status res)))
         (is (some? ack))
-        (is (= callee (:callee ack)))
-        (is (= home-pub (:home-node ack)))
+        (is (= callee-pub (:callee ack)))
+        (is (= home-node (:home-node ack)))
         (is (= 5 (:epoch ack)))
         (is (= offer-hash (:offer-hash ack)))
         (is (= 1 (:seq ack)))
         (is (= 100 (:cumulative-debit ack)))
+        (is (true? (rdv/verify-delivery-ack ack)))))
+
+    (testing "Falls back to :home-node-privkey if :callee-privkey is absent"
+      (let [fallback-ctx (-> base-ctx
+                             (dissoc :callee-privkey)
+                             (assoc :home-node-privkey callee-priv))
+            res (rdv/process-offer-header fallback-ctx)
+            ack (:delivery-ack res)]
+        (is (= :ok (:status res)))
+        (is (some? ack))
         (is (true? (rdv/verify-delivery-ack ack)))))
 
     (testing "Rejects offer when caller is not in callee's allowlist"
@@ -108,7 +119,88 @@
       (let [low-burn-ctx (assoc base-ctx :burn 50)
             res (rdv/process-offer-header low-burn-ctx)]
         (is (nil? (:delivery-ack res)))
-        (is (= :insufficient-burn (:error res)))))))
+        (is (= :insufficient-burn (:error res)))))
+
+    (testing "Rejects offer when seq < 1"
+      (let [zero-seq-ctx (assoc base-ctx :seq 0)
+            res (rdv/process-offer-header zero-seq-ctx)]
+        (is (nil? (:delivery-ack res)))
+        (is (= :invalid-seq (:error res)))))
+
+    (testing "Rejects offer when seq is not strictly (inc last-seq)"
+      (let [gap-ctx (assoc base-ctx :seq 3 :last-seq 1)
+            rollback-ctx (assoc base-ctx :seq 1 :last-seq 1)
+            valid-ctx (assoc base-ctx :seq 2 :last-seq 1)]
+        (is (= :invalid-seq (:error (rdv/process-offer-header gap-ctx))))
+        (is (= :invalid-seq (:error (rdv/process-offer-header rollback-ctx))))
+        (is (= :ok (:status (rdv/process-offer-header valid-ctx))))))
+
+    (testing "Calculates cumulative-debit strictly as (* seq p-b) and rejects mismatched debit"
+      (let [calc-res (rdv/process-offer-header (assoc base-ctx :seq 3 :p-b 50))
+            ack (:delivery-ack calc-res)
+            inflated-ctx (assoc base-ctx :seq 3 :p-b 50 :cumulative-debit 999)]
+        (is (= :ok (:status calc-res)))
+        (is (= 150 (:cumulative-debit ack)))
+        (is (= :invalid-debit (:error (rdv/process-offer-header inflated-ctx))))))))
+
+(deftest verify-ack-for-settlement-test
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        callee-priv (:private callee-kp)
+        home-node "home-node-1"
+        epoch 5
+        seq-num 3
+        p-b 20
+        cum-debit (* seq-num p-b)
+        offer-ctx {:caller "caller-1"
+                   :callee callee-pub
+                   :callee-privkey callee-priv
+                   :home-node home-node
+                   :epoch epoch
+                   :offer-hash "hash-settle-1"
+                   :seq seq-num
+                   :p-b p-b
+                   :burn 100
+                   :allowlist #{"caller-1"}}
+        valid-ack (:delivery-ack (rdv/process-offer-header offer-ctx))
+        settlement-ctx {:settlement-epoch epoch
+                        :registered-price p-b
+                        :settled-tuples #{}}]
+    (testing "Accepts valid DeliveryAck matching epoch, seq * price, and unplayed tuple"
+      (let [res (rdv/verify-ack-for-settlement valid-ack settlement-ctx)]
+        (is (true? (:valid? res)))
+        (is (= cum-debit (:debit res)))
+        (is (= [callee-pub home-node epoch] (:tuple res)))))
+
+    (testing "Rejects replayed voucher tuple"
+      (let [replayed-ctx (assoc settlement-ctx :settled-tuples #{[callee-pub home-node epoch]})
+            res (rdv/verify-ack-for-settlement valid-ack replayed-ctx)]
+        (is (false? (:valid? res)))
+        (is (= :replayed-tuple (:error res)))))
+
+    (testing "Rejects voucher from expired / mismatched epoch"
+      (let [mismatched-ctx (assoc settlement-ctx :settlement-epoch 6)
+            res (rdv/verify-ack-for-settlement valid-ack mismatched-ctx)]
+        (is (false? (:valid? res)))
+        (is (= :expired-epoch (:error res)))))
+
+    (testing "Rejects invalid sequence number (seq <= 0)"
+      (let [zero-seq-ack (assoc valid-ack :seq 0)
+            res (rdv/verify-ack-for-settlement zero-seq-ack settlement-ctx)]
+        (is (false? (:valid? res)))
+        (is (contains? #{:invalid-debit :invalid-seq} (:error res)))))
+
+    (testing "Rejects mismatched / inflated cumulative-debit"
+      (let [bad-debit-ack (assoc valid-ack :cumulative-debit 9999)
+            res (rdv/verify-ack-for-settlement bad-debit-ack settlement-ctx)]
+        (is (false? (:valid? res)))
+        (is (= :invalid-debit (:error res)))))
+
+    (testing "Rejects corrupted / invalid signature"
+      (let [corrupted-ack (assoc valid-ack :signature (basalt/bytes->hex (byte-array 64)))
+            res (rdv/verify-ack-for-settlement corrupted-ack settlement-ctx)]
+        (is (false? (:valid? res)))
+        (is (= :invalid-signature (:error res)))))))
 
 (defspec ^{:doc "Property: register-home-set preserves price bounds and node selection thresholds"}
   prop-register-home-set-invariants 50
@@ -148,3 +240,43 @@
                     (and (some? selected)
                          (:responsive? selected)
                          (every? #(<= (:latency selected) (:latency %)) responsive-nodes))))))
+
+(defspec ^{:doc "Property: DeliveryAck settlement verification safety and replay protection"}
+  prop-delivery-ack-settlement-safety 50
+  (prop/for-all [seq-num (gen/choose 1 50)
+                 p-b (gen/choose 1 100)
+                 epoch (gen/choose 1 20)
+                 mutate-debit? gen/boolean]
+                (let [callee-kp (crypto/generate-keypair)
+                      callee-pub (basalt/bytes->hex (:public callee-kp))
+                      callee-priv (:private callee-kp)
+                      home-node "home-node-sim"
+                      offer-ctx {:caller "caller-sim"
+                                 :callee callee-pub
+                                 :callee-privkey callee-priv
+                                 :home-node home-node
+                                 :epoch epoch
+                                 :offer-hash "hash-gen-test"
+                                 :seq seq-num
+                                 :p-b p-b
+                                 :burn 100
+                                 :allowlist #{"caller-sim"}}
+                      ack (:delivery-ack (rdv/process-offer-header offer-ctx))
+                      test-ack (if mutate-debit?
+                                 (assoc ack :cumulative-debit (+ (:cumulative-debit ack) 1))
+                                 ack)
+                      settlement-ctx {:settlement-epoch epoch
+                                      :registered-price p-b
+                                      :settled-tuples #{}}
+                      res (rdv/verify-ack-for-settlement test-ack settlement-ctx)]
+                  (if mutate-debit?
+                    (and (false? (:valid? res))
+                         (= :invalid-debit (:error res)))
+                    (and (true? (:valid? res))
+                         (= (* seq-num p-b) (:debit res))
+                         (= [callee-pub home-node epoch] (:tuple res))
+                         (let [replayed-res (rdv/verify-ack-for-settlement
+                                             ack
+                                             (assoc settlement-ctx :settled-tuples #{(:tuple res)}))]
+                           (and (false? (:valid? replayed-res))
+                                (= :replayed-tuple (:error replayed-res)))))))))

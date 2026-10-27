@@ -7,6 +7,7 @@
             [bitecho.economy.attestation :as attestation]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.treasury :as treasury]
+            [bitecho.rendezvous.core :as rdv]
             [bitecho.state-machine :as sm]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -574,6 +575,204 @@
                                              (inc t))))]
                   (and (= init-msgs (get-in state-after-ep0 [:frozen-epoch-messages 0]))
                        (= init-msgs (get-in final-state [:frozen-epoch-messages 0]))))))
+
+(deftest rendezvous-state-machine-integration-test
+  (testing "init-state initializes rendezvous and voucher maps/sets"
+    (let [state (sm/init-state [] "my-node")]
+      (is (= {} (:home-sets state)))
+      (is (= {} (:voucher-seqs state)))
+      (is (= [] (:pending-vouchers state)))
+      (is (= #{} (:settled-voucher-tuples state)))))
+
+  (testing "handle-event :register-home-set registers home set at fixed price per epoch"
+    (let [callee "callee-b"
+          candidates [{:node-id "n1" :price 10}
+                      {:node-id "n2" :price 10}
+                      {:node-id "n3" :price 10}
+                      {:node-id "n4" :price 20}]
+          state (assoc (sm/init-state [] "my-node") :epoch 0)
+          reg-res (sm/handle-event state {:type :register-home-set
+                                          :callee callee
+                                          :candidates candidates
+                                          :price 10
+                                          :price-max 20})
+          st1 (:state reg-res)
+          registered (get-in st1 [:home-sets [callee 0]])]
+      (is (= :ok (:status registered)))
+      (is (= 10 (:price registered)))
+      (is (= 3 (count (:home-nodes registered))))
+
+      ;; Re-registration in the SAME epoch at a DIFFERENT price is rejected
+      (let [bad-rereg (sm/handle-event st1 {:type :register-home-set
+                                            :callee callee
+                                            :candidates candidates
+                                            :price 25
+                                            :price-max 30})
+            st-bad (:state bad-rereg)]
+        (is (= 10 (:price (get-in st-bad [:home-sets [callee 0]]))) "Retains initial registration price"))
+
+      ;; Registration for a NEW epoch at a different price succeeds
+      (let [next-epoch-reg (sm/handle-event st1 {:type :register-home-set
+                                                 :callee callee
+                                                 :epoch 1
+                                                 :candidates candidates
+                                                 :price 15
+                                                 :price-max 25})
+            st-next (:state next-epoch-reg)]
+        (is (= 15 (:price (get-in st-next [:home-sets [callee 1]])))))))
+
+  (testing "handle-event :receive-offer-header validates home-node membership, monotonicity, and records voucher"
+    (let [callee-kp (crypto/generate-keypair)
+          callee-pub (basalt/bytes->hex (:public callee-kp))
+          callee-priv (:private callee-kp)
+          home-node "home-node-1"
+          candidates [{:node-id home-node :price 10}
+                      {:node-id "home-node-2" :price 10}
+                      {:node-id "home-node-3" :price 10}]
+          base-state (-> (sm/init-state [] "my-node")
+                         (assoc :epoch 0)
+                         (assoc-in [:home-sets [callee-pub 0]]
+                                   {:status :ok :home-nodes candidates :price 10 :degraded? false}))]
+
+      (testing "Rejects offer header if home-node is not in callee's registered home set"
+        (let [unregistered-event {:type :receive-offer-header
+                                  :caller "caller-a"
+                                  :callee callee-pub
+                                  :callee-privkey callee-priv
+                                  :home-node "rogue-home-node"
+                                  :offer-hash "hash-1"
+                                  :seq 1}
+              res (sm/handle-event base-state unregistered-event)]
+          (is (= base-state (:state res)))))
+
+      (testing "Accepts initial valid offer header at seq = 1 and appends DeliveryAck"
+        (let [valid-event-1 {:type :receive-offer-header
+                             :caller "caller-a"
+                             :callee callee-pub
+                             :callee-privkey callee-priv
+                             :home-node home-node
+                             :offer-hash "hash-1"
+                             :seq 1}
+              res-1 (sm/handle-event base-state valid-event-1)
+              st-1 (:state res-1)]
+          (is (= 1 (get-in st-1 [:voucher-seqs [callee-pub home-node 0]])))
+          (is (= 1 (count (:pending-vouchers st-1))))
+          (let [ack (first (:pending-vouchers st-1))]
+            (is (= 1 (:seq ack)))
+            (is (= 10 (:cumulative-debit ack)))
+            (is (true? (rdv/verify-delivery-ack ack))))
+
+          (testing "Rejects seq gap (e.g. seq = 3 when last-seq = 1) and seq rollback (seq = 1)"
+            (let [gap-event (assoc valid-event-1 :seq 3)
+                  rollback-event (assoc valid-event-1 :seq 1)]
+              (is (= st-1 (:state (sm/handle-event st-1 gap-event))))
+              (is (= st-1 (:state (sm/handle-event st-1 rollback-event))))))
+
+          (testing "Accepts strictly monotonic seq = 2 and accumulates voucher"
+            (let [valid-event-2 (assoc valid-event-1 :seq 2 :offer-hash "hash-2")
+                  res-2 (sm/handle-event st-1 valid-event-2)
+                  st-2 (:state res-2)]
+              (is (= 2 (get-in st-2 [:voucher-seqs [callee-pub home-node 0]])))
+              (is (= 2 (count (:pending-vouchers st-2))))
+              (let [ack2 (second (:pending-vouchers st-2))]
+                (is (= 2 (:seq ack2)))
+                (is (= 20 (:cumulative-debit ack2)))
+                (is (true? (rdv/verify-delivery-ack ack2))))))))))
+
+  (testing "handle-tick at epoch boundary compacts vouchers, settles against ledger, and protects against replay"
+    (let [callee-kp (crypto/generate-keypair)
+          callee-pub (basalt/bytes->hex (:public callee-kp))
+          callee-priv (:private callee-kp)
+          home-node "home-node-settle"
+          price 15
+          candidates [{:node-id home-node :price price}
+                      {:node-id "h2" :price price}
+                      {:node-id "h3" :price price}]
+          ;; Setup ledger: callee has 100, home-node has 10
+          ledger {callee-pub (account/map->AccountState {:balance 100 :seq 0 :deps []})
+                  home-node (account/map->AccountState {:balance 10 :seq 0 :deps []})}
+          init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                     (assoc :epoch 0)
+                     (assoc-in [:home-sets [callee-pub 0]]
+                               {:status :ok :home-nodes candidates :price price :degraded? false}))
+          ;; Receive seq 1 (debit 15) and seq 2 (debit 30)
+          ev1 {:type :receive-offer-header
+               :caller "caller"
+               :callee callee-pub
+               :callee-privkey callee-priv
+               :home-node home-node
+               :offer-hash "hash-a"
+               :seq 1}
+          ev2 (assoc ev1 :seq 2 :offer-hash "hash-b")
+          s1 (:state (sm/handle-event init-s ev1))
+          s2 (:state (sm/handle-event s1 ev2))]
+      (is (= 2 (count (:pending-vouchers s2))))
+
+      ;; Trigger epoch boundary tick
+      (let [tick-res (sm/handle-event s2 {:type :tick :rng (java.util.Random. 42)})
+            new-state (:state tick-res)
+            new-ledger (:ledger new-state)]
+        (is (= 1 (:epoch new-state)))
+        ;; Vouchers for epoch 0 were cleared
+        (is (empty? (:pending-vouchers new-state)))
+        ;; Compacted voucher (seq 2, cum-debit 30) settled:
+        ;; callee balance 100 - 30 = 70; home-node balance 10 + 30 = 40
+        (is (= 70 (:balance (get new-ledger callee-pub))))
+        (is (= 40 (:balance (get new-ledger home-node))))
+        ;; Tuple recorded in settled-tuples
+        (is (contains? (:settled-voucher-tuples new-state) [callee-pub home-node 0]))
+
+        ;; Replay safety: a repeated settlement with an ack for [callee-pub home-node 0] does nothing
+        (let [stale-ack (first (:pending-vouchers s2))
+              replayed-state (assoc new-state :pending-vouchers [stale-ack])
+              re-tick (:state (sm/handle-event replayed-state {:type :tick :rng (java.util.Random. 42)}))]
+          (is (= 70 (:balance (get (:ledger re-tick) callee-pub))))
+          (is (= 40 (:balance (get (:ledger re-tick) home-node)))))))))
+
+(defspec ^{:doc "Property: State machine voucher settlement strictly conserves balance between callee and home-node"}
+  prop-state-machine-voucher-settlement-conservation 50
+  (prop/for-all [callee-init-bal (gen/choose 0 1000)
+                 home-init-bal (gen/choose 0 1000)
+                 seq-num (gen/choose 1 20)
+                 price (gen/choose 1 50)]
+                (let [callee-kp (crypto/generate-keypair)
+                      callee-pub (basalt/bytes->hex (:public callee-kp))
+                      callee-priv (:private callee-kp)
+                      home-node "home-prop-node"
+                      ledger {callee-pub (account/map->AccountState {:balance callee-init-bal :seq 0 :deps []})
+                              home-node (account/map->AccountState {:balance home-init-bal :seq 0 :deps []})}
+                      candidates [{:node-id home-node :price price}
+                                  {:node-id "h2" :price price}
+                                  {:node-id "h3" :price price}]
+                      init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                                 (assoc :epoch 0)
+                                 (assoc-in [:home-sets [callee-pub 0]]
+                                           {:status :ok :home-nodes candidates :price price :degraded? false}))
+                      ev {:type :receive-offer-header
+                          :caller "caller"
+                          :callee callee-pub
+                          :callee-privkey callee-priv
+                          :home-node home-node
+                          :offer-hash "hash-prop"
+                          :seq 1}
+                      ;; Receive sequence of vouchers up to seq-num
+                      final-received (reduce (fn [st s]
+                                               (:state (sm/handle-event st (assoc ev :seq s :offer-hash (str "hash-" s)))))
+                                             init-s
+                                             (range 1 (inc seq-num)))
+                      ;; Tick epoch boundary
+                      tick-res (sm/handle-event final-received {:type :tick :rng (java.util.Random. 99)})
+                      post-state (:state tick-res)
+                      post-ledger (:ledger post-state)
+                      final-callee-bal (:balance (get post-ledger callee-pub))
+                      final-home-bal (:balance (get post-ledger home-node))
+                      total-before (+ callee-init-bal home-init-bal)
+                      total-after (+ final-callee-bal final-home-bal)
+                      expected-debit (* seq-num price)
+                      actual-transfer (min callee-init-bal expected-debit)]
+                  (and (= total-before total-after)
+                       (= final-callee-bal (- callee-init-bal actual-transfer))
+                       (= final-home-bal (+ home-init-bal actual-transfer))))))
 
 
 
