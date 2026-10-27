@@ -8,6 +8,7 @@
             [bitecho.economy.attestation-test]
             [bitecho.economy.bundle-test]
             [bitecho.economy.burn-test]
+            [bitecho.economy.treasury-test]
             [bitecho.murmur.core-test]
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]

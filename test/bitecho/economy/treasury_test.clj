@@ -1,129 +1,186 @@
 (ns bitecho.economy.treasury-test
-  (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]
-            [bitecho.economy.account :as account]
+  "Tests for demand-gated treasury minting, 20/80 split, and Genesis Bootstrap custody."
+  (:require [bitecho.crypto :as crypto]
+            [bitecho.economy.attestation :as attestation]
             [bitecho.economy.treasury :as treasury]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
-(defn- create-test-pod-payload
-  [^bytes agent-pub ^bytes agent-priv ^bytes node-pub ^String payload-id]
-  (let [unsigned-claim (into (sorted-map)
-                             {:agent (vec agent-pub)
-                              :node (vec node-pub)
-                              :payload-id payload-id})
-        payload-bytes (.getBytes (pr-str unsigned-claim) "UTF-8")
-        sig (crypto/sign agent-priv payload-bytes)]
-    (assoc unsigned-claim :signature (vec sig))))
+(deftest constants-test
+  (testing "Treasury constants match V2 demand-gated specification"
+    (is (= 5000 treasury/default-k-bps))
+    (is (= 5000 treasury/max-k-bps))
+    (is (= 20 treasury/streamlet-share-pct))
+    (is (= 80 treasury/mesh-share-pct))))
 
-(deftest test-process-finalized-blocks-empty
-  (testing "Processing an empty list of blocks returns no transfers"
-    (let [treasury-kp (crypto/generate-keypair)
-          pubkey (:public treasury-kp)
-          privkey (:private treasury-kp)
-          result (treasury/process-finalized-blocks pubkey privkey 10 ["hash-prev"] [] 50)]
-      (is (= 10 (:seq result)))
-      (is (= ["hash-prev"] (:deps result)))
-      (is (empty? (:commands result))))))
+(deftest calculate-trailing-revenue-test
+  (testing "Calculates average trailing burn over N epochs"
+    (is (= 2000 (treasury/calculate-trailing-revenue [1000 2000 3000] 3)))
+    (is (= 66 (treasury/calculate-trailing-revenue [100 100] 3)))
+    (is (= 150 (treasury/calculate-trailing-revenue [100 200]))))
 
-(deftest test-process-finalized-blocks-with-receipts
-  (testing "Processing blocks containing PoD routing claims generates valid payout transfers"
-    (let [treasury-kp (crypto/generate-keypair)
-          t-pubkey (:public treasury-kp)
-          t-privkey (:private treasury-kp)
+  (testing "Safe boundary handling"
+    (is (= 0 (treasury/calculate-trailing-revenue [] 5)))
+    (is (= 0 (treasury/calculate-trailing-revenue [100 200] 0)))
+    (is (= 0 (treasury/calculate-trailing-revenue [100 200] -1)))
+    (is (= 0 (treasury/calculate-trailing-revenue nil 5)))))
 
-          agent-kp (crypto/generate-keypair)
-          agent-pub (:public agent-kp)
-          agent-priv (:private agent-kp)
+(deftest calculate-demand-gated-mint-test
+  (testing "Demand-gated mint defaults to 50% of trailing revenue"
+    (is (= 5000 (treasury/calculate-demand-gated-mint 10000)))
+    (is (= 50 (treasury/calculate-demand-gated-mint 100)))
+    (is (= 0 (treasury/calculate-demand-gated-mint 1))))
 
-          node-kp1 (crypto/generate-keypair)
-          node-pub1 (:public node-kp1)
+  (testing "Configurable k-bps within [0, 5000]"
+    (is (= 2500 (treasury/calculate-demand-gated-mint 10000 2500)))
+    (is (= 0 (treasury/calculate-demand-gated-mint 10000 0))))
 
-          node-kp2 (crypto/generate-keypair)
-          node-pub2 (:public node-kp2)
+  (testing "Caps k-bps at 5000 (50%) to guarantee net-deflationary invariant"
+    (is (= 5000 (treasury/calculate-demand-gated-mint 10000 8000))))
 
-          ;; Create some valid routing claims
-          claim1 (create-test-pod-payload agent-pub agent-priv node-pub1 "payload-1")
-          claim2 (create-test-pod-payload agent-pub agent-priv node-pub2 "payload-2")
+  (testing "Zero and negative handling"
+    (is (= 0 (treasury/calculate-demand-gated-mint 0)))
+    (is (= 0 (treasury/calculate-demand-gated-mint -100)))))
 
-          ;; Create blocks with these claims as payloads
-          ;; We only care about the :payload field in treasury logic
-          block1 {:epoch 1 :payload [claim1]}
-          block2 {:epoch 2 :payload [claim2]}
-          blocks [block1 block2]
+(deftest split-mint-test
+  (testing "Exact 20/80 split conserving total mint"
+    (let [split (treasury/split-mint 100)]
+      (is (= 20 (:streamlet split)))
+      (is (= 80 (:mesh split)))
+      (is (= 100 (+ (:streamlet split) (:mesh split))))))
 
-          start-seq 100
-          start-deps ["initial-hash"]
-          payout-amount 50
+  (testing "Conserves total mint under integer truncation"
+    (doseq [m [1 2 5 11 99 101 105 1007 100000]]
+      (let [split (treasury/split-mint m)]
+        (is (= m (+ (:streamlet split) (:mesh split))))))))
 
-          result (treasury/process-finalized-blocks t-pubkey t-privkey start-seq start-deps blocks payout-amount)
+(deftest distribute-shares-test
+  (testing "Equal distribution among recipient collection"
+    (let [recipients ["node-1" "node-2" "node-3"]
+          shares (treasury/distribute-shares 100 recipients)]
+      (is (= 33 (get shares "node-1")))
+      (is (= 33 (get shares "node-2")))
+      (is (= 33 (get shares "node-3")))))
 
-          commands (:commands result)]
+  (testing "Proportional distribution among weighted recipients"
+    (let [weights {"node-1" 10.0 "node-2" 30.0}
+          shares (treasury/distribute-shares 100 weights)]
+      (is (= 25 (get shares "node-1")))
+      (is (= 75 (get shares "node-2")))))
 
-      (is (= 102 (:seq result)))
-      (is (= 2 (count commands)))
-      (is (= 1 (count (:deps result))))
+  (testing "Safe handling of empty or zero-weight recipients"
+    (is (= {} (treasury/distribute-shares 100 [])))
+    (is (= {} (treasury/distribute-shares 100 {"node-1" 0.0})))))
 
-      ;; Verify first transfer
-      (let [t1 (first commands)]
-        (is (= t-pubkey (:sender t1)))
-        (is (= (basalt/bytes->hex node-pub1) (:receiver t1)))
-        (is (= 50 (:amount t1)))
-        (is (= 101 (:seq t1)))
-        (is (= ["initial-hash"] (:deps t1)))
-        ;; verify signature
-        (let [unsigned-t1 (into (sorted-map) (dissoc t1 :signature))
-              payload-bytes (.getBytes (pr-str unsigned-t1) "UTF-8")]
-          (is (crypto/verify t-pubkey payload-bytes (byte-array (:signature t1))))))
+(deftest process-bootstrap-custody-test
+  (let [custody-kp (crypto/generate-keypair)
+        custody-pub (:public custody-kp)
+        custody-priv (:private custody-kp)
+        allocations [{:receiver "partner-1" :amount 200}
+                     {:receiver "partner-2" :amount 300}]
+        ctx {:custody-pubkey custody-pub
+             :custody-privkey custody-priv
+             :custody-balance 1000
+             :allocations allocations
+             :start-seq 10
+             :start-deps ["hash-0"]}
+        res (treasury/process-bootstrap-custody ctx)]
+    (testing "Draws down custody balance without creating new supply"
+      (is (= 500 (:remaining-balance res)))
+      (is (= 2 (count (:commands res))))
+      (is (= 12 (:seq res))))
 
-      ;; Verify second transfer
-      (let [t1 (first commands)
-            t2 (second commands)
-            safe-t1 (assoc (into (sorted-map) t1) :signature (basalt/bytes->hex (byte-array (map byte (:signature t1)))))
-            t1-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-t1) "UTF-8")))]
-        (is (= t-pubkey (:sender t2)))
-        (is (= (basalt/bytes->hex node-pub2) (:receiver t2)))
-        (is (= 50 (:amount t2)))
-        (is (= 102 (:seq t2)))
-        (is (= [t1-hash] (:deps t2)))
-        (is (= [t1-hash] (:deps result)))
-        ;; verify signature
-        (let [unsigned-t2 (into (sorted-map) (dissoc t2 :signature))
-              payload-bytes (.getBytes (pr-str unsigned-t2) "UTF-8")]
-          (is (crypto/verify t-pubkey payload-bytes (byte-array (:signature t2)))))))))
+    (testing "Rejects or caps allocations exceeding available custody balance"
+      (let [over-ctx (assoc ctx :custody-balance 400)
+            over-res (treasury/process-bootstrap-custody over-ctx)]
+        (is (>= (:remaining-balance over-res) 0))
+        (is (<= (reduce + (map :amount (:commands over-res))) 400))))))
 
-(defspec ^{:doc "Property: Generated treasury payouts are always valid Account transfers."}
-  prop-treasury-payouts-valid 50
-  (prop/for-all [num-claims (gen/choose 0 10)
-                 start-seq (gen/choose 1 1000)
-                 payout-amount (gen/choose 1 100)]
-                (let [treasury-kp (crypto/generate-keypair)
-                      t-pubkey (:public treasury-kp)
-                      t-privkey (:private treasury-kp)
+(deftest process-treasury-epoch-test
+  (let [treasury-kp (crypto/generate-keypair)
+        t-pub (:public treasury-kp)
+        t-priv (:private treasury-kp)
+        custody-kp (crypto/generate-keypair)
+        c-pub (:public custody-kp)
+        c-priv (:private custody-kp)
+        ctx {:treasury-pubkey t-pub
+             :treasury-privkey t-priv
+             :trailing-burns [10000 20000 30000]
+             :n-epochs 3
+             :validators ["val-1" "val-2"]
+             :mesh-nodes {"mesh-1" (attestation/calculate-node-weight 100 2000 1000)
+                          "mesh-2" (attestation/calculate-node-weight 100 1000 1000)}
+             :custody-pubkey c-pub
+             :custody-privkey c-priv
+             :custody-balance 50000
+             :custody-allocations [{:receiver "grantee-1" :amount 500}]
+             :start-seq 0
+             :start-deps ["genesis"]}
+        res (treasury/process-treasury-epoch ctx)]
+    (testing "Demand-gated mint matches 50% of trailing revenue"
+      (is (= 20000 (:r-trailing res)))
+      (is (= 10000 (:epoch-mint res)))
+      (is (= 2000 (:m-streamlet res)))
+      (is (= 8000 (:m-mesh res)))
+      (is (= 10000 (+ (:m-streamlet res) (:m-mesh res)))))
 
-                      agent-kp (crypto/generate-keypair)
-                      agent-pub (:public agent-kp)
-                      agent-priv (:private agent-kp)
+    (testing "Commands include signed mint transfers and custody transfers"
+      (is (= 5 (count (:commands res))))
+      (is (= 4 (count (:mint-commands res))))
+      (is (= 1 (count (:custody-commands res))))
+      (is (= 49500 (:remaining-custody-balance res))))))
 
-                      node-kps (repeatedly num-claims crypto/generate-keypair)
-                      claims (map-indexed (fn [i kp]
-                                            (create-test-pod-payload agent-pub agent-priv (:public kp) (str "payload-" i)))
-                                          node-kps)
-          ;; distribute claims somewhat randomly into blocks
-                      blocks (map (fn [clms] {:payload clms})
-                                  (partition-all 3 claims))
+(defspec ^{:doc "Property: In every epoch M_t <= 0.5 * R_trailing and M_streamlet + M_mesh == M_t"}
+  prop-epoch-mint-and-split-invariants 50
+  (prop/for-all [r-trailing (gen/choose 0 1000000)
+                 k-bps (gen/choose 0 10000)]
+                (let [m-t (treasury/calculate-demand-gated-mint r-trailing k-bps)
+                      split (treasury/split-mint m-t)]
+                  (and (<= m-t (quot r-trailing 2))
+                       (<= m-t (* 0.5 (double r-trailing)))
+                       (= m-t (+ (:streamlet split) (:mesh split)))
+                       (>= (:streamlet split) 0)
+                       (>= (:mesh split) 0)))))
 
-                      start-deps ["initial-hash"]
+(defspec ^{:doc "Property: Over multi-cycle horizon T = 5 * N, cumulative demand-gated mint <= 0.5 * cumulative burns"}
+  prop-multi-cycle-net-deflationary 50
+  (prop/for-all [n (gen/choose 3 10)
+                 burns (gen/vector (gen/choose 0 5000) 25)]
+                (let [t-horizon (count burns)
+          ;; Simulate sliding window trailing burns across horizon
+                      mints (loop [step 0
+                                   history []
+                                   acc-mints []]
+                              (if (= step t-horizon)
+                                acc-mints
+                                (let [current-burn (nth burns step)
+                                      new-history (vec (take-last n (conj history current-burn)))
+                                      r-trailing (treasury/calculate-trailing-revenue new-history n)
+                                      m-t (treasury/calculate-demand-gated-mint r-trailing)]
+                                  (recur (inc step) new-history (conj acc-mints m-t)))))
+                      total-burns (reduce + burns)
+                      total-mints (reduce + mints)]
+                  (<= total-mints (Math/ceil (* 0.5 (double total-burns)))))))
 
-                      result (treasury/process-finalized-blocks t-pubkey t-privkey start-seq start-deps blocks payout-amount)
-
-          ;; Validate sequence increments correctly
-                      expected-end-seq (+ start-seq num-claims)]
-                  (and (= expected-end-seq (:seq result))
-                       (= num-claims (count (:commands result)))
-           ;; Each generated command should be a valid account transfer if applied to a ledger
-                       (let [initial-ledger {t-pubkey (account/map->AccountState {:balance 1000000 :seq start-seq :deps start-deps})}
-                             final-ledger (reduce account/apply-transfer initial-ledger (:commands result))]
-                         (= expected-end-seq (:seq (get final-ledger t-pubkey))))))))
+(defspec ^{:doc "Property: Bootstrap custody distributions only debit custody balance and never increase M_t"}
+  prop-bootstrap-custody-invariants 50
+  (prop/for-all [custody-bal (gen/choose 1000 50000)
+                 alloc-amt (gen/choose 10 2000)
+                 r-trailing (gen/choose 100 10000)]
+                (let [custody-kp (crypto/generate-keypair)
+                      ctx {:custody-pubkey (:public custody-kp)
+                           :custody-privkey (:private custody-kp)
+                           :custody-balance custody-bal
+                           :allocations [{:receiver "partner-x" :amount alloc-amt}]
+                           :start-seq 1
+                           :start-deps ["dep-0"]}
+                      res (treasury/process-bootstrap-custody ctx)
+                      m-t-before (treasury/calculate-demand-gated-mint r-trailing)
+                      drawn-amt (reduce + (map :amount (:commands res)))
+                      m-t-after (treasury/calculate-demand-gated-mint r-trailing)]
+                  (and (= m-t-before m-t-after)
+                       (= (:remaining-balance res) (- custody-bal drawn-amt))
+                       (<= drawn-amt alloc-amt)
+                       (<= drawn-amt custody-bal)))))
