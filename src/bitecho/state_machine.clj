@@ -21,6 +21,18 @@
   (let [pk (:pubkey peer)]
     (if (string? pk) pk (basalt/bytes->hex pk))))
 
+(defn- attach-control-frame-signature
+  "If node private key is present in state, signs the control frame and attaches :sender and :signature."
+  [state cmd frame-type message-id]
+  (if-let [priv (or (:node-private-key state)
+                    (get-in state [:config :node-private-key])
+                    (get-in state [:keypair :private])
+                    (get-in state [:keys :private]))]
+    (let [pub (:node-pubkey state)
+          signed (sieve/sign-control-frame frame-type message-id priv pub)]
+      (assoc cmd :sender pub :signature (:signature signed)))
+    cmd))
+
 (defn init-state
   "Initializes the pure Bitecho state map.
    node-pubkey should be the hex-encoded public key of this node.
@@ -241,9 +253,13 @@
                                          (:sieve-delivered-set state))
         echo-ae-commands (when (seq echo-subs)
                            (mapv (fn [mid]
-                                   {:type :send-sieve-echo
-                                    :targets echo-subs
-                                    :message-id mid})
+                                   (attach-control-frame-signature
+                                    state
+                                    {:type :send-sieve-echo
+                                     :targets echo-subs
+                                     :message-id mid}
+                                    :sieve-echo
+                                    mid))
                                  pending-echo-ids))
 
         commands (into (filterv some? (concat [push-command summary-command] subscribe-commands))
@@ -307,29 +323,36 @@
      :commands commands}))
 
 (defn- apply-broadcast-burn
-  "If the event specifies :burn or :signaling-burn, deducts the burn amount
-   from the sender's account in the ledger and updates epoch-burns.
-   Returns {:state updated-state} or nil if deduction failed."
+  "Enforces a mandatory signaling burn (>= burn/min-signaling-burn) on every broadcast.
+   Deducts burn from sender's ledger account and updates epoch-burns.
+   Returns {:state updated-state :burn-amount burn-amt} or nil if deduction failed or burn invalid."
   [state event current-epoch]
-  (if-let [burn-spec (or (:burn event) (:signaling-burn event))]
-    (let [burn-amt (if (number? burn-spec) burn-spec burn/min-signaling-burn)
-          sender (or (:sender event)
-                     (when-let [pk (:public-key event)]
-                       (if (string? pk) pk (basalt/bytes->hex pk)))
-                     (:node-pubkey state))]
-      (when-let [res (burn/deduct-signaling-burn (:ledger state) sender burn-amt)]
-        {:state (-> state
-                    (assoc :ledger (:ledger res))
-                    (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))}))
-    {:state state}))
+  (let [burn-spec (if (contains? event :burn)
+                    (:burn event)
+                    (:signaling-burn event))
+        burn-amt (cond
+                   (number? burn-spec) (when (>= burn-spec burn/min-signaling-burn) burn-spec)
+                   (false? burn-spec) nil
+                   :else burn/min-signaling-burn)]
+    (when burn-amt
+      (let [sender (or (:sender event)
+                       (when-let [pk (:public-key event)]
+                         (if (string? pk) pk (basalt/bytes->hex pk)))
+                       (:node-pubkey state))]
+        (when-let [res (burn/deduct-signaling-burn (:ledger state) sender burn-amt)]
+          {:state (-> state
+                      (assoc :ledger (:ledger res))
+                      (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
+           :burn-amount (:burn-amount res)})))))
 
 (defn- handle-broadcast
   "Handles an internal request to broadcast a payload.
-   Deducts signaling burn if requested; drops broadcast if burn deduction fails."
+   Deducts mandatory signaling burn; drops broadcast if burn deduction fails."
   [state event]
   (let [current-epoch (or (:epoch state) 0)]
     (if-let [burn-res (apply-broadcast-burn state event current-epoch)]
       (let [state (:state burn-res)
+            burn-amt (:burn-amount burn-res)
             cfg (:config state)
             murmur-k (:murmur-k cfg)
             murmur-max-cache-size (:murmur-max-cache-size cfg)
@@ -341,7 +364,7 @@
                             {:payload payload :sender "local" :signature (byte-array 0)})
             broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
             message-id (:message-id broadcast-result)
-            message (assoc sieve-message :message-id message-id)
+            message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
             commands (if (seq (:targets broadcast-result))
                        [{:type :send-gossip
                          :targets (:targets broadcast-result)
@@ -379,12 +402,14 @@
   (let [{new-state :state commands :commands} (handle-broadcast state (assoc event :type :broadcast))
         ;; Find the message-id just created (last added to known-ids)
         message-id (first (set/difference (:contagion-known-ids new-state)
-                                          (:contagion-known-ids state)))
-        delivery-result (handle-event new-state {:type :on-deliver
-                                                 :payload (:payload event)
-                                                 :message-id message-id})]
-    {:state (:state delivery-result)
-     :commands (into commands (:commands delivery-result))}))
+                                          (:contagion-known-ids state)))]
+    (if message-id
+      (let [delivery-result (handle-event new-state {:type :on-deliver
+                                                     :payload (:payload event)
+                                                     :message-id message-id})]
+        {:state (:state delivery-result)
+         :commands (into commands (:commands delivery-result))})
+      {:state state :commands []})))
 
 (defn- handle-receive-push-view
   "Handles an incoming Basalt view exchange."
@@ -447,7 +472,7 @@
 
 (defn- handle-receive-gossip
   "Handles an incoming Murmur gossip message.
-   Validates the Sieve signature before accepting into the cache.
+   Validates Sieve signature and burn-amount before accepting into the cache.
    If new, initializes Sieve and Contagion sampling."
   [state event]
   (let [cfg (:config state)
@@ -455,8 +480,10 @@
         murmur-max-cache-size (:murmur-max-cache-size cfg)
         message (:message event)
         rng (:rng event)
-        valid-signature? (sieve/validate-message message)]
-    (if valid-signature?
+        burn-amt (or (:burn-amount message) burn/min-signaling-burn)
+        valid-burn? (>= burn-amt burn/min-signaling-burn)
+        valid-signature? (when valid-burn? (sieve/validate-message message))]
+    (if (and valid-burn? valid-signature?)
       (let [extracted-peers (basalt/extract-peers (:basalt-view state))
             gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
             gossip-commands (if (seq (:forward-targets gossip-result))
@@ -470,9 +497,13 @@
             ;; If new message, send Sieve Echo to our echo subscribers
             sieve-targets (:echo-subscribers state)
             sieve-echo-command (when (and new-message? (seq sieve-targets))
-                                 {:type :send-sieve-echo
-                                  :targets sieve-targets
-                                  :message-id message-id})
+                                 (attach-control-frame-signature
+                                  state
+                                  {:type :send-sieve-echo
+                                   :targets sieve-targets
+                                   :message-id message-id}
+                                  :sieve-echo
+                                  message-id))
 
             commands (if new-message?
                        (filterv some? (into gossip-commands [sieve-echo-command]))
@@ -501,45 +532,54 @@
          :commands commands})
       {:state state :commands []})))
 
+(defn- transition-to-ready
+  "Transitions node to Ready for message-id and emits signed :send-contagion-ready."
+  [state message-id]
+  (if-not (contains? (:local-ready-set state) message-id)
+    (let [ready-targets (set/union (:ready-subscribers state) (:delivery-subscribers state))
+          cmd (when (seq ready-targets)
+                (attach-control-frame-signature
+                 state
+                 {:type :send-contagion-ready
+                  :targets ready-targets
+                  :message-id message-id}
+                 :contagion-ready
+                 message-id))]
+      {:state (update state :local-ready-set conj message-id)
+       :commands (filterv some? [cmd])})
+    {:state state :commands []}))
+
 (defn- handle-receive-sieve-echo
   "Handles an incoming Sieve Echo message.
-   Records the vote if the sender is in the global-echo-sample.
+   Validates control frame signature before recording vote.
    Uses integer vote counters instead of set intersection for threshold checks.
    If E-hat is reached, transitions to Sieve-Delivered and broadcasts Contagion Ready."
   [state event]
   (let [cfg (:config state)
-        E-hat (:echo-threshold cfg)
-        sender (:sender event)
-        message-id (:message-id event)
-        echo-sample (:global-echo-sample state)
-        received-echoes (get (:received-echoes state) message-id #{})
-        sieve-delivered-set (:sieve-delivered-set state)]
-    (if (and (contains? echo-sample sender)
-             (not (contains? received-echoes sender)))
-      (let [new-received-echoes (conj received-echoes sender)
-            old-count (get-in state [:echo-vote-counts message-id] 0)
-            new-count (inc old-count)
-            state-with-echo (-> state
-                                (assoc-in [:received-echoes message-id] new-received-echoes)
-                                (assoc-in [:echo-vote-counts message-id] new-count))]
-        (if (and (>= new-count E-hat)
-                 (not (contains? sieve-delivered-set message-id)))
-          ;; Threshold reached, transition to Sieve-Delivered
-          (let [state-sieve-delivered (update state-with-echo :sieve-delivered-set conj message-id)
-                ;; Rule 1 (Becoming Ready): we are Sieve-Delivered, so we become Ready.
-                local-ready-set (:local-ready-set state-sieve-delivered)]
-            (if (not (contains? local-ready-set message-id))
-              (let [state-ready (update state-sieve-delivered :local-ready-set conj message-id)
-                    ;; Broadcast Ready to union of ready and delivery subscribers
-                    ready-targets (set/union (:ready-subscribers state) (:delivery-subscribers state))
-                    ready-command (when (seq ready-targets)
-                                    {:type :send-contagion-ready
-                                     :targets ready-targets
-                                     :message-id message-id})]
-                {:state state-ready :commands (filterv some? [ready-command])})
-              {:state state-sieve-delivered :commands []}))
-          {:state state-with-echo :commands []}))
-      {:state state :commands []})))
+        require-signed? (get cfg :require-signed-control-frames true)
+        valid-frame? (sieve/validate-control-frame event :sieve-echo require-signed?)]
+    (if-not valid-frame?
+      {:state state :commands []}
+      (let [E-hat (:echo-threshold cfg)
+            sender (:sender event)
+            message-id (:message-id event)
+            echo-sample (:global-echo-sample state)
+            received-echoes (get (:received-echoes state) message-id #{})
+            sieve-delivered-set (:sieve-delivered-set state)]
+        (if (and (contains? echo-sample sender)
+                 (not (contains? received-echoes sender)))
+          (let [new-received-echoes (conj received-echoes sender)
+                old-count (get-in state [:echo-vote-counts message-id] 0)
+                new-count (inc old-count)
+                state-with-echo (-> state
+                                    (assoc-in [:received-echoes message-id] new-received-echoes)
+                                    (assoc-in [:echo-vote-counts message-id] new-count))]
+            (if (and (>= new-count E-hat)
+                     (not (contains? sieve-delivered-set message-id)))
+              (let [state-sieve-delivered (update state-with-echo :sieve-delivered-set conj message-id)]
+                (transition-to-ready state-sieve-delivered message-id))
+              {:state state-with-echo :commands []}))
+          {:state state :commands []})))))
 
 (defn- apply-payload-to-ledger
   "Attempts to parse a payload and apply any transfer to the ledger.
@@ -589,71 +629,60 @@
         (treasury/apply-epoch-mint state (or (:mint payload-edn) payload-edn))
         state))))
 
+(defn- check-contagion-delivery
+  "Checks if D-hat is reached, transitioning to delivered and calling on-deliver."
+  [state message-id delivery-votes D-hat]
+  (if (and (>= delivery-votes D-hat)
+           (not (contains? (:delivered-set state) message-id)))
+    (let [state-delivered (update state :delivered-set conj message-id)
+          message (get (:messages state) message-id)]
+      (if message
+        (handle-event state-delivered
+                      {:type :on-deliver
+                       :payload (:payload message)
+                       :message-id message-id})
+        {:state state-delivered :commands []}))
+    {:state state :commands []}))
+
 (defn- handle-receive-contagion-ready
   "Handles an incoming Contagion Ready message.
-   Records the vote if the sender is in the global-ready-sample or global-delivery-sample.
+   Validates control frame signature before recording vote.
    Uses integer vote counters instead of set intersection for threshold checks.
    If R-hat is reached, transitions to Ready and broadcasts Contagion Ready.
    If D-hat is reached, transitions to Delivered and emits :on-deliver."
   [state event]
   (let [cfg (:config state)
-        R-hat (:ready-threshold cfg)
-        D-hat (:delivery-threshold cfg)
-        sender (:sender event)
-        message-id (:message-id event)
-        ready-sample (:global-ready-sample state)
-        delivery-sample (:global-delivery-sample state)
-        received-readies (get (:received-readies state) message-id #{})
-        in-ready? (contains? ready-sample sender)
-        in-delivery? (contains? delivery-sample sender)]
-    (if (and (not (contains? received-readies sender))
-             (or in-ready? in-delivery?))
-      (let [new-received-readies (conj received-readies sender)
-            ;; Increment vote counters based on membership
-            old-ready-votes (get-in state [:ready-vote-counts message-id] 0)
-            new-ready-votes (if in-ready? (inc old-ready-votes) old-ready-votes)
-            old-delivery-votes (get-in state [:delivery-vote-counts message-id] 0)
-            new-delivery-votes (if in-delivery? (inc old-delivery-votes) old-delivery-votes)
-            state-with-ready (-> state
-                                 (assoc-in [:received-readies message-id] new-received-readies)
-                                 (assoc-in [:ready-vote-counts message-id] new-ready-votes)
-                                 (assoc-in [:delivery-vote-counts message-id] new-delivery-votes))
-
-            ;; Check R-hat for Ready transition
-            state-checked-ready (if (and (>= new-ready-votes R-hat)
-                                         (not (contains? (:local-ready-set state-with-ready) message-id)))
-                                  (update state-with-ready :local-ready-set conj message-id)
-                                  state-with-ready)
-            ready-commands (if (and (>= new-ready-votes R-hat)
-                                    (not (contains? (:local-ready-set state-with-ready) message-id)))
-                             (let [ready-targets (set/union (:ready-subscribers state) (:delivery-subscribers state))]
-                               (if (seq ready-targets)
-                                 [{:type :send-contagion-ready
-                                   :targets ready-targets
-                                   :message-id message-id}]
-                                 []))
-                             [])
-
-            ;; Check D-hat for Final Delivery transition
-            state-checked-delivery (if (and (>= new-delivery-votes D-hat)
-                                            (not (contains? (:delivered-set state-checked-ready) message-id)))
-                                     (update state-checked-ready :delivered-set conj message-id)
-                                     state-checked-ready)
-
-            delivery-result (if (and (>= new-delivery-votes D-hat)
-                                     (not (contains? (:delivered-set state-checked-ready) message-id)))
-                              (let [message (get (:messages state) message-id)]
-                                (if message
-                                  (handle-event state-checked-delivery
-                                                {:type :on-deliver
-                                                 :payload (:payload message)
-                                                 :message-id message-id})
-                                  {:state state-checked-delivery :commands []}))
-                              {:state state-checked-delivery :commands []})
-
-            commands (into ready-commands (:commands delivery-result))]
-        {:state (:state delivery-result) :commands commands})
-      {:state state :commands []})))
+        require-signed? (get cfg :require-signed-control-frames true)
+        valid-frame? (sieve/validate-control-frame event :contagion-ready require-signed?)]
+    (if-not valid-frame?
+      {:state state :commands []}
+      (let [R-hat (:ready-threshold cfg)
+            D-hat (:delivery-threshold cfg)
+            sender (:sender event)
+            message-id (:message-id event)
+            ready-sample (:global-ready-sample state)
+            delivery-sample (:global-delivery-sample state)
+            received-readies (get (:received-readies state) message-id #{})
+            in-ready? (contains? ready-sample sender)
+            in-delivery? (contains? delivery-sample sender)]
+        (if (and (not (contains? received-readies sender))
+                 (or in-ready? in-delivery?))
+          (let [new-readies (conj received-readies sender)
+                new-r-votes (cond-> (get-in state [:ready-vote-counts message-id] 0)
+                              in-ready? inc)
+                new-d-votes (cond-> (get-in state [:delivery-vote-counts message-id] 0)
+                              in-delivery? inc)
+                state-with-ready (-> state
+                                     (assoc-in [:received-readies message-id] new-readies)
+                                     (assoc-in [:ready-vote-counts message-id] new-r-votes)
+                                     (assoc-in [:delivery-vote-counts message-id] new-d-votes))
+                ready-res (if (>= new-r-votes R-hat)
+                            (transition-to-ready state-with-ready message-id)
+                            {:state state-with-ready :commands []})
+                delivery-res (check-contagion-delivery (:state ready-res) message-id new-d-votes D-hat)]
+            {:state (:state delivery-res)
+             :commands (into (:commands ready-res) (:commands delivery-res))})
+          {:state state :commands []})))))
 
 (defn- handle-on-deliver
   "Handles the internal delivery event, updating the ledger with the payload and emitting an app-event."

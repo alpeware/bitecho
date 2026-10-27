@@ -43,7 +43,10 @@
 
    ;; Contagion Delivery sample (D, D̂)
    :delivery-sample-size  10
-   :delivery-threshold    8})
+   :delivery-threshold    8
+
+   ;; Sieve / Contagion signed control frames
+   :require-signed-control-frames true})
 
 ;; ---------------------------------------------------------------------------
 ;; Large-network preset (N ≈ 1000, up to 25 % Byzantine)

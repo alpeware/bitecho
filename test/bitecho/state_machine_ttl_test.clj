@@ -1,10 +1,13 @@
 (ns bitecho.state-machine-ttl-test
-  (:require [bitecho.state-machine :as sm]
+  (:require [bitecho.config :as config]
+            [bitecho.economy.account :as account]
+            [bitecho.state-machine :as sm]
             [clojure.test :refer [deftest is]]))
 
 (deftest ^{:doc "Tests that old messages are pruned from contagion-known-ids and messages maps based on TTL"} gossip-ttl-pruning-test
   (let [initial-peers [{:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "A"}]
-        state-0 (sm/init-state initial-peers "node-pubkey-stub")
+        cfg (assoc config/default-config :genesis-ledger {"node-pubkey-stub" (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
+        state-0 (sm/init-state initial-peers "node-pubkey-stub" cfg)
         ;; Broadcast a message to insert it
         broadcast-event {:type :broadcast :payload (.getBytes "hello") :rng (java.util.Random. 42)}
         result-1 (sm/handle-event state-0 broadcast-event)

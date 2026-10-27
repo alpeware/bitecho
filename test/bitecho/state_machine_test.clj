@@ -8,6 +8,7 @@
             [bitecho.economy.burn :as burn]
             [bitecho.economy.treasury :as treasury]
             [bitecho.rendezvous.core :as rdv]
+            [bitecho.sieve.core :as sieve]
             [bitecho.state-machine :as sm]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -295,14 +296,69 @@
       (is (= 50 (:balance (get-in (:state res) [:ledger sender-pub]))))
       (is (empty? (:epoch-burns (:state res))))))
 
-  (testing "Broadcast event without burn parameters leaves ledger and epoch-burns untouched"
+  (testing "Broadcast event from un-funded node is dropped with ledger and epoch-burns untouched"
     (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
           state (sm/init-state [peer] "node-pub-1")
           res (sm/handle-event state {:type :broadcast
                                       :payload (.getBytes "hello" "UTF-8")
                                       :rng (java.util.Random. 42)})]
-      (is (= (:ledger state) (:ledger (:state res))))
-      (is (= (:epoch-burns state) (:epoch-burns (:state res)))))))
+      (is (= state (:state res)))
+      (is (empty? (:commands res)))))
+
+  (testing "Broadcast event without explicit :burn from funded node automatically deducts min-signaling-burn (100)"
+    (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
+          kp (crypto/generate-keypair)
+          sender-pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
+          state (sm/init-state [peer] "node-pub-1" cfg)
+          res (sm/handle-event state {:type :broadcast
+                                      :sender sender-pub
+                                      :payload (.getBytes "hello" "UTF-8")
+                                      :rng (java.util.Random. 42)})
+          new-state (:state res)]
+      (is (= 900 (:balance (get-in new-state [:ledger sender-pub]))))
+      (is (= 100 (get-in new-state [:epoch-burns 0])))
+      (is (seq (:commands res)))))
+
+  (testing "Broadcast event with :burn false or < min-signaling-burn is dropped"
+    (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
+          kp (crypto/generate-keypair)
+          sender-pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
+          state (sm/init-state [peer] "node-pub-1" cfg)
+          res-false (sm/handle-event state {:type :broadcast
+                                            :sender sender-pub
+                                            :burn false
+                                            :payload (.getBytes "hello" "UTF-8")
+                                            :rng (java.util.Random. 42)})
+          res-low (sm/handle-event state {:type :broadcast
+                                          :sender sender-pub
+                                          :burn 50
+                                          :payload (.getBytes "hello" "UTF-8")
+                                          :rng (java.util.Random. 42)})]
+      (is (empty? (:commands res-false)))
+      (is (= 1000 (:balance (get-in (:state res-false) [:ledger sender-pub]))))
+      (is (empty? (:commands res-low)))
+      (is (= 1000 (:balance (get-in (:state res-low) [:ledger sender-pub]))))))
+
+  (testing "Outbound gossip message carries :burn-amount and inbound gossip rejects :burn-amount < 100"
+    (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
+          kp (crypto/generate-keypair)
+          sender-pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
+          state (sm/init-state [peer] "node-pub-1" cfg)
+          res (sm/handle-event state {:type :broadcast
+                                      :sender sender-pub
+                                      :burn 150
+                                      :payload (.getBytes "hello" "UTF-8")
+                                      :rng (java.util.Random. 42)})
+          cmd (first (:commands res))
+          msg (:message cmd)]
+      (is (= 150 (:burn-amount msg)))
+      (let [low-burn-msg (assoc msg :burn-amount 50)
+            inbound-res (sm/handle-event state {:type :receive-gossip :message low-burn-msg :rng (java.util.Random. 42)})]
+        (is (= state (:state inbound-res)))
+        (is (empty? (:commands inbound-res)))))))
 
 (defspec ^{:doc "Property: Total initial supply equals final ledger supply plus total accumulated epoch burns."}
   prop-state-machine-burn-accounting 50
@@ -773,6 +829,123 @@
                   (and (= total-before total-after)
                        (= final-callee-bal (- callee-init-bal actual-transfer))
                        (= final-home-bal (+ home-init-bal actual-transfer))))))
+
+(deftest signed-control-frames-test
+  (let [kp-echo (crypto/generate-keypair)
+        echo-sender (basalt/bytes->hex (:public kp-echo))
+        kp-ready (crypto/generate-keypair)
+        ready-sender (basalt/bytes->hex (:public kp-ready))
+        message-id "msg-test-control-1"
+        valid-echo-frame (sieve/sign-control-frame :sieve-echo message-id (:private kp-echo) (:public kp-echo))
+        valid-ready-frame (sieve/sign-control-frame :contagion-ready message-id (:private kp-ready) (:public kp-ready))
+        base-cfg (assoc config/default-config
+                        :echo-threshold 1
+                        :ready-threshold 1
+                        :delivery-threshold 1
+                        :require-signed-control-frames true)
+        state (-> (sm/init-state [] "my-node" base-cfg)
+                  (assoc :global-echo-sample #{echo-sender}
+                         :global-ready-sample #{ready-sender}
+                         :global-delivery-sample #{ready-sender}))]
+
+    (testing "sieve/validate-control-frame validates authentic signatures and rejects forged frames"
+      (is (true? (sieve/validate-control-frame valid-echo-frame :sieve-echo true)))
+      (is (true? (sieve/validate-control-frame valid-ready-frame :contagion-ready true)))
+      (testing "Mismatched frame-type is rejected"
+        (is (false? (sieve/validate-control-frame valid-echo-frame :contagion-ready true))))
+      (testing "Mismatched message-id is rejected"
+        (is (false? (sieve/validate-control-frame (assoc valid-echo-frame :message-id "wrong-id") :sieve-echo true))))
+      (testing "Corrupted signature is rejected"
+        (let [corrupt (assoc valid-echo-frame :signature (basalt/bytes->hex (byte-array 64)))]
+          (is (false? (sieve/validate-control-frame corrupt :sieve-echo true)))))
+      (testing "Unsigned frame is rejected when require-signed is true"
+        (let [unsigned-frame (dissoc valid-echo-frame :signature)]
+          (is (false? (sieve/validate-control-frame unsigned-frame :sieve-echo true)))
+          (is (true? (sieve/validate-control-frame unsigned-frame :sieve-echo false))))))
+
+    (testing "Forged :receive-sieve-echo is rejected and does not increment votes"
+      (let [forged-event {:type :receive-sieve-echo
+                          :sender echo-sender
+                          :message-id message-id
+                          :signature (basalt/bytes->hex (byte-array 64))}
+            res (sm/handle-event state forged-event)]
+        (is (= state (:state res)))
+        (is (empty? (:commands res)))))
+
+    (testing "Unsigned :receive-sieve-echo is rejected when require-signed-control-frames is true"
+      (let [unsigned-event {:type :receive-sieve-echo
+                            :sender echo-sender
+                            :message-id message-id}
+            res (sm/handle-event state unsigned-event)]
+        (is (= state (:state res)))
+        (is (empty? (:commands res)))))
+
+    (testing "Authentic signed :receive-sieve-echo is accepted and increments votes"
+      (let [valid-event (assoc valid-echo-frame :type :receive-sieve-echo)
+            res (sm/handle-event state valid-event)
+            new-state (:state res)]
+        (is (= 1 (get-in new-state [:echo-vote-counts message-id])))
+        (is (contains? (:sieve-delivered-set new-state) message-id))))
+
+    (testing "Forged :receive-contagion-ready is rejected and does not increment votes"
+      (let [forged-event {:type :receive-contagion-ready
+                          :sender ready-sender
+                          :message-id message-id
+                          :signature (basalt/bytes->hex (byte-array 64))}
+            res (sm/handle-event state forged-event)]
+        (is (= state (:state res)))
+        (is (empty? (:commands res)))))
+
+    (testing "Authentic signed :receive-contagion-ready is accepted and increments votes"
+      (let [valid-event (assoc valid-ready-frame :type :receive-contagion-ready)
+            res (sm/handle-event state valid-event)
+            new-state (:state res)]
+        (is (= 1 (get-in new-state [:ready-vote-counts message-id])))
+        (is (= 1 (get-in new-state [:delivery-vote-counts message-id])))))))
+
+(defspec ^{:doc "Property: Signed control frames are authentic; corrupted signatures are always rejected"}
+  prop-signed-control-frame-authenticity 50
+  (prop/for-all [frame-type (gen/elements [:sieve-echo :contagion-ready])
+                 message-id gen/string-alphanumeric
+                 corrupt? gen/boolean]
+                (let [kp (crypto/generate-keypair)
+                      pub (:public kp)
+                      priv (:private kp)
+                      signed (sieve/sign-control-frame frame-type message-id priv pub)
+                      test-frame (if corrupt?
+                                   (assoc signed :signature (basalt/bytes->hex (byte-array 64)))
+                                   signed)
+                      valid? (sieve/validate-control-frame test-frame frame-type true)]
+                  (if corrupt?
+                    (false? valid?)
+                    (true? valid?)))))
+
+(defspec ^{:doc "Property: Mandatory broadcast burn is deducted or broadcast is dropped; balance is strictly conserved"}
+  prop-state-machine-mandatory-burn-conservation 50
+  (prop/for-all [initial-balance (gen/choose 0 500)
+                 burn-amount (gen/choose 50 300)]
+                (let [sender "broadcasting-node"
+                      peer {:ip "127.0.0.1" :port 8001 :pubkey "peer-pubkey" :hash "peer-hash"}
+                      cfg (assoc config/default-config :genesis-ledger {sender (account/map->AccountState {:balance initial-balance :seq 0 :deps []})})
+                      state (sm/init-state [peer] "local-node" cfg)
+                      res (sm/handle-event state {:type :broadcast
+                                                  :sender sender
+                                                  :burn burn-amount
+                                                  :payload (.getBytes "test-payload" "UTF-8")
+                                                  :rng (java.util.Random. 42)})
+                      new-state (:state res)
+                      final-bal (or (:balance (get-in new-state [:ledger sender])) 0)
+                      total-burned (reduce + (vals (or (:epoch-burns new-state) {})))]
+                  (if (and (>= burn-amount burn/min-signaling-burn)
+                           (>= initial-balance burn-amount))
+                    (and (= (- initial-balance burn-amount) final-bal)
+                         (= burn-amount total-burned)
+                         (= 1 (count (:messages new-state)))
+                         (seq (:commands res)))
+                    (and (= initial-balance final-bal)
+                         (zero? total-burned)
+                         (empty? (:messages new-state))
+                         (empty? (:commands res)))))))
 
 
 

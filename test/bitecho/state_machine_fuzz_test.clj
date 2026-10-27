@@ -3,6 +3,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.account :as account]
             [bitecho.state-machine :as sm]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -38,6 +39,11 @@
         node-keys (into {}
                         (for [i node-ids]
                           [i (bitecho.crypto/generate-keypair)]))
+        genesis-ledger (into {}
+                             (for [[_ kp] node-keys]
+                               [(basalt/bytes->hex (:public kp))
+                                (account/map->AccountState {:balance 10000000 :seq 0 :deps []})]))
+        cluster-cfg (assoc cfg :genesis-ledger genesis-ledger)
         node-info (into {}
                         (for [i node-ids]
                           [i {:ip (str "127.0.0." i)
@@ -48,8 +54,11 @@
     (into {}
           (for [i node-ids]
             (let [initial-peers (map val (dissoc node-info i))
-                  state (sm/init-state initial-peers (basalt/bytes->hex (:public (get node-keys i))) cfg)]
-              [i (assoc state :keys (get node-keys i))])))))
+                  pub-hex (basalt/bytes->hex (:public (get node-keys i)))
+                  state (sm/init-state initial-peers pub-hex cluster-cfg)]
+              [i (assoc state
+                        :keys (get node-keys i)
+                        :node-private-key (:private (get node-keys i)))])))))
 
 (defn- build-pubkey-map [cluster-state]
   (into {} (map (fn [[id state]] [(:node-pubkey state) id]) cluster-state)))
@@ -98,10 +107,18 @@
         [target-id {:type :receive-subscribe :sender sender-hex :roles (:roles cmd)}]
 
         :send-sieve-echo
-        [target-id {:type :receive-sieve-echo :sender sender-hex :message-id (:message-id cmd) :rng rng}]
+        [target-id {:type :receive-sieve-echo
+                    :sender sender-hex
+                    :message-id (:message-id cmd)
+                    :signature (:signature cmd)
+                    :rng rng}]
 
         :send-contagion-ready
-        [target-id {:type :receive-contagion-ready :sender sender-hex :message-id (:message-id cmd) :rng rng}]
+        [target-id {:type :receive-contagion-ready
+                    :sender sender-hex
+                    :message-id (:message-id cmd)
+                    :signature (:signature cmd)
+                    :rng rng}]
 
         :app-event nil
 
