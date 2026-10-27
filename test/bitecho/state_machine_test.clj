@@ -1154,8 +1154,7 @@
                       final-home-bal (:balance (get post-ledger home-node))
                       total-before (+ callee-init-bal home-init-bal)
                       total-after (+ final-callee-bal final-home-bal)
-                      expected-debit (* seq-num price)
-                      actual-transfer (min callee-init-bal expected-debit)]
+                      actual-transfer (* (min seq-num (quot callee-init-bal price)) price)]
                   (and (= total-before total-after)
                        (= final-callee-bal (- callee-init-bal actual-transfer))
                        (= final-home-bal (+ home-init-bal actual-transfer))))))
@@ -1328,6 +1327,185 @@
                        (not (.contains entropy "}"))
                        (not (.contains entropy ":epoch"))
                        (= (streamlet/hash-block block) entropy)))))
+
+(deftest fail-closed-voucher-settlement-test
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        callee-priv (:private callee-kp)
+        home-node "home-node-1"
+        price 20
+        candidates [{:node-id home-node :price price}
+                    {:node-id "h2" :price price}
+                    {:node-id "h3" :price price}]]
+
+    (testing "handle-receive-offer-header rejects offer header when callee is in ledger and underfunded"
+      (let [ledger {callee-pub (account/map->AccountState {:balance 15 :seq 0 :deps []})}
+            init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                       (assoc :epoch 0)
+                       (assoc-in [:home-sets [callee-pub 0]]
+                                 {:status :ok :home-nodes candidates :price price :degraded? false}))
+            ev {:type :receive-offer-header
+                :caller "caller"
+                :callee callee-pub
+                :callee-privkey callee-priv
+                :home-node home-node
+                :offer-hash "hash-underfunded"
+                :seq 1}
+            res (sm/handle-event init-s ev)]
+        ;; 15 < cum-debit 20 -> rejected
+        (is (= init-s (:state res)))
+        (is (empty? (:commands res)))
+        (is (empty? (:pending-vouchers (:state res))))))
+
+    (testing "handle-receive-offer-header accepts offer header when callee balance >= cum-debit"
+      (let [ledger {callee-pub (account/map->AccountState {:balance 20 :seq 0 :deps []})}
+            init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                       (assoc :epoch 0)
+                       (assoc-in [:home-sets [callee-pub 0]]
+                                 {:status :ok :home-nodes candidates :price price :degraded? false}))
+            ev {:type :receive-offer-header
+                :caller "caller"
+                :callee callee-pub
+                :callee-privkey callee-priv
+                :home-node home-node
+                :offer-hash "hash-funded"
+                :seq 1}
+            res (sm/handle-event init-s ev)]
+        (is (= 1 (count (:pending-vouchers (:state res)))))))
+
+    (testing "voucher settlement fails closed when callee balance is less than voucher debit at tick"
+      (let [ledger {callee-pub (account/map->AccountState {:balance 100 :seq 0 :deps []})
+                    home-node (account/map->AccountState {:balance 50 :seq 0 :deps []})}
+            init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                       (assoc :epoch 0)
+                       (assoc-in [:home-sets [callee-pub 0]]
+                                 {:status :ok :home-nodes candidates :price price :degraded? false}))
+            ev {:type :receive-offer-header
+                :caller "caller"
+                :callee callee-pub
+                :callee-privkey callee-priv
+                :home-node home-node
+                :offer-hash "hash-drain"
+                :seq 1}
+            s1 (:state (sm/handle-event init-s ev))]
+        (is (= 1 (count (:pending-vouchers s1))))
+        ;; Drain callee balance: callee now has only 10, but voucher debit is 20
+        (let [drained-s (assoc-in s1 [:ledger callee-pub :balance] 10)
+              tick-res (sm/handle-event drained-s {:type :tick :rng (java.util.Random. 42)})
+              post-state (:state tick-res)
+              post-ledger (:ledger post-state)]
+          ;; Fail-closed: 0 transferred, tuple not added to settled-voucher-tuples
+          (is (= 10 (:balance (get post-ledger callee-pub))))
+          (is (= 50 (:balance (get post-ledger home-node))))
+          (is (not (contains? (:settled-voucher-tuples post-state) [callee-pub home-node 0]))))))))
+
+(deftest role-preserving-frozen-epoch-logs-test
+  (testing "init-state initializes role tracking maps"
+    (let [st (sm/init-state [] "my-node")]
+      (is (= {} (:epoch-to-message-roles st)))
+      (is (= {} (:frozen-epoch-message-roles st)))))
+
+  (testing "message handlers track observed roles :gossip, :echo, and :ready"
+    (let [sender-kp (crypto/generate-keypair)
+          sender-pub (basalt/bytes->hex (:public sender-kp))
+          sender-priv (:private sender-kp)
+          ledger {sender-pub (account/map->AccountState {:balance 100000 :seq 0 :deps []})}
+          st (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                 (assoc :epoch 0)
+                 (assoc :global-echo-sample #{sender-pub})
+                 (assoc :global-ready-sample #{sender-pub}))]
+
+      (testing "handle-broadcast records :gossip role"
+        (let [res (sm/handle-event st {:type :broadcast
+                                       :payload (.getBytes "hello broadcast" "UTF-8")
+                                       :sender sender-pub
+                                       :private-key sender-priv
+                                       :public-key (:public sender-kp)
+                                       :rng (java.util.Random. 1)})
+              new-st (:state res)
+              m-id (first (keys (:messages new-st)))]
+          (is (some? m-id))
+          (is (= :gossip (get-in new-st [:epoch-to-message-roles 0 m-id])))))
+
+      (testing "receive-gossip records :gossip role"
+        (let [wrapped (sieve/wrap-message (.getBytes "hello gossip" "UTF-8")
+                                          sender-priv (:public sender-kp) 1000)
+              gossip-msg (assoc wrapped :message-id "msg-gossip-1")
+              res (sm/handle-event st {:type :receive-gossip :message gossip-msg})
+              new-st (:state res)]
+          (is (= :gossip (get-in new-st [:epoch-to-message-roles 0 "msg-gossip-1"])))))
+
+      (testing "receive-sieve-echo records :echo role"
+        (let [echo-frame (sieve/sign-control-frame :sieve-echo "msg-echo-1" sender-priv sender-pub)
+              res (sm/handle-event st (assoc echo-frame :type :receive-sieve-echo))
+              new-st (:state res)]
+          (is (= :echo (get-in new-st [:epoch-to-message-roles 0 "msg-echo-1"])))))
+
+      (testing "receive-contagion-ready records :ready role"
+        (let [ready-frame (sieve/sign-control-frame :contagion-ready "msg-ready-1" sender-priv sender-pub)
+              res (sm/handle-event st (assoc ready-frame :type :receive-contagion-ready))
+              new-st (:state res)]
+          (is (= :ready (get-in new-st [:epoch-to-message-roles 0 "msg-ready-1"])))))))
+
+  (testing "frozen-epoch-message-roles snapshotting and TTL immunity"
+    (let [cfg (assoc config/default-config :gossip-ttl-epochs 2)
+          st (assoc (sm/init-state [] "my-node" cfg)
+                    :epoch 0
+                    :epoch-to-messages {0 #{"m-gossip" "m-echo"}}
+                    :epoch-to-message-roles {0 {"m-gossip" :gossip "m-echo" :echo}})
+          tick-1 (sm/handle-event st {:type :tick :rng (java.util.Random. 42)})
+          st-ep1 (:state tick-1)]
+      (is (= 1 (:epoch st-ep1)))
+      (is (= {"m-gossip" :gossip "m-echo" :echo} (get-in st-ep1 [:frozen-epoch-message-roles 0])))
+
+      ;; Advance ticks past TTL (cutoff-epoch = new-epoch - 2)
+      (let [st-ep5 (loop [s st-ep1
+                          step 1]
+                     (if (>= step 5)
+                       s
+                       (recur (:state (sm/handle-event s {:type :tick :rng (java.util.Random. 42)}))
+                              (inc step))))]
+        (is (= 5 (:epoch st-ep5)))
+        (is (nil? (get-in st-ep5 [:epoch-to-message-roles 0])) "Epoch 0 roles pruned from active store")
+        (is (= {"m-gossip" :gossip "m-echo" :echo} (get-in st-ep5 [:frozen-epoch-message-roles 0]))
+            "Frozen role snapshot is permanently retained past TTL pruning"))))
+
+  (testing "handle-submit-transcript role preservation and bilateral intersection"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          state (assoc (sm/init-state [] "my-node")
+                       :frozen-epoch-messages {0 #{"m1" "m2"}}
+                       :frozen-epoch-message-roles {0 {"m1" :gossip "m2" :ready}})]
+
+      (testing "rejects transcript with falsified role without striking counterparty"
+        (let [falsified-roles [["m1" :echo]]
+              falsified-half (attestation/create-transcript 0 pub-a pub-b falsified-roles (:private kp-a))
+              res (sm/handle-event state {:type :submit-transcript :transcript falsified-half})
+              new-state (:state res)]
+          (is (= {} (:fault-strikes new-state)) "Counterparty B was NOT struck because role mismatch invalidated transcript")))
+
+      (testing "accepts transcript matching authoritative local frozen roles"
+        (let [honest-roles [["m1" :gossip] ["m2" :ready]]
+              honest-half (attestation/create-transcript 0 pub-a pub-b honest-roles (:private kp-a))
+              res (sm/handle-event state {:type :submit-transcript :transcript honest-half})
+              new-state (:state res)]
+          (is (= 1 (get-in new-state [:fault-strikes pub-b])) "Counterparty B was struck for withholding on valid transcript")))
+
+      (testing "uses bilateral intersection with :counterparty-frozen-ids"
+        (let [roles-both [["m1" :gossip] ["m2" :ready]]
+              transcript-both (attestation/create-transcript 0 pub-a pub-b roles-both (:private kp-a))
+              roles-m2 [["m2" :ready]]
+              transcript-m2 (attestation/create-transcript 0 pub-a pub-b roles-m2 (:private kp-a))
+              event-base {:type :submit-transcript
+                          :counterparty-frozen-ids #{"m2"}}
+              res-both (sm/handle-event state (assoc event-base :transcript transcript-both))
+              res-m2 (sm/handle-event state (assoc event-base :transcript transcript-m2))]
+          (is (= {} (:fault-strikes (:state res-both)))
+              "Transcript including non-intersected message m1 is rejected")
+          (is (= 1 (get-in (:state res-m2) [:fault-strikes pub-b]))
+              "Transcript matching bilateral intersection is accepted and strikes withholding peer"))))))
 
 
 

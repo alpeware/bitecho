@@ -62,6 +62,7 @@
       :messages {}
       :message-epochs {}
       :epoch-to-messages {}
+      :epoch-to-message-roles {}
       :global-echo-sample #{}
       :global-ready-sample #{}
       :global-delivery-sample #{}
@@ -81,6 +82,7 @@
       :mint-dust 0
       :epoch-mint-dust {}
       :frozen-epoch-messages {}
+      :frozen-epoch-message-roles {}
       :fault-strikes {}
       :home-sets {}
       :voucher-seqs {}
@@ -112,7 +114,8 @@
      :treasury-privkey (or (:treasury-privkey state) (:treasury-privkey cfg))}))
 
 (defn- settle-single-voucher
-  "Settles a single compacted DeliveryAck voucher against state, updating ledger and settled tuples."
+  "Settles a single compacted DeliveryAck voucher against state, updating ledger and settled tuples.
+   Fails closed: requires callee balance >= debit; rejects settlement and returns acc if underfunded."
   [acc ack closing-epoch]
   (let [callee (:callee ack)
         home-node (:home-node ack)
@@ -128,15 +131,16 @@
       (let [debit (:debit v-res)
             ledger (:ledger acc)
             callee-st (get ledger callee (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-            callee-bal (or (:balance callee-st) 0)
-            transfer-amt (min callee-bal debit)
-            home-st (get ledger home-node (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-            new-callee (assoc callee-st :balance (- callee-bal transfer-amt))
-            new-home (assoc home-st :balance (+ (or (:balance home-st) 0) transfer-amt))
-            new-ledger (assoc ledger callee new-callee home-node new-home)]
-        (-> acc
-            (assoc :ledger new-ledger)
-            (update :settled-voucher-tuples conj tuple)))
+            callee-bal (or (:balance callee-st) 0)]
+        (if (>= callee-bal debit)
+          (let [home-st (get ledger home-node (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                new-callee (assoc callee-st :balance (- callee-bal debit))
+                new-home (assoc home-st :balance (+ (or (:balance home-st) 0) debit))
+                new-ledger (assoc ledger callee new-callee home-node new-home)]
+            (-> acc
+                (assoc :ledger new-ledger)
+                (update :settled-voucher-tuples conj tuple)))
+          acc))
       acc)))
 
 (defn- apply-epoch-voucher-settlement
@@ -225,13 +229,97 @@
       cand
       "genesis")))
 
+(defn- sample-peer-roles
+  "Selects background peer samples for echo, ready, and delivery roles, returning updated sets and subscribe commands."
+  [state cfg rng extracted-peers]
+  (let [E-size (:echo-sample-size cfg)
+        R-size (:ready-sample-size cfg)
+        D-size (:delivery-sample-size cfg)
+        my-pubkey (:node-pubkey state)
+        peer-hexes (mapv peer-hex extracted-peers)
+        needed-echo (max 0 (- E-size (count (:global-echo-sample state))))
+        needed-ready (max 0 (- R-size (count (:global-ready-sample state))))
+        needed-delivery (max 0 (- D-size (count (:global-delivery-sample state))))
+        exclude-fn (fn [sample-set p-hex]
+                     (or (= p-hex my-pubkey) (contains? sample-set p-hex)))
+        avail-idx-for (fn [sample-set]
+                        (filterv #(not (exclude-fn sample-set (nth peer-hexes %)))
+                                 (range (count extracted-peers))))
+        echo-avail-idxs (avail-idx-for (:global-echo-sample state))
+        echo-avail-peers (mapv #(nth extracted-peers %) echo-avail-idxs)
+        new-echo-peers (basalt/select-peers rng echo-avail-peers needed-echo)
+        new-echo-hexes (set (mapv peer-hex new-echo-peers))
+        ready-avail-idxs (avail-idx-for (:global-ready-sample state))
+        ready-avail-peers (mapv #(nth extracted-peers %) ready-avail-idxs)
+        new-ready-peers (basalt/select-peers rng ready-avail-peers needed-ready)
+        new-ready-hexes (set (mapv peer-hex new-ready-peers))
+        delivery-avail-idxs (avail-idx-for (:global-delivery-sample state))
+        delivery-avail-peers (mapv #(nth extracted-peers %) delivery-avail-idxs)
+        new-delivery-peers (basalt/select-peers rng delivery-avail-peers needed-delivery)
+        new-delivery-hexes (set (mapv peer-hex new-delivery-peers))
+        updated-echo-sample (set/union (:global-echo-sample state) new-echo-hexes)
+        updated-ready-sample (set/union (:global-ready-sample state) new-ready-hexes)
+        updated-delivery-sample (set/union (:global-delivery-sample state) new-delivery-hexes)
+        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :echo)) {} new-echo-hexes)
+        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :ready)) new-roles-by-peer new-ready-hexes)
+        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :delivery)) new-roles-by-peer new-delivery-hexes)
+        subscribe-commands (mapv (fn [[peer roles]]
+                                   {:type :send-subscribe
+                                    :target peer
+                                    :roles roles})
+                                 new-roles-by-peer)]
+    {:echo-sample updated-echo-sample
+     :ready-sample updated-ready-sample
+     :delivery-sample updated-delivery-sample
+     :subscribe-commands subscribe-commands}))
+
+(defn- prune-expired-tick-state
+  "Prunes state message and role entries for epochs older than the TTL cutoff."
+  [state new-epoch gossip-ttl-epochs]
+  (let [cutoff-epoch (- new-epoch gossip-ttl-epochs)
+        epoch-to-messages (or (:epoch-to-messages state) {})
+        expired-epochs (filterv #(< % cutoff-epoch) (keys epoch-to-messages))
+        expired-ids (reduce (fn [acc ep] (set/union acc (get epoch-to-messages ep #{})))
+                            #{} expired-epochs)
+        pruned-epoch-to-messages (reduce dissoc epoch-to-messages expired-epochs)
+        pruned-epoch-to-roles (reduce dissoc (or (:epoch-to-message-roles state) {}) expired-epochs)
+        pruned-epochs (reduce dissoc (or (:message-epochs state) {}) expired-ids)
+        pruned-messages (reduce dissoc (:messages state) expired-ids)
+        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
+        pruned-murmur-cache-set (set/difference (:set (:murmur-cache state)) expired-ids)
+        pruned-murmur-cache-queue (if (seq expired-ids)
+                                    (into clojure.lang.PersistentQueue/EMPTY
+                                          (remove expired-ids (:queue (:murmur-cache state))))
+                                    (:queue (:murmur-cache state)))
+        pruned-murmur-cache {:set pruned-murmur-cache-set :queue pruned-murmur-cache-queue}
+        pruned-received-echoes (reduce dissoc (or (:received-echoes state) {}) expired-ids)
+        pruned-received-readies (reduce dissoc (or (:received-readies state) {}) expired-ids)
+        pruned-echo-vote-counts (reduce dissoc (or (:echo-vote-counts state) {}) expired-ids)
+        pruned-ready-vote-counts (reduce dissoc (or (:ready-vote-counts state) {}) expired-ids)
+        pruned-delivery-vote-counts (reduce dissoc (or (:delivery-vote-counts state) {}) expired-ids)
+        pruned-sieve-delivered-set (set/difference (:sieve-delivered-set state) expired-ids)
+        pruned-local-ready-set (set/difference (:local-ready-set state) expired-ids)
+        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)]
+    (assoc state
+           :epoch-to-messages pruned-epoch-to-messages
+           :epoch-to-message-roles pruned-epoch-to-roles
+           :message-epochs pruned-epochs
+           :messages pruned-messages
+           :contagion-known-ids pruned-known-ids
+           :murmur-cache pruned-murmur-cache
+           :received-echoes pruned-received-echoes
+           :received-readies pruned-received-readies
+           :echo-vote-counts pruned-echo-vote-counts
+           :ready-vote-counts pruned-ready-vote-counts
+           :delivery-vote-counts pruned-delivery-vote-counts
+           :sieve-delivered-set pruned-sieve-delivered-set
+           :local-ready-set pruned-local-ready-set
+           :delivered-set pruned-delivered-set)))
+
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
   (let [cfg (:config state)
-        E-size (:echo-sample-size cfg)
-        R-size (:ready-sample-size cfg)
-        D-size (:delivery-sample-size cfg)
         gossip-ttl-epochs (:gossip-ttl-epochs cfg)
         new-epoch (inc (or (:epoch state) 0))
         epoch-entropy (derive-epoch-entropy state cfg)
@@ -246,60 +334,12 @@
                        {:type :send-push-view
                         :targets push-targets
                         :view extracted-peers})
-
-        ;; Bounded anti-entropy: only include recent epoch's known-ids
         summary (contagion/generate-summary rng extracted-peers (:contagion-known-ids state))
         summary-command (when summary
                           {:type :send-summary
                            :target (:target summary)
                            :summary (:summary summary)})
-
-        ;; Background Sampling — pre-normalize pubkeys once
-        my-pubkey (:node-pubkey state)
-        peer-hexes (mapv peer-hex extracted-peers)
-
-        needed-echo (max 0 (- E-size (count (:global-echo-sample state))))
-        needed-ready (max 0 (- R-size (count (:global-ready-sample state))))
-        needed-delivery (max 0 (- D-size (count (:global-delivery-sample state))))
-
-        exclude-fn (fn [sample-set p-hex]
-                     (or (= p-hex my-pubkey) (contains? sample-set p-hex)))
-
-        avail-idx-for (fn [sample-set]
-                        (filterv #(not (exclude-fn sample-set (nth peer-hexes %)))
-                                 (range (count extracted-peers))))
-
-        echo-avail-idxs (avail-idx-for (:global-echo-sample state))
-        echo-avail-peers (mapv #(nth extracted-peers %) echo-avail-idxs)
-        new-echo-peers (basalt/select-peers rng echo-avail-peers needed-echo)
-        new-echo-hexes (set (mapv peer-hex new-echo-peers))
-
-        ready-avail-idxs (avail-idx-for (:global-ready-sample state))
-        ready-avail-peers (mapv #(nth extracted-peers %) ready-avail-idxs)
-        new-ready-peers (basalt/select-peers rng ready-avail-peers needed-ready)
-        new-ready-hexes (set (mapv peer-hex new-ready-peers))
-
-        delivery-avail-idxs (avail-idx-for (:global-delivery-sample state))
-        delivery-avail-peers (mapv #(nth extracted-peers %) delivery-avail-idxs)
-        new-delivery-peers (basalt/select-peers rng delivery-avail-peers needed-delivery)
-        new-delivery-hexes (set (mapv peer-hex new-delivery-peers))
-
-        updated-echo-sample (set/union (:global-echo-sample state) new-echo-hexes)
-        updated-ready-sample (set/union (:global-ready-sample state) new-ready-hexes)
-        updated-delivery-sample (set/union (:global-delivery-sample state) new-delivery-hexes)
-
-        ;; Collect all newly added peers and their roles
-        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :echo)) {} new-echo-hexes)
-        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :ready)) new-roles-by-peer new-ready-hexes)
-        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :delivery)) new-roles-by-peer new-delivery-hexes)
-
-        subscribe-commands (mapv (fn [[peer roles]]
-                                   {:type :send-subscribe
-                                    :target peer
-                                    :roles roles})
-                                 new-roles-by-peer)
-
-        ;; Sieve-echo anti-entropy: re-send echoes for messages not yet sieve-delivered
+        sampling-res (sample-peer-roles state cfg rng extracted-peers)
         echo-subs (:echo-subscribers state)
         pending-echo-ids (set/difference (:contagion-known-ids state)
                                          (:sieve-delivered-set state))
@@ -313,64 +353,26 @@
                                     :sieve-echo
                                     mid))
                                  pending-echo-ids))
-
-        commands (into (filterv some? (concat [push-command summary-command] subscribe-commands))
+        commands (into (filterv some? (concat [push-command summary-command] (:subscribe-commands sampling-res)))
                        echo-ae-commands)
-
-        ;; Snapshot closing epoch's message set before TTL pruning touches anything
         closing-epoch (or (:epoch state) 0)
         closing-messages (get (:epoch-to-messages state) closing-epoch #{})
+        closing-roles (get (:epoch-to-message-roles state) closing-epoch {})
         frozen-epoch-messages (assoc (or (:frozen-epoch-messages state) {}) closing-epoch closing-messages)
-
-        ;; Epoch-indexed GC: collect expired epoch keys, union their message IDs
-        cutoff-epoch (- new-epoch gossip-ttl-epochs)
-        epoch-to-messages (or (:epoch-to-messages state) {})
-        expired-epochs (filterv #(< % cutoff-epoch) (keys epoch-to-messages))
-        expired-ids (reduce (fn [acc ep] (set/union acc (get epoch-to-messages ep #{})))
-                            #{} expired-epochs)
-        pruned-epoch-to-messages (reduce dissoc epoch-to-messages expired-epochs)
-        pruned-epochs (reduce dissoc (or (:message-epochs state) {}) expired-ids)
-        pruned-messages (reduce dissoc (:messages state) expired-ids)
-        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
-        pruned-murmur-cache-set (set/difference (:set (:murmur-cache state)) expired-ids)
-        pruned-murmur-cache-queue (if (seq expired-ids)
-                                    (into clojure.lang.PersistentQueue/EMPTY
-                                          (remove expired-ids (:queue (:murmur-cache state))))
-                                    (:queue (:murmur-cache state)))
-        pruned-murmur-cache {:set pruned-murmur-cache-set :queue pruned-murmur-cache-queue}
-
-        pruned-received-echoes (reduce dissoc (or (:received-echoes state) {}) expired-ids)
-        pruned-received-readies (reduce dissoc (or (:received-readies state) {}) expired-ids)
-        pruned-echo-vote-counts (reduce dissoc (or (:echo-vote-counts state) {}) expired-ids)
-        pruned-ready-vote-counts (reduce dissoc (or (:ready-vote-counts state) {}) expired-ids)
-        pruned-delivery-vote-counts (reduce dissoc (or (:delivery-vote-counts state) {}) expired-ids)
-        pruned-sieve-delivered-set (set/difference (:sieve-delivered-set state) expired-ids)
-        pruned-local-ready-set (set/difference (:local-ready-set state) expired-ids)
-        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)
-        tick-state (assoc state
+        frozen-epoch-roles (assoc (or (:frozen-epoch-message-roles state) {}) closing-epoch closing-roles)
+        base-state (assoc state
                           :epoch new-epoch
                           :epoch-entropy epoch-entropy
                           :basalt-view new-view
                           :basalt-index new-index
-                          :murmur-cache pruned-murmur-cache
-                          :contagion-known-ids pruned-known-ids
-                          :messages pruned-messages
-                          :message-epochs pruned-epochs
-                          :epoch-to-messages pruned-epoch-to-messages
                           :frozen-epoch-messages frozen-epoch-messages
+                          :frozen-epoch-message-roles frozen-epoch-roles
                           :fault-strikes (or (:fault-strikes state) {})
-                          :global-echo-sample updated-echo-sample
-                          :global-ready-sample updated-ready-sample
-                          :global-delivery-sample updated-delivery-sample
-                          :received-echoes pruned-received-echoes
-                          :received-readies pruned-received-readies
-                          :echo-vote-counts pruned-echo-vote-counts
-                          :ready-vote-counts pruned-ready-vote-counts
-                          :delivery-vote-counts pruned-delivery-vote-counts
-                          :sieve-delivered-set pruned-sieve-delivered-set
-                          :local-ready-set pruned-local-ready-set
-                          :delivered-set pruned-delivered-set)
-        tick-state-settled (apply-epoch-voucher-settlement tick-state closing-epoch)]
+                          :global-echo-sample (:echo-sample sampling-res)
+                          :global-ready-sample (:ready-sample sampling-res)
+                          :global-delivery-sample (:delivery-sample sampling-res))
+        pruned-state (prune-expired-tick-state base-state new-epoch gossip-ttl-epochs)
+        tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)]
     {:state (apply-epoch-treasury-boundary tick-state-settled new-epoch)
      :commands commands}))
 
@@ -436,13 +438,16 @@
             new-messages (assoc (:messages state) message-id message)
             new-epochs (assoc (or (:message-epochs state) {}) message-id current-epoch)
             new-epoch-to-messages (update (or (:epoch-to-messages state) {})
-                                          current-epoch (fnil conj #{}) message-id)]
+                                          current-epoch (fnil conj #{}) message-id)
+            new-epoch-to-roles (assoc-in (or (:epoch-to-message-roles state) {})
+                                         [current-epoch message-id] :gossip)]
         {:state (assoc state
                        :murmur-cache new-cache
                        :contagion-known-ids new-known-ids
                        :messages new-messages
                        :message-epochs new-epochs
-                       :epoch-to-messages new-epoch-to-messages)
+                       :epoch-to-messages new-epoch-to-messages
+                       :epoch-to-message-roles new-epoch-to-roles)
          :commands commands})
       {:state state :commands []})))
 
@@ -555,13 +560,18 @@
         new-epoch-to-messages (if new-message?
                                 (update (or (:epoch-to-messages state) {})
                                         current-epoch (fnil conj #{}) message-id)
-                                (or (:epoch-to-messages state) {}))]
+                                (or (:epoch-to-messages state) {}))
+        new-epoch-to-roles (if new-message?
+                             (assoc-in (or (:epoch-to-message-roles state) {})
+                                       [current-epoch message-id] :gossip)
+                             (or (:epoch-to-message-roles state) {}))]
     {:state (assoc state
                    :murmur-cache (:cache gossip-result)
                    :contagion-known-ids new-known-ids
                    :messages new-messages
                    :message-epochs new-epochs
-                   :epoch-to-messages new-epoch-to-messages)
+                   :epoch-to-messages new-epoch-to-messages
+                   :epoch-to-message-roles new-epoch-to-roles)
      :commands commands}))
 
 (defn- handle-receive-gossip
@@ -633,12 +643,14 @@
             sieve-delivered-set (:sieve-delivered-set state)]
         (if (and (contains? echo-sample sender)
                  (not (contains? received-echoes sender)))
-          (let [new-received-echoes (conj received-echoes sender)
+          (let [current-epoch (or (:epoch state) 0)
+                new-received-echoes (conj received-echoes sender)
                 old-count (get-in state [:echo-vote-counts message-id] 0)
                 new-count (inc old-count)
                 state-with-echo (-> state
                                     (assoc-in [:received-echoes message-id] new-received-echoes)
-                                    (assoc-in [:echo-vote-counts message-id] new-count))]
+                                    (assoc-in [:echo-vote-counts message-id] new-count)
+                                    (assoc-in [:epoch-to-message-roles current-epoch message-id] :echo))]
             (if (and (>= new-count E-hat)
                      (not (contains? sieve-delivered-set message-id)))
               (let [state-sieve-delivered (update state-with-echo :sieve-delivered-set conj message-id)]
@@ -730,7 +742,8 @@
             in-delivery? (contains? delivery-sample sender)]
         (if (and (not (contains? received-readies sender))
                  (or in-ready? in-delivery?))
-          (let [new-readies (conj received-readies sender)
+          (let [current-epoch (or (:epoch state) 0)
+                new-readies (conj received-readies sender)
                 new-r-votes (cond-> (get-in state [:ready-vote-counts message-id] 0)
                               in-ready? inc)
                 new-d-votes (cond-> (get-in state [:delivery-vote-counts message-id] 0)
@@ -738,7 +751,8 @@
                 state-with-ready (-> state
                                      (assoc-in [:received-readies message-id] new-readies)
                                      (assoc-in [:ready-vote-counts message-id] new-r-votes)
-                                     (assoc-in [:delivery-vote-counts message-id] new-d-votes))
+                                     (assoc-in [:delivery-vote-counts message-id] new-d-votes)
+                                     (assoc-in [:epoch-to-message-roles current-epoch message-id] :ready))
                 ready-res (if (>= new-r-votes R-hat)
                             (transition-to-ready state-with-ready message-id)
                             {:state state-with-ready :commands []})
@@ -779,6 +793,22 @@
   (let [new-state (treasury/apply-epoch-mint state event)]
     {:state new-state :commands []}))
 
+(defn- derive-authoritative-roles
+  "Derives authoritative message-role entries for dispute reconciliation.
+   Uses local-frozen-roles-map when available for a message-id, falling back
+   to fallback-roles for any message-ids not in the local map."
+  [local-frozen-ids local-frozen-roles-map fallback-roles]
+  (let [fallback-map (into {} (attestation/canonicalize-message-roles fallback-roles))
+        candidate-ids (set/union (set local-frozen-ids) (set (keys local-frozen-roles-map)))]
+    (reduce (fn [acc mid]
+              (if-let [role (get local-frozen-roles-map mid)]
+                (conj acc [mid role])
+                (if-let [role (get fallback-map mid)]
+                  (conj acc [mid role])
+                  acc)))
+            []
+            candidate-ids)))
+
 (defn- handle-submit-transcript
   "Handles bilateral transcript submission and dispute resolution.
    Evaluates the transcript against the frozen epoch message set,
@@ -786,12 +816,20 @@
   [state event]
   (let [transcript (or (:transcript event) (:payload event) event)
         epoch (:epoch transcript)
-        frozen-msgs (get-in state [:frozen-epoch-messages epoch] #{})
-        frozen-log-roles (or (:frozen-log-roles event)
-                             (attestation/reconcile-message-roles
-                              frozen-msgs
-                              frozen-msgs
-                              (or (:message-roles transcript) (:roles transcript) [])))
+        local-frozen-ids (get-in state [:frozen-epoch-messages epoch] #{})
+        counterparty-frozen-ids (or (:counterparty-frozen-ids event)
+                                    (:peer-frozen-ids event)
+                                    local-frozen-ids)
+        local-frozen-roles-map (get-in state [:frozen-epoch-message-roles epoch] {})
+        fallback-roles (or (:frozen-log-roles event)
+                           (:message-roles transcript)
+                           (:roles transcript)
+                           [])
+        auth-roles (derive-authoritative-roles local-frozen-ids local-frozen-roles-map fallback-roles)
+        frozen-log-roles (attestation/reconcile-message-roles
+                          local-frozen-ids
+                          counterparty-frozen-ids
+                          auth-roles)
         dispute-res (attestation/evaluate-transcript-dispute transcript frozen-log-roles)
         strike-peer (:strike dispute-res)
         new-strikes (if strike-peer
@@ -832,7 +870,8 @@
 
 (defn- handle-receive-offer-header
   "Processes an incoming offer header, validating home set membership and
-   sequence monotonicity, and appending the generated DeliveryAck to pending vouchers."
+   sequence monotonicity, and appending the generated DeliveryAck to pending vouchers.
+   Rejects offer header if callee is in ledger and underfunded for cumulative debit."
   [state event]
   (let [callee (:callee event)
         home-node (:home-node event)
@@ -849,18 +888,22 @@
       {:state state :commands []}
       (let [price (:price home-set)
             cum-debit (* seq-num price)
-            offer-ctx (assoc event
-                             :last-seq last-seq
-                             :p-b price
-                             :cumulative-debit cum-debit
-                             :epoch current-epoch)
-            res (rendezvous/process-offer-header offer-ctx)]
-        (if (= :ok (:status res))
-          {:state (-> state
-                      (assoc-in [:voucher-seqs tuple] seq-num)
-                      (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
-           :commands []}
-          {:state state :commands []})))))
+            callee-acct (get-in state [:ledger callee])
+            callee-bal (when callee-acct (or (:balance callee-acct) 0))]
+        (if (and callee-acct (< callee-bal cum-debit))
+          {:state state :commands []}
+          (let [offer-ctx (assoc event
+                                 :last-seq last-seq
+                                 :p-b price
+                                 :cumulative-debit cum-debit
+                                 :epoch current-epoch)
+                res (rendezvous/process-offer-header offer-ctx)]
+            (if (= :ok (:status res))
+              {:state (-> state
+                          (assoc-in [:voucher-seqs tuple] seq-num)
+                          (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
+               :commands []}
+              {:state state :commands []})))))))
 
 (defn- handle-settle-intent
   "Handles an internal or external request to settle a payment intent with protocol take.

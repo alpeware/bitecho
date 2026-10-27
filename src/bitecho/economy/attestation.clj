@@ -158,17 +158,15 @@
                 (verify-transcript transcript))))
 
 (defn calculate-node-weight
-  "Calculates node weight using the formula:
+  "Calculates node weight using continuous linear scaling:
      w_i = participation_i * min(4.0, stake_i / S_min)
-   Enforces < S_min cliff: returns 0.0 when stake < S_min.
    Handles boundary conditions (s-min <= 0, zero or negative participation/stake) safely."
   ([participation stake]
    (calculate-node-weight participation stake default-min-stake))
   ([participation stake s-min]
    (if (or (nil? s-min) (not (number? s-min)) (<= s-min 0)
            (nil? participation) (not (number? participation)) (<= participation 0)
-           (nil? stake) (not (number? stake)) (<= stake 0)
-           (< (double stake) (double s-min)))
+           (nil? stake) (not (number? stake)) (<= stake 0))
      0.0
      (let [stake-ratio (/ (double stake) (double s-min))
            multiplier (min max-stake-multiplier (max 0.0 stake-ratio))]

@@ -75,19 +75,21 @@
         (is (false? (attestation/half-signed? cosigned)))))))
 
 (deftest calculate-node-weight-test
-  (testing "Calculates node weight using w_i = participation_i * min(4.0, stake_i / S_min) with < S_min cliff"
-    (is (= 0.0 (attestation/calculate-node-weight 100 500 1000))
-        "Cliff: stake < S_min returns 0.0")
+  (testing "Calculates node weight using w_i = participation_i * min(4.0, stake_i / S_min) with continuous linear scaling"
+    (is (= 50.0 (attestation/calculate-node-weight 100 500 1000))
+        "Continuous linear scaling: stake = 500, S_min = 1000, ratio = 0.5")
     (is (= 100.0 (attestation/calculate-node-weight 100 1000 1000)))
     (is (= 200.0 (attestation/calculate-node-weight 100 2000 1000)))
     (is (= 400.0 (attestation/calculate-node-weight 100 4000 1000)))
     (is (= 400.0 (attestation/calculate-node-weight 100 8000 1000))
         "Caps stake multiplier at 4.0"))
 
-  (testing "Ratified default S_min is 250,000 with cliff"
+  (testing "Ratified default S_min is 250,000 with continuous linear scaling"
     (is (= 250000 attestation/default-min-stake))
-    (is (= 0.0 (attestation/calculate-node-weight 100 249999))
-        "Below default S_min returns 0.0")
+    (is (= 0.5 (attestation/calculate-node-weight 1.0 125000))
+        "Continuous linear: stake = 125000 with default S_min = 250000 and participation = 1.0 returns 0.5")
+    (is (= 99.9996 (attestation/calculate-node-weight 100 249999))
+        "Below default S_min scales continuously without cliff")
     (is (= 100.0 (attestation/calculate-node-weight 100 250000))
         "At default S_min multiplier is 1.0")
     (is (= 400.0 (attestation/calculate-node-weight 100 1000000))
@@ -132,19 +134,20 @@
                          (attestation/mutually-signed? transcript)
                          (attestation/half-signed? transcript))))))
 
-(defspec ^{:doc "Property: Node weight calculation satisfies bounds [0, 4.0 * participation]"}
+(defspec ^{:doc "Property: Node weight calculation satisfies bounds [0, 4.0 * participation] with continuous linear scaling"}
   prop-calculate-node-weight-bounds 50
-  (prop/for-all [participation (gen/choose 0 10000)
+  (prop/for-all [participation (gen/choose 1 10000)
                  stake (gen/choose 0 1000000)
                  s-min (gen/choose 1 50000)]
                 (let [weight (attestation/calculate-node-weight participation stake s-min)
-                      max-allowed (* 4.0 (double participation))]
+                      max-allowed (* 4.0 (double participation))
+                      expected (if (or (<= participation 0) (<= stake 0) (<= s-min 0))
+                                 0.0
+                                 (* (double participation) (min 4.0 (/ (double stake) (double s-min)))))]
                   (and (number? weight)
                        (>= weight 0.0)
                        (<= weight (+ max-allowed 1e-9))
-                       (if (>= stake (* 4 s-min))
-                         (<= (Math/abs (- weight max-allowed)) 1e-9)
-                         true)))))
+                       (<= (Math/abs (- weight expected)) 1e-9)))))
 
 (deftest canonical-exchange-digest-byte-concatenation-test
   (let [epoch 1
