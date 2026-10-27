@@ -40,30 +40,38 @@
            (get state :mempool [])
            (get state :node-pubkey)))
 
-(defn- chain-length
-  "Calculates the length of the chain ending at block-hash."
+(defn chain-length
+  "Calculates the length of the chain ending at block-hash.
+   Guards against cycles using a visited set: returns -1 if a cycle is detected,
+   indicating an invalid cyclic chain."
   [blocks block-hash]
   (loop [curr block-hash
+         visited #{}
          len 0]
-    (if (= curr "genesis")
-      len
-      (if-let [block (get blocks curr)]
-        (recur (:parent-hash block) (inc len))
-        len))))
+    (cond
+      (= curr "genesis") len
+      (contains? visited curr) -1
+      :else (if-let [block (get blocks curr)]
+              (recur (:parent-hash block) (conj visited curr) (inc len))
+              len))))
 
 (defn longest-notarized-parent?
   "Returns true if parent-hash extends one of the longest notarized chains in state.
    If no blocks are notarized yet, only 'genesis' is valid.
-   If notarized blocks exist, parent-hash must be a notarized block with maximal chain length."
+   If notarized blocks exist, parent-hash must be a notarized block with maximal chain length.
+   Returns false if parent-hash or any notarized ancestor is cyclic."
   [state parent-hash]
   (let [notarized (get state :notarized-blocks #{})
         blocks (get state :blocks {})]
     (if (empty? notarized)
       (= parent-hash "genesis")
-      (boolean
-       (and (contains? notarized parent-hash)
-            (let [max-len (reduce max 0 (map #(chain-length blocks %) notarized))]
-              (= (chain-length blocks parent-hash) max-len)))))))
+      (let [parent-len (chain-length blocks parent-hash)
+            valid-lens (filterv pos? (map #(chain-length blocks %) notarized))]
+        (boolean
+         (and (pos? parent-len)
+              (contains? notarized parent-hash)
+              (seq valid-lens)
+              (= parent-len (reduce max 0 valid-lens))))))))
 
 (defn cast-vote
   "Casts a vote on a block if the state has not already voted in this epoch
@@ -102,15 +110,20 @@
           state-with-vote))
       state)))
 
-(defn- get-ancestors
-  "Recursively retrieves the sequence of ancestors for a given block hash."
+(defn get-ancestors
+  "Recursively retrieves the sequence of ancestors for a given block hash.
+   Guards against cycles using a visited set: terminates traversal if a cycle is detected."
   [blocks block-hash]
   (loop [curr-hash block-hash
+         visited #{block-hash}
          acc []]
-    (let [block (get blocks curr-hash)]
-      (if (or (nil? block) (= "genesis" (:parent-hash block)))
+    (let [block (get blocks curr-hash)
+          parent-hash (:parent-hash block)]
+      (if (or (nil? block)
+              (= "genesis" parent-hash)
+              (contains? visited parent-hash))
         acc
-        (recur (:parent-hash block) (conj acc (:parent-hash block)))))))
+        (recur parent-hash (conj visited parent-hash) (conj acc parent-hash))))))
 
 (defn- find-consecutive-epoch-head
   "Finds the middle block's hash of any 3 consecutive notarized blocks.
@@ -227,13 +240,15 @@
           nil))))
 
 (defn- update-head-hash
-  "Updates :head-hash in state to the maximal length notarized chain head."
+  "Updates :head-hash in state to the maximal length notarized chain head.
+   Guards against cyclic chains by ignoring cyclic notarized heads and falling back to genesis."
   [state]
   (let [notarized (:notarized-blocks state)
         blocks (:blocks state)
-        head-hash (if (empty? notarized)
+        valid-heads (filterv #(pos? (chain-length blocks %)) notarized)
+        head-hash (if (empty? valid-heads)
                     "genesis"
-                    (apply max-key (fn [h] [(chain-length blocks h) (get-in blocks [h :epoch] -1)]) notarized))]
+                    (apply max-key (fn [h] [(chain-length blocks h) (get-in blocks [h :epoch] -1)]) valid-heads))]
     (assoc state :head-hash head-hash)))
 
 (defn- apply-future-votes

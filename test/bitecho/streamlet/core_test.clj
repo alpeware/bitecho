@@ -524,3 +524,94 @@
                        all-notarized?
                        single-vote?
                        no-double-vote?))))
+
+(deftest adversarial-cycle-guard-test
+  (let [kp (crypto/generate-keypair)
+        self-loop-blocks {"block-self" (core/->Block 1 "block-self" [] "p1")}
+        cycle-2-blocks {"block-a" (core/->Block 1 "block-b" [] "p1")
+                        "block-b" (core/->Block 2 "block-a" [] "p2")}
+        multi-cycle-blocks {"block-1" (core/->Block 1 "block-3" [] "p1")
+                            "block-2" (core/->Block 2 "block-1" [] "p2")
+                            "block-3" (core/->Block 3 "block-2" [] "p3")
+                            "block-leaf" (core/->Block 4 "block-3" [] "p4")}]
+    (testing "chain-length detects cycles and returns -1"
+      (is (= -1 (core/chain-length self-loop-blocks "block-self")))
+      (is (= -1 (core/chain-length cycle-2-blocks "block-a")))
+      (is (= -1 (core/chain-length cycle-2-blocks "block-b")))
+      (is (= -1 (core/chain-length multi-cycle-blocks "block-leaf"))))
+
+    (testing "get-ancestors terminates safely on cyclic chains"
+      (is (= [] (core/get-ancestors self-loop-blocks "block-self")))
+      (is (= ["block-b"] (core/get-ancestors cycle-2-blocks "block-a")))
+      (is (= ["block-3" "block-2" "block-1"] (core/get-ancestors multi-cycle-blocks "block-leaf"))))
+
+    (testing "longest-notarized-parent? rejects cyclic parents"
+      (let [state-self {:notarized-blocks #{"block-self"}
+                        :blocks self-loop-blocks}
+            state-2cycle {:notarized-blocks #{"block-a" "block-b"}
+                          :blocks cycle-2-blocks}]
+        (is (false? (core/longest-notarized-parent? state-self "block-self")))
+        (is (false? (core/longest-notarized-parent? state-2cycle "block-a")))
+        (is (false? (core/longest-notarized-parent? state-2cycle "block-b")))))
+
+    (testing "cast-vote refuses to vote for blocks with cyclic parents"
+      (let [state {:voted-epochs #{}
+                   :keypair kp
+                   :notarized-blocks #{"block-a"}
+                   :blocks cycle-2-blocks}
+            block-voting-cyclic (core/->Block 3 "block-a" [] "proposer")]
+        (is (nil? (core/cast-vote state block-voting-cyclic)))))
+
+    (testing "update-head-hash falls back to genesis when all notarized blocks are cyclic"
+      (let [state {:notarized-blocks #{"block-self"}
+                   :blocks self-loop-blocks
+                   :head-hash "old-head"}
+            updated (#'core/update-head-hash state)]
+        (is (= "genesis" (:head-hash updated)))))
+
+    (testing "finalize-prefix terminates safely without hanging on cyclic block graph"
+      (let [state {:notarized-blocks #{"block-a" "block-b"}
+                   :blocks cycle-2-blocks
+                   :finalized-blocks []}
+            finalized (core/finalize-prefix state)]
+        (is (= state finalized))))))
+
+(defspec ^{:doc "Property: Traversal functions strictly terminate and reject arbitrary adversarial cycle topologies"}
+  prop-adversarial-cycle-guard-termination 50
+  (prop/for-all [cycle-len (gen/choose 1 10)
+                 extra-hops (gen/choose 0 5)]
+                (let [kp (crypto/generate-keypair)
+                      cycle-hashes (mapv #(str "cycle-" %) (range cycle-len))
+                      cycle-map (into {}
+                                      (map-indexed
+                                       (fn [i h]
+                                         [h (core/->Block (inc i)
+                                                          (nth cycle-hashes (mod (inc i) cycle-len))
+                                                          []
+                                                          "proposer")])
+                                       cycle-hashes))
+                      leaf-hashes (mapv #(str "leaf-" %) (range extra-hops))
+                      leaf-map (into {}
+                                     (map-indexed
+                                      (fn [i h]
+                                        (let [parent (if (zero? i)
+                                                       (first cycle-hashes)
+                                                       (nth leaf-hashes (dec i)))]
+                                          [h (core/->Block (+ 100 i) parent [] "proposer")]))
+                                      leaf-hashes))
+                      all-blocks (merge cycle-map leaf-map)
+                      target-hash (if (seq leaf-hashes) (last leaf-hashes) (first cycle-hashes))
+                      state {:voted-epochs #{}
+                             :keypair kp
+                             :notarized-blocks (set (keys all-blocks))
+                             :blocks all-blocks
+                             :head-hash "genesis"}
+                      prop-block (core/->Block 200 target-hash [] "proposer")]
+                  (and (= -1 (core/chain-length all-blocks target-hash))
+                       (vector? (core/get-ancestors all-blocks target-hash))
+                       (<= (count (core/get-ancestors all-blocks target-hash)) (+ cycle-len extra-hops))
+                       (false? (core/longest-notarized-parent? state target-hash))
+                       (nil? (core/cast-vote state prop-block))
+                       (= "genesis" (:head-hash (#'core/update-head-hash state)))
+                       (map? (core/finalize-prefix state))))))
+
