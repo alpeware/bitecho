@@ -40,14 +40,14 @@
 (deftest test-cast-vote
   (testing "cast-vote prevents duplicate voting per epoch"
     (let [state {:voted-epochs #{7}}
-          block (core/->Block 7 "hashX" [] "proposer1")
+          block (core/->Block 7 "genesis" [] "proposer1")
           vote (core/cast-vote state block)]
       (is (nil? vote))))
 
   (testing "cast-vote generates valid signed vote"
     (let [keypair (crypto/generate-keypair)
           state {:voted-epochs #{} :keypair keypair}
-          block (core/->Block 8 "hashY" [] "proposer2")
+          block (core/->Block 8 "genesis" [] "proposer2")
           vote (core/cast-vote state block)]
       (is (not (nil? vote)))
       (is (= 8 (:epoch vote)))
@@ -58,6 +58,68 @@
                   (:public keypair)
                   (.getBytes ^String (:block-hash vote) "UTF-8")
                   (core/hex->bytes (:voter-signature vote))))))))
+
+(deftest test-longest-notarized-parent-vote
+  (let [keypair (crypto/generate-keypair)
+        ;; Create a chain: b1 -> b2 -> b3
+        b1 (core/->Block 1 "genesis" [] "p1")
+        h1 (core/hash-block b1)
+        b2 (core/->Block 2 h1 [] "p2")
+        h2 (core/hash-block b2)
+        b3 (core/->Block 3 h2 [] "p3")
+        h3 (core/hash-block b3)
+        ;; And an alternative shorter branch: b1-alt
+        b1-alt (core/->Block 1 "genesis" ["alt"] "p-alt")
+        h1-alt (core/hash-block b1-alt)
+        blocks {h1 b1, h2 b2, h3 b3, h1-alt b1-alt}]
+
+    (testing "when no blocks are notarized, extending 'genesis' succeeds"
+      (let [state {:voted-epochs #{} :keypair keypair :blocks {} :notarized-blocks #{}}
+            block (core/->Block 1 "genesis" [] "p")
+            vote (core/cast-vote state block)]
+        (is (not (nil? vote)))
+        (is (= 1 (:epoch vote)))
+        (is (true? (core/longest-notarized-parent? state "genesis")))))
+
+    (testing "when no blocks are notarized, extending a non-genesis block fails"
+      (let [state {:voted-epochs #{} :keypair keypair :blocks {} :notarized-blocks #{}}
+            block (core/->Block 1 "non-genesis-hash" [] "p")
+            vote (core/cast-vote state block)]
+        (is (nil? vote))
+        (is (false? (core/longest-notarized-parent? state "non-genesis-hash")))))
+
+    (testing "when b1 and b2 are notarized, extending genesis fails (shorter than longest notarized)"
+      (let [state {:voted-epochs #{} :keypair keypair :blocks blocks :notarized-blocks #{h1 h2}}
+            block (core/->Block 3 "genesis" [] "p")
+            vote (core/cast-vote state block)]
+        (is (nil? vote))
+        (is (false? (core/longest-notarized-parent? state "genesis")))))
+
+    (testing "when b1 and b2 are notarized, extending shorter branch h1 fails"
+      (let [state {:voted-epochs #{} :keypair keypair :blocks blocks :notarized-blocks #{h1 h2}}
+            block (core/->Block 3 h1 [] "p")
+            vote (core/cast-vote state block)]
+        (is (nil? vote))
+        (is (false? (core/longest-notarized-parent? state h1)))))
+
+    (testing "when b1 and b2 are notarized, extending longest notarized head h2 succeeds"
+      (let [state {:voted-epochs #{} :keypair keypair :blocks blocks :notarized-blocks #{h1 h2}}
+            block (core/->Block 3 h2 [] "p")
+            vote (core/cast-vote state block)]
+        (is (not (nil? vote)))
+        (is (= 3 (:epoch vote)))
+        (is (true? (core/longest-notarized-parent? state h2)))))
+
+    (testing "when there are two notarized chains of equal length (fork), extending either head succeeds"
+      (let [state {:voted-epochs #{} :keypair keypair :blocks blocks :notarized-blocks #{h1 h1-alt}}
+            block-a (core/->Block 2 h1 [] "p")
+            block-b (core/->Block 2 h1-alt [] "p")
+            vote-a (core/cast-vote state block-a)
+            vote-b (core/cast-vote state block-b)]
+        (is (true? (core/longest-notarized-parent? state h1)))
+        (is (true? (core/longest-notarized-parent? state h1-alt)))
+        (is (not (nil? vote-a)))
+        (is (not (nil? vote-b)))))))
 
 (deftest test-quorum-threshold
   (testing "quorum-threshold calculates 2n/3 properly"
@@ -175,3 +237,36 @@
                                                       consecutive-triplets))
                       expected-finalized (into expected-finalized (map (comp :hash second) consecutive-triplets))]
                   (= finalized expected-finalized))))
+
+(defspec ^{:doc "Property: cast-vote only votes on blocks extending a longest notarized chain head."}
+  prop-longest-notarized-chain-vote 100
+  (prop/for-all [chain-len (gen/choose 1 10)]
+                (let [keypair (crypto/generate-keypair)
+                      epochs (range 1 (inc chain-len))
+                      main-chain (build-test-chain epochs)
+                      main-blocks (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) main-chain))
+                      main-head-hash (:hash (last main-chain))
+                      state {:voted-epochs #{}
+                             :keypair keypair
+                             :blocks main-blocks
+                             :notarized-blocks (set (keys main-blocks))}
+
+          ;; 1. Block extending longest notarized head should be voted on
+                      valid-block (core/->Block (+ chain-len 1) main-head-hash [] "proposer")
+                      valid-vote (core/cast-vote state valid-block)
+
+          ;; 2. Block extending 'genesis' when chain-len >= 1 should be REJECTED (vote is nil)
+                      stale-genesis-block (core/->Block (+ chain-len 2) "genesis" [] "proposer")
+                      stale-genesis-vote (core/cast-vote state stale-genesis-block)
+
+          ;; 3. Block extending a shorter ancestor (if chain-len > 1) should be REJECTED
+                      shorter-ancestor-ok?
+                      (if (> chain-len 1)
+                        (let [shorter-hash (:hash (first main-chain))
+                              shorter-block (core/->Block (+ chain-len 3) shorter-hash [] "proposer")]
+                          (nil? (core/cast-vote state shorter-block)))
+                        true)]
+                  (and (not (nil? valid-vote))
+                       (= (+ chain-len 1) (:epoch valid-vote))
+                       (nil? stale-genesis-vote)
+                       shorter-ancestor-ok?))))

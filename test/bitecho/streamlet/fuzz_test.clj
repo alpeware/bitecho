@@ -2,23 +2,25 @@
   "Generative state-machine fuzzer for Streamlet BFT consensus."
   (:require [bitecho.crypto :as crypto]
             [bitecho.streamlet.core :as core]
+            [clojure.set :as set]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
 (defn- chain-length [blocks block-hash]
   (loop [curr block-hash len 0]
-    (let [block (get blocks curr)]
-      (if (or (nil? block) (= "genesis" (:parent-hash block)))
-        len
-        (recur (:parent-hash block) (inc len))))))
+    (cond
+      (= curr "genesis") len
+      (contains? blocks curr) (recur (:parent-hash (get blocks curr)) (inc len))
+      :else 0)))
 
 (defn- update-head [state]
   (let [notarized (:notarized-blocks state)
         blocks (:blocks state)
-        best-hash (if (empty? notarized)
+        known (filter #(contains? blocks %) notarized)
+        best-hash (if (empty? known)
                     "genesis"
-                    (first (sort-by (juxt #(- (chain-length blocks %)) identity) notarized)))]
+                    (first (sort-by (juxt #(- (chain-length blocks %)) identity) known)))]
     (assoc state :head-hash best-hash)))
 
 (defn- handle-block [state block]
@@ -137,6 +139,16 @@
 
 (defn- test-liveness [sim]
   (let [sim (flush-messages sim)
+        all-blocks (apply merge (map :blocks (vals (:nodes sim))))
+        all-notarized (apply set/union (map :notarized-blocks (vals (:nodes sim))))
+        sim (update sim :nodes
+                    (fn [nodes]
+                      (into {} (map (fn [[id n]]
+                                      [id (-> n
+                                              (update :blocks merge all-blocks)
+                                              (update :notarized-blocks set/union all-notarized)
+                                              update-head)])
+                                    nodes))))
         max-epoch (reduce max 0 (mapcat :voted-epochs (vals (:nodes sim))))
         e1 (inc max-epoch)
         e2 (+ 2 max-epoch)

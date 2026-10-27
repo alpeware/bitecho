@@ -40,13 +40,41 @@
            (get state :mempool [])
            (get state :node-pubkey)))
 
+(defn- chain-length
+  "Calculates the length of the chain ending at block-hash."
+  [blocks block-hash]
+  (loop [curr block-hash
+         len 0]
+    (if (= curr "genesis")
+      len
+      (if-let [block (get blocks curr)]
+        (recur (:parent-hash block) (inc len))
+        len))))
+
+(defn longest-notarized-parent?
+  "Returns true if parent-hash extends one of the longest notarized chains in state.
+   If no blocks are notarized yet, only 'genesis' is valid.
+   If notarized blocks exist, parent-hash must be a notarized block with maximal chain length."
+  [state parent-hash]
+  (let [notarized (get state :notarized-blocks #{})
+        blocks (get state :blocks {})]
+    (if (empty? notarized)
+      (= parent-hash "genesis")
+      (boolean
+       (and (contains? notarized parent-hash)
+            (let [max-len (reduce max 0 (map #(chain-length blocks %) notarized))]
+              (= (chain-length blocks parent-hash) max-len)))))))
+
 (defn cast-vote
-  "Casts a vote on a block if the state has not already voted in this epoch.
-   Returns a Vote record with a valid signature, or nil if already voted."
+  "Casts a vote on a block if the state has not already voted in this epoch
+   and the block's parent-hash extends one of the longest notarized chains.
+   Returns a Vote record with a valid signature, or nil if already voted or invalid parent."
   [state block]
   (let [epoch (:epoch block)
+        parent-hash (:parent-hash block)
         voted (get state :voted-epochs #{})]
-    (when-not (contains? voted epoch)
+    (when (and (not (contains? voted epoch))
+               (longest-notarized-parent? state parent-hash))
       (let [b-hash (hash-block block)
             private-key (get-in state [:keypair :private])
             sig-bytes (crypto/sign private-key (.getBytes ^String b-hash "UTF-8"))]
