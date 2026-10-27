@@ -23,31 +23,37 @@
   ([initial-peers node-pubkey]
    (init-state initial-peers node-pubkey config/default-config))
   ([initial-peers node-pubkey cfg]
-   {:node-pubkey node-pubkey
-    :config cfg
-    :epoch 0
-    :basalt-index 0
-    :basalt-view (basalt/init-view initial-peers (:basalt-max-view-size cfg) (java.util.Random.))
-    :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
-    :contagion-known-ids #{}
-    :messages {}
-    :message-epochs {}
-    :epoch-to-messages {}
-    :global-echo-sample #{}
-    :global-ready-sample #{}
-    :global-delivery-sample #{}
-    :echo-subscribers #{}
-    :ready-subscribers #{}
-    :delivery-subscribers #{}
-    :received-echoes {}
-    :received-readies {}
-    :echo-vote-counts {}
-    :ready-vote-counts {}
-    :delivery-vote-counts {}
-    :sieve-delivered-set #{}
-    :local-ready-set #{}
-    :delivered-set #{}
-    :ledger {node-pubkey (account/map->AccountState {:balance 1000 :seq 0 :deps []})}}))
+   (let [genesis-ledger (when-let [gl (:genesis-ledger cfg)]
+                          (into {} (map (fn [[k v]] [k (if (instance? bitecho.economy.account.AccountState v)
+                                                         v
+                                                         (account/map->AccountState v))]))
+                                gl))]
+     {:node-pubkey node-pubkey
+      :config cfg
+      :epoch 0
+      :basalt-index 0
+      :basalt-view (basalt/init-view initial-peers (:basalt-max-view-size cfg) (java.util.Random.))
+      :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
+      :contagion-known-ids #{}
+      :messages {}
+      :message-epochs {}
+      :epoch-to-messages {}
+      :global-echo-sample #{}
+      :global-ready-sample #{}
+      :global-delivery-sample #{}
+      :echo-subscribers #{}
+      :ready-subscribers #{}
+      :delivery-subscribers #{}
+      :received-echoes {}
+      :received-readies {}
+      :echo-vote-counts {}
+      :ready-vote-counts {}
+      :delivery-vote-counts {}
+      :sieve-delivered-set #{}
+      :local-ready-set #{}
+      :delivered-set #{}
+      :ledger (merge {node-pubkey (account/map->AccountState {:balance 1000 :seq 0 :deps []})}
+                     genesis-ledger)})))
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
@@ -431,16 +437,12 @@
                              transfer-map)
               transfer (account/map->Transfer transfer-map)
               ledger (or (:ledger state) {})
-              ledger (if (and (:sender transfer) (not (contains? ledger (:sender transfer))))
-                       (assoc ledger (:sender transfer) (account/map->AccountState {:balance 1000 :seq 0 :deps []}))
-                       ledger)
               ledger (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
                        (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
                        ledger)
               new-ledger (account/apply-transfer ledger transfer)]
           (assoc state :ledger new-ledger))
-        (catch Exception e
-          (println "Error applying transfer" e)
+        (catch Exception _
           state))
       state)))
 

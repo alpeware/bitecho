@@ -291,22 +291,23 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- create-honest-node
-  [i cfg]
-  (let [keys (crypto/generate-keypair)
-        pubkey-hex (basalt/bytes->hex (:public keys))
-        initial-state (sm/init-state [] pubkey-hex (:protocol cfg))
-        peer {:ip "127.0.0.1"
-              :port (+ 8000 i)
-              :pubkey pubkey-hex
-              :hash (basalt/bytes->hex (crypto/sha256 (:public keys)))}]
-    {:type :honest
-     :pubkey-hex pubkey-hex
-     :keys keys
-     :peer peer
-     :state-vol (volatile! initial-state)
-     :inbox (ConcurrentLinkedQueue.)
-     :scheduled? (AtomicBoolean. false)
-     :pending-ticks (AtomicInteger. 0)}))
+  ([i cfg]
+   (create-honest-node i cfg (crypto/generate-keypair)))
+  ([i cfg keys]
+   (let [pubkey-hex (basalt/bytes->hex (:public keys))
+         initial-state (sm/init-state [] pubkey-hex (:protocol cfg))
+         peer {:ip "127.0.0.1"
+               :port (+ 8000 i)
+               :pubkey pubkey-hex
+               :hash (basalt/bytes->hex (crypto/sha256 (:public keys)))}]
+     {:type :honest
+      :pubkey-hex pubkey-hex
+      :keys keys
+      :peer peer
+      :state-vol (volatile! initial-state)
+      :inbox (ConcurrentLinkedQueue.)
+      :scheduled? (AtomicBoolean. false)
+      :pending-ticks (AtomicInteger. 0)})))
 
 (defn- create-byzantine-node
   [i _cfg]
@@ -336,7 +337,15 @@
         byz (:byzantine-nodes cfg)
         honest (- total byz)
         view-size (get-in cfg [:protocol :basalt-max-view-size])
-        h-nodes (mapv #(create-honest-node % cfg) (range honest))
+        initiator-keys (crypto/generate-keypair)
+        initiator-pubkey (basalt/bytes->hex (:public initiator-keys))
+        genesis-ledger {initiator-pubkey (account/map->AccountState {:balance 1000 :seq 0 :deps []})}
+        cfg (assoc-in cfg [:protocol :genesis-ledger] genesis-ledger)
+        h-nodes (mapv (fn [i]
+                        (if (zero? i)
+                          (create-honest-node i cfg initiator-keys)
+                          (create-honest-node i cfg)))
+                      (range honest))
         b-nodes (mapv #(create-byzantine-node % cfg) (range byz))
         all-nodes (concat h-nodes b-nodes)
         nodes-map (into {} (map (juxt :pubkey-hex identity) all-nodes))
