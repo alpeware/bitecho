@@ -128,9 +128,8 @@
       (is (= 8000 (:m-mesh res)))
       (is (= 10000 (+ (:m-streamlet res) (:m-mesh res)))))
 
-    (testing "Commands include signed mint transfers and custody transfers"
-      (is (= 5 (count (:commands res))))
-      (is (= 4 (count (:mint-commands res))))
+    (testing "Commands include signed custody transfers"
+      (is (= 1 (count (:commands res))))
       (is (= 1 (count (:custody-commands res))))
       (is (= 49500 (:remaining-custody-balance res))))))
 
@@ -247,12 +246,16 @@
         t-priv (:private t-kp)
         base-state {:ledger {}
                     :total-minted 0
-                    :minted-epochs #{}}]
+                    :minted-epochs #{}
+                    :treasury-pubkey t-pub}]
     (testing "Applies valid epoch mint and increments :total-minted by exact distributed sum"
       (let [allocs {"node1" 500 "node2" 300}
+            sig (treasury/sign-epoch-mint t-priv 1 allocs)
             res (treasury/apply-epoch-mint base-state {:epoch 1
                                                        :epoch-gate 1000
-                                                       :allocations allocs})]
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig})]
         (is (= 800 (:total-minted res)))
         (is (contains? (:minted-epochs res) 1))
         (is (= 500 (:balance (get-in res [:ledger "node1"]))))
@@ -260,62 +263,91 @@
 
     (testing "Rounding dust: only actual distributed sum is minted, never phantom gate amount"
       (let [allocs {"node1" 499 "node2" 499}
+            sig (treasury/sign-epoch-mint t-priv 2 allocs)
             res (treasury/apply-epoch-mint base-state {:epoch 2
                                                        :epoch-gate 1000
-                                                       :allocations allocs})]
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig})]
         (is (= 998 (:total-minted res)))
         (is (= 998 (reduce + 0 (map :balance (vals (:ledger res))))))))
 
     (testing "Double-mint of same epoch is rejected in full"
-      (let [state-epoch-1 (assoc base-state :minted-epochs #{1} :total-minted 500)
+      (let [allocs {"node1" 100}
+            sig (treasury/sign-epoch-mint t-priv 1 allocs)
+            state-epoch-1 (assoc base-state :minted-epochs #{1} :total-minted 500)
             res (treasury/apply-epoch-mint state-epoch-1 {:epoch 1
                                                           :epoch-gate 1000
-                                                          :allocations {"node1" 100}})]
+                                                          :allocations allocs
+                                                          :treasury-pubkey t-pub
+                                                          :signature sig})]
         (is (= state-epoch-1 res))))
 
     (testing "Rejects mint exceeding epoch demand gate M_t"
-      (let [res (treasury/apply-epoch-mint base-state {:epoch 3
+      (let [allocs {"node1" 600}
+            sig (treasury/sign-epoch-mint t-priv 3 allocs)
+            res (treasury/apply-epoch-mint base-state {:epoch 3
                                                        :epoch-gate 500
-                                                       :allocations {"node1" 600}})]
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig})]
         (is (= base-state res))))
 
     (testing "Rejects mint exceeding max-conditional-mint-supply (23.1B hard cap limit)"
-      (let [state-near-cap (assoc base-state :total-minted (- treasury/max-conditional-mint-supply 100))
+      (let [allocs {"node1" 150}
+            sig (treasury/sign-epoch-mint t-priv 4 allocs)
+            state-near-cap (assoc base-state :total-minted (- treasury/max-conditional-mint-supply 100))
             res (treasury/apply-epoch-mint state-near-cap {:epoch 4
                                                            :epoch-gate 200
-                                                           :allocations {"node1" 150}})]
+                                                           :allocations allocs
+                                                           :treasury-pubkey t-pub
+                                                           :signature sig})]
         (is (= state-near-cap res))))
 
     (testing "Rejects when any allocation amount is negative"
-      (let [res (treasury/apply-epoch-mint base-state {:epoch 5
+      (let [allocs {"node1" 500 "node2" -50}
+            sig (treasury/sign-epoch-mint t-priv 5 allocs)
+            res (treasury/apply-epoch-mint base-state {:epoch 5
                                                        :epoch-gate 1000
-                                                       :allocations {"node1" 500 "node2" -50}})]
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig})]
         (is (= base-state res))))
 
-    (testing "Verifies cryptographic signature when treasury-pubkey and signature are provided"
+    (testing "Rejects when signature is missing, empty, or nil"
+      (let [allocs {"node1" 400}]
+        (is (= base-state (treasury/apply-epoch-mint base-state {:epoch 6 :epoch-gate 500 :allocations allocs :treasury-pubkey t-pub})))
+        (is (= base-state (treasury/apply-epoch-mint base-state {:epoch 6 :epoch-gate 500 :allocations allocs :treasury-pubkey t-pub :signature ""})))
+        (is (= base-state (treasury/apply-epoch-mint base-state {:epoch 6 :epoch-gate 500 :allocations allocs :treasury-pubkey t-pub :signature nil})))))
+
+    (testing "Rejects when treasury pubkey is missing"
       (let [allocs {"node1" 400}
             sig (treasury/sign-epoch-mint t-priv 6 allocs)
-            valid-ctx {:epoch 6
-                       :epoch-gate 500
-                       :allocations allocs
-                       :treasury-pubkey t-pub
-                       :signature sig}
-            valid-res (treasury/apply-epoch-mint base-state valid-ctx)]
-        (is (= 400 (:total-minted valid-res)))
-        (is (contains? (:minted-epochs valid-res) 6))
-        (is (= 400 (:balance (get-in valid-res [:ledger "node1"])))))
+            state-no-pk (dissoc base-state :treasury-pubkey)]
+        (is (= state-no-pk (treasury/apply-epoch-mint state-no-pk {:epoch 6 :epoch-gate 500 :allocations allocs :signature sig})))))
 
-      (testing "Rejects when signature is tampered"
-        (let [allocs {"node1" 400}
-              sig (treasury/sign-epoch-mint t-priv 6 allocs)
-              tampered-sig (str "ff" (subs sig 2))
-              invalid-ctx {:epoch 6
-                           :epoch-gate 500
-                           :allocations allocs
-                           :treasury-pubkey t-pub
-                           :signature tampered-sig}
-              invalid-res (treasury/apply-epoch-mint base-state invalid-ctx)]
-          (is (= base-state invalid-res)))))))
+    (testing "Rejects when mint-ctx treasury-pubkey mismatches state treasury-pubkey"
+      (let [allocs {"node1" 400}
+            other-kp (crypto/generate-keypair)
+            other-pub (basalt/bytes->hex (:public other-kp))
+            other-sig (treasury/sign-epoch-mint (:private other-kp) 6 allocs)]
+        (is (= base-state (treasury/apply-epoch-mint base-state {:epoch 6
+                                                                 :epoch-gate 500
+                                                                 :allocations allocs
+                                                                 :treasury-pubkey other-pub
+                                                                 :signature other-sig})))))
+
+    (testing "Rejects when signature is tampered"
+      (let [allocs {"node1" 400}
+            sig (treasury/sign-epoch-mint t-priv 6 allocs)
+            tampered-sig (str "ff" (subs sig 2))
+            invalid-ctx {:epoch 6
+                         :epoch-gate 500
+                         :allocations allocs
+                         :treasury-pubkey t-pub
+                         :signature tampered-sig}
+            invalid-res (treasury/apply-epoch-mint base-state invalid-ctx)]
+        (is (= base-state invalid-res))))))
 
 (defspec ^{:doc "Property: apply-epoch-mint strictly respects demand gate, hard cap, and never phantom-mints rounding dust"}
   prop-apply-epoch-mint-invariants 50
@@ -324,17 +356,24 @@
                  alloc-pct-1 (gen/choose 10 40)
                  alloc-pct-2 (gen/choose 10 40)
                  attempt-overflow? gen/boolean]
-                (let [base-state {:ledger {}
+                (let [t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (:private t-kp)
+                      base-state {:ledger {}
                                   :total-minted 0
-                                  :minted-epochs #{}}
+                                  :minted-epochs #{}
+                                  :treasury-pubkey t-pub}
                       amt-1 (quot (* gate alloc-pct-1) 100)
                       amt-2 (quot (* gate alloc-pct-2) 100)
                       allocs (if attempt-overflow?
                                {"n1" (+ gate 100)}
                                {"n1" amt-1 "n2" amt-2})
+                      sig (treasury/sign-epoch-mint t-priv epoch allocs)
                       ctx {:epoch epoch
                            :epoch-gate gate
-                           :allocations allocs}
+                           :allocations allocs
+                           :treasury-pubkey t-pub
+                           :signature sig}
                       res (treasury/apply-epoch-mint base-state ctx)]
                   (if attempt-overflow?
                     (= base-state res)

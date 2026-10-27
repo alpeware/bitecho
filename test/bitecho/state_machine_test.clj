@@ -401,12 +401,19 @@
       (is (= 0 (:total-minted state)))
       (is (= #{} (:minted-epochs state)))))
 
-  (testing "State machine processes :epoch-mint event and credits receivers"
-    (let [state (sm/init-state [] "my-node")
+  (testing "State machine processes signed :epoch-mint event and credits receivers"
+    (let [t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          allocs {"node1" 600 "node2" 400}
+          sig (treasury/sign-epoch-mint t-priv 1 allocs)
+          state (assoc (sm/init-state [] "my-node") :treasury-pubkey t-pub)
           event {:type :epoch-mint
                  :epoch 1
                  :epoch-gate 1000
-                 :allocations {"node1" 600 "node2" 400}}
+                 :allocations allocs
+                 :treasury-pubkey t-pub
+                 :signature sig}
           res (sm/handle-event state event)
           new-state (:state res)]
       (is (= 1000 (:total-minted new-state)))
@@ -414,16 +421,71 @@
       (is (= 600 (:balance (get-in new-state [:ledger "node1"]))))
       (is (= 400 (:balance (get-in new-state [:ledger "node2"]))))))
 
+  (testing "State machine rejects unsigned or invalidly signed :epoch-mint event"
+    (let [t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          allocs {"node1" 600 "node2" 400}
+          state (assoc (sm/init-state [] "my-node") :treasury-pubkey t-pub)
+          ;; Unsigned
+          unsigned-event {:type :epoch-mint
+                          :epoch 1
+                          :epoch-gate 1000
+                          :allocations allocs}
+          res-unsigned (sm/handle-event state unsigned-event)
+          ;; Tampered signature
+          sig (treasury/sign-epoch-mint t-priv 1 allocs)
+          tampered-sig (str "ff" (subs sig 2))
+          tampered-event {:type :epoch-mint
+                          :epoch 1
+                          :epoch-gate 1000
+                          :allocations allocs
+                          :treasury-pubkey t-pub
+                          :signature tampered-sig}
+          res-tampered (sm/handle-event state tampered-event)]
+      (is (= state (:state res-unsigned)))
+      (is (= state (:state res-tampered)))))
+
   (testing "State machine rejects duplicate :epoch-mint event for same epoch"
-    (let [state (assoc (sm/init-state [] "my-node")
+    (let [t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          allocs {"node1" 500}
+          sig (treasury/sign-epoch-mint t-priv 1 allocs)
+          state (assoc (sm/init-state [] "my-node")
+                       :treasury-pubkey t-pub
                        :total-minted 1000
                        :minted-epochs #{1})
           event {:type :epoch-mint
                  :epoch 1
                  :epoch-gate 1000
-                 :allocations {"node1" 500}}
+                 :allocations allocs
+                 :treasury-pubkey t-pub
+                 :signature sig}
           res (sm/handle-event state event)]
       (is (= state (:state res)))))
+
+  (testing "State machine on-deliver ignores gossip mint payloads and never mints"
+    (let [t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          allocs {"attacker-node" 1000000}
+          sig (treasury/sign-epoch-mint t-priv 1 allocs)
+          state (assoc (sm/init-state [] "my-node") :treasury-pubkey t-pub)
+          ;; 1. Payload carrying {:type :epoch-mint ...}
+          p1 (.getBytes (pr-str {:type :epoch-mint :epoch 1 :allocations allocs :treasury-pubkey t-pub :signature sig}) "UTF-8")
+          res1 (sm/handle-event state {:type :on-deliver :payload p1 :message-id "gossip-mint-1"})
+          ;; 2. Payload carrying {:mint {...}}
+          p2 (.getBytes (pr-str {:mint {:epoch 1 :allocations allocs :treasury-pubkey t-pub :signature sig}}) "UTF-8")
+          res2 (sm/handle-event state {:type :on-deliver :payload p2 :message-id "gossip-mint-2"})]
+      (is (= state (:state res1)))
+      (is (= 0 (:total-minted (:state res1))))
+      (is (= #{} (:minted-epochs (:state res1))))
+      (is (nil? (get-in (:state res1) [:ledger "attacker-node"])))
+      (is (= state (:state res2)))
+      (is (= 0 (:total-minted (:state res2))))
+      (is (= #{} (:minted-epochs (:state res2))))
+      (is (nil? (get-in (:state res2) [:ledger "attacker-node"])))))
 
   (testing "Custody drawdown via transfer debits custody balance and never increments :total-minted"
     (let [custody-kp (crypto/generate-keypair)
@@ -453,8 +515,12 @@
                  mint-amt (gen/choose 100 2000)]
                 (let [custody-kp (crypto/generate-keypair)
                       custody-pub (basalt/bytes->hex (:public custody-kp))
+                      t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (:private t-kp)
                       receiver-pub "partner-node"
                       cfg (assoc config/default-config
+                                 :treasury-pubkey t-pub
                                  :genesis-ledger {custody-pub (account/map->AccountState {:balance custody-bal :seq 0 :deps []})})
                       state (sm/init-state [] "my-node" cfg)
                       unsigned-tx {:sender custody-pub
@@ -466,10 +532,14 @@
                       payload (.getBytes (pr-str {:id "tx-drawdown" :transfer tx}) "UTF-8")
                       res-drawdown (sm/handle-event state {:type :on-deliver :payload payload :message-id "tx-drawdown"})
                       state-after-drawdown (:state res-drawdown)
+                      allocs {"mesh-node" mint-amt}
+                      sig (treasury/sign-epoch-mint t-priv 1 allocs)
                       mint-event {:type :epoch-mint
                                   :epoch 1
                                   :epoch-gate (* mint-amt 2)
-                                  :allocations {"mesh-node" mint-amt}}
+                                  :allocations allocs
+                                  :treasury-pubkey t-pub
+                                  :signature sig}
                       res-mint (sm/handle-event state-after-drawdown mint-event)
                       final-state (:state res-mint)]
                   (and (= 0 (:total-minted state-after-drawdown))
@@ -486,7 +556,12 @@
   (testing "handle-tick processes epoch boundary: calculates trailing revenue with zero-padding, mints 20/80 split"
     (let [val-pub "validator-node-1"
           mesh-pub "mesh-routing-node-1"
+          t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
           cfg (assoc config/default-config
+                     :treasury-pubkey t-pub
+                     :treasury-privkey t-priv
                      :treasury-trailing-epochs 168
                      :validators [val-pub]
                      :mesh-nodes {mesh-pub 1.0})
@@ -504,6 +579,25 @@
       (is (contains? (:minted-epochs new-state) 1))
       (is (= 10 (:balance (get-in new-state [:ledger val-pub]))))
       (is (= 40 (:balance (get-in new-state [:ledger mesh-pub]))))))
+
+  (testing "handle-tick does not mint if treasury keys are missing from config"
+    (let [val-pub "validator-node-1"
+          mesh-pub "mesh-routing-node-1"
+          cfg (assoc config/default-config
+                     :treasury-trailing-epochs 168
+                     :validators [val-pub]
+                     :mesh-nodes {mesh-pub 1.0})
+          state (assoc (sm/init-state [] "my-node" cfg)
+                       :epoch 0
+                       :epoch-burns {0 16800}
+                       :epoch-settlement-takes {})
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)]
+      (is (= 1 (:epoch new-state)))
+      (is (= 0 (:total-minted new-state)))
+      (is (= #{} (:minted-epochs new-state)))
+      (is (nil? (get-in new-state [:ledger val-pub])))
+      (is (nil? (get-in new-state [:ledger mesh-pub])))))
 
   (testing "handle-tick executes custody drawdowns from :ledger without increasing :total-minted"
     (let [custody-kp (crypto/generate-keypair)
@@ -541,7 +635,12 @@
                 (let [custody-kp (crypto/generate-keypair)
                       custody-pub (basalt/bytes->hex (:public custody-kp))
                       custody-priv (:private custody-kp)
+                      t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (:private t-kp)
                       cfg (assoc config/default-config
+                                 :treasury-pubkey t-pub
+                                 :treasury-privkey t-priv
                                  :treasury-trailing-epochs 10
                                  :validators ["v-node"]
                                  :mesh-nodes {"m-node" 1.0}

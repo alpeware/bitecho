@@ -2,7 +2,8 @@
   "Demand-gated minting (k = 0.5), 20/80 Streamlet-Mesh split, and Genesis Bootstrap custody."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
-            [bitecho.economy.account :as account]))
+            [bitecho.economy.account :as account]
+            [clojure.string :as string]))
 
 (def default-k-bps
   "Default demand-gated minting factor in basis points (5000 bps = 50.0% = 0.5x)."
@@ -169,29 +170,6 @@
                    deps
                    commands)))))))
 
-(defn- build-mint-transfers
-  "Helper to build and sign account transfers for demand-gated mint allocations."
-  [treasury-pub treasury-priv shares start-seq start-deps]
-  (loop [entries (seq shares)
-         seq-num start-seq
-         deps start-deps
-         transfers []]
-    (if-let [[node amt] (first entries)]
-      (let [next-seq (inc seq-num)
-            node-hex (if (string? node) node (basalt/bytes->hex node))
-            unsigned-tx {:sender treasury-pub
-                         :receiver node-hex
-                         :amount amt
-                         :seq next-seq
-                         :deps deps}
-            payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-tx)) "UTF-8")
-            sig (crypto/sign treasury-priv payload-bytes)
-            transfer (account/map->Transfer (assoc unsigned-tx :signature (vec sig)))
-            safe-tx (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex sig))
-            tx-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-tx) "UTF-8")))]
-        (recur (rest entries) next-seq [tx-hash] (conj transfers transfer)))
-      {:seq seq-num :deps deps :commands transfers})))
-
 (defn burn-unspent-bootstrap-custody
   "Burns any unspent balance in the Bootstrap custody account directly in the ledger
    at or after the bootstrap sunset epoch.
@@ -244,13 +222,6 @@
         all-mint-shares (merge-with + streamlet-shares mesh-shares)
         actual-minted (reduce + 0 (vals all-mint-shares))
         mint-dust (- m-t actual-minted)
-        t-pub (:treasury-pubkey treasury-ctx)
-        t-priv (:treasury-privkey treasury-ctx)
-        start-seq (or (:start-seq treasury-ctx) 0)
-        start-deps (or (:start-deps treasury-ctx) [])
-        mint-res (if (and t-pub t-priv (seq all-mint-shares))
-                   (build-mint-transfers t-pub t-priv all-mint-shares start-seq start-deps)
-                   {:seq start-seq :deps start-deps :commands []})
         c-pk-raw (:custody-pubkey treasury-ctx)
         custody-pub (when c-pk-raw (if (string? c-pk-raw) c-pk-raw (basalt/bytes->hex c-pk-raw)))
         ledger (:ledger treasury-ctx)
@@ -261,27 +232,25 @@
         sunset-epoch (:bootstrap-sunset-epoch treasury-ctx)
         sunset? (and (some? sunset-epoch) (some? epoch) (>= epoch sunset-epoch))
         effective-custody-bal (if sunset? 0 custody-bal)
+        start-seq (or (when (and ledger custody-pub) (get-in ledger [custody-pub :seq]))
+                      (:start-seq treasury-ctx)
+                      0)
+        start-deps (or (when (and ledger custody-pub) (get-in ledger [custody-pub :deps]))
+                       (:start-deps treasury-ctx)
+                       [])
         custody-ctx (assoc treasury-ctx
                            :custody-pubkey custody-pub
                            :custody-balance effective-custody-bal
                            :allocations (if sunset? [] (:custody-allocations treasury-ctx))
-                           :start-seq (if (and ledger custody-pub)
-                                        (get-in ledger [custody-pub :seq] 0)
-                                        (:seq mint-res))
-                           :start-deps (if (and ledger custody-pub)
-                                         (get-in ledger [custody-pub :deps] [])
-                                         (:deps mint-res)))
+                           :start-seq start-seq
+                           :start-deps start-deps)
         custody-res (if (and custody-pub
                              (:custody-privkey custody-ctx)
                              (seq (:allocations custody-ctx)))
                       (process-bootstrap-custody custody-ctx)
                       {:remaining-balance effective-custody-bal
-                       :seq (if (and ledger custody-pub)
-                              (get-in ledger [custody-pub :seq] 0)
-                              (:seq mint-res))
-                       :deps (if (and ledger custody-pub)
-                               (get-in ledger [custody-pub :deps] [])
-                               (:deps mint-res))
+                       :seq start-seq
+                       :deps start-deps
                        :commands []})
         updated-ledger (when ledger
                          (let [l (if sunset? (burn-unspent-bootstrap-custody ledger custody-pub) ledger)]
@@ -297,9 +266,8 @@
      :all-mint-shares all-mint-shares
      :seq (:seq custody-res)
      :deps (:deps custody-res)
-     :mint-commands (:commands mint-res)
      :custody-commands (:commands custody-res)
-     :commands (into (:commands mint-res) (:commands custody-res))
+     :commands (:commands custody-res)
      :remaining-custody-balance (:remaining-balance custody-res)
      :ledger (or updated-ledger ledger)}))
 
@@ -333,64 +301,97 @@
         sig-bytes (crypto/sign priv-bytes payload-bytes)]
     (basalt/bytes->hex sig-bytes)))
 
+(defn- normalize-key-hex
+  "Normalizes a public key representation (string, byte array, or seqable bytes) to a hex string."
+  [k]
+  (cond
+    (string? k) k
+    (bytes? k) (basalt/bytes->hex k)
+    (and (seqable? k) (seq k)) (basalt/bytes->hex (byte-array (map byte k)))
+    :else nil))
+
+(defn- blank-key-or-sig?
+  "Checks if a key or signature is nil or empty."
+  [x]
+  (cond
+    (nil? x) true
+    (string? x) (string/blank? x)
+    (bytes? x) (zero? (alength ^bytes x))
+    (seqable? x) (empty? x)
+    :else false))
+
 (defn apply-epoch-mint
   "Applies an authorized, capped epoch demand-gated mint to state.
+   Requires cryptographic verification against the authoritative treasury public key.
    Rejects in full (leaving :ledger, :total-minted, and :minted-epochs unchanged) if:
-     - epoch is already in :minted-epochs (double-mint rejected);
+     - epoch is missing or already in :minted-epochs (double-mint rejected);
+     - treasury pubkey or signature is missing, empty, mismatched, or invalid;
+     - any allocation amount is not a non-negative integer;
      - total requested mint exceeds epoch-gate (M_t);
-     - total-minted + actual-minted exceeds max-conditional-mint-supply (23.1B);
-     - any allocation amount is negative or signature is invalid when signature verification is required.
+     - total-minted + actual-minted exceeds max-conditional-mint-supply (23.1B).
    Increments :total-minted by the actual distributed sum (excluding rounding dust),
-   credits receivers in :ledger (creating zero-balance AccountState if absent),
-   and records epoch in :minted-epochs."
-  ([state mint-ctx]
-   (let [epoch (:epoch mint-ctx)
-         minted-epochs (or (:minted-epochs state) #{})
-         allocations-raw (or (:allocations mint-ctx) {})
-         allocations (if (map? allocations-raw)
-                       allocations-raw
-                       (into {} (map (fn [item] [(:receiver item) (:amount item)]) allocations-raw)))
-         epoch-gate (:epoch-gate mint-ctx)
-         total-minted (or (:total-minted state) 0)
-         pubkey (:treasury-pubkey mint-ctx)
-         sig (:signature mint-ctx)]
-     (cond
-       ;; 1. Epoch must be present and not already minted
-       (or (nil? epoch) (contains? minted-epochs epoch))
-       state
+   credits receivers in :ledger, and records epoch in :minted-epochs."
+  [state mint-ctx]
+  (let [epoch (:epoch mint-ctx)
+        minted-epochs (or (:minted-epochs state) #{})
+        allocs-raw (or (:allocations mint-ctx) {})
+        allocations (if (map? allocs-raw)
+                      allocs-raw
+                      (into {} (map (fn [item] [(:receiver item) (:amount item)]) allocs-raw)))
+        state-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))
+        ctx-pub (:treasury-pubkey mint-ctx)
+        expected-pub (or state-pub ctx-pub)
+        sig (:signature mint-ctx)]
+    (cond
+      ;; 1. Epoch must be present and not already minted
+      (or (nil? epoch) (contains? minted-epochs epoch))
+      state
 
-       ;; 2. Allocations must be valid integers and non-negative
-       (some (fn [[_ amt]] (or (not (integer? amt)) (neg? amt))) allocations)
-       state
+      ;; 2. Signature and expected pubkey must be non-nil and non-empty
+      (or (blank-key-or-sig? expected-pub) (blank-key-or-sig? sig))
+      state
 
-       ;; 3. Check signature authorization if signature is provided
-       (and pubkey sig
-            (let [pub-bytes (if (string? pubkey) (basalt/hex->bytes pubkey) pubkey)
-                  sig-bytes (if (string? sig) (basalt/hex->bytes sig) (byte-array (map byte sig)))
-                  sorted-allocs (into (sorted-map) allocations)
-                  payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
-              (not (crypto/verify pub-bytes payload-bytes sig-bytes))))
-       state
+      ;; 3. State pubkey and mint-ctx pubkey must match if both are present
+      (and state-pub ctx-pub (not= (normalize-key-hex state-pub) (normalize-key-hex ctx-pub)))
+      state
 
-       :else
-       (let [actual-minted (reduce + 0 (vals allocations))]
-         (cond
-           ;; 4. Check epoch gate M_t
-           (and (some? epoch-gate) (> actual-minted epoch-gate))
-           state
+      ;; 4. Allocations must be non-negative integers
+      (some (fn [[_ amt]] (or (not (integer? amt)) (neg? amt))) allocations)
+      state
 
-           ;; 5. Check hard supply cap (max-conditional-mint-supply)
-           (> (+ total-minted actual-minted) max-conditional-mint-supply)
-           state
+      ;; 5. Cryptographic signature verification against [epoch (sorted-map allocs)]
+      (try
+        (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
+              sig-bytes (cond
+                          (string? sig) (basalt/hex->bytes sig)
+                          (bytes? sig) sig
+                          :else (byte-array (map byte sig)))
+              sorted-allocs (into (sorted-map) allocations)
+              payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
+          (not (crypto/verify pub-bytes payload-bytes sig-bytes)))
+        (catch Exception _
+          true))
+      state
 
-           ;; Valid: apply mint allocations
-           :else
-           (let [new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
-             (-> state
-                 (assoc :ledger new-ledger)
-                 (assoc :total-minted (+ total-minted actual-minted))
-                 (update :minted-epochs (fnil conj #{}) epoch))))))))
-  ([state epoch epoch-gate allocations]
-   (apply-epoch-mint state {:epoch epoch :epoch-gate epoch-gate :allocations allocations})))
+      :else
+      (let [actual-minted (reduce + 0 (vals allocations))
+            epoch-gate (:epoch-gate mint-ctx)
+            total-minted (or (:total-minted state) 0)]
+        (cond
+          ;; 6. Epoch demand gate check
+          (and (some? epoch-gate) (> actual-minted epoch-gate))
+          state
+
+          ;; 7. Hard supply cap check
+          (> (+ total-minted actual-minted) max-conditional-mint-supply)
+          state
+
+          ;; Valid: credit allocations to ledger
+          :else
+          (let [new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
+            (-> state
+                (assoc :ledger new-ledger)
+                (assoc :total-minted (+ total-minted actual-minted))
+                (update :minted-epochs (fnil conj #{}) epoch))))))))
 
 

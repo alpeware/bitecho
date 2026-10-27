@@ -160,12 +160,17 @@
         all-mint-shares (or (:all-mint-shares res) {})
         state-with-custody (if-let [l (:ledger res)]
                              (assoc state :ledger l)
-                             state)]
-    (if (and (seq all-mint-shares) (pos? actual-minted))
-      (treasury/apply-epoch-mint state-with-custody
-                                 {:epoch new-epoch
-                                  :epoch-gate (:epoch-mint res)
-                                  :allocations all-mint-shares})
+                             state)
+        t-priv (or (:treasury-privkey state) (get-in state [:config :treasury-privkey]))
+        t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
+    (if (and (seq all-mint-shares) (pos? actual-minted) t-priv t-pub)
+      (let [sig (treasury/sign-epoch-mint t-priv new-epoch all-mint-shares)]
+        (treasury/apply-epoch-mint state-with-custody
+                                   {:epoch new-epoch
+                                    :epoch-gate (:epoch-mint res)
+                                    :allocations all-mint-shares
+                                    :treasury-pubkey t-pub
+                                    :signature sig}))
       state-with-custody)))
 
 (defn- block->hash-str
@@ -657,9 +662,7 @@
             state))
         (catch Exception _
           state))
-      (if (and (map? payload-edn) (or (:mint payload-edn) (= :epoch-mint (:type payload-edn))))
-        (treasury/apply-epoch-mint state (or (:mint payload-edn) payload-edn))
-        state))))
+      state)))
 
 (defn- check-contagion-delivery
   "Checks if D-hat is reached, transitioning to delivered and calling on-deliver."
