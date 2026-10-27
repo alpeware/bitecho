@@ -5,6 +5,7 @@
             [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
             [bitecho.economy.account :as account]
+            [bitecho.economy.burn :as burn]
             [bitecho.murmur.core :as murmur]
             [bitecho.sieve.core :as sieve]
             [clojure.edn :as edn]
@@ -34,6 +35,7 @@
       :config cfg
       :epoch 0
       :epoch-entropy epoch-entropy
+      :epoch-burns {}
       :basalt-index 0
       :basalt-view (basalt/init-view initial-peers view-size epoch-entropy node-pubkey)
       :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
@@ -201,50 +203,70 @@
                    :delivered-set pruned-delivered-set)
      :commands commands}))
 
+(defn- apply-broadcast-burn
+  "If the event specifies :burn or :signaling-burn, deducts the burn amount
+   from the sender's account in the ledger and updates epoch-burns.
+   Returns {:state updated-state} or nil if deduction failed."
+  [state event current-epoch]
+  (if-let [burn-spec (or (:burn event) (:signaling-burn event))]
+    (let [burn-amt (if (number? burn-spec) burn-spec burn/min-signaling-burn)
+          sender (or (:sender event)
+                     (when-let [pk (:public-key event)]
+                       (if (string? pk) pk (basalt/bytes->hex pk)))
+                     (:node-pubkey state))]
+      (when-let [res (burn/deduct-signaling-burn (:ledger state) sender burn-amt)]
+        {:state (-> state
+                    (assoc :ledger (:ledger res))
+                    (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))}))
+    {:state state}))
+
 (defn- handle-broadcast
-  "Handles an internal request to broadcast a payload."
+  "Handles an internal request to broadcast a payload.
+   Deducts signaling burn if requested; drops broadcast if burn deduction fails."
   [state event]
-  (let [cfg (:config state)
-        murmur-k (:murmur-k cfg)
-        murmur-max-cache-size (:murmur-max-cache-size cfg)
-        payload (:payload event)
-        rng (:rng event)
-        extracted-peers (basalt/extract-peers (:basalt-view state))
-        sieve-message (if (and (:private-key event) (:public-key event))
-                        (sieve/wrap-message payload (:private-key event) (:public-key event))
-                        {:payload payload :sender "local" :signature (byte-array 0)})
-        broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
-        message-id (:message-id broadcast-result)
-        message (assoc sieve-message :message-id message-id)
-        commands (if (seq (:targets broadcast-result))
-                   [{:type :send-gossip
-                     :targets (:targets broadcast-result)
-                     :message message}]
-                   [])
-        _ (when (empty? (:targets broadcast-result)) (println "WARNING: broadcast had no targets! View size:" (count extracted-peers)))
-        ;; We implicitly add our own broadcasts to the known ids and cache
-        new-cache-set (conj (:set (:murmur-cache state)) message-id)
-        new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
-        new-cache-queue-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
-                                  (pop new-cache-queue)
-                                  new-cache-queue)
-        new-cache-set-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
-                                (disj new-cache-set (peek new-cache-queue))
-                                new-cache-set)
-        new-cache {:set new-cache-set-evicted :queue new-cache-queue-evicted}
-        new-known-ids (conj (:contagion-known-ids state) message-id)
-        new-messages (assoc (:messages state) message-id message)
-        current-epoch (or (:epoch state) 0)
-        new-epochs (assoc (or (:message-epochs state) {}) message-id current-epoch)
-        new-epoch-to-messages (update (or (:epoch-to-messages state) {})
-                                      current-epoch (fnil conj #{}) message-id)]
-    {:state (assoc state
-                   :murmur-cache new-cache
-                   :contagion-known-ids new-known-ids
-                   :messages new-messages
-                   :message-epochs new-epochs
-                   :epoch-to-messages new-epoch-to-messages)
-     :commands commands}))
+  (let [current-epoch (or (:epoch state) 0)]
+    (if-let [burn-res (apply-broadcast-burn state event current-epoch)]
+      (let [state (:state burn-res)
+            cfg (:config state)
+            murmur-k (:murmur-k cfg)
+            murmur-max-cache-size (:murmur-max-cache-size cfg)
+            payload (:payload event)
+            rng (:rng event)
+            extracted-peers (basalt/extract-peers (:basalt-view state))
+            sieve-message (if (and (:private-key event) (:public-key event))
+                            (sieve/wrap-message payload (:private-key event) (:public-key event))
+                            {:payload payload :sender "local" :signature (byte-array 0)})
+            broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
+            message-id (:message-id broadcast-result)
+            message (assoc sieve-message :message-id message-id)
+            commands (if (seq (:targets broadcast-result))
+                       [{:type :send-gossip
+                         :targets (:targets broadcast-result)
+                         :message message}]
+                       [])
+            ;; We implicitly add our own broadcasts to the known ids and cache
+            new-cache-set (conj (:set (:murmur-cache state)) message-id)
+            new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
+            new-cache-queue-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                      (pop new-cache-queue)
+                                      new-cache-queue)
+            new-cache-set-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                    (disj new-cache-set (peek new-cache-queue))
+                                    new-cache-set)
+            new-cache {:set new-cache-set-evicted :queue new-cache-queue-evicted}
+            new-known-ids (conj (:contagion-known-ids state) message-id)
+            new-messages (assoc (:messages state) message-id message)
+            new-epochs (assoc (or (:message-epochs state) {}) message-id current-epoch)
+            new-epoch-to-messages (update (or (:epoch-to-messages state) {})
+                                          current-epoch (fnil conj #{}) message-id)]
+        {:state (assoc state
+                       :murmur-cache new-cache
+                       :contagion-known-ids new-known-ids
+                       :messages new-messages
+                       :message-epochs new-epochs
+                       :epoch-to-messages new-epoch-to-messages)
+         :commands commands})
+      {:state state :commands []})))
 
 (declare handle-event)
 
@@ -534,6 +556,22 @@
      :commands [{:type :app-event :event-name :on-deliver
                  :payload (:payload event) :message-id message-id}]}))
 
+(defn- handle-signaling-burn
+  "Handles a direct signaling burn event, deducting burn from the sender's account
+   and incrementing the epoch's burn accumulator."
+  [state event]
+  (let [sender (:sender event)
+        burn-amt (or (:burn event) (:burn-amount event) burn/min-signaling-burn)
+        ledger (or (:ledger state) {})
+        res (burn/deduct-signaling-burn ledger sender burn-amt)]
+    (if res
+      (let [current-epoch (or (:epoch state) 0)]
+        {:state (-> state
+                    (assoc :ledger (:ledger res))
+                    (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
+         :commands []})
+      {:state state :commands []})))
+
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
@@ -542,6 +580,7 @@
     :contagion-broadcast (handle-contagion-broadcast state event)
     :tick (handle-tick state event)
     :broadcast (handle-broadcast state event)
+    :signaling-burn (handle-signaling-burn state event)
     :receive-push-view (handle-receive-push-view state event)
     :receive-summary (handle-receive-summary state event)
     :receive-subscribe (handle-receive-subscribe state event)

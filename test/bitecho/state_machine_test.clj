@@ -4,6 +4,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.economy.burn :as burn]
             [bitecho.state-machine :as sm]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -33,6 +34,7 @@
     (is (not (contains? state :echo-samples)))
     (is (not (contains? state :ready-samples)))
     (is (not (contains? state :delivery-samples)))
+    (is (= {} (:epoch-burns state)) "State should initialize :epoch-burns to empty map")
     (is (map? (:config state)) "State should contain the protocol config map")))
 
 (deftest unknown-sender-rejected-test
@@ -171,3 +173,113 @@
                       seeds2 (mapv :seed view2)]
                   ;; The slot seeds must be 100% identical regardless of different RNG seeds!
                   (= seeds1 seeds2))))
+
+(deftest signaling-burn-state-machine-test
+  (testing "Direct :signaling-burn event decrements sender ledger balance and increments [:epoch-burns current-epoch]"
+    (let [sender "sender-pub-1"
+          cfg (assoc config/default-config :genesis-ledger {sender (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
+          state (sm/init-state [] "node-pub-1" cfg)
+          res (sm/handle-event state {:type :signaling-burn :sender sender :burn 250})
+          new-state (:state res)]
+      (is (= 750 (:balance (get-in new-state [:ledger sender]))))
+      (is (= 250 (get-in new-state [:epoch-burns 0])))
+      (is (empty? (:commands res)))
+      (is (= 1000 (:balance (get-in new-state [:ledger "node-pub-1"])))
+          "No receiver account was credited with the burned amount")))
+
+  (testing "Direct :signaling-burn with default burn amount when not specified"
+    (let [sender "sender-pub-2"
+          cfg (assoc config/default-config :genesis-ledger {sender (account/map->AccountState {:balance 500 :seq 0 :deps []})})
+          state (sm/init-state [] "node-pub-1" cfg)
+          res (sm/handle-event state {:type :signaling-burn :sender sender})
+          new-state (:state res)]
+      (is (= 400 (:balance (get-in new-state [:ledger sender]))))
+      (is (= burn/min-signaling-burn (get-in new-state [:epoch-burns 0])))))
+
+  (testing "Direct :signaling-burn rejects when burn is below min-signaling-burn or sender has insufficient funds"
+    (let [sender "sender-pub-3"
+          cfg (assoc config/default-config :genesis-ledger {sender (account/map->AccountState {:balance 80 :seq 0 :deps []})})
+          state (sm/init-state [] "node-pub-1" cfg)]
+      (testing "Below minimum burn"
+        (let [res (sm/handle-event state {:type :signaling-burn :sender sender :burn (dec burn/min-signaling-burn)})]
+          (is (= state (:state res)))))
+      (testing "Insufficient funds"
+        (let [res (sm/handle-event state {:type :signaling-burn :sender sender :burn 100})]
+          (is (= state (:state res)))))
+      (testing "Unknown sender"
+        (let [res (sm/handle-event state {:type :signaling-burn :sender "unknown-pub" :burn 100})]
+          (is (= state (:state res))))))))
+
+(deftest broadcast-signaling-burn-test
+  (testing "Broadcast event with custom :burn deducts signaling burn from sender and increments [:epoch-burns epoch]"
+    (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
+          kp (crypto/generate-keypair)
+          sender-pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
+          state (sm/init-state [peer] "node-pub-1" cfg)
+          res (sm/handle-event state {:type :broadcast
+                                      :sender sender-pub
+                                      :payload (.getBytes "hello" "UTF-8")
+                                      :rng (java.util.Random. 42)
+                                      :burn 150})
+          new-state (:state res)]
+      (is (= 850 (:balance (get-in new-state [:ledger sender-pub]))))
+      (is (= 150 (get-in new-state [:epoch-burns 0])))
+      (is (seq (:commands res)))))
+
+  (testing "Broadcast event with :signaling-burn true deducts min-signaling-burn"
+    (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
+          kp (crypto/generate-keypair)
+          sender-pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
+          state (sm/init-state [peer] "node-pub-1" cfg)
+          res (sm/handle-event state {:type :broadcast
+                                      :sender sender-pub
+                                      :payload (.getBytes "hello" "UTF-8")
+                                      :rng (java.util.Random. 42)
+                                      :signaling-burn true})
+          new-state (:state res)]
+      (is (= 900 (:balance (get-in new-state [:ledger sender-pub]))))
+      (is (= 100 (get-in new-state [:epoch-burns 0])))
+      (is (seq (:commands res)))))
+
+  (testing "Broadcast event rejects when sender balance is insufficient for requested burn"
+    (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
+          sender-pub "poor-sender"
+          cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance 50 :seq 0 :deps []})})
+          state (sm/init-state [peer] "node-pub-1" cfg)
+          res (sm/handle-event state {:type :broadcast
+                                      :sender sender-pub
+                                      :payload (.getBytes "hello" "UTF-8")
+                                      :rng (java.util.Random. 42)
+                                      :burn 100})]
+      (is (empty? (:commands res)) "Broadcast should not emit send commands when burn cannot be deducted")
+      (is (= 50 (:balance (get-in (:state res) [:ledger sender-pub]))))
+      (is (empty? (:epoch-burns (:state res))))))
+
+  (testing "Broadcast event without burn parameters leaves ledger and epoch-burns untouched"
+    (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
+          state (sm/init-state [peer] "node-pub-1")
+          res (sm/handle-event state {:type :broadcast
+                                      :payload (.getBytes "hello" "UTF-8")
+                                      :rng (java.util.Random. 42)})]
+      (is (= (:ledger state) (:ledger (:state res))))
+      (is (= (:epoch-burns state) (:epoch-burns (:state res)))))))
+
+(defspec ^{:doc "Property: Total initial supply equals final ledger supply plus total accumulated epoch burns."}
+  prop-state-machine-burn-accounting 50
+  (prop/for-all [initial-balance (gen/choose 500 5000)
+                 burn-amount (gen/choose 100 500)]
+                (let [sender "burning-node"
+                      cfg (assoc config/default-config :genesis-ledger {sender (account/map->AccountState {:balance initial-balance :seq 0 :deps []})})
+                      state (sm/init-state [] "local-node" cfg)
+                      initial-ledger (:ledger state)
+                      initial-total-supply (reduce + (map :balance (vals initial-ledger)))
+                      res (sm/handle-event state {:type :signaling-burn :sender sender :burn burn-amount})
+                      final-state (:state res)
+                      final-ledger (:ledger final-state)
+                      final-ledger-supply (reduce + (map :balance (vals final-ledger)))
+                      total-burned (reduce + (vals (:epoch-burns final-state)))]
+                  (and (= initial-total-supply (+ final-ledger-supply total-burned))
+                       (= (- initial-balance burn-amount) (:balance (get final-ledger sender)))
+                       (= burn-amount (get-in final-state [:epoch-burns 0]))))))

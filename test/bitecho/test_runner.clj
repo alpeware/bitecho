@@ -6,6 +6,7 @@
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]
             [bitecho.economy.bundle-test]
+            [bitecho.economy.burn-test]
             [bitecho.economy.receipt-test]
             [bitecho.murmur.core-test]
             [bitecho.shell.agent-test]
