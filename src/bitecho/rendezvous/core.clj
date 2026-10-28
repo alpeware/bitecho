@@ -142,7 +142,11 @@
       (contains? settled-tuples tuple)
       {:valid? false :error :replayed-tuple}
 
-      (and (some? settlement-epoch) (not= epoch settlement-epoch))
+      (if (some? (:min-settlement-epoch settlement-ctx))
+        (or (nil? epoch)
+            (< epoch (:min-settlement-epoch settlement-ctx))
+            (and (some? settlement-epoch) (> epoch settlement-epoch)))
+        (and (some? settlement-epoch) (not= epoch settlement-epoch)))
       {:valid? false :error :expired-epoch}
 
       (or (nil? seq-num) (<= seq-num 0))

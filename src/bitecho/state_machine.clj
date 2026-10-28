@@ -120,16 +120,19 @@
 
 (defn- settle-single-voucher
   "Settles a single compacted DeliveryAck voucher against state, updating ledger and settled tuples.
-   Fails closed: requires callee balance >= debit; rejects settlement and records failure in :failed-vouchers."
-  [acc ack closing-epoch]
+   Fails closed: requires callee balance >= debit; records failure in :failed-vouchers and queues valid
+   underfunded vouchers in :retry-vouchers for retry in subsequent epochs."
+  [acc ack closing-epoch min-epoch]
   (let [callee (:callee ack)
         home-node (:home-node ack)
-        tuple [callee home-node closing-epoch]
-        reg-set (get-in acc [:home-sets [callee closing-epoch]])
+        ack-epoch (:epoch ack)
+        tuple [callee home-node ack-epoch]
+        reg-set (get-in acc [:home-sets [callee ack-epoch]])
         reg-price (:price reg-set)
         v-res (rendezvous/verify-ack-for-settlement
                ack
                {:settlement-epoch closing-epoch
+                :min-settlement-epoch min-epoch
                 :registered-price reg-price
                 :settled-tuples (:settled-voucher-tuples acc)})]
     (if (:valid? v-res)
@@ -145,33 +148,42 @@
             (-> acc
                 (assoc :ledger new-ledger)
                 (update :settled-voucher-tuples conj tuple)))
-          (update acc :failed-vouchers (fnil conj [])
-                  {:voucher ack
-                   :epoch closing-epoch
-                   :debit debit
-                   :callee-balance callee-bal
-                   :reason :insufficient-callee-balance})))
+          (-> acc
+              (update :failed-vouchers (fnil conj [])
+                      {:voucher ack
+                       :epoch ack-epoch
+                       :debit debit
+                       :callee-balance callee-bal
+                       :reason :insufficient-callee-balance})
+              (update :retry-vouchers (fnil conj []) ack))))
       (update acc :failed-vouchers (fnil conj [])
               {:voucher ack
-               :epoch closing-epoch
+               :epoch ack-epoch
                :reason (or (:reason v-res) :invalid-voucher)}))))
 
 (defn- apply-epoch-voucher-settlement
-  "Compacts and settles pending DeliveryAck vouchers for the closing epoch."
+  "Compacts and settles pending DeliveryAck vouchers across the [min-epoch, closing-epoch] window,
+   retrying previously underfunded vouchers and evicting vouchers older than min-epoch."
   [state closing-epoch]
   (let [pending (or (:pending-vouchers state) [])
-        compacted (bundle/compact-vouchers pending closing-epoch)
+        retention (or (get-in state [:config :frozen-log-retention-epochs]) 168)
+        min-epoch (max 0 (- closing-epoch retention))
+        compacted (bundle/compact-vouchers pending closing-epoch min-epoch)
         settled-tuples (or (:settled-voucher-tuples state) #{})
         ledger (or (:ledger state) {})
         init-acc (assoc state
                         :settled-voucher-tuples settled-tuples
                         :ledger ledger
-                        :failed-vouchers [])
-        final-acc (reduce (fn [acc ack] (settle-single-voucher acc ack closing-epoch))
+                        :failed-vouchers []
+                        :retry-vouchers [])
+        final-acc (reduce (fn [acc ack] (settle-single-voucher acc ack closing-epoch min-epoch))
                           init-acc
                           compacted)
-        remaining-pending (filterv #(not= closing-epoch (:epoch %)) pending)]
-    (assoc final-acc :pending-vouchers remaining-pending)))
+        future-pending (filterv #(and (integer? (:epoch %)) (> (:epoch %) closing-epoch)) pending)
+        retained-pending (into (or (:retry-vouchers final-acc) []) future-pending)]
+    (-> final-acc
+        (assoc :pending-vouchers retained-pending)
+        (dissoc :retry-vouchers))))
 
 (defn- apply-epoch-treasury-boundary
   "Executes treasury epoch boundary calculations, applying demand-gated mint

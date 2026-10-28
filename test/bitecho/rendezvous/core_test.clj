@@ -184,6 +184,24 @@
         (is (false? (:valid? res)))
         (is (= :expired-epoch (:error res)))))
 
+    (testing "Accepts voucher within bounded retry window [min-settlement-epoch, settlement-epoch]"
+      (let [window-ctx (assoc settlement-ctx :min-settlement-epoch 3 :settlement-epoch 7)
+            res (rdv/verify-ack-for-settlement valid-ack window-ctx)]
+        (is (true? (:valid? res)))
+        (is (= cum-debit (:debit res)))))
+
+    (testing "Rejects voucher older than min-settlement-epoch"
+      (let [expired-window-ctx (assoc settlement-ctx :min-settlement-epoch 6 :settlement-epoch 8)
+            res (rdv/verify-ack-for-settlement valid-ack expired-window-ctx)]
+        (is (false? (:valid? res)))
+        (is (= :expired-epoch (:error res)))))
+
+    (testing "Rejects voucher newer than settlement-epoch in bounded window"
+      (let [future-window-ctx (assoc settlement-ctx :min-settlement-epoch 2 :settlement-epoch 4)
+            res (rdv/verify-ack-for-settlement valid-ack future-window-ctx)]
+        (is (false? (:valid? res)))
+        (is (= :expired-epoch (:error res)))))
+
     (testing "Rejects invalid sequence number (seq <= 0)"
       (let [zero-seq-ack (assoc valid-ack :seq 0)
             res (rdv/verify-ack-for-settlement zero-seq-ack settlement-ctx)]

@@ -2001,3 +2001,158 @@
                   (and (= (:unclaimed-mint final-s)
                           (reduce + 0 (vals (:epoch-unclaimed-mint final-s))))
                        (every? #(integer? %) (vals (:epoch-unclaimed-mint final-s)))))))
+
+(deftest test-voucher-settlement-unpaid-retry-mechanism
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        callee-priv (:private callee-kp)
+        home-node "home-node"
+        candidates [{:node-id home-node :price 20}]
+        price 20
+        ;; Callee funded with 100 initially, then drained to 10 mid-epoch
+        ledger {callee-pub (account/map->AccountState {:balance 100 :seq 0 :deps []})
+                home-node (account/map->AccountState {:balance 50 :seq 0 :deps []})}
+        init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                   (assoc :epoch 0)
+                   (assoc-in [:home-sets [callee-pub 0]]
+                             {:status :ok :home-nodes candidates :price price :degraded? false}))
+        ev {:type :receive-offer-header
+            :caller "caller"
+            :callee callee-pub
+            :callee-privkey callee-priv
+            :home-node home-node
+            :offer-hash "hash-retry-1"
+            :seq 1}
+        s1 (:state (sm/handle-event init-s ev))
+        underfunded-s1 (assoc-in s1 [:ledger callee-pub :balance] 10)]
+    (is (= 1 (count (:pending-vouchers s1))))
+
+    (testing "Tick 0 -> 1 fails closed, records failed voucher, and retains unpaid voucher in :pending-vouchers"
+      (let [t1-res (sm/handle-event underfunded-s1 {:type :tick :rng (java.util.Random. 42)})
+            s-ep1 (:state t1-res)
+            ledger-ep1 (:ledger s-ep1)]
+        (is (= 1 (:epoch s-ep1)))
+        (is (= 10 (:balance (get ledger-ep1 callee-pub))))
+        (is (= 50 (:balance (get ledger-ep1 home-node))))
+        (is (not (contains? (:settled-voucher-tuples s-ep1) [callee-pub home-node 0])))
+        (is (= 1 (count (:failed-vouchers s-ep1))))
+        (let [failed (first (:failed-vouchers s-ep1))]
+          (is (= :insufficient-callee-balance (:reason failed)))
+          (is (= 0 (:epoch failed)))
+          (is (= 20 (:debit failed))))
+        (is (= 1 (count (:pending-vouchers s-ep1))))
+        (is (= 0 (:epoch (first (:pending-vouchers s-ep1)))))
+
+        (testing "Tick 1 -> 2 retries and settles epoch 0 voucher when callee is topped up in epoch 1"
+          (let [topped-s (assoc-in s-ep1 [:ledger callee-pub :balance] 100)
+                t2-res (sm/handle-event topped-s {:type :tick :rng (java.util.Random. 43)})
+                s-ep2 (:state t2-res)
+                ledger-ep2 (:ledger s-ep2)]
+            (is (= 2 (:epoch s-ep2)))
+            (is (= 80 (:balance (get ledger-ep2 callee-pub))))
+            (is (= 70 (:balance (get ledger-ep2 home-node))))
+            (is (contains? (:settled-voucher-tuples s-ep2) [callee-pub home-node 0]))
+            (is (empty? (:pending-vouchers s-ep2)))
+            (is (empty? (:failed-vouchers s-ep2)))))))))
+
+(deftest test-voucher-settlement-corrupted-voucher-not-retried
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        home-node "home-node"
+        ledger {callee-pub (account/map->AccountState {:balance 100 :seq 0 :deps []})
+                home-node (account/map->AccountState {:balance 50 :seq 0 :deps []})}
+        init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                   (assoc :epoch 0)
+                   (assoc-in [:home-sets [callee-pub 0]]
+                             {:status :ok :home-nodes [{:node-id home-node :price 20}] :price 20 :degraded? false}))
+        corrupted-ack {:callee callee-pub
+                       :home-node home-node
+                       :epoch 0
+                       :seq 1
+                       :cumulative-debit 20
+                       :offer-hash "corrupted-hash"
+                       :signature (basalt/bytes->hex (byte-array 64))}
+        s-with-corrupted (assoc init-s :pending-vouchers [corrupted-ack])
+        t1-res (sm/handle-event s-with-corrupted {:type :tick :rng (java.util.Random. 42)})
+        s-ep1 (:state t1-res)]
+    (testing "Corrupted voucher records failure in :failed-vouchers and is NOT retained in :pending-vouchers"
+      (is (= 1 (count (:failed-vouchers s-ep1))))
+      (is (= 0 (:epoch (first (:failed-vouchers s-ep1)))))
+      (is (empty? (:pending-vouchers s-ep1))))))
+
+(deftest test-voucher-settlement-expired-voucher-evicted
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        callee-priv (:private callee-kp)
+        home-node "home-node"
+        candidates [{:node-id home-node :price 20}]
+        cfg (assoc config/default-config :frozen-log-retention-epochs 2)
+        ledger {callee-pub (account/map->AccountState {:balance 100 :seq 0 :deps []})
+                home-node (account/map->AccountState {:balance 50 :seq 0 :deps []})}
+        init-s (-> (sm/init-state [] "my-node" (assoc cfg :genesis-ledger ledger))
+                   (assoc :epoch 0)
+                   (assoc-in [:home-sets [callee-pub 0]]
+                             {:status :ok :home-nodes candidates :price 20 :degraded? false}))
+        ev {:type :receive-offer-header
+            :caller "caller"
+            :callee callee-pub
+            :callee-privkey callee-priv
+            :home-node home-node
+            :offer-hash "hash-exp-1"
+            :seq 1}
+        s1 (:state (sm/handle-event init-s ev))
+        underfunded-s1 (assoc-in s1 [:ledger callee-pub :balance] 10)
+        ;; Tick 0 -> 1: closing-epoch 0, min-epoch 0. Retained.
+        s-ep1 (:state (sm/handle-event underfunded-s1 {:type :tick :rng (java.util.Random. 1)}))
+        ;; Tick 1 -> 2: closing-epoch 1, min-epoch 0. Retained.
+        s-ep2 (:state (sm/handle-event s-ep1 {:type :tick :rng (java.util.Random. 2)}))
+        ;; Tick 2 -> 3: closing-epoch 2, min-epoch 0. Retained.
+        s-ep3 (:state (sm/handle-event s-ep2 {:type :tick :rng (java.util.Random. 3)}))
+        ;; Tick 3 -> 4: closing-epoch 3, min-epoch 1. Epoch 0 is now older than min-epoch 1: evicted!
+        s-ep4 (:state (sm/handle-event s-ep3 {:type :tick :rng (java.util.Random. 4)}))]
+    (testing "Underfunded voucher retained within retention window"
+      (is (= 1 (count (:pending-vouchers s-ep1))))
+      (is (= 1 (count (:pending-vouchers s-ep2))))
+      (is (= 1 (count (:pending-vouchers s-ep3)))))
+    (testing "Underfunded voucher evicted once older than retention epochs"
+      (is (empty? (:pending-vouchers s-ep4))))))
+
+(defspec ^{:doc "Property: Valid underfunded voucher is retained across ticks and settled upon funding"}
+  prop-unpaid-voucher-retry-settlement 50
+  (prop/for-all [price (gen/choose 1 50)
+                 seq-num (gen/choose 1 5)]
+                (let [cum-debit (* seq-num price)
+                      callee-kp (crypto/generate-keypair)
+                      callee-pub (basalt/bytes->hex (:public callee-kp))
+                      callee-priv (:private callee-kp)
+                      home-node "home-node"
+                      candidates [{:node-id home-node :price price}]
+                      underfunded-bal (max 0 (- cum-debit 1))
+                      funded-ledger {callee-pub (account/map->AccountState {:balance (+ cum-debit 1000) :seq 0 :deps []})
+                                     home-node (account/map->AccountState {:balance 50 :seq 0 :deps []})}
+                      init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger funded-ledger))
+                                 (assoc :epoch 0)
+                                 (assoc-in [:home-sets [callee-pub 0]]
+                                           {:status :ok :home-nodes candidates :price price :degraded? false}))
+                      ev {:type :receive-offer-header
+                          :caller "caller"
+                          :callee callee-pub
+                          :callee-privkey callee-priv
+                          :home-node home-node}
+                      s1 (reduce (fn [st s]
+                                   (:state (sm/handle-event st (assoc ev :seq s :offer-hash (str "hash-retry-" s)))))
+                                 init-s
+                                 (range 1 (inc seq-num)))
+                      underfunded-s (assoc-in s1 [:ledger callee-pub :balance] underfunded-bal)
+                      s-ep1 (:state (sm/handle-event underfunded-s {:type :tick :rng (java.util.Random. 17)}))
+                      topped-s (assoc-in s-ep1 [:ledger callee-pub :balance] (+ cum-debit 200))
+                      s-ep2 (:state (sm/handle-event topped-s {:type :tick :rng (java.util.Random. 18)}))
+                      ledger-ep2 (:ledger s-ep2)]
+                  (and (= 1 (count (:pending-vouchers s-ep1)))
+                       (= underfunded-bal (:balance (get-in s-ep1 [:ledger callee-pub])))
+                       (not (contains? (:settled-voucher-tuples s-ep1) [callee-pub home-node 0]))
+                       (= 200 (:balance (get ledger-ep2 callee-pub)))
+                       (= (+ 50 cum-debit) (:balance (get ledger-ep2 home-node)))
+                       (contains? (:settled-voucher-tuples s-ep2) [callee-pub home-node 0])
+                       (empty? (:pending-vouchers s-ep2))
+                       (empty? (:failed-vouchers s-ep2))))))
