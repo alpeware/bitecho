@@ -159,7 +159,7 @@
       (update acc :failed-vouchers (fnil conj [])
               {:voucher ack
                :epoch ack-epoch
-               :reason (or (:reason v-res) :invalid-voucher)}))))
+               :reason (or (:reason v-res) (:error v-res) :invalid-voucher)}))))
 
 (defn- apply-epoch-voucher-settlement
   "Compacts and settles pending DeliveryAck vouchers across the [min-epoch, closing-epoch] window,
@@ -168,7 +168,7 @@
   (let [pending (or (:pending-vouchers state) [])
         retention (or (get-in state [:config :frozen-log-retention-epochs]) 168)
         min-epoch (max 0 (- closing-epoch retention))
-        compacted (bundle/compact-vouchers pending closing-epoch min-epoch)
+        compacted (bundle/compact-vouchers pending closing-epoch 0)
         settled-tuples (or (:settled-voucher-tuples state) #{})
         ledger (or (:ledger state) {})
         init-acc (assoc state
@@ -308,6 +308,30 @@
      :delivery-sample updated-delivery-sample
      :subscribe-commands subscribe-commands}))
 
+(defn- prune-rendezvous-retention-state
+  "Prunes :home-sets and :voucher-seqs entries strictly older than rdv-cutoff,
+   preserving entries within the active voucher retry window."
+  [state rdv-cutoff]
+  (let [hs (or (:home-sets state) {})
+        vs (or (:voucher-seqs state) {})
+        pruned-hs (reduce-kv (fn [m k v]
+                               (let [ep (second k)]
+                                 (if (and (integer? ep) (< ep rdv-cutoff))
+                                   m
+                                   (assoc m k v))))
+                             {}
+                             hs)
+        pruned-vs (reduce-kv (fn [m k v]
+                               (let [ep (nth k 2 nil)]
+                                 (if (and (integer? ep) (< ep rdv-cutoff))
+                                   m
+                                   (assoc m k v))))
+                             {}
+                             vs)]
+    (assoc state
+           :home-sets pruned-hs
+           :voucher-seqs pruned-vs)))
+
 (defn- prune-expired-tick-state
   "Prunes state message and role entries for epochs older than the TTL cutoff,
    and bounds frozen epoch message and role snapshots to frozen-log-retention-epochs."
@@ -341,24 +365,26 @@
         pruned-delivered-set (set/difference (:delivered-set state) expired-ids)
         expired-frozen-epochs (filterv #(< % frozen-cutoff) (keys (or (:frozen-epoch-messages state) {})))
         pruned-frozen-messages (reduce dissoc (or (:frozen-epoch-messages state) {}) expired-frozen-epochs)
-        pruned-frozen-roles (reduce dissoc (or (:frozen-epoch-message-roles state) {}) expired-frozen-epochs)]
-    (assoc state
-           :epoch-to-messages pruned-epoch-to-messages
-           :epoch-to-message-roles pruned-epoch-to-roles
-           :message-epochs pruned-epochs
-           :messages pruned-messages
-           :contagion-known-ids pruned-known-ids
-           :murmur-cache pruned-murmur-cache
-           :received-echoes pruned-received-echoes
-           :received-readies pruned-received-readies
-           :echo-vote-counts pruned-echo-vote-counts
-           :ready-vote-counts pruned-ready-vote-counts
-           :delivery-vote-counts pruned-delivery-vote-counts
-           :sieve-delivered-set pruned-sieve-delivered-set
-           :local-ready-set pruned-local-ready-set
-           :delivered-set pruned-delivered-set
-           :frozen-epoch-messages pruned-frozen-messages
-           :frozen-epoch-message-roles pruned-frozen-roles)))
+        pruned-frozen-roles (reduce dissoc (or (:frozen-epoch-message-roles state) {}) expired-frozen-epochs)
+        rdv-cutoff (- (dec new-epoch) frozen-retention)]
+    (-> (assoc state
+               :epoch-to-messages pruned-epoch-to-messages
+               :epoch-to-message-roles pruned-epoch-to-roles
+               :message-epochs pruned-epochs
+               :messages pruned-messages
+               :contagion-known-ids pruned-known-ids
+               :murmur-cache pruned-murmur-cache
+               :received-echoes pruned-received-echoes
+               :received-readies pruned-received-readies
+               :echo-vote-counts pruned-echo-vote-counts
+               :ready-vote-counts pruned-ready-vote-counts
+               :delivery-vote-counts pruned-delivery-vote-counts
+               :sieve-delivered-set pruned-sieve-delivered-set
+               :local-ready-set pruned-local-ready-set
+               :delivered-set pruned-delivered-set
+               :frozen-epoch-messages pruned-frozen-messages
+               :frozen-epoch-message-roles pruned-frozen-roles)
+        (prune-rendezvous-retention-state rdv-cutoff))))
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."

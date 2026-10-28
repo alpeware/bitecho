@@ -2078,6 +2078,7 @@
     (testing "Corrupted voucher records failure in :failed-vouchers and is NOT retained in :pending-vouchers"
       (is (= 1 (count (:failed-vouchers s-ep1))))
       (is (= 0 (:epoch (first (:failed-vouchers s-ep1)))))
+      (is (= :invalid-signature (:reason (first (:failed-vouchers s-ep1)))))
       (is (empty? (:pending-vouchers s-ep1))))))
 
 (deftest test-voucher-settlement-expired-voucher-evicted
@@ -2109,13 +2110,73 @@
         ;; Tick 2 -> 3: closing-epoch 2, min-epoch 0. Retained.
         s-ep3 (:state (sm/handle-event s-ep2 {:type :tick :rng (java.util.Random. 3)}))
         ;; Tick 3 -> 4: closing-epoch 3, min-epoch 1. Epoch 0 is now older than min-epoch 1: evicted!
-        s-ep4 (:state (sm/handle-event s-ep3 {:type :tick :rng (java.util.Random. 4)}))]
+        s-ep4 (:state (sm/handle-event s-ep3 {:type :tick :rng (java.util.Random. 4)}))
+        ;; Tick 4 -> 5: closing-epoch 4, min-epoch 2. Evicted voucher was already removed.
+        s-ep5 (:state (sm/handle-event s-ep4 {:type :tick :rng (java.util.Random. 5)}))]
     (testing "Underfunded voucher retained within retention window"
       (is (= 1 (count (:pending-vouchers s-ep1))))
       (is (= 1 (count (:pending-vouchers s-ep2))))
       (is (= 1 (count (:pending-vouchers s-ep3)))))
-    (testing "Underfunded voucher evicted once older than retention epochs"
-      (is (empty? (:pending-vouchers s-ep4))))))
+    (testing "Underfunded voucher evicted once older than retention epochs and recorded in :failed-vouchers"
+      (is (empty? (:pending-vouchers s-ep4)))
+      (is (= 1 (count (:failed-vouchers s-ep4))))
+      (is (= 0 (:epoch (first (:failed-vouchers s-ep4)))))
+      (is (= :expired-epoch (:reason (first (:failed-vouchers s-ep4))))))
+    (testing "Evicted voucher is not re-processed on subsequent ticks"
+      (is (empty? (:pending-vouchers s-ep5)))
+      (is (empty? (:failed-vouchers s-ep5))))))
+
+(deftest test-bounded-rendezvous-state-retention
+  (let [cfg (assoc config/default-config :frozen-log-retention-epochs 2)
+        init-s (assoc (sm/init-state [] "my-node" cfg)
+                      :epoch 3
+                      :home-sets {["callee" 0] {:price 10}
+                                  ["callee" 1] {:price 10}
+                                  ["callee" 2] {:price 10}
+                                  ["callee" 3] {:price 10}}
+                      :voucher-seqs {["callee" "home" 0] 1
+                                     ["callee" "home" 1] 2
+                                     ["callee" "home" 2] 3
+                                     ["callee" "home" 3] 4})
+        ;; On tick from epoch 3 -> 4: closing-epoch = 3, retention = 2, rdv-cutoff = (- 3 2) = 1.
+        ;; Epoch 0 is < 1, so it should be pruned. Epochs 1, 2, 3 should remain.
+        res (sm/handle-event init-s {:type :tick :rng (java.util.Random. 42)})
+        s (:state res)]
+    (testing "Prunes :home-sets and :voucher-seqs strictly older than rdv-cutoff (- closing-epoch retention)"
+      (is (nil? (get-in s [:home-sets ["callee" 0]])))
+      (is (some? (get-in s [:home-sets ["callee" 1]])))
+      (is (some? (get-in s [:home-sets ["callee" 2]])))
+      (is (some? (get-in s [:home-sets ["callee" 3]])))
+      (is (nil? (get-in s [:voucher-seqs ["callee" "home" 0]])))
+      (is (= 2 (get-in s [:voucher-seqs ["callee" "home" 1]])))
+      (is (= 3 (get-in s [:voucher-seqs ["callee" "home" 2]])))
+      (is (= 4 (get-in s [:voucher-seqs ["callee" "home" 3]]))))))
+
+(defspec ^{:doc "Property: :home-sets and :voucher-seqs are strictly bounded by :frozen-log-retention-epochs"}
+  prop-bounded-rendezvous-state-retention 50
+  (prop/for-all [retention (gen/choose 2 5)
+                 ticks (gen/choose 5 12)]
+                (let [cfg (assoc config/default-config
+                                 :frozen-log-retention-epochs retention)
+                      init-s (sm/init-state [] "my-node" cfg)
+                      final-s (loop [s (assoc init-s :epoch 0) step 0]
+                                (if (>= step ticks)
+                                  s
+                                  (let [curr-ep (:epoch s)
+                                        s-with-rdv (-> s
+                                                       (assoc-in [:home-sets [(str "c-" curr-ep) curr-ep]] {:price 10})
+                                                       (assoc-in [:voucher-seqs [(str "c-" curr-ep) "home" curr-ep]] 1))]
+                                    (recur (:state (sm/handle-event s-with-rdv {:type :tick :rng (java.util.Random. step)}))
+                                           (inc step)))))
+                      final-ep (:epoch final-s)
+                      closing-ep (dec final-ep)
+                      cutoff (- closing-ep retention)
+                      hs-eps (map second (keys (:home-sets final-s)))
+                      vs-eps (map #(nth % 2) (keys (:voucher-seqs final-s)))]
+                  (and (every? #(>= % cutoff) hs-eps)
+                       (every? #(>= % cutoff) vs-eps)
+                       (<= (count (:home-sets final-s)) (+ retention 2))
+                       (<= (count (:voucher-seqs final-s)) (+ retention 2))))))
 
 (defspec ^{:doc "Property: Valid underfunded voucher is retained across ticks and settled upon funding"}
   prop-unpaid-voucher-retry-settlement 50
