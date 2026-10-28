@@ -165,13 +165,14 @@
         honest-roles [[m-id :echo]]
         valid-half (attestation/create-transcript 0 pub-a pub-b honest-roles (:privkey (:caller actors)))
         fabricated-half (attestation/create-transcript 0 pub-a pub-b [["invented-fake-id" :seen]] (:privkey (:caller actors)))
-        state-with-frozen (update-in state [:frozen-epoch-messages 0] (fnil conj #{}) m-id)
+        state-with-frozen (-> state
+                              (update-in [:frozen-epoch-messages 0] (fnil conj #{}) m-id)
+                              (assoc-in [:frozen-epoch-message-roles 0 m-id] :echo))
         ;; Fabricated transcript is rejected
         res-fab (sm/handle-event state-with-frozen {:type :submit-transcript :transcript fabricated-half})
         ;; Log-verified half-signed transcript strikes withholding peer B
         res-valid (sm/handle-event state-with-frozen {:type :submit-transcript
-                                                      :transcript valid-half
-                                                      :frozen-log-roles honest-roles})]
+                                                      :transcript valid-half})]
     (is (= {} (:fault-strikes (:state res-fab))) "Fabricated transcript must never strike honest peer B")
     (is (= 1 (get-in (:state res-valid) [:fault-strikes pub-b])) "Peer B struck for withholding signature")))
 

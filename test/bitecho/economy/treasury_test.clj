@@ -324,7 +324,7 @@
 
     (testing "apply-epoch-mint persists :mint-dust in state and :epoch-mint-dust per epoch"
       (let [allocs {"node1" 490 "node2" 490}
-            sig (treasury/sign-epoch-mint t-priv 7 allocs)
+            sig (treasury/sign-epoch-mint t-priv 7 allocs 20)
             res (treasury/apply-epoch-mint base-state {:epoch 7
                                                        :epoch-gate 1000
                                                        :mint-dust 20
@@ -337,7 +337,7 @@
 
     (testing "apply-epoch-mint uses explicit :mint-dust when non-negative integer even if empty pool left gap"
       (let [allocs {"mesh1" 795}
-            sig (treasury/sign-epoch-mint t-priv 8 allocs)
+            sig (treasury/sign-epoch-mint t-priv 8 allocs 5)
             res (treasury/apply-epoch-mint base-state {:epoch 8
                                                        :epoch-gate 1000
                                                        :mint-dust 5
@@ -660,3 +660,150 @@
                        (if (and has-validators? has-mesh?)
                          (= 0 unclaimed-mint)
                          true)))))
+
+(deftest test-sign-and-verify-mint-signature-with-mint-dust
+  (let [t-kp (crypto/generate-keypair)
+        t-pub (basalt/bytes->hex (:public t-kp))
+        t-priv (:private t-kp)
+        allocs {"node1" 500 "node2" 500}
+        sig-3 (treasury/sign-epoch-mint t-priv 1 allocs)
+        sig-4 (treasury/sign-epoch-mint t-priv 1 allocs 15)]
+    (testing "3-arity and 4-arity signatures produce distinct outputs"
+      (is (not= sig-3 sig-4)))
+    (testing "verify-mint-signature 4-arity verifies 3-arity signature"
+      (is (true? (treasury/verify-mint-signature t-pub sig-3 1 allocs)))
+      (is (false? (treasury/verify-mint-signature t-pub sig-4 1 allocs))))
+    (testing "verify-mint-signature 5-arity verifies 4-arity signature with matching mint-dust"
+      (is (true? (treasury/verify-mint-signature t-pub sig-4 1 allocs 15)))
+      (is (false? (treasury/verify-mint-signature t-pub sig-4 1 allocs 16)))
+      (is (false? (treasury/verify-mint-signature t-pub sig-3 1 allocs 15))))))
+
+(deftest test-apply-epoch-mint-mint-dust-binding-and-unclaimed-mint
+  (let [t-kp (crypto/generate-keypair)
+        t-pub (basalt/bytes->hex (:public t-kp))
+        t-priv (:private t-kp)
+        allocs {"node1" 400 "node2" 400}
+        base-state {:ledger {} :total-minted 0 :minted-epochs #{} :mint-dust 0 :treasury-pubkey t-pub}]
+    (testing "Rejects when mint-dust is provided but signed without mint-dust (3-arity)"
+      (let [sig-3 (treasury/sign-epoch-mint t-priv 1 allocs)
+            res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                       :epoch-gate 1000
+                                                       :mint-dust 200
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig-3})]
+        (is (= base-state res) "Rejected: 3-arity signature cannot authorize explicit mint-dust")))
+
+    (testing "Rejects when mint-dust in mint-ctx is tampered"
+      (let [sig-4 (treasury/sign-epoch-mint t-priv 1 allocs 200)
+            res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                       :epoch-gate 1000
+                                                       :mint-dust 201
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig-4})]
+        (is (= base-state res) "Rejected: tampered mint-dust breaks signature")))
+
+    (testing "Rejects when mint-dust is negative or non-integer"
+      (let [sig-4 (treasury/sign-epoch-mint t-priv 1 allocs 200)]
+        (is (= base-state (treasury/apply-epoch-mint base-state {:epoch 1
+                                                                 :epoch-gate 1000
+                                                                 :mint-dust -5
+                                                                 :allocations allocs
+                                                                 :treasury-pubkey t-pub
+                                                                 :signature sig-4})))
+        (is (= base-state (treasury/apply-epoch-mint base-state {:epoch 1
+                                                                 :epoch-gate 1000
+                                                                 :mint-dust "200"
+                                                                 :allocations allocs
+                                                                 :treasury-pubkey t-pub
+                                                                 :signature sig-4})))))
+
+    (testing "Accepts 4-arity signed mint-dust matching mint-ctx"
+      (let [sig-4 (treasury/sign-epoch-mint t-priv 1 allocs 200)
+            res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                       :epoch-gate 1000
+                                                       :mint-dust 200
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig-4})]
+        (is (= 800 (:total-minted res)))
+        (is (= 200 (:mint-dust res)))
+        (is (= 200 (get-in res [:epoch-mint-dust 1])))))
+
+    (testing "Accepts 3-arity signature when mint-dust is nil, computing fallback dust"
+      (let [sig-3 (treasury/sign-epoch-mint t-priv 1 allocs)
+            res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                       :epoch-gate 1000
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig-3})]
+        (is (= 800 (:total-minted res)))
+        (is (= 200 (:mint-dust res)))))
+
+    (testing "Persists :unclaimed-mint in state and :epoch-unclaimed-mint per epoch"
+      (let [sig-4 (treasury/sign-epoch-mint t-priv 2 allocs 100)
+            res (treasury/apply-epoch-mint base-state {:epoch 2
+                                                       :epoch-gate 1000
+                                                       :mint-dust 100
+                                                       :unclaimed-mint 100
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig-4})]
+        (is (= 800 (:total-minted res)))
+        (is (= 100 (:unclaimed-mint res)))
+        (is (= 100 (get-in res [:epoch-unclaimed-mint 2])))))
+
+    (testing "Rejects when (+ actual-minted dust unclaimed) exceeds epoch-gate"
+      (let [sig-4 (treasury/sign-epoch-mint t-priv 3 allocs 200)
+            res (treasury/apply-epoch-mint base-state {:epoch 3
+                                                       :epoch-gate 1000
+                                                       :mint-dust 200
+                                                       :unclaimed-mint 100
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig-4})]
+        (is (= base-state res) "Rejected: (+ 800 200 100) = 1100 > 1000 epoch-gate")))))
+
+(defspec ^{:doc "Property: apply-epoch-mint rejects when :mint-dust in mint-ctx is tampered"}
+  prop-apply-epoch-mint-mint-dust-signature-tampering 50
+  (prop/for-all [amt (gen/choose 100 1000)
+                 dust (gen/choose 1 500)
+                 delta (gen/choose 1 50)]
+                (let [t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (:private t-kp)
+                      allocs {"node1" amt}
+                      sig (treasury/sign-epoch-mint t-priv 1 allocs dust)
+                      base-state {:ledger {} :total-minted 0 :minted-epochs #{} :treasury-pubkey t-pub}
+                      tampered-dust (+ dust delta)
+                      res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                                 :epoch-gate (+ amt tampered-dust)
+                                                                 :mint-dust tampered-dust
+                                                                 :allocations allocs
+                                                                 :treasury-pubkey t-pub
+                                                                 :signature sig})]
+                  (= base-state res))))
+
+(defspec ^{:doc "Property: apply-epoch-mint accurately persists :unclaimed-mint in state and :epoch-unclaimed-mint"}
+  prop-apply-epoch-mint-unclaimed-mint-persistence 50
+  (prop/for-all [amt (gen/choose 100 1000)
+                 dust (gen/choose 0 200)
+                 unclaimed (gen/choose 0 500)]
+                (let [t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (:private t-kp)
+                      allocs {"node1" amt}
+                      sig (treasury/sign-epoch-mint t-priv 1 allocs dust)
+                      base-state {:ledger {} :total-minted 0 :minted-epochs #{} :unclaimed-mint 50 :treasury-pubkey t-pub}
+                      gate (+ amt dust unclaimed)
+                      res (treasury/apply-epoch-mint base-state {:epoch 1
+                                                                 :epoch-gate gate
+                                                                 :mint-dust dust
+                                                                 :unclaimed-mint unclaimed
+                                                                 :allocations allocs
+                                                                 :treasury-pubkey t-pub
+                                                                 :signature sig})]
+                  (and (= (+ 50 unclaimed) (:unclaimed-mint res))
+                       (= unclaimed (get-in res [:epoch-unclaimed-mint 1]))
+                       (= amt (:total-minted res))))))

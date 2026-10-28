@@ -81,6 +81,8 @@
       :minted-epochs #{}
       :mint-dust 0
       :epoch-mint-dust {}
+      :unclaimed-mint 0
+      :epoch-unclaimed-mint {}
       :frozen-epoch-messages {}
       :frozen-epoch-message-roles {}
       :fault-strikes {}
@@ -181,6 +183,7 @@
         actual-minted (or (:actual-minted res) 0)
         epoch-mint (or (:epoch-mint res) 0)
         mint-dust (or (:mint-dust res) 0)
+        unclaimed-mint (or (:unclaimed-mint res) 0)
         all-mint-shares (or (:all-mint-shares res) {})
         state-with-custody (-> (if-let [l (:ledger res)]
                                  (assoc state :ledger l)
@@ -191,11 +194,12 @@
         t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
     (cond
       (and (seq all-mint-shares) (pos? actual-minted) t-priv t-pub)
-      (let [sig (treasury/sign-epoch-mint t-priv new-epoch all-mint-shares)]
+      (let [sig (treasury/sign-epoch-mint t-priv new-epoch all-mint-shares mint-dust)]
         (treasury/apply-epoch-mint state-with-custody
                                    {:epoch new-epoch
                                     :epoch-gate epoch-mint
                                     :mint-dust mint-dust
+                                    :unclaimed-mint unclaimed-mint
                                     :allocations all-mint-shares
                                     :treasury-pubkey t-pub
                                     :signature sig}))
@@ -203,7 +207,9 @@
       (and (pos? epoch-mint) (zero? actual-minted) t-priv t-pub)
       (-> state-with-custody
           (assoc :mint-dust mint-dust)
-          (assoc-in [:epoch-mint-dust new-epoch] mint-dust))
+          (assoc-in [:epoch-mint-dust new-epoch] mint-dust)
+          (update :unclaimed-mint (fnil + 0) unclaimed-mint)
+          (assoc-in [:epoch-unclaimed-mint new-epoch] unclaimed-mint))
 
       :else
       state-with-custody)))
@@ -820,17 +826,12 @@
 
 (defn- derive-authoritative-roles
   "Derives authoritative message-role entries for dispute reconciliation.
-   Uses local-frozen-roles-map when available for a message-id, falling back
-   to fallback-roles for any message-ids not in the local map."
-  [local-frozen-ids local-frozen-roles-map fallback-roles]
-  (let [fallback-map (into {} (attestation/canonicalize-message-roles fallback-roles))
-        candidate-ids (set/union (set local-frozen-ids) (set (keys local-frozen-roles-map)))]
+   For each message ID in local-frozen-ids or local-frozen-roles-map, looks up
+   the role in local-frozen-roles-map, defaulting to :gossip if unmapped."
+  [local-frozen-ids local-frozen-roles-map]
+  (let [candidate-ids (set/union (set local-frozen-ids) (set (keys local-frozen-roles-map)))]
     (reduce (fn [acc mid]
-              (if-let [role (get local-frozen-roles-map mid)]
-                (conj acc [mid role])
-                (if-let [role (get fallback-map mid)]
-                  (conj acc [mid role])
-                  acc)))
+              (conj acc [mid (get local-frozen-roles-map mid :gossip)]))
             []
             candidate-ids)))
 
@@ -877,11 +878,7 @@
             local-frozen-ids (get-in state [:frozen-epoch-messages epoch] #{})
             counterparty-frozen-ids (:ids resolved-cp)
             local-frozen-roles-map (get-in state [:frozen-epoch-message-roles epoch] {})
-            fallback-roles (or (:frozen-log-roles event)
-                               (:message-roles transcript)
-                               (:roles transcript)
-                               [])
-            auth-roles (derive-authoritative-roles local-frozen-ids local-frozen-roles-map fallback-roles)
+            auth-roles (derive-authoritative-roles local-frozen-ids local-frozen-roles-map)
             frozen-log-roles (attestation/reconcile-message-roles
                               local-frozen-ids
                               counterparty-frozen-ids

@@ -1052,7 +1052,8 @@
           valid-half (attestation/create-transcript 0 pub-a pub-b honest-roles (:private kp-a))
           fabricated-half (attestation/create-transcript 0 pub-a pub-b [["invented-fake" :seen]] (:private kp-a))
           state (assoc (sm/init-state [] "my-node")
-                       :frozen-epoch-messages {0 #{"m1"}})]
+                       :frozen-epoch-messages {0 #{"m1"}}
+                       :frozen-epoch-message-roles {0 {"m1" :echo}})]
       (testing "Fabricated unilateral report is rejected and does NOT strike peer B"
         (let [res (sm/handle-event state {:type :submit-transcript :transcript fabricated-half})
               new-state (:state res)]
@@ -1060,8 +1061,7 @@
 
       (testing "Log-verified half-signed transcript credits peer A and records a strike on peer B"
         (let [res (sm/handle-event state {:type :submit-transcript
-                                          :transcript valid-half
-                                          :frozen-log-roles honest-roles})
+                                          :transcript valid-half})
               new-state (:state res)]
           (is (= 1 (get-in new-state [:fault-strikes pub-b])) "Peer B was struck for withholding signature"))))))
 
@@ -1881,3 +1881,123 @@
                        (every? #(>= % cutoff) frozen-role-eps)
                        (<= (count frozen-eps) (inc retention))
                        (<= (count frozen-role-eps) (inc retention))))))
+
+(deftest test-submit-transcript-ignores-event-supplied-roles
+  (testing "handle-submit-transcript completely ignores event-supplied roles and uses local frozen roles"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          honest-roles [["m1" :echo]]
+          valid-half (attestation/create-transcript 0 pub-a pub-b honest-roles (:private kp-a))
+          state (assoc (sm/init-state [] pub-a)
+                       :frozen-epoch-messages {0 #{"m1"}}
+                       :frozen-epoch-message-roles {0 {"m1" :echo}})]
+      ;; 1. Adversary passes forged :frozen-log-roles, :message-roles, and :roles trying to force :gossip
+      (let [res (sm/handle-event state {:type :submit-transcript
+                                        :transcript valid-half
+                                        :frozen-log-roles [["m1" :gossip]]
+                                        :message-roles [["m1" :gossip]]
+                                        :roles [["m1" :gossip]]})
+            new-state (:state res)]
+        (is (= 1 (get-in new-state [:fault-strikes pub-b]))
+            "Counterparty B is struck because authoritative role is :echo from local state, ignoring forged event roles"))
+      ;; 2. Transcript with forged role matching event-supplied role is rejected
+      (let [forged-half (attestation/create-transcript 0 pub-a pub-b [["m1" :gossip]] (:private kp-a))
+            res (sm/handle-event state {:type :submit-transcript
+                                        :transcript forged-half
+                                        :frozen-log-roles [["m1" :gossip]]})
+            new-state (:state res)]
+        (is (= {} (:fault-strikes new-state))
+            "Forged transcript is rejected against local authoritative :echo role despite matching forged event roles"))
+      ;; 3. Message in local-frozen-ids without entry in local-frozen-roles defaults to :gossip
+      (let [state-unmapped (assoc (sm/init-state [] pub-a)
+                                  :frozen-epoch-messages {0 #{"m2"}})
+            gossip-half (attestation/create-transcript 0 pub-a pub-b [["m2" :gossip]] (:private kp-a))
+            res (sm/handle-event state-unmapped {:type :submit-transcript
+                                                 :transcript gossip-half
+                                                 :frozen-log-roles [["m2" :ready]]})
+            new-state (:state res)]
+        (is (= 1 (get-in new-state [:fault-strikes pub-b]))
+            "Unmapped message defaults to :gossip, striking B on honest gossip transcript despite event :ready")))))
+
+(defspec ^{:doc "Property: Event-supplied roles are completely ignored in handle-submit-transcript"}
+  prop-submit-transcript-forged-event-roles-ignored 50
+  (prop/for-all [role-idx (gen/choose 0 2)
+                 forged-role-idx (gen/choose 0 2)]
+                (let [roles-pool [:gossip :echo :ready]
+                      honest-role (nth roles-pool role-idx)
+                      forged-role (nth roles-pool forged-role-idx)
+                      kp-a (crypto/generate-keypair)
+                      kp-b (crypto/generate-keypair)
+                      pub-a (basalt/bytes->hex (:public kp-a))
+                      pub-b (basalt/bytes->hex (:public kp-b))
+                      honest-roles [["m1" honest-role]]
+                      valid-half (attestation/create-transcript 0 pub-a pub-b honest-roles (:private kp-a))
+                      state (assoc (sm/init-state [] pub-a)
+                                   :frozen-epoch-messages {0 #{"m1"}}
+                                   :frozen-epoch-message-roles {0 {"m1" honest-role}})
+                      res-clean (sm/handle-event state {:type :submit-transcript :transcript valid-half})
+                      res-forged (sm/handle-event state {:type :submit-transcript
+                                                         :transcript valid-half
+                                                         :frozen-log-roles [["m1" forged-role]]
+                                                         :message-roles [["m1" forged-role]]
+                                                         :roles [["m1" forged-role]]})]
+                  (= (:fault-strikes (:state res-clean))
+                     (:fault-strikes (:state res-forged))))))
+
+(deftest test-state-machine-unclaimed-mint-initialization-and-accumulation
+  (testing "init-state initializes :unclaimed-mint to 0 and :epoch-unclaimed-mint to {}"
+    (let [st (sm/init-state [] "my-node")]
+      (is (= 0 (:unclaimed-mint st)))
+      (is (= {} (:epoch-unclaimed-mint st)))))
+
+  (testing "handle-tick with empty recipient pools accumulates :unclaimed-mint and records :epoch-unclaimed-mint"
+    (let [cfg (assoc config/default-config
+                     :treasury-trailing-epochs 1)
+          t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          s0 (assoc (sm/init-state [] "my-node" cfg)
+                    :epoch 0
+                    :treasury-pubkey t-pub
+                    :treasury-privkey t-priv
+                    :epoch-burns {0 1000})
+          ;; Tick from 0 to 1 with empty recipient pools
+          t1-res (sm/handle-event s0 {:type :tick :rng (java.util.Random. 1)})
+          s1 (:state t1-res)]
+      (is (= 1 (:epoch s1)))
+      (is (= 500 (:unclaimed-mint s1)))
+      (is (= 500 (get-in s1 [:epoch-unclaimed-mint 1])))
+      (is (= 0 (:mint-dust s1)))
+      (is (= 0 (:total-minted s1)))
+      ;; Tick from 1 to 2 with empty recipient pools and 1000 burn in epoch 1
+      (let [s1-with-burn (assoc-in s1 [:epoch-burns 1] 1000)
+            t2-res (sm/handle-event s1-with-burn {:type :tick :rng (java.util.Random. 2)})
+            s2 (:state t2-res)]
+        (is (= 2 (:epoch s2)))
+        (is (= 1000 (:unclaimed-mint s2)))
+        (is (= 500 (get-in s2 [:epoch-unclaimed-mint 2])))
+        (is (= 0 (:mint-dust s2)))))))
+
+(defspec ^{:doc "Property: State machine :unclaimed-mint strictly equals the sum of :epoch-unclaimed-mint"}
+  prop-state-machine-unclaimed-mint-persistence 50
+  (prop/for-all [burn (gen/choose 100 5000)
+                 ticks (gen/choose 2 5)]
+                (let [t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (:private t-kp)
+                      cfg (assoc config/default-config :treasury-trailing-epochs 1)
+                      init-s (assoc (sm/init-state [] "my-node" cfg)
+                                    :epoch 0
+                                    :treasury-pubkey t-pub
+                                    :treasury-privkey t-priv)
+                      final-s (loop [s init-s step 0]
+                                (if (>= step ticks) s
+                                    (let [curr-ep (:epoch s)
+                                          s-burned (assoc-in s [:epoch-burns curr-ep] burn)
+                                          t-res (sm/handle-event s-burned {:type :tick :rng (java.util.Random. step)})]
+                                      (recur (:state t-res) (inc step)))))]
+                  (and (= (:unclaimed-mint final-s)
+                          (reduce + 0 (vals (:epoch-unclaimed-mint final-s))))
+                       (every? #(integer? %) (vals (:epoch-unclaimed-mint final-s)))))))

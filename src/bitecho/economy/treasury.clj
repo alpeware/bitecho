@@ -327,13 +327,20 @@
    genesis-custody-shares))
 
 (defn sign-epoch-mint
-  "Cryptographically signs an epoch mint context using the treasury private key."
-  [treasury-priv epoch allocations]
-  (let [sorted-allocs (into (sorted-map) allocations)
-        payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")
-        priv-bytes (if (string? treasury-priv) (basalt/hex->bytes treasury-priv) treasury-priv)
-        sig-bytes (crypto/sign priv-bytes payload-bytes)]
-    (basalt/bytes->hex sig-bytes)))
+  "Cryptographically signs an epoch mint context using the treasury private key.
+   Supports 3-arity (epoch and allocations) and 4-arity (binding mint-dust)."
+  ([treasury-priv epoch allocations]
+   (let [sorted-allocs (into (sorted-map) allocations)
+         payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")
+         priv-bytes (if (string? treasury-priv) (basalt/hex->bytes treasury-priv) treasury-priv)
+         sig-bytes (crypto/sign priv-bytes payload-bytes)]
+     (basalt/bytes->hex sig-bytes)))
+  ([treasury-priv epoch allocations mint-dust]
+   (let [sorted-allocs (into (sorted-map) allocations)
+         payload-bytes (.getBytes (pr-str [epoch sorted-allocs mint-dust]) "UTF-8")
+         priv-bytes (if (string? treasury-priv) (basalt/hex->bytes treasury-priv) treasury-priv)
+         sig-bytes (crypto/sign priv-bytes payload-bytes)]
+     (basalt/bytes->hex sig-bytes))))
 
 (defn- normalize-key-hex
   "Normalizes a public key representation (string, byte array, or seqable bytes) to a hex string."
@@ -354,20 +361,33 @@
     (seqable? x) (empty? x)
     :else false))
 
-(defn- verify-mint-signature
-  "Cryptographically verifies the treasury signature on epoch mint allocations."
-  [expected-pub sig epoch allocations]
-  (try
-    (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
-          sig-bytes (cond
-                      (string? sig) (basalt/hex->bytes sig)
-                      (bytes? sig) sig
-                      :else (byte-array (map byte sig)))
-          sorted-allocs (into (sorted-map) allocations)
-          payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
-      (boolean (crypto/verify pub-bytes payload-bytes sig-bytes)))
-    (catch Exception _
-      false)))
+(defn verify-mint-signature
+  "Cryptographically verifies the treasury signature on epoch mint allocations,
+   optionally binding mint-dust into the signed payload."
+  ([expected-pub sig epoch allocations]
+   (try
+     (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
+           sig-bytes (cond
+                       (string? sig) (basalt/hex->bytes sig)
+                       (bytes? sig) sig
+                       :else (byte-array (map byte sig)))
+           sorted-allocs (into (sorted-map) allocations)
+           payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
+       (boolean (crypto/verify pub-bytes payload-bytes sig-bytes)))
+     (catch Exception _
+       false)))
+  ([expected-pub sig epoch allocations mint-dust]
+   (try
+     (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
+           sig-bytes (cond
+                       (string? sig) (basalt/hex->bytes sig)
+                       (bytes? sig) sig
+                       :else (byte-array (map byte sig)))
+           sorted-allocs (into (sorted-map) allocations)
+           payload-bytes (.getBytes (pr-str [epoch sorted-allocs mint-dust]) "UTF-8")]
+       (boolean (crypto/verify pub-bytes payload-bytes sig-bytes)))
+     (catch Exception _
+       false))))
 
 (defn apply-epoch-mint
   "Applies an authorized, capped epoch demand-gated mint to state.
@@ -376,10 +396,13 @@
      - epoch is missing or already in :minted-epochs (double-mint rejected);
      - treasury pubkey or signature is missing, empty, mismatched, or invalid;
      - any allocation amount is not a non-negative integer;
+     - mint-dust is present but negative or not an integer;
      - total requested mint exceeds epoch-gate (M_t);
+     - total requested mint + dust + unclaimed exceeds epoch-gate (M_t);
      - total-minted + actual-minted exceeds max-conditional-mint-supply (23.1B).
    Increments :total-minted by the actual distributed sum (excluding rounding dust),
-   credits receivers in :ledger, and records epoch in :minted-epochs."
+   credits receivers in :ledger, records epoch in :minted-epochs, and updates :mint-dust
+   and :unclaimed-mint state accumulators."
   [state mint-ctx]
   (let [epoch (:epoch mint-ctx)
         minted-epochs (or (:minted-epochs state) #{})
@@ -389,7 +412,9 @@
                       (into {} (map (fn [item] [(:receiver item) (:amount item)]) allocs-raw)))
         state-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))
         ctx-pub (:treasury-pubkey mint-ctx)
-        sig (:signature mint-ctx)]
+        sig (:signature mint-ctx)
+        has-dust? (some? (:mint-dust mint-ctx))
+        raw-dust (:mint-dust mint-ctx)]
     (cond
       ;; 1. Epoch must be present and not already minted
       (or (nil? epoch) (contains? minted-epochs epoch))
@@ -407,34 +432,50 @@
       (some (fn [[_ amt]] (or (not (integer? amt)) (neg? amt))) allocations)
       state
 
-      ;; 5. Cryptographic signature verification against [epoch (sorted-map allocs)]
-      (not (verify-mint-signature state-pub sig epoch allocations))
+      ;; 4b. When mint-dust is provided, it must be a non-negative integer
+      (and has-dust? (or (not (integer? raw-dust)) (neg? raw-dust)))
+      state
+
+      ;; 5. Cryptographic signature verification against allocations, binding mint-dust if present
+      (not (if has-dust?
+             (verify-mint-signature state-pub sig epoch allocations raw-dust)
+             (verify-mint-signature state-pub sig epoch allocations)))
       state
 
       :else
       (let [actual-minted (reduce + 0 (vals allocations))
             epoch-gate (:epoch-gate mint-ctx)
-            total-minted (or (:total-minted state) 0)]
+            total-minted (or (:total-minted state) 0)
+            unclaimed (if (and (integer? (:unclaimed-mint mint-ctx))
+                               (not (neg? (:unclaimed-mint mint-ctx))))
+                        (:unclaimed-mint mint-ctx)
+                        0)
+            dust (if has-dust?
+                   raw-dust
+                   (if epoch-gate (max 0 (- epoch-gate actual-minted unclaimed)) 0))]
         (cond
-          ;; 6. Epoch demand gate check
+          ;; 6. Epoch demand gate check: actual-minted cannot exceed epoch-gate
           (and (some? epoch-gate) (> actual-minted epoch-gate))
+          state
+
+          ;; 6b. Total allocation + dust + unclaimed cannot exceed epoch-gate
+          (and (some? epoch-gate) (> (+ actual-minted dust unclaimed) epoch-gate))
           state
 
           ;; 7. Hard supply cap check
           (> (+ total-minted actual-minted) max-conditional-mint-supply)
           state
 
-          ;; Valid: credit allocations to ledger
+          ;; Valid: credit allocations to ledger, persist mint-dust and unclaimed-mint
           :else
-          (let [dust (if (and (integer? (:mint-dust mint-ctx)) (not (neg? (:mint-dust mint-ctx))))
-                       (:mint-dust mint-ctx)
-                       (if epoch-gate (max 0 (- epoch-gate actual-minted)) 0))
-                new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
+          (let [new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
             (-> state
                 (assoc :ledger new-ledger)
                 (assoc :total-minted (+ total-minted actual-minted))
                 (update :minted-epochs (fnil conj #{}) epoch)
                 (assoc :mint-dust dust)
-                (assoc-in [:epoch-mint-dust epoch] dust))))))))
+                (assoc-in [:epoch-mint-dust epoch] dust)
+                (update :unclaimed-mint (fnil + 0) unclaimed)
+                (assoc-in [:epoch-unclaimed-mint epoch] unclaimed))))))))
 
 
