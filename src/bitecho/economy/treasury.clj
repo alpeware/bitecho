@@ -142,12 +142,14 @@
            rem-balance balance
            seq-num start-seq
            deps start-deps
-           commands []]
+           commands []
+           skipped []]
       (if (empty? rem-allocs)
         {:remaining-balance rem-balance
          :seq seq-num
          :deps deps
-         :commands commands}
+         :commands commands
+         :skipped-allocations skipped}
         (let [{:keys [receiver amount]} (first rem-allocs)
               req-amt (or amount 0)]
           (if (and (integer? req-amt) (pos? req-amt) (<= req-amt rem-balance))
@@ -167,12 +169,19 @@
                      (- rem-balance req-amt)
                      next-seq
                      [tx-hash]
-                     (conj commands transfer)))
-            (recur (rest rem-allocs)
-                   rem-balance
-                   seq-num
-                   deps
-                   commands)))))))
+                     (conj commands transfer)
+                     skipped))
+            (let [reason (if (and (integer? req-amt) (pos? req-amt))
+                           :insufficient-custody-balance
+                           :invalid-amount)]
+              (recur (rest rem-allocs)
+                     rem-balance
+                     seq-num
+                     deps
+                     commands
+                     (conj skipped {:receiver receiver
+                                    :amount amount
+                                    :reason reason})))))))))
 
 (defn burn-unspent-bootstrap-custody
   "Burns any unspent balance in the Bootstrap custody account directly in the ledger
@@ -226,7 +235,8 @@
                       {:remaining-balance effective-custody-bal
                        :seq start-seq
                        :deps start-deps
-                       :commands []})
+                       :commands []
+                       :skipped-allocations []})
         updated-ledger (when ledger
                          (let [l (if sunset? (burn-unspent-bootstrap-custody ledger custody-pub) ledger)]
                            (apply-custody-transfers-to-ledger l (:commands custody-res))))]
@@ -245,9 +255,10 @@
         r-trailing (calculate-trailing-revenue trailing-burns n)
         k-bps (or (:k-bps treasury-ctx) default-k-bps)
         demand-gate (calculate-demand-gated-mint r-trailing k-bps)
+        carry-dust (max 0 (or (:carry-dust treasury-ctx) (:mint-dust treasury-ctx) 0))
         total-minted (or (:total-minted treasury-ctx) 0)
         cap-room (max 0 (- max-conditional-mint-supply total-minted))
-        m-t (min demand-gate cap-room)
+        m-t (min (+ demand-gate carry-dust) cap-room)
         split (split-mint m-t)
         m-streamlet (:streamlet split)
         m-mesh (:mesh split)
@@ -270,6 +281,8 @@
         custody-res (:custody-res custody-state)]
     {:r-trailing r-trailing
      :epoch-mint m-t
+     :m-t m-t
+     :demand-gate demand-gate
      :actual-minted actual-minted
      :mint-dust mint-dust
      :m-streamlet m-streamlet
@@ -282,6 +295,7 @@
      :custody-commands (:commands custody-res)
      :commands (:commands custody-res)
      :remaining-custody-balance (:remaining-balance custody-res)
+     :skipped-allocations (or (:skipped-allocations custody-res) [])
      :ledger (:updated-ledger custody-state)}))
 
 (def genesis-custody-shares
@@ -368,19 +382,18 @@
                       (into {} (map (fn [item] [(:receiver item) (:amount item)]) allocs-raw)))
         state-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))
         ctx-pub (:treasury-pubkey mint-ctx)
-        expected-pub (or state-pub ctx-pub)
         sig (:signature mint-ctx)]
     (cond
       ;; 1. Epoch must be present and not already minted
       (or (nil? epoch) (contains? minted-epochs epoch))
       state
 
-      ;; 2. Signature and expected pubkey must be non-nil and non-empty
-      (or (blank-key-or-sig? expected-pub) (blank-key-or-sig? sig))
+      ;; 2. Signature and state pubkey must be non-nil and non-empty
+      (or (blank-key-or-sig? state-pub) (blank-key-or-sig? sig))
       state
 
-      ;; 3. State pubkey and mint-ctx pubkey must match if both are present
-      (and state-pub ctx-pub (not= (normalize-key-hex state-pub) (normalize-key-hex ctx-pub)))
+      ;; 3. State pubkey and mint-ctx pubkey must match if ctx-pub is present
+      (and ctx-pub (not= (normalize-key-hex state-pub) (normalize-key-hex ctx-pub)))
       state
 
       ;; 4. Allocations must be non-negative integers
@@ -388,7 +401,7 @@
       state
 
       ;; 5. Cryptographic signature verification against [epoch (sorted-map allocs)]
-      (not (verify-mint-signature expected-pub sig epoch allocations))
+      (not (verify-mint-signature state-pub sig epoch allocations))
       state
 
       :else
@@ -413,7 +426,7 @@
                 (assoc :ledger new-ledger)
                 (assoc :total-minted (+ total-minted actual-minted))
                 (update :minted-epochs (fnil conj #{}) epoch)
-                (update :mint-dust (fnil + 0) dust)
+                (assoc :mint-dust dust)
                 (assoc-in [:epoch-mint-dust epoch] dust))))))))
 
 

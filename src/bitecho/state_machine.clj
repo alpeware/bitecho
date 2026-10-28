@@ -88,6 +88,7 @@
       :voucher-seqs {}
       :pending-vouchers []
       :settled-voucher-tuples #{}
+      :skipped-custody-allocations []
       :ledger (or genesis-ledger {})})))
 
 (defn- build-tick-treasury-ctx
@@ -102,6 +103,7 @@
      :trailing-burns trailing-revs
      :total-minted (or (:total-minted state) 0)
      :ledger (or (:ledger state) {})
+     :carry-dust (or (:mint-dust state) 0)
      :validators (or (:validators state) (:validators cfg))
      :mesh-nodes (or (:mesh-nodes state) (:mesh-nodes cfg))
      :custody-pubkey custody-pk
@@ -168,9 +170,11 @@
         epoch-mint (or (:epoch-mint res) 0)
         mint-dust (or (:mint-dust res) 0)
         all-mint-shares (or (:all-mint-shares res) {})
-        state-with-custody (if-let [l (:ledger res)]
-                             (assoc state :ledger l)
-                             state)
+        state-with-custody (-> (if-let [l (:ledger res)]
+                                 (assoc state :ledger l)
+                                 state)
+                               (assoc :skipped-custody-allocations
+                                      (or (:skipped-allocations res) [])))
         t-priv (or (:treasury-privkey state) (get-in state [:config :treasury-privkey]))
         t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
     (cond
@@ -186,7 +190,7 @@
 
       (and (pos? epoch-mint) (zero? actual-minted) t-priv t-pub)
       (-> state-with-custody
-          (update :mint-dust (fnil + 0) mint-dust)
+          (assoc :mint-dust mint-dust)
           (assoc-in [:epoch-mint-dust new-epoch] mint-dust))
 
       :else
@@ -908,7 +912,7 @@
 
 (defn- handle-settle-intent
   "Handles an internal or external request to settle a payment intent with protocol take.
-   Accepts {:type :settle-intent :payer payer :receiver receiver :amount amount :take-bps optional-bps}.
+   Accepts {:type :settle-intent :payer payer :receiver receiver :amount amount}.
    Validates payer, receiver, amount (positive integer), and payer balance >= amount.
    Deducts amount from payer, credits (- amount take-amt) to receiver,
    and records take-amt in [:epoch-settlement-takes current-epoch]."
@@ -926,7 +930,11 @@
              (pos? amount)
              payer-acct
              (>= payer-bal amount))
-      (let [take-amt (burn/calculate-settlement-take amount (:take-bps event))
+      (let [configured-bps (or (:settlement-take-bps state)
+                               (get-in state [:config :settlement-take-bps])
+                               burn/default-settlement-take-bps)
+            take-bps (max 1 configured-bps)
+            take-amt (burn/calculate-settlement-take amount take-bps)
             net-amt (- amount take-amt)
             current-epoch (or (:epoch event) (:epoch state) 0)
             receiver-acct (get-in state [:ledger receiver-hex]

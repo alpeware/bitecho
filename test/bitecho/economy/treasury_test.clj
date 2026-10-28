@@ -102,7 +102,19 @@
         (is (= 1 (count (:commands over-res))))
         (is (= 200 (reduce + (map :amount (:commands over-res)))))
         (is (= 11 (:seq over-res)))
-        (is (= ["hash-0"] (:deps (first (:commands over-res)))))))))
+        (is (= ["hash-0"] (:deps (first (:commands over-res)))))))
+
+    (testing "Reports :skipped-allocations for over-budget or invalid allocations"
+      (let [over-ctx (assoc ctx :custody-balance 400)
+            over-res (treasury/process-bootstrap-custody over-ctx)
+            invalid-ctx (assoc ctx :allocations [{:receiver "p1" :amount -100}
+                                                 {:receiver "p2" :amount 200}])
+            invalid-res (treasury/process-bootstrap-custody invalid-ctx)]
+        (is (= [] (:skipped-allocations res)))
+        (is (= [{:receiver "partner-2" :amount 300 :reason :insufficient-custody-balance}]
+               (:skipped-allocations over-res)))
+        (is (= [{:receiver "p1" :amount -100 :reason :invalid-amount}]
+               (:skipped-allocations invalid-res)))))))
 
 (deftest process-treasury-epoch-test
   (let [treasury-kp (crypto/generate-keypair)
@@ -135,7 +147,16 @@
     (testing "Commands include signed custody transfers"
       (is (= 1 (count (:commands res))))
       (is (= 1 (count (:custody-commands res))))
-      (is (= 49500 (:remaining-custody-balance res))))))
+      (is (= 49500 (:remaining-custody-balance res))))
+
+    (testing "Carries forward :carry-dust into epoch mint pool M_t"
+      (let [ctx-with-dust (assoc ctx :carry-dust 7 :trailing-burns [1000] :n-epochs 1)
+            res-dust (treasury/process-treasury-epoch ctx-with-dust)]
+        ;; Trailing burn 1000 with 50% discount -> demand-gate 500.
+        ;; carry-dust 7 -> m-t = 507.
+        (is (= 500 (:demand-gate res-dust)))
+        (is (= 507 (:m-t res-dust)))
+        (is (= 507 (:epoch-mint res-dust)))))))
 
 (defspec ^{:doc "Property: In every epoch M_t <= 0.5 * R_trailing and M_streamlet + M_mesh == M_t"}
   prop-epoch-mint-and-split-invariants 50
@@ -342,6 +363,21 @@
             sig (treasury/sign-epoch-mint t-priv 6 allocs)
             state-no-pk (dissoc base-state :treasury-pubkey)]
         (is (= state-no-pk (treasury/apply-epoch-mint state-no-pk {:epoch 6 :epoch-gate 500 :allocations allocs :signature sig})))))
+
+    (testing "Rejects valid self-signed mint-ctx when state lacks authoritative :treasury-pubkey"
+      (let [allocs {"node1" 400}
+            self-kp (crypto/generate-keypair)
+            self-pub (basalt/bytes->hex (:public self-kp))
+            self-priv (:private self-kp)
+            self-sig (treasury/sign-epoch-mint self-priv 6 allocs)
+            state-no-pk (dissoc base-state :treasury-pubkey)
+            self-ctx {:epoch 6
+                      :epoch-gate 500
+                      :allocations allocs
+                      :treasury-pubkey self-pub
+                      :signature self-sig}]
+        (is (nil? (:treasury-pubkey state-no-pk)))
+        (is (= state-no-pk (treasury/apply-epoch-mint state-no-pk self-ctx)))))
 
     (testing "Rejects when mint-ctx treasury-pubkey mismatches state treasury-pubkey"
       (let [allocs {"node1" 400}
@@ -556,7 +592,7 @@
                                                                  :allocations allocs
                                                                  :treasury-pubkey t-pub
                                                                  :signature sig})]
-                  (and (= (+ prior-dust dust) (:mint-dust res))
+                  (and (= dust (:mint-dust res))
                        (= dust (get-in res [:epoch-mint-dust 1]))
                        (= amt (:total-minted res))))))
 

@@ -71,7 +71,9 @@
     (is (number? (or (:mint-dust state) 0))
         ":mint-dust must be tracked in state")
     (is (map? (or (:epoch-mint-dust state) {}))
-        ":epoch-mint-dust must be tracked in state")))
+        ":epoch-mint-dust must be tracked in state")
+    (is (vector? (or (:skipped-custody-allocations state) []))
+        ":skipped-custody-allocations must be tracked in state")))
 
 (defn- build-scenario-state
   "Initializes the pure root state machine with default Genesis custody and initial balances."

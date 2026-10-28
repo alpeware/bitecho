@@ -804,13 +804,25 @@
                (+ (:balance (get-in new-state [:ledger payer]))
                   (:balance (get-in new-state [:ledger receiver])))))))
 
-    (testing "Valid settle-intent with custom take-bps"
-      ;; Amount 1000 with 100 bps take (1%): take = 10, net = 990
+    (testing "Event :take-bps is ignored: passing :take-bps 0 does not waive take, configured 50 bps is deducted"
       (let [res (sm/handle-event state {:type :settle-intent
                                         :payer payer
                                         :receiver receiver
                                         :amount 1000
-                                        :take-bps 100})
+                                        :take-bps 0})
+            new-state (:state res)]
+        (is (= 9000 (:balance (get-in new-state [:ledger payer]))))
+        (is (= 995 (:balance (get-in new-state [:ledger receiver]))))
+        (is (= 5 (get-in new-state [:epoch-settlement-takes 0])))))
+
+    (testing "Configured settlement-take-bps in state/config is used (event :take-bps ignored)"
+      (let [cfg-100 (assoc cfg :settlement-take-bps 100)
+            st-100 (assoc (sm/init-state [] "my-node" cfg-100) :epoch 0)
+            res (sm/handle-event st-100 {:type :settle-intent
+                                         :payer payer
+                                         :receiver receiver
+                                         :amount 1000
+                                         :take-bps 0})
             new-state (:state res)]
         (is (= 9000 (:balance (get-in new-state [:ledger payer]))))
         (is (= 990 (:balance (get-in new-state [:ledger receiver]))))
@@ -910,20 +922,23 @@
   prop-settle-intent-conservation 50
   (prop/for-all [initial-payer-bal (gen/choose 1000 50000)
                  settle-amt (gen/choose 100 2000)
-                 take-bps (gen/choose 0 200)]
+                 event-take-bps (gen/choose 0 200)
+                 configured-take-bps (gen/choose 0 200)]
                 (let [payer "payer-node"
                       receiver "receiver-node"
                       cfg (assoc config/default-config
+                                 :settlement-take-bps configured-take-bps
                                  :genesis-ledger {payer (account/map->AccountState {:balance initial-payer-bal :seq 0 :deps []})})
                       state (assoc (sm/init-state [] "local-node" cfg) :epoch 2)
                       res (sm/handle-event state {:type :settle-intent
                                                   :payer payer
                                                   :receiver receiver
                                                   :amount settle-amt
-                                                  :take-bps take-bps})
+                                                  :take-bps event-take-bps})
                       new-state (:state res)
                       new-ledger (:ledger new-state)
-                      take-amt (burn/calculate-settlement-take settle-amt take-bps)
+                      effective-bps (max 1 (or configured-take-bps 50))
+                      take-amt (burn/calculate-settlement-take settle-amt effective-bps)
                       net-amt (- settle-amt take-amt)]
                   (and (= (- initial-payer-bal settle-amt) (:balance (get new-ledger payer)))
                        (= net-amt (:balance (get new-ledger receiver)))
@@ -931,6 +946,73 @@
                        (= (- initial-payer-bal take-amt)
                           (+ (:balance (get new-ledger payer))
                              (:balance (get new-ledger receiver))))))))
+
+(deftest test-tick-carries-forward-mint-dust-conserved
+  (testing "handle-tick carries forward mint-dust into future epoch gate and satisfies conservation identity"
+    (let [val-pub1 "v1"
+          val-pub2 "v2"
+          val-pub3 "v3"
+          mesh-pub "m1"
+          t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          cfg (assoc config/default-config
+                     :treasury-pubkey t-pub
+                     :treasury-privkey t-priv
+                     :treasury-trailing-epochs 1
+                     :validators [val-pub1 val-pub2 val-pub3]
+                     :mesh-nodes {mesh-pub 1.0})
+          ;; Epoch 0 burns 1000 -> gate 500. Split: Streamlet 100 (33 each = 99), Mesh 400.
+          ;; Actual minted = 499, dust = 1.
+          s0 (assoc (sm/init-state [] "my-node" cfg)
+                    :epoch 0
+                    :epoch-burns {0 1000})
+          t1-res (sm/handle-event s0 {:type :tick :rng (java.util.Random. 42)})
+          s1 (:state t1-res)]
+      (is (= 1 (:epoch s1)))
+      (is (= 499 (:total-minted s1)))
+      (is (= 1 (:mint-dust s1)))
+      (is (= (+ (:total-minted s1) (:mint-dust s1)) 500))
+
+      ;; In Epoch 1, burn 1000 again -> demand gate 500.
+      ;; With carry-dust 1, m-t becomes 501.
+      ;; Split 501: Streamlet floor(0.20 * 501) = 100 (33 each = 99), Mesh 501 - 100 = 401.
+      ;; Actual minted = 99 + 401 = 500.
+      ;; New dust = 501 - 500 = 1.
+      (let [s1-with-burn (assoc-in s1 [:epoch-burns 1] 1000)
+            t2-res (sm/handle-event s1-with-burn {:type :tick :rng (java.util.Random. 42)})
+            s2 (:state t2-res)]
+        (is (= 2 (:epoch s2)))
+        (is (= (+ 499 500) (:total-minted s2)))
+        (is (= 1 (:mint-dust s2)))
+        ;; Conservation identity across epochs:
+        ;; (+ total-minted mint-dust) == sum of demand gates (500 + 500 = 1000)
+        (is (= 1000 (+ (:total-minted s2) (:mint-dust s2))))))))
+
+(deftest test-state-machine-skipped-custody-allocations
+  (testing "init-state initializes :skipped-custody-allocations to []"
+    (let [state (sm/init-state [] "my-node")]
+      (is (= [] (:skipped-custody-allocations state)))))
+
+  (testing "handle-tick populates :skipped-custody-allocations when custody allocations exceed balance"
+    (let [c-kp (crypto/generate-keypair)
+          c-pub (basalt/bytes->hex (:public c-kp))
+          c-priv (:private c-kp)
+          cfg (assoc config/default-config
+                     :custody-pubkey c-pub
+                     :custody-privkey c-priv
+                     :custody-allocations [{:receiver "p1" :amount 300}
+                                           {:receiver "p2" :amount 400}]
+                     :genesis-ledger {c-pub (account/map->AccountState {:balance 500 :seq 0 :deps []})})
+          state (assoc (sm/init-state [] "my-node" cfg) :epoch 0)
+          res (sm/handle-event state {:type :tick :rng (java.util.Random. 42)})
+          new-state (:state res)]
+      (is (= 1 (:epoch new-state)))
+      ;; 300 succeeded, 400 exceeded remaining 200 balance and was skipped
+      (is (= 200 (:balance (get-in new-state [:ledger c-pub]))))
+      (is (= 300 (:balance (get-in new-state [:ledger "p1"]))))
+      (is (= [{:receiver "p2" :amount 400 :reason :insufficient-custody-balance}]
+             (:skipped-custody-allocations new-state))))))
 
 (deftest test-state-machine-frozen-messages-and-strikes
   (testing "init-state initializes :frozen-epoch-messages to {} and :fault-strikes to {}"
