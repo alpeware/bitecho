@@ -920,11 +920,12 @@
 
 (defspec ^{:doc "Property: Settle intent strictly conserves ledger supply minus protocol take and records protocol take"}
   prop-settle-intent-conservation 50
-  (prop/for-all [initial-payer-bal (gen/choose 1000 50000)
+  (prop/for-all [extra-bal (gen/choose 0 50000)
                  settle-amt (gen/choose 100 2000)
                  event-take-bps (gen/choose 0 200)
                  configured-take-bps (gen/choose 0 200)]
-                (let [payer "payer-node"
+                (let [initial-payer-bal (+ settle-amt extra-bal)
+                      payer "payer-node"
                       receiver "receiver-node"
                       cfg (assoc config/default-config
                                  :settlement-take-bps configured-take-bps
@@ -1140,8 +1141,24 @@
                       {:node-id "home-node-3" :price 10}]
           base-state (-> (sm/init-state [] "my-node")
                          (assoc :epoch 0)
+                         (assoc-in [:ledger callee-pub]
+                                   (account/map->AccountState {:balance 100 :seq 0 :deps []}))
                          (assoc-in [:home-sets [callee-pub 0]]
                                    {:status :ok :home-nodes candidates :price 10 :degraded? false}))]
+
+      (testing "Rejects offer header if callee is absent from :ledger (or has 0 balance) when price > 0"
+        (let [unfunded-state (assoc base-state :ledger {})
+              unfunded-event {:type :receive-offer-header
+                              :caller "caller-a"
+                              :callee callee-pub
+                              :callee-privkey callee-priv
+                              :home-node home-node
+                              :offer-hash "hash-unfunded"
+                              :seq 1}
+              res (sm/handle-event unfunded-state unfunded-event)]
+          (is (= unfunded-state (:state res)))
+          (is (empty? (:commands res)))
+          (is (empty? (:pending-vouchers (:state res))))))
 
       (testing "Rejects offer header if home-node is not in callee's registered home set"
         (let [unregistered-event {:type :receive-offer-header
@@ -1281,6 +1298,43 @@
                   (and (= total-before total-after)
                        (= final-callee-bal (- callee-init-bal actual-transfer))
                        (= final-home-bal (+ home-init-bal actual-transfer))))))
+
+(defspec ^{:doc "Property: receive-offer-header fails closed when callee is absent or has balance < cum-debit"}
+  prop-receive-offer-header-callee-balance-invariants 50
+  (prop/for-all [callee-bal (gen/choose 0 500)
+                 price (gen/choose 1 50)
+                 seq-num (gen/choose 1 10)
+                 absent? gen/boolean]
+                (let [callee-kp (crypto/generate-keypair)
+                      callee-pub (basalt/bytes->hex (:public callee-kp))
+                      callee-priv (:private callee-kp)
+                      home-node "home-node"
+                      candidates [{:node-id home-node :price price}]
+                      cum-debit (* seq-num price)
+                      ledger (if absent?
+                               {}
+                               {callee-pub (account/map->AccountState {:balance callee-bal :seq 0 :deps []})})
+                      state (-> (sm/init-state [] "my-node")
+                                (assoc :epoch 0)
+                                (assoc :ledger ledger)
+                                (assoc-in [:home-sets [callee-pub 0]]
+                                          {:status :ok :home-nodes candidates :price price :degraded? false})
+                                (assoc-in [:voucher-seqs [callee-pub home-node 0]] (dec seq-num)))
+                      event {:type :receive-offer-header
+                             :caller "caller"
+                             :callee callee-pub
+                             :callee-privkey callee-priv
+                             :home-node home-node
+                             :offer-hash "hash-prop"
+                             :seq seq-num}
+                      res (sm/handle-event state event)
+                      effective-bal (if absent? 0 callee-bal)]
+                  (if (< effective-bal cum-debit)
+                    (and (= state (:state res))
+                         (empty? (:commands res))
+                         (empty? (:pending-vouchers (:state res))))
+                    (and (= 1 (count (:pending-vouchers (:state res))))
+                         (= seq-num (get-in (:state res) [:voucher-seqs [callee-pub home-node 0]])))))))
 
 (deftest signed-control-frames-test
   (let [kp-echo (crypto/generate-keypair)
@@ -1598,7 +1652,7 @@
           kp-b (crypto/generate-keypair)
           pub-a (basalt/bytes->hex (:public kp-a))
           pub-b (basalt/bytes->hex (:public kp-b))
-          state (assoc (sm/init-state [] "my-node")
+          state (assoc (sm/init-state [] pub-a)
                        :frozen-epoch-messages {0 #{"m1" "m2"}}
                        :frozen-epoch-message-roles {0 {"m1" :gossip "m2" :ready}})]
 
@@ -1616,19 +1670,43 @@
               new-state (:state res)]
           (is (= 1 (get-in new-state [:fault-strikes pub-b])) "Counterparty B was struck for withholding on valid transcript")))
 
-      (testing "uses bilateral intersection with :counterparty-frozen-ids"
+      (testing "uses bilateral intersection with cryptographically signed :counterparty-frozen-log"
         (let [roles-both [["m1" :gossip] ["m2" :ready]]
               transcript-both (attestation/create-transcript 0 pub-a pub-b roles-both (:private kp-a))
               roles-m2 [["m2" :ready]]
               transcript-m2 (attestation/create-transcript 0 pub-a pub-b roles-m2 (:private kp-a))
-              event-base {:type :submit-transcript
-                          :counterparty-frozen-ids #{"m2"}}
-              res-both (sm/handle-event state (assoc event-base :transcript transcript-both))
-              res-m2 (sm/handle-event state (assoc event-base :transcript transcript-m2))]
-          (is (= {} (:fault-strikes (:state res-both)))
-              "Transcript including non-intersected message m1 is rejected")
-          (is (= 1 (get-in (:state res-m2) [:fault-strikes pub-b]))
-              "Transcript matching bilateral intersection is accepted and strikes withholding peer"))))))
+              valid-cp-log (attestation/sign-frozen-log 0 pub-b ["m2"] (:private kp-b))
+              forged-key-log (attestation/sign-frozen-log 0 pub-b ["m2"] (:private (crypto/generate-keypair)))
+              wrong-epoch-log (attestation/sign-frozen-log 1 pub-b ["m2"] (:private kp-b))
+              wrong-peer-log (attestation/sign-frozen-log 0 pub-a ["m2"] (:private kp-a))
+              event-valid {:type :submit-transcript
+                           :counterparty-frozen-log valid-cp-log}
+              res-both (sm/handle-event state (assoc event-valid :transcript transcript-both))
+              res-m2 (sm/handle-event state (assoc event-valid :transcript transcript-m2))]
+
+          (testing "Rejects unauthenticated raw counterparty IDs without signed log"
+            (let [raw-res (sm/handle-event state {:type :submit-transcript
+                                                  :transcript transcript-m2
+                                                  :counterparty-frozen-ids #{"m2"}})]
+              (is (= {} (:fault-strikes (:state raw-res)))
+                  "Unauthenticated raw counterparty IDs must fail closed without striking")))
+
+          (testing "Rejects forged or mismatched counterparty frozen log"
+            (is (= {} (:fault-strikes (:state (sm/handle-event state {:type :submit-transcript
+                                                                      :transcript transcript-m2
+                                                                      :counterparty-frozen-log forged-key-log})))))
+            (is (= {} (:fault-strikes (:state (sm/handle-event state {:type :submit-transcript
+                                                                      :transcript transcript-m2
+                                                                      :counterparty-frozen-log wrong-epoch-log})))))
+            (is (= {} (:fault-strikes (:state (sm/handle-event state {:type :submit-transcript
+                                                                      :transcript transcript-m2
+                                                                      :counterparty-frozen-log wrong-peer-log}))))))
+
+          (testing "Reconciles with valid signed counterparty log"
+            (is (= {} (:fault-strikes (:state res-both)))
+                "Transcript including non-intersected message m1 is rejected")
+            (is (= 1 (get-in (:state res-m2) [:fault-strikes pub-b]))
+                "Transcript matching bilateral intersection is accepted and strikes withholding peer")))))))
 
 
 

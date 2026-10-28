@@ -249,3 +249,59 @@
                            (= #{pub-a} (:credit res))
                            (= pub-b (:strike res))))))))
 
+(deftest signed-frozen-log-test
+  (let [kp (crypto/generate-keypair)
+        pub-hex (basalt/bytes->hex (:public kp))
+        priv (:private kp)
+        epoch 5
+        frozen-ids ["msg-b" "msg-a" "msg-c"]
+        signed-log (attestation/sign-frozen-log epoch pub-hex frozen-ids priv)]
+    (testing "Produces a map with normalized peer, sorted frozen-ids, and hex signature"
+      (is (= epoch (:epoch signed-log)))
+      (is (= pub-hex (:peer signed-log)))
+      (is (= ["msg-a" "msg-b" "msg-c"] (:frozen-ids signed-log)))
+      (is (string? (:signature signed-log)))
+      (is (re-matches #"^[0-9a-fA-F]+$" (:signature signed-log))))
+
+    (testing "Valid signed frozen log passes verify-frozen-log"
+      (is (true? (attestation/verify-frozen-log signed-log))))
+
+    (testing "Rejects tampered epoch"
+      (is (false? (attestation/verify-frozen-log (assoc signed-log :epoch 6)))))
+
+    (testing "Rejects tampered peer"
+      (let [other-kp (crypto/generate-keypair)
+            other-pub (basalt/bytes->hex (:public other-kp))]
+        (is (false? (attestation/verify-frozen-log (assoc signed-log :peer other-pub))))))
+
+    (testing "Rejects tampered or modified frozen-ids"
+      (is (false? (attestation/verify-frozen-log (assoc signed-log :frozen-ids ["msg-a" "msg-b"]))))
+      (is (false? (attestation/verify-frozen-log (assoc signed-log :frozen-ids ["msg-a" "msg-b" "msg-c" "msg-d"]))))
+      (is (false? (attestation/verify-frozen-log (assoc signed-log :frozen-ids ["msg-a" "msg-b" "msg-tampered"])))))
+
+    (testing "Rejects corrupted signature"
+      (let [sig (:signature signed-log)
+            corrupted-sig (str (if (= \0 (first sig)) "f" "0") (subs sig 1))]
+        (is (false? (attestation/verify-frozen-log (assoc signed-log :signature corrupted-sig))))))
+
+    (testing "Rejects malformed inputs gracefully"
+      (is (false? (attestation/verify-frozen-log nil)))
+      (is (false? (attestation/verify-frozen-log {})))
+      (is (false? (attestation/verify-frozen-log (dissoc signed-log :signature))))
+      (is (false? (attestation/verify-frozen-log (assoc signed-log :epoch "not-an-int")))))))
+
+(defspec ^{:doc "Property: Cryptographic frozen log signatures strictly verify and fail on any tampering"}
+  prop-frozen-log-signature-integrity 50
+  (prop/for-all [epoch (gen/choose 0 1000)
+                 ids (gen/vector gen/string-alphanumeric 0 10)
+                 tamper-choice (gen/choose 0 3)]
+                (let [kp (crypto/generate-keypair)
+                      pub-hex (basalt/bytes->hex (:public kp))
+                      priv (:private kp)
+                      signed (attestation/sign-frozen-log epoch pub-hex ids priv)]
+                  (case tamper-choice
+                    0 (true? (attestation/verify-frozen-log signed))
+                    1 (false? (attestation/verify-frozen-log (assoc signed :epoch (inc epoch))))
+                    2 (false? (attestation/verify-frozen-log (assoc signed :frozen-ids (conj ids "tampered-mid"))))
+                    3 (let [sig (:signature signed)] (false? (attestation/verify-frozen-log (assoc signed :signature (str (if (= "0" (subs sig 0 1)) "f" "0") (subs sig 1))))))))))
+

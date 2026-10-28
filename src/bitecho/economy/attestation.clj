@@ -2,7 +2,8 @@
   "Bilateral epoch transcript attestations and deterministic node weight calculation."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [clojure.string :as str]))
 
 (def max-stake-multiplier
   "Maximum multiplier allowed for stake weighting (4.0x)."
@@ -215,3 +216,41 @@
 
         :else
         {:status :rejected :credit #{} :strike nil}))))
+
+(defn sign-frozen-log
+  "Signs a counterparty frozen message log for an epoch using privkey.
+   Canonical payload: (pr-str [epoch peer-hex sorted-ids]).
+   Returns {:epoch epoch :peer peer-hex :frozen-ids sorted-ids :signature sig-hex}."
+  [epoch peer-pubkey frozen-ids privkey]
+  (let [peer-hex (to-hex peer-pubkey)
+        sorted-ids (vec (sort (map str (or frozen-ids []))))
+        payload (.getBytes (pr-str [epoch peer-hex sorted-ids]) "UTF-8")
+        sig (crypto/sign (to-bytes privkey) payload)]
+    {:epoch epoch
+     :peer peer-hex
+     :frozen-ids sorted-ids
+     :signature (basalt/bytes->hex sig)}))
+
+(defn verify-frozen-log
+  "Verifies a cryptographically signed counterparty frozen log map.
+   Validates map shape, integer epoch, non-blank peer and signature,
+   and verifies that the signature matches the canonical payload under peer's public key."
+  [signed-log]
+  (try
+    (if (and (map? signed-log)
+             (integer? (:epoch signed-log))
+             (or (sequential? (:frozen-ids signed-log))
+                 (set? (:frozen-ids signed-log)))
+             (string? (:peer signed-log))
+             (not (str/blank? (:peer signed-log)))
+             (string? (:signature signed-log))
+             (not (str/blank? (:signature signed-log))))
+      (let [peer-hex (to-hex (:peer signed-log))
+            sorted-ids (vec (sort (map str (or (:frozen-ids signed-log) []))))
+            payload (.getBytes (pr-str [(:epoch signed-log) peer-hex sorted-ids]) "UTF-8")
+            pub-bytes (to-bytes peer-hex)
+            sig-bytes (to-bytes (:signature signed-log))]
+        (boolean (crypto/verify pub-bytes payload sig-bytes)))
+      false)
+    (catch Exception _
+      false)))

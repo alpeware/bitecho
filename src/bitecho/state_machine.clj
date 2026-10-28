@@ -814,34 +814,65 @@
             []
             candidate-ids)))
 
+(defn- resolve-counterparty-frozen-ids
+  "Resolves counterparty frozen message IDs for transcript submission.
+   Enforces cryptographic verification of :counterparty-frozen-log.
+   Rejects submission if unauthenticated counterparty IDs are provided,
+   or if the signed log is invalid / mismatched.
+   Returns {:ok? true :ids ids} or {:ok? false}."
+  [event transcript state]
+  (let [has-raw? (or (contains? event :counterparty-frozen-ids)
+                     (contains? event :peer-frozen-ids))
+        cp-log (or (:counterparty-frozen-log event)
+                   (:peer-frozen-log event))]
+    (cond
+      (and has-raw? (nil? cp-log))
+      {:ok? false}
+
+      (some? cp-log)
+      (let [epoch (:epoch transcript)
+            node-pub (:node-pubkey state)
+            pa (:peer-a transcript)
+            pb (:peer-b transcript)
+            expected-cp (if (= node-pub pb) pa pb)]
+        (if (and (attestation/verify-frozen-log cp-log)
+                 (= epoch (:epoch cp-log))
+                 (= expected-cp (:peer cp-log)))
+          {:ok? true :ids (set (:frozen-ids cp-log))}
+          {:ok? false}))
+
+      :else
+      {:ok? true :ids (get-in state [:frozen-epoch-messages (:epoch transcript)] #{})})))
+
 (defn- handle-submit-transcript
   "Handles bilateral transcript submission and dispute resolution.
    Evaluates the transcript against the frozen epoch message set,
    and records faults in :fault-strikes if a counterparty has faulted."
   [state event]
   (let [transcript (or (:transcript event) (:payload event) event)
-        epoch (:epoch transcript)
-        local-frozen-ids (get-in state [:frozen-epoch-messages epoch] #{})
-        counterparty-frozen-ids (or (:counterparty-frozen-ids event)
-                                    (:peer-frozen-ids event)
-                                    local-frozen-ids)
-        local-frozen-roles-map (get-in state [:frozen-epoch-message-roles epoch] {})
-        fallback-roles (or (:frozen-log-roles event)
-                           (:message-roles transcript)
-                           (:roles transcript)
-                           [])
-        auth-roles (derive-authoritative-roles local-frozen-ids local-frozen-roles-map fallback-roles)
-        frozen-log-roles (attestation/reconcile-message-roles
-                          local-frozen-ids
-                          counterparty-frozen-ids
-                          auth-roles)
-        dispute-res (attestation/evaluate-transcript-dispute transcript frozen-log-roles)
-        strike-peer (:strike dispute-res)
-        new-strikes (if strike-peer
-                      (update (or (:fault-strikes state) {}) strike-peer (fnil inc 0))
-                      (or (:fault-strikes state) {}))]
-    {:state (assoc state :fault-strikes new-strikes)
-     :commands []}))
+        resolved-cp (resolve-counterparty-frozen-ids event transcript state)]
+    (if-not (:ok? resolved-cp)
+      {:state state :commands []}
+      (let [epoch (:epoch transcript)
+            local-frozen-ids (get-in state [:frozen-epoch-messages epoch] #{})
+            counterparty-frozen-ids (:ids resolved-cp)
+            local-frozen-roles-map (get-in state [:frozen-epoch-message-roles epoch] {})
+            fallback-roles (or (:frozen-log-roles event)
+                               (:message-roles transcript)
+                               (:roles transcript)
+                               [])
+            auth-roles (derive-authoritative-roles local-frozen-ids local-frozen-roles-map fallback-roles)
+            frozen-log-roles (attestation/reconcile-message-roles
+                              local-frozen-ids
+                              counterparty-frozen-ids
+                              auth-roles)
+            dispute-res (attestation/evaluate-transcript-dispute transcript frozen-log-roles)
+            strike-peer (:strike dispute-res)
+            new-strikes (if strike-peer
+                          (update (or (:fault-strikes state) {}) strike-peer (fnil inc 0))
+                          (or (:fault-strikes state) {}))]
+        {:state (assoc state :fault-strikes new-strikes)
+         :commands []}))))
 
 (defn- handle-register-home-set
   "Registers a home set of nodes for Callee B for an epoch.
@@ -876,7 +907,7 @@
 (defn- handle-receive-offer-header
   "Processes an incoming offer header, validating home set membership and
    sequence monotonicity, and appending the generated DeliveryAck to pending vouchers.
-   Rejects offer header if callee is in ledger and underfunded for cumulative debit."
+   Rejects offer header if callee is absent from ledger or underfunded for cumulative debit."
   [state event]
   (let [callee (:callee event)
         home-node (:home-node event)
@@ -893,9 +924,8 @@
       {:state state :commands []}
       (let [price (:price home-set)
             cum-debit (* seq-num price)
-            callee-acct (get-in state [:ledger callee])
-            callee-bal (when callee-acct (or (:balance callee-acct) 0))]
-        (if (and callee-acct (< callee-bal cum-debit))
+            callee-bal (or (get-in state [:ledger callee :balance]) 0)]
+        (if (< callee-bal cum-debit)
           {:state state :commands []}
           (let [offer-ctx (assoc event
                                  :last-seq last-seq
