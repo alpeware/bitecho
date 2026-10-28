@@ -34,6 +34,8 @@
    :basalt-max-view-size  20
    ;; Epochs before a gossip message expires from all caches
    :gossip-ttl-epochs     10
+   ;; Epochs before a frozen log message snapshot is evicted (7 days of 1-hour epochs)
+   :frozen-log-retention-epochs 168
 
    ;; Sieve Echo sample (E, Ê)
    :echo-sample-size      10

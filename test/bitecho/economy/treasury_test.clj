@@ -156,7 +156,32 @@
         ;; carry-dust 7 -> m-t = 507.
         (is (= 500 (:demand-gate res-dust)))
         (is (= 507 (:m-t res-dust)))
-        (is (= 507 (:epoch-mint res-dust)))))))
+        (is (= 507 (:epoch-mint res-dust)))))
+
+    (testing "Conservation identity holds and active pools have zero unclaimed-mint"
+      (is (= 0 (:unclaimed-mint res)))
+      (is (= (:epoch-mint res) (+ (:actual-minted res) (:mint-dust res) (or (:unclaimed-mint res) 0)))))
+
+    (testing "Empty validator pool produces zero streamlet-dust and allocates full streamlet share to unclaimed-mint"
+      (let [ctx-no-val (assoc ctx :validators [])
+            res-no-val (treasury/process-treasury-epoch ctx-no-val)]
+        (is (= {} (:streamlet-shares res-no-val)))
+        (is (= 2000 (:m-streamlet res-no-val)))
+        (is (= 2000 (:unclaimed-mint res-no-val)))
+        ;; mesh-nodes 8000 divided 2/3 (5333) and 1/3 (2666) sums to 7999 with 1 rounding dust
+        (is (= 7999 (:actual-minted res-no-val)))
+        (is (= 1 (:mint-dust res-no-val)))
+        (is (= (:epoch-mint res-no-val)
+               (+ (:actual-minted res-no-val) (:mint-dust res-no-val) (or (:unclaimed-mint res-no-val) 0))))))
+
+    (testing "Empty validator and mesh pools produce zero mint-dust and entire emission is unclaimed-mint"
+      (let [ctx-empty (assoc ctx :validators [] :mesh-nodes {})
+            res-empty (treasury/process-treasury-epoch ctx-empty)]
+        (is (= 0 (:actual-minted res-empty)))
+        (is (= 0 (:mint-dust res-empty)))
+        (is (= (:epoch-mint res-empty) (:unclaimed-mint res-empty)))
+        (is (= (:epoch-mint res-empty)
+               (+ (:actual-minted res-empty) (:mint-dust res-empty) (or (:unclaimed-mint res-empty) 0))))))))
 
 (defspec ^{:doc "Property: In every epoch M_t <= 0.5 * R_trailing and M_streamlet + M_mesh == M_t"}
   prop-epoch-mint-and-split-invariants 50
@@ -309,6 +334,19 @@
         (is (= 980 (:total-minted res)))
         (is (= 20 (:mint-dust res)))
         (is (= 20 (get-in res [:epoch-mint-dust 7])))))
+
+    (testing "apply-epoch-mint uses explicit :mint-dust when non-negative integer even if empty pool left gap"
+      (let [allocs {"mesh1" 795}
+            sig (treasury/sign-epoch-mint t-priv 8 allocs)
+            res (treasury/apply-epoch-mint base-state {:epoch 8
+                                                       :epoch-gate 1000
+                                                       :mint-dust 5
+                                                       :allocations allocs
+                                                       :treasury-pubkey t-pub
+                                                       :signature sig})]
+        (is (= 795 (:total-minted res)))
+        (is (= 5 (:mint-dust res)))
+        (is (= 5 (get-in res [:epoch-mint-dust 8])))))
 
     (testing "Double-mint of same epoch is rejected in full"
       (let [allocs {"node1" 100}
@@ -596,5 +634,29 @@
                        (= dust (get-in res [:epoch-mint-dust 1]))
                        (= amt (:total-minted res))))))
 
-
-
+(defspec ^{:doc "Property: Active-pool mint dust and unclaimed mint conservation identity (+ actual-minted mint-dust unclaimed-mint) == epoch-mint"}
+  prop-active-pool-mint-dust-conservation 50
+  (prop/for-all [burns (gen/vector (gen/choose 0 10000) 1 10)
+                 has-validators? gen/boolean
+                 has-mesh? gen/boolean]
+                (let [ctx {:trailing-burns burns
+                           :n-epochs (count burns)
+                           :validators (if has-validators? ["v1" "v2" "v3"] [])
+                           :mesh-nodes (if has-mesh? {"m1" 1.0 "m2" 2.0} {})}
+                      res (treasury/process-treasury-epoch ctx)
+                      actual-minted (:actual-minted res)
+                      mint-dust (:mint-dust res)
+                      unclaimed-mint (or (:unclaimed-mint res) 0)
+                      epoch-mint (:epoch-mint res)]
+                  (and (= epoch-mint (+ actual-minted mint-dust unclaimed-mint))
+                       (>= mint-dust 0)
+                       (>= actual-minted 0)
+                       (>= unclaimed-mint 0)
+                       (if (and (not has-validators?) (not has-mesh?))
+                         (and (= 0 actual-minted)
+                              (= 0 mint-dust)
+                              (= epoch-mint unclaimed-mint))
+                         true)
+                       (if (and has-validators? has-mesh?)
+                         (= 0 unclaimed-mint)
+                         true)))))

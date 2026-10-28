@@ -1092,7 +1092,8 @@
       (is (= {} (:home-sets state)))
       (is (= {} (:voucher-seqs state)))
       (is (= [] (:pending-vouchers state)))
-      (is (= #{} (:settled-voucher-tuples state)))))
+      (is (= #{} (:settled-voucher-tuples state)))
+      (is (= [] (:failed-vouchers state)))))
 
   (testing "handle-event :register-home-set registers home set at fixed price per epoch"
     (let [callee "callee-b"
@@ -1708,5 +1709,175 @@
             (is (= 1 (get-in (:state res-m2) [:fault-strikes pub-b]))
                 "Transcript matching bilateral intersection is accepted and strikes withholding peer")))))))
 
+(deftest test-voucher-settlement-failed-vouchers-tracking
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        callee-priv (:private callee-kp)
+        home-node "home-node-settle"
+        price 15
+        candidates [{:node-id home-node :price price}]
+        ledger {callee-pub (account/map->AccountState {:balance 100 :seq 0 :deps []})
+                home-node (account/map->AccountState {:balance 10 :seq 0 :deps []})}
+        init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger ledger))
+                   (assoc :epoch 0)
+                   (assoc-in [:home-sets [callee-pub 0]]
+                             {:status :ok :home-nodes candidates :price price :degraded? false}))
+        ev1 {:type :receive-offer-header
+             :caller "caller"
+             :callee callee-pub
+             :callee-privkey callee-priv
+             :home-node home-node
+             :offer-hash "hash-a"
+             :seq 1}
+        ev2 (assoc ev1 :seq 2 :offer-hash "hash-b")
+        s1 (:state (sm/handle-event init-s ev1))
+        s2 (:state (sm/handle-event s1 ev2))]
 
+    (testing "Depleted callee balance mid-epoch fails closed and records unpaid voucher in :failed-vouchers"
+      (let [depleted-state (assoc-in s2 [:ledger callee-pub :balance] 10)
+            tick-res (sm/handle-event depleted-state {:type :tick :rng (java.util.Random. 42)})
+            new-state (:state tick-res)
+            new-ledger (:ledger new-state)]
+        (is (= 1 (:epoch new-state)))
+        (is (= 10 (:balance (get new-ledger callee-pub))))
+        (is (= 10 (:balance (get new-ledger home-node))))
+        (is (not (contains? (:settled-voucher-tuples new-state) [callee-pub home-node 0])))
+        (is (= 1 (count (:failed-vouchers new-state))))
+        (let [failed (first (:failed-vouchers new-state))]
+          (is (= :insufficient-callee-balance (:reason failed)))
+          (is (= 30 (:debit failed)))
+          (is (= 10 (:callee-balance failed)))
+          (is (= 0 (:epoch failed))))))
 
+    (testing "Invalid voucher failing cryptographic verification records failure in :failed-vouchers"
+      (let [stale-ack (first (:pending-vouchers s2))
+            corrupted-ack (assoc stale-ack :signature (byte-array 64) :epoch 0)
+            corrupted-state (assoc init-s :pending-vouchers [corrupted-ack])
+            tick-res (sm/handle-event corrupted-state {:type :tick :rng (java.util.Random. 42)})
+            new-state (:state tick-res)]
+        (is (= 1 (count (:failed-vouchers new-state))))
+        (let [failed (first (:failed-vouchers new-state))]
+          (is (contains? #{:invalid-voucher :signature-verification-failed :invalid-signature} (:reason failed)))
+          (is (= 0 (:epoch failed))))))))
+
+(deftest test-state-machine-bounded-frozen-retention
+  (testing "handle-tick bounds frozen epoch message retention to :frozen-log-retention-epochs"
+    (let [cfg (assoc config/default-config :gossip-ttl-epochs 2 :frozen-log-retention-epochs 4)
+          state (assoc (sm/init-state [] "my-node" cfg)
+                       :epoch 0
+                       :epoch-to-messages {0 #{"msg-ep0"}}
+                       :epoch-to-message-roles {0 {"msg-ep0" :gossip}})
+          s3 (loop [s state step 0]
+               (if (>= step 3) s
+                   (recur (:state (sm/handle-event s {:type :tick :rng (java.util.Random. 42)})) (inc step))))]
+      (is (= 3 (:epoch s3)))
+      (is (nil? (get-in s3 [:epoch-to-messages 0])) "Epoch 0 active messages pruned past TTL")
+      (is (= #{"msg-ep0"} (get-in s3 [:frozen-epoch-messages 0])) "Epoch 0 frozen messages retained within retention window (4)")
+      (is (= {"msg-ep0" :gossip} (get-in s3 [:frozen-epoch-message-roles 0])) "Epoch 0 frozen roles retained within retention window (4)")
+      (let [s5 (loop [s s3 step 3]
+                 (if (>= step 5) s
+                     (recur (:state (sm/handle-event s {:type :tick :rng (java.util.Random. 42)})) (inc step))))]
+        (is (= 5 (:epoch s5)))
+        (is (nil? (get-in s5 [:frozen-epoch-messages 0])) "Epoch 0 frozen messages evicted past retention window (4)")
+        (is (nil? (get-in s5 [:frozen-epoch-message-roles 0])) "Epoch 0 frozen roles evicted past retention window (4)")))))
+
+(deftest test-tick-empty-recipient-pools-do-not-accumulate-mint-dust
+  (testing "Empty validator and mesh pools produce zero mint-dust and do not bank emission reservoir"
+    (let [t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          cfg (assoc config/default-config
+                     :treasury-pubkey t-pub
+                     :treasury-privkey t-priv
+                     :treasury-trailing-epochs 1
+                     :validators []
+                     :mesh-nodes {})
+          s0 (assoc (sm/init-state [] "my-node" cfg)
+                    :epoch 0
+                    :epoch-burns {0 1000})
+          t1-res (sm/handle-event s0 {:type :tick :rng (java.util.Random. 42)})
+          s1 (:state t1-res)]
+      (is (= 1 (:epoch s1)))
+      (is (= 0 (:total-minted s1)))
+      (is (= 0 (:mint-dust s1)))
+      (is (= 0 (get-in s1 [:epoch-mint-dust 1])))
+
+      (let [val-pub1 "v1"
+            mesh-pub "m1"
+            s1-active (-> s1
+                          (assoc :validators [val-pub1])
+                          (assoc :mesh-nodes {mesh-pub 1.0})
+                          (assoc-in [:epoch-burns 1] 1000))
+            t2-res (sm/handle-event s1-active {:type :tick :rng (java.util.Random. 42)})
+            s2 (:state t2-res)]
+        (is (= 2 (:epoch s2)))
+        (is (= 500 (:total-minted s2)) "Total minted reflects ONLY epoch 1 demand gate (500), not banked epoch 0 (1000)!")
+        (is (= 0 (:mint-dust s2)))))))
+
+(defspec ^{:doc "Property: Failed vouchers are strictly tracked in :failed-vouchers when callee balance is depleted mid-epoch, and settlement fails closed"}
+  prop-failed-voucher-tracking-and-isolation 50
+  (prop/for-all [price (gen/choose 1 50)
+                 seq-num (gen/choose 1 10)
+                 callee-bal (gen/choose 0 500)]
+                (let [cum-debit (* seq-num price)
+                      callee-kp (crypto/generate-keypair)
+                      callee-pub (basalt/bytes->hex (:public callee-kp))
+                      callee-priv (:private callee-kp)
+                      home-node "home-node"
+                      candidates [{:node-id home-node :price price}]
+                      funded-ledger {callee-pub (account/map->AccountState {:balance (+ cum-debit 1000) :seq 0 :deps []})
+                                     home-node (account/map->AccountState {:balance 50 :seq 0 :deps []})}
+                      init-s (-> (sm/init-state [] "my-node" (assoc config/default-config :genesis-ledger funded-ledger))
+                                 (assoc :epoch 0)
+                                 (assoc-in [:home-sets [callee-pub 0]]
+                                           {:status :ok :home-nodes candidates :price price :degraded? false}))
+                      ev {:type :receive-offer-header
+                          :caller "caller"
+                          :callee callee-pub
+                          :callee-privkey callee-priv
+                          :home-node home-node}
+                      s1 (reduce (fn [st s]
+                                   (:state (sm/handle-event st (assoc ev :seq s :offer-hash (str "hash-failed-v-" s)))))
+                                 init-s
+                                 (range 1 (inc seq-num)))
+                      mid-state (assoc-in s1 [:ledger callee-pub :balance] callee-bal)
+                      post-state (:state (sm/handle-event mid-state {:type :tick :rng (java.util.Random. 17)}))
+                      post-ledger (:ledger post-state)]
+                  (if (< callee-bal cum-debit)
+                    (and (= callee-bal (:balance (get post-ledger callee-pub)))
+                         (= 50 (:balance (get post-ledger home-node)))
+                         (not (contains? (:settled-voucher-tuples post-state) [callee-pub home-node 0]))
+                         (= 1 (count (:failed-vouchers post-state)))
+                         (= :insufficient-callee-balance (:reason (first (:failed-vouchers post-state)))))
+                    (and (= (- callee-bal cum-debit) (:balance (get post-ledger callee-pub)))
+                         (= (+ 50 cum-debit) (:balance (get post-ledger home-node)))
+                         (contains? (:settled-voucher-tuples post-state) [callee-pub home-node 0])
+                         (= 0 (count (:failed-vouchers post-state))))))))
+
+(defspec ^{:doc "Property: Frozen epoch logs are strictly bounded by :frozen-log-retention-epochs"}
+  prop-bounded-frozen-log-retention 50
+  (prop/for-all [retention (gen/choose 2 6)
+                 ticks (gen/choose 5 15)]
+                (let [cfg (assoc config/default-config
+                                 :gossip-ttl-epochs 1
+                                 :frozen-log-retention-epochs retention)
+                      init-s (assoc (sm/init-state [] "my-node" cfg)
+                                    :epoch 0
+                                    :epoch-to-messages {0 #{"m0"}}
+                                    :epoch-to-message-roles {0 {"m0" :gossip}})
+                      final-s (loop [s init-s step 0]
+                                (if (>= step ticks) s
+                                    (let [curr-ep (:epoch s)
+                                          s-with-msg (-> s
+                                                         (assoc-in [:epoch-to-messages curr-ep] #{(str "m" curr-ep)})
+                                                         (assoc-in [:epoch-to-message-roles curr-ep] {(str "m" curr-ep) :gossip}))]
+                                      (recur (:state (sm/handle-event s-with-msg {:type :tick :rng (java.util.Random. step)}))
+                                             (inc step)))))
+                      final-ep (:epoch final-s)
+                      cutoff (- final-ep retention)
+                      frozen-eps (keys (:frozen-epoch-messages final-s))
+                      frozen-role-eps (keys (:frozen-epoch-message-roles final-s))]
+                  (and (every? #(>= % cutoff) frozen-eps)
+                       (every? #(>= % cutoff) frozen-role-eps)
+                       (<= (count frozen-eps) (inc retention))
+                       (<= (count frozen-role-eps) (inc retention))))))

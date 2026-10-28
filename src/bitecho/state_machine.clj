@@ -88,6 +88,7 @@
       :voucher-seqs {}
       :pending-vouchers []
       :settled-voucher-tuples #{}
+      :failed-vouchers []
       :skipped-custody-allocations []
       :ledger (or genesis-ledger {})})))
 
@@ -117,7 +118,7 @@
 
 (defn- settle-single-voucher
   "Settles a single compacted DeliveryAck voucher against state, updating ledger and settled tuples.
-   Fails closed: requires callee balance >= debit; rejects settlement and returns acc if underfunded."
+   Fails closed: requires callee balance >= debit; rejects settlement and records failure in :failed-vouchers."
   [acc ack closing-epoch]
   (let [callee (:callee ack)
         home-node (:home-node ack)
@@ -142,8 +143,16 @@
             (-> acc
                 (assoc :ledger new-ledger)
                 (update :settled-voucher-tuples conj tuple)))
-          acc))
-      acc)))
+          (update acc :failed-vouchers (fnil conj [])
+                  {:voucher ack
+                   :epoch closing-epoch
+                   :debit debit
+                   :callee-balance callee-bal
+                   :reason :insufficient-callee-balance})))
+      (update acc :failed-vouchers (fnil conj [])
+              {:voucher ack
+               :epoch closing-epoch
+               :reason (or (:reason v-res) :invalid-voucher)}))))
 
 (defn- apply-epoch-voucher-settlement
   "Compacts and settles pending DeliveryAck vouchers for the closing epoch."
@@ -152,7 +161,10 @@
         compacted (bundle/compact-vouchers pending closing-epoch)
         settled-tuples (or (:settled-voucher-tuples state) #{})
         ledger (or (:ledger state) {})
-        init-acc (assoc state :settled-voucher-tuples settled-tuples :ledger ledger)
+        init-acc (assoc state
+                        :settled-voucher-tuples settled-tuples
+                        :ledger ledger
+                        :failed-vouchers [])
         final-acc (reduce (fn [acc ack] (settle-single-voucher acc ack closing-epoch))
                           init-acc
                           compacted)
@@ -279,9 +291,13 @@
      :subscribe-commands subscribe-commands}))
 
 (defn- prune-expired-tick-state
-  "Prunes state message and role entries for epochs older than the TTL cutoff."
-  [state new-epoch gossip-ttl-epochs]
-  (let [cutoff-epoch (- new-epoch gossip-ttl-epochs)
+  "Prunes state message and role entries for epochs older than the TTL cutoff,
+   and bounds frozen epoch message and role snapshots to frozen-log-retention-epochs."
+  [state new-epoch cfg]
+  (let [gossip-ttl-epochs (or (:gossip-ttl-epochs cfg) 10)
+        cutoff-epoch (- new-epoch gossip-ttl-epochs)
+        frozen-retention (or (:frozen-log-retention-epochs cfg) 168)
+        frozen-cutoff (- new-epoch frozen-retention)
         epoch-to-messages (or (:epoch-to-messages state) {})
         expired-epochs (filterv #(< % cutoff-epoch) (keys epoch-to-messages))
         expired-ids (reduce (fn [acc ep] (set/union acc (get epoch-to-messages ep #{})))
@@ -304,7 +320,10 @@
         pruned-delivery-vote-counts (reduce dissoc (or (:delivery-vote-counts state) {}) expired-ids)
         pruned-sieve-delivered-set (set/difference (:sieve-delivered-set state) expired-ids)
         pruned-local-ready-set (set/difference (:local-ready-set state) expired-ids)
-        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)]
+        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)
+        expired-frozen-epochs (filterv #(< % frozen-cutoff) (keys (or (:frozen-epoch-messages state) {})))
+        pruned-frozen-messages (reduce dissoc (or (:frozen-epoch-messages state) {}) expired-frozen-epochs)
+        pruned-frozen-roles (reduce dissoc (or (:frozen-epoch-message-roles state) {}) expired-frozen-epochs)]
     (assoc state
            :epoch-to-messages pruned-epoch-to-messages
            :epoch-to-message-roles pruned-epoch-to-roles
@@ -319,13 +338,14 @@
            :delivery-vote-counts pruned-delivery-vote-counts
            :sieve-delivered-set pruned-sieve-delivered-set
            :local-ready-set pruned-local-ready-set
-           :delivered-set pruned-delivered-set)))
+           :delivered-set pruned-delivered-set
+           :frozen-epoch-messages pruned-frozen-messages
+           :frozen-epoch-message-roles pruned-frozen-roles)))
 
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
   (let [cfg (:config state)
-        gossip-ttl-epochs (:gossip-ttl-epochs cfg)
         new-epoch (inc (or (:epoch state) 0))
         epoch-entropy (derive-epoch-entropy state cfg)
         view (:basalt-view state)
@@ -376,7 +396,7 @@
                           :global-echo-sample (:echo-sample sampling-res)
                           :global-ready-sample (:ready-sample sampling-res)
                           :global-delivery-sample (:delivery-sample sampling-res))
-        pruned-state (prune-expired-tick-state base-state new-epoch gossip-ttl-epochs)
+        pruned-state (prune-expired-tick-state base-state new-epoch cfg)
         tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)]
     {:state (apply-epoch-treasury-boundary tick-state-settled new-epoch)
      :commands commands}))

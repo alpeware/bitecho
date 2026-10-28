@@ -265,8 +265,14 @@
         streamlet-shares (distribute-shares m-streamlet (:validators treasury-ctx))
         mesh-shares (distribute-shares m-mesh (:mesh-nodes treasury-ctx))
         all-mint-shares (merge-with + streamlet-shares mesh-shares)
-        actual-minted (reduce + 0 (vals all-mint-shares))
-        mint-dust (- m-t actual-minted)
+        streamlet-minted (reduce + 0 (vals streamlet-shares))
+        mesh-minted (reduce + 0 (vals mesh-shares))
+        streamlet-dust (if (seq streamlet-shares) (- m-streamlet streamlet-minted) 0)
+        mesh-dust (if (seq mesh-shares) (- m-mesh mesh-minted) 0)
+        unclaimed-mint (+ (if (seq streamlet-shares) 0 m-streamlet)
+                          (if (seq mesh-shares) 0 m-mesh))
+        actual-minted (+ streamlet-minted mesh-minted)
+        mint-dust (+ streamlet-dust mesh-dust)
         c-pk-raw (:custody-pubkey treasury-ctx)
         custody-pub (when c-pk-raw (if (string? c-pk-raw) c-pk-raw (basalt/bytes->hex c-pk-raw)))
         ledger (:ledger treasury-ctx)
@@ -285,6 +291,7 @@
      :demand-gate demand-gate
      :actual-minted actual-minted
      :mint-dust mint-dust
+     :unclaimed-mint unclaimed-mint
      :m-streamlet m-streamlet
      :m-mesh m-mesh
      :streamlet-shares streamlet-shares
@@ -419,8 +426,9 @@
 
           ;; Valid: credit allocations to ledger
           :else
-          (let [dust (or (:mint-dust mint-ctx)
-                         (if epoch-gate (max 0 (- epoch-gate actual-minted)) 0))
+          (let [dust (if (and (integer? (:mint-dust mint-ctx)) (not (neg? (:mint-dust mint-ctx))))
+                       (:mint-dust mint-ctx)
+                       (if epoch-gate (max 0 (- epoch-gate actual-minted)) 0))
                 new-ledger (account/apply-mint (or (:ledger state) {}) allocations)]
             (-> state
                 (assoc :ledger new-ledger)
