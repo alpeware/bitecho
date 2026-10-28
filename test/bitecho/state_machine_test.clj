@@ -436,6 +436,24 @@
           (is (= poor-state (:state inbound-res)))
           (is (empty? (:commands inbound-res)))))
 
+      (testing "Inbound gossip from unknown sender absent from :ledger is rejected"
+        (let [unknown-kp (crypto/generate-keypair)
+              unknown-pub (basalt/bytes->hex (:public unknown-kp))
+              unknown-priv (:private unknown-kp)
+              unknown-raw (sieve/wrap-message (.getBytes "hello unknown" "UTF-8")
+                                              unknown-priv
+                                              (:public unknown-kp)
+                                              150)
+              unknown-msg (assoc unknown-raw :message-id "msg-unknown-1")
+              inbound-res (sm/handle-event state {:type :receive-gossip
+                                                  :message unknown-msg
+                                                  :rng (java.util.Random. 42)})]
+          (is (= state (:state inbound-res)))
+          (is (empty? (:commands inbound-res)))
+          (is (nil? (get-in (:state inbound-res) [:ledger unknown-pub])))
+          (is (nil? (get-in (:state inbound-res) [:epoch-burns 0])))
+          (is (not (contains? (:contagion-known-ids (:state inbound-res)) "msg-unknown-1")))))
+
       (testing "Inbound gossip where sender is local node (node-pubkey) does not deduct again"
         (let [self-cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})})
               self-state (assoc (sm/init-state [peer] sender-pub self-cfg) :epoch 0)
@@ -445,11 +463,12 @@
           (is (nil? (get-in new-state [:epoch-burns 0])))
           (is (contains? (:contagion-known-ids new-state) (:message-id msg))))))))
 
-(defspec ^{:doc "Property: Inbound gossip enforces burn deduction and conservation for funded senders, and drops underfunded or tampered gossip"}
+(defspec ^{:doc "Property: Inbound gossip enforces burn deduction and conservation for funded senders, and drops underfunded, unseeded, or tampered gossip"}
   prop-inbound-gossip-burn-enforcement 50
   (prop/for-all [initial-balance (gen/choose 0 500)
                  burn-amt (gen/choose 100 300)
-                 tamper-burn? gen/boolean]
+                 tamper-burn? gen/boolean
+                 unseeded-sender? gen/boolean]
                 (let [peer {:ip "127.0.0.1" :port 8000 :pubkey (byte-array 32) :hash "peer-a"}
                       kp (crypto/generate-keypair)
                       sender-pub (basalt/bytes->hex (:public kp))
@@ -458,21 +477,27 @@
                       raw-msg (sieve/wrap-message payload sender-priv (:public kp) burn-amt)
                       msg (assoc raw-msg :message-id "msg-prop-1")
                       final-msg (if tamper-burn? (assoc msg :burn-amount (+ burn-amt 50)) msg)
-                      cfg (assoc config/default-config :genesis-ledger {sender-pub (account/map->AccountState {:balance initial-balance :seq 0 :deps []})})
+                      genesis-ledger (if unseeded-sender?
+                                       {}
+                                       {sender-pub (account/map->AccountState {:balance initial-balance :seq 0 :deps []})})
+                      cfg (assoc config/default-config :genesis-ledger genesis-ledger)
                       state (assoc (sm/init-state [peer] "node-local" cfg) :epoch 0)
                       res (sm/handle-event state {:type :receive-gossip :message final-msg :rng (java.util.Random. 42)})
                       new-state (:state res)
                       sender-bal (or (:balance (get-in new-state [:ledger sender-pub])) 0)
                       epoch-burns (or (get-in new-state [:epoch-burns 0]) 0)]
-                  (if (and (not tamper-burn?) (>= initial-balance burn-amt))
+                  (if (and (not unseeded-sender?) (not tamper-burn?) (>= initial-balance burn-amt))
                     (and (= (- initial-balance burn-amt) sender-bal)
                          (= burn-amt epoch-burns)
                          (contains? (:contagion-known-ids new-state) "msg-prop-1")
                          (seq (:commands res)))
-                    (and (= initial-balance sender-bal)
+                    (and (= (if unseeded-sender? 0 initial-balance) sender-bal)
                          (zero? epoch-burns)
                          (= state new-state)
-                         (empty? (:commands res)))))))
+                         (empty? (:commands res))
+                         (if unseeded-sender?
+                           (nil? (get-in new-state [:ledger sender-pub]))
+                           true))))))
 
 (defspec ^{:doc "Property: Total initial supply equals final ledger supply plus total accumulated epoch burns."}
   prop-state-machine-burn-accounting 50

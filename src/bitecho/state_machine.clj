@@ -162,8 +162,7 @@
                :reason (or (:reason v-res) (:error v-res) :invalid-voucher)}))))
 
 (defn- apply-epoch-voucher-settlement
-  "Compacts and settles pending DeliveryAck vouchers across the [min-epoch, closing-epoch] window,
-   retrying previously underfunded vouchers and evicting vouchers older than min-epoch."
+  "Compacts pending vouchers from epoch 0 through closing-epoch and settles valid vouchers within [min-epoch, closing-epoch], recording and evicting expired vouchers."
   [state closing-epoch]
   (let [pending (or (:pending-vouchers state) [])
         retention (or (get-in state [:config :frozen-log-retention-epochs]) 168)
@@ -662,10 +661,9 @@
             new-message? (some? (:message gossip-result))
             sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
             node-pk (when-let [np (:node-pubkey state)] (if (string? np) np (basalt/bytes->hex np)))
-            sender-in-ledger? (and sender (get-in state [:ledger sender]))
-            burn-deduction (when (and new-message? sender-in-ledger? (not= sender node-pk))
+            burn-deduction (when (and new-message? (not= sender node-pk) sender)
                              (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
-        (if (and new-message? sender-in-ledger? (not= sender node-pk) (nil? burn-deduction))
+        (if (and new-message? (not= sender node-pk) (nil? burn-deduction))
           {:state state :commands []}
           (let [current-epoch (or (:epoch state) 0)
                 state-with-burn (if burn-deduction
