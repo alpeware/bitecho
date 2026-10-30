@@ -1,15 +1,29 @@
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}
         org.clojure/core.async {:mvn/version "1.9.829-alpha2"}
-        com.taoensso/nippy {:mvn/version "3.6.0"}}
- :aliases {:simulate {:extra-paths ["dev"]
+        com.taoensso/nippy {:mvn/version "3.6.0"}
+        alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
+                                  :git/sha "1e4529875310311d1902094d25ad5ebb824665d1"}}
+ :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                            "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
+                            "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]
+                 :main-opts ["-m" "bitecho.main"]}
+           :simulate {:extra-paths ["dev"]
                       :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"
+                                 "--enable-native-access=ALL-UNNAMED"
+                                 "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
+                                 "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"
                                  "-Dclojure.core.async.pool-size=32"]}
            :test {:extra-paths ["test"]
                   :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}
-                  :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"]}
+                  :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"
+                             "--enable-native-access=ALL-UNNAMED"
+                             "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
+                             "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]}
            :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.01.19"}
                                  org.clojure/test.check {:mvn/version "1.1.1"}}
                   :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "dev/bitecho/simulator"]}
            :format {:replace-deps {dev.weavejester/cljfmt {:mvn/version "0.16.1"}}
-                    :main-opts ["-m" "cljfmt.main" "fix" "src" "test" "dev/bitecho/simulator"]}}}
+                    :main-opts ["-m" "cljfmt.main" "fix" "src" "test" "dev/bitecho/simulator"]}
+           :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}}
+                   :ns-default build}}}

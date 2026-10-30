@@ -13,6 +13,7 @@
             [bitecho.rendezvous.core-test]
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]
+            [bitecho.shell.mesh-test]
             [bitecho.sieve.core-test]
             [bitecho.simulator-config-test]
             [bitecho.state-machine-fuzz-test]
