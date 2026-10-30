@@ -2,7 +2,16 @@
   "Streamlet core data structures and pure functions."
   (:require [bitecho.crypto :as crypto]))
 
-(defrecord Block [epoch parent-hash payload proposer])
+(defrecord Block [epoch parent-hash payload proposer signature])
+
+#_{:clj-kondo/ignore [:redefined-var]}
+(defn ->Block
+  "Constructs a Block record.
+   Supports 4-arity (signature defaults to nil) and 5-arity."
+  ([epoch parent-hash payload proposer]
+   (Block. epoch parent-hash payload proposer nil))
+  ([epoch parent-hash payload proposer signature]
+   (Block. epoch parent-hash payload proposer signature)))
 
 (defrecord Vote [block-hash epoch voter-signature])
 
@@ -25,6 +34,28 @@
   [^bytes ba]
   (apply str (map #(format "%02x" %) ba)))
 
+(defn block-signing-bytes
+  "Serializes block contents excluding signature for Ed25519 signing."
+  [block]
+  (.getBytes (pr-str [(:epoch block) (:parent-hash block) (:payload block) (:proposer block)]) "UTF-8"))
+
+(defn sign-block
+  "Signs a block with proposer's private key bytes, attaching the hex signature."
+  [block ^bytes private-key]
+  (let [sig-bytes (crypto/sign private-key (block-signing-bytes block))]
+    (assoc block :signature (bytes->hex sig-bytes))))
+
+(defn verify-block-signature
+  "Verifies the Ed25519 signature of a block against the proposer's public key bytes."
+  [block ^bytes proposer-pubkey-bytes]
+  (boolean
+   (when (and (map? block) (string? (:signature block)) (some? proposer-pubkey-bytes))
+     (try
+       (crypto/verify proposer-pubkey-bytes
+                      (block-signing-bytes block)
+                      (hex->bytes (:signature block)))
+       (catch Exception _ false)))))
+
 (defn hash-block
   "Serializes a block to a string, hashes it via SHA-256, and returns a hex string."
   [block]
@@ -33,12 +64,19 @@
 (defn propose-block
   "Proposes a block for a given epoch.
    Uses :node-pubkey for the proposer, :head-hash (defaulting to 'genesis') for parent-hash,
-   and :mempool (defaulting to []) for payload."
+   and :mempool (defaulting to []) for payload.
+   Signs the block if a private key is present in state."
   [state epoch]
-  (->Block epoch
-           (get state :head-hash "genesis")
-           (get state :mempool [])
-           (get state :node-pubkey)))
+  (let [raw-block (->Block epoch
+                           (get state :head-hash "genesis")
+                           (get state :mempool [])
+                           (get state :node-pubkey))
+        priv-key (or (get-in state [:keypair :private])
+                     (get-in state [:keys :private])
+                     (:node-private-key state))]
+    (if priv-key
+      (sign-block raw-block priv-key)
+      raw-block)))
 
 (defn chain-length
   "Calculates the length of the chain ending at block-hash.
@@ -169,6 +207,9 @@
     (seq (:peers-map state))
     (vec (sort (keys (:peers-map state))))
 
+    (and (contains? state :peers-map) (empty? (:peers-map state)))
+    []
+
     (:node-pubkey state)
     [(:node-pubkey state)]
 
@@ -181,6 +222,52 @@
   (or (:total-nodes state)
       (when (seq peer-hexes) (count peer-hexes))
       1))
+
+(defn resolve-peer-pubkey-bytes
+  "Resolves the peer's public key byte array strictly from :peers-map in state.
+   Returns nil if peer-hex is not present in :peers-map."
+  [state peer-hex]
+  (when (and (map? (:peers-map state)) (contains? (:peers-map state) peer-hex))
+    (let [entry (get-in state [:peers-map peer-hex])]
+      (cond
+        (bytes? entry) entry
+        (string? entry) (try (hex->bytes entry) (catch Exception _ nil))
+        :else nil))))
+
+(defn valid-block-proposal?
+  "Validates a block proposal event against state:
+   - event and block must be maps
+   - :peers-map must be non-empty
+   - epoch must be a positive integer
+   - proposer must be a string and in :peers-map
+   - proposer must match expected round-robin leader for epoch
+   - if :sender is present on event, must equal (:proposer block)
+   - proposer signature must be valid Ed25519 signature verified by proposer's pubkey bytes"
+  [state event]
+  (boolean
+   (when (and (map? state) (map? event) (map? (:block event)))
+     (let [block (:block event)
+           peer-hexes (extract-peer-hexes state)
+           total-nodes (total-node-count state peer-hexes)
+           epoch (:epoch block)
+           proposer (:proposer block)
+           sender (:sender event)
+           sender-hex (cond
+                        (string? sender) sender
+                        (bytes? sender) (bytes->hex sender)
+                        :else nil)]
+       (when (and (seq (:peers-map state))
+                  (integer? epoch)
+                  (pos? epoch)
+                  (string? proposer)
+                  (pos? total-nodes)
+                  (or (nil? sender) (= sender-hex proposer)))
+         (let [expected-leader (when (seq peer-hexes) (nth peer-hexes (mod epoch total-nodes)))
+               proposer-pk (resolve-peer-pubkey-bytes state proposer)]
+           (and expected-leader
+                (= proposer expected-leader)
+                proposer-pk
+                (verify-block-signature block proposer-pk))))))))
 
 (defn- extract-targets
   "Determines target destinations for outgoing network commands.
@@ -200,25 +287,17 @@
         (try (hex->bytes hex) (catch Exception _ nil)))))
 
 (defn- extract-sender-pubkey-bytes
-  "Resolves the sender's public key bytes from event or :peers-map in state."
+  "Resolves the sender's public key bytes strictly from :peers-map in state.
+   Returns nil if sender is absent from :peers-map or sender-hex is nil."
   [state event]
-  (or (:sender-pubkey-bytes event)
-      (when-let [sender (:sender event)]
-        (cond
-          (bytes? sender)
-          sender
-
-          (contains? (:peers-map state) sender)
-          (let [entry (get-in state [:peers-map sender])]
-            (if (bytes? entry)
-              entry
-              (try (hex->bytes entry) (catch Exception _ nil))))
-
-          (string? sender)
-          (try (hex->bytes sender) (catch Exception _ nil))
-
-          :else
-          nil))))
+  (let [sender (:sender event)
+        sender-hex (cond
+                     (string? sender) sender
+                     (bytes? sender) (bytes->hex sender)
+                     (bytes? (:sender-pubkey-bytes event)) (bytes->hex (:sender-pubkey-bytes event))
+                     :else nil)]
+    (when sender-hex
+      (resolve-peer-pubkey-bytes state sender-hex))))
 
 (defn- update-head-hash
   "Updates :head-hash in state to the maximal length notarized chain head.
@@ -263,60 +342,65 @@
         state (-> state
                   (assoc :epoch new-epoch)
                   update-head-hash)
-        peer-hexes (extract-peer-hexes state)
-        total-nodes (total-node-count state peer-hexes)
-        proposer-idx (mod new-epoch total-nodes)
-        proposer-hex (when (seq peer-hexes) (nth peer-hexes proposer-idx))
-        is-proposer? (= proposer-hex (:node-pubkey state))]
-    (if is-proposer?
-      (let [block (propose-block state new-epoch)
-            b-hash (hash-block block)
-            state (assoc-in state [:blocks b-hash] block)
-            vote (cast-vote state block)
-            local-pk (extract-local-pubkey-bytes state)
-            state (if vote
-                    (-> state
-                        (update :voted-epochs (fnil conj #{}) (:epoch block))
-                        (accumulate-vote vote local-pk total-nodes))
-                    state)
-            state (apply-future-votes state b-hash total-nodes)
-            state (finalize-prefix state)
-            targets (extract-targets state)
-            commands (if vote
-                       [{:type :send-propose :targets targets :block block}
-                        {:type :send-vote :targets targets :vote vote}]
-                       [{:type :send-propose :targets targets :block block}])]
-        {:state state :commands commands})
-      {:state state :commands []})))
+        peer-hexes (extract-peer-hexes state)]
+    (if (empty? peer-hexes)
+      {:state state :commands []}
+      (let [total-nodes (total-node-count state peer-hexes)
+            proposer-idx (mod new-epoch total-nodes)
+            proposer-hex (nth peer-hexes proposer-idx)
+            is-proposer? (= proposer-hex (:node-pubkey state))]
+        (if is-proposer?
+          (let [block (propose-block state new-epoch)
+                b-hash (hash-block block)
+                state (assoc-in state [:blocks b-hash] block)
+                vote (cast-vote state block)
+                local-pk (extract-local-pubkey-bytes state)
+                state (if vote
+                        (-> state
+                            (update :voted-epochs (fnil conj #{}) (:epoch block))
+                            (accumulate-vote vote local-pk total-nodes))
+                        state)
+                state (apply-future-votes state b-hash total-nodes)
+                state (finalize-prefix state)
+                targets (extract-targets state)
+                commands (if vote
+                           [{:type :send-propose :targets targets :block block}
+                            {:type :send-vote :targets targets :vote vote}]
+                           [{:type :send-propose :targets targets :block block}])]
+            {:state state :commands commands})
+          {:state state :commands []})))))
 
 (defn- handle-propose-event
-  "Handles a :receive-propose event: records block and votes if parent is known."
+  "Handles a :receive-propose event: validates proposal fail-closed,
+   records block and votes if parent is known, or buffers into :future-blocks if parent is unknown."
   [state event]
-  (let [block (:block event)
-        b-hash (hash-block block)
-        state (assoc-in state [:blocks b-hash] block)
-        parent-hash (:parent-hash block)
-        known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
-    (if known-parent?
-      (let [peer-hexes (extract-peer-hexes state)
-            total-nodes (total-node-count state peer-hexes)
-            vote (cast-vote state block)
-            local-pk (extract-local-pubkey-bytes state)
-            state (if vote
-                    (-> state
-                        (update :voted-epochs (fnil conj #{}) (:epoch block))
-                        (accumulate-vote vote local-pk total-nodes))
-                    state)
-            state (apply-future-votes state b-hash total-nodes)
-            state (finalize-prefix state)
-            targets (extract-targets state)
-            commands (if vote
-                       [{:type :send-vote :targets targets :vote vote}]
-                       [])]
-        {:state state :commands commands})
-      (let [future-blocks (get state :future-blocks [])
-            state (assoc state :future-blocks (conj future-blocks event))]
-        {:state state :commands []}))))
+  (if-not (valid-block-proposal? state event)
+    {:state state :commands []}
+    (let [block (:block event)
+          b-hash (hash-block block)
+          state (assoc-in state [:blocks b-hash] block)
+          parent-hash (:parent-hash block)
+          known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
+      (if known-parent?
+        (let [peer-hexes (extract-peer-hexes state)
+              total-nodes (total-node-count state peer-hexes)
+              vote (cast-vote state block)
+              local-pk (extract-local-pubkey-bytes state)
+              state (if vote
+                      (-> state
+                          (update :voted-epochs (fnil conj #{}) (:epoch block))
+                          (accumulate-vote vote local-pk total-nodes))
+                      state)
+              state (apply-future-votes state b-hash total-nodes)
+              state (finalize-prefix state)
+              targets (extract-targets state)
+              commands (if vote
+                         [{:type :send-vote :targets targets :vote vote}]
+                         [])]
+          {:state state :commands commands})
+        (let [future-blocks (get state :future-blocks [])
+              state (assoc state :future-blocks (conj future-blocks event))]
+          {:state state :commands []})))))
 
 (defn- drain-future-blocks
   "Re-evaluates buffered future block proposals whose parents may now be known."
@@ -342,23 +426,24 @@
               (recur (rest remaining) curr-state acc-cmds (conj unresolved event)))))))))
 
 (defn- handle-vote-event
-  "Handles a :receive-vote event: accumulates vote if block is known, or buffers it."
+  "Handles a :receive-vote event: rejects Sybil senders or malformed votes fail-closed,
+   accumulates vote if block is known, or buffers into :future-votes."
   [state event]
   (let [vote (:vote event)
         sender-pk (extract-sender-pubkey-bytes state event)
-        b-hash (:block-hash vote)
-        known-block? (contains? (:blocks state) b-hash)]
-    (if known-block?
-      (let [peer-hexes (extract-peer-hexes state)
-            total-nodes (total-node-count state peer-hexes)
-            state (if sender-pk
-                    (accumulate-vote state vote sender-pk total-nodes)
-                    state)
-            {state :state cmds :commands} (drain-future-blocks state)
-            state (finalize-prefix state)]
-        {:state state :commands cmds})
-      (let [state (buffer-future-vote state vote sender-pk)]
-        {:state state :commands []}))))
+        b-hash (when (map? vote) (:block-hash vote))
+        sig (when (map? vote) (:voter-signature vote))]
+    (if (or (nil? sender-pk) (nil? b-hash) (nil? sig))
+      {:state state :commands []}
+      (if (contains? (:blocks state) b-hash)
+        (let [peer-hexes (extract-peer-hexes state)
+              total-nodes (total-node-count state peer-hexes)
+              state (accumulate-vote state vote sender-pk total-nodes)
+              {state :state cmds :commands} (drain-future-blocks state)
+              state (finalize-prefix state)]
+          {:state state :commands cmds})
+        (let [state (buffer-future-vote state vote sender-pk)]
+          {:state state :commands []})))))
 
 (defn handle-streamlet-event
   "Pure state machine reducer for Streamlet BFT nodes.

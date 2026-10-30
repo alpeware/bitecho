@@ -337,7 +337,9 @@
                                         :created-at (System/currentTimeMillis)}))))
 
 (defn- init-agent-listener!
-  "Starts agent ingress listener when enabled."
+  "Starts agent ingress listener when enabled.
+   Sanitizes incoming agent messages: drops validator consensus events,
+   strips unverified sender pubkey bytes, and attaches an rng instance."
   [config shell-node transport]
   (when (and (= transport :datachannel)
              (get-in config [:cluster :listen-agents?] false))
@@ -349,7 +351,11 @@
                                           {:on-message
                                            (fn [evt]
                                              (when-let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
-                                               (async/put! (:network-in shell-node) msg)))}))}))))
+                                               (when-not (#{:receive-propose :receive-vote} (:type msg))
+                                                 (let [sanitized (-> msg
+                                                                     (dissoc :sender-pubkey-bytes)
+                                                                     (assoc :rng (java.util.Random.)))]
+                                                   (async/put! (:network-in shell-node) sanitized)))))}))}))))
 
 (defn stop-mesh-node!
   "Stops all running resources of a mesh node cleanly."
@@ -400,7 +406,10 @@
        (doseq [[pid pcfg] nodes-cfg :when (not= pid node-id)]
          (init-datachannel-peer! ctx pid pcfg)))
      (start-net-out-loop! ctx)
-     (let [tick-interval (get-in config [:protocol :tick-interval-ms] 10000)
+     (let [tick-interval (or (get-in config [:protocol :tick-interval-ms])
+                             (get-in initial-state [:config :tick-interval-ms])
+                             (:tick-interval-ms config/devnet-config)
+                             10000)
            ticker (start-ticker! ctx tick-interval)
            agent-listener (init-agent-listener! config shell-node transport)
            http-server (start-http-server! (get config :http {})

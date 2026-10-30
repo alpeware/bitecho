@@ -7,12 +7,21 @@
             [clojure.test.check.properties :as prop]))
 
 (deftest test-streamlet-records
-  (testing "Block record can be instantiated"
+  (testing "Block record can be instantiated with 4-arity (signature nil)"
     (let [block (core/->Block 1 "parent-hash-xyz" {:some "payload"} "proposer-xyz")]
       (is (= 1 (:epoch block)))
       (is (= "parent-hash-xyz" (:parent-hash block)))
       (is (= {:some "payload"} (:payload block)))
-      (is (= "proposer-xyz" (:proposer block)))))
+      (is (= "proposer-xyz" (:proposer block)))
+      (is (nil? (:signature block)))))
+
+  (testing "Block record can be instantiated with 5-arity"
+    (let [block (core/->Block 1 "parent-hash-xyz" {:some "payload"} "proposer-xyz" "sig-xyz")]
+      (is (= 1 (:epoch block)))
+      (is (= "parent-hash-xyz" (:parent-hash block)))
+      (is (= {:some "payload"} (:payload block)))
+      (is (= "proposer-xyz" (:proposer block)))
+      (is (= "sig-xyz" (:signature block)))))
 
   (testing "Vote record can be instantiated"
     (let [vote (core/->Vote "block-hash-abc" 2 "signature-123")]
@@ -21,13 +30,14 @@
       (is (= "signature-123" (:voter-signature vote))))))
 
 (deftest test-propose-block
-  (testing "propose-block uses correct state defaults"
+  (testing "propose-block uses correct state defaults and leaves signature nil without private key"
     (let [state {:node-pubkey "pub1" :mempool ["tx1"] :head-hash "hash0"}
           block (core/propose-block state 5)]
       (is (= 5 (:epoch block)))
       (is (= "hash0" (:parent-hash block)))
       (is (= ["tx1"] (:payload block)))
-      (is (= "pub1" (:proposer block)))))
+      (is (= "pub1" (:proposer block)))
+      (is (nil? (:signature block)))))
 
   (testing "propose-block falls back to genesis and empty mempool"
     (let [state {:node-pubkey "pub2"}
@@ -35,7 +45,21 @@
       (is (= 6 (:epoch block)))
       (is (= "genesis" (:parent-hash block)))
       (is (= [] (:payload block)))
-      (is (= "pub2" (:proposer block))))))
+      (is (= "pub2" (:proposer block)))
+      (is (nil? (:signature block)))))
+
+  (testing "propose-block signs block when private key is present in state"
+    (let [keypair (crypto/generate-keypair)
+          pub-hex (core/bytes->hex (:public keypair))
+          state {:node-pubkey pub-hex
+                 :keypair keypair
+                 :mempool ["tx1"]
+                 :head-hash "hash0"}
+          block (core/propose-block state 5)]
+      (is (string? (:signature block)))
+      (is (true? (core/verify-block-signature block (:public keypair))))
+      (let [tampered (assoc block :payload ["tampered"])]
+        (is (false? (core/verify-block-signature tampered (:public keypair))))))))
 
 (deftest test-cast-vote
   (testing "cast-vote prevents duplicate voting per epoch"
@@ -353,6 +377,7 @@
 (deftest test-handle-streamlet-event-receive-propose
   (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
         kp0 (first pairs)
+        kp1 (second pairs)
         hex0 (first peer-hexes)
         hex1 (second peer-hexes)
         state {:epoch 1
@@ -363,7 +388,8 @@
                :blocks {}
                :notarized-blocks #{}
                :head-hash "genesis"}
-        block (core/->Block 1 "genesis" ["tx1"] hex1)
+        raw-block (core/->Block 1 "genesis" ["tx1"] hex1)
+        block (core/sign-block raw-block (:private kp1))
         b-hash (core/hash-block block)]
 
     (testing "valid proposal with known parent triggers vote"
@@ -383,7 +409,8 @@
                                     (core/hex->bytes (:voter-signature (:vote cmd)))))))))
 
     (testing "proposal with unknown parent buffers into future-blocks"
-      (let [orphan-block (core/->Block 2 "unknown-parent-hash" ["tx2"] hex1)
+      (let [raw-orphan (core/->Block 1 "unknown-parent-hash" ["tx2"] hex1)
+            orphan-block (core/sign-block raw-orphan (:private kp1))
             event {:type :receive-propose :block orphan-block :sender hex1}
             result (core/handle-streamlet-event state event)
             new-state (:state result)
@@ -397,7 +424,44 @@
             event {:type :receive-propose :block block :sender hex1}
             result (core/handle-streamlet-event already-voted-state event)
             commands (:commands result)]
-        (is (empty? commands))))))
+        (is (empty? commands))))
+
+    (testing "unsigned proposal is rejected fail-closed"
+      (let [event {:type :receive-propose :block raw-block :sender hex1}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
+        (is (empty? (:commands result)))))
+
+    (testing "proposal with corrupted signature is rejected fail-closed"
+      (let [corrupted (assoc block :signature (core/bytes->hex (byte-array 64)))
+            event {:type :receive-propose :block corrupted :sender hex1}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
+        (is (empty? (:commands result)))))
+
+    (testing "proposal from wrong leader for epoch is rejected fail-closed"
+      (let [wrong-raw (core/->Block 1 "genesis" ["tx1"] hex0)
+            wrong-block (core/sign-block wrong-raw (:private kp0))
+            event {:type :receive-propose :block wrong-block :sender hex0}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
+        (is (empty? (:commands result)))))
+
+    (testing "proposal with mismatched sender is rejected fail-closed"
+      (let [event {:type :receive-propose :block block :sender hex0}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
+        (is (empty? (:commands result)))))
+
+    (testing "proposal from Sybil peer outside peers-map is rejected fail-closed"
+      (let [sybil-kp (crypto/generate-keypair)
+            sybil-hex (core/bytes->hex (:public sybil-kp))
+            sybil-raw (core/->Block 1 "genesis" ["tx1"] sybil-hex)
+            sybil-block (core/sign-block sybil-raw (:private sybil-kp))
+            event {:type :receive-propose :block sybil-block :sender sybil-hex}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
+        (is (empty? (:commands result)))))))
 
 (deftest test-handle-streamlet-event-receive-vote
   (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
@@ -436,6 +500,38 @@
             result (core/handle-streamlet-event state event)
             new-state (:state result)]
         (is (= 1 (count (get-in new-state [:future-votes unknown-hash]))))
+        (is (empty? (:commands result)))))
+
+    (testing "receiving Sybil vote for known block is rejected fail-closed without modifying state"
+      (let [sybil-kp (crypto/generate-keypair)
+            sybil-hex (core/bytes->hex (:public sybil-kp))
+            sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (.getBytes ^String b-hash "UTF-8")))
+            sybil-vote (core/->Vote b-hash 1 sybil-sig)
+            event {:type :receive-vote
+                   :vote sybil-vote
+                   :sender sybil-hex
+                   :sender-pubkey-bytes (:public sybil-kp)}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
+        (is (empty? (:commands result)))))
+
+    (testing "receiving Sybil vote for unknown block is rejected fail-closed without buffering"
+      (let [sybil-kp (crypto/generate-keypair)
+            sybil-hex (core/bytes->hex (:public sybil-kp))
+            unknown-hash "unknown-hash-xyz"
+            sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (.getBytes ^String unknown-hash "UTF-8")))
+            sybil-vote (core/->Vote unknown-hash 1 sybil-sig)
+            event {:type :receive-vote :vote sybil-vote :sender sybil-hex}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
+        (is (nil? (get-in (:state result) [:future-votes unknown-hash])))
+        (is (empty? (:commands result)))))
+
+    (testing "receiving malformed vote (missing voter-signature or block-hash) is rejected fail-closed"
+      (let [malformed-vote {:epoch 1}
+            event {:type :receive-vote :vote malformed-vote :sender hex1}
+            result (core/handle-streamlet-event state event)]
+        (is (= state (:state result)))
         (is (empty? (:commands result)))))))
 
 (deftest test-handle-streamlet-event-unknown-type
@@ -514,7 +610,9 @@
                       all-notarized? (every? (fn [[_ st]] (contains? (:notarized-blocks st) b-hash)) final-nodes)
                       single-vote? (every? (fn [[_ st]] (= #{1} (:voted-epochs st))) final-nodes)
                       no-double-vote? (every? (fn [[_ st]]
-                                                (let [dup-block (core/->Block 1 "genesis" ["rogue"] proposer-hex)
+                                                (let [proposer-kp (nth pairs proposer-idx)
+                                                      dup-raw (core/->Block 1 "genesis" ["rogue"] proposer-hex)
+                                                      dup-block (core/sign-block dup-raw (:private proposer-kp))
                                                       dup-res (core/handle-streamlet-event st {:type :receive-propose :block dup-block :sender proposer-hex})]
                                                   (empty? (:commands dup-res))))
                                               final-nodes)]
@@ -524,6 +622,79 @@
                        all-notarized?
                        single-vote?
                        no-double-vote?))))
+
+(defspec ^{:doc "Property: Streamlet only accepts block proposals from the designated round-robin leader with valid Ed25519 signature."}
+  prop-block-proposal-authentication 50
+  (prop/for-all [node-count (gen/choose 3 6)
+                 epoch (gen/choose 1 50)]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes node-count)
+                      leader-idx (mod epoch node-count)
+                      leader-hex (nth peer-hexes leader-idx)
+                      leader-kp (nth pairs leader-idx)
+                      non-leader-idx (mod (inc leader-idx) node-count)
+                      non-leader-hex (nth peer-hexes non-leader-idx)
+                      non-leader-kp (nth pairs non-leader-idx)
+                      sybil-kp (crypto/generate-keypair)
+                      sybil-hex (core/bytes->hex (:public sybil-kp))
+                      state {:epoch epoch
+                             :node-pubkey (first peer-hexes)
+                             :keypair (first pairs)
+                             :peers-map peers-map
+                             :total-nodes node-count
+                             :blocks {}
+                             :notarized-blocks #{}
+                             :head-hash "genesis"}
+                      valid-raw (core/->Block epoch "genesis" ["tx"] leader-hex)
+                      valid-block (core/sign-block valid-raw (:private leader-kp))
+                      valid-res (core/handle-streamlet-event state {:type :receive-propose :block valid-block :sender leader-hex})
+                      unsigned-res (core/handle-streamlet-event state {:type :receive-propose :block valid-raw :sender leader-hex})
+                      tampered-block (assoc valid-block :payload ["tampered"])
+                      tampered-res (core/handle-streamlet-event state {:type :receive-propose :block tampered-block :sender leader-hex})
+                      wrong-leader-raw (core/->Block epoch "genesis" ["tx"] non-leader-hex)
+                      wrong-leader-block (core/sign-block wrong-leader-raw (:private non-leader-kp))
+                      wrong-leader-res (core/handle-streamlet-event state {:type :receive-propose :block wrong-leader-block :sender non-leader-hex})
+                      mismatched-res (core/handle-streamlet-event state {:type :receive-propose :block valid-block :sender non-leader-hex})
+                      sybil-raw (core/->Block epoch "genesis" ["tx"] sybil-hex)
+                      sybil-block (core/sign-block sybil-raw (:private sybil-kp))
+                      sybil-res (core/handle-streamlet-event state {:type :receive-propose :block sybil-block :sender sybil-hex})]
+                  (and (contains? (:blocks (:state valid-res)) (core/hash-block valid-block))
+                       (= state (:state unsigned-res))
+                       (= state (:state tampered-res))
+                       (= state (:state wrong-leader-res))
+                       (= state (:state mismatched-res))
+                       (= state (:state sybil-res))))))
+
+(defspec ^{:doc "Property: Streamlet reducer rejects votes from Sybil senders (absent from peers-map) for both known and unknown blocks fail-closed."}
+  prop-vote-sybil-sender-rejection 50
+  (prop/for-all [node-count (gen/choose 3 6)
+                 epoch (gen/choose 1 50)
+                 unknown-block? gen/boolean]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes node-count)
+                      honest-idx 1
+                      honest-hex (nth peer-hexes honest-idx)
+                      honest-kp (nth pairs honest-idx)
+                      sybil-kp (crypto/generate-keypair)
+                      sybil-hex (core/bytes->hex (:public sybil-kp))
+                      block (core/->Block epoch "genesis" [] (first peer-hexes))
+                      b-hash (if unknown-block? "unseen-block-hash" (core/hash-block block))
+                      base-state {:epoch epoch
+                                  :node-pubkey (first peer-hexes)
+                                  :keypair (first pairs)
+                                  :peers-map peers-map
+                                  :total-nodes node-count
+                                  :blocks (if unknown-block? {} {b-hash block})
+                                  :block-votes (if unknown-block? {} {b-hash #{(first peer-hexes)}})
+                                  :notarized-blocks #{}
+                                  :voted-epochs #{epoch}}
+                      honest-sig (core/bytes->hex (crypto/sign (:private honest-kp) (.getBytes ^String b-hash "UTF-8")))
+                      honest-vote (core/->Vote b-hash epoch honest-sig)
+                      honest-res (core/handle-streamlet-event base-state {:type :receive-vote :vote honest-vote :sender honest-hex})
+                      sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (.getBytes ^String b-hash "UTF-8")))
+                      sybil-vote (core/->Vote b-hash epoch sybil-sig)
+                      sybil-res (core/handle-streamlet-event base-state {:type :receive-vote :vote sybil-vote :sender sybil-hex})]
+                  (and (not= base-state (:state honest-res))
+                       (= base-state (:state sybil-res))
+                       (empty? (:commands sybil-res))))))
 
 (deftest adversarial-cycle-guard-test
   (let [kp (crypto/generate-keypair)
