@@ -1,10 +1,13 @@
 (ns bitecho.shell.mesh-test
   "Unit and generative tests for Bitecho mesh, node identity, and transport boundary."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.account :as account]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.mesh :as mesh]
             [bitecho.shell.persistence :as persistence]
+            [bitecho.sieve.core :as sieve]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
             [clojure.edn :as edn]
@@ -14,8 +17,10 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [datachannel.dtls :as dtls])
+            [datachannel.dtls :as dtls]
+            [taoensso.nippy :as nippy])
   (:import [java.io File]
+           [java.nio.charset StandardCharsets]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
@@ -104,13 +109,40 @@
                        (nil? (:targets evt))
                        (nil? (:target evt))))))
 
+(def gen-byte-array
+  "Generates non-empty primitive byte arrays."
+  (gen/fmap (fn [bytes-vec] (byte-array (map byte bytes-vec)))
+            (gen/not-empty (gen/vector gen/byte 1 32))))
+
+(def gen-sieve-gossip-event
+  "Generates real Sieve gossip messages."
+  (gen/let [payload gen-byte-array
+            burn-amount (gen/elements [nil 100 250])
+            kp (gen/fmap (fn [_] (crypto/generate-keypair)) gen/nat)]
+    (let [sieve-msg (if burn-amount
+                      (sieve/wrap-message payload (:private kp) (:public kp) burn-amount)
+                      (sieve/wrap-message payload (:private kp) (:public kp)))]
+      {:type :receive-gossip
+       :message sieve-msg})))
+
+(def gen-nested-bytes-event
+  "Generates events containing nested maps, vectors, and sets of byte arrays."
+  (gen/let [ba gen-byte-array
+            sieve-event gen-sieve-gossip-event]
+    (assoc sieve-event
+           :extra {:raw-bytes ba
+                   :vec-bytes [ba]
+                   :set-bytes #{ba}})))
+
 (def gen-allowed-agent-event
-  "Generates realistic allowed agent events."
-  (gen/elements [{:type :receive-gossip :topic "discovery" :data "alpha"}
-                 {:type :receive-summary :epoch 1 :summary "digest-1"}
-                 {:type :receive-pull-request :missing-ids ["msg-1" "msg-2"]}
-                 {:type :register-home-set :client-id "client-1" :home-set ["h1" "h2"]}
-                 {:type :receive-offer-header :caller "caller-hex" :offer-id "off-1"}]))
+  "Generates realistic allowed agent events including byte[] payloads, Sieve messages, and nested structures."
+  (gen/one-of [gen-sieve-gossip-event
+               gen-nested-bytes-event
+               (gen/elements [{:type :receive-gossip :topic "discovery" :data "alpha"}
+                              {:type :receive-summary :epoch 1 :summary "digest-1"}
+                              {:type :receive-pull-request :missing-ids ["msg-1" "msg-2"]}
+                              {:type :register-home-set :client-id "client-1" :home-set ["h1" "h2"]}
+                              {:type :receive-offer-header :caller "caller-hex" :offer-id "off-1"}])]))
 
 (def gen-disallowed-agent-event
   "Generates disallowed agent events."
@@ -119,7 +151,7 @@
                  {:type :tick}
                  {:type :custom-injection :data "malicious"}]))
 
-(defspec ^{:doc "Verifies authenticated agent envelope signing, verification, and fail-closed security properties."}
+(defspec ^{:doc "Verifies authenticated agent envelope signing, verification, and fail-closed security properties across nippy round-trips."}
   test-prop-authenticated-agent-envelope
   50
   (prop/for-all [event gen-allowed-agent-event
@@ -130,13 +162,37 @@
                       agent-priv (:private kp)
                       other-kp (crypto/generate-keypair)
                       env (mesh/wrap-agent-event event agent-pub agent-priv)
+                      frozen-bytes (nippy/freeze env)
+                      thawed-env (nippy/thaw frozen-bytes)
                       unwrapped (mesh/unwrap-authenticated-agent-event env)
+                      unwrapped-frozen (mesh/unwrap-authenticated-agent-event frozen-bytes)
+                      unwrapped-thawed (mesh/unwrap-authenticated-agent-event thawed-env)
                       tampered-env (assoc-in env [:event :tampered] tampered-key)
                       wrong-sig-env (assoc env :signature (basalt/bytes->hex (crypto/sign (:private other-kp) (mesh/agent-event-signing-bytes agent-pub (:event env)))))
-                      disallowed-env (mesh/wrap-agent-event disallowed-evt agent-pub agent-priv)]
+                      disallowed-env (mesh/wrap-agent-event disallowed-evt agent-pub agent-priv)
+                      mutated-payload-env (when-let [payload (get-in env [:event :message :payload])]
+                                            (when (bytes? payload)
+                                              (let [cloned (byte-array payload)]
+                                                (aset cloned 0 (unchecked-byte (bit-xor (aget cloned 0) 1)))
+                                                (assoc-in (nippy/thaw (nippy/freeze env)) [:event :message :payload] cloned))))]
                   (and (= (:type unwrapped) (:type event))
                        (= (:sender unwrapped) agent-pub)
                        (= (vec (:sender-pubkey-bytes unwrapped)) (vec (:public kp)))
+                       (some? unwrapped-frozen)
+                       (some? unwrapped-thawed)
+                       (= (:type unwrapped-frozen) (:type event))
+                       (= (:type unwrapped-thawed) (:type event))
+                       (= (:sender unwrapped-frozen) agent-pub)
+                       (= (:sender unwrapped-thawed) agent-pub)
+                       (if-let [orig-pl (get-in event [:message :payload])]
+                         (and (bytes? (get-in unwrapped-frozen [:message :payload]))
+                              (bytes? (get-in unwrapped-thawed [:message :payload]))
+                              (java.util.Arrays/equals ^bytes orig-pl ^bytes (get-in unwrapped-frozen [:message :payload]))
+                              (java.util.Arrays/equals ^bytes orig-pl ^bytes (get-in unwrapped-thawed [:message :payload])))
+                         true)
+                       (if mutated-payload-env
+                         (nil? (mesh/unwrap-authenticated-agent-event mutated-payload-env))
+                         true)
                        (nil? (mesh/unwrap-authenticated-agent-event tampered-env))
                        (nil? (mesh/unwrap-authenticated-agent-event wrong-sig-env))
                        (nil? (mesh/unwrap-authenticated-agent-event disallowed-env))
@@ -545,3 +601,43 @@
       (let [r (mesh/validate-node-config (assoc-in base-cfg [:cluster :nodes :node-2 :ice-pwd] ""))]
         (is (false? (:valid? r)))
         (is (str/includes? (:error r) ":ice-pwd"))))))
+
+(deftest test-agent-gossip-sieve-nippy-roundtrip
+  (let [kp (crypto/generate-keypair)
+        agent-pub (basalt/bytes->hex (:public kp))
+        agent-priv (:private kp)
+        payload (.getBytes "gossip-payload-123" StandardCharsets/UTF_8)
+        raw-sieve-msg (sieve/wrap-message payload agent-priv (:public kp) 100)
+        sieve-msg (assoc raw-sieve-msg :message-id "msg-sieve-1")
+        event {:type :receive-gossip :message sieve-msg}
+        envelope (mesh/wrap-agent-event event agent-pub agent-priv)
+        frozen (nippy/freeze envelope)
+        unwrapped (mesh/unwrap-authenticated-agent-event frozen)]
+    (is (some? unwrapped))
+    (is (= (:sender unwrapped) agent-pub))
+    (is (bytes? (:sender-pubkey-bytes unwrapped)))
+    (is (bytes? (get-in unwrapped [:message :payload])))
+    (is (bytes? (get-in unwrapped [:message :signature])))
+    (is (or (bytes? (get-in unwrapped [:message :sender]))
+            (string? (get-in unwrapped [:message :sender]))))
+
+    (testing "unwrapped event processed by state-machine/handle-event debits balance by 100"
+      (let [peer (basalt/make-peer "127.0.0.1" 8000 (:public (crypto/generate-keypair)))
+            initial-balance 1000
+            genesis-ledger {agent-pub (account/map->AccountState {:balance initial-balance :seq 0 :deps []})}
+            cfg (assoc config/default-config :genesis-ledger genesis-ledger)
+            state (assoc (sm/init-state [peer] "local-node" cfg) :epoch 0)
+            res (sm/handle-event state unwrapped)
+            new-state (:state res)
+            sender-bal (get-in new-state [:ledger agent-pub :balance])]
+        (is (= 900 sender-bal))
+        (is (= 100 (get-in new-state [:epoch-burns 0])))
+        (is (contains? (:messages new-state) "msg-sieve-1"))))
+
+    (testing "mutating 1 byte of payload causes unwrap to return nil"
+      (let [thawed (nippy/thaw frozen)
+            pl (get-in thawed [:event :message :payload])
+            mutated-pl (byte-array pl)]
+        (aset mutated-pl 0 (unchecked-byte (bit-xor (aget mutated-pl 0) 1)))
+        (let [tampered (assoc-in thawed [:event :message :payload] mutated-pl)]
+          (is (nil? (mesh/unwrap-authenticated-agent-event tampered))))))))

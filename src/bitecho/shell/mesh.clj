@@ -79,11 +79,32 @@
     :register-home-set
     :receive-offer-header})
 
+(defn canonicalize-for-signing
+  "Recursively converts a data structure into a content-deterministic
+   canonical form for pr-str signing (converting byte arrays to [:bytes hex]
+   and sorting maps and sets deterministically)."
+  [x]
+  (cond
+    (bytes? x)
+    [:bytes (basalt/bytes->hex x)]
+
+    (map? x)
+    (into (sorted-map-by (fn [a b] (compare (pr-str a) (pr-str b))))
+          (map (fn [[k v]] [(canonicalize-for-signing k) (canonicalize-for-signing v)]) x))
+
+    (set? x)
+    (vec (sort-by pr-str (map canonicalize-for-signing x)))
+
+    (sequential? x)
+    (mapv canonicalize-for-signing x)
+
+    :else x))
+
 (defn agent-event-signing-bytes
   "Serializes agent public key and event map into deterministic byte array for Ed25519 signing."
   [agent-pubkey-hex event]
   (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)]
-    (.getBytes (pr-str [agent-pubkey-hex (into (sorted-map) clean)]) StandardCharsets/UTF_8)))
+    (.getBytes (pr-str [agent-pubkey-hex (canonicalize-for-signing clean)]) StandardCharsets/UTF_8)))
 
 (defn wrap-agent-event
   "Wraps an agent event into an envelope signed with agent-privkey-bytes."
