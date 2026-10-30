@@ -231,6 +231,79 @@
             :node-private-key privkey-bytes
             :keypair (:keypair identity)})))
 
+(defn- validate-peer-node-entry
+  "Validates a single peer node entry in cluster config.
+   Returns nil if valid, or an error string."
+  [pid pcfg]
+  (cond
+    (not (map? pcfg))
+    (format "Peer %s configuration must be a map" pid)
+
+    (or (not (string? (:ip pcfg))) (str/blank? (:ip pcfg)))
+    (format "Peer %s missing or invalid :ip" pid)
+
+    (or (not (integer? (:port pcfg))) (not (pos? (:port pcfg))))
+    (format "Peer %s missing or invalid :port" pid)
+
+    (let [pk (:pubkey pcfg)]
+      (not (and (string? pk) (= 88 (count pk)) (re-matches #"^[0-9a-fA-F]{88}$" pk))))
+    (format "Peer %s has invalid :pubkey (must be 88-char hex)" pid)
+
+    (not (identity/verify-peer-fingerprint? (:fingerprint pcfg) (:fingerprint pcfg)))
+    (format "Peer %s has invalid DTLS :fingerprint" pid)
+
+    (or (not (string? (:ice-ufrag pcfg))) (str/blank? (:ice-ufrag pcfg)))
+    (format "Peer %s missing or invalid :ice-ufrag" pid)
+
+    (or (not (string? (:ice-pwd pcfg))) (str/blank? (:ice-pwd pcfg)))
+    (format "Peer %s missing or invalid :ice-pwd" pid)
+
+    :else nil))
+
+(defn validate-node-config
+  "Validates a Bitecho node configuration map fail-closed:
+   checks map structure, node-id keyword, non-blank state-dir, cluster peer fields,
+   and verifies that initial node state construction succeeds.
+   Returns {:valid? true} or {:valid? false :error <string>}."
+  [cfg]
+  (cond
+    (not (map? cfg))
+    {:valid? false :error "Config must be a map"}
+
+    (not (keyword? (or (:node/id cfg) (:node-id cfg))))
+    {:valid? false :error "Config missing valid :node/id or :node-id keyword"}
+
+    (let [sd (:state-dir cfg)]
+      (or (not (string? sd)) (str/blank? sd)))
+    {:valid? false :error "Config missing or invalid :state-dir"}
+
+    (and (contains? cfg :cluster) (not (map? (:cluster cfg))))
+    {:valid? false :error "Cluster configuration must be a map"}
+
+    (and (contains? cfg :cluster)
+         (contains? (:cluster cfg) :nodes)
+         (not (map? (get-in cfg [:cluster :nodes]))))
+    {:valid? false :error "[:cluster :nodes] must be a map"}
+
+    :else
+    (let [node-id (or (:node/id cfg) (:node-id cfg))
+          nodes (get-in cfg [:cluster :nodes])
+          peer-errs (when (map? nodes)
+                      (keep (fn [[pid pcfg]]
+                              (when (not= pid node-id)
+                                (validate-peer-node-entry pid pcfg)))
+                            nodes))]
+      (if (seq peer-errs)
+        {:valid? false :error (first peer-errs)}
+        (try
+          (let [synth-id {:node-id node-id
+                          :pubkey-hex (apply str (repeat 88 "a"))
+                          :keypair (crypto/generate-keypair)}]
+            (build-initial-node-state cfg synth-id)
+            {:valid? true})
+          (catch Exception e
+            {:valid? false :error (str "State initialization failed: " (.getMessage e))}))))))
+
 (defn render-statusz
   "Renders single-line diagnostic statusz string."
   [state connected-count total-peers]

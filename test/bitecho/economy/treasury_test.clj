@@ -581,8 +581,9 @@
                       res (treasury/process-treasury-epoch ctx)
                       actual-minted (:actual-minted res)
                       mint-dust (:mint-dust res)
+                      unclaimed-mint (or (:unclaimed-mint res) 0)
                       epoch-mint (:epoch-mint res)]
-                  (and (= epoch-mint (+ actual-minted mint-dust))
+                  (and (= epoch-mint (+ actual-minted mint-dust unclaimed-mint))
                        (<= (+ minted-so-far actual-minted) treasury/max-conditional-mint-supply)
                        (>= mint-dust 0)
                        (>= actual-minted 0)))))

@@ -8,6 +8,21 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+resolve_local_java() {
+  if [[ -n "${JAVA_CMD:-}" && -x "${JAVA_CMD:-}" ]]; then
+    echo "$JAVA_CMD"
+  elif [[ -x "/opt/jdk-25/bin/java" ]]; then
+    echo "/opt/jdk-25/bin/java"
+  elif [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME:-}/bin/java" ]]; then
+    echo "${JAVA_HOME}/bin/java"
+  elif command -v java >/dev/null 2>&1; then
+    command -v java
+  else
+    echo "Error: Java runtime not found. Set JAVA_CMD or JAVA_HOME." >&2
+    return 1
+  fi
+}
+
 # Source local overrides if present
 if [[ -f "${ROOT_DIR}/.cluster.env" ]]; then
   # shellcheck disable=SC1091
@@ -353,6 +368,7 @@ ENV_EOF
                    :node2 {:project "${RESOLVED_PROJECTS[node2]}" :region "${REGION[node2]}" :zone "${ZONE[node2]}" :ip "${ip2}"}
                    :node3 {:project "${RESOLVED_PROJECTS[node3]}" :region "${REGION[node3]}" :zone "${ZONE[node3]}" :ip "${ip3}"}}}}
 EDN_EOF
+  chmod 600 "${ROOT_DIR}/.cluster.env" "${ROOT_DIR}/cluster.edn"
 
   echo ""
   echo "================================================================================"
@@ -398,26 +414,47 @@ cmd_deploy() {
   # 2. Ensure Devnet Treasury & Custody keypairs exist locally
   echo "--> Step 2/7: Ensuring Treasury and Custody Ed25519 keypairs..."
   mkdir -p "${SSH_KEY_DIR}"
+  local local_java
+  local_java="$(resolve_local_java)"
   if [[ ! -f "${TREASURY_KEY_FILE}" ]]; then
     echo "Generating Devnet Treasury keypair at ${TREASURY_KEY_FILE}..."
-    java --enable-native-access=ALL-UNNAMED \
+    "$local_java" --enable-native-access=ALL-UNNAMED \
          --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
          --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
          -jar "${ROOT_DIR}/target/bitecho.jar" gen-keypair "${TREASURY_KEY_FILE}" >/dev/null
   fi
   if [[ ! -f "${CUSTODY_KEY_FILE}" ]]; then
     echo "Generating Devnet Custody keypair at ${CUSTODY_KEY_FILE}..."
-    java --enable-native-access=ALL-UNNAMED \
+    "$local_java" --enable-native-access=ALL-UNNAMED \
          --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
          --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
          -jar "${ROOT_DIR}/target/bitecho.jar" gen-keypair "${CUSTODY_KEY_FILE}" >/dev/null
   fi
+
+  chmod 600 "${TREASURY_KEY_FILE}" "${CUSTODY_KEY_FILE}"
 
   local TREASURY_PUB TREASURY_PRIV CUSTODY_PUB CUSTODY_PRIV
   TREASURY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${TREASURY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
   TREASURY_PRIV="$(grep -o ':privkey-hex "[^"]*"' "${TREASURY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
   CUSTODY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${CUSTODY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
   CUSTODY_PRIV="$(grep -o ':privkey-hex "[^"]*"' "${CUSTODY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
+
+  if [[ -z "${TREASURY_PUB:-}" || ! "${TREASURY_PUB}" =~ ^[0-9a-fA-F]{88}$ ]]; then
+    echo "Error: Invalid or missing Treasury public key in ${TREASURY_KEY_FILE} (must be 88-char hex)." >&2
+    return 1
+  fi
+  if [[ -z "${TREASURY_PRIV:-}" || ! "${TREASURY_PRIV}" =~ ^[0-9a-fA-F]{96}$ ]]; then
+    echo "Error: Invalid or missing Treasury private key in ${TREASURY_KEY_FILE} (must be 96-char hex)." >&2
+    return 1
+  fi
+  if [[ -z "${CUSTODY_PUB:-}" || ! "${CUSTODY_PUB}" =~ ^[0-9a-fA-F]{88}$ ]]; then
+    echo "Error: Invalid or missing Custody public key in ${CUSTODY_KEY_FILE} (must be 88-char hex)." >&2
+    return 1
+  fi
+  if [[ -z "${CUSTODY_PRIV:-}" || ! "${CUSTODY_PRIV}" =~ ^[0-9a-fA-F]{96}$ ]]; then
+    echo "Error: Invalid or missing Custody private key in ${CUSTODY_KEY_FILE} (must be 96-char hex)." >&2
+    return 1
+  fi
 
   echo "Treasury Pubkey: ${TREASURY_PUB}"
   echo "Custody Pubkey:  ${CUSTODY_PUB}"
@@ -484,7 +521,15 @@ REMOTE_ID
     local tmp_cfg
     tmp_cfg="$(mktemp /tmp/config-${node}-XXXXXX.edn)"
     cat > "$tmp_cfg" << CFG_EOF
+;; =========================================================================
 ;; /etc/bitecho/config.edn for ${node}
+;;
+;; DEVNET TRUST MODEL NOTICE:
+;; In Devnet, treasury and custody private keys are distributed to validator
+;; nodes to allow automated signing of epoch mints and custody drawdown during
+;; testing. In Mainnet, treasury and custody private keys are strictly cold
+;; storage keys held offline by governance signers and NEVER deployed to nodes.
+;; =========================================================================
 {:node/id :${node}
  :network :devnet
  :state-dir "/var/lib/bitecho"
@@ -502,6 +547,7 @@ REMOTE_ID
  :protocol {:tick-interval-ms ${TICK_INTERVAL_MS}
             :epoch-length-ms ${TICK_INTERVAL_MS}}
  :http {:enabled? true
+        :host "127.0.0.1"
         :port 8080}
  :cluster {:port 5000
            :agent-port 5010
@@ -512,12 +558,22 @@ REMOTE_ID
                    :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}}}}
 CFG_EOF
 
+    chmod 600 "$tmp_cfg"
+    echo "Validating config locally for ${node}..."
+    "$local_java" -jar "${ROOT_DIR}/target/bitecho.jar" validate-config "$tmp_cfg"
+
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
       "$tmp_cfg" "${SSH_USER}@${ip}:/etc/bitecho/config.edn.new"
     rm -f "$tmp_cfg"
 
     ssh_cmd "$node" bash -s << REMOTE_CFG
 set -euo pipefail
+chmod 600 /etc/bitecho/config.edn.new
+/opt/jdk-25/bin/java \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho/bitecho.jar validate-config /etc/bitecho/config.edn.new
 if [ "${reset_state}" = "true" ]; then
   echo "Resetting node state on ${node}..."
   rm -rf /var/lib/bitecho/state/*
@@ -529,6 +585,7 @@ REMOTE_CFG
   # 6. Generate local devnet/bootstrap descriptors
   echo "--> Step 6/7: Generating local devnet/bootstrap.edn and devnet/bootstrap.txt..."
   mkdir -p "${ROOT_DIR}/devnet"
+  chmod 700 "${ROOT_DIR}/devnet"
 
   cat > "${ROOT_DIR}/devnet/bootstrap.edn" << EDN_BOOTSTRAP_EOF
 ;; Auto-generated by scripts/cluster.sh deploy on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -546,7 +603,7 @@ Bitecho Genesis Devnet - Bootstrap Peer & WebRTC Connection Descriptor
 Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 ================================================================================
 
-Network: devnet (3-node Streamlet BFT validator quorum, N=3, 2f+1=2)
+Network: devnet (3-node Streamlet BFT validator quorum, N=3, quorum=2 of 3)
 Treasury Public Key: ${TREASURY_PUB}
 Custody Public Key:  ${CUSTODY_PUB}
 
@@ -577,12 +634,18 @@ Node: node3 (us-east1)
   ICE Credentials:   ufrag=${ICE_UFRAG[node3]} pwd=${ICE_PWD[node3]}
 
 Connection Instructions for Agents / Light Nodes:
-Connect over WebRTC DataChannel (UDP port 5010) with channel name "bitecho".
-Authenticate using the server's SHA-256 fingerprint and ICE credentials above.
+Agent Ingress (UDP port 5010) is disabled by default (:listen-agents? false).
+When enabled on a node, agents connect over WebRTC DataChannel (UDP port 5010)
+with channel name "bitecho", authenticating via the server's SHA-256 fingerprint
+and ICE credentials above. All inbound agent events MUST be wrapped in an
+Ed25519-signed envelope via wrap-agent-event.
 TXT_BOOTSTRAP_EOF
+
+  chmod 600 "${ROOT_DIR}/devnet/bootstrap.edn" "${ROOT_DIR}/devnet/bootstrap.txt"
 
   # 7. Restart bitecho.service and poll healthz
   echo "--> Step 7/7: Restarting bitecho.service and verifying healthz..."
+  local deploy_failed=false
   for node in "${NODES[@]}"; do
     local ip
     ip="$(get_ip "$node")"
@@ -604,10 +667,16 @@ TXT_BOOTSTRAP_EOF
     if [[ "$ok" == true ]]; then
       echo "${node} is healthy (healthz ok)."
     else
-      echo "Warning: ${node} health check timed out. Inspecting journal..."
+      echo "Error: ${node} health check timed out. Inspecting journal..." >&2
       ssh_cmd "$node" sudo journalctl -u bitecho -n 20 --no-pager || true
+      deploy_failed=true
     fi
   done
+
+  if [[ "$deploy_failed" == true ]]; then
+    echo "Error: Devnet deployment failed because one or more nodes failed health checks." >&2
+    return 1
+  fi
 
   echo ""
   echo "================================================================================"

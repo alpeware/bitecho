@@ -13,7 +13,8 @@
   (println "Usage:")
   (println "  bitecho run <config.edn>")
   (println "  bitecho print-identity <config.edn>")
-  (println "  bitecho gen-keypair [output-file.edn]"))
+  (println "  bitecho gen-keypair [output-file.edn]")
+  (println "  bitecho validate-config <config.edn>"))
 
 (defn- cmd-run
   "Runs a Bitecho mesh node given a config EDN file."
@@ -71,6 +72,30 @@
         (println (str "Ed25519 Pubkey: " (:pubkey-hex kp-map)))
         (println "Pass an output file path (e.g. bitecho gen-keypair <path>) to persist private key securely with 0600 permissions.")))))
 
+(defn- cmd-validate-config
+  "Validates a Bitecho node configuration EDN file."
+  [config-file]
+  (let [f (io/file config-file)]
+    (when-not (.exists f)
+      (binding [*out* *err*]
+        (println (str "Error: config file not found: " config-file)))
+      (System/exit 1))
+    (let [cfg (try
+                (edn/read-string (slurp f))
+                (catch Exception e
+                  (binding [*out* *err*]
+                    (println (str "Error: failed to parse EDN in " config-file ": " (.getMessage e))))
+                  (System/exit 1)))
+          res (mesh/validate-node-config cfg)]
+      (if (:valid? res)
+        (do
+          (println (str "Config valid: " config-file))
+          (System/exit 0))
+        (do
+          (binding [*out* *err*]
+            (println (str "Config invalid: " (:error res))))
+          (System/exit 1))))))
+
 (defn -main
   "Main CLI entrypoint."
   [& args]
@@ -88,6 +113,11 @@
 
       "gen-keypair"
       (apply cmd-gen-keypair rest-args)
+
+      "validate-config"
+      (if (first rest-args)
+        (cmd-validate-config (first rest-args))
+        (do (print-usage) (System/exit 1)))
 
       (do
         (print-usage)

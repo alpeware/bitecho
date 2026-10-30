@@ -34,6 +34,14 @@
   [^bytes ba]
   (apply str (map #(format "%02x" %) ba)))
 
+(defn valid-hex-string?
+  "Returns true if s is a non-empty, even-length hex string."
+  [s]
+  (boolean (and (string? s)
+                (pos? (count s))
+                (even? (count s))
+                (re-matches #"[0-9a-fA-F]+" s))))
+
 (defn block-signing-bytes
   "Serializes block contents excluding signature for Ed25519 signing."
   [block]
@@ -49,11 +57,28 @@
   "Verifies the Ed25519 signature of a block against the proposer's public key bytes."
   [block ^bytes proposer-pubkey-bytes]
   (boolean
-   (when (and (map? block) (string? (:signature block)) (some? proposer-pubkey-bytes))
+   (when (and (map? block)
+              (valid-hex-string? (:signature block))
+              (bytes? proposer-pubkey-bytes))
      (try
        (crypto/verify proposer-pubkey-bytes
                       (block-signing-bytes block)
                       (hex->bytes (:signature block)))
+       (catch Exception _ false)))))
+
+(defn verify-vote-signature
+  "Verifies the Ed25519 signature of a vote against voter-pubkey-bytes.
+   Returns false on any non-string field, malformed hex, or verification error."
+  [vote ^bytes voter-pubkey-bytes]
+  (boolean
+   (when (and (map? vote)
+              (string? (:block-hash vote))
+              (valid-hex-string? (:voter-signature vote))
+              (bytes? voter-pubkey-bytes))
+     (try
+       (crypto/verify voter-pubkey-bytes
+                      (.getBytes ^String (:block-hash vote) "UTF-8")
+                      (hex->bytes (:voter-signature vote)))
        (catch Exception _ false)))))
 
 (defn hash-block
@@ -135,16 +160,14 @@
   "Validates a vote and accumulates it into the block's vote set.
    If the accumulated valid votes reach the 2n/3 threshold, adds the block to the :notarized-blocks set."
   [state vote voter-pubkey-bytes n]
-  (let [{:keys [block-hash voter-signature]} vote]
-    (if (crypto/verify voter-pubkey-bytes
-                       (.getBytes ^String block-hash "UTF-8")
-                       (hex->bytes voter-signature))
+  (let [b-hash (when (map? vote) (:block-hash vote))]
+    (if (and b-hash (verify-vote-signature vote voter-pubkey-bytes))
       (let [pubkey-hex (bytes->hex voter-pubkey-bytes)
-            current-votes (get-in state [:block-votes block-hash] #{})
+            current-votes (get-in state [:block-votes b-hash] #{})
             new-votes (conj current-votes pubkey-hex)
-            state-with-vote (assoc-in state [:block-votes block-hash] new-votes)]
+            state-with-vote (assoc-in state [:block-votes b-hash] new-votes)]
         (if (>= (count new-votes) (quorum-threshold n))
-          (update state-with-vote :notarized-blocks (fnil conj #{}) block-hash)
+          (update state-with-vote :notarized-blocks (fnil conj #{}) b-hash)
           state-with-vote))
       state)))
 
@@ -433,7 +456,10 @@
         sender-pk (extract-sender-pubkey-bytes state event)
         b-hash (when (map? vote) (:block-hash vote))
         sig (when (map? vote) (:voter-signature vote))]
-    (if (or (nil? sender-pk) (nil? b-hash) (nil? sig))
+    (if (or (nil? sender-pk)
+            (not (string? b-hash))
+            (not (valid-hex-string? sig))
+            (not (verify-vote-signature vote sender-pk)))
       {:state state :commands []}
       (if (contains? (:blocks state) b-hash)
         (let [peer-hexes (extract-peer-hexes state)

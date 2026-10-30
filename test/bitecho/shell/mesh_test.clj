@@ -476,3 +476,72 @@
       (finally
         (doseq [f (reverse (file-seq temp-dir))]
           (.delete ^File f))))))
+
+(deftest test-validate-node-config
+  (let [valid-peer-fp "11:22:33:44:55:66:77:88:99:00:AA:BB:CC:DD:EE:FF:11:22:33:44:55:66:77:88:99:00:AA:BB:CC:DD:EE:FF"
+        base-cfg {:node/id :node-1
+                  :state-dir "/tmp/bitecho"
+                  :cluster {:network :devnet
+                            :nodes {:node-1 {:ip "127.0.0.1"
+                                             :port 5000
+                                             :pubkey (apply str (repeat 88 "a"))
+                                             :fingerprint valid-peer-fp
+                                             :ice-ufrag "ufrag1"
+                                             :ice-pwd "pwd12345678901234567890"}
+                                    :node-2 {:ip "127.0.0.1"
+                                             :port 5001
+                                             :pubkey (apply str (repeat 88 "b"))
+                                             :fingerprint valid-peer-fp
+                                             :ice-ufrag "ufrag2"
+                                             :ice-pwd "pwd22345678901234567890"}}}}
+        res (mesh/validate-node-config base-cfg)]
+    (is (true? (:valid? res)))
+    (is (nil? (:error res)))
+
+    (testing "fails when config is not a map"
+      (let [r (mesh/validate-node-config "not-a-map")]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) "map"))))
+
+    (testing "fails when node-id is missing or not a keyword"
+      (let [r (mesh/validate-node-config (dissoc base-cfg :node/id))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) "keyword"))))
+
+    (testing "fails when state-dir is missing or blank"
+      (let [r (mesh/validate-node-config (assoc base-cfg :state-dir ""))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) ":state-dir"))))
+
+    (testing "fails when cluster configuration is not a map"
+      (let [r (mesh/validate-node-config (assoc base-cfg :cluster "invalid"))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) "Cluster"))))
+
+    (testing "fails when peer has invalid or missing ip"
+      (let [r (mesh/validate-node-config (assoc-in base-cfg [:cluster :nodes :node-2 :ip] ""))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) ":ip"))))
+
+    (testing "fails when peer has invalid or non-positive port"
+      (let [r (mesh/validate-node-config (assoc-in base-cfg [:cluster :nodes :node-2 :port] 0))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) ":port"))))
+
+    (testing "fails when peer has invalid pubkey hex"
+      (let [r (mesh/validate-node-config (assoc-in base-cfg [:cluster :nodes :node-2 :pubkey] "not-hex-88"))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) ":pubkey"))))
+
+    (testing "fails when peer has malformed fingerprint"
+      (let [r (mesh/validate-node-config (assoc-in base-cfg [:cluster :nodes :node-2 :fingerprint] "bad-fingerprint"))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) ":fingerprint"))))
+
+    (testing "fails when peer is missing ice credentials"
+      (let [r (mesh/validate-node-config (assoc-in base-cfg [:cluster :nodes :node-2 :ice-ufrag] ""))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) ":ice-ufrag")))
+      (let [r (mesh/validate-node-config (assoc-in base-cfg [:cluster :nodes :node-2 :ice-pwd] ""))]
+        (is (false? (:valid? r)))
+        (is (str/includes? (:error r) ":ice-pwd"))))))

@@ -786,3 +786,82 @@
                        (= "genesis" (:head-hash (#'core/update-head-hash state)))
                        (map? (core/finalize-prefix state))))))
 
+(def gen-malformed-vote
+  "Generates malformed vote payloads to test exception-safety and fail-closed validation."
+  (gen/one-of
+   [(gen/elements [nil "not-a-map" 12345 :vote-kw ["vec" "vote"]])
+    (gen/let [b-hash (gen/elements [123 :bad-hash ["vec"] nil {} true])
+              sig (gen/elements ["112233" "aabbcc" 123 :sig nil])]
+      {:block-hash b-hash :epoch 1 :voter-signature sig})
+    (gen/let [b-hash (gen/elements ["known-block-hash" "unknown-block-hash"])
+              sig (gen/elements [123 :sig-kw ["not" "hex"] (byte-array [1 2 3]) "abc" "zzzzzzzz" "xyz123" "1" "" nil])]
+      {:block-hash b-hash :epoch 1 :voter-signature sig})]))
+
+(defspec ^{:doc "Property: Streamlet reducer drops all malformed vote events fail-closed without throwing or altering state"}
+  prop-malformed-vote-resilience 50
+  (prop/for-all [node-count (gen/choose 3 6)
+                 epoch (gen/choose 1 50)
+                 unknown-block? gen/boolean
+                 malformed-vote gen-malformed-vote]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes node-count)
+                      sender-hex (nth peer-hexes 1)
+                      block (core/->Block epoch "genesis" [] (first peer-hexes))
+                      known-hash (core/hash-block block)
+                      vote (if (and (map? malformed-vote) (contains? malformed-vote :block-hash))
+                             (if unknown-block?
+                               (assoc malformed-vote :block-hash (if (string? (:block-hash malformed-vote))
+                                                                   "unknown-block-hash"
+                                                                   (:block-hash malformed-vote)))
+                               (assoc malformed-vote :block-hash (if (string? (:block-hash malformed-vote))
+                                                                   known-hash
+                                                                   (:block-hash malformed-vote))))
+                             malformed-vote)
+                      base-state {:epoch epoch
+                                  :node-pubkey (first peer-hexes)
+                                  :keypair (first pairs)
+                                  :peers-map peers-map
+                                  :total-nodes node-count
+                                  :blocks {known-hash block}
+                                  :block-votes {known-hash #{(first peer-hexes)}}
+                                  :notarized-blocks #{}
+                                  :voted-epochs #{epoch}}
+                      event {:type :receive-vote :vote vote :sender sender-hex}
+                      res (try (core/handle-streamlet-event base-state event)
+                               (catch Throwable e {:error e}))]
+                  (and (not (contains? res :error))
+                       (= base-state (:state res))
+                       (= [] (:commands res))))))
+
+(deftest test-malformed-vote-resilience-unit
+  (testing "accumulate-vote and handle-streamlet-event are exception-safe against malformed votes"
+    (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+          voter-pk (:public (second pairs))
+          voter-hex (second peer-hexes)
+          block (core/->Block 1 "genesis" [] (first peer-hexes))
+          b-hash (core/hash-block block)
+          state {:epoch 1
+                 :node-pubkey (first peer-hexes)
+                 :keypair (first pairs)
+                 :peers-map peers-map
+                 :total-nodes 3
+                 :blocks {b-hash block}
+                 :block-votes {b-hash #{(first peer-hexes)}}
+                 :notarized-blocks #{}
+                 :voted-epochs #{1}}
+          bad-votes [{:block-hash 123 :voter-signature "abcd"}
+                     {:block-hash b-hash :voter-signature 123}
+                     {:block-hash b-hash :voter-signature "abc"}
+                     {:block-hash b-hash :voter-signature "zzzzzzzz"}
+                     {:block-hash nil :voter-signature "abcd"}
+                     {:block-hash b-hash :voter-signature nil}
+                     "not-a-map"
+                     nil]]
+      (doseq [bv bad-votes]
+        (testing (str "malformed vote: " (pr-str bv))
+          ;; accumulate-vote should safely return state unchanged without throwing
+          (is (= state (core/accumulate-vote state bv voter-pk 3)))
+          ;; handle-streamlet-event should safely drop vote and return state unchanged
+          (let [res (core/handle-streamlet-event state {:type :receive-vote :vote bv :sender voter-hex})]
+            (is (= state (:state res)))
+            (is (= [] (:commands res)))))))))
+
