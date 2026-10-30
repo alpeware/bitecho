@@ -5,6 +5,7 @@
    embedded HTTP /healthz & /statusz diagnostics, and node lifecycle management."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
+            [bitecho.crypto :as crypto]
             [bitecho.shell.core :as core]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.persistence :as persistence]
@@ -18,6 +19,12 @@
            [java.net InetSocketAddress]
            [java.nio.charset StandardCharsets]
            [java.util.concurrent Executors TimeUnit]))
+
+(defn log-mesh-error
+  "Logs an error message and exception with context for mesh operations."
+  [context ^Throwable e]
+  (binding [*out* *err*]
+    (println (format "[mesh-error] %s: %s" context (or (when e (.getMessage e)) "unknown")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Shared In-Memory Bus for Fast Test Transport
@@ -61,6 +68,65 @@
     (vec (distinct (keep resolve-hex raw-targets)))))
 
 ;; ---------------------------------------------------------------------------
+;; Pure Agent Ingress Envelope & Authentication
+;; ---------------------------------------------------------------------------
+
+(def allowed-agent-events
+  "Set of event types permitted from external agent connections on the agent ingress port."
+  #{:receive-gossip
+    :receive-summary
+    :receive-pull-request
+    :register-home-set
+    :receive-offer-header})
+
+(defn agent-event-signing-bytes
+  "Serializes agent public key and event map into deterministic byte array for Ed25519 signing."
+  [agent-pubkey-hex event]
+  (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)]
+    (.getBytes (pr-str [agent-pubkey-hex (into (sorted-map) clean)]) StandardCharsets/UTF_8)))
+
+(defn wrap-agent-event
+  "Wraps an agent event into an envelope signed with agent-privkey-bytes."
+  [event agent-pubkey-hex ^bytes agent-privkey-bytes]
+  (let [clean-event (dissoc event :sender :sender-pubkey-bytes :rng)
+        sb (agent-event-signing-bytes agent-pubkey-hex clean-event)
+        sig (crypto/sign agent-privkey-bytes sb)
+        sig-hex (if (string? sig) sig (basalt/bytes->hex sig))]
+    {:agent-pubkey agent-pubkey-hex
+     :event clean-event
+     :signature sig-hex}))
+
+(defn unwrap-authenticated-agent-event
+  "Unwraps and verifies an authenticated agent envelope.
+   Returns sanitized event with bound :sender and :sender-pubkey-bytes if valid, or nil."
+  [raw-msg]
+  (try
+    (let [msg (if (bytes? raw-msg)
+                (try (nippy/thaw raw-msg) (catch Exception _ nil))
+                raw-msg)]
+      (when (and (map? msg)
+                 (string? (:agent-pubkey msg))
+                 (map? (:event msg))
+                 (contains? allowed-agent-events (:type (:event msg)))
+                 (or (string? (:signature msg)) (bytes? (:signature msg))))
+        (let [agent-pub-hex (:agent-pubkey msg)
+              agent-pub-bytes (basalt/hex->bytes agent-pub-hex)
+              sig-bytes (if (bytes? (:signature msg))
+                          (:signature msg)
+                          (basalt/hex->bytes (:signature msg)))
+              event (:event msg)
+              sb (agent-event-signing-bytes agent-pub-hex event)]
+          (when (and (some? agent-pub-bytes)
+                     (some? sig-bytes)
+                     (crypto/verify agent-pub-bytes sb sig-bytes))
+            (-> event
+                (dissoc :sender :sender-pubkey-bytes :rng)
+                (assoc :sender agent-pub-hex
+                       :sender-pubkey-bytes agent-pub-bytes
+                       :rng (java.util.Random.)))))))
+    (catch Exception _ nil)))
+
+;; ---------------------------------------------------------------------------
 ;; Pure State Initialization & Status Rendering
 ;; ---------------------------------------------------------------------------
 
@@ -69,7 +135,7 @@
   [pk]
   (cond
     (bytes? pk) pk
-    (string? pk) (basalt/hex->bytes pk)
+    (string? pk) (try (basalt/hex->bytes pk) (catch Exception _ nil))
     :else nil))
 
 (defn- extract-top-level-overrides
@@ -116,20 +182,26 @@
         mesh-nodes (or (:mesh-nodes cluster-cfg)
                        (into {} (map (fn [pk] [pk 1.0]) validators)))
         peer-entries (for [[_ ninfo] nodes-cfg
-                           :let [pk (:pubkey ninfo)]
-                           :when (some? pk)]
-                       [(if (string? pk) pk (basalt/bytes->hex pk))
-                        (resolve-pubkey-bytes pk)])
+                           :let [pk (:pubkey ninfo)
+                                 pk-bytes (resolve-pubkey-bytes pk)]
+                           :when (some? pk-bytes)]
+                       [(if (string? pk) pk (basalt/bytes->hex pk-bytes))
+                        pk-bytes])
         peers-map (into {pubkey-hex pubkey-bytes} peer-entries)
         initial-peers (vec (for [[nid ninfo] nodes-cfg
                                  :when (not= nid node-id)
-                                 :let [pk (:pubkey ninfo)]
-                                 :when (some? pk)]
+                                 :let [pk (:pubkey ninfo)
+                                       pk-bytes (resolve-pubkey-bytes pk)]
+                                 :when (some? pk-bytes)]
                              (basalt/make-peer (or (:ip ninfo) "127.0.0.1")
                                                (or (:port ninfo) 8000)
-                                               (resolve-pubkey-bytes pk))))
+                                               pk-bytes)))
         overrides (extract-top-level-overrides cfg cluster-cfg)
-        proto-cfg (merge config/devnet-config
+        network (or (:network cfg) (get-in cfg [:cluster :network]) :mainnet)
+        base-proto-cfg (if (= network :devnet)
+                         config/devnet-config
+                         config/default-config)
+        proto-cfg (merge base-proto-cfg
                          (get cfg :protocol {})
                          (get cluster-cfg :protocol {})
                          overrides
@@ -146,6 +218,19 @@
             :peers-map peers-map
             :mesh-nodes mesh-nodes})))
 
+(defn rebind-restored-state
+  "Rebinds node private keys, credentials, and configuration overrides to a deserialized snapshot state."
+  [loaded-state config identity]
+  (let [cluster-cfg (get config :cluster {})
+        overrides (extract-top-level-overrides config cluster-cfg)
+        privkey-bytes (resolve-pubkey-bytes (get-in identity [:keypair :private]))
+        pubkey-hex (:pubkey-hex identity)]
+    (merge loaded-state
+           overrides
+           {:node-pubkey pubkey-hex
+            :node-private-key privkey-bytes
+            :keypair (:keypair identity)})))
+
 (defn render-statusz
   "Renders single-line diagnostic statusz string."
   [state connected-count total-peers]
@@ -154,13 +239,9 @@
                "validator"
                "mesh")
         epoch (long (or (:epoch state) 0))
-        head (str (or (get-in state [:streamlet :head-hash]) (:head-hash state) "genesis"))
-        notarized (long (or (get-in state [:streamlet :notarized-height])
-                            (count (:notarized-blocks state))
-                            0))
-        finalized (long (or (get-in state [:streamlet :finalized-height])
-                            (count (:finalized-blocks state))
-                            0))
+        head (str (or (:head-hash state) "genesis"))
+        notarized (long (count (or (:notarized-blocks state) #{})))
+        finalized (long (count (or (:finalized-blocks state) #{})))
         ledger (or (:ledger state) {})
         supply (long (reduce + 0 (map (fn [v] (if (map? v) (or (:balance v) 0) (or v 0))) (vals ledger))))
         minted (long (or (:total-minted state) 0))
@@ -212,7 +293,8 @@
   [http-cfg ctx total-peers fallback-state]
   (when (get http-cfg :enabled? true)
     (let [port (int (get http-cfg :port 8080))
-          server (HttpServer/create (InetSocketAddress. port) 0)
+          host (str (get http-cfg :host "127.0.0.1"))
+          server (HttpServer/create (InetSocketAddress. ^String host port) 0)
           handler (make-http-handler ctx total-peers fallback-state)]
       (.createContext server "/healthz" handler)
       (.createContext server "/statusz" handler)
@@ -225,6 +307,29 @@
 ;; ---------------------------------------------------------------------------
 
 (declare init-datachannel-peer!)
+
+(defn create-peer-datachannel-node
+  "Constructs a DataChannel node map using persistent DTLS cert-data and deterministic ICE credentials,
+   avoiding runtime throwaway certificate generation."
+  [local-port setup cert-data local-ice local-fp]
+  (let [opts {:port local-port :setup setup}
+        local-sdp-params {:port local-port
+                          :ice-ufrag (:ufrag local-ice)
+                          :ice-pwd (:pwd local-ice)
+                          :fingerprint local-fp
+                          :setup setup}]
+    {:opts opts
+     :cert-data cert-data
+     :ice-creds local-ice
+     :local-sdp-params local-sdp-params
+     :running (atom false)
+     :state-atom (atom nil)
+     :channel (atom nil)
+     :selector (atom nil)
+     :loop-future (atom nil)
+     :remote-addr (atom nil)
+     :shared-channel? false
+     :callbacks (atom nil)}))
 
 (defn- check-and-reconnect-peers!
   "Checks peer datachannel health and attempts reconnect if closed or stalled."
@@ -242,7 +347,8 @@
       (when (or (nil? conn) (= st :closed) stalled?)
         (try
           (init-datachannel-peer! ctx pid pcfg)
-          (catch Exception _ nil))))))
+          (catch Exception e
+            (log-mesh-error (str "Peer reconnect error for " pid) e)))))))
 
 (defn- start-ticker!
   "Starts the periodic virtual-thread timer pushing :tick events and auto-reconnecting."
@@ -256,7 +362,8 @@
                                           {:type :tick :rng (java.util.Random.)})
                               (when (= transport :datachannel)
                                 (check-and-reconnect-peers! ctx))
-                              (catch Exception _ nil)))
+                              (catch Exception e
+                                (log-mesh-error "Ticker loop error" e))))
                           tick-interval-ms
                           tick-interval-ms
                           TimeUnit/MILLISECONDS)
@@ -284,78 +391,78 @@
                 (when-let [conn (get @peer-conns target)]
                   (when-let [cid @(:channel-id conn)]
                     (api/send! (:node conn) frozen cid))))))
-          (catch Exception _ nil))
+          (catch Exception e
+            (log-mesh-error "Net-out loop error" e)))
         (recur)))))
 
 (defn- init-datachannel-peer!
   "Establishes a single peer DataChannel connection."
   [ctx pid peer-cfg]
-  (let [{:keys [node-id identity node-idx nodes-cfg shell-node peer-conns]} ctx
-        peer-hex (:pubkey peer-cfg)]
-    (when-let [old-conn (get @peer-conns peer-hex)]
-      (when-let [old-node (:node old-conn)]
-        (try (api/close! old-node) (catch Exception _ nil))))
-    (let [peer-ip (or (:ip peer-cfg) "127.0.0.1")
-          base-peer-port (int (or (:port peer-cfg) 5000))
-          peer-port (+ base-peer-port (int (get node-idx node-id 0)))
-          base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))
-          local-port (+ base-local-port (int (get node-idx pid 0)))
-          setup (if (neg? (compare (name node-id) (name pid))) "active" "passive")
-          raw-node (api/create-node {:port local-port :setup setup})
-          local-fp (:fingerprint identity)
-          local-ice (identity/deterministic-ice-creds node-id local-fp)
-          node (assoc raw-node
-                      :cert-data (:cert-data identity)
-                      :ice-creds local-ice
-                      :local-sdp-params (assoc (:local-sdp-params raw-node)
-                                               :ice-ufrag (:ufrag local-ice)
-                                               :ice-pwd (:pwd local-ice)
-                                               :fingerprint local-fp
-                                               :setup setup))
-          channel-id (atom nil)
-          peer-fp (identity/normalize-fingerprint (:fingerprint peer-cfg))
-          remote-ice (identity/deterministic-ice-creds pid peer-fp)
-          remote-sdp {:ip peer-ip
-                      :port peer-port
-                      :fingerprint peer-fp
-                      :remote-ice-ufrag (:ufrag remote-ice)
-                      :remote-ice-pwd (:pwd remote-ice)}
-          callbacks {:on-open (fn [evt]
-                                (when-not (:channel-id evt)
-                                  (reset! channel-id (api/create-data-channel! node "bitecho" {:ordered true}))))
-                     :on-message (fn [evt]
-                                   (when-let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
-                                     (let [event (assoc msg
-                                                        :sender peer-hex
-                                                        :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
-                                                        :rng (java.util.Random.))]
-                                       (async/put! (:network-in shell-node) event))))
-                     :on-close (fn [_] (reset! channel-id nil))}]
-      (api/start! node remote-sdp callbacks)
-      (swap! peer-conns assoc peer-hex {:node node
-                                        :channel-id channel-id
-                                        :created-at (System/currentTimeMillis)}))))
+  (try
+    (let [raw-fp (:fingerprint peer-cfg)
+          peer-fp (when (identity/verify-peer-fingerprint? raw-fp raw-fp)
+                    (identity/normalize-fingerprint raw-fp))]
+      (if-not peer-fp
+        (log-mesh-error (format "Invalid peer fingerprint for %s" pid)
+                        (ex-info "Invalid peer fingerprint" {:peer pid :fingerprint raw-fp}))
+        (let [{:keys [node-id identity node-idx nodes-cfg shell-node peer-conns]} ctx
+              peer-hex (:pubkey peer-cfg)]
+          (when-let [old-conn (get @peer-conns peer-hex)]
+            (when-let [old-node (:node old-conn)]
+              (try (api/close! old-node) (catch Exception _ nil))))
+          (let [peer-ip (or (:ip peer-cfg) "127.0.0.1")
+                base-peer-port (int (or (:port peer-cfg) 5000))
+                peer-port (+ base-peer-port (int (get node-idx node-id 0)))
+                base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))
+                local-port (+ base-local-port (int (get node-idx pid 0)))
+                setup (if (neg? (compare (name node-id) (name pid))) "active" "passive")
+                local-fp (:fingerprint identity)
+                local-ice (identity/deterministic-ice-creds node-id local-fp)
+                node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp)
+                channel-id (atom nil)
+                remote-ice (identity/deterministic-ice-creds pid peer-fp)
+                remote-sdp {:ip peer-ip
+                            :port peer-port
+                            :fingerprint peer-fp
+                            :remote-ice-ufrag (:ufrag remote-ice)
+                            :remote-ice-pwd (:pwd remote-ice)}
+                callbacks {:on-open (fn [evt]
+                                      (when-not (:channel-id evt)
+                                        (reset! channel-id (api/create-data-channel! node "bitecho" {:ordered true}))))
+                           :on-message (fn [evt]
+                                         (when-let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
+                                           (let [event (assoc msg
+                                                              :sender peer-hex
+                                                              :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
+                                                              :rng (java.util.Random.))]
+                                             (async/put! (:network-in shell-node) event))))
+                           :on-close (fn [_] (reset! channel-id nil))}]
+            (api/start! node remote-sdp callbacks)
+            (swap! peer-conns assoc peer-hex {:node node
+                                              :channel-id channel-id
+                                              :created-at (System/currentTimeMillis)})))))
+    (catch Exception e
+      (log-mesh-error (format "Failed to connect to peer %s" pid) e)
+      nil)))
 
 (defn- init-agent-listener!
   "Starts agent ingress listener when enabled.
-   Sanitizes incoming agent messages: drops validator consensus events,
-   strips unverified sender pubkey bytes, and attaches an rng instance."
-  [config shell-node transport]
+   Sanitizes incoming agent messages using unwrap-authenticated-agent-event."
+  [config identity shell-node transport]
   (when (and (= transport :datachannel)
              (get-in config [:cluster :listen-agents?] false))
-    (let [port (int (get-in config [:cluster :agent-port] 5010))]
-      (api/listen! {:port port}
+    (let [port (int (get-in config [:cluster :agent-port] 5010))
+          listen-opts {:port port
+                       :cert-data (:cert-data identity)
+                       :ice-creds (:ice-creds identity)}]
+      (api/listen! listen-opts
                    {:on-connection
                     (fn [agent-node]
                       (api/set-callbacks! agent-node
                                           {:on-message
                                            (fn [evt]
-                                             (when-let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
-                                               (when-not (#{:receive-propose :receive-vote} (:type msg))
-                                                 (let [sanitized (-> msg
-                                                                     (dissoc :sender-pubkey-bytes)
-                                                                     (assoc :rng (java.util.Random.)))]
-                                                   (async/put! (:network-in shell-node) sanitized)))))}))}))))
+                                             (when-let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
+                                               (async/put! (:network-in shell-node) unwrapped)))}))}))))
 
 (defn stop-mesh-node!
   "Stops all running resources of a mesh node cleanly."
@@ -384,9 +491,12 @@
          state-dir (or (:state-dir config) "data")
          identity (or (:identity opts) (identity/load-or-create-node-identity! state-dir node-id))
          transport (or (:transport opts) (:transport config) :datachannel)
-         initial-state (or (when-let [f (:snapshot-file opts)] (persistence/load-state-from-disk f))
-                           (build-initial-node-state config identity))
          snapshot-file (str (io/file state-dir "state" (str "snapshot-" (name node-id) ".edn")))
+         loaded-state (or (when-let [f (:snapshot-file opts)] (persistence/load-state-from-disk f))
+                          (when (.exists (io/file snapshot-file)) (persistence/load-state-from-disk snapshot-file)))
+         initial-state (if loaded-state
+                         (rebind-restored-state loaded-state config identity)
+                         (build-initial-node-state config identity))
          shell-node (core/start-node initial-state snapshot-file {:persist? (get opts :persist? true)})
          peer-conns (atom {})
          cluster-cfg (get config :cluster {})
@@ -404,14 +514,17 @@
      (if (= transport :in-memory)
        (swap! in-memory-bus assoc (:pubkey-hex identity) {:node-id node-id :network-in (:network-in shell-node)})
        (doseq [[pid pcfg] nodes-cfg :when (not= pid node-id)]
-         (init-datachannel-peer! ctx pid pcfg)))
+         (try
+           (init-datachannel-peer! ctx pid pcfg)
+           (catch Exception e
+             (log-mesh-error (str "Failed to initialize peer " pid) e)))))
      (start-net-out-loop! ctx)
      (let [tick-interval (or (get-in config [:protocol :tick-interval-ms])
                              (get-in initial-state [:config :tick-interval-ms])
                              (:tick-interval-ms config/devnet-config)
                              10000)
            ticker (start-ticker! ctx tick-interval)
-           agent-listener (init-agent-listener! config shell-node transport)
+           agent-listener (init-agent-listener! config identity shell-node transport)
            http-server (start-http-server! (get config :http {})
                                            ctx
                                            (count (disj (set (keys nodes-cfg)) node-id))

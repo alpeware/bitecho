@@ -126,11 +126,32 @@
 ;; ---------------------------------------------------------------------------
 
 (defn generate-ed25519-keypair-map
-  "Generates an Ed25519 keypair and returns map with hex-encoded :pubkey-hex and :privkey-hex."
+  "Generates an Ed25519 keypair and returns map with hex-encoded :pubkey-hex and :privkey-hex.
+   :pubkey-hex is 88 hex chars (44-byte X.509 SPKI DER) and :privkey-hex is 96 hex chars (48-byte PKCS#8 DER)."
   []
   (let [kp (crypto/generate-keypair)]
     {:pubkey-hex (basalt/bytes->hex (:public kp))
      :privkey-hex (basalt/bytes->hex (:private kp))}))
+
+(defn write-keypair-file!
+  "Writes an Ed25519 keypair map atomically to output-file with 0600 (rw-------) permissions."
+  [output-file kp-map]
+  (let [out (io/file output-file)
+        parent (.getParentFile out)
+        _ (when parent (.mkdirs parent))
+        tmp (File/createTempFile "keypair" ".tmp" (or parent (io/file ".")))]
+    (spit tmp (pr-str kp-map))
+    (try
+      (Files/setPosixFilePermissions (.toPath tmp) (PosixFilePermissions/fromString "rw-------"))
+      (catch UnsupportedOperationException _ nil))
+    (try
+      (Files/move (.toPath tmp) (.toPath out)
+                  (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                                        StandardCopyOption/REPLACE_EXISTING]))
+      (catch Exception _
+        (Files/move (.toPath tmp) (.toPath out)
+                    (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+    true))
 
 (defn- read-persisted-identity
   "Reads and validates an existing node-identity.edn file."
@@ -179,6 +200,7 @@
 (defn load-or-create-node-identity!
   "Loads or creates node identity containing Ed25519 keypair, DTLS certificate/key,
    deterministic ICE credentials, and SHA-256 fingerprint.
+   :pubkey-hex is 88 hex chars (44-byte X.509 SPKI DER) and :privkey-hex is 96 hex chars (48-byte PKCS#8 DER).
    Persists to <state-dir>/identity/node-identity.edn."
   [state-dir node-id]
   (let [identity-dir (io/file state-dir "identity")

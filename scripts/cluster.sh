@@ -486,6 +486,7 @@ REMOTE_ID
     cat > "$tmp_cfg" << CFG_EOF
 ;; /etc/bitecho/config.edn for ${node}
 {:node/id :${node}
+ :network :devnet
  :state-dir "/var/lib/bitecho"
  :treasury-pubkey "${TREASURY_PUB}"
  :treasury-privkey "${TREASURY_PRIV}"
@@ -504,7 +505,7 @@ REMOTE_ID
         :port 8080}
  :cluster {:port 5000
            :agent-port 5010
-           :listen-agents? true
+           :listen-agents? ${LISTEN_AGENTS:-false}
            :validators ["${PUBKEY[node1]}" "${PUBKEY[node2]}" "${PUBKEY[node3]}"]
            :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
                    :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
@@ -554,7 +555,7 @@ Bootstrap Validators:
 Node: node1 (us-west1)
   Cluster Address:   ${ip1}:5000 (UDP DataChannel)
   Agent Ingress:     ${ip1}:5010 (UDP DataChannel)
-  HTTP Diagnostics:  http://${ip1}:8080/healthz, /statusz
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node1]}
   DTLS Fingerprint:  ${FINGERPRINT[node1]}
   ICE Credentials:   ufrag=${ICE_UFRAG[node1]} pwd=${ICE_PWD[node1]}
@@ -562,7 +563,7 @@ Node: node1 (us-west1)
 Node: node2 (us-central1)
   Cluster Address:   ${ip2}:5000 (UDP DataChannel)
   Agent Ingress:     ${ip2}:5010 (UDP DataChannel)
-  HTTP Diagnostics:  http://${ip2}:8080/healthz, /statusz
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node2]}
   DTLS Fingerprint:  ${FINGERPRINT[node2]}
   ICE Credentials:   ufrag=${ICE_UFRAG[node2]} pwd=${ICE_PWD[node2]}
@@ -570,7 +571,7 @@ Node: node2 (us-central1)
 Node: node3 (us-east1)
   Cluster Address:   ${ip3}:5000 (UDP DataChannel)
   Agent Ingress:     ${ip3}:5010 (UDP DataChannel)
-  HTTP Diagnostics:  http://${ip3}:8080/healthz, /statusz
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node3]}
   DTLS Fingerprint:  ${FINGERPRINT[node3]}
   ICE Credentials:   ufrag=${ICE_UFRAG[node3]} pwd=${ICE_PWD[node3]}

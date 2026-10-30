@@ -61,14 +61,15 @@
 (defn- cmd-gen-keypair
   "Generates an Ed25519 keypair and optionally saves to output file."
   [& [output-file]]
-  (let [kp-map (identity/generate-ed25519-keypair-map)
-        serialized (pr-str kp-map)]
-    (when output-file
-      (spit output-file serialized)
-      (println (str "Wrote keypair to " output-file)))
-    (println (str "Ed25519 Pubkey: " (:pubkey-hex kp-map)))
-    (println (str "Ed25519 Privkey: " (:privkey-hex kp-map)))
-    (println serialized)))
+  (let [kp-map (identity/generate-ed25519-keypair-map)]
+    (if output-file
+      (do
+        (identity/write-keypair-file! output-file kp-map)
+        (println (str "Wrote keypair to " output-file))
+        (println (str "Ed25519 Pubkey: " (:pubkey-hex kp-map))))
+      (do
+        (println (str "Ed25519 Pubkey: " (:pubkey-hex kp-map)))
+        (println "Pass an output file path (e.g. bitecho gen-keypair <path>) to persist private key securely with 0600 permissions.")))))
 
 (defn -main
   "Main CLI entrypoint."

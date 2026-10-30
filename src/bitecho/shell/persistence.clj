@@ -3,7 +3,9 @@
    Ensures unserializable objects like core.async channels or PersistentQueues are safely handled."
   (:require [clojure.java.io :as io]
             [clojure.walk :as walk]
-            [taoensso.nippy :as nippy]))
+            [taoensso.nippy :as nippy])
+  (:import [java.nio.file Files StandardCopyOption]
+           [java.nio.file.attribute PosixFilePermissions]))
 
 (def default-snapshot-filename
   "The default filename used for saving and loading the state snapshot."
@@ -12,11 +14,15 @@
 (defn strip-unserializable-state
   "Transforms the pure state map into a serializable format.
    Strips raw java.util.Random instances, clojure.core.async channels,
-   and converts the :murmur-cache :queue (a clojure.lang.PersistentQueue) into a standard vector."
+   private key material, and converts the :murmur-cache :queue into a standard vector."
   [state]
   (let [queue-handled (if (get-in state [:murmur-cache :queue])
                         (update-in state [:murmur-cache :queue] vec)
-                        state)]
+                        state)
+        secrets-stripped (-> queue-handled
+                             (dissoc :keypair :keys :node-private-key :treasury-privkey :custody-privkey)
+                             (cond-> (map? (:config queue-handled))
+                               (update :config dissoc :keypair :keys :node-private-key :treasury-privkey :custody-privkey)))]
     (walk/postwalk
      (fn [x]
        (cond
@@ -24,7 +30,7 @@
          ;; Handle core.async channels safely without class errors by checking class name
          (and (class x) (= "clojure.core.async.impl.channels.ManyToManyChannel" (.getName (class x)))) nil
          :else x))
-     queue-handled)))
+     secrets-stripped)))
 
 (defn restore-unserializable-state
   "Reconstitutes a strictly EDN-serialized state map back into its fully functional form.
@@ -39,19 +45,25 @@
 (defn save-state-to-disk
   "Serializes the provided state map and atomically writes it to the specified filepath
    using a temporary file rename to prevent corruption.
+   Sets 0600 (rw-------) POSIX file permissions.
    Returns true if successful, or throws an exception on failure."
   [filepath state]
   (let [safe-state (strip-unserializable-state state)
         temp-filepath (str filepath ".tmp")
         file (io/file filepath)
         temp-file (io/file temp-filepath)]
+    (when-let [parent (.getParentFile file)]
+      (.mkdirs parent))
     (nippy/freeze-to-file temp-filepath safe-state)
+    (try
+      (Files/setPosixFilePermissions (.toPath temp-file) (PosixFilePermissions/fromString "rw-------"))
+      (catch UnsupportedOperationException _ nil))
     ;; Atomic rename using java.nio.file.Files/move
-    (java.nio.file.Files/move (.toPath temp-file)
-                              (.toPath file)
-                              (into-array java.nio.file.CopyOption
-                                          [java.nio.file.StandardCopyOption/REPLACE_EXISTING
-                                           java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
+    (Files/move (.toPath temp-file)
+                (.toPath file)
+                (into-array java.nio.file.CopyOption
+                            [StandardCopyOption/REPLACE_EXISTING
+                             StandardCopyOption/ATOMIC_MOVE]))
     true))
 
 (defn load-state-from-disk

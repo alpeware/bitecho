@@ -4,7 +4,10 @@
             [bitecho.crypto :as crypto]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.mesh :as mesh]
+            [bitecho.shell.persistence :as persistence]
             [bitecho.state-machine :as sm]
+            [clojure.core.async :as async]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -14,7 +17,7 @@
             [datachannel.dtls :as dtls])
   (:import [java.io File]
            [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+           [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 ;; ---------------------------------------------------------------------------
 ;; Generators
@@ -100,6 +103,46 @@
                        (= (:payload evt) payload-val)
                        (nil? (:targets evt))
                        (nil? (:target evt))))))
+
+(def gen-allowed-agent-event
+  "Generates realistic allowed agent events."
+  (gen/elements [{:type :receive-gossip :topic "discovery" :data "alpha"}
+                 {:type :receive-summary :epoch 1 :summary "digest-1"}
+                 {:type :receive-pull-request :missing-ids ["msg-1" "msg-2"]}
+                 {:type :register-home-set :client-id "client-1" :home-set ["h1" "h2"]}
+                 {:type :receive-offer-header :caller "caller-hex" :offer-id "off-1"}]))
+
+(def gen-disallowed-agent-event
+  "Generates disallowed agent events."
+  (gen/elements [{:type :receive-propose :block {:epoch 1}}
+                 {:type :receive-vote :vote {:epoch 1}}
+                 {:type :tick}
+                 {:type :custom-injection :data "malicious"}]))
+
+(defspec ^{:doc "Verifies authenticated agent envelope signing, verification, and fail-closed security properties."}
+  test-prop-authenticated-agent-envelope
+  50
+  (prop/for-all [event gen-allowed-agent-event
+                 disallowed-evt gen-disallowed-agent-event
+                 tampered-key gen/string-alphanumeric]
+                (let [kp (crypto/generate-keypair)
+                      agent-pub (basalt/bytes->hex (:public kp))
+                      agent-priv (:private kp)
+                      other-kp (crypto/generate-keypair)
+                      env (mesh/wrap-agent-event event agent-pub agent-priv)
+                      unwrapped (mesh/unwrap-authenticated-agent-event env)
+                      tampered-env (assoc-in env [:event :tampered] tampered-key)
+                      wrong-sig-env (assoc env :signature (basalt/bytes->hex (crypto/sign (:private other-kp) (mesh/agent-event-signing-bytes agent-pub (:event env)))))
+                      disallowed-env (mesh/wrap-agent-event disallowed-evt agent-pub agent-priv)]
+                  (and (= (:type unwrapped) (:type event))
+                       (= (:sender unwrapped) agent-pub)
+                       (= (vec (:sender-pubkey-bytes unwrapped)) (vec (:public kp)))
+                       (nil? (mesh/unwrap-authenticated-agent-event tampered-env))
+                       (nil? (mesh/unwrap-authenticated-agent-event wrong-sig-env))
+                       (nil? (mesh/unwrap-authenticated-agent-event disallowed-env))
+                       (nil? (mesh/unwrap-authenticated-agent-event (dissoc env :signature)))
+                       (nil? (mesh/unwrap-authenticated-agent-event (dissoc env :agent-pubkey)))
+                       (nil? (mesh/unwrap-authenticated-agent-event nil))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Unit Tests
@@ -235,10 +278,9 @@
   (testing "statusz line format"
     (let [state {:epoch 5
                  :node-pubkey "abc1234567890abcdef"
-                 :streamlet {:chain {"hash1" {:height 10 :epoch 5}}
-                             :head-hash "hash1"
-                             :notarized-height 8
-                             :finalized-height 6}
+                 :head-hash "hash1"
+                 :notarized-blocks #{"h1" "h2"}
+                 :finalized-blocks #{"h1"}
                  :validators ["abc1234567890abcdef"]
                  :ledger {"abc1234567890abcdef" {:balance 1000}}
                  :total-minted 2000
@@ -248,8 +290,8 @@
       (is (str/starts-with? out "role=validator"))
       (is (str/includes? out "epoch=5"))
       (is (str/includes? out "head=hash1"))
-      (is (str/includes? out "notarized=8"))
-      (is (str/includes? out "finalized=6"))
+      (is (str/includes? out "notarized=2"))
+      (is (str/includes? out "finalized=1"))
       (is (str/includes? out "peers=2/3"))
       (is (str/includes? out "supply=1000"))
       (is (str/includes? out "minted=2000"))
@@ -257,7 +299,7 @@
       (is (str/ends-with? out "\n")))))
 
 (deftest test-in-memory-mesh-lifecycle
-  (testing "start and stop 3-node in-memory cluster"
+  (testing "start, run consensus ticks, and stop 3-node in-memory cluster"
     (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-mesh-cluster-" (into-array FileAttribute [])))
           state-root (.getAbsolutePath temp-dir)
           id-a (identity/load-or-create-node-identity! (str state-root "/a") :node-a)
@@ -266,7 +308,9 @@
           cfg-nodes {:node-a {:pubkey (:pubkey-hex id-a) :fingerprint (:fingerprint id-a)}
                      :node-b {:pubkey (:pubkey-hex id-b) :fingerprint (:fingerprint id-b)}
                      :node-c {:pubkey (:pubkey-hex id-c) :fingerprint (:fingerprint id-c)}}
-          base-cfg {:cluster {:nodes cfg-nodes
+          base-cfg {:network :devnet
+                    :cluster {:network :devnet
+                              :nodes cfg-nodes
                               :validators #{(:pubkey-hex id-a) (:pubkey-hex id-b) (:pubkey-hex id-c)}}
                     :transport :in-memory
                     :http {:enabled? false}}
@@ -280,12 +324,155 @@
         (is (some? node-a))
         (is (some? node-b))
         (is (some? node-c))
-        (is (fn? (:stop! node-a)))
-        (is (fn? (:stop! node-b)))
-        (is (fn? (:stop! node-c)))
+        ;; Inject ticks across 4 epochs so leaders propose, peers vote, and 3-epoch chain finalizes
+        (doseq [_ (range 4)]
+          (doseq [n [node-a node-b node-c]]
+            (async/put! (:events-in (:shell-node n)) {:type :tick :rng (java.util.Random.)}))
+          (Thread/sleep 150))
+        (let [st-a (#'mesh/query-node-state (:shell-node node-a) 1000)
+              st-b (#'mesh/query-node-state (:shell-node node-b) 1000)
+              st-c (#'mesh/query-node-state (:shell-node node-c) 1000)]
+          (is (some? st-a))
+          (is (some? st-b))
+          (is (some? st-c))
+          (is (>= (:epoch st-a) 4))
+          (is (seq (:blocks st-a)))
+          (is (seq (:notarized-blocks st-a)))
+          (is (seq (:notarized-blocks st-b)))
+          (is (seq (:notarized-blocks st-c)))
+          (is (seq (:finalized-blocks st-a)))
+          (is (seq (:finalized-blocks st-b)))
+          (is (seq (:finalized-blocks st-c))))
         (finally
           ((:stop! node-a))
           ((:stop! node-b))
           ((:stop! node-c))
           (doseq [f (reverse (file-seq temp-dir))]
             (.delete ^File f)))))))
+
+(deftest test-agent-envelope-allowed-and-disallowed
+  (let [kp (crypto/generate-keypair)
+        pub (basalt/bytes->hex (:public kp))
+        priv (:private kp)]
+    (testing "all allowed event types successfully authenticate and unwrap"
+      (doseq [t mesh/allowed-agent-events]
+        (let [evt {:type t :sample "data"}
+              env (mesh/wrap-agent-event evt pub priv)
+              res (mesh/unwrap-authenticated-agent-event env)]
+          (is (some? res))
+          (is (= t (:type res)))
+          (is (= pub (:sender res)))
+          (is (= (vec (:public kp)) (vec (:sender-pubkey-bytes res)))))))
+    (testing "disallowed consensus events return nil fail-closed"
+      (doseq [t [:receive-propose :receive-vote :tick :other-arbitrary]]
+        (let [evt {:type t :sample "data"}
+              env (mesh/wrap-agent-event evt pub priv)
+              res (mesh/unwrap-authenticated-agent-event env)]
+          (is (nil? res)))))))
+
+(deftest test-http-server-loopback-host
+  (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-http-test-" (into-array FileAttribute [])))
+        state-root (.getAbsolutePath temp-dir)
+        id (identity/load-or-create-node-identity! state-root :node-1)
+        cfg {:node/id :node-1
+             :state-dir state-root
+             :http {:enabled? true :port 0 :host "127.0.0.1"}
+             :transport :in-memory}
+        node (mesh/start-mesh-node! cfg {:identity id})]
+    (try
+      (is (some? (:http-server node)))
+      (let [addr (.getAddress ^com.sun.net.httpserver.HttpServer (:http-server node))]
+        (is (= "127.0.0.1" (.getHostString addr))))
+      (finally
+        ((:stop! node))
+        (doseq [f (reverse (file-seq temp-dir))]
+          (.delete ^File f))))))
+
+(deftest test-snapshot-strips-secrets-and-rebinds-on-restore
+  (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-snap-test-" (into-array FileAttribute [])))
+        snap-file (io/file temp-dir "snapshot.bin")
+        kp (crypto/generate-keypair)
+        id-map {:node-id :node-1
+                :pubkey-hex (basalt/bytes->hex (:public kp))
+                :privkey-hex (basalt/bytes->hex (:private kp))
+                :keypair kp
+                :fingerprint "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+                :ice-creds (identity/deterministic-ice-creds :node-1)}
+        cfg {:node/id :node-1
+             :cluster {:network :devnet
+                       :nodes {:node-1 {:pubkey (:pubkey-hex id-map) :fingerprint (:fingerprint id-map)}}}
+             :treasury-privkey (basalt/bytes->hex (:private kp))
+             :custody-privkey (basalt/bytes->hex (:private kp))}
+        init-st (mesh/build-initial-node-state cfg id-map)
+        state-to-save (assoc init-st
+                             :epoch 7
+                             :head-hash "h7"
+                             :notarized-blocks #{"h7"})]
+    (try
+      (is (true? (persistence/save-state-to-disk (.getAbsolutePath snap-file) state-to-save)))
+      (is (.exists snap-file))
+      (let [perms (Files/getPosixFilePermissions (.toPath snap-file) (into-array java.nio.file.LinkOption []))]
+        (is (= "rw-------" (PosixFilePermissions/toString perms))))
+      (let [loaded (persistence/load-state-from-disk (.getAbsolutePath snap-file))]
+        (is (= 7 (:epoch loaded)))
+        (is (nil? (:keypair loaded)))
+        (is (nil? (:node-private-key loaded)))
+        (is (nil? (:treasury-privkey loaded)))
+        (is (nil? (:custody-privkey loaded)))
+        (let [rebound (mesh/rebind-restored-state loaded cfg id-map)]
+          (is (= 7 (:epoch rebound)))
+          (is (some? (:keypair rebound)))
+          (is (some? (:node-private-key rebound)))
+          (is (some? (:treasury-privkey rebound)))
+          (is (= (:pubkey-hex id-map) (:node-pubkey rebound)))))
+      (finally
+        (doseq [f (reverse (file-seq temp-dir))]
+          (.delete ^File f))))))
+
+(deftest test-peer-init-malformed-fingerprint-resilient
+  (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-malformed-peer-" (into-array FileAttribute [])))
+        state-root (.getAbsolutePath temp-dir)
+        id (identity/load-or-create-node-identity! state-root :node-1)
+        cfg {:node/id :node-1
+             :state-dir state-root
+             :cluster {:nodes {:node-1 {:pubkey (:pubkey-hex id) :fingerprint (:fingerprint id)}
+                               :node-bad {:pubkey "bad-hex" :fingerprint "NOT-A-FINGERPRINT"}}}
+             :transport :in-memory
+             :http {:enabled? false}}
+        node (mesh/start-mesh-node! cfg {:identity id})]
+    (try
+      (is (some? node))
+      (is (fn? (:stop! node)))
+      (finally
+        ((:stop! node))
+        (doseq [f (reverse (file-seq temp-dir))]
+          (.delete ^File f))))))
+
+(deftest test-build-initial-node-state-network-preset
+  (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-preset-test-" (into-array FileAttribute [])))
+        state-root (.getAbsolutePath temp-dir)
+        id (identity/load-or-create-node-identity! state-root :node-1)]
+    (try
+      (let [dev-st (mesh/build-initial-node-state {:node/id :node-1 :network :devnet} id)
+            def-st (mesh/build-initial-node-state {:node/id :node-1} id)]
+        (is (= 10000 (get-in dev-st [:config :tick-interval-ms])))
+        (is (= 3600000 (get-in def-st [:config :tick-interval-ms]))))
+      (finally
+        (doseq [f (reverse (file-seq temp-dir))]
+          (.delete ^File f))))))
+
+(deftest test-write-keypair-file
+  (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-kp-file-test-" (into-array FileAttribute [])))
+        kp-file (io/file temp-dir "secret-keypair.edn")
+        kp-map (identity/generate-ed25519-keypair-map)]
+    (try
+      (is (true? (identity/write-keypair-file! (.getAbsolutePath kp-file) kp-map)))
+      (is (.exists kp-file))
+      (let [perms (Files/getPosixFilePermissions (.toPath kp-file) (into-array java.nio.file.LinkOption []))]
+        (is (= "rw-------" (PosixFilePermissions/toString perms))))
+      (let [read-kp (edn/read-string (slurp kp-file))]
+        (is (= (:pubkey-hex kp-map) (:pubkey-hex read-kp)))
+        (is (= (:privkey-hex kp-map) (:privkey-hex read-kp))))
+      (finally
+        (doseq [f (reverse (file-seq temp-dir))]
+          (.delete ^File f))))))

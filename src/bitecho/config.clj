@@ -22,6 +22,7 @@
    :genesis-ledger        {}
    ;; Treasury / Tokenomics parameters
    :epoch-length-ms       3600000
+   :tick-interval-ms      3600000
    :treasury-trailing-epochs 168
    :min-node-stake        250000
    :bootstrap-sunset-epoch 26280
