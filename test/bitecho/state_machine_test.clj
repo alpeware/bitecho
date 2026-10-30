@@ -2242,3 +2242,177 @@
                        (contains? (:settled-voucher-tuples s-ep2) [callee-pub home-node 0])
                        (empty? (:pending-vouchers s-ep2))
                        (empty? (:failed-vouchers s-ep2))))))
+
+(deftest test-devnet-config-and-unified-3node-cluster
+  (testing "devnet-config parameters are tuned for 3-node Genesis Devnet cluster"
+    (is (= 10000 (:epoch-length-ms config/devnet-config)))
+    (is (= 10000 (:tick-interval-ms config/devnet-config)))
+    (is (= 2 (:murmur-k config/devnet-config)))
+    (is (= 10 (:basalt-max-view-size config/devnet-config)))
+    (is (= 2 (:echo-sample-size config/devnet-config)))
+    (is (= 2 (:echo-threshold config/devnet-config)))
+    (is (= 2 (:ready-sample-size config/devnet-config)))
+    (is (= 1 (:ready-threshold config/devnet-config)))
+    (is (= 2 (:delivery-sample-size config/devnet-config)))
+    (is (= 2 (:delivery-threshold config/devnet-config))))
+
+  (testing "3-node unified state machine cluster drives Streamlet block proposals, quorum, and finalization"
+    (let [kp0 (crypto/generate-keypair)
+          kp1 (crypto/generate-keypair)
+          kp2 (crypto/generate-keypair)
+          raw-nodes [{:kp kp0 :pub (basalt/bytes->hex (:public kp0))}
+                     {:kp kp1 :pub (basalt/bytes->hex (:public kp1))}
+                     {:kp kp2 :pub (basalt/bytes->hex (:public kp2))}]
+          sorted-nodes (vec (sort-by :pub raw-nodes))
+          node0 (nth sorted-nodes 0)
+          node1 (nth sorted-nodes 1)
+          node2 (nth sorted-nodes 2)
+          pub0 (:pub node0)
+          pub1 (:pub node1)
+          pub2 (:pub node2)
+          peers-map {pub0 (:public (:kp node0))
+                     pub1 (:public (:kp node1))
+                     pub2 (:public (:kp node2))}
+          cfg (assoc config/devnet-config :peers-map peers-map)
+          init-s0 (sm/init-state [] pub0 (assoc cfg :keypair (:kp node0)))
+          init-s1 (sm/init-state [] pub1 (assoc cfg :keypair (:kp node1)))
+          init-s2 (sm/init-state [] pub2 (assoc cfg :keypair (:kp node2)))]
+
+      (testing "init-state sets Streamlet BFT fields"
+        (is (= {} (:blocks init-s0)))
+        (is (= #{} (:notarized-blocks init-s0)))
+        (is (= #{} (:finalized-blocks init-s0)))
+        (is (= {} (:block-votes init-s0)))
+        (is (= #{} (:voted-epochs init-s0)))
+        (is (= "genesis" (:head-hash init-s0)))
+        (is (= [] (:mempool init-s0)))
+        (is (= peers-map (:peers-map init-s0)))
+        (is (= (:kp node0) (:keypair init-s0))))
+
+      ;; Epoch 1: Proposer is index (mod 1 3) = 1 -> node1
+      (let [t1-res1 (sm/handle-event init-s1 {:type :tick :rng (java.util.Random. 1)})
+            s1-ep1 (:state t1-res1)
+            cmds1-ep1 (:commands t1-res1)
+            t1-res0 (sm/handle-event init-s0 {:type :tick :rng (java.util.Random. 1)})
+            s0-ep1 (:state t1-res0)
+            t1-res2 (sm/handle-event init-s2 {:type :tick :rng (java.util.Random. 1)})
+            s2-ep1 (:state t1-res2)
+            prop1-cmd (first (filter #(= :send-propose (:type %)) cmds1-ep1))
+            vote1-cmd (first (filter #(= :send-vote (:type %)) cmds1-ep1))
+            b1 (:block prop1-cmd)
+            h1 (streamlet/hash-block b1)
+            v1 (:vote vote1-cmd)]
+        (is (some? prop1-cmd))
+        (is (some? vote1-cmd))
+        (is (= 1 (:epoch b1)))
+        (is (= "genesis" (:parent-hash b1)))
+        (is (= pub1 (:proposer b1)))
+
+        ;; Peers receive proposal and vote
+        (let [p0-res (sm/handle-event s0-ep1 {:type :receive-propose :block b1 :sender pub1})
+              v0 (:vote (first (filter #(= :send-vote (:type %)) (:commands p0-res))))
+              s0-notarized (:state (sm/handle-event (:state p0-res) {:type :receive-vote :vote v1 :sender pub1}))
+              s1-notarized (:state (sm/handle-event s1-ep1 {:type :receive-vote :vote v0 :sender pub0}))
+              p2-res (sm/handle-event s2-ep1 {:type :receive-propose :block b1 :sender pub1})
+              s2-notarized (:state (sm/handle-event (:state p2-res) {:type :receive-vote :vote v1 :sender pub1}))]
+          (is (contains? (:notarized-blocks s0-notarized) h1))
+          (is (contains? (:notarized-blocks s1-notarized) h1))
+          (is (contains? (:notarized-blocks s2-notarized) h1))
+
+          ;; Epoch 2: Proposer is index (mod 2 3) = 2 -> node2
+          (let [t2-res2 (sm/handle-event s2-notarized {:type :tick :rng (java.util.Random. 2)})
+                s2-ep2 (:state t2-res2)
+                b2-prop (first (filter #(= :send-propose (:type %)) (:commands t2-res2)))
+                b2-vote (first (filter #(= :send-vote (:type %)) (:commands t2-res2)))
+                b2 (:block b2-prop)
+                h2 (streamlet/hash-block b2)
+                v2 (:vote b2-vote)
+                s0-ep2 (:state (sm/handle-event s0-notarized {:type :tick :rng (java.util.Random. 2)}))
+                s1-ep2 (:state (sm/handle-event s1-notarized {:type :tick :rng (java.util.Random. 2)}))
+                p0-res2 (sm/handle-event s0-ep2 {:type :receive-propose :block b2 :sender pub2})
+                v0-ep2 (:vote (first (filter #(= :send-vote (:type %)) (:commands p0-res2))))
+                s0-notarized2 (:state (sm/handle-event (:state p0-res2) {:type :receive-vote :vote v2 :sender pub2}))
+                s2-notarized2 (:state (sm/handle-event s2-ep2 {:type :receive-vote :vote v0-ep2 :sender pub0}))
+                p1-res2 (sm/handle-event s1-ep2 {:type :receive-propose :block b2 :sender pub2})
+                s1-notarized2 (:state (sm/handle-event (:state p1-res2) {:type :receive-vote :vote v2 :sender pub2}))]
+            (is (some? b2-prop))
+            (is (= 2 (:epoch b2)))
+            (is (= h1 (:parent-hash b2)))
+            (is (contains? (:notarized-blocks s0-notarized2) h2))
+            (is (contains? (:notarized-blocks s1-notarized2) h2))
+            (is (contains? (:notarized-blocks s2-notarized2) h2))
+
+            ;; Epoch 3: Proposer is index (mod 3 3) = 0 -> node0
+            (let [t3-res0 (sm/handle-event s0-notarized2 {:type :tick :rng (java.util.Random. 3)})
+                  s0-ep3 (:state t3-res0)
+                  b3-prop (first (filter #(= :send-propose (:type %)) (:commands t3-res0)))
+                  b3-vote (first (filter #(= :send-vote (:type %)) (:commands t3-res0)))
+                  b3 (:block b3-prop)
+                  h3 (streamlet/hash-block b3)
+                  v0-ep3 (:vote b3-vote)
+                  s1-ep3 (:state (sm/handle-event s1-notarized2 {:type :tick :rng (java.util.Random. 3)}))
+                  p1-res3 (sm/handle-event s1-ep3 {:type :receive-propose :block b3 :sender pub0})
+                  v1-ep3 (:vote (first (filter #(= :send-vote (:type %)) (:commands p1-res3))))
+                  s0-notarized3 (:state (sm/handle-event s0-ep3 {:type :receive-vote :vote v1-ep3 :sender pub1}))
+                  s1-notarized3 (:state (sm/handle-event (:state p1-res3) {:type :receive-vote :vote v0-ep3 :sender pub0}))]
+              (is (some? b3-prop))
+              (is (= 3 (:epoch b3)))
+              (is (= h2 (:parent-hash b3)))
+              (is (contains? (:notarized-blocks s0-notarized3) h3))
+
+              ;; Finalization: 3 consecutive epochs (1, 2, 3) finalizes middle block h2 and ancestors h1
+              (is (contains? (:finalized-blocks s0-notarized3) h2))
+              (is (contains? (:finalized-blocks s0-notarized3) h1))
+              (is (contains? (:finalized-blocks s1-notarized3) h2))
+              (is (contains? (:finalized-blocks s1-notarized3) h1))
+
+              ;; Epoch entropy is derived from finalized blocks
+              (let [entropy0 (sm/derive-epoch-entropy s0-notarized3 cfg)
+                    entropy1 (sm/derive-epoch-entropy s1-notarized3 cfg)]
+                (is (not= "genesis" entropy0))
+                (is (= entropy0 entropy1))
+                (is (contains? (:finalized-blocks s0-notarized3) entropy0))))))))))
+
+(defspec ^{:doc "Property: Unified state machine deterministically notarizes proposed blocks upon 2n/3 quorum and never with < 2 votes"}
+  prop-unified-streamlet-state-machine-quorum 50
+  (prop/for-all [epoch-num (gen/choose 1 20)
+                 proposer-offset (gen/choose 0 2)]
+                (let [kp0 (crypto/generate-keypair)
+                      kp1 (crypto/generate-keypair)
+                      kp2 (crypto/generate-keypair)
+                      kps [kp0 kp1 kp2]
+                      pubs (mapv #(basalt/bytes->hex (:public %)) kps)
+                      sorted-indices (sort-by #(nth pubs %) (range 3))
+                      sorted-kps (mapv #(nth kps %) sorted-indices)
+                      sorted-pubs (mapv #(nth pubs %) sorted-indices)
+                      peers-map (into {} (map (fn [i] [(nth sorted-pubs i) (:public (nth sorted-kps i))]) (range 3)))
+                      cfg (assoc config/devnet-config :peers-map peers-map)
+                      proposer-idx (mod epoch-num 3)
+                      proposer-pub (nth sorted-pubs proposer-idx)
+                      obs-idx (mod (+ proposer-idx 1 proposer-offset) 3)
+                      obs-pub (nth sorted-pubs obs-idx)
+                      obs-kp (nth sorted-kps obs-idx)
+                      other-idx (first (filter #(and (not= % proposer-idx) (not= % obs-idx)) (range 3)))
+                      other-pub (nth sorted-pubs other-idx)
+                      other-kp (nth sorted-kps other-idx)
+                      obs-state (assoc (sm/init-state [] obs-pub (assoc cfg :keypair obs-kp))
+                                       :epoch epoch-num)
+                      block (streamlet/->Block epoch-num "genesis" [] proposer-pub)
+                      b-hash (streamlet/hash-block block)
+                      res-prop (sm/handle-event obs-state {:type :receive-propose :block block :sender proposer-pub})
+                      s1 (:state res-prop)
+                      corrupted-vote (streamlet/->Vote b-hash epoch-num (streamlet/bytes->hex (byte-array 64)))
+                      s-corrupt (:state (sm/handle-event s1 {:type :receive-vote :vote corrupted-vote :sender other-pub}))
+                      valid-sig (streamlet/bytes->hex (crypto/sign (:private other-kp) (.getBytes ^String b-hash "UTF-8")))
+                      valid-vote (streamlet/->Vote b-hash epoch-num valid-sig)
+                      s2 (:state (sm/handle-event s1 {:type :receive-vote :vote valid-vote :sender other-pub}))]
+                  (if (= obs-idx proposer-idx)
+                    (and (not (contains? (:notarized-blocks s1) b-hash))
+                         (not (contains? (:notarized-blocks s-corrupt) b-hash))
+                         (contains? (:notarized-blocks s2) b-hash))
+                    (and (= 1 (count (get-in s1 [:block-votes b-hash])))
+                         (not (contains? (:notarized-blocks s1) b-hash))
+                         (= 1 (count (get-in s-corrupt [:block-votes b-hash])))
+                         (not (contains? (:notarized-blocks s-corrupt) b-hash))
+                         (= 2 (count (get-in s2 [:block-votes b-hash])))
+                         (contains? (:notarized-blocks s2) b-hash))))))

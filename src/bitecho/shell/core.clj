@@ -19,7 +19,11 @@
     :receive-gossip
     :receive-sieve-echo
     :receive-contagion-ready
-    :receive-subscribe})
+    :receive-subscribe
+    :receive-propose
+    :receive-vote
+    :register-home-set
+    :receive-offer-header})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."

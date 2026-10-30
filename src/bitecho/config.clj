@@ -72,6 +72,24 @@
           :delivery-threshold     17}))
 
 ;; ---------------------------------------------------------------------------
+;; Genesis Devnet preset (3-node cluster, N = 3)
+;; ---------------------------------------------------------------------------
+
+(def devnet-config
+  "Protocol parameters tuned for the 3-node Genesis Devnet cluster (N = 3)."
+  (merge default-config
+         {:epoch-length-ms      10000
+          :tick-interval-ms     10000
+          :murmur-k             2
+          :basalt-max-view-size 10
+          :echo-sample-size     2
+          :echo-threshold       2
+          :ready-sample-size    2
+          :ready-threshold      1
+          :delivery-sample-size 2
+          :delivery-threshold   2}))
+
+;; ---------------------------------------------------------------------------
 ;; Constructor
 ;; ---------------------------------------------------------------------------
 

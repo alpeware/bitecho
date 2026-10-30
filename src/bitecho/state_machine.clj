@@ -59,40 +59,25 @@
       :basalt-view (basalt/init-view initial-peers view-size epoch-entropy node-pubkey)
       :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
       :contagion-known-ids #{}
-      :messages {}
-      :message-epochs {}
-      :epoch-to-messages {}
-      :epoch-to-message-roles {}
-      :global-echo-sample #{}
-      :global-ready-sample #{}
-      :global-delivery-sample #{}
-      :echo-subscribers #{}
-      :ready-subscribers #{}
-      :delivery-subscribers #{}
-      :received-echoes {}
-      :received-readies {}
-      :echo-vote-counts {}
-      :ready-vote-counts {}
-      :delivery-vote-counts {}
-      :sieve-delivered-set #{}
-      :local-ready-set #{}
-      :delivered-set #{}
-      :total-minted 0
-      :minted-epochs #{}
-      :mint-dust 0
-      :epoch-mint-dust {}
-      :unclaimed-mint 0
-      :epoch-unclaimed-mint {}
-      :frozen-epoch-messages {}
-      :frozen-epoch-message-roles {}
-      :fault-strikes {}
-      :home-sets {}
-      :voucher-seqs {}
-      :pending-vouchers []
-      :settled-voucher-tuples #{}
-      :failed-vouchers []
+      :messages {} :message-epochs {}
+      :epoch-to-messages {} :epoch-to-message-roles {}
+      :global-echo-sample #{} :global-ready-sample #{} :global-delivery-sample #{}
+      :echo-subscribers #{} :ready-subscribers #{} :delivery-subscribers #{}
+      :received-echoes {} :received-readies {}
+      :echo-vote-counts {} :ready-vote-counts {} :delivery-vote-counts {}
+      :sieve-delivered-set #{} :local-ready-set #{} :delivered-set #{}
+      :total-minted 0 :minted-epochs #{} :mint-dust 0 :epoch-mint-dust {}
+      :unclaimed-mint 0 :epoch-unclaimed-mint {}
+      :frozen-epoch-messages {} :frozen-epoch-message-roles {}
+      :fault-strikes {} :home-sets {} :voucher-seqs {}
+      :pending-vouchers [] :settled-voucher-tuples #{} :failed-vouchers []
       :skipped-custody-allocations []
-      :ledger (or genesis-ledger {})})))
+      :ledger (or genesis-ledger {})
+      ;; Streamlet BFT state
+      :blocks {} :notarized-blocks #{} :finalized-blocks #{}
+      :block-votes {} :voted-epochs #{} :head-hash "genesis" :mempool []
+      :peers-map (or (:peers-map cfg) {})
+      :keypair (or (:keypair cfg) nil)})))
 
 (defn- build-tick-treasury-ctx
   "Extracts trailing revenues and builds the treasury context for an epoch tick boundary."
@@ -385,6 +370,18 @@
                :frozen-epoch-message-roles pruned-frozen-roles)
         (prune-rendezvous-retention-state rdv-cutoff))))
 
+(defn- apply-streamlet-tick
+  "Steps Streamlet BFT tick if peers-map is configured, advancing consensus state and commands."
+  [treasury-state commands closing-epoch]
+  (if (seq (:peers-map treasury-state))
+    (let [streamlet-res (streamlet/handle-streamlet-event
+                         (assoc treasury-state :epoch closing-epoch)
+                         {:type :tick})]
+      {:state (:state streamlet-res)
+       :commands (into (or commands []) (:commands streamlet-res))})
+    {:state treasury-state
+     :commands commands}))
+
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
@@ -440,9 +437,9 @@
                           :global-ready-sample (:ready-sample sampling-res)
                           :global-delivery-sample (:delivery-sample sampling-res))
         pruned-state (prune-expired-tick-state base-state new-epoch cfg)
-        tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)]
-    {:state (apply-epoch-treasury-boundary tick-state-settled new-epoch)
-     :commands commands}))
+        tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)
+        treasury-state (apply-epoch-treasury-boundary tick-state-settled new-epoch)]
+    (apply-streamlet-tick treasury-state commands closing-epoch)))
 
 (defn- apply-broadcast-burn
   "Enforces a mandatory signaling burn (>= burn/min-signaling-burn) on every broadcast.
@@ -1055,5 +1052,7 @@
     :receive-gossip (handle-receive-gossip state event)
     :receive-sieve-echo (handle-receive-sieve-echo state event)
     :receive-contagion-ready (handle-receive-contagion-ready state event)
+    :receive-propose (streamlet/handle-streamlet-event state event)
+    :receive-vote (streamlet/handle-streamlet-event state event)
     :on-deliver (handle-on-deliver state event)
     {:state state :commands []}))
