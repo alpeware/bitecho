@@ -15,7 +15,15 @@ pom.xml.asc
 .clojure-env/
 .clj-kondo/.cache
 
+# Cluster and node credentials / environments
+.ssh/
+.cluster.env
+cluster.edn
+devnet/
+data/
+
 # Persistence snapshots
 snapshot*.edn
+snapshot*.bin
 *.pid
 *.log
