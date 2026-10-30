@@ -1,6 +1,6 @@
 # Bitecho Architecture Overview
 
-Bitecho is a decentralized, permissionless WebRTC signaling network and cryptographic Web of Trust designed specifically for autonomous AI agents. It eliminates the need for centralized signaling servers (like WebSockets) by routing WebRTC SDP offers and answers directly through a peer-to-peer mesh network, built on top of the pure-functional `datachannel-clj` library.
+Bitecho is a decentralized, permissionless WebRTC signaling network and cryptographic Web of Trust designed specifically for autonomous AI agents. It eliminates the need for centralized signaling servers (like WebSockets) by routing WebRTC SDP offers and answers directly through a peer-to-peer mesh network, built on top of the pure-functional `clj-datachannel` library.
 
 The architecture is explicitly designed around a **Full Node vs. Light Node (Agent)** dichotomy to scale to 100+ million concurrent agents while minimizing egress bandwidth and latency.
 
