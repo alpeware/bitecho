@@ -203,7 +203,7 @@ cmd_init() {
     echo "--> Checking static external IPv4 ${addr} in ${proj} (${reg})..."
     if ! gcloud compute addresses describe "$addr" --project="$proj" --region="$reg" &>/dev/null; then
       echo "Reserving static external IPv4 ${addr} in ${proj} (${reg})..."
-      gcloud compute addresses create "$addr" --project="$proj" --region="$reg" --quiet
+      gcloud compute addresses create "$addr" --project="$proj" --region="$reg" --network-tier=STANDARD --quiet
     fi
     local ip
     ip="$(gcloud compute addresses describe "$addr" --project="$proj" --region="$reg" --format='value(address)')"
@@ -239,6 +239,7 @@ cmd_init() {
         --project="$proj" \
         --zone="$z" \
         --machine-type=e2-micro \
+        --network-tier=STANDARD \
         --image-family=debian-12 \
         --image-project=debian-cloud \
         --boot-disk-size=30GB \
@@ -834,6 +835,74 @@ cmd_ssh() {
 }
 
 # ------------------------------------------------------------------------------
+# Subcommand: chaos
+# ------------------------------------------------------------------------------
+
+cmd_chaos() {
+  local rounds=3
+  local interval=25
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --rounds)
+        rounds="$2"
+        shift 2
+        ;;
+      --interval)
+        interval="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown chaos option: $1" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  echo "=== Running Chaos Monkey Mode (${rounds} rounds, interval ${interval}s) ==="
+  for (( i = 1; i <= rounds; i++ )); do
+    local victim="${NODES[$(( RANDOM % ${#NODES[@]} ))]}"
+    echo "=== Chaos Round ${i}/${rounds}: Restarting ${victim} ==="
+    ssh_cmd "$victim" sudo systemctl restart bitecho.service
+
+    echo "Polling healthz on ${victim} (up to 30s)..."
+    local retries=15
+    local healthy=false
+    while (( retries > 0 )); do
+      local resp
+      resp="$(ssh_cmd "$victim" curl -fsSL --max-time 2 http://127.0.0.1:8080/healthz 2>/dev/null || true)"
+      if [[ "$resp" == *"ok"* ]]; then
+        healthy=true
+        break
+      fi
+      sleep 2
+      (( retries-- ))
+    done
+    if [[ "$healthy" != true ]]; then
+      echo "Error: ${victim} failed to become healthy within 30s after restart." >&2
+      return 1
+    fi
+    echo "${victim} is healthy (healthz ok)."
+
+    echo "Waiting ${interval}s for WebRTC DataChannel peer reconnection and Streamlet consensus ticks..."
+    sleep "$interval"
+
+    cmd_status
+    for node in "${NODES[@]}"; do
+      local st
+      st="$(ssh_cmd "$node" systemctl is-active bitecho 2>/dev/null || echo "inactive")"
+      if [[ "$st" != "active" ]]; then
+        echo "Error: Node ${node} is not active (state: ${st})." >&2
+        return 1
+      fi
+    done
+    echo "Chaos Round ${i}/${rounds} PASSED: All nodes active."
+  done
+
+  echo "=== Chaos Monkey Mode Completed Successfully (${rounds} rounds) ==="
+}
+
+# ------------------------------------------------------------------------------
 # CLI Dispatcher & Usage
 # ------------------------------------------------------------------------------
 
@@ -845,18 +914,19 @@ Usage:
   ./scripts/cluster.sh <command> [options]
 
 Commands:
-  init                       Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
-  deploy [--reset-state]     Build local uberjar, sync configs/keys/binaries, and restart bitecho services
-  status                     Display live status table across all 3 cluster nodes
-  logs [node1|node2|node3]   Stream systemd journal logs from a cluster node
-  bootstrap-sdp              Display WebRTC DataChannel bootstrap connection parameters for agents
-  ssh <node1|node2|node3>    Open interactive SSH shell into a cluster node
-  help, -h, --help           Show this help message
+  init                                Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
+  deploy [--reset-state]              Build local uberjar, sync configs/keys/binaries, and restart bitecho services
+  status                              Display live status table across all 3 cluster nodes
+  chaos [--rounds N] [--interval SEC] Run chaos monkey restarting random nodes and checking convergence
+  logs [node1|node2|node3]            Stream systemd journal logs from a cluster node
+  bootstrap-sdp                       Display WebRTC DataChannel bootstrap connection parameters for agents
+  ssh <node1|node2|node3>             Open interactive SSH shell into a cluster node
+  help, -h, --help                    Show this help message
 
 Environment Variables & Overrides:
-  BILLING_ACCOUNT            GCP Billing Account (default: 00A760-ADD23B-93C934)
-  SSH_USER                   Remote SSH username (default: bitecho)
-  TICK_INTERVAL_MS           Streamlet & Treasury tick interval in ms (default: 10000)
+  BILLING_ACCOUNT                     GCP Billing Account (default: 00A760-ADD23B-93C934)
+  SSH_USER                            Remote SSH username (default: bitecho)
+  TICK_INTERVAL_MS                    Streamlet & Treasury tick interval in ms (default: 10000)
 USAGE_EOF
 }
 
@@ -878,6 +948,9 @@ main() {
       ;;
     status)
       cmd_status "$@"
+      ;;
+    chaos)
+      cmd_chaos "$@"
       ;;
     logs)
       cmd_logs "$@"

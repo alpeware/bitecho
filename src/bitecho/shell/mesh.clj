@@ -425,29 +425,51 @@
      :shared-channel? false
      :callbacks (atom nil)}))
 
-(defn- check-and-reconnect-peers!
-  "Checks peer datachannel health and attempts reconnect if closed or stalled."
-  [ctx]
-  (let [{:keys [nodes-cfg node-id peer-conns]} ctx
-        now-ms (System/currentTimeMillis)]
-    (doseq [[pid pcfg] nodes-cfg
-            :when (not= pid node-id)
-            :let [peer-hex (:pubkey pcfg)
-                  conn (get @peer-conns peer-hex)
-                  node (:node conn)
-                  st (when node (try (api/get-state node) (catch Exception _ :closed)))
-                  stalled? (and (nil? @(:channel-id conn))
-                                (> (- now-ms (:created-at conn 0)) 15000))]]
-      (when (or (nil? conn) (= st :closed) stalled?)
+(defn send-peer-keepalives!
+  "Sends a keepalive frame to each connected peer DataChannel."
+  [peer-conns]
+  (when peer-conns
+    (let [keepalive-bytes (nippy/freeze {:type :keepalive})]
+      (doseq [[_ conn] @peer-conns
+              :when (some? @(:channel-id conn))]
         (try
-          (init-datachannel-peer! ctx pid pcfg)
+          (api/send! (:node conn) keepalive-bytes @(:channel-id conn))
           (catch Exception e
-            (log-mesh-error (str "Peer reconnect error for " pid) e)))))))
+            (log-mesh-error "Failed to send keepalive" e)))))))
+
+(defn check-and-reconnect-peers!
+  "Checks peer datachannel health and attempts reconnect if closed, stalled during handshake, or quiet past timeout-ms."
+  ([ctx]
+   (check-and-reconnect-peers! ctx 20000 (System/currentTimeMillis)))
+  ([ctx timeout-ms]
+   (check-and-reconnect-peers! ctx timeout-ms (System/currentTimeMillis)))
+  ([ctx timeout-ms now-ms]
+   (let [{:keys [nodes-cfg node-id peer-conns]} ctx]
+     (doseq [[pid pcfg] nodes-cfg
+             :when (not= pid node-id)
+             :let [peer-hex (:pubkey pcfg)
+                   conn (get @peer-conns peer-hex)
+                   node (:node conn)
+                   st (when node (try (api/get-state node) (catch Exception _ :closed)))
+                   cid (when conn @(:channel-id conn))
+                   created-at (get conn :created-at 0)
+                   last-rx (when conn @(or (:last-rx-at conn) (atom now-ms)))
+                   stalled-unconnected? (and (nil? cid) (> (- now-ms created-at) 12000))
+                   timed-out-connected? (and (some? cid) (> (- now-ms (or last-rx now-ms)) (long timeout-ms)))]]
+       (when (or (nil? conn)
+                 (= st :closed)
+                 stalled-unconnected?
+                 timed-out-connected?)
+         (try
+           (init-datachannel-peer! ctx pid pcfg)
+           (catch Exception e
+             (log-mesh-error (str "Peer reconnect error for " pid) e))))))))
 
 (defn- start-ticker!
-  "Starts the periodic virtual-thread timer pushing :tick events and auto-reconnecting."
+  "Starts the periodic virtual-thread timer pushing :tick events, sending peer keepalives, and auto-reconnecting."
   [ctx tick-interval-ms]
   (let [{:keys [shell-node transport]} ctx
+        timeout-ms (max 20000 (* 2 (long tick-interval-ms)))
         executor (Executors/newSingleThreadScheduledExecutor)]
     (.scheduleAtFixedRate executor
                           (fn []
@@ -455,7 +477,8 @@
                               (async/put! (:events-in shell-node)
                                           {:type :tick :rng (java.util.Random.)})
                               (when (= transport :datachannel)
-                                (check-and-reconnect-peers! ctx))
+                                (send-peer-keepalives! (:peer-conns ctx))
+                                (check-and-reconnect-peers! ctx timeout-ms))
                               (catch Exception e
                                 (log-mesh-error "Ticker loop error" e))))
                           tick-interval-ms
@@ -503,7 +526,8 @@
               peer-hex (:pubkey peer-cfg)]
           (when-let [old-conn (get @peer-conns peer-hex)]
             (when-let [old-node (:node old-conn)]
-              (try (api/close! old-node) (catch Exception _ nil))))
+              (try (api/close! old-node) (catch Exception _ nil))
+              (Thread/sleep 50)))
           (let [peer-ip (or (:ip peer-cfg) "127.0.0.1")
                 base-peer-port (int (or (:port peer-cfg) 5000))
                 peer-port (+ base-peer-port (int (get node-idx node-id 0)))
@@ -514,6 +538,7 @@
                 local-ice (identity/deterministic-ice-creds node-id local-fp)
                 node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp)
                 channel-id (atom nil)
+                last-rx-at (atom (System/currentTimeMillis))
                 remote-ice (identity/deterministic-ice-creds pid peer-fp)
                 remote-sdp {:ip peer-ip
                             :port peer-port
@@ -521,19 +546,28 @@
                             :remote-ice-ufrag (:ufrag remote-ice)
                             :remote-ice-pwd (:pwd remote-ice)}
                 callbacks {:on-open (fn [evt]
-                                      (when-not (:channel-id evt)
-                                        (reset! channel-id (api/create-data-channel! node "bitecho" {:ordered true}))))
+                                      (reset! last-rx-at (System/currentTimeMillis))
+                                      (if-let [cid (:channel-id evt)]
+                                        (reset! channel-id cid)
+                                        (do
+                                          (reset! channel-id (api/create-data-channel! node "bitecho" {:ordered true}))
+                                          (println (str "[Mesh] Connected to peer " (name pid))))))
                            :on-message (fn [evt]
+                                         (reset! last-rx-at (System/currentTimeMillis))
                                          (when-let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
-                                           (let [event (assoc msg
-                                                              :sender peer-hex
-                                                              :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
-                                                              :rng (java.util.Random.))]
-                                             (async/put! (:network-in shell-node) event))))
-                           :on-close (fn [_] (reset! channel-id nil))}]
+                                           (when-not (= :keepalive (:type msg))
+                                             (let [event (assoc msg
+                                                                :sender peer-hex
+                                                                :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
+                                                                :rng (java.util.Random.))]
+                                               (async/put! (:network-in shell-node) event)))))
+                           :on-close (fn [_]
+                                       (reset! channel-id nil)
+                                       (println (str "[Mesh] Disconnected from peer " (name pid))))}]
             (api/start! node remote-sdp callbacks)
             (swap! peer-conns assoc peer-hex {:node node
                                               :channel-id channel-id
+                                              :last-rx-at last-rx-at
                                               :created-at (System/currentTimeMillis)})))))
     (catch Exception e
       (log-mesh-error (format "Failed to connect to peer %s" pid) e)

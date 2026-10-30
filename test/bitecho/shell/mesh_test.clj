@@ -17,6 +17,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [datachannel.api :as api]
             [datachannel.dtls :as dtls]
             [taoensso.nippy :as nippy])
   (:import [java.io File]
@@ -641,3 +642,115 @@
         (aset mutated-pl 0 (unchecked-byte (bit-xor (aget mutated-pl 0) 1)))
         (let [tampered (assoc-in thawed [:event :message :payload] mutated-pl)]
           (is (nil? (mesh/unwrap-authenticated-agent-event tampered))))))))
+
+(deftest test-send-peer-keepalives
+  (let [sent (atom [])
+        mock-node-1 {:id 1}
+        mock-node-2 {:id 2}
+        mock-node-3 {:id 3}
+        peer-conns (atom {"peer-1" {:node mock-node-1 :channel-id (atom 10)}
+                          "peer-2" {:node mock-node-2 :channel-id (atom nil)}
+                          "peer-3" {:node mock-node-3 :channel-id (atom 20)}})]
+    (with-redefs [api/send! (fn [node data cid]
+                              (swap! sent conj {:node node :data (nippy/thaw data) :cid cid}))]
+      (mesh/send-peer-keepalives! peer-conns)
+      (is (= 2 (count @sent)))
+      (is (= #{1 3} (set (map #(get-in % [:node :id]) @sent))))
+      (is (= #{10 20} (set (map :cid @sent))))
+      (is (every? #(= {:type :keepalive} (:data %)) @sent)))
+
+    (testing "send error is caught and does not throw"
+      (with-redefs [api/send! (fn [_ _ _] (throw (RuntimeException. "send failed")))]
+        (is (nil? (mesh/send-peer-keepalives! peer-conns)))))))
+
+(defspec ^{:doc "Verifies check-and-reconnect-peers! reconnects peers strictly when closed, stalled, or timed out."}
+  prop-check-and-reconnect-peers-invariants
+  100
+  (prop/for-all [conn-exists? gen/boolean
+                 cid-val (gen/elements [nil 0 1 2])
+                 elapsed-created (gen/choose 0 30000)
+                 elapsed-rx (gen/choose 0 60000)
+                 st (gen/elements [:connected :connecting :closed])
+                 timeout-ms (gen/choose 10000 40000)]
+                (let [now-ms 100000
+                      created-at (- now-ms (long elapsed-created))
+                      last-rx-at (- now-ms (long elapsed-rx))
+                      mock-node {:mock true}
+                      peer-conn (when conn-exists?
+                                  {:node mock-node
+                                   :channel-id (atom cid-val)
+                                   :created-at created-at
+                                   :last-rx-at (atom last-rx-at)})
+                      reconnected (atom [])
+                      peer-conns (atom (if conn-exists? {"peer-hex" peer-conn} {}))
+                      ctx {:node-id :node-local
+                           :nodes-cfg {:node-local {:pubkey "local-hex"}
+                                       :node-remote {:pubkey "peer-hex"}}
+                           :peer-conns peer-conns}
+                      expected-reconnect? (or (not conn-exists?)
+                                              (= st :closed)
+                                              (and (nil? cid-val) (> (long elapsed-created) 12000))
+                                              (and (some? cid-val) (> (long elapsed-rx) (long timeout-ms))))]
+                  (with-redefs [mesh/init-datachannel-peer! (fn [_ pid _] (swap! reconnected conj pid))
+                                api/get-state (fn [_] st)]
+                    (mesh/check-and-reconnect-peers! ctx timeout-ms now-ms)
+                    (= expected-reconnect? (contains? (set @reconnected) :node-remote))))))
+
+(deftest test-datachannel-keepalive-message-handling
+  (let [captured-callbacks (atom nil)
+        network-in (async/chan 10)
+        shell-node {:network-in network-in}
+        peer-conns (atom {})
+        ctx {:node-id :node-local
+             :identity {:pubkey-hex (apply str (repeat 88 "a"))
+                        :fingerprint "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+                        :cert-data {}}
+             :node-idx {:node-local 0 :node-remote 1}
+             :nodes-cfg {:node-local {:port 5000}
+                         :node-remote {:ip "127.0.0.1"
+                                       :port 5001
+                                       :pubkey (apply str (repeat 88 "b"))
+                                       :fingerprint "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"}}
+             :shell-node shell-node
+             :peer-conns peer-conns}]
+    (with-redefs [api/start! (fn [_ _ cbs] (reset! captured-callbacks cbs))
+                  api/create-data-channel! (fn [_ _ _] 0)]
+      (#'mesh/init-datachannel-peer! ctx :node-remote (get-in ctx [:nodes-cfg :node-remote]))
+      (is (some? @captured-callbacks))
+      (let [conn (get @peer-conns (get-in ctx [:nodes-cfg :node-remote :pubkey]))
+            last-rx-at (:last-rx-at conn)
+            on-msg (:on-message @captured-callbacks)
+            on-open (:on-open @captured-callbacks)
+            on-close (:on-close @captured-callbacks)]
+        (is (some? conn))
+        (is (some? last-rx-at))
+
+        ;; Test on-open updates last-rx-at and sets channel-id
+        (let [t0 @last-rx-at]
+          (Thread/sleep 2)
+          (on-open {})
+          (is (> @last-rx-at t0))
+          (is (= 0 @(:channel-id conn))))
+
+        ;; Test on-message with :keepalive updates last-rx-at and does not put to network-in
+        (let [t1 @last-rx-at]
+          (Thread/sleep 2)
+          (on-msg {:payload (nippy/freeze {:type :keepalive})})
+          (is (> @last-rx-at t1))
+          (is (nil? (async/poll! network-in))))
+
+        ;; Test on-message with regular event puts to network-in
+        (let [t2 @last-rx-at]
+          (Thread/sleep 2)
+          (on-msg {:payload (nippy/freeze {:type :receive-gossip :data "hello"})})
+          (is (> @last-rx-at t2))
+          (let [received (async/poll! network-in)]
+            (is (some? received))
+            (is (= :receive-gossip (:type received)))
+            (is (= "hello" (:data received)))))
+
+        ;; Test on-close clears channel-id
+        (on-close {})
+        (is (nil? @(:channel-id conn)))))))
+
+
