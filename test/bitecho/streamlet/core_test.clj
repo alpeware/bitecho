@@ -1,6 +1,7 @@
 (ns bitecho.streamlet.core-test
   (:require [bitecho.crypto :as crypto]
             [bitecho.streamlet.core :as core]
+            [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -864,4 +865,199 @@
           (let [res (core/handle-streamlet-event state {:type :receive-vote :vote bv :sender voter-hex})]
             (is (= state (:state res)))
             (is (= [] (:commands res)))))))))
+
+(defn- step-consensus-round
+  "Executes one full consensus round for epoch e across nodes-map:
+   proposer ticks, broadcasts proposal w/ ancestors, peers vote, votes are delivered to all nodes."
+  [nodes-map peer-hexes e]
+  (let [node-count (count peer-hexes)
+        proposer-idx (mod e node-count)
+        proposer-hex (nth peer-hexes proposer-idx)
+        proposer-st (get nodes-map proposer-hex)
+        proposer-res (core/handle-streamlet-event proposer-st {:type :tick})
+        prop-cmd (first (filter #(= (:type %) :send-propose) (:commands proposer-res)))
+        prop-vote-cmd (first (filter #(= (:type %) :send-vote) (:commands proposer-res)))
+        proposed-block (:block prop-cmd)
+        ancestors (:ancestors prop-cmd)
+        proposer-vote (when prop-vote-cmd (:vote prop-vote-cmd))
+        proposer-st-after (:state proposer-res)
+
+        ;; Deliver proposal to peers
+        nodes-and-votes
+        (mapv (fn [hex]
+                (if (= hex proposer-hex)
+                  {:hex hex :state proposer-st-after :vote proposer-vote}
+                  (let [st (get nodes-map hex)
+                        res (core/handle-streamlet-event st {:type :receive-propose
+                                                             :block proposed-block
+                                                             :ancestors ancestors
+                                                             :sender proposer-hex})
+                        vote-cmd (first (filter #(= (:type %) :send-vote) (:commands res)))]
+                    {:hex hex :state (:state res) :vote (when vote-cmd (:vote vote-cmd))})))
+              peer-hexes)
+
+        nodes-after-proposal (into {} (map (fn [item] [(:hex item) (:state item)]) nodes-and-votes))
+        all-votes (vec (keep :vote nodes-and-votes))
+
+        ;; Deliver all votes to all nodes
+        final-nodes
+        (into {}
+              (map (fn [[hex st]]
+                     (let [final-st (reduce (fn [s v]
+                                              (let [voter-hex (first (filter (fn [h]
+                                                                               (let [pk (get-in s [:peers-map h])]
+                                                                                 (and pk
+                                                                                      (crypto/verify pk
+                                                                                                     (.getBytes ^String (:block-hash v) "UTF-8")
+                                                                                                     (core/hex->bytes (:voter-signature v))))))
+                                                                             peer-hexes))]
+                                                (:state (core/handle-streamlet-event s {:type :receive-vote :vote v :sender voter-hex}))))
+                                            st
+                                            all-votes)]
+                       [hex final-st]))
+                   nodes-after-proposal))]
+    final-nodes))
+
+(deftest test-longest-notarized-parent-epoch-monotonicity
+  (let [b1 (core/->Block 5 "genesis" [] "p1")
+        h1 (core/hash-block b1)
+        b2 (core/->Block 6 h1 [] "p2")
+        h2 (core/hash-block b2)
+        state {:blocks {h1 b1, h2 b2}
+               :notarized-blocks #{h1 h2}}]
+    (testing "child epoch > parent epoch is allowed"
+      (is (true? (core/longest-notarized-parent? state h2 7))))
+    (testing "child epoch <= parent epoch is rejected"
+      (is (false? (core/longest-notarized-parent? state h2 6)))
+      (is (false? (core/longest-notarized-parent? state h2 5)))
+      (is (false? (core/longest-notarized-parent? state h2 4))))
+    (testing "genesis parent allows any positive child epoch"
+      (is (true? (core/longest-notarized-parent? {:notarized-blocks #{}} "genesis" 1))))))
+
+(deftest test-staggered-epoch-catchup-and-finalization
+  (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+        [hex1 hex2 hex3] peer-hexes
+        [kp1 kp2 kp3] pairs
+        blocks-seq (reduce (fn [acc e]
+                             (let [parent-hash (if (empty? acc) "genesis" (:hash (last acc)))
+                                   leader-idx (mod e 3)
+                                   leader-hex (nth peer-hexes leader-idx)
+                                   leader-kp (nth pairs leader-idx)
+                                   raw-b (core/->Block e parent-hash [] leader-hex)
+                                   b (core/sign-block raw-b (:private leader-kp))
+                                   h (core/hash-block b)]
+                               (conj acc (assoc b :hash h))))
+                           []
+                           (range 1 6))
+        all-blocks (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) blocks-seq))
+        h1-h5 (mapv :hash blocks-seq)
+        h5 (nth h1-h5 4)
+        h2 (nth h1-h5 1)
+        n1 {:epoch 5
+            :node-pubkey hex1
+            :keypair kp1
+            :peers-map peers-map
+            :total-nodes 3
+            :blocks all-blocks
+            :notarized-blocks (set h1-h5)
+            :head-hash h5}
+        n2 {:epoch 2
+            :node-pubkey hex2
+            :keypair kp2
+            :peers-map peers-map
+            :total-nodes 3
+            :blocks (select-keys all-blocks (take 2 h1-h5))
+            :notarized-blocks (set (take 2 h1-h5))
+            :head-hash h2}
+        n3 {:epoch 0
+            :node-pubkey hex3
+            :keypair kp3
+            :peers-map peers-map
+            :total-nodes 3
+            :blocks {}
+            :notarized-blocks #{}
+            :head-hash "genesis"}
+        nodes {hex1 n1, hex2 n2, hex3 n3}
+        nodes-6 (step-consensus-round nodes peer-hexes 6)
+        nodes-7 (step-consensus-round nodes-6 peer-hexes 7)
+        nodes-8 (step-consensus-round nodes-7 peer-hexes 8)]
+
+    (testing "all nodes catch up to epoch 8"
+      (is (= 8 (:epoch (get nodes-8 hex1))))
+      (is (= 8 (:epoch (get nodes-8 hex2))))
+      (is (= 8 (:epoch (get nodes-8 hex3)))))
+
+    (testing "node3 ingested missing ancestors 1..5"
+      (doseq [h (take 5 h1-h5)]
+        (is (contains? (:blocks (get nodes-8 hex3)) h))
+        (is (contains? (:notarized-blocks (get nodes-8 hex3)) h))))
+
+    (testing "all nodes have non-empty finalized-blocks"
+      (is (seq (:finalized-blocks (get nodes-8 hex1))))
+      (is (seq (:finalized-blocks (get nodes-8 hex2))))
+      (is (seq (:finalized-blocks (get nodes-8 hex3))))
+      (is (= (:finalized-blocks (get nodes-8 hex1))
+             (:finalized-blocks (get nodes-8 hex2))
+             (:finalized-blocks (get nodes-8 hex3)))))))
+
+(defspec ^{:doc "Property: 3 nodes starting with random staggered initial epochs converge to identical epoch and non-empty finalized-blocks after 4 consecutive leader rounds."}
+  prop-staggered-epoch-convergence 50
+  (prop/for-all [e1 (gen/choose 0 10)
+                 e2 (gen/choose 0 10)
+                 e3 (gen/choose 0 10)]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+                      sorted-epochs (vec (sort > [e1 e2 e3]))
+                      top-epoch (nth sorted-epochs 0)
+                      mid-epoch (nth sorted-epochs 1)
+                      low-epoch (nth sorted-epochs 2)
+                      start-round (inc top-epoch)
+                      leader-idx (mod start-round 3)
+                      other-idxs (vec (remove #{leader-idx} [0 1 2]))
+                      node-epochs {leader-idx top-epoch
+                                   (nth other-idxs 0) mid-epoch
+                                   (nth other-idxs 1) low-epoch}
+                      blocks-seq (if (pos? top-epoch)
+                                   (reduce (fn [acc e]
+                                             (let [parent-hash (if (empty? acc) "genesis" (:hash (last acc)))
+                                                   l-idx (mod e 3)
+                                                   l-hex (nth peer-hexes l-idx)
+                                                   l-kp (nth pairs l-idx)
+                                                   raw-b (core/->Block e parent-hash [] l-hex)
+                                                   b (core/sign-block raw-b (:private l-kp))
+                                                   h (core/hash-block b)]
+                                               (conj acc (assoc b :hash h))))
+                                           []
+                                           (range 1 (inc top-epoch)))
+                                   [])
+                      all-blocks (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) blocks-seq))
+                      all-hashes (mapv :hash blocks-seq)
+                      make-node (fn [idx]
+                                  (let [hex (nth peer-hexes idx)
+                                        kp (nth pairs idx)
+                                        ep (get node-epochs idx)
+                                        node-hashes (take ep all-hashes)
+                                        head (or (last node-hashes) "genesis")]
+                                    {:epoch ep
+                                     :node-pubkey hex
+                                     :keypair kp
+                                     :peers-map peers-map
+                                     :total-nodes 3
+                                     :blocks (select-keys all-blocks node-hashes)
+                                     :notarized-blocks (set node-hashes)
+                                     :head-hash head}))
+                      initial-nodes (into {} (map (fn [idx] [(nth peer-hexes idx) (make-node idx)]) [0 1 2]))
+                      final-nodes (reduce (fn [nds r]
+                                            (step-consensus-round nds peer-hexes r))
+                                          initial-nodes
+                                          (range start-round (+ start-round 4)))
+                      end-epoch (+ top-epoch 4)
+                      st1 (get final-nodes (nth peer-hexes 0))
+                      st2 (get final-nodes (nth peer-hexes 1))
+                      st3 (get final-nodes (nth peer-hexes 2))]
+                  (and (= end-epoch (:epoch st1) (:epoch st2) (:epoch st3))
+                       (seq (:finalized-blocks st1))
+                       (seq (:finalized-blocks st2))
+                       (seq (:finalized-blocks st3))
+                       (seq (set/intersection (:finalized-blocks st1) (:finalized-blocks st2) (:finalized-blocks st3)))))))
+
 

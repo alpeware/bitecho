@@ -122,19 +122,26 @@
   "Returns true if parent-hash extends one of the longest notarized chains in state.
    If no blocks are notarized yet, only 'genesis' is valid.
    If notarized blocks exist, parent-hash must be a notarized block with maximal chain length.
+   When child-epoch is provided, requires child-epoch > parent-epoch when parent-hash is not 'genesis'.
    Returns false if parent-hash or any notarized ancestor is cyclic."
-  [state parent-hash]
-  (let [notarized (get state :notarized-blocks #{})
-        blocks (get state :blocks {})]
-    (if (empty? notarized)
-      (= parent-hash "genesis")
-      (let [parent-len (chain-length blocks parent-hash)
-            valid-lens (filterv pos? (map #(chain-length blocks %) notarized))]
-        (boolean
-         (and (pos? parent-len)
-              (contains? notarized parent-hash)
-              (seq valid-lens)
-              (= parent-len (reduce max 0 valid-lens))))))))
+  ([state parent-hash]
+   (longest-notarized-parent? state parent-hash nil))
+  ([state parent-hash child-epoch]
+   (let [notarized (get state :notarized-blocks #{})
+         blocks (get state :blocks {})]
+     (if (empty? notarized)
+       (= parent-hash "genesis")
+       (let [parent-len (chain-length blocks parent-hash)
+             valid-lens (filterv pos? (map #(chain-length blocks %) notarized))
+             epoch-monotonic? (or (nil? child-epoch)
+                                  (= parent-hash "genesis")
+                                  (> (long child-epoch) (long (get-in blocks [parent-hash :epoch] 0))))]
+         (boolean
+          (and (pos? parent-len)
+               (contains? notarized parent-hash)
+               epoch-monotonic?
+               (seq valid-lens)
+               (= parent-len (reduce max 0 valid-lens)))))))))
 
 (defn cast-vote
   "Casts a vote on a block if the state has not already voted in this epoch
@@ -145,7 +152,7 @@
         parent-hash (:parent-hash block)
         voted (get state :voted-epochs #{})]
     (when (and (not (contains? voted epoch))
-               (longest-notarized-parent? state parent-hash))
+               (longest-notarized-parent? state parent-hash epoch))
       (let [b-hash (hash-block block)
             private-key (get-in state [:keypair :private])
             sig-bytes (crypto/sign private-key (.getBytes ^String b-hash "UTF-8"))]
@@ -358,6 +365,42 @@
       (assoc-in state [:future-votes b-hash]
                 (conj future-votes {:vote vote :sender-pubkey-bytes sender-pubkey-bytes})))))
 
+(defn extract-notarized-ancestors
+  "Extracts a vector of up to max-depth notarized ancestor blocks walking back from parent-hash in state.
+   Guards against cycles using a visited set."
+  [state parent-hash max-depth]
+  (let [blocks (get state :blocks {})
+        notarized (get state :notarized-blocks #{})]
+    (loop [curr-hash parent-hash
+           depth 0
+           visited #{parent-hash}
+           acc []]
+      (if (or (>= depth max-depth)
+              (= "genesis" curr-hash)
+              (not (contains? notarized curr-hash)))
+        acc
+        (if-let [block (get blocks curr-hash)]
+          (let [p-hash (:parent-hash block)]
+            (if (contains? visited p-hash)
+              (conj acc block)
+              (recur p-hash (inc depth) (conj visited p-hash) (conj acc block))))
+          acc)))))
+
+(defn ingest-verified-ancestors
+  "Ingests verified notarized ancestor blocks into state if they pass block proposal validation.
+   Ancestors are processed in ascending epoch order."
+  [state ancestors]
+  (let [sorted-ancestors (sort-by (fn [b] (or (:epoch b) 0)) ancestors)]
+    (reduce (fn [s ab]
+              (if (valid-block-proposal? s {:block ab})
+                (let [ab-hash (hash-block ab)]
+                  (-> s
+                      (assoc-in [:blocks ab-hash] ab)
+                      (update :notarized-blocks (fnil conj #{}) ab-hash)))
+                s))
+            state
+            sorted-ancestors)))
+
 (defn- handle-tick-event
   "Handles a :tick event: advances epoch, elects proposer, and proposes if local node."
   [state]
@@ -384,12 +427,15 @@
                             (accumulate-vote vote local-pk total-nodes))
                         state)
                 state (apply-future-votes state b-hash total-nodes)
-                state (finalize-prefix state)
+                state (-> state
+                          update-head-hash
+                          finalize-prefix)
                 targets (extract-targets state)
+                ancestors (extract-notarized-ancestors state (:parent-hash block) 6)
                 commands (if vote
-                           [{:type :send-propose :targets targets :block block}
+                           [{:type :send-propose :targets targets :block block :ancestors ancestors}
                             {:type :send-vote :targets targets :vote vote}]
-                           [{:type :send-propose :targets targets :block block}])]
+                           [{:type :send-propose :targets targets :block block :ancestors ancestors}])]
             {:state state :commands commands})
           {:state state :commands []})))))
 
@@ -399,7 +445,11 @@
   [state event]
   (if-not (valid-block-proposal? state event)
     {:state state :commands []}
-    (let [block (:block event)
+    (let [state (if (seq (:ancestors event))
+                  (ingest-verified-ancestors state (:ancestors event))
+                  state)
+          block (:block event)
+          state (update state :epoch (fn [e] (max (or e 0) (long (:epoch block)))))
           b-hash (hash-block block)
           state (assoc-in state [:blocks b-hash] block)
           parent-hash (:parent-hash block)
@@ -415,14 +465,19 @@
                           (accumulate-vote vote local-pk total-nodes))
                       state)
               state (apply-future-votes state b-hash total-nodes)
-              state (finalize-prefix state)
+              state (-> state
+                        update-head-hash
+                        finalize-prefix)
               targets (extract-targets state)
               commands (if vote
                          [{:type :send-vote :targets targets :vote vote}]
                          [])]
           {:state state :commands commands})
         (let [future-blocks (get state :future-blocks [])
-              state (assoc state :future-blocks (conj future-blocks event))]
+              state (-> state
+                        (assoc :future-blocks (conj future-blocks event))
+                        update-head-hash
+                        finalize-prefix)]
           {:state state :commands []})))))
 
 (defn- drain-future-blocks
@@ -461,15 +516,20 @@
             (not (valid-hex-string? sig))
             (not (verify-vote-signature vote sender-pk)))
       {:state state :commands []}
-      (if (contains? (:blocks state) b-hash)
-        (let [peer-hexes (extract-peer-hexes state)
-              total-nodes (total-node-count state peer-hexes)
-              state (accumulate-vote state vote sender-pk total-nodes)
-              {state :state cmds :commands} (drain-future-blocks state)
-              state (finalize-prefix state)]
-          {:state state :commands cmds})
-        (let [state (buffer-future-vote state vote sender-pk)]
-          {:state state :commands []})))))
+      (let [state (update state :epoch (fn [e] (max (or e 0) (if (integer? (:epoch vote)) (long (:epoch vote)) 0))))]
+        (if (contains? (:blocks state) b-hash)
+          (let [peer-hexes (extract-peer-hexes state)
+                total-nodes (total-node-count state peer-hexes)
+                state (accumulate-vote state vote sender-pk total-nodes)
+                {state :state cmds :commands} (drain-future-blocks state)
+                state (-> state
+                          update-head-hash
+                          finalize-prefix)]
+            {:state state :commands cmds})
+          (let [state (-> (buffer-future-vote state vote sender-pk)
+                          update-head-hash
+                          finalize-prefix)]
+            {:state state :commands []}))))))
 
 (defn handle-streamlet-event
   "Pure state machine reducer for Streamlet BFT nodes.

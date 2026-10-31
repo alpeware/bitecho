@@ -470,7 +470,10 @@
   [ctx tick-interval-ms]
   (let [{:keys [shell-node transport]} ctx
         timeout-ms (max 20000 (* 2 (long tick-interval-ms)))
-        executor (Executors/newSingleThreadScheduledExecutor)]
+        executor (Executors/newSingleThreadScheduledExecutor)
+        initial-delay (let [t (long tick-interval-ms)
+                            rem-ms (mod (System/currentTimeMillis) t)]
+                        (if (zero? rem-ms) t (- t rem-ms)))]
     (.scheduleAtFixedRate executor
                           (fn []
                             (try
@@ -481,7 +484,7 @@
                                 (check-and-reconnect-peers! ctx timeout-ms))
                               (catch Exception e
                                 (log-mesh-error "Ticker loop error" e))))
-                          tick-interval-ms
+                          initial-delay
                           tick-interval-ms
                           TimeUnit/MILLISECONDS)
     executor))
