@@ -1266,4 +1266,136 @@
         (is (= (:vote-proofs q-votes1) (get-in (:state res) [:block-vote-proofs h1])))
         (is (<= 1 (:epoch (:state res))))))))
 
+(defspec ^{:doc "Property: (chain-length blocks h depths) matches uncached chain-length on rooted trees and handles cycles safely"}
+  prop-chain-length-cached-parity 50
+  (prop/for-all [chain-len (gen/choose 1 20)
+                 partial-cache? gen/boolean]
+                (let [block-hashes (mapv #(str "blk-" %) (range 1 (inc chain-len)))
+                      blocks (into {}
+                                   (map-indexed
+                                    (fn [idx h]
+                                      [h (core/->Block (inc idx)
+                                                       (if (zero? idx) "genesis" (nth block-hashes (dec idx)))
+                                                       []
+                                                       "validator-stub")])
+                                    block-hashes))
+                      depths (if partial-cache?
+                               (into {} (map-indexed (fn [i h] [h (inc i)]) (take (quot chain-len 2) block-hashes)))
+                               (into {} (map-indexed (fn [i h] [h (inc i)]) block-hashes)))
+                      target-hash (last block-hashes)
+                      uncached-len (core/chain-length blocks target-hash)
+                      cached-len (core/chain-length blocks target-hash depths)
+                      genesis-len (core/chain-length blocks "genesis" depths)
+                      cyclic-blocks (assoc-in blocks [(first block-hashes) :parent-hash] target-hash)
+                      cyclic-len (core/chain-length cyclic-blocks target-hash (apply dissoc depths block-hashes))]
+                  (and (= uncached-len chain-len)
+                       (= cached-len uncached-len)
+                       (= 0 genesis-len)
+                       (= -1 (core/chain-length cyclic-blocks target-hash nil))
+                       (= -1 cyclic-len)))))
+
+(deftest test-record-block-depth-unit
+  (testing "record-block-depth records depths for blocks rooted to genesis"
+    (let [b1 (core/->Block 1 "genesis" [] "p1")
+          h1 (core/hash-block b1)
+          b2 (core/->Block 2 h1 [] "p2")
+          h2 (core/hash-block b2)
+          state {:blocks {h1 b1 h2 b2} :block-depths {}}
+          s1 (core/record-block-depth state h1)
+          s2 (core/record-block-depth s1 h2)]
+      (is (= 1 (get-in s1 [:block-depths h1])))
+      (is (= 2 (get-in s2 [:block-depths h2])))))
+
+  (testing "record-block-depth does NOT cache positive depths for unrooted orphan blocks"
+    (let [orphan (core/->Block 5 "unknown-parent" [] "p1")
+          h (core/hash-block orphan)
+          state {:blocks {h orphan} :block-depths {}}
+          s (core/record-block-depth state h)]
+      (is (nil? (get-in s [:block-depths h])))))
+
+  (testing "record-block-depth does NOT cache positive depths for cyclic blocks"
+    (let [b1 (core/->Block 1 "h2" [] "p1")
+          h1 "h1"
+          b2 (core/->Block 2 h1 [] "p2")
+          h2 "h2"
+          state {:blocks {h1 b1 h2 b2} :block-depths {}}
+          s (core/record-block-depth state h1)]
+      (is (nil? (get-in s [:block-depths h1]))))))
+
+(defspec ^{:doc "Property: prune-streamlet-state bounds history beyond retention cutoff while preserving head-hash, latest-finalized-block-hash, and cumulative counts"}
+  prop-prune-streamlet-state-invariants 50
+  (prop/for-all [total-blocks (gen/choose 10 30)
+                 retention (gen/choose 3 8)]
+                (let [hashes (mapv #(str "h-" %) (range 1 (inc total-blocks)))
+                      blocks (into {}
+                                   (map-indexed
+                                    (fn [i h]
+                                      [h (core/->Block (inc i)
+                                                       (if (zero? i) "genesis" (nth hashes (dec i)))
+                                                       []
+                                                       "v1")])
+                                    hashes))
+                      current-epoch total-blocks
+                      cutoff (- current-epoch retention)
+                      head-hash (last hashes)
+                      preserved-old-finalized (first hashes)
+                      notarized-set (set hashes)
+                      finalized-set #{preserved-old-finalized (nth hashes (quot total-blocks 2))}
+                      voted-set (set (range 1 (inc total-blocks)))
+                      state {:epoch current-epoch
+                             :config {:streamlet-retention-epochs retention}
+                             :blocks blocks
+                             :notarized-blocks notarized-set
+                             :finalized-blocks finalized-set
+                             :block-votes (into {} (map (fn [h] [h #{"v1"}]) hashes))
+                             :block-vote-proofs (into {} (map (fn [h] [h {"v1" {:vote "sig"}}]) hashes))
+                             :voted-epochs voted-set
+                             :head-hash head-hash
+                             :latest-finalized-block-hash preserved-old-finalized}
+                      pruned (core/prune-streamlet-state state)
+                      pruned-blocks (:blocks pruned)
+                      pruned-epochs (:voted-epochs pruned)]
+                  (and
+                   (contains? pruned-blocks head-hash)
+                   (contains? pruned-blocks preserved-old-finalized)
+                   (every? (fn [[h b]]
+                             (or (>= (long (:epoch b)) cutoff)
+                                 (= h head-hash)
+                                 (= h preserved-old-finalized)))
+                           pruned-blocks)
+                   (every? #(>= (long %) cutoff) pruned-epochs)
+                   (= total-blocks (+ (long (or (:pruned-notarized-count pruned) 0))
+                                      (long (count (:notarized-blocks pruned)))))
+                   (= (count finalized-set) (+ (long (or (:pruned-finalized-count pruned) 0))
+                                               (long (count (:finalized-blocks pruned)))))))))
+
+(deftest test-incremental-finalize-prefix
+  (testing "Incremental finalize-prefix updates :latest-finalized-block-hash and terminates walk early"
+    (let [b1 (core/->Block 1 "genesis" [] "v1")
+          h1 (core/hash-block b1)
+          b2 (core/->Block 2 h1 [] "v2")
+          h2 (core/hash-block b2)
+          b3 (core/->Block 3 h2 [] "v3")
+          h3 (core/hash-block b3)
+          b4 (core/->Block 4 h3 [] "v1")
+          h4 (core/hash-block b4)
+          b5 (core/->Block 5 h4 [] "v2")
+          h5 (core/hash-block b5)
+          state1 {:blocks {h1 b1 h2 b2 h3 b3}
+                  :notarized-blocks #{h1 h2 h3}
+                  :finalized-blocks #{}}
+          state1-finalized (core/finalize-prefix state1)]
+      (is (= #{h1 h2} (:finalized-blocks state1-finalized)))
+      (is (= h2 (:latest-finalized-block-hash state1-finalized)))
+
+      (let [state2 (-> state1-finalized
+                       (assoc-in [:blocks h4] b4)
+                       (assoc-in [:blocks h5] b5)
+                       (update :notarized-blocks conj h4 h5))
+            state2-finalized (core/finalize-prefix state2)]
+        (is (contains? (:finalized-blocks state2-finalized) h3))
+        (is (contains? (:finalized-blocks state2-finalized) h4))
+        (is (= h4 (:latest-finalized-block-hash state2-finalized)))))))
+
+
 

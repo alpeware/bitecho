@@ -30,70 +30,71 @@
   [event]
   (contains? allowed-network-events (:type event)))
 
+(defn- dispatch-commands!
+  "Routes generated commands to appropriate shell output channels."
+  [commands app-out net-out events-in node-pubkey]
+  (doseq [cmd commands]
+    (cond
+      (= (:type cmd) :app-event)
+      (async/put! app-out (assoc cmd :node-pubkey node-pubkey))
+      (is-network-command? cmd) (async/put! net-out cmd)
+      :else (async/put! events-in cmd))))
+
+(defn- start-persistence-worker!
+  "Spawns a dedicated thread draining persist-ch to snapshot files."
+  [persist-ch snapshot-filename]
+  (async/thread
+    (loop []
+      (when-let [state-to-save (async/<!! persist-ch)]
+        (persistence/save-state-to-disk snapshot-filename state-to-save)
+        (recur)))))
+
 (defn start-node
   "Starts a transparent go-loop wrapping the state machine.
-   Returns a map with the internal channels :events-in, :network-in, :net-out, :app-out, :persist-ch, and the loop :stop-ch.
-   Snapshots state to disk automatically via a dedicated sliding-buffer channel when state changes.
+   Returns a map with channels :events-in, :network-in, :net-out, :app-out, :persist-ch, :stop-ch, and :state-atom.
+   Snapshots state to disk automatically via dedicated async/thread sliding-buffer channel.
    Accepts an optional opts map:
-     :persist?  — when false, disables persistence entirely (default true)"
+     :persist?  — when false, disables persistence entirely (default true)
+     :persist-every-event? — when true, persists on every event rather than throttling to :tick"
   ([initial-state]
    (start-node initial-state persistence/default-snapshot-filename))
   ([initial-state snapshot-filename]
    (start-node initial-state snapshot-filename {}))
   ([initial-state snapshot-filename opts]
    (let [persist? (get opts :persist? true)
+         persist-every? (get opts :persist-every-event? false)
+         state-atom (atom initial-state)
          events-in (async/chan 8192)
          network-in (async/chan 8192)
          net-out (async/chan 8192)
          app-out (async/chan 8192)
          persist-ch (when persist? (async/chan (async/sliding-buffer 1)))
          stop-ch (async/chan)]
-
-     ;; Dedicated I/O loop for persistence (only when enabled)
      (when persist?
-       (async/go-loop []
-         (when-let [state-to-save (async/<! persist-ch)]
-           (persistence/save-state-to-disk snapshot-filename state-to-save)
-           (recur))))
-
+       (start-persistence-worker! persist-ch snapshot-filename))
      (async/go-loop [state initial-state]
        (let [[val port] (async/alts! [events-in network-in stop-ch])]
          (cond
-           (= port stop-ch)
-           nil ;; Node stopped
-
-           (nil? val)
-           (recur state) ;; Handle channel close
-
+           (= port stop-ch) nil
+           (nil? val) (recur state)
            (= port network-in)
            (if (valid-network-event? val)
              (let [{new-state :state commands :commands} (sm/handle-event state val)]
-               (doseq [cmd commands]
-                 (cond
-                   (= (:type cmd) :app-event)
-                   (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
-                   (is-network-command? cmd) (async/put! net-out cmd)
-                   :else (async/put! events-in cmd)))
-               (when (and persist? (not= state new-state))
+               (reset! state-atom new-state)
+               (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
+               (when (and persist? persist-every?)
                  (async/put! persist-ch new-state))
                (recur new-state))
-             ;; Drop invalid network events
              (recur state))
 
            (and (= port events-in) (= (:type val) :query-state))
-           (do
-             (async/put! (:reply-chan val) state)
-             (recur state))
+           (do (async/put! (:reply-chan val) state) (recur state))
 
            (= port events-in)
            (let [{new-state :state commands :commands} (sm/handle-event state val)]
-             (doseq [cmd commands]
-               (cond
-                 (= (:type cmd) :app-event)
-                 (async/put! app-out (assoc cmd :node-pubkey (:node-pubkey new-state)))
-                 (is-network-command? cmd) (async/put! net-out cmd)
-                 :else (async/put! events-in cmd)))
-             (when (and persist? (not= state new-state))
+             (reset! state-atom new-state)
+             (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
+             (when (and persist? (or persist-every? (= (:type val) :tick)))
                (async/put! persist-ch new-state))
              (recur new-state)))))
      {:events-in events-in
@@ -101,7 +102,8 @@
       :net-out net-out
       :app-out app-out
       :persist-ch persist-ch
-      :stop-ch stop-ch})))
+      :stop-ch stop-ch
+      :state-atom state-atom})))
 
 (defn stop-node
   "Gracefully stops a running shell node."
@@ -111,14 +113,19 @@
   (async/close! (:network-in node))
   (async/close! (:net-out node))
   (async/close! (:app-out node))
-  (when (:persist-ch node)
-    (async/close! (:persist-ch node))))
+  (when-let [pch (:persist-ch node)]
+    (when-let [st-atom (:state-atom node)]
+      (async/put! pch @st-atom))
+    (async/close! pch)))
 
 (defn query-node-state
   "Queries the current pure state of a running shell node.
-   Sends a :query-state event and blocks until a reply arrives or timeout-ms elapses.
+   Reads :state-atom directly in O(1) if present, falling back to channel query.
    Returns the state map, or nil on timeout."
   [node & {:keys [timeout-ms] :or {timeout-ms 5000}}]
-  (let [reply-ch (async/chan 1)]
-    (async/put! (:events-in node) {:type :query-state :reply-chan reply-ch})
-    (first (async/alts!! [reply-ch (async/timeout timeout-ms)]))))
+  (if-let [st-atom (:state-atom node)]
+    (when (instance? clojure.lang.IDeref st-atom)
+      @st-atom)
+    (let [reply-ch (async/chan 1)]
+      (async/put! (:events-in node) {:type :query-state :reply-chan reply-ch})
+      (first (async/alts!! [reply-ch (async/timeout timeout-ms)])))))

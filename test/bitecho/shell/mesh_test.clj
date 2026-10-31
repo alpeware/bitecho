@@ -353,7 +353,22 @@
       (is (str/includes? out "supply=1000"))
       (is (str/includes? out "minted=2000"))
       (is (str/includes? out "burns=50"))
-      (is (str/ends-with? out "\n")))))
+      (is (str/ends-with? out "\n"))))
+
+  (testing "statusz line format accounts for pruned counts"
+    (let [state {:epoch 500
+                 :node-pubkey "abc1234567890abcdef"
+                 :head-hash "hash500"
+                 :notarized-blocks #{"h500"}
+                 :finalized-blocks #{"h499"}
+                 :pruned-notarized-count 450
+                 :pruned-finalized-count 440
+                 :validators ["abc1234567890abcdef"]
+                 :ledger {"abc1234567890abcdef" {:balance 1000}}
+                 :total-minted 2000}
+          out (mesh/render-statusz state 2 3)]
+      (is (str/includes? out "notarized=451"))
+      (is (str/includes? out "finalized=441")))))
 
 (deftest test-in-memory-mesh-lifecycle
   (testing "start, run consensus ticks, and stop 3-node in-memory cluster"

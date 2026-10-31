@@ -646,6 +646,15 @@ TXT_BOOTSTRAP_EOF
 
   chmod 600 "${ROOT_DIR}/devnet/bootstrap.edn" "${ROOT_DIR}/devnet/bootstrap.txt"
 
+  # Sync to /home/simonpure/src/alpeware/clj-web/public/devnet if present
+  if [[ -d "/home/simonpure/src/alpeware/clj-web/public" ]]; then
+    echo "--> Syncing bootstrap descriptors to clj-web public directory..."
+    mkdir -p "/home/simonpure/src/alpeware/clj-web/public/devnet"
+    cp -f "${ROOT_DIR}/devnet/bootstrap.txt" "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.txt"
+    cp -f "${ROOT_DIR}/devnet/bootstrap.edn" "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.edn"
+    chmod 644 "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.txt" "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.edn"
+  fi
+
   # 7. Restart bitecho.service and poll healthz
   echo "--> Step 7/7: Restarting bitecho.service and verifying healthz..."
   local deploy_failed=false

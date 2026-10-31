@@ -334,8 +334,8 @@
                "mesh")
         epoch (long (or (:epoch state) 0))
         head (str (or (:head-hash state) "genesis"))
-        notarized (long (count (or (:notarized-blocks state) #{})))
-        finalized (long (count (or (:finalized-blocks state) #{})))
+        notarized (+ (long (or (:pruned-notarized-count state) 0)) (long (count (or (:notarized-blocks state) #{}))))
+        finalized (+ (long (or (:pruned-finalized-count state) 0)) (long (count (or (:finalized-blocks state) #{}))))
         ledger (or (:ledger state) {})
         supply (long (reduce + 0 (map (fn [v] (if (map? v) (or (:balance v) 0) (or v 0))) (vals ledger))))
         minted (long (or (:total-minted state) 0))
@@ -348,12 +348,18 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- query-node-state
-  "Queries the active shell node for its current internal state with timeout."
+  "Queries the active shell node for its current internal state with timeout.
+   Reads :state-atom directly in O(1) if present, falling back to channel query."
   [shell-node timeout-ms]
-  (let [reply-ch (async/promise-chan)]
-    (async/put! (:events-in shell-node) {:type :query-state :reply-chan reply-ch})
-    (let [[val _] (async/alts!! [reply-ch (async/timeout timeout-ms)])]
-      val)))
+  (if-let [st-atom (or (:state-atom shell-node)
+                       (get-in shell-node [:shell-node :state-atom]))]
+    (when (instance? clojure.lang.IDeref st-atom)
+      @st-atom)
+    (let [sh (if (:shell-node shell-node) (:shell-node shell-node) shell-node)
+          reply-ch (async/promise-chan)]
+      (async/put! (:events-in sh) {:type :query-state :reply-chan reply-ch})
+      (let [[val _] (async/alts!! [reply-ch (async/timeout timeout-ms)])]
+        val))))
 
 (defn- make-http-handler
   "Creates an HttpHandler for healthz and statusz endpoints."
@@ -661,6 +667,7 @@
                      :identity identity
                      :transport transport
                      :shell-node shell-node
+                     :state-atom (:state-atom shell-node)
                      :peer-conns peer-conns
                      :http-server http-server
                      :ticker-executor ticker

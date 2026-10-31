@@ -1,6 +1,7 @@
 (ns bitecho.streamlet.core
   "Streamlet core data structures and pure functions."
-  (:require [bitecho.crypto :as crypto]))
+  (:require [bitecho.crypto :as crypto]
+            [clojure.set :as set]))
 
 (defrecord Block [epoch parent-hash payload proposer signature])
 
@@ -110,17 +111,74 @@
 (defn chain-length
   "Calculates the length of the chain ending at block-hash.
    Guards against cycles using a visited set: returns -1 if a cycle is detected,
-   indicating an invalid cyclic chain."
-  [blocks block-hash]
-  (loop [curr block-hash
-         visited #{}
-         len 0]
+   indicating an invalid cyclic chain.
+   Optional 3-arity accepts block-depths map for O(1) cached lookups."
+  ([blocks block-hash]
+   (chain-length blocks block-hash nil))
+  ([blocks block-hash block-depths]
+   (loop [curr block-hash
+          visited #{}
+          len 0]
+     (cond
+       (= curr "genesis") len
+       (contains? visited curr) -1
+       (and (map? block-depths) (contains? block-depths curr))
+       (let [d (long (get block-depths curr -1))]
+         (if (>= d 0) (+ d len) -1))
+       :else (if-let [block (get blocks curr)]
+               (recur (:parent-hash block) (conj visited curr) (inc len))
+               len)))))
+
+(defn record-block-depth
+  "Records the chain depth of block-hash in (:block-depths state) if it roots to genesis.
+   If parent-hash is genesis, depth is 1.
+   If parent-hash has a cached depth d, depth is (inc d).
+   Otherwise walks ancestors in :blocks; if walk reaches genesis or a cached depth,
+   records the depths for all walked rooted blocks.
+   Does not cache depths for unrooted orphan chains or cyclic chains."
+  [state block-hash]
+  (let [blocks (:blocks state)
+        depths (get state :block-depths {})]
     (cond
-      (= curr "genesis") len
-      (contains? visited curr) -1
-      :else (if-let [block (get blocks curr)]
-              (recur (:parent-hash block) (conj visited curr) (inc len))
-              len))))
+      (or (nil? block-hash) (= block-hash "genesis") (contains? depths block-hash))
+      state
+
+      :else
+      (if-let [block (get blocks block-hash)]
+        (let [p-hash (:parent-hash block)]
+          (cond
+            (= p-hash "genesis")
+            (assoc-in state [:block-depths block-hash] 1)
+
+            (and (contains? depths p-hash) (pos? (long (get depths p-hash 0))))
+            (assoc-in state [:block-depths block-hash] (inc (long (get depths p-hash))))
+
+            :else
+            (loop [curr p-hash
+                   path [block-hash]
+                   visited #{block-hash}]
+              (cond
+                (= curr "genesis")
+                (let [path-rev (vec (rseq path))
+                      new-depths (into {} (map-indexed (fn [idx h] [h (inc idx)]) path-rev))]
+                  (update state :block-depths (fnil merge {}) new-depths))
+
+                (contains? visited curr)
+                state
+
+                (contains? depths curr)
+                (let [d (long (get depths curr 0))]
+                  (if (pos? d)
+                    (let [path-rev (vec (rseq path))
+                          new-depths (into {} (map-indexed (fn [idx h] [h (+ d (inc idx))]) path-rev))]
+                      (update state :block-depths (fnil merge {}) new-depths))
+                    state))
+
+                :else
+                (if-let [curr-blk (get blocks curr)]
+                  (recur (:parent-hash curr-blk) (conj path curr) (conj visited curr))
+                  state)))))
+        state))))
 
 (defn longest-notarized-parent?
   "Returns true if parent-hash extends one of the longest notarized chains in state.
@@ -132,11 +190,12 @@
    (longest-notarized-parent? state parent-hash nil))
   ([state parent-hash child-epoch]
    (let [notarized (get state :notarized-blocks #{})
-         blocks (get state :blocks {})]
+         blocks (get state :blocks {})
+         depths (:block-depths state)]
      (if (empty? notarized)
        (= parent-hash "genesis")
-       (let [parent-len (chain-length blocks parent-hash)
-             valid-lens (filterv pos? (map #(chain-length blocks %) notarized))
+       (let [parent-len (chain-length blocks parent-hash depths)
+             valid-lens (filterv pos? (map #(chain-length blocks % depths) notarized))
              epoch-monotonic? (or (nil? child-epoch)
                                   (= parent-hash "genesis")
                                   (> (long child-epoch) (long (get-in blocks [parent-hash :epoch] 0))))]
@@ -201,40 +260,121 @@
 
 (defn- find-consecutive-epoch-head
   "Finds the middle block's hash of any 3 consecutive notarized blocks.
-   Returns a sequence of such hashes."
-  [notarized-blocks blocks]
-  (let [notarized-block-maps (keep #(when-let [b (get blocks %)] (assoc b :hash %)) notarized-blocks)
-        ;; For each notarized block, trace back its ancestors to see if we have 3 consecutive epochs
-        consecutive-heads
-        (keep (fn [{:keys [epoch parent-hash]}]
-                (let [parent-block (get blocks parent-hash)
-                      parent-epoch (:epoch parent-block)]
-                  (when (and parent-block
-                             (contains? notarized-blocks parent-hash)
-                             (= epoch (inc parent-epoch)))
-                    (let [grandparent-hash (:parent-hash parent-block)
-                          grandparent-block (get blocks grandparent-hash)
-                          grandparent-epoch (:epoch grandparent-block)]
-                      (when (and grandparent-block
-                                 (contains? notarized-blocks grandparent-hash)
-                                 (= parent-epoch (inc grandparent-epoch)))
-                        parent-hash)))))
-              notarized-block-maps)]
-    consecutive-heads))
+   Returns a sequence of such hashes.
+   When existing-finalized is provided, skips candidate if parent-hash is already finalized."
+  ([notarized-blocks blocks]
+   (find-consecutive-epoch-head notarized-blocks blocks nil))
+  ([notarized-blocks blocks existing-finalized]
+   (let [notarized-block-maps (keep #(when-let [b (get blocks %)] (assoc b :hash %)) notarized-blocks)
+         consecutive-heads
+         (keep (fn [{:keys [epoch parent-hash]}]
+                 (when-not (and existing-finalized (contains? existing-finalized parent-hash))
+                   (let [parent-block (get blocks parent-hash)
+                         parent-epoch (:epoch parent-block)]
+                     (when (and parent-block
+                                (contains? notarized-blocks parent-hash)
+                                (= epoch (inc parent-epoch)))
+                       (let [grandparent-hash (:parent-hash parent-block)
+                             grandparent-block (get blocks grandparent-hash)
+                             grandparent-epoch (:epoch grandparent-block)]
+                         (when (and grandparent-block
+                                    (contains? notarized-blocks grandparent-hash)
+                                    (= parent-epoch (inc grandparent-epoch)))
+                           parent-hash))))))
+               notarized-block-maps)]
+     consecutive-heads)))
+
+(defn- get-incremental-ancestors
+  "Recursively retrieves ancestors for head-hash, stopping when an ancestor is
+   'genesis', absent from blocks, already in existing-finalized, or in visited."
+  [blocks head-hash existing-finalized]
+  (loop [curr-hash head-hash
+         visited #{head-hash}
+         acc []]
+    (let [block (get blocks curr-hash)
+          parent-hash (:parent-hash block)]
+      (if (or (nil? block)
+              (= "genesis" parent-hash)
+              (not (contains? blocks parent-hash))
+              (and existing-finalized (contains? existing-finalized parent-hash))
+              (contains? visited parent-hash))
+        acc
+        (recur parent-hash (conj visited parent-hash) (conj acc parent-hash))))))
 
 (defn finalize-prefix
   "Scans the notarized chain. If three adjacent blocks have consecutive epoch numbers,
-   finalizes the prefix of blocks starting from the middle block."
+   finalizes the prefix of blocks starting from the middle block.
+   Terminates ancestor walks incrementally at existing finalized blocks.
+   Updates :latest-finalized-block-hash to the finalized block hash with highest epoch."
   [state]
   (let [blocks (get state :blocks {})
         notarized-blocks (get state :notarized-blocks #{})
-        heads (find-consecutive-epoch-head notarized-blocks blocks)
+        existing-finalized (get state :finalized-blocks #{})
+        heads (find-consecutive-epoch-head notarized-blocks blocks existing-finalized)
         new-finalized (reduce (fn [acc head-hash]
-                                (let [ancestors (get-ancestors blocks head-hash)]
-                                  (into acc (conj ancestors head-hash))))
+                                (if (contains? existing-finalized head-hash)
+                                  acc
+                                  (let [ancestors (get-incremental-ancestors blocks head-hash existing-finalized)]
+                                    (into (conj acc head-hash) ancestors))))
                               #{}
                               heads)]
-    (update state :finalized-blocks (fnil into #{}) new-finalized)))
+    (if (empty? new-finalized)
+      state
+      (let [updated-finalized (into existing-finalized new-finalized)
+            candidates (if-let [curr (:latest-finalized-block-hash state)]
+                         (conj new-finalized curr)
+                         new-finalized)
+            new-latest (last (sort-by #(get-in blocks [% :epoch] -1) candidates))]
+        (assoc state
+               :finalized-blocks updated-finalized
+               :latest-finalized-block-hash new-latest)))))
+
+(def default-streamlet-retention-epochs
+  "Default number of historical epochs to retain before pruning state."
+  256)
+
+(defn prune-streamlet-state
+  "Prunes Streamlet state beyond retention epoch threshold to bound memory.
+   Retains :head-hash and :latest-finalized-block-hash regardless of epoch.
+   Updates cumulative :pruned-notarized-count and :pruned-finalized-count."
+  [state]
+  (let [retention (or (get-in state [:config :streamlet-retention-epochs])
+                      (:streamlet-retention-epochs state)
+                      default-streamlet-retention-epochs)
+        current-epoch (or (:epoch state) 0)
+        cutoff (- current-epoch (long retention))
+        head-hash (get state :head-hash "genesis")]
+    (if (or (<= cutoff 0) (= head-hash "genesis"))
+      state
+      (let [blocks (:blocks state)
+            state-with-depths (reduce record-block-depth state (keys blocks))
+            latest-finalized (:latest-finalized-block-hash state-with-depths)
+            expired-hashes (into #{}
+                                 (keep (fn [[h b]]
+                                         (when (and (< (long (or (:epoch b) 0)) cutoff)
+                                                    (not= h head-hash)
+                                                    (not= h latest-finalized))
+                                           h)))
+                                 blocks)
+            voted-epochs (into #{} (filter #(>= (long %) cutoff)) (get state-with-depths :voted-epochs #{}))]
+        (if (empty? expired-hashes)
+          (assoc state-with-depths :voted-epochs voted-epochs)
+          (let [notarized (get state-with-depths :notarized-blocks #{})
+                finalized (get state-with-depths :finalized-blocks #{})
+                pruned-notarized (count (set/intersection notarized expired-hashes))
+                pruned-finalized (count (set/intersection finalized expired-hashes))
+                cum-pruned-notarized (+ (long (or (:pruned-notarized-count state-with-depths) 0)) pruned-notarized)
+                cum-pruned-finalized (+ (long (or (:pruned-finalized-count state-with-depths) 0)) pruned-finalized)]
+            (-> state-with-depths
+                (update :blocks #(reduce dissoc (or % {}) expired-hashes))
+                (update :notarized-blocks #(set/difference (or % #{}) expired-hashes))
+                (update :finalized-blocks #(set/difference (or % #{}) expired-hashes))
+                (update :block-votes #(reduce dissoc (or % {}) expired-hashes))
+                (update :block-vote-proofs #(reduce dissoc (or % {}) expired-hashes))
+                (update :block-depths #(reduce dissoc (or % {}) expired-hashes))
+                (assoc :voted-epochs voted-epochs
+                       :pruned-notarized-count cum-pruned-notarized
+                       :pruned-finalized-count cum-pruned-finalized))))))))
 
 (defn- extract-peer-hexes
   "Extracts a sorted vector of peer public key hex strings from state."
@@ -341,10 +481,17 @@
   [state]
   (let [notarized (:notarized-blocks state)
         blocks (:blocks state)
-        valid-heads (filterv #(pos? (chain-length blocks %)) notarized)
-        head-hash (if (empty? valid-heads)
+        depths (:block-depths state)
+        candidates (keep (fn [h]
+                           (let [len (chain-length blocks h depths)]
+                             (when (pos? len)
+                               {:hash h
+                                :len len
+                                :epoch (get-in blocks [h :epoch] -1)})))
+                         notarized)
+        head-hash (if (empty? candidates)
                     "genesis"
-                    (last (sort-by (fn [h] [(chain-length blocks h) (get-in blocks [h :epoch] -1)]) valid-heads)))]
+                    (:hash (last (sort-by (juxt :len :epoch) candidates))))]
     (assoc state :head-hash head-hash)))
 
 (defn- apply-future-votes
@@ -448,6 +595,7 @@
                         block (:block res)]
                     (-> s
                         (assoc-in [:blocks b-hash] block)
+                        (record-block-depth b-hash)
                         (update-in [:block-votes b-hash] (fnil into #{}) (:voter-set res))
                         (update-in [:block-vote-proofs b-hash] merge (:vote-proofs res))
                         (update :notarized-blocks (fnil conj #{}) b-hash)
@@ -465,7 +613,7 @@
                   update-head-hash)
         peer-hexes (extract-peer-hexes state)]
     (if (empty? peer-hexes)
-      {:state state :commands []}
+      {:state (prune-streamlet-state state) :commands []}
       (let [total-nodes (total-node-count state peer-hexes)
             proposer-idx (mod new-epoch total-nodes)
             proposer-hex (nth peer-hexes proposer-idx)
@@ -473,7 +621,9 @@
         (if is-proposer?
           (let [block (propose-block state new-epoch)
                 b-hash (hash-block block)
-                state (assoc-in state [:blocks b-hash] block)
+                state (-> state
+                          (assoc-in [:blocks b-hash] block)
+                          (record-block-depth b-hash))
                 vote (cast-vote state block)
                 local-pk (extract-local-pubkey-bytes state)
                 state (if vote
@@ -491,8 +641,8 @@
                            [{:type :send-propose :targets targets :block block :ancestors ancestors}
                             {:type :send-vote :targets targets :vote vote}]
                            [{:type :send-propose :targets targets :block block :ancestors ancestors}])]
-            {:state state :commands commands})
-          {:state state :commands []})))))
+            {:state (prune-streamlet-state state) :commands commands})
+          {:state (prune-streamlet-state state) :commands []})))))
 
 (defn- handle-propose-event
   "Handles a :receive-propose event: validates proposal fail-closed,
@@ -510,7 +660,9 @@
                                      state)
               state (update state-with-ancestors :epoch (fn [e] (max (or e 0) (long (:epoch block)))))
               b-hash (hash-block block)
-              state (assoc-in state [:blocks b-hash] block)
+              state (-> state
+                        (assoc-in [:blocks b-hash] block)
+                        (record-block-depth b-hash))
               parent-hash (:parent-hash block)
               known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
           (if known-parent?

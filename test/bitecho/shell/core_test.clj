@@ -34,3 +34,18 @@
   (is (#'core/valid-network-event? {:type :receive-offer-header}))
   (is (not (#'core/valid-network-event? {:type :tick})))
   (is (not (#'core/valid-network-event? {:type :some-malicious-event}))))
+
+(deftest test-state-atom-and-query-node-state
+  (testing "start-node returns :state-atom and query-node-state reads it in O(1)"
+    (let [initial (sm/init-state [] "test-pubkey")
+          node (core/start-node initial "/tmp/test-snap.edn" {:persist? false})]
+      (is (some? (:state-atom node)))
+      (is (instance? clojure.lang.IDeref (:state-atom node)))
+      (is (= "test-pubkey" (:node-pubkey (core/query-node-state node))))
+
+      ;; Test channel fallback when :state-atom is absent
+      (let [node-no-atom (dissoc node :state-atom)]
+        (is (= "test-pubkey" (:node-pubkey (core/query-node-state node-no-atom :timeout-ms 500)))))
+
+      (core/stop-node node))))
+
