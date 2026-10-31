@@ -633,7 +633,7 @@
             sender-bal (get-in new-state [:ledger agent-pub :balance])]
         (is (= 900 sender-bal))
         (is (= 100 (get-in new-state [:epoch-burns 0])))
-        (is (contains? (:messages new-state) "msg-sieve-1"))))
+        (is (contains? (:messages new-state) (basalt/bytes->hex (crypto/sha256 payload))))))
 
     (testing "mutating 1 byte of payload causes unwrap to return nil"
       (let [thawed (nippy/thaw frozen)

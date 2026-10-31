@@ -934,6 +934,20 @@
     (testing "genesis parent allows any positive child epoch"
       (is (true? (core/longest-notarized-parent? {:notarized-blocks #{}} "genesis" 1))))))
 
+(defn- make-quorum-votes-for-block
+  "Generates a quorum of signed votes for b-hash at epoch using keypairs from pairs."
+  [b-hash epoch pairs peer-hexes]
+  (let [threshold (core/quorum-threshold (count peer-hexes))
+        voters (take threshold (map vector pairs peer-hexes))
+        votes (into {}
+                    (map (fn [[kp hex]]
+                           (let [sig-bytes (crypto/sign (:private kp) (.getBytes ^String b-hash "UTF-8"))
+                                 vote (core/->Vote b-hash epoch (core/bytes->hex sig-bytes))]
+                             [hex vote]))
+                         voters))]
+    {:voter-set (set (keys votes))
+     :vote-proofs votes}))
+
 (deftest test-staggered-epoch-catchup-and-finalization
   (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
         [hex1 hex2 hex3] peer-hexes
@@ -950,6 +964,16 @@
                            []
                            (range 1 6))
         all-blocks (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) blocks-seq))
+        all-block-votes (into {}
+                              (map (fn [b]
+                                     [(:hash b)
+                                      (:voter-set (make-quorum-votes-for-block (:hash b) (:epoch b) pairs peer-hexes))])
+                                   blocks-seq))
+        all-block-proofs (into {}
+                               (map (fn [b]
+                                      [(:hash b)
+                                       (:vote-proofs (make-quorum-votes-for-block (:hash b) (:epoch b) pairs peer-hexes))])
+                                    blocks-seq))
         h1-h5 (mapv :hash blocks-seq)
         h5 (nth h1-h5 4)
         h2 (nth h1-h5 1)
@@ -959,6 +983,8 @@
             :peers-map peers-map
             :total-nodes 3
             :blocks all-blocks
+            :block-votes all-block-votes
+            :block-vote-proofs all-block-proofs
             :notarized-blocks (set h1-h5)
             :head-hash h5}
         n2 {:epoch 2
@@ -967,6 +993,8 @@
             :peers-map peers-map
             :total-nodes 3
             :blocks (select-keys all-blocks (take 2 h1-h5))
+            :block-votes (select-keys all-block-votes (take 2 h1-h5))
+            :block-vote-proofs (select-keys all-block-proofs (take 2 h1-h5))
             :notarized-blocks (set (take 2 h1-h5))
             :head-hash h2}
         n3 {:epoch 0
@@ -1031,6 +1059,16 @@
                                    [])
                       all-blocks (into {} (map (fn [b] [(:hash b) (dissoc b :hash)]) blocks-seq))
                       all-hashes (mapv :hash blocks-seq)
+                      all-block-votes (into {}
+                                            (map (fn [b]
+                                                   [(:hash b)
+                                                    (:voter-set (make-quorum-votes-for-block (:hash b) (:epoch b) pairs peer-hexes))])
+                                                 blocks-seq))
+                      all-block-proofs (into {}
+                                             (map (fn [b]
+                                                    [(:hash b)
+                                                     (:vote-proofs (make-quorum-votes-for-block (:hash b) (:epoch b) pairs peer-hexes))])
+                                                  blocks-seq))
                       make-node (fn [idx]
                                   (let [hex (nth peer-hexes idx)
                                         kp (nth pairs idx)
@@ -1043,6 +1081,8 @@
                                      :peers-map peers-map
                                      :total-nodes 3
                                      :blocks (select-keys all-blocks node-hashes)
+                                     :block-votes (select-keys all-block-votes node-hashes)
+                                     :block-vote-proofs (select-keys all-block-proofs node-hashes)
                                      :notarized-blocks (set node-hashes)
                                      :head-hash head}))
                       initial-nodes (into {} (map (fn [idx] [(nth peer-hexes idx) (make-node idx)]) [0 1 2]))
@@ -1059,5 +1099,171 @@
                        (seq (:finalized-blocks st2))
                        (seq (:finalized-blocks st3))
                        (seq (set/intersection (:finalized-blocks st1) (:finalized-blocks st2) (:finalized-blocks st3)))))))
+
+(defspec ^{:doc "Property: Streamlet reducer drops proposals exceeding max-epoch-catchup-delta fail-closed"}
+  prop-rejects-excessive-epoch-proposal 50
+  (prop/for-all [curr-epoch (gen/choose 0 50)
+                 delta-excess (gen/choose 65 500)]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+                      future-epoch (+ curr-epoch delta-excess)
+                      leader-idx (mod future-epoch 3)
+                      leader-hex (nth peer-hexes leader-idx)
+                      leader-kp (nth pairs leader-idx)
+                      raw-b (core/->Block future-epoch "genesis" [] leader-hex)
+                      b (core/sign-block raw-b (:private leader-kp))
+                      state {:epoch curr-epoch
+                             :node-pubkey (first peer-hexes)
+                             :keypair (first pairs)
+                             :peers-map peers-map
+                             :total-nodes 3
+                             :blocks {}
+                             :head-hash "genesis"}
+                      event {:type :receive-propose :block b :sender leader-hex}
+                      res (core/handle-streamlet-event state event)]
+                  (and (= state (:state res))
+                       (= [] (:commands res))))))
+
+(defspec ^{:doc "Property: Streamlet reducer drops votes exceeding max-epoch-catchup-delta fail-closed"}
+  prop-rejects-excessive-epoch-vote 50
+  (prop/for-all [curr-epoch (gen/choose 0 50)
+                 delta-excess (gen/choose 65 500)]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+                      future-epoch (+ curr-epoch delta-excess)
+                      voter-idx 1
+                      voter-hex (nth peer-hexes voter-idx)
+                      voter-kp (nth pairs voter-idx)
+                      b-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                      sig-bytes (crypto/sign (:private voter-kp) (.getBytes ^String b-hash "UTF-8"))
+                      vote (core/->Vote b-hash future-epoch (core/bytes->hex sig-bytes))
+                      state {:epoch curr-epoch
+                             :node-pubkey (first peer-hexes)
+                             :keypair (first pairs)
+                             :peers-map peers-map
+                             :total-nodes 3
+                             :blocks {}
+                             :head-hash "genesis"}
+                      event {:type :receive-vote :vote vote :sender voter-hex}
+                      res (core/handle-streamlet-event state event)]
+                  (and (= state (:state res))
+                       (= [] (:commands res))))))
+
+(deftest test-accumulate-vote-proofs
+  (testing "accumulate-vote records both voter-hex in :block-votes and vote record in :block-vote-proofs"
+    (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+          b (core/->Block 1 "genesis" [] (first peer-hexes))
+          b-hash (core/hash-block b)
+          voter-kp (second pairs)
+          voter-hex (second peer-hexes)
+          sig (crypto/sign (:private voter-kp) (.getBytes ^String b-hash "UTF-8"))
+          vote (core/->Vote b-hash 1 (core/bytes->hex sig))
+          init-state {:epoch 1
+                      :node-pubkey (first peer-hexes)
+                      :peers-map peers-map
+                      :blocks {b-hash b}}
+          next-state (core/accumulate-vote init-state vote (:public voter-kp) 3)]
+      (is (= #{voter-hex} (get-in next-state [:block-votes b-hash])))
+      (is (= vote (get-in next-state [:block-vote-proofs b-hash voter-hex]))))))
+
+(deftest test-extract-notarized-ancestors-bundling
+  (testing "extract-notarized-ancestors bundles block and quorum vote proofs"
+    (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+          b1 (core/sign-block (core/->Block 1 "genesis" [] (nth peer-hexes 1)) (:private (nth pairs 1)))
+          h1 (core/hash-block b1)
+          q-votes (make-quorum-votes-for-block h1 1 pairs peer-hexes)
+          state {:epoch 2
+                 :node-pubkey (first peer-hexes)
+                 :peers-map peers-map
+                 :total-nodes 3
+                 :blocks {h1 b1}
+                 :block-votes {h1 (:voter-set q-votes)}
+                 :block-vote-proofs {h1 (:vote-proofs q-votes)}
+                 :notarized-blocks #{h1}}
+          ancestors (core/extract-notarized-ancestors state h1 5)]
+      (is (= 1 (count ancestors)))
+      (is (= b1 (:block (first ancestors))))
+      (is (= (:vote-proofs q-votes) (:votes (first ancestors)))))))
+
+(deftest test-ancestor-quorum-verification
+  (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+        [hex1 hex2 hex3] peer-hexes
+        [kp1 kp2 kp3] pairs
+        b1 (core/sign-block (core/->Block 1 "genesis" [] hex2) (:private kp2))
+        h1 (core/hash-block b1)
+        q-votes1 (make-quorum-votes-for-block h1 1 pairs peer-hexes)
+        valid-entry1 {:block b1 :votes (:vote-proofs q-votes1)}
+        b2 (core/sign-block (core/->Block 2 h1 [] hex3) (:private kp3))
+        state {:epoch 0
+               :node-pubkey hex1
+               :keypair kp1
+               :peers-map peers-map
+               :total-nodes 3
+               :blocks {}
+               :head-hash "genesis"}]
+
+    (testing "bare ancestor block without votes is rejected fail-closed"
+      (let [res (core/handle-streamlet-event state {:type :receive-propose
+                                                    :block b2
+                                                    :ancestors [b1]
+                                                    :sender hex3})]
+        (is (not (contains? (:blocks (:state res)) h1)))
+        (is (not (contains? (:notarized-blocks (:state res)) h1)))))
+
+    (testing "ancestor with fewer than quorum votes (< threshold) is rejected fail-closed"
+      (let [sub-threshold-votes (select-keys (:vote-proofs q-votes1) [hex1])
+            res (core/handle-streamlet-event state {:type :receive-propose
+                                                    :block b2
+                                                    :ancestors [{:block b1 :votes sub-threshold-votes}]
+                                                    :sender hex3})]
+        (is (not (contains? (:blocks (:state res)) h1)))
+        (is (not (contains? (:notarized-blocks (:state res)) h1)))))
+
+    (testing "ancestor with quorum count but corrupted signature is rejected fail-closed"
+      (let [bad-vote (core/->Vote h1 1 "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+            tampered-votes (assoc (:vote-proofs q-votes1) hex1 bad-vote)
+            res (core/handle-streamlet-event state {:type :receive-propose
+                                                    :block b2
+                                                    :ancestors [{:block b1 :votes tampered-votes}]
+                                                    :sender hex3})]
+        (is (not (contains? (:blocks (:state res)) h1)))
+        (is (not (contains? (:notarized-blocks (:state res)) h1)))))
+
+    (testing "ancestor with quorum count but Sybil voter outside peers-map is rejected fail-closed"
+      (let [sybil-kp (crypto/generate-keypair)
+            sybil-hex (core/bytes->hex (:public sybil-kp))
+            sybil-sig (crypto/sign (:private sybil-kp) (.getBytes ^String h1 "UTF-8"))
+            sybil-vote (core/->Vote h1 1 (core/bytes->hex sybil-sig))
+            sybil-votes {hex1 (get (:vote-proofs q-votes1) hex1)
+                         sybil-hex sybil-vote}
+            res (core/handle-streamlet-event state {:type :receive-propose
+                                                    :block b2
+                                                    :ancestors [{:block b1 :votes sybil-votes}]
+                                                    :sender hex3})]
+        (is (not (contains? (:blocks (:state res)) h1)))
+        (is (not (contains? (:notarized-blocks (:state res)) h1)))))
+
+    (testing "ancestor with epoch jump > 64 is rejected fail-closed"
+      (let [b-far (core/sign-block (core/->Block 65 "genesis" [] (nth peer-hexes (mod 65 3)))
+                                   (:private (nth pairs (mod 65 3))))
+            h-far (core/hash-block b-far)
+            q-far (make-quorum-votes-for-block h-far 65 pairs peer-hexes)
+            b-next (core/sign-block (core/->Block 66 h-far [] (nth peer-hexes (mod 66 3)))
+                                    (:private (nth pairs (mod 66 3))))
+            res (core/handle-streamlet-event state {:type :receive-propose
+                                                    :block b-next
+                                                    :ancestors [{:block b-far :votes (:vote-proofs q-far)}]
+                                                    :sender (nth peer-hexes (mod 66 3))})]
+        (is (not (contains? (:blocks (:state res)) h-far)))
+        (is (not (contains? (:notarized-blocks (:state res)) h-far)))))
+
+    (testing "valid bundled ancestor with quorum vote proofs is accepted and ingested"
+      (let [res (core/handle-streamlet-event state {:type :receive-propose
+                                                    :block b2
+                                                    :ancestors [valid-entry1]
+                                                    :sender hex3})]
+        (is (contains? (:blocks (:state res)) h1))
+        (is (contains? (:notarized-blocks (:state res)) h1))
+        (is (= (:voter-set q-votes1) (get-in (:state res) [:block-votes h1])))
+        (is (= (:vote-proofs q-votes1) (get-in (:state res) [:block-vote-proofs h1])))
+        (is (<= 1 (:epoch (:state res))))))))
 
 

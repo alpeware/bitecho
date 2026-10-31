@@ -489,7 +489,7 @@
                   (if (and (not unseeded-sender?) (not tamper-burn?) (>= initial-balance burn-amt))
                     (and (= (- initial-balance burn-amt) sender-bal)
                          (= burn-amt epoch-burns)
-                         (contains? (:contagion-known-ids new-state) "msg-prop-1")
+                         (contains? (:contagion-known-ids new-state) (basalt/bytes->hex (crypto/sha256 payload)))
                          (seq (:commands res)))
                     (and (= (if unseeded-sender? 0 initial-balance) sender-bal)
                          (zero? epoch-burns)
@@ -1631,12 +1631,12 @@
           (is (= :gossip (get-in new-st [:epoch-to-message-roles 0 m-id])))))
 
       (testing "receive-gossip records :gossip role"
-        (let [wrapped (sieve/wrap-message (.getBytes "hello gossip" "UTF-8")
-                                          sender-priv (:public sender-kp) 1000)
-              gossip-msg (assoc wrapped :message-id "msg-gossip-1")
-              res (sm/handle-event st {:type :receive-gossip :message gossip-msg})
-              new-st (:state res)]
-          (is (= :gossip (get-in new-st [:epoch-to-message-roles 0 "msg-gossip-1"])))))
+        (let [payload (.getBytes "hello gossip" "UTF-8")
+              wrapped (sieve/wrap-message payload sender-priv (:public sender-kp) 1000)
+              res (sm/handle-event st {:type :receive-gossip :message wrapped})
+              new-st (:state res)
+              expected-id (basalt/bytes->hex (crypto/sha256 payload))]
+          (is (= :gossip (get-in new-st [:epoch-to-message-roles 0 expected-id])))))
 
       (testing "receive-sieve-echo records :echo role"
         (let [echo-frame (sieve/sign-control-frame :sieve-echo "msg-echo-1" sender-priv sender-pub)
@@ -2443,3 +2443,35 @@
       (is (= 6 (:epoch new-state)))
       (is (empty? (filter #(#{:send-propose :send-vote} (:type %)) commands)))
       (is (empty? (:blocks new-state))))))
+
+(deftest test-receive-gossip-ignores-claimed-message-id
+  (testing "State machine ignores any claimed or spoofed message-id and derives true id from sha256 of payload"
+    (let [kp-a (crypto/generate-keypair)
+          sender-a (basalt/bytes->hex (:public kp-a))
+          kp-b (crypto/generate-keypair)
+          sender-b (basalt/bytes->hex (:public kp-b))
+          payload-a (.getBytes "payload-A-data" "UTF-8")
+          payload-b (.getBytes "payload-B-data" "UTF-8")
+          hash-a (basalt/bytes->hex (crypto/sha256 payload-a))
+          hash-b (basalt/bytes->hex (crypto/sha256 payload-b))
+          burn 500
+          cfg (assoc config/default-config
+                     :genesis-ledger {sender-a (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      sender-b (account/map->AccountState {:balance 10000 :seq 0 :deps []})})
+          state (assoc (sm/init-state [] "node-local" cfg) :epoch 0)
+          ;; Sender A sends payload-a with spoofed message-id = hash-b
+          sieve-a (sieve/wrap-message payload-a (:private kp-a) (:public kp-a) burn)
+          spoofed-a (assoc sieve-a :message-id hash-b)
+          res-a (sm/handle-event state {:type :receive-gossip :message spoofed-a})
+          st-a (:state res-a)]
+      ;; The state machine records it under hash-a, NOT hash-b
+      (is (contains? (:contagion-known-ids st-a) hash-a))
+      (is (not (contains? (:contagion-known-ids st-a) hash-b)))
+      (is (= burn (get-in st-a [:epoch-burns 0])))
+      ;; Sender B subsequently sends payload-b
+      (let [sieve-b (sieve/wrap-message payload-b (:private kp-b) (:public kp-b) burn)
+            res-b (sm/handle-event st-a {:type :receive-gossip :message sieve-b})
+            st-b (:state res-b)]
+        ;; Sender B's message is accepted under hash-b and not dropped as duplicate!
+        (is (contains? (:contagion-known-ids st-b) hash-b))
+        (is (= (* 2 burn) (get-in st-b [:epoch-burns 0])))))))

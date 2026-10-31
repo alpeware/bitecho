@@ -15,6 +15,10 @@
 
 (defrecord Vote [block-hash epoch voter-signature])
 
+(def max-epoch-catchup-delta
+  "Maximum allowed forward epoch jump from a single message or ancestor step."
+  64)
+
 (defn hex->bytes
   "Converts a hex string to a byte array."
   [^String s]
@@ -172,7 +176,9 @@
       (let [pubkey-hex (bytes->hex voter-pubkey-bytes)
             current-votes (get-in state [:block-votes b-hash] #{})
             new-votes (conj current-votes pubkey-hex)
-            state-with-vote (assoc-in state [:block-votes b-hash] new-votes)]
+            state-with-vote (-> state
+                                (assoc-in [:block-votes b-hash] new-votes)
+                                (assoc-in [:block-vote-proofs b-hash pubkey-hex] vote))]
         (if (>= (count new-votes) (quorum-threshold n))
           (update state-with-vote :notarized-blocks (fnil conj #{}) b-hash)
           state-with-vote))
@@ -367,10 +373,14 @@
 
 (defn extract-notarized-ancestors
   "Extracts a vector of up to max-depth notarized ancestor blocks walking back from parent-hash in state.
+   Bundles each notarized ancestor as {:block block :votes vote-proofs} with verified quorum vote proofs.
    Guards against cycles using a visited set."
   [state parent-hash max-depth]
   (let [blocks (get state :blocks {})
-        notarized (get state :notarized-blocks #{})]
+        notarized (get state :notarized-blocks #{})
+        peer-hexes (extract-peer-hexes state)
+        total-nodes (total-node-count state peer-hexes)
+        threshold (quorum-threshold total-nodes)]
     (loop [curr-hash parent-hash
            depth 0
            visited #{parent-hash}
@@ -380,24 +390,69 @@
               (not (contains? notarized curr-hash)))
         acc
         (if-let [block (get blocks curr-hash)]
-          (let [p-hash (:parent-hash block)]
+          (let [p-hash (:parent-hash block)
+                vote-proofs (get-in state [:block-vote-proofs curr-hash] {})
+                bundled-entry (when (>= (count vote-proofs) threshold)
+                                {:block block :votes vote-proofs})
+                next-acc (if bundled-entry (conj acc bundled-entry) acc)]
             (if (contains? visited p-hash)
-              (conj acc block)
-              (recur p-hash (inc depth) (conj visited p-hash) (conj acc block))))
+              next-acc
+              (recur p-hash (inc depth) (conj visited p-hash) next-acc)))
           acc)))))
 
+(defn verify-ancestor-quorum
+  "Verifies that an ancestor entry contains a valid block proposal within max-epoch-catchup-delta
+   and a quorum of validly signed votes from peers in :peers-map."
+  [state ancestor-entry]
+  (if-not (and (map? ancestor-entry)
+               (map? (:block ancestor-entry))
+               (map? (:votes ancestor-entry)))
+    {:valid? false}
+    (let [block (:block ancestor-entry)
+          votes-map (:votes ancestor-entry)
+          curr-ep (or (:epoch state) 0)
+          max-d (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta)
+          epoch-ok? (and (integer? (:epoch block))
+                         (<= (long (:epoch block)) (+ curr-ep max-d)))
+          proposal-ok? (and epoch-ok? (valid-block-proposal? state {:block block}))]
+      (if-not proposal-ok?
+        {:valid? false}
+        (let [b-hash (hash-block block)
+              peer-hexes (extract-peer-hexes state)
+              total-nodes (total-node-count state peer-hexes)
+              threshold (quorum-threshold total-nodes)
+              verified-votes
+              (into {}
+                    (filter (fn [[voter-hex vote]]
+                              (when (and (string? voter-hex)
+                                         (map? vote)
+                                         (= (:block-hash vote) b-hash))
+                                (when-let [voter-pk (resolve-peer-pubkey-bytes state voter-hex)]
+                                  (verify-vote-signature vote voter-pk))))
+                            votes-map))]
+          {:valid? (>= (count verified-votes) threshold)
+           :b-hash b-hash
+           :block block
+           :voter-set (set (keys verified-votes))
+           :vote-proofs verified-votes})))))
+
 (defn ingest-verified-ancestors
-  "Ingests verified notarized ancestor blocks into state if they pass block proposal validation.
-   Ancestors are processed in ascending epoch order."
+  "Ingests verified notarized ancestor blocks into state if they have valid quorum vote proofs
+   and do not exceed max-epoch-catchup-delta. Ancestors are processed in ascending epoch order."
   [state ancestors]
-  (let [sorted-ancestors (sort-by (fn [b] (or (:epoch b) 0)) ancestors)]
-    (reduce (fn [s ab]
-              (if (valid-block-proposal? s {:block ab})
-                (let [ab-hash (hash-block ab)]
-                  (-> s
-                      (assoc-in [:blocks ab-hash] ab)
-                      (update :notarized-blocks (fnil conj #{}) ab-hash)))
-                s))
+  (let [sorted-ancestors (sort-by (fn [entry] (or (get-in entry [:block :epoch]) 0)) ancestors)]
+    (reduce (fn [s entry]
+              (let [res (verify-ancestor-quorum s entry)]
+                (if (:valid? res)
+                  (let [b-hash (:b-hash res)
+                        block (:block res)]
+                    (-> s
+                        (assoc-in [:blocks b-hash] block)
+                        (update-in [:block-votes b-hash] (fnil into #{}) (:voter-set res))
+                        (update-in [:block-vote-proofs b-hash] merge (:vote-proofs res))
+                        (update :notarized-blocks (fnil conj #{}) b-hash)
+                        (update :epoch (fn [e] (max (or e 0) (long (:epoch block)))))))
+                  s)))
             state
             sorted-ancestors)))
 
@@ -441,44 +496,48 @@
 
 (defn- handle-propose-event
   "Handles a :receive-propose event: validates proposal fail-closed,
-   records block and votes if parent is known, or buffers into :future-blocks if parent is unknown."
+   enforces epoch bounds, ingests verified quorum ancestors, records block and votes."
   [state event]
   (if-not (valid-block-proposal? state event)
     {:state state :commands []}
-    (let [state (if (seq (:ancestors event))
-                  (ingest-verified-ancestors state (:ancestors event))
-                  state)
-          block (:block event)
-          state (update state :epoch (fn [e] (max (or e 0) (long (:epoch block)))))
-          b-hash (hash-block block)
-          state (assoc-in state [:blocks b-hash] block)
-          parent-hash (:parent-hash block)
-          known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
-      (if known-parent?
-        (let [peer-hexes (extract-peer-hexes state)
-              total-nodes (total-node-count state peer-hexes)
-              vote (cast-vote state block)
-              local-pk (extract-local-pubkey-bytes state)
-              state (if vote
-                      (-> state
-                          (update :voted-epochs (fnil conj #{}) (:epoch block))
-                          (accumulate-vote vote local-pk total-nodes))
-                      state)
-              state (apply-future-votes state b-hash total-nodes)
-              state (-> state
-                        update-head-hash
-                        finalize-prefix)
-              targets (extract-targets state)
-              commands (if vote
-                         [{:type :send-vote :targets targets :vote vote}]
-                         [])]
-          {:state state :commands commands})
-        (let [future-blocks (get state :future-blocks [])
-              state (-> state
-                        (assoc :future-blocks (conj future-blocks event))
-                        update-head-hash
-                        finalize-prefix)]
-          {:state state :commands []})))))
+    (let [block (:block event)
+          curr-epoch (or (:epoch state) 0)
+          max-delta (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta)]
+      (if (> (long (:epoch block)) (+ curr-epoch max-delta))
+        {:state state :commands []}
+        (let [state-with-ancestors (if (seq (:ancestors event))
+                                     (ingest-verified-ancestors state (:ancestors event))
+                                     state)
+              state (update state-with-ancestors :epoch (fn [e] (max (or e 0) (long (:epoch block)))))
+              b-hash (hash-block block)
+              state (assoc-in state [:blocks b-hash] block)
+              parent-hash (:parent-hash block)
+              known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
+          (if known-parent?
+            (let [peer-hexes (extract-peer-hexes state)
+                  total-nodes (total-node-count state peer-hexes)
+                  vote (cast-vote state block)
+                  local-pk (extract-local-pubkey-bytes state)
+                  state (if vote
+                          (-> state
+                              (update :voted-epochs (fnil conj #{}) (:epoch block))
+                              (accumulate-vote vote local-pk total-nodes))
+                          state)
+                  state (apply-future-votes state b-hash total-nodes)
+                  state (-> state
+                            update-head-hash
+                            finalize-prefix)
+                  targets (extract-targets state)
+                  commands (if vote
+                             [{:type :send-vote :targets targets :vote vote}]
+                             [])]
+              {:state state :commands commands})
+            (let [future-blocks (get state :future-blocks [])
+                  state (-> state
+                            (assoc :future-blocks (conj future-blocks event))
+                            update-head-hash
+                            finalize-prefix)]
+              {:state state :commands []})))))))
 
 (defn- drain-future-blocks
   "Re-evaluates buffered future block proposals whose parents may now be known."
@@ -504,19 +563,25 @@
               (recur (rest remaining) curr-state acc-cmds (conj unresolved event)))))))))
 
 (defn- handle-vote-event
-  "Handles a :receive-vote event: rejects Sybil senders or malformed votes fail-closed,
+  "Handles a :receive-vote event: rejects Sybil senders, malformed votes, or far-future epochs fail-closed,
    accumulates vote if block is known, or buffers into :future-votes."
   [state event]
   (let [vote (:vote event)
         sender-pk (extract-sender-pubkey-bytes state event)
         b-hash (when (map? vote) (:block-hash vote))
-        sig (when (map? vote) (:voter-signature vote))]
+        sig (when (map? vote) (:voter-signature vote))
+        epoch (when (map? vote) (:epoch vote))
+        curr-epoch (or (:epoch state) 0)
+        max-delta (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta)]
     (if (or (nil? sender-pk)
             (not (string? b-hash))
             (not (valid-hex-string? sig))
+            (not (integer? epoch))
+            (not (pos? epoch))
+            (> (long epoch) (+ curr-epoch max-delta))
             (not (verify-vote-signature vote sender-pk)))
       {:state state :commands []}
-      (let [state (update state :epoch (fn [e] (max (or e 0) (if (integer? (:epoch vote)) (long (:epoch vote)) 0))))]
+      (let [state (update state :epoch (fn [e] (max (or e 0) (long epoch))))]
         (if (contains? (:blocks state) b-hash)
           (let [peer-hexes (extract-peer-hexes state)
                 total-nodes (total-node-count state peer-hexes)

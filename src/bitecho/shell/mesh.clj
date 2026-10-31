@@ -552,9 +552,7 @@
                                       (reset! last-rx-at (System/currentTimeMillis))
                                       (if-let [cid (:channel-id evt)]
                                         (reset! channel-id cid)
-                                        (do
-                                          (reset! channel-id (api/create-data-channel! node "bitecho" {:ordered true}))
-                                          (println (str "[Mesh] Connected to peer " (name pid))))))
+                                        (reset! channel-id (api/create-data-channel! node "bitecho" {:ordered true}))))
                            :on-message (fn [evt]
                                          (reset! last-rx-at (System/currentTimeMillis))
                                          (when-let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
@@ -565,8 +563,7 @@
                                                                 :rng (java.util.Random.))]
                                                (async/put! (:network-in shell-node) event)))))
                            :on-close (fn [_]
-                                       (reset! channel-id nil)
-                                       (println (str "[Mesh] Disconnected from peer " (name pid))))}]
+                                       (reset! channel-id nil))}]
             (api/start! node remote-sdp callbacks)
             (swap! peer-conns assoc peer-hex {:node node
                                               :channel-id channel-id

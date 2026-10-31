@@ -637,10 +637,10 @@ Node: node3 (us-east1)
   ICE Credentials:   ufrag=${ICE_UFRAG[node3]} pwd=${ICE_PWD[node3]}
 
 Connection Instructions for Agents / Light Nodes:
-Agent Ingress (UDP port 5010) is disabled by default (:listen-agents? false).
-When enabled on a node, agents connect over WebRTC DataChannel (UDP port 5010)
-with channel name "bitecho", authenticating via the server's SHA-256 fingerprint
-and ICE credentials above. All inbound agent events MUST be wrapped in an
+Agent Ingress (UDP port 5010) is enabled on Devnet (:listen-agents? ${LISTEN_AGENTS:-true}).
+Agents connect over WebRTC DataChannel (UDP port 5010) with channel name
+"bitecho", authenticating via the validator's SHA-256 DTLS fingerprint and
+ICE credentials above. All inbound agent events MUST be wrapped in an
 Ed25519-signed envelope via wrap-agent-event.
 TXT_BOOTSTRAP_EOF
 
