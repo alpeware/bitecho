@@ -613,7 +613,7 @@
   (when (= (:transport mesh-node) :in-memory)
     (swap! in-memory-bus dissoc (get-in mesh-node [:identity :pubkey-hex])))
   (when-let [sh (:shell-node mesh-node)]
-    (try (async/put! (:stop-ch sh) :stop) (catch Exception _ nil)))
+    (try (core/stop-node sh) (catch Exception _ nil)))
   true)
 
 (defn start-mesh-node!

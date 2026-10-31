@@ -334,12 +334,6 @@
         pruned-epochs (reduce dissoc (or (:message-epochs state) {}) expired-ids)
         pruned-messages (reduce dissoc (:messages state) expired-ids)
         pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
-        pruned-murmur-cache-set (set/difference (:set (:murmur-cache state)) expired-ids)
-        pruned-murmur-cache-queue (if (seq expired-ids)
-                                    (into clojure.lang.PersistentQueue/EMPTY
-                                          (remove expired-ids (:queue (:murmur-cache state))))
-                                    (:queue (:murmur-cache state)))
-        pruned-murmur-cache {:set pruned-murmur-cache-set :queue pruned-murmur-cache-queue}
         pruned-received-echoes (reduce dissoc (or (:received-echoes state) {}) expired-ids)
         pruned-received-readies (reduce dissoc (or (:received-readies state) {}) expired-ids)
         pruned-echo-vote-counts (reduce dissoc (or (:echo-vote-counts state) {}) expired-ids)
@@ -358,7 +352,6 @@
                :message-epochs pruned-epochs
                :messages pruned-messages
                :contagion-known-ids pruned-known-ids
-               :murmur-cache pruned-murmur-cache
                :received-echoes pruned-received-echoes
                :received-readies pruned-received-readies
                :echo-vote-counts pruned-echo-vote-counts
@@ -546,7 +539,8 @@
   "Handles an incoming Contagion anti-entropy summary."
   [state event]
   (let [remote-summary (:summary event)
-        missing-ids (contagion/lazy-pull (:contagion-known-ids state) remote-summary)
+        known-ids (set/union (:contagion-known-ids state) (get-in state [:murmur-cache :set] #{}))
+        missing-ids (contagion/lazy-pull known-ids remote-summary)
         commands (if (seq missing-ids)
                    [{:type :send-pull-request
                      :target (:sender event)

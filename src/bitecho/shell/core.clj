@@ -69,9 +69,8 @@
          net-out (async/chan 8192)
          app-out (async/chan 8192)
          persist-ch (when persist? (async/chan (async/sliding-buffer 1)))
+         persist-done-ch (when persist? (start-persistence-worker! persist-ch snapshot-filename))
          stop-ch (async/chan)]
-     (when persist?
-       (start-persistence-worker! persist-ch snapshot-filename))
      (async/go-loop [state initial-state]
        (let [[val port] (async/alts! [events-in network-in stop-ch])]
          (cond
@@ -102,6 +101,7 @@
       :net-out net-out
       :app-out app-out
       :persist-ch persist-ch
+      :persist-done-ch persist-done-ch
       :stop-ch stop-ch
       :state-atom state-atom})))
 
@@ -116,7 +116,9 @@
   (when-let [pch (:persist-ch node)]
     (when-let [st-atom (:state-atom node)]
       (async/put! pch @st-atom))
-    (async/close! pch)))
+    (async/close! pch)
+    (when-let [done-ch (:persist-done-ch node)]
+      (async/alts!! [done-ch (async/timeout 2000)]))))
 
 (defn query-node-state
   "Queries the current pure state of a running shell node.

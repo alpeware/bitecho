@@ -245,18 +245,27 @@
 
 (defn get-ancestors
   "Recursively retrieves the sequence of ancestors for a given block hash.
-   Guards against cycles using a visited set: terminates traversal if a cycle is detected."
-  [blocks block-hash]
-  (loop [curr-hash block-hash
-         visited #{block-hash}
-         acc []]
-    (let [block (get blocks curr-hash)
-          parent-hash (:parent-hash block)]
-      (if (or (nil? block)
-              (= "genesis" parent-hash)
-              (contains? visited parent-hash))
-        acc
-        (recur parent-hash (conj visited parent-hash) (conj acc parent-hash))))))
+   Guards against cycles using a visited set: terminates traversal if a cycle is detected.
+   Optional 3-arity terminates walk early if parent-hash is in existing-finalized or not in blocks."
+  ([blocks block-hash]
+   (get-ancestors blocks block-hash nil))
+  ([blocks block-hash existing-finalized]
+   (loop [curr-hash block-hash
+          visited #{block-hash}
+          acc []]
+     (let [block (get blocks curr-hash)
+           parent-hash (:parent-hash block)]
+       (if (if existing-finalized
+             (or (nil? block)
+                 (= "genesis" parent-hash)
+                 (not (contains? blocks parent-hash))
+                 (contains? existing-finalized parent-hash)
+                 (contains? visited parent-hash))
+             (or (nil? block)
+                 (= "genesis" parent-hash)
+                 (contains? visited parent-hash)))
+         acc
+         (recur parent-hash (conj visited parent-hash) (conj acc parent-hash)))))))
 
 (defn- find-consecutive-epoch-head
   "Finds the middle block's hash of any 3 consecutive notarized blocks.
@@ -284,23 +293,6 @@
                notarized-block-maps)]
      consecutive-heads)))
 
-(defn- get-incremental-ancestors
-  "Recursively retrieves ancestors for head-hash, stopping when an ancestor is
-   'genesis', absent from blocks, already in existing-finalized, or in visited."
-  [blocks head-hash existing-finalized]
-  (loop [curr-hash head-hash
-         visited #{head-hash}
-         acc []]
-    (let [block (get blocks curr-hash)
-          parent-hash (:parent-hash block)]
-      (if (or (nil? block)
-              (= "genesis" parent-hash)
-              (not (contains? blocks parent-hash))
-              (and existing-finalized (contains? existing-finalized parent-hash))
-              (contains? visited parent-hash))
-        acc
-        (recur parent-hash (conj visited parent-hash) (conj acc parent-hash))))))
-
 (defn finalize-prefix
   "Scans the notarized chain. If three adjacent blocks have consecutive epoch numbers,
    finalizes the prefix of blocks starting from the middle block.
@@ -314,7 +306,7 @@
         new-finalized (reduce (fn [acc head-hash]
                                 (if (contains? existing-finalized head-hash)
                                   acc
-                                  (let [ancestors (get-incremental-ancestors blocks head-hash existing-finalized)]
+                                  (let [ancestors (get-ancestors blocks head-hash existing-finalized)]
                                     (into (conj acc head-hash) ancestors))))
                               #{}
                               heads)]

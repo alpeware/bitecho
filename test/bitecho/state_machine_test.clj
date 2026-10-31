@@ -2475,3 +2475,70 @@
         ;; Sender B's message is accepted under hash-b and not dropped as duplicate!
         (is (contains? (:contagion-known-ids st-b) hash-b))
         (is (= (* 2 burn) (get-in st-b [:epoch-burns 0])))))))
+
+(deftest test-ttl-pruned-gossip-prevents-pull-and-reburn
+  (testing "Gossip message that is TTL-pruned from :messages and :contagion-known-ids is retained in :murmur-cache, preventing re-burn and duplicate pull request"
+    (let [kp (crypto/generate-keypair)
+          sender (basalt/bytes->hex (:public kp))
+          payload (.getBytes "test-ttl-pruned-payload" "UTF-8")
+          msg-id (basalt/bytes->hex (crypto/sha256 payload))
+          burn 500
+          cfg (assoc config/default-config
+                     :gossip-ttl-epochs 2
+                     :genesis-ledger {sender (account/map->AccountState {:balance 10000 :seq 0 :deps []})})
+          state (assoc (sm/init-state [] "node-local" cfg) :epoch 0)
+          sieve-msg (sieve/wrap-message payload (:private kp) (:public kp) burn)
+          res1 (sm/handle-event state {:type :receive-gossip :message sieve-msg})
+          st1 (:state res1)]
+      (is (= 9500 (get-in st1 [:ledger sender :balance])))
+      (is (contains? (:contagion-known-ids st1) msg-id))
+      (is (contains? (get-in st1 [:murmur-cache :set]) msg-id))
+      (is (contains? (:messages st1) msg-id))
+      (let [st-pruned (reduce (fn [s _] (:state (sm/handle-event s {:type :tick}))) st1 (range 3))]
+        (is (> (:epoch st-pruned) 2))
+        (is (not (contains? (:messages st-pruned) msg-id)))
+        (is (not (contains? (:contagion-known-ids st-pruned) msg-id)))
+        (is (contains? (get-in st-pruned [:murmur-cache :set]) msg-id))
+        (let [res-summary (sm/handle-event st-pruned {:type :receive-summary :sender "peer-remote" :summary #{msg-id}})]
+          (is (empty? (filter (fn [cmd]
+                                (and (= :send-pull-request (:type cmd))
+                                     (contains? (:missing-ids cmd) msg-id)))
+                              (:commands res-summary)))))
+        (let [res2 (sm/handle-event st-pruned {:type :receive-gossip :message sieve-msg})
+              st2 (:state res2)]
+          (is (= 9500 (get-in st2 [:ledger sender :balance])))
+          (is (nil? (get-in st2 [:epoch-burns (:epoch st2)]))))))))
+
+(defspec ^{:doc "Property: TTL-pruned gossip messages retained in murmur cache prevent redundant lazy pulls and double burn deduction across subsequent epochs"}
+  prop-ttl-pruned-gossip-no-reburn-or-pull 25
+  (prop/for-all [initial-balance (gen/choose 1000 5000)
+                 burn-amt (gen/choose 100 500)
+                 ticks (gen/choose 3 6)]
+                (let [kp (crypto/generate-keypair)
+                      sender-pub (basalt/bytes->hex (:public kp))
+                      payload (.getBytes "prop-ttl-payload" "UTF-8")
+                      msg-id (basalt/bytes->hex (crypto/sha256 payload))
+                      cfg (assoc config/default-config
+                                 :gossip-ttl-epochs 2
+                                 :genesis-ledger {sender-pub (account/map->AccountState {:balance initial-balance :seq 0 :deps []})})
+                      state (assoc (sm/init-state [] "node-local" cfg) :epoch 0)
+                      sieve-msg (sieve/wrap-message payload (:private kp) (:public kp) burn-amt)
+                      res1 (sm/handle-event state {:type :receive-gossip :message sieve-msg :rng (java.util.Random. 42)})
+                      st1 (:state res1)
+                      bal-after-1 (get-in st1 [:ledger sender-pub :balance])
+                      st-pruned (reduce (fn [s _] (:state (sm/handle-event s {:type :tick}))) st1 (range ticks))
+                      res-summary (sm/handle-event st-pruned {:type :receive-summary :sender "peer-remote" :summary #{msg-id}})
+                      res-gossip2 (sm/handle-event st-pruned {:type :receive-gossip :message sieve-msg :rng (java.util.Random. 43)})
+                      st2 (:state res-gossip2)
+                      bal-after-2 (get-in st2 [:ledger sender-pub :balance])
+                      pull-commands (filter (fn [cmd]
+                                              (and (= :send-pull-request (:type cmd))
+                                                   (contains? (:missing-ids cmd) msg-id)))
+                                            (:commands res-summary))]
+                  (and (= (- initial-balance burn-amt) bal-after-1)
+                       (not (contains? (:messages st-pruned) msg-id))
+                       (not (contains? (:contagion-known-ids st-pruned) msg-id))
+                       (contains? (get-in st-pruned [:murmur-cache :set]) msg-id)
+                       (empty? pull-commands)
+                       (= bal-after-1 bal-after-2)))))
+

@@ -702,17 +702,18 @@ TXT_BOOTSTRAP_EOF
 
 cmd_status() {
   echo "=== 3-Node Bitecho Devnet Cluster Status ==="
-  printf "%-6s %-16s %-10s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
-    "Node" "IP" "State" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns"
-  printf "%-6s %-16s %-10s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
-    "------" "----------------" "----------" "------------" "----------------" "------------" "------" "------------" "--------" "-----------------------"
+  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
+    "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns"
+  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
+    "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-----------------------"
 
   for node in "${NODES[@]}"; do
-    local ip vm_state state mem_usage disk_usage egress_nic epoch blocks peers tokenomics
+    local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics
     ip="$(get_ip "$node")"
     if [[ -z "$ip" ]]; then
       ip="UNRESOLVED"
       state="UNKNOWN"
+      cpu_usage="N/A"
       mem_usage="N/A"
       disk_usage="N/A"
       egress_nic="N/A"
@@ -729,6 +730,7 @@ cmd_status() {
         raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_STATUS' 2>/dev/null || echo "SSH_FAILED"
 set -o pipefail
 svc=$(systemctl is-active bitecho 2>/dev/null || echo "inactive")
+cpu=$(ps -o %cpu= -C java 2>/dev/null | awk '{s+=$1} END {if (NR>0) printf "%.1f%%", s; else print "0.0%"}' || echo "N/A")
 mem=$(free -m 2>/dev/null | awk '/Mem:/ {print $3 "/" $2 "M"}' || echo "N/A")
 disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}' || echo "N/A")
 dev=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
@@ -736,11 +738,12 @@ dev=${dev:-ens4}
 nic_raw=$(cat /sys/class/net/"$dev"/statistics/tx_bytes 2>/dev/null || echo 0)
 statusz=$(curl -fsSL --max-time 2 http://127.0.0.1:8080/statusz 2>/dev/null || true)
 
-echo "${svc}|${mem}|${disk}|${nic_raw}|${statusz}"
+echo "${svc}|${cpu}|${mem}|${disk}|${nic_raw}|${statusz}"
 REMOTE_STATUS
 )"
         if [[ -z "$raw_metrics" || "$raw_metrics" == "SSH_FAILED" ]]; then
           state="UNREACHABLE"
+          cpu_usage="N/A"
           mem_usage="N/A"
           disk_usage="N/A"
           egress_nic="N/A"
@@ -749,9 +752,10 @@ REMOTE_STATUS
           peers="N/A"
           tokenomics="N/A"
         else
-          local raw_svc raw_mem raw_disk raw_nic raw_statusz
-          IFS='|' read -r raw_svc raw_mem raw_disk raw_nic raw_statusz <<< "$raw_metrics"
+          local raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz
+          IFS='|' read -r raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz <<< "$raw_metrics"
           state="${raw_svc:-inactive}"
+          cpu_usage="${raw_cpu:-N/A}"
           mem_usage="${raw_mem:-N/A}"
           disk_usage="${raw_disk:-N/A}"
 
@@ -789,6 +793,7 @@ REMOTE_STATUS
         fi
       else
         state="${vm_state:-OFFLINE}"
+        cpu_usage="N/A"
         mem_usage="N/A"
         disk_usage="N/A"
         egress_nic="N/A"
@@ -799,8 +804,8 @@ REMOTE_STATUS
       fi
     fi
 
-    printf "%-6s %-16s %-10s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
-      "$node" "$ip" "$state" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics"
+    printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
+      "$node" "$ip" "$state" "$cpu_usage" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics"
   done
 }
 
