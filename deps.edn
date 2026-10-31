@@ -1,13 +1,18 @@
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}
         org.clojure/core.async {:mvn/version "1.9.829-alpha2"}
+        org.clojure/data.json {:mvn/version "2.5.1"}
         com.taoensso/nippy {:mvn/version "3.6.0"}
         alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
-                                  :git/sha "fab118f4ac0c25fb37fb76480ffeddf683fe132b"}}
+                                  :git/sha "2b6c7f6087e317b77ff92a98b3e8709b68d5c60c"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]
                  :main-opts ["-m" "bitecho.main"]}
+           :light-node {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                                   "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
+                                   "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]
+                        :main-opts ["-m" "bitecho.main" "light-node"]}
            :simulate {:extra-paths ["dev"]
                       :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"
                                  "--enable-native-access=ALL-UNNAMED"

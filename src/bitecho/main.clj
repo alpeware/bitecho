@@ -3,6 +3,7 @@
   (:gen-class)
   (:require [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.identity :as identity]
+            [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
             [clojure.edn :as edn]
             [clojure.java.io :as io]))
@@ -16,7 +17,8 @@
   (println "  bitecho print-identity <config.edn>")
   (println "  bitecho gen-keypair [output-file.edn]")
   (println "  bitecho validate-config <config.edn>")
-  (println "  bitecho simulate-agents <bootstrap.edn> <keypair.edn> [--agents N] [--messages M] [--burn B]"))
+  (println "  bitecho simulate-agents <bootstrap.edn> <keypair.edn> [--agents N] [--messages M] [--burn B]")
+  (println "  bitecho light-node <serve|verb> [options]"))
 
 (defn- cmd-run
   "Runs a Bitecho mesh node given a config EDN file."
@@ -136,6 +138,9 @@
 
       "simulate-agents"
       (cmd-simulate-agents rest-args)
+
+      "light-node"
+      (light-node/run-light-node-cli! rest-args)
 
       (do
         (print-usage)

@@ -48,9 +48,10 @@
 (defn build-home-set-envelope
   "Builds a signed agent envelope registering Rendezvous home-set candidates for callee."
   [agent-pub-hex agent-priv-bytes candidates price epoch]
-  (let [event {:type :register-home-set
+  (let [candidate-maps (mapv (fn [c] (if (map? c) (assoc c :price (or (:price c) price)) {:node-id c :price price})) candidates)
+        event {:type :register-home-set
                :callee agent-pub-hex
-               :candidates candidates
+               :candidates candidate-maps
                :price price
                :price-max price
                :epoch epoch}]

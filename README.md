@@ -30,4 +30,46 @@ Bitecho is implemented as a pure, Sans-IO deterministic state machine, cleanly s
   - **Edge FX Settlement:** Full Nodes act as principals accepting Base, Solana, and Bitcoin payments under mandatory escrow-first settlement.
 * **Delegated PKI:** Agents operate in live, potentially vulnerable environments using disposable Node Keys, cryptographically bound to a highly secure Parent Key via Delegated Agent Certificates (DACs).
 
+## Light Node Architecture & Edge CLI
+
+The Bitecho Light Node provides a sovereign edge client enabling autonomous agents to connect to the Bitecho validator mesh, register rendezvous home sets, establish end-to-end encrypted sealed channels over peer-to-peer WebRTC DataChannels, and execute micro-transfers with mandatory anti-spam burn accounting.
+
+### Key Capabilities & Invariants
+* **Pure Sans-IO Core (`bitecho.light-node.core`):** Fully deterministic state machine with zero side effects, evaluated under strict TDD invariants (`clojure.test.check`).
+* **Sealed Channel Encryption (`bitecho.crypto.sealed`):** Ephemeral X25519 ECDH key exchange, RFC 5869 HKDF-SHA256 directional key derivation (`tx-key` and `rx-key`), and ChaCha20-Poly1305 AEAD authenticated payload encryption.
+* **Replay Protection & Anti-Skew:** Gap-tolerant 64-bit sliding bitmask replay window with strict 2-epoch wire skew tolerance.
+* **Ephemeral Key Isolation & POSIX Permissions:** Ephemeral session private keys are never persisted to disk. State files (`state.nippy`) and identity keys (`identity/node-identity.edn`) enforce `0600` POSIX permissions and atomic replacement via temporary files.
+
+### Usage
+
+The light node supports both a continuous JSONL `serve` daemon (for parent agent loops) and one-shot CLI commands:
+
+```bash
+# 1. Inspect local identity and DTLS credentials
+clojure -M:light-node identity --state-dir data/alice
+
+# 2. Discover network parameters and validators from bootstrap descriptor
+clojure -M:light-node discover --bootstrap devnet/bootstrap.edn
+
+# 3. Register rendezvous home node set ($m >= 3$) at uniform price
+clojure -M:light-node register-home-set --price 10 --state-dir data/alice
+
+# 4. Initiate a sealed channel session offer to a callee
+clojure -M:light-node offer --callee <callee-pubkey-hex> --price 10 --burn 500 --state-dir data/alice
+
+# 5. Send an encrypted sealed message across an open session
+clojure -M:light-node send --session <session-id> --text "Hello peer" --burn 500 --state-dir data/alice
+
+# 6. Read and drain inbox
+clojure -M:light-node inbox --state-dir data/alice
+
+# 7. Close a session and securely wipe ephemeral keys
+clojure -M:light-node close --session <session-id> --state-dir data/alice
+
+# 8. Run in serve mode (JSONL stdio protocol with optional autonomous offer acceptance)
+clojure -M:light-node serve --state-dir data/alice --bootstrap devnet/bootstrap.edn --autonomous
+```
+
+For complete protocol schemas, payload specifications, and parent agent integration examples, see [`skill/SKILL.md`](skill/SKILL.md).
+
 **Bitecho is the sovereign physics engine for the autonomous workforce.**

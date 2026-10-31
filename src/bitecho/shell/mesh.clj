@@ -498,7 +498,7 @@
 (defn- start-net-out-loop!
   "Consumes net-out commands, transforms them to peer events, and delivers to targets."
   [ctx]
-  (let [{:keys [shell-node identity transport peer-conns in-mem-bus]} ctx]
+  (let [{:keys [shell-node identity transport peer-conns in-mem-bus agent-conns]} ctx]
     (async/go-loop []
       (when-let [cmd (async/<! (:net-out shell-node))]
         (try
@@ -514,9 +514,15 @@
                                       :sender-pubkey-bytes (get-in identity [:keypair :public])
                                       :rng (java.util.Random.))]
                     (async/put! (:network-in peer-entry) thawed)))
-                (when-let [conn (get @peer-conns target)]
+                (when-let [conn (or (get @peer-conns target)
+                                    (when agent-conns (get @agent-conns target)))]
                   (when-let [cid @(:channel-id conn)]
-                    (api/send! (:node conn) frozen cid))))))
+                    (api/send! (:node conn) frozen cid)))))
+            (when (and (= (:type cmd) :send-gossip) agent-conns)
+              (doseq [[_ conn] @agent-conns]
+                (when-let [cid @(:channel-id conn)]
+                  (try (api/send! (:node conn) frozen cid)
+                       (catch Exception _ nil))))))
           (catch Exception e
             (log-mesh-error "Net-out loop error" e)))
         (recur)))))
@@ -582,7 +588,7 @@
 (defn- init-agent-listener!
   "Starts agent ingress listener when enabled.
    Sanitizes incoming agent messages using unwrap-authenticated-agent-event."
-  [config identity shell-node transport]
+  [config identity shell-node transport agent-conns]
   (when (and (= transport :datachannel)
              (get-in config [:cluster :listen-agents?] false))
     (let [port (int (get-in config [:cluster :agent-port] 5010))
@@ -592,11 +598,52 @@
       (api/listen! listen-opts
                    {:on-connection
                     (fn [agent-node]
-                      (api/set-callbacks! agent-node
-                                          {:on-message
-                                           (fn [evt]
-                                             (when-let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
-                                               (async/put! (:network-in shell-node) unwrapped)))}))}))))
+                      (let [channel-id (atom 0)
+                            agent-sender (atom nil)]
+                        (api/set-callbacks!
+                         agent-node
+                         {:on-open (fn [evt]
+                                     (when-let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                       (reset! channel-id cid))
+                                     (when agent-conns
+                                       (let [anon-key [:anon (System/identityHashCode agent-node)]]
+                                         (reset! agent-sender anon-key)
+                                         (swap! agent-conns assoc anon-key {:node agent-node
+                                                                            :channel-id channel-id
+                                                                            :last-rx-at (atom (System/currentTimeMillis))}))))
+                          :on-data-channel (fn [evt]
+                                             (when-let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                               (reset! channel-id cid)))
+                          :on-message
+                          (fn [evt]
+                            (when-let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                              (reset! channel-id cid))
+                            (when-let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
+                              (when-let [sender (:sender unwrapped)]
+                                (when (not= sender @agent-sender)
+                                  (let [old-key @agent-sender]
+                                    (reset! agent-sender sender)
+                                    (when agent-conns
+                                      (swap! agent-conns (fn [conns]
+                                                           (-> conns
+                                                               (dissoc old-key)
+                                                               (assoc sender {:node agent-node
+                                                                              :channel-id channel-id
+                                                                              :last-rx-at (atom (System/currentTimeMillis))}))))))))
+                              (async/put! (:network-in shell-node) unwrapped)
+                              (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
+                                (let [frozen (:payload evt)
+                                      sender (:sender unwrapped)]
+                                  (doseq [[pk conn] @agent-conns
+                                          :when (not= pk sender)]
+                                    (when-let [cid (or @(:channel-id conn) 0)]
+                                      (try (api/send! (:node conn) frozen cid)
+                                           (catch Exception _ nil))))))))
+                          :on-close (fn [_]
+                                      (reset! channel-id nil)
+                                      (when-let [k @agent-sender]
+                                        (when agent-conns
+                                          (swap! agent-conns dissoc k))))})))}))))
 
 (defn stop-mesh-node!
   "Stops all running resources of a mesh node cleanly."
@@ -608,6 +655,9 @@
   (when-let [al (:agent-listener mesh-node)]
     (try (api/close! al) (catch Exception _ nil)))
   (doseq [[_ conn] @(:peer-conns mesh-node)]
+    (when-let [n (:node conn)]
+      (try (api/close! n) (catch Exception _ nil))))
+  (doseq [[_ conn] @(:agent-conns mesh-node)]
     (when-let [n (:node conn)]
       (try (api/close! n) (catch Exception _ nil))))
   (when (= (:transport mesh-node) :in-memory)
@@ -633,6 +683,7 @@
                          (build-initial-node-state config identity))
          shell-node (core/start-node initial-state snapshot-file {:persist? (get opts :persist? true)})
          peer-conns (atom {})
+         agent-conns (atom {})
          cluster-cfg (get config :cluster {})
          nodes-cfg (get cluster-cfg :nodes {})
          sorted-ids (vec (sort-by name (keys nodes-cfg)))
@@ -642,6 +693,7 @@
               :transport transport
               :shell-node shell-node
               :peer-conns peer-conns
+              :agent-conns agent-conns
               :in-mem-bus in-memory-bus
               :node-idx node-idx
               :nodes-cfg nodes-cfg}]
@@ -658,7 +710,7 @@
                              (:tick-interval-ms config/devnet-config)
                              10000)
            ticker (start-ticker! ctx tick-interval)
-           agent-listener (init-agent-listener! config identity shell-node transport)
+           agent-listener (init-agent-listener! config identity shell-node transport agent-conns)
            http-server (start-http-server! (get config :http {})
                                            ctx
                                            (count (disj (set (keys nodes-cfg)) node-id))
@@ -669,6 +721,7 @@
                      :shell-node shell-node
                      :state-atom (:state-atom shell-node)
                      :peer-conns peer-conns
+                     :agent-conns agent-conns
                      :http-server http-server
                      :ticker-executor ticker
                      :agent-listener agent-listener
