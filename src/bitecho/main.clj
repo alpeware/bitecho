@@ -1,7 +1,8 @@
 (ns bitecho.main
   "CLI entrypoint for Bitecho node."
   (:gen-class)
-  (:require [bitecho.shell.identity :as identity]
+  (:require [bitecho.shell.agent-sim :as agent-sim]
+            [bitecho.shell.identity :as identity]
             [bitecho.shell.mesh :as mesh]
             [clojure.edn :as edn]
             [clojure.java.io :as io]))
@@ -14,7 +15,8 @@
   (println "  bitecho run <config.edn>")
   (println "  bitecho print-identity <config.edn>")
   (println "  bitecho gen-keypair [output-file.edn]")
-  (println "  bitecho validate-config <config.edn>"))
+  (println "  bitecho validate-config <config.edn>")
+  (println "  bitecho simulate-agents <bootstrap.edn> <keypair.edn> [--agents N] [--messages M] [--burn B]"))
 
 (defn- cmd-run
   "Runs a Bitecho mesh node given a config EDN file."
@@ -96,6 +98,17 @@
             (println (str "Config invalid: " (:error res))))
           (System/exit 1))))))
 
+(defn- cmd-simulate-agents
+  "Runs light agent swarm simulation against bootstrap nodes."
+  [args]
+  (try
+    (let [{:keys [bootstrap-file keypair-file opts]} (agent-sim/parse-sim-args args)]
+      (agent-sim/run-agent-simulation! bootstrap-file keypair-file opts))
+    (catch Exception e
+      (binding [*out* *err*]
+        (println (str "Error: " (.getMessage e))))
+      (System/exit 1))))
+
 (defn -main
   "Main CLI entrypoint."
   [& args]
@@ -118,6 +131,9 @@
       (if (first rest-args)
         (cmd-validate-config (first rest-args))
         (do (print-usage) (System/exit 1)))
+
+      "simulate-agents"
+      (cmd-simulate-agents rest-args)
 
       (do
         (print-usage)

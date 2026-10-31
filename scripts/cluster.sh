@@ -36,6 +36,7 @@ SSH_KEY="${SSH_KEY_DIR}/bitecho_cluster_ed25519"
 TREASURY_KEY_FILE="${SSH_KEY_DIR}/devnet_treasury_keypair.edn"
 CUSTODY_KEY_FILE="${SSH_KEY_DIR}/devnet_custody_keypair.edn"
 TICK_INTERVAL_MS="${TICK_INTERVAL_MS:-10000}"
+LISTEN_AGENTS="${LISTEN_AGENTS:-true}"
 
 NODES=("node1" "node2" "node3")
 
@@ -334,8 +335,8 @@ LimitNOFILE=65536
 Restart=always
 RestartSec=3
 ExecStart=/opt/jdk-25/bin/java \
-  -Xms256m -Xmx512m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m \
-  -XX:+UseCompactObjectHeaders -XX:+UseZGC \
+  -Xms128m -Xmx320m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m \
+  -XX:+UseCompactObjectHeaders -XX:+UseG1GC \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
   --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
@@ -577,6 +578,7 @@ chmod 600 /etc/bitecho/config.edn.new
   -jar /opt/bitecho/bitecho.jar validate-config /etc/bitecho/config.edn.new
 if [ "${reset_state}" = "true" ]; then
   echo "Resetting node state on ${node}..."
+  sudo systemctl stop bitecho.service || true
   rm -rf /var/lib/bitecho/state/*
 fi
 mv -f /etc/bitecho/config.edn.new /etc/bitecho/config.edn
@@ -902,6 +904,32 @@ cmd_chaos() {
   echo "=== Chaos Monkey Mode Completed Successfully (${rounds} rounds) ==="
 }
 
+cmd_simulate() {
+  if [[ ! -f "${ROOT_DIR}/devnet/bootstrap.edn" ]]; then
+    echo "Error: devnet/bootstrap.edn not found. Run ./scripts/cluster.sh deploy first." >&2
+    return 1
+  fi
+  if [[ ! -f "${CUSTODY_KEY_FILE}" ]]; then
+    echo "Error: Custody keypair not found at ${CUSTODY_KEY_FILE}." >&2
+    return 1
+  fi
+  local local_java
+  local_java="$(resolve_local_java)"
+  if [[ ! -f "${ROOT_DIR}/target/bitecho.jar" ]]; then
+    echo "Building ${ROOT_DIR}/target/bitecho.jar..."
+    clojure -T:build uber
+  fi
+  cmd_status
+  "$local_java" --enable-native-access=ALL-UNNAMED \
+    --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+    --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+    -jar "${ROOT_DIR}/target/bitecho.jar" simulate-agents \
+    "${ROOT_DIR}/devnet/bootstrap.edn" "${CUSTODY_KEY_FILE}" "$@"
+  echo "Waiting 12s for Devnet epoch tick and Treasury demand-gated mint..."
+  sleep 12
+  cmd_status
+}
+
 # ------------------------------------------------------------------------------
 # CLI Dispatcher & Usage
 # ------------------------------------------------------------------------------
@@ -917,6 +945,7 @@ Commands:
   init                                Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
   deploy [--reset-state]              Build local uberjar, sync configs/keys/binaries, and restart bitecho services
   status                              Display live status table across all 3 cluster nodes
+  simulate [--agents N] [--messages M] [--burn B] Run light agent swarm simulator against Devnet
   chaos [--rounds N] [--interval SEC] Run chaos monkey restarting random nodes and checking convergence
   logs [node1|node2|node3]            Stream systemd journal logs from a cluster node
   bootstrap-sdp                       Display WebRTC DataChannel bootstrap connection parameters for agents
@@ -948,6 +977,9 @@ main() {
       ;;
     status)
       cmd_status "$@"
+      ;;
+    simulate)
+      cmd_simulate "$@"
       ;;
     chaos)
       cmd_chaos "$@"
