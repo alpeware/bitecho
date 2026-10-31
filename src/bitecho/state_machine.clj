@@ -4,6 +4,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
+            [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
             [bitecho.economy.attestation :as attestation]
             [bitecho.economy.bundle :as bundle]
@@ -647,12 +648,19 @@
   (let [cfg (:config state)
         murmur-k (:murmur-k cfg)
         murmur-max-cache-size (:murmur-max-cache-size cfg)
-        message (:message event)
+        raw-message (:message event)
+        payload (:payload raw-message)
+        msg-id (or (when (and (string? (:message-id raw-message))
+                              (not (string/blank? (:message-id raw-message))))
+                     (:message-id raw-message))
+                   (when (bytes? payload)
+                     (basalt/bytes->hex (crypto/sha256 payload))))
+        message (when msg-id (assoc raw-message :message-id msg-id))
         rng (:rng event)
         burn-amt (:burn-amount message)
         valid-burn? (and (number? burn-amt) (>= burn-amt burn/min-signaling-burn))
-        valid-signature? (when valid-burn? (sieve/validate-message message))]
-    (if (and valid-burn? valid-signature?)
+        valid-signature? (when (and valid-burn? message) (sieve/validate-message message))]
+    (if (and (some? msg-id) valid-burn? valid-signature?)
       (let [extracted-peers (basalt/extract-peers (:basalt-view state))
             gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
             new-message? (some? (:message gossip-result))

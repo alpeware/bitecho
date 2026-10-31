@@ -7,6 +7,7 @@
             [bitecho.shell.agent-sim :as sim]
             [bitecho.shell.mesh :as mesh]
             [bitecho.state-machine :as sm]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -58,12 +59,43 @@
 
                       state (setup-test-state node-pub-hex sender-pub-hex initial-bal)
                       res (sm/handle-event state unwrapped)
-                      st' (:state res)]
+                      st' (:state res)
+                      msg-id (get-in unwrapped [:message :message-id])]
                   (and (some? unwrapped)
                        (= :receive-gossip (:type unwrapped))
+                       (string? msg-id)
+                       (not (str/blank? msg-id))
                        (= (get-in st' [:epoch-burns 1]) burn)
                        (= (get-in st' [:ledger sender-pub-hex :balance]) (- initial-bal burn))
-                       (contains? (:contagion-known-ids st') (get-in unwrapped [:message :message-id]))))))
+                       (contains? (:contagion-known-ids st') msg-id)))))
+
+(deftest test-multiple-gossip-envelopes-distinct-ids-accumulate-burn
+  (testing "Multiple distinct gossip envelopes produce distinct message-ids, accept all into contagion-known-ids, and accumulate epoch burns"
+    (let [sender-kp (crypto/generate-keypair)
+          sender-pub-hex (basalt/bytes->hex (:public sender-kp))
+          sender-priv-bytes (:private sender-kp)
+          node-kp (crypto/generate-keypair)
+          node-pub-hex (basalt/bytes->hex (:public node-kp))
+          burn 500
+          initial-bal 50000
+          init-st (setup-test-state node-pub-hex sender-pub-hex initial-bal)
+          envelopes (mapv (fn [i]
+                            (let [p (.getBytes (str "test-payload-" i) "UTF-8")]
+                              (sim/build-gossip-envelope sender-pub-hex sender-priv-bytes p burn)))
+                          (range 5))
+          unwrapped-events (mapv #(mesh/unwrap-authenticated-agent-event (nippy/freeze %)) envelopes)
+          msg-ids (mapv #(get-in % [:message :message-id]) unwrapped-events)]
+      ;; 5 distinct non-blank message-ids
+      (is (= 5 (count (distinct msg-ids))))
+      (is (every? #(and (string? %) (not (str/blank? %))) msg-ids))
+      ;; sequentially process all 5 events
+      (let [final-st (reduce (fn [st evt]
+                               (:state (sm/handle-event st evt)))
+                             init-st
+                             unwrapped-events)]
+        (is (= (* 5 burn) (get-in final-st [:epoch-burns 1])))
+        (is (= (- initial-bal (* 5 burn)) (get-in final-st [:ledger sender-pub-hex :balance])))
+        (is (every? #(contains? (:contagion-known-ids final-st) %) msg-ids))))))
 
 (deftest test-transfer-gossip-envelope-e2e
   (testing "build-transfer-gossip-envelope produces valid transfer delivered via on-deliver"

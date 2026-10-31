@@ -1,6 +1,7 @@
 (ns bitecho.shell.agent-sim
   "Light Agent Swarm Simulator: pure envelope builders and WebRTC DataChannel swarm runner."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.mesh :as mesh]
@@ -26,7 +27,8 @@
                   sender-pub-hex
                   (basalt/bytes->hex sender-pub-hex))
         sieve-msg (sieve/wrap-message payload-bytes sender-priv-bytes sender-pub-bytes burn-amount)
-        agent-event {:type :receive-gossip :message sieve-msg}]
+        message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))
+        agent-event {:type :receive-gossip :message (assoc sieve-msg :message-id message-id)}]
     (mesh/wrap-agent-event agent-event pub-hex sender-priv-bytes)))
 
 (defn build-transfer-gossip-envelope
