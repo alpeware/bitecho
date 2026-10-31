@@ -153,7 +153,7 @@
 (defn- distribute-swarm-messages!
   "Distributes M unique signed gossip messages across the connected light agent channels."
   [connections sender-pub-hex sender-priv-bytes message-count burn-amount]
-  (let [pacing-ms 50
+  (let [pacing-ms 20
         active-conns (filterv :connected? connections)
         active-count (count active-conns)]
     (if (zero? active-count)

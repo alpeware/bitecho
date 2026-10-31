@@ -103,7 +103,9 @@
   [args]
   (try
     (let [{:keys [bootstrap-file keypair-file opts]} (agent-sim/parse-sim-args args)]
-      (agent-sim/run-agent-simulation! bootstrap-file keypair-file opts))
+      (agent-sim/run-agent-simulation! bootstrap-file keypair-file opts)
+      (shutdown-agents)
+      (System/exit 0))
     (catch Exception e
       (binding [*out* *err*]
         (println (str "Error: " (.getMessage e))))
