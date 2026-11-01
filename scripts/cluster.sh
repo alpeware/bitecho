@@ -793,8 +793,8 @@ REMOTE_STATUS
           fi
 
           # Parse statusz line:
-          # role=validator epoch=1 head=genesis notarized=0 finalized=0 peers=2/2 supply=18900000000 minted=0 burns=0 finalized_epoch=0 burn_digest=... pending_receipts=0 failed_receipts=0
-          local r_role="" r_epoch="" r_notarized="" r_finalized="" r_peers="" r_supply="" r_minted="" r_burns="" r_finalized_epoch="" r_burn_digest="" r_pending_receipts="" r_failed_receipts=""
+          # role=validator epoch=1 head=genesis notarized=0 finalized=0 peers=2/2 supply=18900000000 minted=0 burns=0 finalized_epoch=0 burn_digest=... pending_receipts=0 failed_receipts=0 conn_dropped=0 conn_stale=0
+          local r_role="" r_epoch="" r_notarized="" r_finalized="" r_peers="" r_supply="" r_minted="" r_burns="" r_finalized_epoch="" r_burn_digest="" r_pending_receipts="" r_failed_receipts="" r_conn_dropped="" r_conn_stale=""
           for kv in $raw_statusz; do
             case "$kv" in
               role=*) r_role="${kv#role=}" ;;
@@ -809,6 +809,8 @@ REMOTE_STATUS
               burn_digest=*) r_burn_digest="${kv#burn_digest=}" ;;
               pending_receipts=*) r_pending_receipts="${kv#pending_receipts=}" ;;
               failed_receipts=*) r_failed_receipts="${kv#failed_receipts=}" ;;
+              conn_dropped=*) r_conn_dropped="${kv#conn_dropped=}" ;;
+              conn_stale=*) r_conn_stale="${kv#conn_stale=}" ;;
             esac
           done
 

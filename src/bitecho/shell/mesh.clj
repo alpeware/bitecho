@@ -360,27 +360,360 @@
           (catch Exception e
             {:valid? false :error (str "State initialization failed: " (.getMessage e))}))))))
 
+;; ---------------------------------------------------------------------------
+;; Single-Authority Mesh Connection State Machine (Rules 4 & 5)
+;; ---------------------------------------------------------------------------
+
+(defn conn-channel-id
+  "Extracts channel-id from a connection map, unwrapping IDeref atoms if present for backward compatibility."
+  [conn]
+  (let [cid (:channel-id conn)]
+    (if (instance? clojure.lang.IDeref cid) @cid cid)))
+
+(defn conn-last-rx-at
+  "Extracts last-rx-at from a connection map, unwrapping IDeref atoms if present for backward compatibility."
+  [conn]
+  (let [rx (:last-rx-at conn)]
+    (if (instance? clojure.lang.IDeref rx) @rx rx)))
+
+(defn conn-sent-msg-ids
+  "Extracts sent-msg-ids set from a connection map, unwrapping IDeref atoms if present for backward compatibility."
+  [conn]
+  (let [s (:sent-msg-ids conn)]
+    (if (instance? clojure.lang.IDeref s) @s (or s #{}))))
+
+(defn init-mesh-conn-state
+  "Initializes a pure single-authority connection lifecycle state map for a mesh peer or agent."
+  ([] (init-mesh-conn-state {}))
+  ([opts]
+   (let [now-ms (long (or (:now-ms opts) 0))]
+     {:generation (long (or (:generation opts) 0))
+      :phase :down
+      :ok? false
+      :node nil
+      :channel-id nil
+      :created-at now-ms
+      :last-rx-at now-ms
+      :sent-msg-ids #{}
+      :error nil
+      :last-error nil
+      :dropped 0
+      :ignored-stale 0
+      :diagnostics []})))
+
+(defn push-mesh-diagnostic
+  "Appends an effect to the connection diagnostics ring-buffer (capped at 64 entries) and updates :last-diagnostic."
+  [conn eff]
+  (-> conn
+      (assoc :last-diagnostic eff)
+      (update :diagnostics (fn [ds] (vec (take-last 64 (conj (vec (or ds [])) eff)))))))
+
+(defn transition-mesh-conn
+  "Pure reducer transitioning mesh connection lifecycle state and returning [new-conn effects].
+   Phases: :down, :dialing, :open, :failed.
+   Ignores stale generation callbacks (< (:generation event) (:generation conn)) or superseded nodes
+   without mutating connection phase, liveness, active channel, or resources, incrementing only :ignored-stale."
+  [conn event]
+  (let [init-st (init-mesh-conn-state {:now-ms (or (:now-ms event) 0)})
+        conn (if (nil? conn)
+               init-st
+               (let [base (merge init-st conn)]
+                 (assoc base
+                        :channel-id (conn-channel-id conn)
+                        :last-rx-at (or (conn-last-rx-at conn) (:last-rx-at base) 0)
+                        :sent-msg-ids (conn-sent-msg-ids conn))))
+        stale-gen? (and (some? (:generation event))
+                        (< (long (:generation event)) (long (:generation conn 0))))
+        superseded-node? (and (not (#{:dial-started :accept-started} (:type event)))
+                              (some? (:node event))
+                              (not= (:node event) (:node conn)))]
+    (if (or stale-gen? superseded-node?)
+      (let [eff (cond-> {:effect :ignore-stale :generation (or (:generation event) (:generation conn 0))}
+                  (:peer event) (assoc :peer (:peer event)))]
+        [(-> conn
+             (update :ignored-stale (fnil inc 0))
+             (push-mesh-diagnostic eff))
+         [eff]])
+      (case (:type event)
+        (:dial-started :accept-started)
+        (let [next-gen (long (or (:generation event) (inc (long (:generation conn 0)))))
+              now-ms (long (or (:now-ms event) (System/currentTimeMillis)))
+              old-node (:node conn)
+              new-node (:node event)
+              effects (if (and old-node (not= old-node new-node))
+                        [{:effect :close-node :node old-node :generation (:generation conn 0)}]
+                        [])
+              cid (:channel-id event)
+              phase (if (= (:type event) :accept-started)
+                      (if (some? cid) :open :dialing)
+                      :dialing)
+              new-conn (assoc conn
+                              :generation next-gen
+                              :phase phase
+                              :ok? (= phase :open)
+                              :node new-node
+                              :channel-id cid
+                              :created-at now-ms
+                              :last-rx-at now-ms
+                              :sent-msg-ids (or (:sent-msg-ids event) #{})
+                              :error nil)]
+          [new-conn effects])
+
+        (:on-open :on-data-channel)
+        (let [target-gen (long (or (:generation event) (:generation conn 0)))
+              now-ms (long (or (:now-ms event) (System/currentTimeMillis)))
+              old-node (:node conn)
+              new-node (or (:node event) old-node)
+              cid (if (contains? event :channel-id) (:channel-id event) (:channel-id conn))
+              effects (if (and old-node new-node (not= old-node new-node))
+                        [{:effect :close-node :node old-node :generation (:generation conn 0)}]
+                        [])
+              open? (some? cid)
+              new-conn (assoc conn
+                              :generation target-gen
+                              :phase (if open? :open :dialing)
+                              :ok? open?
+                              :node new-node
+                              :channel-id cid
+                              :last-rx-at now-ms
+                              :error nil)]
+          [new-conn effects])
+
+        :on-message
+        (let [now-ms (long (or (:now-ms event) (System/currentTimeMillis)))
+              cid (if (and (contains? event :channel-id) (some? (:channel-id event)))
+                    (:channel-id event)
+                    (:channel-id conn))
+              open? (some? cid)
+              new-conn (assoc conn
+                              :phase (if open? :open (:phase conn))
+                              :ok? (if open? true (:ok? conn))
+                              :channel-id cid
+                              :last-rx-at now-ms)]
+          [new-conn []])
+
+        :record-sent-msg
+        (let [mid (:msg-id event)
+              curr-set (conn-sent-msg-ids conn)
+              next-set (if mid (conj (if (>= (count curr-set) 1024) #{} curr-set) mid) curr-set)]
+          [(assoc conn :sent-msg-ids next-set) []])
+
+        (:send-failed :invalid-frame)
+        (let [err (or (:error event) (name (:type event)))
+              diag-eff (cond-> {:effect :diagnose :reason (:type event) :error err}
+                         (:peer event) (assoc :peer (:peer event)))
+              new-conn (-> conn
+                           (assoc :last-error err
+                                  :dropped (inc (long (:dropped conn 0))))
+                           (push-mesh-diagnostic diag-eff))]
+          [new-conn [diag-eff]])
+
+        :dial-failed
+        (let [err (or (:error event) "dial-failed")
+              node-to-close (:node conn)
+              diag-eff (cond-> {:effect :diagnose :reason :dial-failed :error err}
+                         (:peer event) (assoc :peer (:peer event)))
+              effects (cond-> []
+                        node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
+                        true (conj diag-eff))
+              new-conn (-> conn
+                           (assoc :phase :failed
+                                  :ok? false
+                                  :node nil
+                                  :channel-id nil
+                                  :error err
+                                  :last-error err
+                                  :dropped (inc (long (:dropped conn 0))))
+                           (push-mesh-diagnostic diag-eff))]
+          [new-conn effects])
+
+        :on-close
+        (let [err (or (:error event) "connection-closed")
+              node-to-close (:node conn)
+              diag-eff (cond-> {:effect :diagnose :reason :on-close :error err}
+                         (:peer event) (assoc :peer (:peer event)))
+              effects (cond-> []
+                        node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
+                        true (conj diag-eff))
+              new-conn (-> conn
+                           (assoc :phase :failed
+                                  :ok? false
+                                  :node nil
+                                  :channel-id nil
+                                  :error err
+                                  :last-error err)
+                           (push-mesh-diagnostic diag-eff))]
+          [new-conn effects])
+
+        :shutdown
+        (let [node-to-close (:node conn)
+              effects (if node-to-close
+                        [{:effect :close-node :node node-to-close :generation (:generation conn 0)}]
+                        [])
+              new-conn (assoc conn
+                              :phase :down
+                              :ok? false
+                              :node nil
+                              :channel-id nil
+                              :error nil)]
+          [new-conn effects])
+
+        [conn []]))))
+
+(defn execute-mesh-conn-effects!
+  "Executes boundary side-effects resulting from mesh connection state transitions.
+   Handles :close-node, :diagnose, and :ignore-stale effects."
+  ([effects]
+   (execute-mesh-conn-effects! effects nil))
+  ([effects opts]
+   (doseq [eff effects]
+     (case (:effect eff)
+       :close-node
+       (when-let [n (:node eff)]
+         (try (api/close! n) (catch Exception _ nil)))
+
+       (:diagnose :ignore-stale)
+       (do
+         (when-let [dfn (:diagnose-fn opts)]
+           (when (fn? dfn)
+             (try (dfn eff) (catch Exception _ nil))))
+         (when-let [datom (:diagnostics-atom opts)]
+           (when (instance? clojure.lang.IAtom datom)
+             (swap! datom (fn [curr] (vec (take-last 64 (conj (vec curr) eff))))))))
+
+       nil))))
+
+(defn apply-mesh-conn-event!
+  "Atomically transitions an entry in a connections atom (peer-conns or agent-conns)
+   via transition-mesh-conn, executes effects outside the swap!, and returns the updated connection map."
+  ([conns-atom key event]
+   (apply-mesh-conn-event! conns-atom key event nil))
+  ([conns-atom key event opts]
+   (let [effects-ref (atom [])]
+     (swap! conns-atom
+            (fn [conns]
+              (let [conn (get conns key)
+                    [new-conn effects] (transition-mesh-conn conn event)]
+                (reset! effects-ref effects)
+                (assoc conns key new-conn))))
+     (execute-mesh-conn-effects! @effects-ref opts)
+     (get @conns-atom key))))
+
+(defn rebind-agent-conn-sender
+  "Pure helper. Moves connection entry from anon-key to sender-hex when an agent authenticates.
+   If anon-key is already closed/failed or missing a node, treats the rebind as stale without
+   overwriting sender-hex. If sender-hex already exists with a different node, closes the existing
+   node, advances generation, and preserves cumulative drop/stale counters. Returns [new-conns-map effects]."
+  [conns-map anon-key sender-hex cid now-ms]
+  (let [anon-conn (get conns-map anon-key)
+        existing (get conns-map sender-hex)]
+    (if (or (nil? anon-conn)
+            (nil? (:node anon-conn))
+            (#{:down :failed} (:phase anon-conn)))
+      (let [eff {:effect :ignore-stale :generation (long (or (:generation anon-conn) 0))}
+            new-map (cond-> (dissoc conns-map anon-key)
+                      existing (assoc sender-hex (-> existing
+                                                     (update :ignored-stale (fnil inc 0))
+                                                     (push-mesh-diagnostic eff))))]
+        [new-map [eff]])
+      (let [superseded? (and existing
+                             (:node existing)
+                             (not= (:node existing) (:node anon-conn)))
+            effects (if superseded?
+                      [{:effect :close-node :node (:node existing) :generation (:generation existing 0)}]
+                      [])
+            next-gen (if existing
+                       (max (long (or (:generation anon-conn) 1))
+                            (inc (long (or (:generation existing) 0))))
+                       (long (or (:generation anon-conn) 1)))
+            cumulative-dropped (+ (long (or (:dropped anon-conn) 0))
+                                  (long (or (:dropped existing) 0)))
+            cumulative-stale (+ (long (or (:ignored-stale anon-conn) 0))
+                                (long (or (:ignored-stale existing) 0)))
+            merged-sent-ids (into (set (conn-sent-msg-ids existing))
+                                  (set (conn-sent-msg-ids anon-conn)))
+            rebound-conn (assoc anon-conn
+                                :generation next-gen
+                                :phase (if (some? cid) :open (:phase anon-conn))
+                                :ok? (if (some? cid) true (:ok? anon-conn))
+                                :channel-id (or cid (:channel-id anon-conn))
+                                :last-rx-at (or now-ms (:last-rx-at anon-conn))
+                                :dropped cumulative-dropped
+                                :ignored-stale cumulative-stale
+                                :sent-msg-ids merged-sent-ids)
+            new-map (-> conns-map
+                        (dissoc anon-key)
+                        (assoc sender-hex rebound-conn))]
+        [new-map effects]))))
+
+(defn apply-agent-sender-rebind!
+  "Atomically moves an agent connection from anon-key to sender-hex,
+   executing any close-node effects outside swap!."
+  ([agent-conns anon-key sender-hex cid now-ms]
+   (apply-agent-sender-rebind! agent-conns anon-key sender-hex cid now-ms nil))
+  ([agent-conns anon-key sender-hex cid now-ms opts]
+   (let [effects-ref (atom [])]
+     (swap! agent-conns
+            (fn [conns]
+              (let [[new-conns effects] (rebind-agent-conn-sender conns anon-key sender-hex cid now-ms)]
+                (reset! effects-ref effects)
+                new-conns)))
+     (execute-mesh-conn-effects! @effects-ref opts)
+     (get @agent-conns sender-hex))))
+
+(defn mesh-conn-diagnostics-summary
+  "Computes aggregate and per-connection diagnostics for peer and agent connections."
+  ([peer-conns-map]
+   (mesh-conn-diagnostics-summary peer-conns-map {}))
+  ([peer-conns-map agent-conns-map]
+   (let [peers (or peer-conns-map {})
+         agents (or agent-conns-map {})
+         all-conns (concat (vals peers) (vals agents))
+         total-dropped (reduce + 0 (map #(long (or (:dropped %) 0)) all-conns))
+         total-stale (reduce + 0 (map #(long (or (:ignored-stale %) 0)) all-conns))
+         summarize (fn [conn]
+                     (let [diag-count (count (or (:diagnostics conn) []))]
+                       (cond-> {:phase (name (or (:phase conn) :down))
+                                :generation (long (or (:generation conn) 0))
+                                :ok? (boolean (:ok? conn))
+                                :last_error (:last-error conn)
+                                :dropped (long (or (:dropped conn) 0))
+                                :ignored_stale (long (or (:ignored-stale conn) 0))
+                                :diagnostics_buffered (long diag-count)}
+                         (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn)))))
+         peers-summary (into {} (map (fn [[k c]] [k (summarize c)]) peers))
+         agents-summary (into {} (map (fn [[k c]] [(if (keyword? k) (name k) (str k)) (summarize c)]) agents))]
+     {:conn_dropped total-dropped
+      :conn_stale total-stale
+      :peers peers-summary
+      :agents agents-summary})))
+
 (defn render-statusz
-  "Renders single-line diagnostic statusz string."
-  [state connected-count total-peers]
-  (let [vals-set (set (or (:validators state) (get-in state [:config :validators])))
-        role (if (contains? vals-set (:node-pubkey state))
-               "validator"
-               "mesh")
-        epoch (long (or (:epoch state) 0))
-        head (str (or (:head-hash state) "genesis"))
-        notarized (+ (long (or (:pruned-notarized-count state) 0)) (long (count (or (:notarized-blocks state) #{}))))
-        finalized (+ (long (or (:pruned-finalized-count state) 0)) (long (count (or (:finalized-blocks state) #{}))))
-        ledger (or (:ledger state) {})
-        supply (long (reduce + 0 (map (fn [v] (if (map? v) (or (:balance v) 0) (or v 0))) (vals ledger))))
-        minted (long (or (:total-minted state) 0))
-        burns (long (reduce + 0 (vals (or (:epoch-burns state) {}))))
-        finalized-epoch (long (or (:last-executed-finalized-epoch state) 0))
-        burn-digest (sm/compute-burn-map-digest state)
-        pending-receipts (long (count (or (:pending-receipts state) [])))
-        failed-receipts (long (or (:failed-receipts-count state) 0))]
-    (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d\n"
-            role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts)))
+  "Renders single-line diagnostic statusz string.
+   Supports 3-arity (defaults conn_dropped=0 conn_stale=0) and 4-arity with conn-diag-summary."
+  ([state connected-count total-peers]
+   (render-statusz state connected-count total-peers {:conn_dropped 0 :conn_stale 0}))
+  ([state connected-count total-peers conn-diag-summary]
+   (let [vals-set (set (or (:validators state) (get-in state [:config :validators])))
+         role (if (contains? vals-set (:node-pubkey state))
+                "validator"
+                "mesh")
+         epoch (long (or (:epoch state) 0))
+         head (str (or (:head-hash state) "genesis"))
+         notarized (+ (long (or (:pruned-notarized-count state) 0)) (long (count (or (:notarized-blocks state) #{}))))
+         finalized (+ (long (or (:pruned-finalized-count state) 0)) (long (count (or (:finalized-blocks state) #{}))))
+         ledger (or (:ledger state) {})
+         supply (long (reduce + 0 (map (fn [v] (if (map? v) (or (:balance v) 0) (or v 0))) (vals ledger))))
+         minted (long (or (:total-minted state) 0))
+         burns (long (reduce + 0 (vals (or (:epoch-burns state) {}))))
+         finalized-epoch (long (or (:last-executed-finalized-epoch state) 0))
+         burn-digest (sm/compute-burn-map-digest state)
+         pending-receipts (long (count (or (:pending-receipts state) [])))
+         failed-receipts (long (or (:failed-receipts-count state) 0))
+         conn-dropped (long (or (:conn_dropped conn-diag-summary) 0))
+         conn-stale (long (or (:conn_stale conn-diag-summary) 0))]
+     (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d conn_dropped=%d conn_stale=%d\n"
+             role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts conn-dropped conn-stale))))
 
 ;; ---------------------------------------------------------------------------
 ;; Embedded HTTP Server (/healthz & /statusz)
@@ -401,9 +734,9 @@
         val))))
 
 (defn- make-http-handler
-  "Creates an HttpHandler for healthz, statusz, burnsz, and accountz endpoints."
+  "Creates an HttpHandler for healthz, statusz, connz, burnsz, and accountz endpoints."
   [ctx total-peers fallback-state]
-  (let [{:keys [shell-node peer-conns transport in-mem-bus]} ctx]
+  (let [{:keys [shell-node peer-conns agent-conns transport in-mem-bus]} ctx]
     (reify HttpHandler
       (handle [_ exchange]
         (let [path (.getPath (.getRequestURI ^HttpExchange exchange))
@@ -415,8 +748,15 @@
                               (let [st (or (query-node-state shell-node 500) fallback-state)
                                     connected (if (= transport :in-memory)
                                                 (max 0 (dec (count @in-mem-bus)))
-                                                (count (filter (fn [[_ c]] (some? @(:channel-id c))) @peer-conns)))]
-                                [200 (render-statusz st connected total-peers)])
+                                                (count (filter (fn [[_ c]] (some? (conn-channel-id c))) (when peer-conns @peer-conns))))
+                                    conn-diag (mesh-conn-diagnostics-summary (when peer-conns @peer-conns)
+                                                                             (when agent-conns @agent-conns))]
+                                [200 (render-statusz st connected total-peers conn-diag)])
+
+                              (= path "/connz")
+                              (let [conn-diag (mesh-conn-diagnostics-summary (when peer-conns @peer-conns)
+                                                                             (when agent-conns @agent-conns))]
+                                [200 (str (pr-str conn-diag) "\n")])
 
                               (= path "/burnsz")
                               (let [st (or (query-node-state shell-node 500) fallback-state)]
@@ -455,6 +795,7 @@
           handler (make-http-handler ctx total-peers fallback-state)]
       (.createContext server "/healthz" handler)
       (.createContext server "/statusz" handler)
+      (.createContext server "/connz" handler)
       (.createContext server "/burnsz" handler)
       (.createContext server "/accountz" handler)
       (.setExecutor server (Executors/newVirtualThreadPerTaskExecutor))
@@ -495,11 +836,15 @@
   [peer-conns]
   (when peer-conns
     (let [keepalive-bytes (nippy/freeze {:type :keepalive})]
-      (doseq [[_ conn] @peer-conns
-              :when (some? @(:channel-id conn))]
+      (doseq [[peer-hex conn] @peer-conns
+              :let [cid (conn-channel-id conn)]
+              :when (some? cid)]
         (try
-          (api/send! (:node conn) keepalive-bytes @(:channel-id conn))
+          (when-let [node (:node conn)]
+            (api/send! node keepalive-bytes cid))
           (catch Exception e
+            (apply-mesh-conn-event! peer-conns peer-hex
+                                    {:type :send-failed :peer peer-hex :error (or (.getMessage e) "send-failed")})
             (log-mesh-error "Failed to send keepalive" e)))))))
 
 (defn check-and-reconnect-peers!
@@ -516,11 +861,11 @@
                    conn (get @peer-conns peer-hex)
                    node (:node conn)
                    st (when node (try (api/get-state node) (catch Exception _ :closed)))
-                   cid (when conn @(:channel-id conn))
-                   created-at (get conn :created-at 0)
-                   last-rx (when conn @(or (:last-rx-at conn) (atom now-ms)))
-                   stalled-unconnected? (and (nil? cid) (> (- now-ms created-at) 12000))
-                   timed-out-connected? (and (some? cid) (> (- now-ms (or last-rx now-ms)) (long timeout-ms)))]]
+                   cid (when conn (conn-channel-id conn))
+                   created-at (long (get conn :created-at 0))
+                   last-rx (long (or (when conn (conn-last-rx-at conn)) now-ms))
+                   stalled-unconnected? (and (nil? cid) (> (- (long now-ms) created-at) 12000))
+                   timed-out-connected? (and (some? cid) (> (- (long now-ms) last-rx) (long timeout-ms)))]]
        (when (or (nil? conn)
                  (= st :closed)
                  stalled-unconnected?
@@ -579,20 +924,26 @@
 
 (defn- forward-gossip-to-agents!
   "Forwards a frozen gossip network event to all connected agent DataChannels, optionally excluding a sender.
-   Deduplicates messages per agent connection using :sent-msg-ids atom."
+   Deduplicates messages per agent connection using :sent-msg-ids."
   [agent-conns frozen-evt exclude-sender]
   (when agent-conns
     (let [msg-id (extract-gossip-msg-id frozen-evt)]
       (doseq [[pk conn] @agent-conns
               :when (not= pk exclude-sender)]
-        (let [sent-ids-atom (:sent-msg-ids conn)]
-          (when-not (and msg-id sent-ids-atom (contains? @sent-ids-atom msg-id))
-            (when-let [cid (or @(:channel-id conn) 0)]
-              (when (try (api/send! (:node conn) frozen-evt cid)
-                         true
-                         (catch Exception _ nil))
-                (when (and msg-id sent-ids-atom)
-                  (swap! sent-ids-atom conj msg-id))))))))))
+        (let [sent-ids (conn-sent-msg-ids conn)]
+          (when-not (and msg-id (contains? sent-ids msg-id))
+            (when-let [cid (or (conn-channel-id conn) 0)]
+              (when-let [node (:node conn)]
+                (try
+                  (when (api/send! node frozen-evt cid)
+                    (when msg-id
+                      (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
+                        (swap! (:sent-msg-ids conn) conj msg-id)
+                        (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id}))))
+                  (catch Exception e
+                    (apply-mesh-conn-event! agent-conns pk
+                                            {:type :send-failed :error (or (.getMessage e) "send-failed")})
+                    nil))))))))))
 
 (defn- start-net-out-loop!
   "Consumes net-out commands, transforms them to peer events, and delivers to targets."
@@ -615,8 +966,16 @@
                     (async/put! (:network-in peer-entry) thawed)))
                 (when-let [conn (or (get @peer-conns target)
                                     (when agent-conns (get @agent-conns target)))]
-                  (when-let [cid @(:channel-id conn)]
-                    (api/send! (:node conn) frozen cid)))))
+                  (when-let [cid (conn-channel-id conn)]
+                    (try
+                      (when-let [node (:node conn)]
+                        (api/send! node frozen cid))
+                      (catch Exception e
+                        (let [target-conns (if (get @peer-conns target) peer-conns agent-conns)]
+                          (when target-conns
+                            (apply-mesh-conn-event! target-conns target
+                                                    {:type :send-failed :peer target :error (or (.getMessage e) "send-failed")})))
+                        nil))))))
             (when (and (or (= (:type cmd) :send-gossip)
                            (= (:type evt) :receive-gossip))
                        agent-conns)
@@ -626,137 +985,172 @@
         (recur)))))
 
 (defn- init-datachannel-peer!
-  "Establishes a single peer DataChannel connection."
+  "Establishes a single peer DataChannel connection using single-authority lifecycle state machine."
   [ctx pid peer-cfg]
   (try
-    (let [raw-fp (:fingerprint peer-cfg)
+    (let [peer-hex (:pubkey peer-cfg)
+          raw-fp (:fingerprint peer-cfg)
           peer-fp (when (identity/verify-peer-fingerprint? raw-fp raw-fp)
                     (identity/normalize-fingerprint raw-fp))]
       (if-not peer-fp
-        (log-mesh-error (format "Invalid peer fingerprint for %s" pid)
-                        (ex-info "Invalid peer fingerprint" {:peer pid :fingerprint raw-fp}))
+        (do
+          (when peer-hex
+            (apply-mesh-conn-event! (:peer-conns ctx) peer-hex
+                                    {:type :dial-failed :peer pid :error "invalid-peer-fingerprint"}))
+          (log-mesh-error (format "Invalid peer fingerprint for %s" pid)
+                          (ex-info "Invalid peer fingerprint" {:peer pid :fingerprint raw-fp})))
         (let [{:keys [node-id identity node-idx nodes-cfg shell-node peer-conns agent-conns]} ctx
-              peer-hex (:pubkey peer-cfg)]
-          (when-let [old-conn (get @peer-conns peer-hex)]
-            (when-let [old-node (:node old-conn)]
-              (try (api/close! old-node) (catch Exception _ nil))
-              (Thread/sleep 50)))
-          (let [peer-ip (or (:ip peer-cfg) "127.0.0.1")
-                base-peer-port (int (or (:port peer-cfg) 5000))
-                peer-port (+ base-peer-port (int (get node-idx node-id 0)))
-                base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))
-                local-port (+ base-local-port (int (get node-idx pid 0)))
-                setup (if (neg? (compare (name node-id) (name pid))) "active" "passive")
-                local-fp (:fingerprint identity)
-                local-ice (identity/deterministic-ice-creds node-id local-fp)
-                node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp)
-                channel-id (atom nil)
-                last-rx-at (atom (System/currentTimeMillis))
-                remote-ice (identity/deterministic-ice-creds pid peer-fp)
-                remote-sdp {:ip peer-ip
-                            :port peer-port
-                            :fingerprint peer-fp
-                            :remote-ice-ufrag (:ufrag remote-ice)
-                            :remote-ice-pwd (:pwd remote-ice)}
-                callbacks {:on-open (fn [evt]
-                                      (reset! last-rx-at (System/currentTimeMillis))
-                                      (if-let [cid (:channel-id evt)]
-                                        (reset! channel-id cid)
-                                        (reset! channel-id (api/create-data-channel! node "bitecho" {:ordered true}))))
-                           :on-message (fn [evt]
-                                         (reset! last-rx-at (System/currentTimeMillis))
-                                         (when-let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
-                                           (when-not (= :keepalive (:type msg))
-                                             (let [event (assoc msg
-                                                                :sender peer-hex
-                                                                :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
-                                                                :rng (java.util.Random.))]
-                                               (async/put! (:network-in shell-node) event)
-                                               (when (= :receive-gossip (:type msg))
-                                                 (forward-gossip-to-agents! agent-conns (:payload evt) nil))))))
-                           :on-close (fn [_]
-                                       (reset! channel-id nil))}]
+              next-gen (inc (long (get-in @peer-conns [peer-hex :generation] 0)))
+              peer-ip (or (:ip peer-cfg) "127.0.0.1")
+              base-peer-port (int (or (:port peer-cfg) 5000))
+              peer-port (+ base-peer-port (int (get node-idx node-id 0)))
+              base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))
+              local-port (+ base-local-port (int (get node-idx pid 0)))
+              setup (if (neg? (compare (name node-id) (name pid))) "active" "passive")
+              local-fp (:fingerprint identity)
+              local-ice (identity/deterministic-ice-creds node-id local-fp)
+              node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp)
+              _ (apply-mesh-conn-event! peer-conns peer-hex
+                                        {:type :dial-started :generation next-gen :node node :peer pid})
+              remote-ice (identity/deterministic-ice-creds pid peer-fp)
+              remote-sdp {:ip peer-ip
+                          :port peer-port
+                          :fingerprint peer-fp
+                          :remote-ice-ufrag (:ufrag remote-ice)
+                          :remote-ice-pwd (:pwd remote-ice)}
+              callbacks {:on-open
+                         (fn [evt]
+                           (let [curr-conn (get @peer-conns peer-hex)]
+                             (if (or (< next-gen (long (:generation curr-conn 0)))
+                                     (not= node (:node curr-conn)))
+                               (apply-mesh-conn-event! peer-conns peer-hex
+                                                       {:type :on-open :generation next-gen :node node :peer pid})
+                               (let [cid (or (:channel-id evt)
+                                             (try (api/create-data-channel! node "bitecho" {:ordered true})
+                                                  (catch Exception _ 0)))]
+                                 (apply-mesh-conn-event! peer-conns peer-hex
+                                                         {:type :on-open :generation next-gen :node node :channel-id cid :peer pid})))))
+                         :on-message
+                         (fn [evt]
+                           (let [updated (apply-mesh-conn-event!
+                                          peer-conns peer-hex
+                                          (cond-> {:type :on-message :generation next-gen :node node :peer pid}
+                                            (:channel-id evt) (assoc :channel-id (:channel-id evt))))]
+                             (when (= node (:node updated))
+                               (let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
+                                 (if (nil? msg)
+                                   (apply-mesh-conn-event! peer-conns peer-hex
+                                                           {:type :invalid-frame :generation next-gen :node node :peer pid :error "malformed-peer-frame"})
+                                   (when-not (= :keepalive (:type msg))
+                                     (let [event (assoc msg
+                                                        :sender peer-hex
+                                                        :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
+                                                        :rng (java.util.Random.))]
+                                       (async/put! (:network-in shell-node) event)
+                                       (when (= :receive-gossip (:type msg))
+                                         (forward-gossip-to-agents! agent-conns (:payload evt) nil)))))))))
+                         :on-close
+                         (fn [_]
+                           (apply-mesh-conn-event! peer-conns peer-hex
+                                                   {:type :on-close :generation next-gen :node node :peer pid}))}]
+          (try
             (api/start! node remote-sdp callbacks)
-            (swap! peer-conns assoc peer-hex {:node node
-                                              :channel-id channel-id
-                                              :last-rx-at last-rx-at
-                                              :created-at (System/currentTimeMillis)})))))
+            (catch Exception e
+              (apply-mesh-conn-event! peer-conns peer-hex
+                                      {:type :dial-failed :generation next-gen :node node :peer pid :error (or (.getMessage e) "start-failed")})
+              (throw e))))))
     (catch Exception e
       (log-mesh-error (format "Failed to connect to peer %s" pid) e)
       nil)))
 
 (defn- replay-cached-gossip-to-agent!
   "Replays all cached epoch gossip messages to a newly connected or identified agent DataChannel,
-   deduplicating per agent connection via replayed-msg-ids atom."
-  ([shell-node agent-node cid]
-   (replay-cached-gossip-to-agent! shell-node agent-node cid nil))
-  ([shell-node agent-node cid replayed-msg-ids]
-   (when-let [st (query-node-state shell-node 200)]
-     (let [messages-map (or (:messages st) {})
-           epochs-map (or (:message-epochs st) {})
-           sorted-msgs (sort-by (fn [[mid _]] [(long (get epochs-map mid 0)) (str mid)]) messages-map)]
-       (doseq [[mid message] sorted-msgs]
-         (when (or (nil? replayed-msg-ids)
-                   (not (contains? @replayed-msg-ids mid)))
-           (let [frozen (nippy/freeze {:type :receive-gossip :message message})]
-             (when (try (api/send! agent-node frozen cid)
-                        true
-                        (catch Exception _ nil))
-               (when replayed-msg-ids
-                 (swap! replayed-msg-ids conj mid))))))))))
+   deduplicating per agent connection via :sent-msg-ids."
+  [shell-node agent-conns conn-key]
+  (when-let [st (query-node-state shell-node 200)]
+    (let [messages-map (or (:messages st) {})
+          epochs-map (or (:message-epochs st) {})
+          sorted-msgs (sort-by (fn [[mid _]] [(long (get epochs-map mid 0)) (str mid)]) messages-map)]
+      (doseq [[mid message] sorted-msgs]
+        (let [conn (when agent-conns (get @agent-conns conn-key))]
+          (when conn
+            (let [sent-ids (conn-sent-msg-ids conn)]
+              (when-not (contains? sent-ids mid)
+                (let [cid (or (conn-channel-id conn) 0)
+                      frozen (nippy/freeze {:type :receive-gossip :message message})]
+                  (try
+                    (when (api/send! (:node conn) frozen cid)
+                      (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
+                        (swap! (:sent-msg-ids conn) conj mid)
+                        (apply-mesh-conn-event! agent-conns conn-key {:type :record-sent-msg :msg-id mid})))
+                    (catch Exception e
+                      (when agent-conns
+                        (apply-mesh-conn-event! agent-conns conn-key
+                                                {:type :send-failed :error (or (.getMessage e) "send-failed")}))
+                      nil)))))))))))
 
 (defn- make-agent-connection-handler
   "Returns a connection handler function for an incoming agent node.
-   Works identically for UDP and TCP agent connections."
+   Works identically for UDP and TCP agent connections using single-authority lifecycle state."
   [shell-node agent-conns]
   (fn [agent-node]
-    (let [channel-id (atom 0)
-          agent-sender (atom nil)
-          replayed-msg-ids (atom #{})]
+    (let [conn-key (atom [:anon (System/identityHashCode agent-node)])
+          init-gen (inc (long (reduce max 0 (map #(long (or (:generation %) 0)) (vals (or (when agent-conns (deref agent-conns)) {}))))))
+          node-gen (atom init-gen)]
+      (when agent-conns
+        (apply-mesh-conn-event! agent-conns @conn-key
+                                {:type :accept-started :generation @node-gen :node agent-node :channel-id 0}))
       (api/set-callbacks!
        agent-node
        {:on-open (fn [evt]
-                   (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                     (reset! channel-id cid)
-                     (replay-cached-gossip-to-agent! shell-node agent-node cid replayed-msg-ids))
-                   (when agent-conns
-                     (let [anon-key [:anon (System/identityHashCode agent-node)]]
-                       (reset! agent-sender anon-key)
-                       (swap! agent-conns assoc anon-key {:node agent-node
-                                                          :channel-id channel-id
-                                                          :sent-msg-ids replayed-msg-ids
-                                                          :last-rx-at (atom (System/currentTimeMillis))}))))
+                   (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                         updated (when agent-conns
+                                   (apply-mesh-conn-event! agent-conns @conn-key
+                                                           {:type :on-open :generation @node-gen :node agent-node :channel-id cid}))]
+                     (when (or (nil? agent-conns) (= agent-node (:node updated)))
+                       (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
         :on-data-channel (fn [evt]
-                           (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                             (reset! channel-id cid)
-                             (replay-cached-gossip-to-agent! shell-node agent-node cid replayed-msg-ids)))
+                           (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                                 updated (when agent-conns
+                                           (apply-mesh-conn-event! agent-conns @conn-key
+                                                                   {:type :on-data-channel :generation @node-gen :node agent-node :channel-id cid}))]
+                             (when (or (nil? agent-conns) (= agent-node (:node updated)))
+                               (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
         :on-message
         (fn [evt]
-          (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-            (reset! channel-id cid))
-          (when-let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
-            (when-let [sender (:sender unwrapped)]
-              (when (not= sender @agent-sender)
-                (let [old-key @agent-sender]
-                  (reset! agent-sender sender)
+          (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                active? (or (nil? agent-conns)
+                            (= agent-node (:node (get @agent-conns @conn-key))))]
+            (if-not active?
+              (when agent-conns
+                (apply-mesh-conn-event! agent-conns @conn-key
+                                        {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))
+              (let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
+                (if-not unwrapped
                   (when agent-conns
-                    (swap! agent-conns (fn [conns]
-                                         (-> conns
-                                             (dissoc old-key)
-                                             (assoc sender {:node agent-node
-                                                            :channel-id channel-id
-                                                            :sent-msg-ids replayed-msg-ids
-                                                            :last-rx-at (atom (System/currentTimeMillis))}))))
-                    (when-let [cid (or @channel-id 0)]
-                      (replay-cached-gossip-to-agent! shell-node agent-node cid replayed-msg-ids))))))
-            (async/put! (:network-in shell-node) unwrapped)
-            (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
-              (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped)))))
+                    (apply-mesh-conn-event! agent-conns @conn-key
+                                            {:type :invalid-frame :generation @node-gen :node agent-node :error "invalid-agent-envelope"}))
+                  (let [sender (:sender unwrapped)]
+                    (when (and sender (not= sender @conn-key))
+                      (let [old-key @conn-key]
+                        (if agent-conns
+                          (let [rebound (apply-agent-sender-rebind! agent-conns old-key sender cid (System/currentTimeMillis))]
+                            (when (= agent-node (:node rebound))
+                              (reset! conn-key sender)
+                              (reset! node-gen (long (or (:generation rebound) @node-gen)))
+                              (replay-cached-gossip-to-agent! shell-node agent-conns sender)))
+                          (reset! conn-key sender))))
+                    (let [updated (when agent-conns
+                                    (apply-mesh-conn-event! agent-conns @conn-key
+                                                            {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
+                      (when (or (nil? agent-conns) (= agent-node (:node updated)))
+                        (async/put! (:network-in shell-node) unwrapped)
+                        (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
+                          (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped)))))))))))
         :on-close (fn [_]
-                    (reset! channel-id nil)
-                    (when-let [k @agent-sender]
-                      (when agent-conns
-                        (swap! agent-conns dissoc k))))}))))
+                    (when agent-conns
+                      (apply-mesh-conn-event! agent-conns @conn-key
+                                              {:type :on-close :generation @node-gen :node agent-node})))}))))
 
 (defn- init-agent-listener!
   "Starts agent ingress listener when enabled.
@@ -796,12 +1190,12 @@
     (try (api/close! al) (catch Exception _ nil)))
   (when-let [atl (:agent-tcp-listener mesh-node)]
     (try (api/close! atl) (catch Exception _ nil)))
-  (doseq [[_ conn] @(:peer-conns mesh-node)]
-    (when-let [n (:node conn)]
-      (try (api/close! n) (catch Exception _ nil))))
-  (doseq [[_ conn] @(:agent-conns mesh-node)]
-    (when-let [n (:node conn)]
-      (try (api/close! n) (catch Exception _ nil))))
+  (when-let [pcs (:peer-conns mesh-node)]
+    (doseq [[peer-hex _] @pcs]
+      (apply-mesh-conn-event! pcs peer-hex {:type :shutdown})))
+  (when-let [acs (:agent-conns mesh-node)]
+    (doseq [[k _] @acs]
+      (apply-mesh-conn-event! acs k {:type :shutdown})))
   (when (= (:transport mesh-node) :in-memory)
     (swap! in-memory-bus dissoc (get-in mesh-node [:identity :pubkey-hex])))
   (when-let [sh (:shell-node mesh-node)]

@@ -357,6 +357,8 @@
       (is (str/includes? out "burn_digest="))
       (is (str/includes? out "pending_receipts=0"))
       (is (str/includes? out "failed_receipts=0"))
+      (is (str/includes? out "conn_dropped=0"))
+      (is (str/includes? out "conn_stale=0"))
       (is (str/ends-with? out "\n"))))
 
   (testing "statusz line format accounts for pruned counts"
@@ -841,40 +843,304 @@
                   api/create-data-channel! (fn [_ _ _] 0)]
       (#'mesh/init-datachannel-peer! ctx :node-remote (get-in ctx [:nodes-cfg :node-remote]))
       (is (some? @captured-callbacks))
-      (let [conn (get @peer-conns (get-in ctx [:nodes-cfg :node-remote :pubkey]))
-            last-rx-at (:last-rx-at conn)
+      (let [peer-pk (get-in ctx [:nodes-cfg :node-remote :pubkey])
+            conn (get @peer-conns peer-pk)
             on-msg (:on-message @captured-callbacks)
             on-open (:on-open @captured-callbacks)
             on-close (:on-close @captured-callbacks)]
         (is (some? conn))
-        (is (some? last-rx-at))
+        (is (some? (mesh/conn-last-rx-at conn)))
 
         ;; Test on-open updates last-rx-at and sets channel-id
-        (let [t0 @last-rx-at]
+        (let [t0 (mesh/conn-last-rx-at conn)]
           (Thread/sleep 2)
           (on-open {})
-          (is (> @last-rx-at t0))
-          (is (= 0 @(:channel-id conn))))
+          (let [c (get @peer-conns peer-pk)]
+            (is (> (mesh/conn-last-rx-at c) t0))
+            (is (= 0 (mesh/conn-channel-id c)))
+            (is (= :open (:phase c)))
+            (is (true? (:ok? c)))))
 
         ;; Test on-message with :keepalive updates last-rx-at and does not put to network-in
-        (let [t1 @last-rx-at]
+        (let [t1 (mesh/conn-last-rx-at (get @peer-conns peer-pk))]
           (Thread/sleep 2)
           (on-msg {:payload (nippy/freeze {:type :keepalive})})
-          (is (> @last-rx-at t1))
-          (is (nil? (async/poll! network-in))))
+          (let [c (get @peer-conns peer-pk)]
+            (is (> (mesh/conn-last-rx-at c) t1))
+            (is (nil? (async/poll! network-in)))))
 
         ;; Test on-message with regular event puts to network-in
-        (let [t2 @last-rx-at]
+        (let [t2 (mesh/conn-last-rx-at (get @peer-conns peer-pk))]
           (Thread/sleep 2)
           (on-msg {:payload (nippy/freeze {:type :receive-gossip :data "hello"})})
-          (is (> @last-rx-at t2))
-          (let [received (async/poll! network-in)]
-            (is (some? received))
-            (is (= :receive-gossip (:type received)))
-            (is (= "hello" (:data received)))))
+          (let [c (get @peer-conns peer-pk)]
+            (is (> (mesh/conn-last-rx-at c) t2))
+            (let [received (async/poll! network-in)]
+              (is (some? received))
+              (is (= :receive-gossip (:type received)))
+              (is (= "hello" (:data received))))))
 
-        ;; Test on-close clears channel-id
+        ;; Test malformed frame increments dropped count (Rule 5: Zero Silent Failures)
+        (let [d0 (:dropped (get @peer-conns peer-pk))]
+          (on-msg {:payload (byte-array [1 2 3 4 5 6])})
+          (let [c (get @peer-conns peer-pk)]
+            (is (= (inc d0) (:dropped c)))))
+
+        ;; Test on-close clears channel-id and sets phase to :failed
         (on-close {})
-        (is (nil? @(:channel-id conn)))))))
+        (let [c (get @peer-conns peer-pk)]
+          (is (nil? (mesh/conn-channel-id c)))
+          (is (= :failed (:phase c)))
+          (is (false? (:ok? c))))))))
+
+(def ^:private gen-mesh-event-type
+  (gen/elements [:dial-started
+                 :accept-started
+                 :on-open
+                 :on-data-channel
+                 :on-message
+                 :send-failed
+                 :invalid-frame
+                 :dial-failed
+                 :on-close
+                 :shutdown]))
+
+(def ^:private gen-mesh-gen-mode
+  (gen/frequency [[60 (gen/return :current)]
+                  [25 (gen/return :stale)]
+                  [15 (gen/return :future)]]))
+
+(def ^:private gen-mesh-node-mode
+  (gen/frequency [[70 (gen/return :same)]
+                  [15 (gen/return :new)]
+                  [15 (gen/return :superseded)]]))
+
+(def ^:private gen-mesh-step
+  (gen/hash-map :type gen-mesh-event-type
+                :gen-mode gen-mesh-gen-mode
+                :node-mode gen-mesh-node-mode
+                :has-cid? gen/boolean
+                :error-msg (gen/elements [nil "err-timeout" "err-rst" "err-down"])))
+
+(def ^:private gen-mesh-sequence
+  (gen/vector gen-mesh-step 5 40))
+
+(defspec ^{:doc "Property: Pure single-authority mesh connection lifecycle state machine invariants"}
+  mesh-conn-lifecycle-state-machine-spec 100
+  (prop/for-all [steps gen-mesh-sequence]
+                (let [initial-conn (mesh/init-mesh-conn-state)]
+                  (loop [idx 0
+                         conn initial-conn
+                         installed-nodes []
+                         closed-nodes []]
+                    (if (>= idx (count steps))
+                      true
+                      (let [step (nth steps idx)
+                            evt-type (:type step)
+                            curr-gen (:generation conn 0)
+                            gen-mode (:gen-mode step)
+                            evt-gen (case gen-mode
+                                      :current (if (#{:dial-started :accept-started} evt-type) nil curr-gen)
+                                      :stale (if (pos? curr-gen) (max 0 (dec curr-gen)) -1)
+                                      :future (inc curr-gen))
+                            active-node (:node conn)
+                            node-mode (:node-mode step)
+                            evt-node (if (#{:dial-started :accept-started} evt-type)
+                                       {:mock-id (str "node-" idx)}
+                                       (case node-mode
+                                         :same active-node
+                                         :new active-node
+                                         :superseded (when (seq closed-nodes) (last closed-nodes))))
+                            evt-cid (when (:has-cid? step) (str "cid-" idx))
+                            event (cond-> {:type evt-type}
+                                    (some? evt-gen) (assoc :generation evt-gen)
+                                    (some? evt-node) (assoc :node evt-node)
+                                    (some? evt-cid) (assoc :channel-id evt-cid)
+                                    (:error-msg step) (assoc :error (:error-msg step)))
+                            [new-conn effects] (mesh/transition-mesh-conn conn event)
+                            stale-gen? (and (some? (:generation event)) (< (long (:generation event)) (long (:generation conn 0))))
+                            superseded-node? (and (not (#{:dial-started :accept-started} evt-type))
+                                                  (some? (:node event))
+                                                  (not= (:node event) (:node conn)))
+                            stale? (or stale-gen? superseded-node?)
+                            newly-closed (keep (fn [eff] (when (= :close-node (:effect eff)) (:node eff))) effects)
+                            new-closed (into closed-nodes newly-closed)
+                            new-installed (if (and (not stale?)
+                                                   (#{:dial-started :accept-started} evt-type)
+                                                   (:node new-conn))
+                                            (conj installed-nodes (:node new-conn))
+                                            installed-nodes)
+
+                ;; Invariant 1 (Liveness Agreement)
+                            inv1 (= (boolean (:ok? new-conn))
+                                    (and (= :open (:phase new-conn))
+                                         (some? (:channel-id new-conn))))
+
+                ;; Invariant 2 (Stale Generation & Superseded Node Isolation)
+                            inv2 (if stale?
+                                   (and (= (:phase conn) (:phase new-conn))
+                                        (= (:ok? conn) (:ok? new-conn))
+                                        (= (:node conn) (:node new-conn))
+                                        (= (:channel-id conn) (:channel-id new-conn))
+                                        (= (:last-rx-at conn) (:last-rx-at new-conn))
+                                        (= (:ignored-stale new-conn) (inc (:ignored-stale conn 0)))
+                                        (= (first effects) {:effect :ignore-stale
+                                                            :generation (or (:generation event) (:generation conn 0))}))
+                                   true)
+
+                ;; Invariant 3 (Superseded Node Closed Exactly Once)
+                            inv3 (and (= (count new-closed) (count (distinct new-closed)))
+                                      (every? (set new-installed) new-closed)
+                                      (if-let [n (:node new-conn)]
+                                        (not (contains? (set new-closed) n))
+                                        true))
+
+                ;; Invariant 4 (No Silent Failures)
+                            inv4 (if (and (not stale?) (#{:dial-failed :send-failed :invalid-frame} evt-type))
+                                   (and (= (:dropped new-conn) (inc (:dropped conn 0)))
+                                        (boolean (some (fn [eff] (and (= :diagnose (:effect eff)) (some? (:error eff)))) effects)))
+                                   true)]
+                        (if (and inv1 inv2 inv3 inv4)
+                          (recur (inc idx) new-conn new-installed new-closed)
+                          false)))))))
+
+(defspec ^{:doc "Property: Agent connection re-keying from anon to sender, superseded node closing, and delayed stale callback isolation"}
+  agent-conn-rebind-and-stale-close-spec 50
+  (prop/for-all [sender-pk (gen/elements ["agent-pub-1" "agent-pub-2" "agent-pub-3"])
+                 cid-num (gen/choose 1 10)]
+                (let [conns-atom (atom {})
+                      anon-key-1 [:anon 1001]
+                      node-1 {:agent-node 1}
+                      now1 1000
+          ;; 1. Accept started under anon-key-1
+                      _ (mesh/apply-mesh-conn-event! conns-atom anon-key-1
+                                                     {:type :accept-started :generation 1 :node node-1 :channel-id 0 :now-ms now1})
+                      conn1 (get @conns-atom anon-key-1)
+                      _ (assert (= :open (:phase conn1)))
+                      _ (assert (= node-1 (:node conn1)))
+
+          ;; 2. Rebind to sender-pk
+                      _ (mesh/apply-agent-sender-rebind! conns-atom anon-key-1 sender-pk cid-num now1)
+                      rebound1 (get @conns-atom sender-pk)
+                      _ (assert (nil? (get @conns-atom anon-key-1)))
+                      _ (assert (= node-1 (:node rebound1)))
+                      _ (assert (= 1 (:generation rebound1)))
+
+          ;; 3. Second connection from same sender under new anon-key-2
+                      anon-key-2 [:anon 1002]
+                      node-2 {:agent-node 2}
+                      now2 2000
+                      closed-nodes (atom [])
+                      _ (mesh/apply-mesh-conn-event! conns-atom anon-key-2
+                                                     {:type :accept-started :generation 2 :node node-2 :channel-id 0 :now-ms now2})
+          ;; Rebind anon-key-2 to the same sender-pk with custom close-node tracker
+                      rebound-res (mesh/rebind-agent-conn-sender @conns-atom anon-key-2 sender-pk cid-num now2)
+                      [new-conns-map effects] rebound-res
+                      _ (doseq [eff effects]
+                          (when (= :close-node (:effect eff))
+                            (swap! closed-nodes conj (:node eff))))
+                      _ (reset! conns-atom new-conns-map)
+                      rebound2 (get @conns-atom sender-pk)]
+
+      ;; Verification: node-1 closed on rebind, node-2 active with higher generation
+                  (and (= [node-1] @closed-nodes)
+                       (= node-2 (:node rebound2))
+                       (> (:generation rebound2) (:generation rebound1))
+                       (nil? (get @conns-atom anon-key-2))
+
+           ;; 4. Delayed stale callbacks from superseded node-1 arrive
+                       (let [[after-stale-close eff-close] (mesh/transition-mesh-conn rebound2
+                                                                                      {:type :on-close :node node-1 :generation 1})
+                             [after-stale-msg eff-msg] (mesh/transition-mesh-conn after-stale-close
+                                                                                  {:type :on-message :node node-1 :generation 1})]
+             ;; Both stale callbacks ignored! Node-2 remains active and open!
+                         (and (= :open (:phase after-stale-msg))
+                              (= node-2 (:node after-stale-msg))
+                              (= true (:ok? after-stale-msg))
+                              (= cid-num (:channel-id after-stale-msg))
+                              (= 2 (:ignored-stale after-stale-msg))
+                              (= :ignore-stale (:effect (first eff-close)))
+                              (= :ignore-stale (:effect (first eff-msg)))))))))
+
+(deftest test-http-connz-endpoint
+  (testing "GET /connz and GET /statusz return structured EDN diagnostics and counters for peers and agents"
+    (let [peer-conns (atom {"peer1" (assoc (mesh/init-mesh-conn-state) :phase :open :ok? true :generation 1 :dropped 2 :ignored-stale 1)})
+          agent-conns (atom {"agent1" (assoc (mesh/init-mesh-conn-state) :phase :open :ok? true :generation 2 :dropped 1 :ignored-stale 0)})
+          summary (mesh/mesh-conn-diagnostics-summary @peer-conns @agent-conns)]
+      (is (= 3 (:conn_dropped summary)))
+      (is (= 1 (:conn_stale summary)))
+      (is (contains? (:peers summary) "peer1"))
+      (is (contains? (:agents summary) "agent1"))
+      (is (= "open" (get-in summary [:peers "peer1" :phase])))
+      (is (= 2 (get-in summary [:peers "peer1" :dropped])))
+      (is (= 1 (get-in summary [:peers "peer1" :ignored_stale]))))
+    (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-http-connz-test-" (into-array FileAttribute [])))
+          state-root (.getAbsolutePath temp-dir)
+          id (identity/load-or-create-node-identity! state-root :node-1)
+          cfg {:node/id :node-1
+               :state-dir state-root
+               :http {:enabled? true :port 0 :host "127.0.0.1"}
+               :transport :in-memory}
+          node (mesh/start-mesh-node! cfg {:identity id})]
+      (try
+        (reset! (:peer-conns node) {"peer1" (assoc (mesh/init-mesh-conn-state) :phase :open :ok? true :channel-id 0 :generation 1 :dropped 2 :ignored-stale 1)})
+        (reset! (:agent-conns node) {"agent1" (assoc (mesh/init-mesh-conn-state) :phase :open :ok? true :channel-id 0 :generation 2 :dropped 1 :ignored-stale 3)})
+        (let [server ^com.sun.net.httpserver.HttpServer (:http-server node)
+              port (.getPort (.getAddress server))
+              base-url (str "http://127.0.0.1:" port)
+              connz-resp (edn/read-string (slurp (str base-url "/connz")))
+              statusz-resp (slurp (str base-url "/statusz"))]
+          (is (= 3 (:conn_dropped connz-resp)))
+          (is (= 4 (:conn_stale connz-resp)))
+          (is (= "open" (get-in connz-resp [:peers "peer1" :phase])))
+          (is (= "open" (get-in connz-resp [:agents "agent1" :phase])))
+          (is (str/includes? statusz-resp "conn_dropped=3"))
+          (is (str/includes? statusz-resp "conn_stale=4")))
+        (finally
+          ((:stop! node))
+          (doseq [f (reverse (file-seq temp-dir))]
+            (.delete ^File f)))))))
+
+(deftest test-agent-connection-handler-rebind-and-stale-callback-isolation
+  (testing "make-agent-connection-handler rebinds sender, closes superseded node, and isolates delayed stale callbacks"
+    (let [kp (crypto/generate-keypair)
+          agent-pub (basalt/bytes->hex (:public kp))
+          agent-priv (:private kp)
+          network-in (async/chan 10)
+          shell-node {:network-in network-in
+                      :state-atom (atom {:messages {} :message-epochs {}})}
+          agent-conns (atom {})
+          cbs-map (atom {})
+          closed-nodes (atom [])
+          handler (#'mesh/make-agent-connection-handler shell-node agent-conns)
+          node-1 {:id :agent-node-1}
+          node-2 {:id :agent-node-2}
+          valid-env (nippy/freeze (mesh/wrap-agent-event {:type :receive-summary :epoch 1 :summary "s1"} agent-pub agent-priv))
+          valid-env-2 (nippy/freeze (mesh/wrap-agent-event {:type :receive-summary :epoch 2 :summary "s2"} agent-pub agent-priv))]
+      (with-redefs [api/set-callbacks! (fn [n cbs] (swap! cbs-map assoc n cbs))
+                    api/close! (fn [n] (swap! closed-nodes conj n))]
+        ;; 1. First agent connection accepted and authenticates
+        (handler node-1)
+        ((:on-message (get @cbs-map node-1)) {:channel-id 1 :payload valid-env})
+        (is (= node-1 (get-in @agent-conns [agent-pub :node])))
+        (is (= :open (get-in @agent-conns [agent-pub :phase])))
+        (is (some? (async/poll! network-in)))
+
+        ;; 2. Second agent connection from same sender accepted and authenticates
+        (handler node-2)
+        ((:on-message (get @cbs-map node-2)) {:channel-id 2 :payload valid-env-2})
+        (is (= [node-1] @closed-nodes))
+        (is (= node-2 (get-in @agent-conns [agent-pub :node])))
+        (is (= :open (get-in @agent-conns [agent-pub :phase])))
+        (is (some? (async/poll! network-in)))
+
+        ;; 3. Delayed :on-close and :on-message from superseded node-1 must be ignored without evicting node-2 or delivering duplicate events
+        ((:on-close (get @cbs-map node-1)) {})
+        ((:on-message (get @cbs-map node-1)) {:channel-id 1 :payload valid-env})
+        (is (= node-2 (get-in @agent-conns [agent-pub :node])))
+        (is (= :open (get-in @agent-conns [agent-pub :phase])))
+        (is (true? (get-in @agent-conns [agent-pub :ok?])))
+        (is (= 2 (get-in @agent-conns [agent-pub :ignored-stale])))
+        (is (nil? (async/poll! network-in)))))))
 
 

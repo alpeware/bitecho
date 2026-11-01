@@ -171,3 +171,27 @@ Light nodes (AI agents) and edge participants maintain zero-loss, zero-duplicati
    - Replay envelopes advance envelope `:epoch` to at least the current state epoch to prevent skew rejection if failover spans epoch ticks.
    - Consensus validators forward peer-received gossip to connected agents (`forward-gossip-to-agents!`) and replay cached epoch gossip (`replay-cached-gossip-to-agent!`) upon agent connection and DataChannel identification with connection-scoped message deduplication.
 
+### G. Full-Node Mesh Shell Lifecycle Discipline (Rules 4 & 5)
+Full-node WebRTC DataChannel mesh connections (peer-to-peer full-mesh and agent ingress listeners) enforce single-authority lifecycle state machines:
+
+1. **Single-Authority Pure Reducer (`transition-mesh-conn`)**:
+   - Connection lifecycle is governed by pure transitions: `(transition-mesh-conn conn event) -> [new-conn effects]`.
+   - Phases: `:down`, `:dialing`, `:open`, `:failed`.
+   - Side-effects (`:close-node`, `:diagnose`, `:ignore-stale`) are returned as pure effect descriptors and executed strictly outside atomic transitions via `execute-mesh-conn-effects!`.
+   - Liveness agreement invariant: `(:ok? conn)` is true if and only if `(= :open (:phase conn))` and `(some? (:channel-id conn))`.
+
+2. **Monotonic Generations & Superseded Node Isolation**:
+   - Every connection attempt or accepted DataChannel receives a strictly monotonic `:generation` tag.
+   - Any callback bearing a stale generation (`gen < current`) or originating from a superseded `:node` is dropped without mutating connection phase, liveness, active channels, or resources.
+   - Stale callbacks increment `:ignored-stale` and emit `:ignore-stale` diagnostic effects.
+   - Superseded nodes are closed exactly once upon replacement via `:close-node` effects without relying on `Thread/sleep` or racing atoms.
+
+3. **Agent Sender Rebinding & Cumulative Accounting**:
+   - Incoming agent connections authenticate with Ed25519 envelopes and are rebound from anonymous keys to sender public keys via pure `rebind-agent-conn-sender`.
+   - Rebinding supersedes previous connection nodes, closes them cleanly, advances generation counters, and preserves cumulative `:dropped` and `:ignored-stale` metrics across reconnects.
+
+4. **Zero Silent Failures & Telemetry (`/statusz` and `/connz`)**:
+   - Send failures, malformed frames, and dial errors increment `:dropped` and emit non-silent counted `:diagnose` effects.
+   - HTTP endpoint `GET /connz` returns full structured EDN diagnostic summaries for all active peer and agent connections.
+   - HTTP endpoint `GET /statusz` surfaces aggregate `conn_dropped` and `conn_stale` metrics alongside consensus and tokenomics telemetry.
+
