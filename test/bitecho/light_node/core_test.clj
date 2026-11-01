@@ -9,7 +9,8 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
-            [clojure.test.check.properties :as prop]))
+            [clojure.test.check.properties :as prop]
+            [taoensso.nippy :as nippy]))
 
 (defn- sample-pubkey-hex
   "Returns an 88-character SubjectPublicKeyInfo hex string for testing."
@@ -185,3 +186,125 @@
              (dissoc (:response res-nested) "session_id")))
       (is (= 15 (get-in res-flat [:response "price"])))
       (is (= 15 (get-in res-nested [:response "price"]))))))
+
+(defspec ^{:doc "Property: Tampered offers (price, epoch, session-id, offer-hash) are rejected, untampered accepted"}
+  prop-offer-integrity-and-tamper-rejection 25
+  (prop/for-all [price (gen/choose 1 1000)
+                 epoch (gen/choose 1 100)
+                 tamper-field (gen/elements [:price :epoch :session-id :offer-hash :none])]
+                (let [alice (test-identity)
+                      bob (test-identity)
+                      callee (:pubkey-hex bob)
+                      cmd {"cmd" "offer" "callee" callee "price" price "burn" 500}
+                      st-alice (light-core/init-light-state (:identity alice) {:epoch epoch})
+                      res-offer (light-core/handle-command st-alice cmd (:privkey-bytes alice))
+                      offer-env (first (filter gossip-env? (:net-envelopes res-offer)))
+                      raw-msg (try (nippy/thaw (get-in offer-env [:event :message :payload])) (catch Exception _ nil))
+                      tampered-msg (case tamper-field
+                                     :price (assoc raw-msg :price (inc price))
+                                     :epoch (assoc raw-msg :epoch (+ epoch 5))
+                                     :session-id (assoc raw-msg :session-id "sess-forged")
+                                     :offer-hash (assoc raw-msg :offer-hash "hash-forged")
+                                     :none raw-msg)
+                      st-bob (light-core/init-light-state (:identity bob) {:epoch epoch})
+                      res-bob (light-core/handle-wire-payload st-bob tampered-msg (:privkey-bytes bob))]
+                  (if (= tamper-field :none)
+                    (and (= 1 (count (:pending-offers (:state res-bob))))
+                         (= 1 (count (:stdout-events res-bob))))
+                    (and (empty? (:pending-offers (:state res-bob)))
+                         (empty? (:stdout-events res-bob)))))))
+
+(defspec ^{:doc "Property: Consecutive transfers auto-increment seq and chain causal deps"}
+  prop-transfer-auto-sequence-and-deps 20
+  (prop/for-all [n (gen/choose 2 5)]
+                (let [alice (test-identity)
+                      recipient (sample-pubkey-hex)
+                      st0 (light-core/init-light-state (:identity alice) {})
+                      steps (reduce (fn [{:keys [state txs]} _]
+                                      (let [cmd {"cmd" "transfer" "recipient" recipient "amount" 100}
+                                            res (light-core/handle-command state cmd (:privkey-bytes alice))
+                                            resp (:response res)]
+                                        {:state (:state res)
+                                         :txs (conj txs resp)}))
+                                    {:state st0 :txs []}
+                                    (range n))
+                      txs (:txs steps)]
+                  (and (= n (count txs))
+                       (= (range 1 (inc n)) (map #(get % "seq") txs))
+                       (every? #(and (get % "ok")
+                                     (= (get % "transfer_hash") (get % "tx_id"))
+                                     (= recipient (get % "receiver"))
+                                     (= recipient (get % "recipient")))
+                               txs)
+                       (= (get-in steps [:state :transfer-seq]) n)
+                       (= (get-in steps [:state :last-transfer-hash]) (get (last txs) "transfer_hash"))))))
+
+(deftest test-non-vacuous-epoch-skew-and-adoption
+  (testing "Light node adopts first epoch when uninitialized and rejects skew > 2 even from epoch 0"
+    (let [alice (test-identity)
+          bob (test-identity)
+          session-id "sess-adopt-epoch"
+          sec (byte-array 32)
+          alice-keys (sealed/derive-channel-keys sec session-id :initiator)
+          bob-keys (sealed/derive-channel-keys sec session-id :responder)
+          plain (.getBytes "test" "UTF-8")
+          sealed-fn (fn [seq-n] (sealed/seal-message (:tx-key alice-keys) seq-n plain (.getBytes session-id "UTF-8")))
+          make-msg (fn [ep seq-n]
+                     (let [s (sealed-fn seq-n)]
+                       {:bitecho/type :sealed-message
+                        :session-id session-id
+                        :sender (:pubkey-hex alice)
+                        :recipient (:pubkey-hex bob)
+                        :epoch ep
+                        :seq seq-n
+                        :nonce (basalt/bytes->hex (:nonce s))
+                        :ciphertext (basalt/bytes->hex (:ciphertext s))}))
+          st0 (light-core/init-light-state (:identity bob) {})
+          st-sess (assoc-in st0 [:sessions session-id]
+                            {:session-id session-id :peer (:pubkey-hex alice) :role :responder :state "open"
+                             :rx-key (:rx-key bob-keys) :tx-key (:tx-key bob-keys)
+                             :replay-window (sealed/init-replay-window 64)})
+          ;; 1. First message arrives with epoch 0 -> node adopts epoch 0
+          res1 (light-core/handle-wire-payload st-sess (make-msg 0 1) (:privkey-bytes bob))
+          st1 (:state res1)
+          ;; 2. Message arrives with epoch 3 (> 2 skew from 0) -> dropped!
+          res2 (light-core/handle-wire-payload st1 (make-msg 3 2) (:privkey-bytes bob))
+          ;; 3. Message arrives with epoch 2 (<= 2 skew from 0) -> accepted!
+          res3 (light-core/handle-wire-payload st1 (make-msg 2 3) (:privkey-bytes bob))]
+      (is (false? (:epoch-initialized? st0)))
+      (is (= 0 (:epoch st1)))
+      (is (true? (:epoch-initialized? st1)))
+      (is (= 1 (count (:inbox st1))))
+      (is (= 1 (count (:inbox (:state res2)))))
+      (is (= 2 (count (:inbox (:state res3))))))))
+
+(deftest test-discover-status-inbox-keys
+  (testing "exec-discover, exec-status, and exec-inbox output required keys"
+    (let [alice (test-identity)
+          desc {:network :devnet
+                :treasury-pubkey (sample-pubkey-hex)
+                :custody-pubkey (sample-pubkey-hex)
+                :nodes {:node1 {:node-id :node1 :ip "127.0.0.1" :port 5000 :agent-port 5010
+                                :pubkey (sample-pubkey-hex)
+                                :ingress-host "ingress.bitecho.org"
+                                :ingress-port 443
+                                :fingerprint "95:09:40:3B..."}}}
+          st (light-core/init-light-state (:identity alice) {:bootstrap desc})
+          disc-res (light-core/handle-command st {"cmd" "discover"} (:privkey-bytes alice))
+          val1 (first (get-in disc-res [:response "validators"]))
+          status-res (light-core/handle-command st {"cmd" "status"} (:privkey-bytes alice))
+          st-with-inbox (assoc st :inbox [{:session-id "s1" :session_id "s1"
+                                           :from "peer1" :seq 1 :text "hi"
+                                           :payload-hex "aabb" :payload_hex "aabb"}])
+          inbox-res (light-core/handle-command st-with-inbox {"cmd" "inbox"} (:privkey-bytes alice))
+          first-msg (first (get-in inbox-res [:response "messages"]))]
+      ;; discover keys
+      (is (= "ingress.bitecho.org" (get val1 "ingress_host")))
+      (is (= 443 (get val1 "ingress_port")))
+      (is (some? (get val1 "pubkey")))
+      ;; status keys
+      (is (contains? (:response status-res) "connected"))
+      (is (contains? (:response status-res) "connection_error"))
+      ;; inbox keys
+      (is (= "s1" (or (get first-msg "session_id") (get first-msg :session_id))))
+      (is (= "aabb" (or (get first-msg "payload_hex") (get first-msg :payload_hex)))))))

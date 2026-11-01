@@ -25,13 +25,16 @@
    :ice-creds (:ice-creds identity-pub-map)
    :autonomous? (boolean (:autonomous? opts false))
    :epoch (long (:epoch opts 0))
+   :epoch-initialized? (contains? opts :epoch)
    :bootstrap (:bootstrap opts)
    :home-set []
    :sessions {}
    :pending-offers {}
    :inbox []
    :local-accounting {:burned-ech 0}
-   :vouchers []})
+   :vouchers []
+   :transfer-seq 0
+   :last-transfer-hash nil})
 
 ;; -----------------------------------------------------------------------------
 ;; Command Handlers (Pure Helpers)
@@ -55,7 +58,10 @@
                          "port" (:port v)
                          "agent_port" (:agent-port v)
                          "fingerprint" (:fingerprint v)}
-                  (:agent-tcp-port v) (assoc "agent_tcp_port" (:agent-tcp-port v))))]
+                  (:agent-tcp-port v) (assoc "agent_tcp_port" (:agent-tcp-port v))
+                  (:pubkey v) (assoc "pubkey" (:pubkey v))
+                  (:ingress-host v) (assoc "ingress_host" (:ingress-host v))
+                  (:ingress-port v) (assoc "ingress_port" (:ingress-port v))))]
     {:state state
      :response {"ok" true
                 "network" (name (or (:network bs) :devnet))
@@ -83,6 +89,18 @@
      :net-envelopes [env-curr env-nil]
      :stdout-events []}))
 
+(defn compute-session-id
+  "Computes deterministic session-id from caller, callee, and caller-ephemeral-pub."
+  [caller callee caller-ephemeral-pub]
+  (let [sid-input (str caller "-" callee "-" caller-ephemeral-pub)]
+    (basalt/bytes->hex (crypto/sha256 (.getBytes ^String sid-input "UTF-8")))))
+
+(defn compute-offer-hash
+  "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, and home-node."
+  [{:keys [session-id caller callee caller-ephemeral-pub epoch price home-node]}]
+  (let [hash-input (str session-id "-" caller "-" callee "-" caller-ephemeral-pub "-" epoch "-" price "-" (name (or home-node "")))]
+    (basalt/bytes->hex (crypto/sha256 (.getBytes ^String hash-input "UTF-8")))))
+
 (defn- exec-offer [state cmd-map privkey-bytes]
   (let [callee (get cmd-map "callee")
         price (long (or (get cmd-map "price") 0))
@@ -92,11 +110,15 @@
         kp-eph (sealed/generate-x25519-keypair)
         caller (:pubkey state)
         eph-pub-hex (basalt/bytes->hex (:public kp-eph))
-        sid-input (str caller "-" callee "-" eph-pub-hex)
-        session-id (basalt/bytes->hex (crypto/sha256 (.getBytes sid-input "UTF-8")))
+        session-id (compute-session-id caller callee eph-pub-hex)
         epoch (:epoch state)
-        hash-input (str session-id "-" caller "-" callee "-" eph-pub-hex "-" epoch "-" price "-" home-node)
-        offer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes hash-input "UTF-8")))
+        offer-hash (compute-offer-hash {:session-id session-id
+                                        :caller caller
+                                        :callee callee
+                                        :caller-ephemeral-pub eph-pub-hex
+                                        :epoch epoch
+                                        :price price
+                                        :home-node home-node})
         sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
         offer-payload {:bitecho/type :channel-offer
                        :session-id session-id
@@ -265,21 +287,28 @@
          :stdout-events []}))))
 
 (defn- exec-transfer [state cmd-map privkey-bytes]
-  (let [receiver (get cmd-map "receiver")
+  (let [receiver (or (get cmd-map "receiver") (get cmd-map "recipient"))
         amount (long (or (get cmd-map "amount") 0))
-        seq-num (long (or (get cmd-map "seq") 1))
+        seq-num (long (or (get cmd-map "seq") (inc (:transfer-seq state 0))))
+        deps (vec (or (get cmd-map "deps") (when-let [prev (:last-transfer-hash state)] [prev]) []))
         burn-amt (long (or (get cmd-map "burn") 500))
         res (agent-sim/build-transfer-gossip-envelope
              (:pubkey state)
              privkey-bytes
-             {:receiver receiver :amount amount :seq seq-num :deps []}
+             {:receiver receiver :amount amount :seq seq-num :deps deps}
              burn-amt)
-        new-state (update-in state [:local-accounting :burned-ech] (fnil + 0) burn-amt)]
+        new-state (-> state
+                      (assoc :transfer-seq seq-num
+                             :last-transfer-hash (:transfer-hash res))
+                      (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
     {:state new-state
      :response {"ok" true
                 "transfer_hash" (:transfer-hash res)
+                "tx_id" (:transfer-hash res)
                 "receiver" receiver
-                "amount" amount}
+                "recipient" receiver
+                "amount" amount
+                "seq" seq-num}
      :net-envelopes [(:envelope res)]
      :stdout-events []}))
 
@@ -288,6 +317,8 @@
                                 (select-keys s [:session-id :peer :role :state :tx-seq :epoch])))]
     {:state state
      :response {"ok" true
+                "connected" (boolean (:connected? state false))
+                "connection_error" (:connection-error state)
                 "pubkey" (:pubkey state)
                 "autonomous" (:autonomous? state)
                 "epoch" (:epoch state)
@@ -351,7 +382,12 @@
     {:state state :net-envelopes [] :stdout-events []}
     (let [caller-pub (try (basalt/hex->bytes (:caller msg)) (catch Exception _ nil))
           sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
-          valid-sig? (and caller-pub sig-bytes
+          expected-sid (compute-session-id (:caller msg) (:callee msg) (:caller-ephemeral-pub msg))
+          expected-hash (compute-offer-hash msg)
+          valid-hashes? (and (= (:session-id msg) expected-sid)
+                             (= (:offer-hash msg) expected-hash))
+          valid-sig? (and valid-hashes?
+                          caller-pub sig-bytes
                           (crypto/verify caller-pub (.getBytes ^String (:offer-hash msg) "UTF-8") sig-bytes))]
       (if-not valid-sig?
         {:state state :net-envelopes [] :stdout-events []}
@@ -419,10 +455,12 @@
                 {:state state :net-envelopes [] :stdout-events []}
                 (let [text (try (String. ^bytes decrypted "UTF-8") (catch Exception _ nil))
                       inbox-item {:session-id session-id
+                                  :session_id session-id
                                   :from (:sender msg)
                                   :seq (:seq msg)
                                   :text text
-                                  :payload-hex (basalt/bytes->hex decrypted)}
+                                  :payload-hex (basalt/bytes->hex decrypted)
+                                  :payload_hex (basalt/bytes->hex decrypted)}
                       updated-sess (assoc session :replay-window (:window chk))
                       new-state (-> state
                                     (assoc-in [:sessions session-id] updated-sess)
@@ -463,19 +501,26 @@
   (let [msg (unwrap-wire-message raw-payload-or-event)]
     (if-not (map? msg)
       {:state state :net-envelopes [] :stdout-events []}
-      (let [msg-epoch (:epoch msg)
-            st-epoch (:epoch state)
-            skew-exceeded? (and (integer? msg-epoch) (integer? st-epoch)
-                                (pos? msg-epoch) (pos? st-epoch)
-                                (> (Math/abs (long (- msg-epoch st-epoch))) 2))]
+      (let [msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
+            ref-epoch (if (or (:epoch-initialized? state)
+                              (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
+                        (:epoch state)
+                        (or (when-let [sid (:session-id msg)]
+                              (get-in state [:sessions sid :epoch]))
+                            msg-epoch))
+            skew-exceeded? (and msg-epoch ref-epoch
+                                (> (Math/abs (- msg-epoch ref-epoch)) 2))]
         (if skew-exceeded?
           {:state state :net-envelopes [] :stdout-events []}
-          (case (:bitecho/type msg)
-            :channel-offer (handle-wire-offer state msg privkey-bytes)
-            :channel-accept (handle-wire-accept state msg)
-            :sealed-message (handle-wire-sealed-msg state msg)
-            :channel-close (handle-wire-close state msg)
-            {:state state :net-envelopes [] :stdout-events []}))))))
+          (let [res (case (:bitecho/type msg)
+                      :channel-offer (handle-wire-offer state msg privkey-bytes)
+                      :channel-accept (handle-wire-accept state msg)
+                      :sealed-message (handle-wire-sealed-msg state msg)
+                      :channel-close (handle-wire-close state msg)
+                      {:state state :net-envelopes [] :stdout-events []})]
+            (if (and msg-epoch (not (:epoch-initialized? (:state res))))
+              (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
+              res)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; JSONL Line Processor

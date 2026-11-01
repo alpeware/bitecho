@@ -42,6 +42,7 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
   - `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
   - `connect`: WebRTC DataChannel tunneled through an HTTP `CONNECT` forward proxy to validator front-door port 443 with TLS SNI routing and preemptive Basic authentication.
 - `--proxy <url>`: HTTP CONNECT proxy URL (e.g., `http://user:pass@proxy.corp.internal:8080`). If omitted when using `--transport connect`, the node checks environment variables in order: `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`.
+- `--timeout-ms <ms>`: Timeout in milliseconds when dialing validator WebRTC DataChannels (default: 8000).
 
 ---
 
@@ -57,8 +58,14 @@ clojure -M:light-node serve --state-dir data/alice --bootstrap devnet/bootstrap.
 - Each request written to `stdin` must be a single-line JSON object with a `"cmd"` field.
 - Each response written to `stdout` is a single-line JSON object containing `"ok": true|false` alongside result fields or an `"error"` message.
 - Asynchronous protocol events received from the network are pushed to `stdout` as JSON objects containing an `"event"` field.
+- Upon launch, the daemon immediately emits a startup readiness event (`"event": "ready"` or `"event": "connection-failed"`).
 
 #### Example Stdio Session
+
+**Startup Event (stdout):**
+```json
+{"event": "ready", "connected": true, "transport": "udp"}
+```
 
 **Request (stdin):**
 ```json
@@ -118,6 +125,8 @@ Queries and parses the configured bootstrap descriptor to discover available val
         "port": 5400,
         "agent_port": 5420,
         "pubkey": "<hex>",
+        "ingress_host": "ns1.bitecho.org",
+        "ingress_port": 443,
         "fingerprint": "<fp>"
       }
     ]
@@ -212,10 +221,11 @@ Retrieves and drains all decrypted inbound messages from local memory, along wit
     "ok": true,
     "messages": [
       {
-        "session-id": "sess-c47b19...",
+        "session_id": "sess-c47b19...",
         "from": "<sender-pubkey-hex>",
         "seq": 1,
-        "text": "Hello peer"
+        "text": "Hello peer",
+        "payload_hex": "<hex>"
       }
     ],
     "pending_offers": []
@@ -241,17 +251,20 @@ Signs and broadcasts a channel close message, wiping session ephemeral keys and 
 ---
 
 ### `transfer`
-Submits an account balance transfer to another public key.
+Submits an account balance transfer to another public key. Consecutive transfers automatically increment the sequence number (`seq`) and chain causal dependencies (`deps`).
 
-- **CLI**: `clojure -M:light-node transfer --recipient <pubkey-hex> --amount 100`
-- **JSONL**: `{"cmd": "transfer", "recipient": "<pubkey-hex>", "amount": 100}`
+- **CLI**: `clojure -M:light-node transfer --receiver <pubkey-hex> --amount 100` (also accepts `--recipient <pubkey-hex>` and optional `--seq <num>`)
+- **JSONL**: `{"cmd": "transfer", "receiver": "<pubkey-hex>", "amount": 100}` (or `"recipient"`)
 - **Response**:
   ```json
   {
     "ok": true,
     "tx_id": "tx-8b2...",
+    "transfer_hash": "tx-8b2...",
+    "receiver": "<pubkey-hex>",
     "recipient": "<pubkey-hex>",
-    "amount": 100
+    "amount": 100,
+    "seq": 1
   }
   ```
 
@@ -266,18 +279,28 @@ Inspects local node accounting, active and pending sessions, burned ECHO, and va
   ```json
   {
     "ok": true,
+    "connected": true,
+    "connection_error": null,
     "pubkey": "<pubkey-hex>",
     "epoch": 5,
-    "active_sessions": 2,
-    "pending_offers": 0,
-    "burned_ech": 1500,
-    "sessions": {
-      "sess-c47b19...": {
+    "autonomous": false,
+    "sessions": [
+      {
+        "session-id": "sess-c47b19...",
         "peer": "<peer-pubkey-hex>",
+        "role": "initiator",
         "state": "open",
-        "tx_seq": 1,
-        "price": 10
+        "tx-seq": 1,
+        "epoch": 5
       }
+    ],
+    "pending_offers_count": 0,
+    "inbox_count": 0,
+    "accounting": {
+      "scope": "local-non-consensus",
+      "note": "Locally computed devnet totals; never consensus finalized",
+      "burned_ech": 1500,
+      "vouchers_count": 0
     }
   }
   ```

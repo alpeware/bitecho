@@ -74,9 +74,12 @@
                                "session_id" (or (extract-flag-value args "--session-id" nil)
                                                 (extract-flag-value args "--session" nil))}
                    "transfer" {"cmd" "transfer"
-                               "receiver" (extract-flag-value args "--receiver" nil)
+                               "receiver" (or (extract-flag-value args "--receiver" nil)
+                                              (extract-flag-value args "--recipient" nil))
+                               "recipient" (or (extract-flag-value args "--receiver" nil)
+                                               (extract-flag-value args "--recipient" nil))
                                "amount" (extract-long-flag args "--amount" 0)
-                               "seq" (extract-long-flag args "--seq" 1)
+                               "seq" (extract-long-flag args "--seq" nil)
                                "burn" (extract-long-flag args "--burn" 500)}
                    "register-home-set" {"cmd" "register-home-set"
                                         "home_nodes" (let [nodes (extract-flag-value args "--nodes" nil)]
@@ -117,6 +120,7 @@
                     "tcp" :tcp
                     "connect" :connect
                     :udp)
+        timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
         proxy-cli (extract-flag-value clean-args "--proxy" nil)
         proxy-url (resolve-proxy-url proxy-cli)]
     (cond-> {:mode (if serve? :serve :one-shot)
@@ -126,6 +130,7 @@
              :autonomous? (boolean autonomous?)
              :transport transport
              :cmd-map (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))}
+      timeout-ms (assoc :timeout-ms timeout-ms)
       proxy-url (assoc :proxy proxy-url))))
 
 ;; -----------------------------------------------------------------------------
@@ -185,7 +190,8 @@
     (when (some (fn [node]
                   (let [raw-fp (:fingerprint node)]
                     (not (and (string? raw-fp)
-                              (identity/verify-peer-fingerprint? raw-fp raw-fp)))))
+                              (try (boolean (identity/normalize-fingerprint raw-fp))
+                                   (catch Exception _ false))))))
                 nodes)
       {:ok? false :error "bad-fingerprint"})))
 
@@ -216,7 +222,9 @@
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (deliver connected? :bad-fingerprint)))
      :on-close (fn [_]
-                 (reset! channel-id nil))}))
+                 (reset! channel-id nil)
+                 (when state-atom
+                   (swap! state-atom assoc :connected? false)))}))
 
 (defn- dial-single-node!
   "Dials a single validator node via WebRTC DataChannel (UDP, TCP, or HTTP CONNECT proxy)."
@@ -253,7 +261,7 @@
         (catch Exception _
           (deliver connected? :connect-failed)))
       (api/start! client-node remote-sdp callbacks))
-    (let [timeout-ms (long (or (:timeout-ms opts) 2500))
+    (let [timeout-ms (long (or (:timeout-ms opts) 8000))
           res (deref connected? timeout-ms :timeout)]
       (cond
         (= res :bad-fingerprint)
@@ -303,6 +311,34 @@
   (.println writer ^String (json/write-str data))
   (.flush writer))
 
+(defn- handle-serve-line!
+  "Processes a single STDIN JSON line in serve mode, handling network retries if required."
+  [line ctx]
+  (let [{:keys [state-atom conn-atom out-writer state-file identity bootstrap conn-opts]} ctx
+        res (light-core/process-jsonl-line @state-atom line (:privkey-bytes identity))
+        needs-net? (seq (:net-envelopes res))]
+    (if (and needs-net? (not (:ok? @conn-atom)))
+      (let [reconn (connect-validators! identity bootstrap conn-opts)]
+        (reset! conn-atom reconn)
+        (swap! state-atom assoc :connected? (boolean (:ok? reconn)) :connection-error (:error reconn))
+        (if-not (:ok? reconn)
+          (emit-json-line! out-writer {"ok" false "error" (or (:error reconn) "listener-disabled")})
+          (do
+            (reset! state-atom (:state res))
+            (save-light-state! state-file @state-atom)
+            (when-let [resp (:response res)]
+              (emit-json-line! out-writer resp))
+            (doseq [env (:net-envelopes res)]
+              ((:send-fn reconn) env)))))
+      (do
+        (reset! state-atom (:state res))
+        (save-light-state! state-file @state-atom)
+        (when-let [resp (:response res)]
+          (emit-json-line! out-writer resp))
+        (when (and (:ok? @conn-atom) needs-net?)
+          (doseq [env (:net-envelopes res)]
+            ((:send-fn @conn-atom) env)))))))
+
 (defn run-serve!
   "Runs the light node in continuous JSONL serve mode reading STDIN and writing STDOUT."
   [opts]
@@ -318,20 +354,31 @@
         out-writer (PrintWriter. System/out true)
         event-out (fn [ev] (emit-json-line! out-writer ev))
         conn-opts (assoc opts :state-atom state-atom :event-out event-out)
-        conn-res (connect-validators! identity bootstrap conn-opts)]
+        conn-res (connect-validators! identity bootstrap conn-opts)
+        conn-atom (atom conn-res)
+        ctx {:state-atom state-atom
+             :conn-atom conn-atom
+             :out-writer out-writer
+             :state-file state-file
+             :identity identity
+             :bootstrap bootstrap
+             :conn-opts conn-opts}]
+    (swap! state-atom assoc
+           :connected? (boolean (:ok? conn-res))
+           :connection-error (:error conn-res))
+    (if (:ok? conn-res)
+      (emit-json-line! out-writer {"event" "ready"
+                                   "connected" true
+                                   "transport" (name (or (:transport opts) :udp))})
+      (emit-json-line! out-writer {"event" "connection-failed"
+                                   "connected" false
+                                   "error" (:error conn-res)}))
     (binding [*out* *err*]
       (let [reader (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
         (loop []
           (when-let [line (.readLine reader)]
             (when-not (str/blank? line)
-              (let [res (light-core/process-jsonl-line @state-atom line (:privkey-bytes identity))]
-                (reset! state-atom (:state res))
-                (save-light-state! state-file @state-atom)
-                (when-let [resp (:response res)]
-                  (emit-json-line! out-writer resp))
-                (when (:ok? conn-res)
-                  (doseq [env (:net-envelopes res)]
-                    ((:send-fn conn-res) env)))))
+              (handle-serve-line! line ctx))
             (recur)))))))
 
 (defn run-one-shot!
@@ -349,17 +396,26 @@
         out-writer (PrintWriter. System/out true)]
     (binding [*out* *err*]
       (let [res (light-core/handle-command initial-state cmd-map (:privkey-bytes identity))
-            new-state (:state res)]
-        (save-light-state! state-file new-state)
-        (emit-json-line! out-writer (:response res))
-        (when (and (seq (:net-envelopes res)) (:connect? opts true))
+            new-state (:state res)
+            needs-network? (and (seq (:net-envelopes res)) (:connect? opts true))]
+        (if needs-network?
           (let [conn-res (connect-validators! identity bootstrap opts)]
-            (when (:ok? conn-res)
-              (doseq [env (:net-envelopes res)]
-                ((:send-fn conn-res) env))
-              (when-let [n (:node conn-res)]
-                (try (api/close! n) (catch Exception _ nil))))))
-        (:response res)))))
+            (if-not (:ok? conn-res)
+              (let [err-resp {"ok" false "error" (or (:error conn-res) "listener-disabled")}]
+                (emit-json-line! out-writer err-resp)
+                err-resp)
+              (do
+                (save-light-state! state-file new-state)
+                (emit-json-line! out-writer (:response res))
+                (doseq [env (:net-envelopes res)]
+                  ((:send-fn conn-res) env))
+                (when-let [n (:node conn-res)]
+                  (try (api/close! n) (catch Exception _ nil)))
+                (:response res))))
+          (do
+            (save-light-state! state-file new-state)
+            (emit-json-line! out-writer (:response res))
+            (:response res)))))))
 
 (defn run-light-node-cli!
   "Dispatches light-node CLI invocation based on parsed arguments."

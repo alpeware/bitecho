@@ -224,7 +224,6 @@ cmd_init() {
     ensure_firewall_rule "$proj" "bitecho-ssh" "tcp:22" "0.0.0.0/0" "bitecho"
     ensure_firewall_rule "$proj" "bitecho-cluster" "udp:5000-5005" "$cluster_ranges" "bitecho"
     ensure_firewall_rule "$proj" "bitecho-agent" "udp:5010,tcp:5010" "0.0.0.0/0" "bitecho"
-    ensure_firewall_rule "$proj" "bitecho-allow-mesh" "udp:5000-5005,udp:5010,tcp:5010" "0.0.0.0/0" "bitecho"
   done
 
   # 5. Create e2-micro VM instances
