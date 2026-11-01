@@ -1024,7 +1024,8 @@
                       rebound1 (get @conns-atom sender-pk)
                       _ (assert (nil? (get @conns-atom anon-key-1)))
                       _ (assert (= node-1 (:node rebound1)))
-                      _ (assert (= 1 (:generation rebound1)))
+                      _ (assert (= 2 (:generation rebound1)))
+                      _ (assert (> (:generation rebound1) (:generation conn1)))
 
           ;; 3. Second connection from same sender under new anon-key-2
                       anon-key-2 [:anon 1002]
@@ -1142,5 +1143,93 @@
         (is (true? (get-in @agent-conns [agent-pub :ok?])))
         (is (= 2 (get-in @agent-conns [agent-pub :ignored-stale])))
         (is (nil? (async/poll! network-in)))))))
+
+(deftest test-record-sent-msg-fifo-eviction-at-1024-cap
+  (testing "inserting the 1025th message ID evicts only the 1st message ID while retaining 2..1025"
+    (let [initial-conn (mesh/init-mesh-conn-state)
+          ;; Record 1024 message IDs: "msg-1" .. "msg-1024"
+          conn-1024 (reduce (fn [c i]
+                              (first (mesh/transition-mesh-conn c {:type :record-sent-msg :msg-id (str "msg-" i)})))
+                            initial-conn
+                            (range 1 1025))]
+      (is (= 1024 (count (:sent-msg-ids conn-1024))))
+      (is (= 1024 (count (:sent-msg-order conn-1024))))
+      (is (contains? (:sent-msg-ids conn-1024) "msg-1"))
+      (is (contains? (:sent-msg-ids conn-1024) "msg-1024"))
+      ;; Now insert the 1025th message ID: "msg-1025"
+      (let [[conn-1025 _] (mesh/transition-mesh-conn conn-1024 {:type :record-sent-msg :msg-id "msg-1025"})]
+        (is (= 1024 (count (:sent-msg-ids conn-1025))))
+        (is (= 1024 (count (:sent-msg-order conn-1025))))
+        ;; First message ID evicted
+        (is (not (contains? (:sent-msg-ids conn-1025) "msg-1")))
+        ;; Newest message ID present
+        (is (contains? (:sent-msg-ids conn-1025) "msg-1025"))
+        ;; Message IDs 2 through 1024 still retained
+        (is (every? #(contains? (:sent-msg-ids conn-1025) (str "msg-" %)) (range 2 1026)))
+        (is (= "msg-2" (first (:sent-msg-order conn-1025))))
+        (is (= "msg-1025" (last (:sent-msg-order conn-1025))))))))
+
+(deftest test-prune-closed-agent-tombstones-preserves-diagnostics
+  (testing ">64 closed anonymous agent connections are pruned to bounded size while preserving cumulative dropped and stale counts"
+    (let [conns-atom (atom {})]
+      ;; Create 80 agent connections, simulate drops/stales on each, then close each
+      (doseq [i (range 1 81)]
+        (let [anon-key [:anon i]
+              mock-node {:agent-id i}
+              t (long (* i 1000))]
+          (mesh/apply-mesh-conn-event! conns-atom anon-key
+                                       {:type :accept-started :generation 1 :node mock-node :channel-id 1 :now-ms t})
+          ;; 1 drop event
+          (mesh/apply-mesh-conn-event! conns-atom anon-key
+                                       {:type :invalid-frame :generation 1 :node mock-node :error "bad-frame"})
+          ;; 1 stale event
+          (mesh/apply-mesh-conn-event! conns-atom anon-key
+                                       {:type :on-message :generation 0 :node mock-node})
+          ;; close
+          (mesh/apply-mesh-conn-event! conns-atom anon-key
+                                       {:type :on-close :generation 1 :node mock-node :now-ms (inc t)})))
+      ;; Total closed tombstones in @conns-atom must be capped at 64
+      (let [closed-entries (filter (fn [[_ c]] (#{:down :failed} (:phase c))) @conns-atom)]
+        (is (<= (count closed-entries) 64))
+        (is (= 64 (count @conns-atom))))
+      ;; Diagnostics summary must preserve all 80 dropped and 80 stale counts exactly
+      (let [diag (mesh/mesh-conn-diagnostics-summary {} @conns-atom)]
+        (is (= 80 (:conn_dropped diag)))
+        (is (= 80 (:conn_stale diag)))))))
+
+(deftest test-agent-gossip-dedup-when-api-send-returns-nil
+  (testing "replay-cached-gossip-to-agent! and forward-gossip-to-agents! deduplicate when api/send! returns nil"
+    (let [sends (atom [])
+          shell-node {:state-atom (atom {:messages {"m1" {:content "hello-1"}
+                                                    "m2" {:content "hello-2"}}
+                                         :message-epochs {"m1" 1 "m2" 1}})}
+          agent-pub "agent-pk-1"
+          mock-node {:agent-node 1}
+          agent-conns (atom {agent-pub (assoc (mesh/init-mesh-conn-state)
+                                              :phase :open
+                                              :ok? true
+                                              :node mock-node
+                                              :channel-id 1)})]
+      (with-redefs [api/send! (fn [_node data _cid]
+                                (swap! sends conj data)
+                                nil)] ; returns nil on success, matching datachannel.api/send!
+        ;; 1. Replay cached gossip to agent
+        (#'mesh/replay-cached-gossip-to-agent! shell-node agent-conns agent-pub)
+        (is (= 2 (count @sends)) "Both messages m1 and m2 should be sent on first replay")
+        (is (= #{"m1" "m2"} (mesh/conn-sent-msg-ids (get @agent-conns agent-pub))))
+
+        ;; 2. Second replay to same agent must be a complete no-op (no duplicates!)
+        (#'mesh/replay-cached-gossip-to-agent! shell-node agent-conns agent-pub)
+        (is (= 2 (count @sends)) "No duplicate messages sent on second replay")
+
+        ;; 3. Forward new gossip to agents
+        (let [frozen-m3 (nippy/freeze {:type :receive-gossip :message {:message-id "m3" :content "hello-3"}})]
+          (#'mesh/forward-gossip-to-agents! agent-conns frozen-m3 nil)
+          (is (= 3 (count @sends)) "m3 sent on first forward")
+          (is (contains? (mesh/conn-sent-msg-ids (get @agent-conns agent-pub)) "m3"))
+
+          ;; 4. Forward same m3 again: must be deduped (no duplicate sent!)
+          (#'mesh/forward-gossip-to-agents! agent-conns frozen-m3 nil)
+          (is (= 3 (count @sends)) "No duplicate gossip forwarded on second call"))))))
 
 

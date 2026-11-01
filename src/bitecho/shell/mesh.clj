@@ -395,6 +395,7 @@
       :created-at now-ms
       :last-rx-at now-ms
       :sent-msg-ids #{}
+      :sent-msg-order []
       :error nil
       :last-error nil
       :dropped 0
@@ -421,7 +422,8 @@
                  (assoc base
                         :channel-id (conn-channel-id conn)
                         :last-rx-at (or (conn-last-rx-at conn) (:last-rx-at base) 0)
-                        :sent-msg-ids (conn-sent-msg-ids conn))))
+                        :sent-msg-ids (conn-sent-msg-ids conn)
+                        :sent-msg-order (or (:sent-msg-order conn) (vec (conn-sent-msg-ids conn))))))
         stale-gen? (and (some? (:generation event))
                         (< (long (:generation event)) (long (:generation conn 0))))
         superseded-node? (and (not (#{:dial-started :accept-started} (:type event)))
@@ -456,6 +458,7 @@
                               :created-at now-ms
                               :last-rx-at now-ms
                               :sent-msg-ids (or (:sent-msg-ids event) #{})
+                              :sent-msg-order (or (:sent-msg-order event) (vec (or (:sent-msg-ids event) [])))
                               :error nil)]
           [new-conn effects])
 
@@ -494,9 +497,18 @@
 
         :record-sent-msg
         (let [mid (:msg-id event)
-              curr-set (conn-sent-msg-ids conn)
-              next-set (if mid (conj (if (>= (count curr-set) 1024) #{} curr-set) mid) curr-set)]
-          [(assoc conn :sent-msg-ids next-set) []])
+              curr-set (set (conn-sent-msg-ids conn))
+              curr-order (or (:sent-msg-order conn) (vec curr-set))]
+          (if (or (nil? mid) (contains? curr-set mid))
+            [conn []]
+            (let [overflow? (>= (count curr-set) 1024)
+                  evicted (when overflow? (first curr-order))
+                  next-set (cond-> curr-set
+                             evicted (disj evicted)
+                             true (conj mid))
+                  next-order (cond-> (if overflow? (subvec curr-order 1) curr-order)
+                               true (conj mid))]
+              [(assoc conn :sent-msg-ids next-set :sent-msg-order next-order) []])))
 
         (:send-failed :invalid-frame)
         (let [err (or (:error event) (name (:type event)))
@@ -583,6 +595,37 @@
 
        nil))))
 
+(defn prune-closed-conn-tombstones
+  "Pure helper. Limits closed or failed connection tombstones in conns-map to max-tombstones (default 64).
+   Evicts the oldest closed/failed entries by :last-rx-at / :created-at, rolling their :dropped and
+   :ignored-stale counts into the newest remaining closed entry so cumulative diagnostics totals are preserved."
+  ([conns-map]
+   (prune-closed-conn-tombstones conns-map 64))
+  ([conns-map max-tombstones]
+   (if (empty? conns-map)
+     conns-map
+     (let [closed-entries (filter (fn [[_ c]] (#{:down :failed} (:phase c))) conns-map)
+           excess (- (count closed-entries) (long max-tombstones))]
+       (if (<= excess 0)
+         conns-map
+         (let [sorted-closed (vec (sort-by (fn [[_ c]]
+                                             [(long (or (:last-rx-at c) (:created-at c) 0))
+                                              (long (or (:created-at c) 0))])
+                                           closed-entries))
+               to-evict (subvec sorted-closed 0 excess)
+               remaining-closed (subvec sorted-closed excess)
+               evicted-dropped (reduce + 0 (map (fn [[_ c]] (long (or (:dropped c) 0))) to-evict))
+               evicted-stale (reduce + 0 (map (fn [[_ c]] (long (or (:ignored-stale c) 0))) to-evict))
+               to-evict-keys (set (map first to-evict))]
+           (if (seq remaining-closed)
+             (let [[newest-k newest-c] (last remaining-closed)
+                   updated-newest-c (assoc newest-c
+                                           :dropped (+ (long (or (:dropped newest-c) 0)) evicted-dropped)
+                                           :ignored-stale (+ (long (or (:ignored-stale newest-c) 0)) evicted-stale))]
+               (-> (apply dissoc conns-map to-evict-keys)
+                   (assoc newest-k updated-newest-c)))
+             (apply dissoc conns-map to-evict-keys))))))))
+
 (defn apply-mesh-conn-event!
   "Atomically transitions an entry in a connections atom (peer-conns or agent-conns)
    via transition-mesh-conn, executes effects outside the swap!, and returns the updated connection map."
@@ -593,9 +636,10 @@
      (swap! conns-atom
             (fn [conns]
               (let [conn (get conns key)
-                    [new-conn effects] (transition-mesh-conn conn event)]
+                    [new-conn effects] (transition-mesh-conn conn event)
+                    updated (assoc conns key new-conn)]
                 (reset! effects-ref effects)
-                (assoc conns key new-conn))))
+                (prune-closed-conn-tombstones updated))))
      (execute-mesh-conn-effects! @effects-ref opts)
      (get @conns-atom key))))
 
@@ -611,10 +655,19 @@
             (nil? (:node anon-conn))
             (#{:down :failed} (:phase anon-conn)))
       (let [eff {:effect :ignore-stale :generation (long (or (:generation anon-conn) 0))}
-            new-map (cond-> (dissoc conns-map anon-key)
-                      existing (assoc sender-hex (-> existing
-                                                     (update :ignored-stale (fnil inc 0))
-                                                     (push-mesh-diagnostic eff))))]
+            anon-dropped (long (or (:dropped anon-conn) 0))
+            anon-stale (long (or (:ignored-stale anon-conn) 0))
+            new-map (if existing
+                      (-> (dissoc conns-map anon-key)
+                          (assoc sender-hex (-> existing
+                                                (update :dropped (fn [d] (+ (long (or d 0)) anon-dropped)))
+                                                (update :ignored-stale (fn [s] (+ (long (or s 0)) anon-stale 1)))
+                                                (push-mesh-diagnostic eff))))
+                      (if anon-conn
+                        (assoc conns-map anon-key (-> anon-conn
+                                                      (update :ignored-stale (fnil inc 0))
+                                                      (push-mesh-diagnostic eff)))
+                        conns-map))]
         [new-map [eff]])
       (let [superseded? (and existing
                              (:node existing)
@@ -622,16 +675,19 @@
             effects (if superseded?
                       [{:effect :close-node :node (:node existing) :generation (:generation existing 0)}]
                       [])
-            next-gen (if existing
-                       (max (long (or (:generation anon-conn) 1))
-                            (inc (long (or (:generation existing) 0))))
-                       (long (or (:generation anon-conn) 1)))
+            next-gen (inc (max (long (or (:generation anon-conn) 0))
+                               (long (or (:generation existing) 0))))
             cumulative-dropped (+ (long (or (:dropped anon-conn) 0))
                                   (long (or (:dropped existing) 0)))
             cumulative-stale (+ (long (or (:ignored-stale anon-conn) 0))
                                 (long (or (:ignored-stale existing) 0)))
-            merged-sent-ids (into (set (conn-sent-msg-ids existing))
-                                  (set (conn-sent-msg-ids anon-conn)))
+            existing-order (or (:sent-msg-order existing) (vec (conn-sent-msg-ids existing)))
+            anon-order (or (:sent-msg-order anon-conn) (vec (conn-sent-msg-ids anon-conn)))
+            merged-sent-order (vec (distinct (into existing-order anon-order)))
+            capped-order (if (> (count merged-sent-order) 1024)
+                           (subvec merged-sent-order (- (count merged-sent-order) 1024))
+                           merged-sent-order)
+            capped-ids (set capped-order)
             rebound-conn (assoc anon-conn
                                 :generation next-gen
                                 :phase (if (some? cid) :open (:phase anon-conn))
@@ -640,7 +696,8 @@
                                 :last-rx-at (or now-ms (:last-rx-at anon-conn))
                                 :dropped cumulative-dropped
                                 :ignored-stale cumulative-stale
-                                :sent-msg-ids merged-sent-ids)
+                                :sent-msg-ids capped-ids
+                                :sent-msg-order capped-order)
             new-map (-> conns-map
                         (dissoc anon-key)
                         (assoc sender-hex rebound-conn))]
@@ -657,7 +714,7 @@
             (fn [conns]
               (let [[new-conns effects] (rebind-agent-conn-sender conns anon-key sender-hex cid now-ms)]
                 (reset! effects-ref effects)
-                new-conns)))
+                (prune-closed-conn-tombstones new-conns))))
      (execute-mesh-conn-effects! @effects-ref opts)
      (get @agent-conns sender-hex))))
 
@@ -935,11 +992,11 @@
             (when-let [cid (or (conn-channel-id conn) 0)]
               (when-let [node (:node conn)]
                 (try
-                  (when (api/send! node frozen-evt cid)
-                    (when msg-id
-                      (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
-                        (swap! (:sent-msg-ids conn) conj msg-id)
-                        (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id}))))
+                  (api/send! node frozen-evt cid)
+                  (when msg-id
+                    (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
+                      (swap! (:sent-msg-ids conn) conj msg-id)
+                      (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id})))
                   (catch Exception e
                     (apply-mesh-conn-event! agent-conns pk
                                             {:type :send-failed :error (or (.getMessage e) "send-failed")})
@@ -1073,16 +1130,16 @@
           sorted-msgs (sort-by (fn [[mid _]] [(long (get epochs-map mid 0)) (str mid)]) messages-map)]
       (doseq [[mid message] sorted-msgs]
         (let [conn (when agent-conns (get @agent-conns conn-key))]
-          (when conn
+          (when-let [node (:node conn)]
             (let [sent-ids (conn-sent-msg-ids conn)]
               (when-not (contains? sent-ids mid)
                 (let [cid (or (conn-channel-id conn) 0)
                       frozen (nippy/freeze {:type :receive-gossip :message message})]
                   (try
-                    (when (api/send! (:node conn) frozen cid)
-                      (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
-                        (swap! (:sent-msg-ids conn) conj mid)
-                        (apply-mesh-conn-event! agent-conns conn-key {:type :record-sent-msg :msg-id mid})))
+                    (api/send! node frozen cid)
+                    (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
+                      (swap! (:sent-msg-ids conn) conj mid)
+                      (apply-mesh-conn-event! agent-conns conn-key {:type :record-sent-msg :msg-id mid}))
                     (catch Exception e
                       (when agent-conns
                         (apply-mesh-conn-event! agent-conns conn-key

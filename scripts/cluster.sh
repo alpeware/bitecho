@@ -722,13 +722,13 @@ TXT_BOOTSTRAP_EOF
 
 cmd_status() {
   echo "=== 3-Node Bitecho Devnet Cluster Status ==="
-  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
-    "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns" "FinEpoch" "BurnDigest" "Pending/Failed"
-  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
-    "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-------------------------" "----------" "------------------" "--------------"
+  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %-16s %s\n" \
+    "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns" "FinEpoch" "BurnDigest" "Pending/Failed" "Conn(Drop/Stale)"
+  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %-16s %s\n" \
+    "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-------------------------" "----------" "------------------" "--------------" "----------------"
 
   for node in "${NODES[@]}"; do
-    local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics fin_epoch burn_dig pending_failed
+    local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics fin_epoch burn_dig pending_failed conn_diag
     ip="$(get_ip "$node")"
     if [[ -z "$ip" ]]; then
       ip="UNRESOLVED"
@@ -744,6 +744,7 @@ cmd_status() {
       fin_epoch="N/A"
       burn_dig="N/A"
       pending_failed="N/A"
+      conn_diag="N/A"
     else
       local proj
       proj="$(get_project "$node")"
@@ -777,6 +778,7 @@ REMOTE_STATUS
           fin_epoch="N/A"
           burn_dig="N/A"
           pending_failed="N/A"
+          conn_diag="N/A"
         else
           local raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz
           IFS='|' read -r raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz <<< "$raw_metrics"
@@ -825,6 +827,7 @@ REMOTE_STATUS
           fin_epoch="${r_finalized_epoch:-0}"
           burn_dig="${r_burn_digest:-N/A}"
           pending_failed="${r_pending_receipts:-0}/${r_failed_receipts:-0}"
+          conn_diag="${r_conn_dropped:-0}/${r_conn_stale:-0}"
         fi
       else
         state="${vm_state:-OFFLINE}"
@@ -839,11 +842,12 @@ REMOTE_STATUS
         fin_epoch="N/A"
         burn_dig="N/A"
         pending_failed="N/A"
+        conn_diag="N/A"
       fi
     fi
 
-    printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
-      "$node" "$ip" "$state" "$cpu_usage" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics" "$fin_epoch" "$burn_dig" "$pending_failed"
+    printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %-16s %s\n" \
+      "$node" "$ip" "$state" "$cpu_usage" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics" "$fin_epoch" "$burn_dig" "$pending_failed" "$conn_diag"
   done
 }
 
