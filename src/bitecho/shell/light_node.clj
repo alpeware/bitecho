@@ -20,11 +20,14 @@
 ;; -----------------------------------------------------------------------------
 
 (defn strip-sensitive-keys
-  "Pure helper to remove ephemeral private keys from session state prior to persistence."
+  "Pure helper to remove ephemeral private keys from session state prior to persistence,
+   and dissoc transient runtime connection liveness keys so state.nippy never persists them."
   [state]
   (let [clean-sessions (into {} (for [[sid s] (:sessions state)]
                                   [sid (dissoc s :ephemeral-priv)]))]
-    (assoc state :sessions clean-sessions)))
+    (-> state
+        (assoc :sessions clean-sessions)
+        (dissoc :connected? :connection-error :conn-diagnostics))))
 
 (defn- extract-flag-value
   "Extracts the value following a flag from an argument vector."
@@ -81,10 +84,15 @@
                                "amount" (extract-long-flag args "--amount" 0)
                                "seq" (extract-long-flag args "--seq" nil)
                                "burn" (extract-long-flag args "--burn" 500)}
-                   "register-home-set" {"cmd" "register-home-set"
-                                        "home_nodes" (let [nodes (extract-flag-value args "--nodes" nil)]
-                                                       (if nodes (str/split nodes #",") []))
-                                        "burn" (extract-long-flag args "--burn" 500)}
+                   "register-home-set" (let [nodes (extract-flag-value args "--nodes" nil)
+                                             p (extract-long-flag args "--price" 10)
+                                             p-max (extract-long-flag args "--price-max" nil)
+                                             m {"cmd" "register-home-set"
+                                                "price" p
+                                                "home_nodes" (if nodes (str/split nodes #",") [])
+                                                "burn" (extract-long-flag args "--burn" 500)}]
+                                         (cond-> m
+                                           p-max (assoc "price_max" p-max)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -182,6 +190,169 @@
 ;; Validator Connection Manager
 ;; -----------------------------------------------------------------------------
 
+(defn init-conn-state
+  "Initializes the pure single-authority connection lifecycle state map."
+  []
+  {:generation 0
+   :phase :down
+   :ok? false
+   :channel-id nil
+   :send-fn nil
+   :node nil
+   :error nil
+   :last-error nil
+   :dropped 0
+   :ignored-stale 0})
+
+(defn transition-conn
+  "Pure reducer transitioning connection lifecycle state and returning [new-conn effects].
+   Phases: :down, :dialing, :open, :closing, :failed.
+   Ignores stale generation callbacks (< (:generation event) (:generation conn)) without mutating state."
+  [conn event]
+  (let [conn (merge (init-conn-state) conn)]
+    (if (and (contains? event :generation)
+             (some? (:generation event))
+             (< (:generation event) (:generation conn 0)))
+      [(update conn :ignored-stale (fnil inc 0))
+       [{:effect :ignore-stale :generation (:generation event)}]]
+      (case (:type event)
+        :dial-started
+        (let [next-gen (long (or (:generation event) (inc (:generation conn 0))))
+              node-to-close (:node conn)
+              effects (if node-to-close
+                        [{:effect :close-node :node node-to-close :generation (:generation conn 0)}]
+                        [])
+              new-conn (assoc conn
+                              :generation next-gen
+                              :phase :dialing
+                              :ok? false
+                              :channel-id nil
+                              :send-fn nil
+                              :node nil
+                              :error nil)]
+          [new-conn effects])
+
+        :dial-ok
+        (let [node-to-close (:node conn)
+              target-gen (long (or (:generation event) (:generation conn 0)))
+              effects (if (and node-to-close (not= node-to-close (:node event)))
+                        [{:effect :close-node :node node-to-close :generation (:generation conn 0)}]
+                        [])
+              new-conn (assoc conn
+                              :generation target-gen
+                              :phase :open
+                              :ok? true
+                              :channel-id (:channel-id event)
+                              :send-fn (:send-fn event)
+                              :node (:node event)
+                              :error nil)]
+          [new-conn effects])
+
+        :dial-failed
+        (let [err (or (:error event) "listener-disabled")
+              node-to-close (or (:node event) (:node conn))
+              effects (cond-> []
+                        node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
+                        true (conj {:effect :diagnose :reason :dial-failed :error err}))
+              new-conn (assoc conn
+                              :phase :failed
+                              :ok? false
+                              :channel-id nil
+                              :send-fn nil
+                              :node nil
+                              :error err
+                              :last-error err
+                              :dropped (inc (:dropped conn 0)))]
+          [new-conn effects])
+
+        :on-close
+        (let [err (or (:error event) "connection-closed")
+              node-to-close (:node conn)
+              effects (cond-> []
+                        node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
+                        true (conj {:effect :diagnose :reason :on-close :error err}))
+              new-conn (assoc conn
+                              :phase :failed
+                              :ok? false
+                              :channel-id nil
+                              :send-fn nil
+                              :node nil
+                              :error err
+                              :last-error err)]
+          [new-conn effects])
+
+        :send-failed
+        (let [err (or (:error event) "send-failed")
+              node-to-close (:node conn)
+              effects (cond-> []
+                        node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
+                        true (conj {:effect :diagnose :reason :send-failed :error err}))
+              new-conn (assoc conn
+                              :phase :failed
+                              :ok? false
+                              :channel-id nil
+                              :send-fn nil
+                              :node nil
+                              :error err
+                              :last-error err
+                              :dropped (inc (:dropped conn 0)))]
+          [new-conn effects])
+
+        :shutdown
+        (let [node-to-close (:node conn)
+              effects (if node-to-close
+                        [{:effect :close-node :node node-to-close :generation (:generation conn 0)}]
+                        [])
+              new-conn (assoc conn
+                              :phase :down
+                              :ok? false
+                              :channel-id nil
+                              :send-fn nil
+                              :node nil
+                              :error nil)]
+          [new-conn effects])
+
+        [conn []]))))
+
+(defn execute-conn-effects!
+  "Executes boundary side-effects resulting from connection state machine transitions."
+  [effects]
+  (doseq [eff effects]
+    (when (= :close-node (:effect eff))
+      (when-let [n (:node eff)]
+        (try (api/close! n) (catch Exception _ nil))))))
+
+(defn apply-conn-event!
+  "Atomically transitions conn-atom via transition-conn, executes effects outside the swap, and returns @conn-atom."
+  [conn-atom event]
+  (let [effects-ref (atom [])]
+    (swap! conn-atom (fn [conn]
+                       (let [[new-conn effects] (transition-conn conn event)]
+                         (reset! effects-ref effects)
+                         new-conn)))
+    (execute-conn-effects! @effects-ref)
+    @conn-atom))
+
+(defn conn-diagnostics-summary
+  "Constructs diagnostic summary map from a connection state map."
+  [conn]
+  {:phase (name (or (:phase conn) :down))
+   :generation (:generation conn 0)
+   :last_error (:last-error conn)
+   :dropped (:dropped conn 0)
+   :ignored_stale (:ignored-stale conn 0)})
+
+(defn- sync-conn-diagnostics!
+  "Updates state-atom with connection liveness and conn-diagnostics summary."
+  [state-atom conn-atom]
+  (when (and state-atom conn-atom)
+    (let [c @conn-atom
+          diag (conn-diagnostics-summary c)]
+      (swap! state-atom assoc
+             :connected? (boolean (:ok? c))
+             :connection-error (:error c)
+             :conn-diagnostics diag))))
+
 (defn- validate-node-fingerprints
   "Verifies DTLS fingerprints for all nodes in descriptor.
    Returns nil if valid, or {:ok? false :error \"bad-fingerprint\"} on mismatch."
@@ -196,12 +367,15 @@
       {:ok? false :error "bad-fingerprint"})))
 
 (defn connection-live?
-  "Checks if connection is marked ok and channel-id is present and state is connected."
+  "Checks if connection is marked ok and open, channel-id is present, and state is connected."
   [conn state]
   (and (boolean (:ok? conn))
+       (or (nil? (:phase conn)) (= :open (:phase conn)))
        (not (false? (:connected? state)))
-       (if-let [cid-atom (:channel-id conn)]
-         (some? @cid-atom)
+       (if-let [cid (:channel-id conn)]
+         (if (instance? clojure.lang.IDeref cid)
+           (some? @cid)
+           (some? cid))
          true)))
 
 (defn send-all-envelopes!
@@ -214,7 +388,7 @@
 
 (defn- dispatch-auto-reply!
   "Sends auto-reply envelopes, attempting reconnect if connection is lost, or failing closed."
-  [envelopes send-fn-atom state-atom event-out reconnect-fn]
+  [envelopes send-fn-atom state-atom conn-atom event-out reconnect-fn]
   (let [live? (and @send-fn-atom (not (false? (:connected? @state-atom))))
         sent? (when live?
                 (send-all-envelopes! @send-fn-atom envelopes))]
@@ -224,47 +398,78 @@
           (when-not (and (:ok? reconn)
                          (send-all-envelopes! (:send-fn reconn) envelopes))
             (let [err (or (:error reconn) "connection-closed")]
+              (when conn-atom
+                (apply-conn-event! conn-atom {:type :send-failed :error err}))
               (when state-atom
                 (swap! state-atom assoc :connected? false :connection-error err))
+              (sync-conn-diagnostics! state-atom conn-atom)
               (when event-out
                 (event-out {"event" "connection-failed" "connected" false "error" err})))))
         (let [err "connection-closed"]
+          (when conn-atom
+            (apply-conn-event! conn-atom {:type :send-failed :error err}))
           (when state-atom
             (swap! state-atom assoc :connected? false :connection-error err))
+          (sync-conn-diagnostics! state-atom conn-atom)
           (when event-out
             (event-out {"event" "connection-failed" "connected" false "error" err})))))))
 
 (defn make-client-callbacks
   "Creates callback handlers for client DataChannel connection."
   [client-node channel-id connected? send-fn-atom ctx]
-  (let [{:keys [identity state-atom conn-atom event-out reconnect-fn]} ctx]
+  (let [{:keys [identity state-atom conn-atom event-out reconnect-fn generation]} ctx]
     {:on-open (fn [evt]
-                (if-let [cid (:channel-id evt)]
-                  (reset! channel-id cid)
-                  (reset! channel-id (api/create-data-channel! client-node "bitecho" {:ordered true})))
-                (deliver connected? true))
+                (if (and conn-atom (some? generation) (< generation (:generation @conn-atom 0)))
+                  (do
+                    (apply-conn-event! conn-atom {:type :on-open :generation generation})
+                    (sync-conn-diagnostics! state-atom conn-atom))
+                  (do
+                    (if-let [cid (:channel-id evt)]
+                      (reset! channel-id cid)
+                      (reset! channel-id (api/create-data-channel! client-node "bitecho" {:ordered true})))
+                    (deliver connected? true))))
      :on-message (fn [evt]
-                   (when-let [cid (:channel-id evt)]
-                     (reset! channel-id cid))
-                   (when-let [payload (:payload evt)]
-                     (when state-atom
-                       (let [st @state-atom
-                             res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
-                         (reset! state-atom (:state res))
-                         (when (and event-out (seq (:stdout-events res)))
-                           (doseq [ev (:stdout-events res)]
-                             (event-out ev)))
-                         (when (seq (:net-envelopes res))
-                           (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom event-out reconnect-fn))))))
+                   (if (and conn-atom (some? generation) (< generation (:generation @conn-atom 0)))
+                     (do
+                       (apply-conn-event! conn-atom {:type :on-message :generation generation})
+                       (sync-conn-diagnostics! state-atom conn-atom))
+                     (do
+                       (when-let [cid (:channel-id evt)]
+                         (reset! channel-id cid))
+                       (when-let [payload (:payload evt)]
+                         (when state-atom
+                           (let [st @state-atom
+                                 res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
+                             (reset! state-atom (:state res))
+                             (when (and event-out (seq (:stdout-events res)))
+                               (doseq [ev (:stdout-events res)]
+                                 (event-out ev)))
+                             (when (seq (:net-envelopes res))
+                               (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn))))))))
      :on-error (fn [evt]
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (deliver connected? :bad-fingerprint)))
      :on-close (fn [_]
-                 (reset! channel-id nil)
-                 (when conn-atom
-                   (swap! conn-atom assoc :ok? false :error "connection-closed"))
-                 (when state-atom
-                   (swap! state-atom assoc :connected? false :connection-error "connection-closed")))}))
+                 (if conn-atom
+                   (if (and (some? generation)
+                            (pos? (:generation @conn-atom 0))
+                            (not= generation (:generation @conn-atom)))
+                     (do
+                       (apply-conn-event! conn-atom {:type :on-close :generation generation})
+                       (sync-conn-diagnostics! state-atom conn-atom))
+                     (do
+                       (when (instance? clojure.lang.Atom channel-id)
+                         (reset! channel-id nil))
+                       (apply-conn-event! conn-atom (cond-> {:type :on-close}
+                                                      (some? generation) (assoc :generation generation)))
+                       (when state-atom
+                         (swap! state-atom assoc :connected? false :connection-error "connection-closed"))
+                       (sync-conn-diagnostics! state-atom conn-atom)))
+                   (do
+                     (when (instance? clojure.lang.Atom channel-id)
+                       (reset! channel-id nil))
+                     (when state-atom
+                       (swap! state-atom assoc :connected? false :connection-error "connection-closed")))))}))
 
 (defn- dial-single-node!
   "Dials a single validator node via WebRTC DataChannel (UDP, TCP, or HTTP CONNECT proxy)."
@@ -281,7 +486,8 @@
                                           :state-atom (:state-atom opts)
                                           :conn-atom (:conn-atom opts)
                                           :event-out (:event-out opts)
-                                          :reconnect-fn (:reconnect-fn opts)})
+                                          :reconnect-fn (:reconnect-fn opts)
+                                          :generation (:generation opts)})
         transport (:transport opts)
         target-host (if (= transport :connect)
                       (or (:ingress-host node) (:ip node) "127.0.0.1")
@@ -371,23 +577,44 @@
         (if sent?
           (do
             (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+            (sync-conn-diagnostics! state-atom conn-atom)
             (save-light-state! state-file @state-atom)
             (when-let [resp (:response res)]
               (emit-json-line! out-writer resp)))
-          (let [reconn (connect-validators! identity bootstrap conn-opts)]
-            (reset! conn-atom reconn)
-            (if (and (:ok? reconn)
-                     (send-all-envelopes! (:send-fn reconn) (:net-envelopes res)))
-              (do
-                (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
-                (save-light-state! state-file @state-atom)
-                (when-let [resp (:response res)]
-                  (emit-json-line! out-writer resp)))
-              (let [err (or (:error @conn-atom) "listener-disabled")]
-                (swap! state-atom assoc :connected? false :connection-error err)
-                (emit-json-line! out-writer {"ok" false "error" err}))))))
+          (do
+            (when conn-atom
+              (apply-conn-event! conn-atom {:type :dial-started}))
+            (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
+                  opts-with-gen (assoc (or conn-opts {}) :generation target-gen)
+                  reconn (connect-validators! identity bootstrap opts-with-gen)]
+              (if (:ok? reconn)
+                (do
+                  (when conn-atom
+                    (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen)))
+                  (if (send-all-envelopes! (:send-fn reconn) (:net-envelopes res))
+                    (do
+                      (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                      (sync-conn-diagnostics! state-atom conn-atom)
+                      (save-light-state! state-file @state-atom)
+                      (when-let [resp (:response res)]
+                        (emit-json-line! out-writer resp)))
+                    (let [err "send-failed"]
+                      (when conn-atom
+                        (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen}))
+                      (when state-atom
+                        (swap! state-atom assoc :connected? false :connection-error err))
+                      (sync-conn-diagnostics! state-atom conn-atom)
+                      (emit-json-line! out-writer {"ok" false "error" err}))))
+                (let [err (or (:error reconn) "listener-disabled")]
+                  (when conn-atom
+                    (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen}))
+                  (when state-atom
+                    (swap! state-atom assoc :connected? false :connection-error err))
+                  (sync-conn-diagnostics! state-atom conn-atom)
+                  (emit-json-line! out-writer {"ok" false "error" err})))))))
       (do
         (reset! state-atom (:state res))
+        (sync-conn-diagnostics! state-atom conn-atom)
         (save-light-state! state-file @state-atom)
         (when-let [resp (:response res)]
           (emit-json-line! out-writer resp))))))
@@ -405,17 +632,33 @@
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (:autonomous? opts false)}))
         state-atom (atom initial-state)
-        conn-atom (atom nil)
+        conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
         event-out (fn [ev] (emit-json-line! out-writer ev))
         conn-opts-atom (atom nil)
         reconnect-fn (fn []
-                       (let [reconn (connect-validators! identity bootstrap @conn-opts-atom)]
-                         (reset! conn-atom reconn)
-                         (swap! state-atom assoc
-                                :connected? (boolean (:ok? reconn))
-                                :connection-error (:error reconn))
-                         reconn))
+                       (when conn-atom
+                         (apply-conn-event! conn-atom {:type :dial-started}))
+                       (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
+                             opts-with-gen (assoc (or @conn-opts-atom {}) :generation target-gen)
+                             reconn (connect-validators! identity bootstrap opts-with-gen)]
+                         (if (:ok? reconn)
+                           (do
+                             (when conn-atom
+                               (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen)))
+                             (swap! state-atom assoc
+                                    :connected? true
+                                    :connection-error nil)
+                             (sync-conn-diagnostics! state-atom conn-atom)
+                             reconn)
+                           (let [err (or (:error reconn) "listener-disabled")]
+                             (when conn-atom
+                               (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen}))
+                             (swap! state-atom assoc
+                                    :connected? false
+                                    :connection-error err)
+                             (sync-conn-diagnostics! state-atom conn-atom)
+                             reconn))))
         conn-opts (assoc opts
                          :state-atom state-atom
                          :conn-atom conn-atom

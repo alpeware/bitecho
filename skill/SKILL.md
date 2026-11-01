@@ -138,7 +138,7 @@ Queries and parses the configured bootstrap descriptor to discover available val
 ### `register-home-set`
 Registers the light node's rendezvous home node set ($m \ge 3$) with the validator mesh at uniform price $p_B$.
 
-- **CLI**: `clojure -M:light-node register-home-set --price 10 [--price-max 20]`
+- **CLI**: `clojure -M:light-node register-home-set --price 10 [--price-max 20] [--nodes <node1,node2,...>] [--burn <burn-amt>]`
 - **JSONL**: `{"cmd": "register-home-set", "price": 10, "price_max": 20}`
 - **Response**:
   ```json
@@ -155,7 +155,7 @@ Registers the light node's rendezvous home node set ($m \ge 3$) with the validat
 ### `offer`
 Initiates a sealed channel session offer to a target callee public key, burning anti-spam ECHO tokens.
 
-- **CLI**: `clojure -M:light-node offer --callee <pubkey-hex> --price <price> [--burn <burn-amt>]`
+- **CLI**: `clojure -M:light-node offer --callee <pubkey-hex> --price <price> [--burn <burn-amt>] [--home-node <node-id>]`
 - **JSONL**: `{"cmd": "offer", "callee": "<pubkey-hex>", "price": 10, "burn": 500}`
 - **Response**:
   ```json
@@ -174,7 +174,7 @@ Initiates a sealed channel session offer to a target callee public key, burning 
 ### `accept`
 Manually accepts a pending channel offer received from an initiator (automatically called if `--autonomous` is set).
 
-- **CLI**: `clojure -M:light-node accept --session <session-id>`
+- **CLI**: `clojure -M:light-node accept --session <session-id>` (or `--session-id <session-id>`)
 - **JSONL**: `{"cmd": "accept", "session_id": "<session-id>"}`
 - **Response**:
   ```json
@@ -191,7 +191,7 @@ Manually accepts a pending channel offer received from an initiator (automatical
 ### `send`
 Encrypts and dispatches a sealed message (from UTF-8 text or raw hex bytes) over an open channel session using ChaCha20-Poly1305 AEAD.
 
-- **CLI**: `clojure -M:light-node send --session <session-id> --text "Hello peer" [--burn <burn-amt>]`
+- **CLI**: `clojure -M:light-node send --session <session-id> --text "Hello peer" [--burn <burn-amt>]` (or `--session-id <session-id>`)
 - **CLI (raw bytes)**: `clojure -M:light-node send --session <session-id> --payload-hex <hex-data>`
 - **JSONL**:
   ```json
@@ -237,7 +237,7 @@ Retrieves and drains all decrypted inbound messages from local memory, along wit
 ### `close`
 Signs and broadcasts a channel close message, wiping session ephemeral keys and advancing session state to `closed`.
 
-- **CLI**: `clojure -M:light-node close --session <session-id>`
+- **CLI**: `clojure -M:light-node close --session <session-id>` (or `--session-id <session-id>`)
 - **JSONL**: `{"cmd": "close", "session_id": "<session-id>"}`
 - **Response**:
   ```json
@@ -253,7 +253,7 @@ Signs and broadcasts a channel close message, wiping session ephemeral keys and 
 ### `transfer`
 Submits an account balance transfer to another public key. Consecutive transfers automatically increment the sequence number (`seq`) and chain causal dependencies (`deps`).
 
-- **CLI**: `clojure -M:light-node transfer --receiver <pubkey-hex> --amount 100` (also accepts `--recipient <pubkey-hex>` and optional `--seq <num>`)
+- **CLI**: `clojure -M:light-node transfer --receiver <pubkey-hex> --amount 100` (also accepts `--recipient <pubkey-hex>`, optional `--seq <num>`, and optional `--burn <burn-amt>`)
 - **JSONL**: `{"cmd": "transfer", "receiver": "<pubkey-hex>", "amount": 100}` (or `"recipient"`)
 - **Response**:
   ```json

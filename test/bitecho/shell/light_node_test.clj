@@ -10,6 +10,9 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]
             [datachannel.api :as api])
   (:import [java.io PrintWriter StringWriter]
            [java.net ServerSocket Socket]
@@ -937,3 +940,256 @@
         (finally
           (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
                 (reverse (file-seq (io/file state-dir)))))))))
+
+;; -----------------------------------------------------------------------------
+;; 9. Generative Connection Lifecycle State Machine Spec (Rules 1, 4, 5)
+;; -----------------------------------------------------------------------------
+
+(def ^:private gen-event-type
+  (gen/elements [:dial-started :dial-ok :dial-failed :on-close :send-failed :shutdown]))
+
+(def ^:private gen-gen-mode
+  (gen/frequency [[60 (gen/return :current)]
+                  [25 (gen/return :stale)]
+                  [15 (gen/return :future)]]))
+
+(def ^:private gen-lifecycle-step
+  (gen/hash-map :type gen-event-type
+                :gen-mode gen-gen-mode
+                :error-msg (gen/elements [nil "err-timeout" "err-rst" "err-down"])))
+
+(def ^:private gen-lifecycle-sequence
+  (gen/vector gen-lifecycle-step 5 40))
+
+(defspec ^{:doc "Property: Pure single-authority connection lifecycle state machine invariants"}
+  conn-lifecycle-state-machine-spec 100
+  (prop/for-all [steps gen-lifecycle-sequence]
+                (let [initial-conn (light-shell/init-conn-state)]
+                  (loop [idx 0
+                         conn initial-conn
+                         installed-nodes []
+                         closed-nodes []]
+                    (if (>= idx (count steps))
+                      true
+                      (let [step (nth steps idx)
+                            evt-type (:type step)
+                            curr-gen (:generation conn 0)
+                            gen-mode (:gen-mode step)
+                            evt-gen (case gen-mode
+                                      :current (if (= evt-type :dial-started) nil curr-gen)
+                                      :stale (if (pos? curr-gen) (max 0 (dec curr-gen)) -1)
+                                      :future (inc curr-gen))
+                            mock-node (when (= evt-type :dial-ok) {:node-id idx})
+                            mock-cid (when (= evt-type :dial-ok) (atom (str "cid-" idx)))
+                            mock-send-fn (when (= evt-type :dial-ok) (constantly true))
+                            event (cond-> {:type evt-type}
+                                    (some? evt-gen) (assoc :generation evt-gen)
+                                    (= evt-type :dial-ok) (assoc :node mock-node
+                                                                 :channel-id mock-cid
+                                                                 :send-fn mock-send-fn)
+                                    (:error-msg step) (assoc :error (:error-msg step)))
+                            [new-conn effects] (light-shell/transition-conn conn event)
+                            stale? (and (some? (:generation event)) (< (:generation event) (:generation conn 0)))
+                            new-installed (if (and (= evt-type :dial-ok) (not stale?))
+                                            (conj installed-nodes mock-node)
+                                            installed-nodes)
+                            newly-closed (keep (fn [eff] (when (= :close-node (:effect eff)) (:node eff))) effects)
+                            new-closed (into closed-nodes newly-closed)
+
+                ;; Invariant 1 (Liveness Agreement)
+                            inv1 (and (= (boolean (:ok? new-conn)) (= :open (:phase new-conn)))
+                                      (if (:ok? new-conn)
+                                        (and (some? (:send-fn new-conn))
+                                             (some? (:channel-id new-conn)))
+                                        true))
+
+                ;; Invariant 2 (Stale Generation Isolation)
+                            inv2 (if stale?
+                                   (and (= (:phase conn) (:phase new-conn))
+                                        (= (:ok? conn) (:ok? new-conn))
+                                        (= (:channel-id conn) (:channel-id new-conn))
+                                        (= (:send-fn conn) (:send-fn new-conn))
+                                        (= (:node conn) (:node new-conn))
+                                        (= (:ignored-stale new-conn) (inc (:ignored-stale conn 0)))
+                                        (= effects [{:effect :ignore-stale :generation (:generation event)}]))
+                                   true)
+
+                ;; Invariant 3 (Superseded Node Closed Exactly Once)
+                            inv3 (and (= (count new-closed) (count (distinct new-closed)))
+                                      (every? (set new-installed) new-closed)
+                                      (if-let [active-node (:node new-conn)]
+                                        (not (contains? (set new-closed) active-node))
+                                        true)
+                                      (= (set new-installed)
+                                         (set (cond-> new-closed
+                                                (:node new-conn) (conj (:node new-conn))))))
+
+                ;; Invariant 4 (No Silent Drops)
+                            inv4 (if (and (not stale?) (#{:dial-failed :send-failed} evt-type))
+                                   (and (= (:dropped new-conn) (inc (:dropped conn 0)))
+                                        (boolean (some (fn [eff] (and (= :diagnose (:effect eff)) (some? (:error eff)))) effects)))
+                                   true)]
+
+                        (if (and inv1 inv2 inv3 inv4)
+                          (recur (inc idx) new-conn new-installed new-closed)
+                          false)))))))
+
+;; -----------------------------------------------------------------------------
+;; 10. Stale Callback Isolation & Superseded Node Cleanup Test (Rule 4, 5)
+;; -----------------------------------------------------------------------------
+
+(deftest test-stale-callback-isolation-and-node-cleanup
+  (testing "Superseded node closed on reconnect in handle-serve-line!, stale callbacks ignored, sensitive keys stripped on persist"
+    (let [temp-dir (Files/createTempDirectory "bitecho-test-stale" (into-array FileAttribute []))
+          state-dir (str temp-dir)
+          state-file (str (io/file state-dir "state.nippy"))
+          identity (light-shell/load-or-create-light-identity! state-dir)
+          descriptor {:network :devnet
+                      :treasury-pubkey (:pubkey-hex identity)
+                      :custody-pubkey (:pubkey-hex identity)
+                      :nodes {:node1 {:node-id :node1
+                                      :ip "127.0.0.1"
+                                      :port 5000
+                                      :agent-port 5010
+                                      :pubkey (:pubkey-hex identity)
+                                      :fingerprint (:fingerprint identity)
+                                      :ice-ufrag "u1" :ice-pwd "p1"}}}
+          initial-st (assoc (light-core/init-light-state identity {:bootstrap descriptor :epoch 1})
+                            :connected? true
+                            :connection-error nil
+                            :conn-diagnostics {:phase "open" :generation 1 :last_error nil :dropped 0 :ignored_stale 0})
+          state-atom (atom initial-st)
+          node-gen1 {:id "mock-node-gen1"}
+          node-gen2 {:id "mock-node-gen2"}
+          closed-nodes (atom [])
+          cid1 (atom "cid-1")
+          cid2 (atom "cid-2")
+          conn-atom (atom {:generation 1
+                           :phase :open
+                           :ok? true
+                           :channel-id cid1
+                           :send-fn (fn [_] false)
+                           :node node-gen1
+                           :error nil
+                           :last-error nil
+                           :dropped 0
+                           :ignored-stale 0})
+          dialer-mock (fn [_id _desc _opts]
+                        {:ok? true
+                         :node node-gen2
+                         :channel-id cid2
+                         :send-fn (constantly true)})
+          conn-opts {:dialer-fn dialer-mock}
+          sw (StringWriter.)
+          out-writer (PrintWriter. sw true)
+          ctx {:state-atom state-atom
+               :conn-atom conn-atom
+               :out-writer out-writer
+               :state-file state-file
+               :identity identity
+               :bootstrap descriptor
+               :conn-opts conn-opts}
+          callee-pub (sample-pubkey-hex)
+          offer-json (json/write-str {"cmd" "offer" "callee" callee-pub "price" 10 "burn" 500})]
+      (try
+        (with-redefs [api/close! (fn [node] (swap! closed-nodes conj node))]
+          ;; 1. Send failure on gen1 triggers reconnect to gen2
+          (light-shell/handle-serve-line! offer-json ctx)
+
+          ;; Superseded node-gen1 must have been closed
+          (is (= [node-gen1] @closed-nodes))
+          ;; conn-atom must have transitioned to generation 2
+          (is (= 2 (:generation @conn-atom)))
+          (is (= :open (:phase @conn-atom)))
+          (is (= true (:ok? @conn-atom)))
+          (is (= node-gen2 (:node @conn-atom)))
+
+          ;; 2. Simulate stale :on-close callback from generation 1
+          (let [connected? (promise)
+                send-fn-atom (atom (constantly true))
+                cbs-gen1 (light-shell/make-client-callbacks node-gen1 cid1 connected? send-fn-atom
+                                                            {:identity identity
+                                                             :state-atom state-atom
+                                                             :conn-atom conn-atom
+                                                             :generation 1})]
+            ((:on-close cbs-gen1) nil)
+
+            ;; Stale callback must be ignored!
+            (is (= 2 (:generation @conn-atom)))
+            (is (= :open (:phase @conn-atom)))
+            (is (= true (:ok? @conn-atom)))
+            (is (= true (:connected? @state-atom)))
+            (is (nil? (:connection-error @state-atom)))
+            (is (= 1 (:ignored-stale @conn-atom)))
+            ;; node-gen2 must NOT be closed by stale callback
+            (is (= [node-gen1] @closed-nodes)))
+
+          ;; 3. Verify strip-sensitive-keys and state persistence never save transient runtime liveness
+          (swap! state-atom assoc
+                 :connected? true
+                 :connection-error "transient"
+                 :conn-diagnostics {:phase "open" :generation 2 :last_error nil :dropped 0 :ignored_stale 1})
+          (light-shell/save-light-state! state-file @state-atom)
+          (let [loaded (light-shell/load-light-state! state-file)]
+            (is (nil? (:connected? loaded)))
+            (is (nil? (:connection-error loaded)))
+            (is (nil? (:conn-diagnostics loaded)))
+            (is (= (:pubkey @state-atom) (:pubkey loaded)))))
+        (finally
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file state-dir)))))))))
+
+;; -----------------------------------------------------------------------------
+;; 11. CLI & skill/SKILL.md Flag/Verb Inventory Test (Rule 6)
+;; -----------------------------------------------------------------------------
+
+(deftest test-cli-and-skill-flag-inventory
+  (testing "Bidirectional CLI verbs and flags inventory between skill/SKILL.md and parse-light-node-args"
+    (let [skill-md (slurp "skill/SKILL.md")
+          documented-flags (set (re-seq #"--[a-z][a-z-]*" skill-md))
+          verbs ["serve" "identity" "status" "discover" "register-home-set"
+                 "offer" "accept" "send" "inbox" "close" "transfer"]
+          flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
+                  "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
+                  "--session" "--session-id" "--text" "--payload-hex" "--receiver"
+                  "--recipient" "--amount" "--seq" "--nodes"}]
+      ;; All verbs documented in SKILL.md
+      (doseq [v verbs]
+        (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
+      ;; Exact bidirectional flag inventory parity between SKILL.md and parser test suite
+      (is (= flags documented-flags))
+      ;; Handled by parser:
+      ;; Verbs
+      (is (= :serve (:mode (light-shell/parse-light-node-args ["serve"]))))
+      (is (= {"cmd" "identity"} (:cmd-map (light-shell/parse-light-node-args ["identity"]))))
+      (is (= {"cmd" "status"} (:cmd-map (light-shell/parse-light-node-args ["status"]))))
+      (is (= {"cmd" "discover"} (:cmd-map (light-shell/parse-light-node-args ["discover"]))))
+      (is (= "register-home-set" (get-in (light-shell/parse-light-node-args ["register-home-set"]) [:cmd-map "cmd"])))
+      (is (= "offer" (get-in (light-shell/parse-light-node-args ["offer"]) [:cmd-map "cmd"])))
+      (is (= "accept" (get-in (light-shell/parse-light-node-args ["accept"]) [:cmd-map "cmd"])))
+      (is (= "send" (get-in (light-shell/parse-light-node-args ["send"]) [:cmd-map "cmd"])))
+      (is (= {"cmd" "inbox"} (:cmd-map (light-shell/parse-light-node-args ["inbox"]))))
+      (is (= "close" (get-in (light-shell/parse-light-node-args ["close"]) [:cmd-map "cmd"])))
+      (is (= "transfer" (get-in (light-shell/parse-light-node-args ["transfer"]) [:cmd-map "cmd"])))
+      ;; Flags (all 20 flags tested end-to-end)
+      (is (= "foo/bar" (:state-dir (light-shell/parse-light-node-args ["status" "--state-dir" "foo/bar"]))))
+      (is (= "boot.edn" (:bootstrap (light-shell/parse-light-node-args ["status" "--bootstrap" "boot.edn"]))))
+      (is (true? (:autonomous? (light-shell/parse-light-node-args ["serve" "--autonomous"]))))
+      (is (= :tcp (:transport (light-shell/parse-light-node-args ["status" "--transport" "tcp"]))))
+      (is (= "http://proxy.internal:8080" (:proxy (light-shell/parse-light-node-args ["status" "--proxy" "http://proxy.internal:8080"]))))
+      (is (= 5000 (:timeout-ms (light-shell/parse-light-node-args ["status" "--timeout-ms" "5000"]))))
+      (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["offer" "--callee" "deadbeef"]) [:cmd-map "callee"])))
+      (is (= 42 (get-in (light-shell/parse-light-node-args ["offer" "--price" "42"]) [:cmd-map "price"])))
+      (is (= 10 (get-in (light-shell/parse-light-node-args ["register-home-set" "--price" "10" "--price-max" "25"]) [:cmd-map "price"])))
+      (is (= 25 (get-in (light-shell/parse-light-node-args ["register-home-set" "--price" "10" "--price-max" "25"]) [:cmd-map "price_max"])))
+      (is (= 700 (get-in (light-shell/parse-light-node-args ["offer" "--burn" "700"]) [:cmd-map "burn"])))
+      (is (= "val-node-1" (get-in (light-shell/parse-light-node-args ["offer" "--home-node" "val-node-1"]) [:cmd-map "home_node"])))
+      (is (= "sess-abc" (get-in (light-shell/parse-light-node-args ["accept" "--session" "sess-abc"]) [:cmd-map "session_id"])))
+      (is (= "sess-123" (get-in (light-shell/parse-light-node-args ["accept" "--session-id" "sess-123"]) [:cmd-map "session_id"])))
+      (is (= "hello world" (get-in (light-shell/parse-light-node-args ["send" "--text" "hello world"]) [:cmd-map "text"])))
+      (is (= "010203" (get-in (light-shell/parse-light-node-args ["send" "--payload-hex" "010203"]) [:cmd-map "payload_hex"])))
+      (is (= "recv-pub" (get-in (light-shell/parse-light-node-args ["transfer" "--receiver" "recv-pub"]) [:cmd-map "receiver"])))
+      (is (= "rcpt-pub" (get-in (light-shell/parse-light-node-args ["transfer" "--recipient" "rcpt-pub"]) [:cmd-map "recipient"])))
+      (is (= 100 (get-in (light-shell/parse-light-node-args ["transfer" "--amount" "100"]) [:cmd-map "amount"])))
+      (is (= 7 (get-in (light-shell/parse-light-node-args ["transfer" "--seq" "7"]) [:cmd-map "seq"])))
+      (is (= ["n1" "n2"] (get-in (light-shell/parse-light-node-args ["register-home-set" "--nodes" "n1,n2"]) [:cmd-map "home_nodes"]))))))

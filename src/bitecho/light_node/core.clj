@@ -74,7 +74,10 @@
 (defn- exec-register-home-set [state cmd-map privkey-bytes]
   (let [p-b (long (or (get cmd-map "price") 0))
         p-b-max (long (or (get cmd-map "price_max") p-b 0))
-        candidates (vec (keys (get-in state [:bootstrap :nodes])))
+        explicit-nodes (seq (remove str/blank? (map str (get cmd-map "home_nodes"))))
+        candidates (if explicit-nodes
+                     (mapv keyword explicit-nodes)
+                     (vec (keys (get-in state [:bootstrap :nodes]))))
         candidate-maps (mapv (fn [cid] {:node-id cid :responsive? true :latency-ms 10 :price p-b}) candidates)
         hs (rendezvous/register-home-set candidate-maps p-b p-b-max)
         my-pub (:pubkey state)
@@ -316,19 +319,20 @@
   (let [sessions-summary (vec (for [[_ s] (:sessions state)]
                                 (select-keys s [:session-id :peer :role :state :tx-seq :epoch])))]
     {:state state
-     :response {"ok" true
-                "connected" (boolean (:connected? state false))
-                "connection_error" (:connection-error state)
-                "pubkey" (:pubkey state)
-                "autonomous" (:autonomous? state)
-                "epoch" (:epoch state)
-                "sessions" sessions-summary
-                "pending_offers_count" (count (:pending-offers state))
-                "inbox_count" (count (:inbox state))
-                "accounting" {"scope" "local-non-consensus"
-                              "note" "Locally computed devnet totals; never consensus finalized"
-                              "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
-                              "vouchers_count" (count (:vouchers state []))}}
+     :response (cond-> {"ok" true
+                        "connected" (boolean (:connected? state false))
+                        "connection_error" (:connection-error state)
+                        "pubkey" (:pubkey state)
+                        "autonomous" (:autonomous? state)
+                        "epoch" (:epoch state)
+                        "sessions" sessions-summary
+                        "pending_offers_count" (count (:pending-offers state))
+                        "inbox_count" (count (:inbox state))
+                        "accounting" {"scope" "local-non-consensus"
+                                      "note" "Locally computed devnet totals; never consensus finalized"
+                                      "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
+                                      "vouchers_count" (count (:vouchers state []))}}
+                 (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state)))
      :net-envelopes []
      :stdout-events []}))
 
