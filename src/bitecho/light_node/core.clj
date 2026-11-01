@@ -50,11 +50,12 @@
 (defn- exec-discover [state]
   (let [bs (:bootstrap state)
         nodes (for [[k v] (or (:nodes bs) {})]
-                {"node_id" (name k)
-                 "ip" (:ip v)
-                 "port" (:port v)
-                 "agent_port" (:agent-port v)
-                 "fingerprint" (:fingerprint v)})]
+                (cond-> {"node_id" (name k)
+                         "ip" (:ip v)
+                         "port" (:port v)
+                         "agent_port" (:agent-port v)
+                         "fingerprint" (:fingerprint v)}
+                  (:agent-tcp-port v) (assoc "agent_tcp_port" (:agent-tcp-port v))))]
     {:state state
      :response {"ok" true
                 "network" (name (or (:network bs) :devnet))

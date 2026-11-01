@@ -97,12 +97,15 @@
         default-bootstrap "https://bitecho.org/devnet/bootstrap.txt"
         state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
         bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
-        autonomous? (some #{"--autonomous"} clean-args)]
+        autonomous? (some #{"--autonomous"} clean-args)
+        transport-str (extract-flag-value clean-args "--transport" "udp")
+        transport (if (= (str/lower-case transport-str) "tcp") :tcp :udp)]
     {:mode (if serve? :serve :one-shot)
      :verb verb
      :state-dir state-dir
      :bootstrap bootstrap-path
      :autonomous? (boolean autonomous?)
+     :transport transport
      :cmd-map (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))}))
 
 ;; -----------------------------------------------------------------------------
@@ -166,8 +169,37 @@
                 nodes)
       {:ok? false :error "bad-fingerprint"})))
 
+(defn- make-client-callbacks
+  "Creates callback handlers for client DataChannel connection."
+  [client-node channel-id connected? send-fn-atom ctx]
+  (let [{:keys [identity state-atom event-out]} ctx]
+    {:on-open (fn [evt]
+                (if-let [cid (:channel-id evt)]
+                  (reset! channel-id cid)
+                  (reset! channel-id (api/create-data-channel! client-node "bitecho" {:ordered true})))
+                (deliver connected? true))
+     :on-message (fn [evt]
+                   (when-let [cid (:channel-id evt)]
+                     (reset! channel-id cid))
+                   (when-let [payload (:payload evt)]
+                     (when state-atom
+                       (let [st @state-atom
+                             res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
+                         (reset! state-atom (:state res))
+                         (when (and event-out (seq (:stdout-events res)))
+                           (doseq [ev (:stdout-events res)]
+                             (event-out ev)))
+                         (when (and (seq (:net-envelopes res)) @send-fn-atom)
+                           (doseq [env (:net-envelopes res)]
+                             (@send-fn-atom env)))))))
+     :on-error (fn [evt]
+                 (when (str/includes? (str (:message evt)) "Fingerprint")
+                   (deliver connected? :bad-fingerprint)))
+     :on-close (fn [_]
+                 (reset! channel-id nil))}))
+
 (defn- dial-single-node!
-  "Dials a single validator node via WebRTC DataChannel."
+  "Dials a single validator node via WebRTC DataChannel (UDP or TCP)."
   [identity node opts]
   (let [client-node (api/create-node {:port 0
                                       :cert-data (:cert-data identity)
@@ -176,45 +208,31 @@
         channel-id (atom nil)
         connected? (promise)
         send-fn-atom (atom nil)
-        state-atom (:state-atom opts)
-        event-out (:event-out opts)
-        callbacks {:on-open (fn [evt]
-                              (if-let [cid (:channel-id evt)]
-                                (reset! channel-id cid)
-                                (reset! channel-id (api/create-data-channel! client-node "bitecho" {:ordered true})))
-                              (deliver connected? true))
-                   :on-message (fn [evt]
-                                 (when-let [cid (:channel-id evt)]
-                                   (reset! channel-id cid))
-                                 (when-let [payload (:payload evt)]
-                                   (when state-atom
-                                     (let [st @state-atom
-                                           res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
-                                       (reset! state-atom (:state res))
-                                       (when (and event-out (seq (:stdout-events res)))
-                                         (doseq [ev (:stdout-events res)]
-                                           (event-out ev)))
-                                       (when (and (seq (:net-envelopes res)) @send-fn-atom)
-                                         (doseq [env (:net-envelopes res)]
-                                           (@send-fn-atom env)))))))
-                   :on-error (fn [evt]
-                               (when (str/includes? (str (:message evt)) "Fingerprint")
-                                 (deliver connected? :bad-fingerprint)))
-                   :on-close (fn [_]
-                               (reset! channel-id nil))}
+        callbacks (make-client-callbacks client-node channel-id connected? send-fn-atom
+                                         {:identity identity
+                                          :state-atom (:state-atom opts)
+                                          :event-out (:event-out opts)})
+        target-port (if (= (:transport opts) :tcp)
+                      (int (or (:agent-tcp-port node) (:agent-port node) (:port node) 5010))
+                      (int (or (:agent-port node) (:port node) 5010)))
         remote-sdp {:ip (or (:ip node) "127.0.0.1")
-                    :port (int (or (:agent-port node) (:port node) 5010))
+                    :port target-port
                     :fingerprint (identity/normalize-fingerprint (:fingerprint node))
                     :remote-ice-ufrag (or (:ice-ufrag node) "ufrag")
                     :remote-ice-pwd (or (:ice-pwd node) "pwd")}]
-    (api/start! client-node remote-sdp callbacks)
+    (if (= (:transport opts) :tcp)
+      (try
+        (api/start-tcp! client-node remote-sdp callbacks)
+        (catch Exception _
+          (deliver connected? :connect-failed)))
+      (api/start! client-node remote-sdp callbacks))
     (let [timeout-ms (long (or (:timeout-ms opts) 2500))
           res (deref connected? timeout-ms :timeout)]
       (cond
         (= res :bad-fingerprint)
         (do (try (api/close! client-node) (catch Exception _ nil))
             {:ok? false :error "bad-fingerprint"})
-        (= res :timeout)
+        (or (= res :timeout) (= res :connect-failed))
         (do (try (api/close! client-node) (catch Exception _ nil))
             {:ok? false :error "listener-disabled"})
         :else

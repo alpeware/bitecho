@@ -157,6 +157,30 @@
               (when mesh-node (try ((:stop! mesh-node)) (catch Exception _ nil)))
               (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
                     (reverse (file-seq (io/file (str val-dir))))))))
+
+        ;; 4. TCP Bad fingerprint rejection
+        (let [bad-desc-tcp {:network :devnet
+                            :nodes {:node1 {:node-id :node1
+                                            :ip "127.0.0.1"
+                                            :port 5000
+                                            :agent-tcp-port 5010
+                                            :fingerprint "INVALID:FINGERPRINT:STRING"
+                                            :ice-ufrag "u1" :ice-pwd "p1"}}}
+              res-tcp1 (light-shell/connect-validators! id bad-desc-tcp {:transport :tcp})]
+          (is (= false (:ok? res-tcp1)))
+          (is (= "bad-fingerprint" (:error res-tcp1))))
+
+        ;; 5. TCP Listener disabled (connect refused or timeout to dead port)
+        (let [disabled-desc-tcp {:network :devnet
+                                 :nodes {:node1 {:node-id :node1
+                                                 :ip "127.0.0.1"
+                                                 :port 5000
+                                                 :agent-tcp-port 5999
+                                                 :fingerprint (identity/normalize-fingerprint (:fingerprint id))
+                                                 :ice-ufrag "u1" :ice-pwd "p1"}}}
+              res-tcp2 (light-shell/connect-validators! id disabled-desc-tcp {:transport :tcp :timeout-ms 200})]
+          (is (= false (:ok? res-tcp2)))
+          (is (= "listener-disabled" (:error res-tcp2))))
         (finally
           (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
                 (reverse (file-seq (io/file (str temp-dir))))))))))
@@ -206,7 +230,15 @@
     ;; One-shot status
     (let [p-status (light-shell/parse-light-node-args ["status"])]
       (is (= :one-shot (:mode p-status)))
-      (is (= {"cmd" "status"} (:cmd-map p-status))))))
+      (is (= {"cmd" "status"} (:cmd-map p-status))))
+
+    ;; Transport flag
+    (let [p-tcp (light-shell/parse-light-node-args ["status" "--transport" "tcp"])
+          p-udp (light-shell/parse-light-node-args ["status" "--transport" "udp"])
+          p-def (light-shell/parse-light-node-args ["status"])]
+      (is (= :tcp (:transport p-tcp)))
+      (is (= :udp (:transport p-udp)))
+      (is (= :udp (:transport p-def))))))
 
 ;; -----------------------------------------------------------------------------
 ;; 5. Real UDP WebRTC DataChannel End-to-End Two-Party Conversation
@@ -296,6 +328,133 @@
 
           ;; 2. Alice sends a sealed message to Bob
           (let [secret-msg "Secret payload over WebRTC DataChannel"
+                send-res (light-core/handle-command @st-alice
+                                                    {"cmd" "send" "session_id" session-id "text" secret-msg "burn" 500}
+                                                    (:privkey-bytes alice-id))]
+            (reset! st-alice (:state send-res))
+            (is (= true (get-in send-res [:response "ok"])))
+            (doseq [env (:net-envelopes send-res)]
+              ((:send-fn alice-conn) env))
+
+            ;; Wait for Bob to receive the sealed message in inbox
+            (let [deadline (+ (System/currentTimeMillis) 4000)]
+              (while (and (empty? (:inbox @st-bob))
+                          (< (System/currentTimeMillis) deadline))
+                (Thread/sleep 50)))
+
+            ;; Bob reads inbox
+            (let [inbox-res (light-core/handle-command @st-bob {"cmd" "inbox"} (:privkey-bytes bob-id))
+                  messages (get-in inbox-res [:response "messages"])]
+              (reset! st-bob (:state inbox-res))
+              (is (= 1 (count messages)))
+              (is (= secret-msg (:text (first messages)))))))
+
+        (finally
+          ;; Clean up DataChannels and validator node
+          (when-let [n (:node alice-conn)] (try (api/close! n) (catch Exception _ nil)))
+          (when-let [n (:node bob-conn)] (try (api/close! n) (catch Exception _ nil)))
+          (when mesh-node (try ((:stop! mesh-node)) (catch Exception _ nil)))
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file val-state-dir))))
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file (str a-dir)))))
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file (str b-dir))))))))))
+
+;; -----------------------------------------------------------------------------
+;; 6. Real TCP WebRTC DataChannel End-to-End Two-Party Conversation (RFC 4571)
+;; -----------------------------------------------------------------------------
+
+(deftest test-real-tcp-datachannel-two-light-nodes-e2e
+  (testing "Two light nodes communicate over real TCP WebRTC DataChannel (RFC 4571) through a local mesh node validator"
+    (let [v-dir (Files/createTempDirectory "bitecho-mesh-tcp-val" (into-array FileAttribute []))
+          a-dir (Files/createTempDirectory "bitecho-alice-tcp" (into-array FileAttribute []))
+          b-dir (Files/createTempDirectory "bitecho-bob-tcp" (into-array FileAttribute []))
+          val-state-dir (str v-dir)
+          val-id (identity/load-or-create-node-identity! val-state-dir :node-val)
+          val-agent-tcp-port 5520
+          val-agent-port 5510
+          val-peer-port 5480
+          val-cfg {:node/id :node-val
+                   :state-dir val-state-dir
+                   :transport :datachannel
+                   :cluster {:agent-port val-agent-port
+                             :agent-tcp-port val-agent-tcp-port
+                             :listen-agents? true
+                             :nodes {:node-val {:ip "127.0.0.1"
+                                                :port val-peer-port
+                                                :agent-port val-agent-port
+                                                :agent-tcp-port val-agent-tcp-port
+                                                :pubkey (:pubkey-hex val-id)
+                                                :fingerprint (:fingerprint val-id)
+                                                :ice-ufrag (:ufrag (:ice-creds val-id))
+                                                :ice-pwd (:pwd (:ice-creds val-id))}}}}
+          mesh-node (mesh/start-mesh-node! val-cfg {:identity val-id :persist? false})
+          descriptor {:network :devnet
+                      :treasury-pubkey (:pubkey-hex val-id)
+                      :custody-pubkey (:pubkey-hex val-id)
+                      :nodes {:node-val {:node-id :node-val
+                                         :ip "127.0.0.1"
+                                         :port val-peer-port
+                                         :agent-port val-agent-port
+                                         :agent-tcp-port val-agent-tcp-port
+                                         :pubkey (:pubkey-hex val-id)
+                                         :fingerprint (:fingerprint val-id)
+                                         :ice-ufrag (:ufrag (:ice-creds val-id))
+                                         :ice-pwd (:pwd (:ice-creds val-id))}}}
+          alice-id (light-shell/load-or-create-light-identity! (str a-dir))
+          bob-id (light-shell/load-or-create-light-identity! (str b-dir))
+          st-alice (atom (light-core/init-light-state alice-id {:bootstrap descriptor :epoch 1}))
+          st-bob (atom (light-core/init-light-state bob-id {:bootstrap descriptor :epoch 1 :autonomous? true}))
+          alice-events (atom [])
+          bob-events (atom [])
+          alice-conn (light-shell/connect-validators! alice-id descriptor {:state-atom st-alice
+                                                                           :transport :tcp
+                                                                           :event-out #(swap! alice-events conj %)
+                                                                           :timeout-ms 3000})
+          bob-conn (light-shell/connect-validators! bob-id descriptor {:state-atom st-bob
+                                                                       :transport :tcp
+                                                                       :event-out #(swap! bob-events conj %)
+                                                                       :timeout-ms 3000})]
+      (try
+        ;; Verify both connections succeeded over real TCP WebRTC DataChannels
+        (is (= true (:ok? alice-conn)))
+        (is (= true (:ok? bob-conn)))
+
+        ;; 1. Bob registers rendezvous home set over TCP DataChannel
+        (let [hs-res (light-core/handle-command @st-bob
+                                                {"cmd" "register-home-set" "price" 10}
+                                                (:privkey-bytes bob-id))]
+          (reset! st-bob (:state hs-res))
+          (is (= true (get-in hs-res [:response "ok"])))
+          (doseq [env (:net-envelopes hs-res)]
+            ((:send-fn bob-conn) env)))
+
+        ;; 2. Alice creates channel offer to Bob
+        (let [offer-res (light-core/handle-command @st-alice
+                                                   {"cmd" "offer" "callee" (:pubkey-hex bob-id) "price" 10 "burn" 500}
+                                                   (:privkey-bytes alice-id))
+              session-id (get-in offer-res [:response "session_id"])]
+          (reset! st-alice (:state offer-res))
+          (is (some? session-id))
+          ;; Alice sends gossip envelope over TCP DataChannel to validator
+          (doseq [env (:net-envelopes offer-res)]
+            ((:send-fn alice-conn) env))
+
+          ;; Wait for Bob to receive offer, autonomous-accept, and send accept back
+          (let [deadline (+ (System/currentTimeMillis) 4000)]
+            (while (and (not= "open" (get-in @st-alice [:sessions session-id :state]))
+                        (< (System/currentTimeMillis) deadline))
+              (Thread/sleep 50)))
+
+          ;; Check that both sessions opened
+          (let [alice-sess (get-in @st-alice [:sessions session-id])
+                bob-sess (get-in @st-bob [:sessions session-id])]
+            (is (= "open" (:state alice-sess)))
+            (is (= "open" (:state bob-sess))))
+
+          ;; 3. Alice sends a sealed message to Bob
+          (let [secret-msg "Secret payload over TCP WebRTC DataChannel (RFC 4571)"
                 send-res (light-core/handle-command @st-alice
                                                     {"cmd" "send" "session_id" session-id "text" secret-msg "burn" 500}
                                                     (:privkey-bytes alice-id))]

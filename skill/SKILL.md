@@ -37,6 +37,7 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--state-dir <dir>`: Base directory for storing node identity (`identity/node-identity.edn`) and encrypted state (`state.nippy`). Default: `~/.bitecho/light-node` or `./data/light-node`.
 - `--bootstrap <path|url>`: Path or URL to a network descriptor file (`.edn` or `.txt`) defining validator nodes, custody keys, and network topology.
 - `--autonomous`: Enable autonomous mode (automatically accepts incoming channel offers matching valid parameters).
+- `--transport <udp|tcp>`: WebRTC DataChannel transport protocol to validators (`udp` or `tcp`, default: `udp`). Over TCP, frames use RFC 4571 2-byte length-prefix framing.
 
 ---
 
