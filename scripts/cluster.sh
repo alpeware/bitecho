@@ -516,7 +516,7 @@ REMOTE_ID
 
   # 5. Render and upload per-node config.edn
   echo "--> Step 5/7: Rendering and uploading /etc/bitecho/config.edn..."
-  local devnet_agent_pubkeys="${DEVNET_AGENT_PUBKEYS:-"302a300506032b65700321007b5d0f2dc8aa3a1728408a7f5d546fb68ed1031aa5633da2fb6a2d0ba45dd55b 302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"}"
+  local devnet_agent_pubkeys="${DEVNET_AGENT_PUBKEYS:-"302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc 302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"}"
   local agent_ledger_lines=""
   local agent_count=0
   for apk in $devnet_agent_pubkeys; do
@@ -1048,12 +1048,12 @@ print(f'{seq} {deps}')
 
   echo "--> Waiting for Streamlet finalization..."
   local funded=false
-  for _ in {1..15}; do
+  for _ in {1..20}; do
     sleep 2
     local rec_edn
     rec_edn="$(ssh_cmd node1 curl -sf "http://127.0.0.1:8080/accountz?pubkey=${recipient}" 2>/dev/null || echo "")"
-    local bal
-    bal="$(echo "$rec_edn" | grep -o ':balance [0-9]*' | awk '{print $2}')"
+    local bal=""
+    bal="$(echo "$rec_edn" | grep -o ':balance [0-9]*' | awk '{print $2}' || true)"
     if [[ -n "$bal" && "$bal" -gt 0 ]]; then
       echo "Verified: Recipient ${recipient:0:16}... balance is now ${bal} ECH."
       funded=true

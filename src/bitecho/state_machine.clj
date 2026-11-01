@@ -402,9 +402,9 @@
         updated-echo-sample (set/union (:global-echo-sample state) new-echo-hexes)
         updated-ready-sample (set/union (:global-ready-sample state) new-ready-hexes)
         updated-delivery-sample (set/union (:global-delivery-sample state) new-delivery-hexes)
-        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :echo)) {} new-echo-hexes)
-        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :ready)) new-roles-by-peer new-ready-hexes)
-        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :delivery)) new-roles-by-peer new-delivery-hexes)
+        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :echo)) {} updated-echo-sample)
+        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :ready)) new-roles-by-peer updated-ready-sample)
+        new-roles-by-peer (reduce (fn [acc peer] (update acc peer (fnil conj #{}) :delivery)) new-roles-by-peer updated-delivery-sample)
         subscribe-commands (mapv (fn [[peer roles]]
                                    {:type :send-subscribe
                                     :target peer
