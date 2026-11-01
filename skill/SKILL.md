@@ -37,7 +37,11 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--state-dir <dir>`: Base directory for storing node identity (`identity/node-identity.edn`) and encrypted state (`state.nippy`). Default: `~/.bitecho/light-node` or `./data/light-node`.
 - `--bootstrap <path|url>`: Path or URL to a network descriptor file (`.edn` or `.txt`) defining validator nodes, custody keys, and network topology.
 - `--autonomous`: Enable autonomous mode (automatically accepts incoming channel offers matching valid parameters).
-- `--transport <udp|tcp>`: WebRTC DataChannel transport protocol to validators (`udp` or `tcp`, default: `udp`). Over TCP, frames use RFC 4571 2-byte length-prefix framing.
+- `--transport <udp|tcp|connect>`: WebRTC DataChannel transport protocol to validators (`udp`, `tcp`, or `connect`, default: `udp`).
+  - `udp`: Direct P2P WebRTC DataChannel over UDP (default port 5010).
+  - `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
+  - `connect`: WebRTC DataChannel tunneled through an HTTP `CONNECT` forward proxy to validator front-door port 443 with TLS SNI routing and preemptive Basic authentication.
+- `--proxy <url>`: HTTP CONNECT proxy URL (e.g., `http://user:pass@proxy.corp.internal:8080`). If omitted when using `--transport connect`, the node checks environment variables in order: `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`.
 
 ---
 

@@ -30,6 +30,8 @@
         port (when-let [p (:port node-map)] (long p))
         agent-port (when-let [ap (:agent-port node-map)] (long ap))
         agent-tcp-port (when-let [atp (:agent-tcp-port node-map)] (long atp))
+        ingress-host (when-let [ih (:ingress-host node-map)] (str/trim (str ih)))
+        ingress-port (when-let [ip-p (:ingress-port node-map)] (long ip-p))
         pubkey (validate-pubkey! (:pubkey node-map) (str "node " node-id))
         raw-fp (:fingerprint node-map)
         fp (try
@@ -52,7 +54,9 @@
              :fingerprint fp
              :ice-ufrag ufrag
              :ice-pwd pwd}
-      agent-tcp-port (assoc :agent-tcp-port agent-tcp-port))))
+      agent-tcp-port (assoc :agent-tcp-port agent-tcp-port)
+      (seq ingress-host) (assoc :ingress-host ingress-host)
+      ingress-port (assoc :ingress-port ingress-port))))
 
 (defn parse-bootstrap-edn
   "Parses a bootstrap.edn string or map, validating all node entries and normalizing fingerprints."
@@ -86,6 +90,7 @@
         cluster-match (re-find #"(?i)Cluster Address:\s*([^\s:]+):([0-9]+)" block-str)
         agent-match (re-find #"(?i)Agent Ingress:\s*([^\s:]+):([0-9]+)" block-str)
         agent-tcp-match (re-find #"(?i)Agent TCP Ingress:\s*([^\s:]+):([0-9]+)" block-str)
+        agent-proxy-match (re-find #"(?i)Agent HTTPS/Proxy Ingress:\s*([^\s:]+):([0-9]+)" block-str)
         pubkey-match (re-find #"(?i)Ed25519 Pubkey:\s*([0-9a-fA-F]+)" block-str)
         fp-match (re-find #"(?i)DTLS Fingerprint:\s*([0-9a-fA-F:]+)" block-str)
         ice-match (re-find #"(?i)ICE Credentials:\s*ufrag=([^\s]+)\s+pwd=([^\s]+)" block-str)]
@@ -100,7 +105,9 @@
                  :fingerprint (when fp-match (second fp-match))
                  :ice-ufrag (when ice-match (nth ice-match 1))
                  :ice-pwd (when ice-match (nth ice-match 2))}
-          agent-tcp-match (assoc :agent-tcp-port (Long/parseLong (nth agent-tcp-match 2)))))])))
+          agent-tcp-match (assoc :agent-tcp-port (Long/parseLong (nth agent-tcp-match 2)))
+          agent-proxy-match (assoc :ingress-host (nth agent-proxy-match 1)
+                                   :ingress-port (Long/parseLong (nth agent-proxy-match 2)))))])))
 
 (defn parse-bootstrap-txt
   "Parses a bootstrap.txt descriptor, extracting network, keys, and validator entries."

@@ -7,10 +7,14 @@
             [bitecho.shell.light-node :as light-shell]
             [bitecho.shell.mesh :as mesh]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [datachannel.api :as api])
-  (:import [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute PosixFilePermissions]))
+  (:import [java.net ServerSocket Socket]
+           [java.nio.charset StandardCharsets]
+           [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute PosixFilePermissions]
+           [java.util Base64]))
 
 (defn- sample-pubkey-hex
   "Returns an 88-character SubjectPublicKeyInfo hex string for testing."
@@ -481,6 +485,235 @@
           (when-let [n (:node alice-conn)] (try (api/close! n) (catch Exception _ nil)))
           (when-let [n (:node bob-conn)] (try (api/close! n) (catch Exception _ nil)))
           (when mesh-node (try ((:stop! mesh-node)) (catch Exception _ nil)))
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file val-state-dir))))
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file (str a-dir)))))
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file (str b-dir))))))))))
+
+;; -----------------------------------------------------------------------------
+;; 7. HTTP CONNECT Proxy Tunneling & Options Resolution
+;; -----------------------------------------------------------------------------
+
+(defn- find-free-port
+  "Finds an ephemeral free port for testing."
+  []
+  (with-open [s (ServerSocket. 0)]
+    (.getLocalPort s)))
+
+(defn- handle-proxy-client!
+  [^Socket client ^String expected-b64]
+  (try
+    (let [in (.getInputStream client)
+          out (.getOutputStream client)
+          buf (byte-array 4096)
+          n (.read in buf 0 4096)]
+      (when (pos? n)
+        (let [req (String. buf 0 n StandardCharsets/UTF_8)
+              lines (str/split-lines req)
+              first-line (first lines)
+              [_ target-host target-port-str] (re-matches #"CONNECT\s+([^:]+):(\d+)\s+HTTP/1\.[01]" (or first-line ""))
+              auth-hdr (some (fn [l]
+                               (when (str/starts-with? (str/lower-case l) "proxy-authorization:")
+                                 (str/trim (subs l (count "proxy-authorization:")))))
+                             lines)]
+          (cond
+            (and expected-b64 (not= (str "Basic " expected-b64) auth-hdr))
+            (do
+              (.write out (.getBytes "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n" StandardCharsets/UTF_8))
+              (.flush out)
+              (.close client))
+
+            (and target-host target-port-str)
+            (let [target-port (Integer/parseInt target-port-str)
+                  target-sock (Socket. ^String target-host (int target-port))
+                  t-in (.getInputStream target-sock)
+                  t-out (.getOutputStream target-sock)]
+              (.write out (.getBytes "HTTP/1.1 200 Connection established\r\n\r\n" StandardCharsets/UTF_8))
+              (.flush out)
+              (.start (Thread/ofVirtual)
+                      (fn []
+                        (try (.transferTo in t-out)
+                             (catch Exception _ nil)
+                             (finally
+                               (try (.close client) (catch Exception _ nil))
+                               (try (.close target-sock) (catch Exception _ nil))))))
+              (.start (Thread/ofVirtual)
+                      (fn []
+                        (try (.transferTo t-in out)
+                             (catch Exception _ nil)
+                             (finally
+                               (try (.close client) (catch Exception _ nil))
+                               (try (.close target-sock) (catch Exception _ nil)))))))
+
+            :else
+            (do
+              (.write out (.getBytes "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n" StandardCharsets/UTF_8))
+              (.flush out)
+              (.close client))))))
+    (catch Exception _
+      (try (.close client) (catch Exception _ nil)))))
+
+(defn- start-mock-connect-proxy!
+  "Starts an in-process mock HTTP CONNECT proxy with optional basic auth."
+  [port expected-auth]
+  (let [server-sock (ServerSocket. (int port))
+        running? (atom true)
+        expected-b64 (when expected-auth
+                       (.encodeToString (Base64/getEncoder) (.getBytes ^String expected-auth StandardCharsets/UTF_8)))
+        proxy-fut (future
+                    (try
+                      (while @running?
+                        (let [client (.accept server-sock)]
+                          (.start (Thread/ofVirtual) (fn [] (handle-proxy-client! client expected-b64)))))
+                      (catch Exception _ nil)))]
+    {:port port
+     :stop-fn (fn []
+                (reset! running? false)
+                (try (.close server-sock) (catch Exception _ nil))
+                (future-cancel proxy-fut))}))
+
+(deftest test-resolve-proxy-url-and-transport-args
+  (testing "resolve-proxy-url resolves explicit URL, or falls back to env vars in order"
+    (is (= "http://proxy.example.com:8080" (light-shell/resolve-proxy-url "http://proxy.example.com:8080")))
+    (let [env {"HTTPS_PROXY" "http://corp-proxy:3128"
+               "HTTP_PROXY" "http://other-proxy:8080"}]
+      (is (= "http://corp-proxy:3128" (light-shell/resolve-proxy-url nil #(get env %))))
+      (is (= "http://override:9090" (light-shell/resolve-proxy-url "http://override:9090" #(get env %)))))
+    (let [env {"http_proxy" "http://fallback:8888"}]
+      (is (= "http://fallback:8888" (light-shell/resolve-proxy-url nil #(get env %))))))
+
+  (testing "parse-light-node-args parses --transport connect and --proxy"
+    (let [parsed (light-shell/parse-light-node-args ["status" "--transport" "connect" "--proxy" "http://proxy.test:8080"])]
+      (is (= :connect (:transport parsed)))
+      (is (= "http://proxy.test:8080" (:proxy parsed))))
+    (let [parsed-tcp (light-shell/parse-light-node-args ["status" "--transport" "tcp"])]
+      (is (= :tcp (:transport parsed-tcp))))
+    (let [parsed-udp (light-shell/parse-light-node-args ["status"])]
+      (is (= :udp (:transport parsed-udp))))))
+
+(defn- verify-proxy-exchange!
+  "Verifies rendezvous home set, channel offer/accept, and sealed message delivery
+   between Alice and Bob light nodes over proxy connection."
+  [{:keys [alice-conn bob-conn alice-id bob-id st-alice st-bob]}]
+  (let [hs-res (light-core/handle-command @st-bob
+                                          {"cmd" "register-home-set" "price" 10}
+                                          (:privkey-bytes bob-id))]
+    (reset! st-bob (:state hs-res))
+    (is (= true (get-in hs-res [:response "ok"])))
+    (doseq [env (:net-envelopes hs-res)]
+      ((:send-fn bob-conn) env)))
+
+  (let [offer-res (light-core/handle-command @st-alice
+                                             {"cmd" "offer" "callee" (:pubkey-hex bob-id) "price" 10 "burn" 500}
+                                             (:privkey-bytes alice-id))
+        session-id (get-in offer-res [:response "session_id"])]
+    (reset! st-alice (:state offer-res))
+    (is (some? session-id))
+    (doseq [env (:net-envelopes offer-res)]
+      ((:send-fn alice-conn) env))
+
+    (let [deadline (+ (System/currentTimeMillis) 4000)]
+      (while (and (not= "open" (get-in @st-alice [:sessions session-id :state]))
+                  (< (System/currentTimeMillis) deadline))
+        (Thread/sleep 50)))
+
+    (is (= "open" (get-in @st-alice [:sessions session-id :state])))
+    (is (= "open" (get-in @st-bob [:sessions session-id :state])))
+
+    (let [secret-msg "Secret payload over HTTP CONNECT proxy WebRTC DataChannel (RFC 4571)"
+          send-res (light-core/handle-command @st-alice
+                                              {"cmd" "send" "session_id" session-id "text" secret-msg "burn" 500}
+                                              (:privkey-bytes alice-id))]
+      (reset! st-alice (:state send-res))
+      (is (= true (get-in send-res [:response "ok"])))
+      (doseq [env (:net-envelopes send-res)]
+        ((:send-fn alice-conn) env))
+
+      (let [deadline (+ (System/currentTimeMillis) 4000)]
+        (while (and (empty? (:inbox @st-bob))
+                    (< (System/currentTimeMillis) deadline))
+          (Thread/sleep 50)))
+
+      (let [inbox-res (light-core/handle-command @st-bob {"cmd" "inbox"} (:privkey-bytes bob-id))
+            messages (get-in inbox-res [:response "messages"])]
+        (reset! st-bob (:state inbox-res))
+        (is (= 1 (count messages)))
+        (is (= secret-msg (:text (first messages))))))))
+
+(deftest test-real-connect-proxy-two-light-nodes-e2e
+  (testing "Two light nodes communicate over authenticated HTTP CONNECT proxy tunnel via WebRTC DataChannel (RFC 4571) through a local mesh node validator"
+    (let [v-dir (Files/createTempDirectory "bitecho-proxy-val" (into-array FileAttribute []))
+          a-dir (Files/createTempDirectory "bitecho-proxy-alice" (into-array FileAttribute []))
+          b-dir (Files/createTempDirectory "bitecho-proxy-bob" (into-array FileAttribute []))
+          proxy-port (find-free-port)
+          proxy (start-mock-connect-proxy! proxy-port "agentproxy:secrettoken")
+          proxy-url (str "http://agentproxy:secrettoken@127.0.0.1:" proxy-port)
+          val-state-dir (str v-dir)
+          val-id (identity/load-or-create-node-identity! val-state-dir :node-val)
+          val-agent-tcp-port (find-free-port)
+          val-agent-port (find-free-port)
+          val-peer-port (find-free-port)
+          val-cfg {:node/id :node-val
+                   :state-dir val-state-dir
+                   :transport :datachannel
+                   :cluster {:agent-port val-agent-port
+                             :agent-tcp-port val-agent-tcp-port
+                             :listen-agents? true
+                             :nodes {:node-val {:ip "127.0.0.1"
+                                                :port val-peer-port
+                                                :agent-port val-agent-port
+                                                :agent-tcp-port val-agent-tcp-port
+                                                :pubkey (:pubkey-hex val-id)
+                                                :fingerprint (:fingerprint val-id)
+                                                :ice-ufrag (:ufrag (:ice-creds val-id))
+                                                :ice-pwd (:pwd (:ice-creds val-id))}}}}
+          mesh-node (mesh/start-mesh-node! val-cfg {:identity val-id :persist? false})
+          descriptor {:network :devnet
+                      :treasury-pubkey (:pubkey-hex val-id)
+                      :custody-pubkey (:pubkey-hex val-id)
+                      :nodes {:node-val {:node-id :node-val
+                                         :ip "127.0.0.1"
+                                         :ingress-host "127.0.0.1"
+                                         :ingress-port val-agent-tcp-port
+                                         :port val-peer-port
+                                         :agent-port val-agent-port
+                                         :agent-tcp-port val-agent-tcp-port
+                                         :pubkey (:pubkey-hex val-id)
+                                         :fingerprint (:fingerprint val-id)
+                                         :ice-ufrag (:ufrag (:ice-creds val-id))
+                                         :ice-pwd (:pwd (:ice-creds val-id))}}}
+          alice-id (light-shell/load-or-create-light-identity! (str a-dir))
+          bob-id (light-shell/load-or-create-light-identity! (str b-dir))
+          st-alice (atom (light-core/init-light-state alice-id {:bootstrap descriptor :epoch 1}))
+          st-bob (atom (light-core/init-light-state bob-id {:bootstrap descriptor :epoch 1 :autonomous? true}))
+          alice-events (atom [])
+          bob-events (atom [])
+          alice-conn (light-shell/connect-validators! alice-id descriptor {:state-atom st-alice
+                                                                           :transport :connect
+                                                                           :proxy proxy-url
+                                                                           :event-out #(swap! alice-events conj %)
+                                                                           :timeout-ms 5000})
+          bob-conn (light-shell/connect-validators! bob-id descriptor {:state-atom st-bob
+                                                                       :transport :connect
+                                                                       :proxy proxy-url
+                                                                       :event-out #(swap! bob-events conj %)
+                                                                       :timeout-ms 5000})]
+      (try
+        (is (= true (:ok? alice-conn)))
+        (is (= true (:ok? bob-conn)))
+        (verify-proxy-exchange! {:alice-conn alice-conn
+                                 :bob-conn bob-conn
+                                 :alice-id alice-id
+                                 :bob-id bob-id
+                                 :st-alice st-alice
+                                 :st-bob st-bob})
+        (finally
+          (when-let [n (:node alice-conn)] (try (api/close! n) (catch Exception _ nil)))
+          (when-let [n (:node bob-conn)] (try (api/close! n) (catch Exception _ nil)))
+          (when mesh-node (try ((:stop! mesh-node)) (catch Exception _ nil)))
+          ((:stop-fn proxy))
           (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
                 (reverse (file-seq (io/file val-state-dir))))
           (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))

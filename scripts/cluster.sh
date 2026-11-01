@@ -597,9 +597,9 @@ REMOTE_CFG
 {:network :devnet
  :treasury-pubkey "${TREASURY_PUB}"
  :custody-pubkey "${CUSTODY_PUB}"
- :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
-         :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
-         :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}}}
+ :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node1.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
+         :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node2.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
+         :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}}}
 EDN_BOOTSTRAP_EOF
 
   cat > "${ROOT_DIR}/devnet/bootstrap.txt" << TXT_BOOTSTRAP_EOF
@@ -618,6 +618,7 @@ Node: node1 (us-west1)
   Cluster Address:   ${ip1}:5000 (UDP DataChannel)
   Agent Ingress:     ${ip1}:5010 (UDP DataChannel)
   Agent TCP Ingress: ${ip1}:5010 (TCP DataChannel)
+  Agent HTTPS/Proxy Ingress: node1.ingress.bitecho.org:443 (TCP DataChannel)
   HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node1]}
   DTLS Fingerprint:  ${FINGERPRINT[node1]}
@@ -627,6 +628,7 @@ Node: node2 (us-central1)
   Cluster Address:   ${ip2}:5000 (UDP DataChannel)
   Agent Ingress:     ${ip2}:5010 (UDP DataChannel)
   Agent TCP Ingress: ${ip2}:5010 (TCP DataChannel)
+  Agent HTTPS/Proxy Ingress: node2.ingress.bitecho.org:443 (TCP DataChannel)
   HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node2]}
   DTLS Fingerprint:  ${FINGERPRINT[node2]}
@@ -636,6 +638,7 @@ Node: node3 (us-east1)
   Cluster Address:   ${ip3}:5000 (UDP DataChannel)
   Agent Ingress:     ${ip3}:5010 (UDP DataChannel)
   Agent TCP Ingress: ${ip3}:5010 (TCP DataChannel)
+  Agent HTTPS/Proxy Ingress: node3.ingress.bitecho.org:443 (TCP DataChannel)
   HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node3]}
   DTLS Fingerprint:  ${FINGERPRINT[node3]}

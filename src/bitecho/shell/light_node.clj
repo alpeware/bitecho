@@ -87,6 +87,20 @@
       (merge base-map json-args {"cmd" verb})
       base-map)))
 
+(defn resolve-proxy-url
+  "Pure helper. Returns explicit proxy url, or resolves from environment variables
+   in order: HTTPS_PROXY, https_proxy, HTTP_PROXY, http_proxy."
+  ([explicit-proxy]
+   (resolve-proxy-url explicit-proxy #(System/getenv %)))
+  ([explicit-proxy getenv-fn]
+   (or (when (and (string? explicit-proxy) (seq (str/trim explicit-proxy)))
+         (str/trim explicit-proxy))
+       (some (fn [env-var]
+               (when-let [val (getenv-fn env-var)]
+                 (when (seq (str/trim val))
+                   (str/trim val))))
+             ["HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy"]))))
+
 (defn parse-light-node-args
   "Parses light-node command line arguments into an options map."
   [args]
@@ -99,14 +113,20 @@
         bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
         autonomous? (some #{"--autonomous"} clean-args)
         transport-str (extract-flag-value clean-args "--transport" "udp")
-        transport (if (= (str/lower-case transport-str) "tcp") :tcp :udp)]
-    {:mode (if serve? :serve :one-shot)
-     :verb verb
-     :state-dir state-dir
-     :bootstrap bootstrap-path
-     :autonomous? (boolean autonomous?)
-     :transport transport
-     :cmd-map (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))}))
+        transport (case (str/lower-case transport-str)
+                    "tcp" :tcp
+                    "connect" :connect
+                    :udp)
+        proxy-cli (extract-flag-value clean-args "--proxy" nil)
+        proxy-url (resolve-proxy-url proxy-cli)]
+    (cond-> {:mode (if serve? :serve :one-shot)
+             :verb verb
+             :state-dir state-dir
+             :bootstrap bootstrap-path
+             :autonomous? (boolean autonomous?)
+             :transport transport
+             :cmd-map (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))}
+      proxy-url (assoc :proxy proxy-url))))
 
 ;; -----------------------------------------------------------------------------
 ;; State Persistence & Identity Loading
@@ -199,7 +219,7 @@
                  (reset! channel-id nil))}))
 
 (defn- dial-single-node!
-  "Dials a single validator node via WebRTC DataChannel (UDP or TCP)."
+  "Dials a single validator node via WebRTC DataChannel (UDP, TCP, or HTTP CONNECT proxy)."
   [identity node opts]
   (let [client-node (api/create-node {:port 0
                                       :cert-data (:cert-data identity)
@@ -212,15 +232,22 @@
                                          {:identity identity
                                           :state-atom (:state-atom opts)
                                           :event-out (:event-out opts)})
-        target-port (if (= (:transport opts) :tcp)
-                      (int (or (:agent-tcp-port node) (:agent-port node) (:port node) 5010))
+        transport (:transport opts)
+        target-host (if (= transport :connect)
+                      (or (:ingress-host node) (:ip node) "127.0.0.1")
+                      (or (:ip node) "127.0.0.1"))
+        target-port (case transport
+                      :connect (int (or (:ingress-port node) (:agent-tcp-port node) (:agent-port node) 443))
+                      :tcp (int (or (:agent-tcp-port node) (:agent-port node) (:port node) 5010))
                       (int (or (:agent-port node) (:port node) 5010)))
-        remote-sdp {:ip (or (:ip node) "127.0.0.1")
-                    :port target-port
-                    :fingerprint (identity/normalize-fingerprint (:fingerprint node))
-                    :remote-ice-ufrag (or (:ice-ufrag node) "ufrag")
-                    :remote-ice-pwd (or (:ice-pwd node) "pwd")}]
-    (if (= (:transport opts) :tcp)
+        remote-sdp (cond-> {:ip target-host
+                            :port target-port
+                            :fingerprint (identity/normalize-fingerprint (:fingerprint node))
+                            :remote-ice-ufrag (or (:ice-ufrag node) "ufrag")
+                            :remote-ice-pwd (or (:ice-pwd node) "pwd")}
+                     (= transport :connect)
+                     (assoc :proxy (or (:proxy opts) (resolve-proxy-url nil))))]
+    (if (or (= transport :tcp) (= transport :connect))
       (try
         (api/start-tcp! client-node remote-sdp callbacks)
         (catch Exception _

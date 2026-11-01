@@ -34,6 +34,8 @@
             ip gen-ip
             port (gen/choose 5000 5009)
             agent-port (gen/choose 5010 5019)
+            ingress-host (gen/elements [nil "node1.ingress.bitecho.org" "node2.ingress.bitecho.org"])
+            ingress-port (gen/elements [nil 443 8443])
             ufrag (gen/fmap (partial apply str) (gen/vector gen/char-alphanumeric 8))
             pwd (gen/fmap (partial apply str) (gen/vector gen/char-alphanumeric 24))]
     (let [pubkey (sample-pubkey-hex)
@@ -43,14 +45,16 @@
       {:network :devnet
        :treasury-pubkey treasury-pk
        :custody-pubkey custody-pk
-       :nodes {node-id {:node-id node-id
-                        :ip ip
-                        :port port
-                        :agent-port agent-port
-                        :pubkey pubkey
-                        :fingerprint fp
-                        :ice-ufrag ufrag
-                        :ice-pwd pwd}}})))
+       :nodes {node-id (cond-> {:node-id node-id
+                                :ip ip
+                                :port port
+                                :agent-port agent-port
+                                :pubkey pubkey
+                                :fingerprint fp
+                                :ice-ufrag ufrag
+                                :ice-pwd pwd}
+                         ingress-host (assoc :ingress-host ingress-host
+                                             :ingress-port (or ingress-port 443)))}})))
 
 (defn- descriptor->txt
   "Renders a descriptor map into bootstrap.txt format."
@@ -65,6 +69,8 @@
          "Node: " node-id " (zone-a)\n"
          "  Cluster Address:   " (:ip node) ":" (:port node) " (UDP DataChannel)\n"
          "  Agent Ingress:     " (:ip node) ":" (:agent-port node) " (UDP DataChannel)\n"
+         (when-let [ih (:ingress-host node)]
+           (str "  Agent HTTPS/Proxy Ingress: " ih ":" (or (:ingress-port node) 443) " (TCP DataChannel)\n"))
          "  Ed25519 Pubkey:    " (:pubkey node) "\n"
          "  DTLS Fingerprint:  " (:fingerprint node) "\n"
          "  ICE Credentials:   ufrag=" (:ice-ufrag node) " pwd=" (:ice-pwd node) "\n")))
@@ -96,6 +102,8 @@
             (is (= "35.212.129.138" (:ip n1)))
             (is (= 5000 (:port n1)))
             (is (= 5010 (:agent-port n1)))
+            (is (= "node1.ingress.bitecho.org" (:ingress-host n1)))
+            (is (= 443 (:ingress-port n1)))
             (is (= "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B"
                    (:fingerprint n1))))))))
 
@@ -112,6 +120,8 @@
             (is (= "35.206.120.143" (:ip n2)))
             (is (= 5000 (:port n2)))
             (is (= 5010 (:agent-port n2)))
+            (is (= "node2.ingress.bitecho.org" (:ingress-host n2)))
+            (is (= 443 (:ingress-port n2)))
             (is (= "F8:73:94:91:1D:7B:CA:66:D9:67:9E:4B:72:B0:D0:8D:5F:5C:37:0F:FE:04:2E:ED:86:E6:8D:79:B8:07:43:78"
                    (:fingerprint n2))))))))
 

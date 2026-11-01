@@ -68,7 +68,15 @@ clojure -M:light-node close --session <session-id> --state-dir data/alice
 
 # 8. Run in serve mode (JSONL stdio protocol with optional autonomous offer acceptance)
 clojure -M:light-node serve --state-dir data/alice --bootstrap devnet/bootstrap.edn --autonomous
+
+# 9. Tunnel WebRTC DataChannel through an HTTP CONNECT proxy to validator front-door port 443
+clojure -M:light-node serve --state-dir data/alice --bootstrap devnet/bootstrap.edn --transport connect --proxy http://user:pass@proxy.corp.internal:8080
 ```
+
+Transport protocols supported via `--transport`:
+- `udp`: Direct P2P WebRTC DataChannel (default port 5010).
+- `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
+- `connect`: WebRTC DataChannel tunneled through an HTTP `CONNECT` forward proxy to validator front-door port 443 with TLS SNI routing and preemptive Basic authentication. When `--proxy` is omitted, proxy URL defaults to standard environment variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`).
 
 For complete protocol schemas, payload specifications, and parent agent integration examples, see [`skill/SKILL.md`](skill/SKILL.md).
 
