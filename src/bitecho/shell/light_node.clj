@@ -195,10 +195,49 @@
                 nodes)
       {:ok? false :error "bad-fingerprint"})))
 
-(defn- make-client-callbacks
+(defn connection-live?
+  "Checks if connection is marked ok and channel-id is present and state is connected."
+  [conn state]
+  (and (boolean (:ok? conn))
+       (not (false? (:connected? state)))
+       (if-let [cid-atom (:channel-id conn)]
+         (some? @cid-atom)
+         true)))
+
+(defn send-all-envelopes!
+  "Transmits all envelopes using send-fn and returns true only if all succeeded."
+  [send-fn envelopes]
+  (if (empty? envelopes)
+    true
+    (and (fn? send-fn)
+         (every? true? (mapv #(boolean (send-fn %)) envelopes)))))
+
+(defn- dispatch-auto-reply!
+  "Sends auto-reply envelopes, attempting reconnect if connection is lost, or failing closed."
+  [envelopes send-fn-atom state-atom event-out reconnect-fn]
+  (let [live? (and @send-fn-atom (not (false? (:connected? @state-atom))))
+        sent? (when live?
+                (send-all-envelopes! @send-fn-atom envelopes))]
+    (when-not sent?
+      (if reconnect-fn
+        (let [reconn (reconnect-fn)]
+          (when-not (and (:ok? reconn)
+                         (send-all-envelopes! (:send-fn reconn) envelopes))
+            (let [err (or (:error reconn) "connection-closed")]
+              (when state-atom
+                (swap! state-atom assoc :connected? false :connection-error err))
+              (when event-out
+                (event-out {"event" "connection-failed" "connected" false "error" err})))))
+        (let [err "connection-closed"]
+          (when state-atom
+            (swap! state-atom assoc :connected? false :connection-error err))
+          (when event-out
+            (event-out {"event" "connection-failed" "connected" false "error" err})))))))
+
+(defn make-client-callbacks
   "Creates callback handlers for client DataChannel connection."
   [client-node channel-id connected? send-fn-atom ctx]
-  (let [{:keys [identity state-atom event-out]} ctx]
+  (let [{:keys [identity state-atom conn-atom event-out reconnect-fn]} ctx]
     {:on-open (fn [evt]
                 (if-let [cid (:channel-id evt)]
                   (reset! channel-id cid)
@@ -215,16 +254,17 @@
                          (when (and event-out (seq (:stdout-events res)))
                            (doseq [ev (:stdout-events res)]
                              (event-out ev)))
-                         (when (and (seq (:net-envelopes res)) @send-fn-atom)
-                           (doseq [env (:net-envelopes res)]
-                             (@send-fn-atom env)))))))
+                         (when (seq (:net-envelopes res))
+                           (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom event-out reconnect-fn))))))
      :on-error (fn [evt]
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (deliver connected? :bad-fingerprint)))
      :on-close (fn [_]
                  (reset! channel-id nil)
+                 (when conn-atom
+                   (swap! conn-atom assoc :ok? false :error "connection-closed"))
                  (when state-atom
-                   (swap! state-atom assoc :connected? false)))}))
+                   (swap! state-atom assoc :connected? false :connection-error "connection-closed")))}))
 
 (defn- dial-single-node!
   "Dials a single validator node via WebRTC DataChannel (UDP, TCP, or HTTP CONNECT proxy)."
@@ -239,7 +279,9 @@
         callbacks (make-client-callbacks client-node channel-id connected? send-fn-atom
                                          {:identity identity
                                           :state-atom (:state-atom opts)
-                                          :event-out (:event-out opts)})
+                                          :conn-atom (:conn-atom opts)
+                                          :event-out (:event-out opts)
+                                          :reconnect-fn (:reconnect-fn opts)})
         transport (:transport opts)
         target-host (if (= transport :connect)
                       (or (:ingress-host node) (:ip node) "127.0.0.1")
@@ -272,9 +314,14 @@
             {:ok? false :error "listener-disabled"})
         :else
         (let [send-fn (fn [env]
-                        (when-let [cid @channel-id]
-                          (let [payload (if (bytes? env) env (nippy/freeze env))]
-                            (api/send! client-node payload cid))))]
+                        (if-let [cid @channel-id]
+                          (try
+                            (let [payload (if (bytes? env) env (nippy/freeze env))]
+                              (api/send! client-node payload cid)
+                              true)
+                            (catch Exception _
+                              false))
+                          false))]
           (reset! send-fn-atom send-fn)
           {:ok? true
            :node client-node
@@ -311,33 +358,39 @@
   (.println writer ^String (json/write-str data))
   (.flush writer))
 
-(defn- handle-serve-line!
+(defn handle-serve-line!
   "Processes a single STDIN JSON line in serve mode, handling network retries if required."
   [line ctx]
   (let [{:keys [state-atom conn-atom out-writer state-file identity bootstrap conn-opts]} ctx
         res (light-core/process-jsonl-line @state-atom line (:privkey-bytes identity))
         needs-net? (seq (:net-envelopes res))]
-    (if (and needs-net? (not (:ok? @conn-atom)))
-      (let [reconn (connect-validators! identity bootstrap conn-opts)]
-        (reset! conn-atom reconn)
-        (swap! state-atom assoc :connected? (boolean (:ok? reconn)) :connection-error (:error reconn))
-        (if-not (:ok? reconn)
-          (emit-json-line! out-writer {"ok" false "error" (or (:error reconn) "listener-disabled")})
+    (if needs-net?
+      (let [currently-live? (connection-live? @conn-atom @state-atom)
+            sent? (when currently-live?
+                    (send-all-envelopes! (:send-fn @conn-atom) (:net-envelopes res)))]
+        (if sent?
           (do
-            (reset! state-atom (:state res))
+            (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
             (save-light-state! state-file @state-atom)
             (when-let [resp (:response res)]
-              (emit-json-line! out-writer resp))
-            (doseq [env (:net-envelopes res)]
-              ((:send-fn reconn) env)))))
+              (emit-json-line! out-writer resp)))
+          (let [reconn (connect-validators! identity bootstrap conn-opts)]
+            (reset! conn-atom reconn)
+            (if (and (:ok? reconn)
+                     (send-all-envelopes! (:send-fn reconn) (:net-envelopes res)))
+              (do
+                (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                (save-light-state! state-file @state-atom)
+                (when-let [resp (:response res)]
+                  (emit-json-line! out-writer resp)))
+              (let [err (or (:error @conn-atom) "listener-disabled")]
+                (swap! state-atom assoc :connected? false :connection-error err)
+                (emit-json-line! out-writer {"ok" false "error" err}))))))
       (do
         (reset! state-atom (:state res))
         (save-light-state! state-file @state-atom)
         (when-let [resp (:response res)]
-          (emit-json-line! out-writer resp))
-        (when (and (:ok? @conn-atom) needs-net?)
-          (doseq [env (:net-envelopes res)]
-            ((:send-fn @conn-atom) env)))))))
+          (emit-json-line! out-writer resp))))))
 
 (defn run-serve!
   "Runs the light node in continuous JSONL serve mode reading STDIN and writing STDOUT."
@@ -351,11 +404,24 @@
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (:autonomous? opts false)}))
         state-atom (atom initial-state)
+        conn-atom (atom nil)
         out-writer (PrintWriter. System/out true)
         event-out (fn [ev] (emit-json-line! out-writer ev))
-        conn-opts (assoc opts :state-atom state-atom :event-out event-out)
-        conn-res (connect-validators! identity bootstrap conn-opts)
-        conn-atom (atom conn-res)
+        conn-opts-atom (atom nil)
+        reconnect-fn (fn []
+                       (let [reconn (connect-validators! identity bootstrap @conn-opts-atom)]
+                         (reset! conn-atom reconn)
+                         (swap! state-atom assoc
+                                :connected? (boolean (:ok? reconn))
+                                :connection-error (:error reconn))
+                         reconn))
+        conn-opts (assoc opts
+                         :state-atom state-atom
+                         :conn-atom conn-atom
+                         :event-out event-out
+                         :reconnect-fn reconnect-fn)
+        _ (reset! conn-opts-atom conn-opts)
+        conn-res (reconnect-fn)
         ctx {:state-atom state-atom
              :conn-atom conn-atom
              :out-writer out-writer
@@ -363,9 +429,6 @@
              :identity identity
              :bootstrap bootstrap
              :conn-opts conn-opts}]
-    (swap! state-atom assoc
-           :connected? (boolean (:ok? conn-res))
-           :connection-error (:error conn-res))
     (if (:ok? conn-res)
       (emit-json-line! out-writer {"event" "ready"
                                    "connected" true
@@ -404,14 +467,17 @@
               (let [err-resp {"ok" false "error" (or (:error conn-res) "listener-disabled")}]
                 (emit-json-line! out-writer err-resp)
                 err-resp)
-              (do
-                (save-light-state! state-file new-state)
-                (emit-json-line! out-writer (:response res))
-                (doseq [env (:net-envelopes res)]
-                  ((:send-fn conn-res) env))
+              (let [sent? (send-all-envelopes! (:send-fn conn-res) (:net-envelopes res))]
                 (when-let [n (:node conn-res)]
                   (try (api/close! n) (catch Exception _ nil)))
-                (:response res))))
+                (if sent?
+                  (do
+                    (save-light-state! state-file new-state)
+                    (emit-json-line! out-writer (:response res))
+                    (:response res))
+                  (let [err-resp {"ok" false "error" "connection-closed"}]
+                    (emit-json-line! out-writer err-resp)
+                    err-resp)))))
           (do
             (save-light-state! state-file new-state)
             (emit-json-line! out-writer (:response res))

@@ -6,11 +6,13 @@
             [bitecho.shell.identity :as identity]
             [bitecho.shell.light-node :as light-shell]
             [bitecho.shell.mesh :as mesh]
+            [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [datachannel.api :as api])
-  (:import [java.net ServerSocket Socket]
+  (:import [java.io PrintWriter StringWriter]
+           [java.net ServerSocket Socket]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]
@@ -720,3 +722,170 @@
                 (reverse (file-seq (io/file (str a-dir)))))
           (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
                 (reverse (file-seq (io/file (str b-dir))))))))))
+
+;; -----------------------------------------------------------------------------
+;; 7. Mid-Session Disconnect & Lazy Reconnect Test
+;; -----------------------------------------------------------------------------
+
+(defn- run-lazy-reconnect-test!
+  "Tests lazy reconnect on post-startup disconnect when command emits envelopes."
+  [identity descriptor state-dir]
+  (let [state-file (str (io/file state-dir "state.nippy"))
+        initial-st (light-core/init-light-state identity {:bootstrap descriptor :epoch 1})
+        state-atom (atom initial-st)
+        reconnect-count (atom 0)
+        sent-envelopes (atom [])
+        dialer-mock (fn [_id _desc _opts]
+                      (swap! reconnect-count inc)
+                      {:ok? true
+                       :channel-id (atom "new-cid")
+                       :send-fn (fn [env]
+                                  (swap! sent-envelopes conj env)
+                                  true)})
+        conn-opts {:dialer-fn dialer-mock}
+        conn-atom (atom {:ok? true
+                         :channel-id (atom "initial-cid")
+                         :send-fn (fn [env]
+                                    (swap! sent-envelopes conj env)
+                                    true)})
+        sw (StringWriter.)
+        out-writer (PrintWriter. sw true)
+        ctx {:state-atom state-atom
+             :conn-atom conn-atom
+             :out-writer out-writer
+             :state-file state-file
+             :identity identity
+             :bootstrap descriptor
+             :conn-opts conn-opts}
+        callee-pub (sample-pubkey-hex)
+        offer-json (json/write-str {"cmd" "offer" "callee" callee-pub "price" 10 "burn" 500})]
+    (swap! state-atom assoc :connected? true)
+    (is (= true (light-shell/connection-live? @conn-atom @state-atom)))
+    ;; Simulate mid-session disconnect
+    (reset! (:channel-id @conn-atom) nil)
+    (swap! state-atom assoc :connected? false :connection-error "connection-closed")
+    (is (= false (light-shell/connection-live? @conn-atom @state-atom)))
+    ;; Command requiring network triggers lazy reconnect
+    (light-shell/handle-serve-line! offer-json ctx)
+    (is (= 1 @reconnect-count))
+    (is (= true (:ok? @conn-atom)))
+    (is (= true (:connected? @state-atom)))
+    (is (nil? (:connection-error @state-atom)))
+    (is (pos? (count @sent-envelopes)))
+    (let [lines (str/split-lines (.toString sw))
+          resp (json/read-str (last lines))]
+      (is (= true (get resp "ok")))
+      (is (some? (get resp "session_id"))))
+    (let [saved-st (light-shell/load-light-state! state-file)]
+      (is (some? saved-st))
+      (is (= 1 (count (:sessions saved-st)))))))
+
+(defn- run-fail-closed-test!
+  "Tests fail-closed handling on reconnect failure: command fails, state not saved."
+  [identity descriptor state-dir]
+  (let [state-file (str (io/file state-dir "state.nippy"))
+        initial-st (light-core/init-light-state identity {:bootstrap descriptor :epoch 1})
+        _ (light-shell/save-light-state! state-file initial-st)
+        state-atom (atom initial-st)
+        reconnect-attempted (atom false)
+        dialer-mock (fn [_id _desc _opts]
+                      (reset! reconnect-attempted true)
+                      {:ok? false :error "listener-disabled"})
+        conn-opts {:dialer-fn dialer-mock}
+        conn-atom (atom {:ok? false :error "connection-closed"})
+        sw (StringWriter.)
+        out-writer (PrintWriter. sw true)
+        ctx {:state-atom state-atom
+             :conn-atom conn-atom
+             :out-writer out-writer
+             :state-file state-file
+             :identity identity
+             :bootstrap descriptor
+             :conn-opts conn-opts}
+        callee-pub (sample-pubkey-hex)
+        offer-json (json/write-str {"cmd" "offer" "callee" callee-pub "price" 10 "burn" 500})]
+    (light-shell/handle-serve-line! offer-json ctx)
+    (is (= true @reconnect-attempted))
+    (is (= false (:ok? @conn-atom)))
+    (is (= false (:connected? @state-atom)))
+    (is (= "listener-disabled" (:connection-error @state-atom)))
+    (let [lines (str/split-lines (.toString sw))
+          resp (json/read-str (last lines))]
+      (is (= false (get resp "ok")))
+      (is (= "listener-disabled" (get resp "error"))))
+    (let [saved-st (light-shell/load-light-state! state-file)]
+      (is (= 0 (count (:sessions saved-st)))))))
+
+(defn- run-failed-send-test!
+  "Tests failed send detection: when send-fn returns false, triggers reconnect or fails closed."
+  [identity descriptor state-dir]
+  (let [state-file (str (io/file state-dir "state.nippy"))
+        initial-st (light-core/init-light-state identity {:bootstrap descriptor :epoch 1})
+        state-atom (atom (assoc initial-st :connected? true))
+        reconn-sent (atom [])
+        dialer-mock (fn [_id _desc _opts]
+                      {:ok? true
+                       :channel-id (atom "reconnected-cid")
+                       :send-fn (fn [env]
+                                  (swap! reconn-sent conj env)
+                                  true)})
+        conn-opts {:dialer-fn dialer-mock}
+        conn-atom (atom {:ok? true
+                         :channel-id (atom "stale-cid")
+                         :send-fn (fn [_env] false)})
+        sw (StringWriter.)
+        out-writer (PrintWriter. sw true)
+        ctx {:state-atom state-atom
+             :conn-atom conn-atom
+             :out-writer out-writer
+             :state-file state-file
+             :identity identity
+             :bootstrap descriptor
+             :conn-opts conn-opts}
+        callee-pub (sample-pubkey-hex)
+        offer-json (json/write-str {"cmd" "offer" "callee" callee-pub "price" 10 "burn" 500})]
+    (light-shell/handle-serve-line! offer-json ctx)
+    (is (pos? (count @reconn-sent)))
+    (is (= true (:ok? @conn-atom)))
+    (is (= true (:connected? @state-atom)))
+    (let [lines (str/split-lines (.toString sw))
+          resp (json/read-str (last lines))]
+      (is (= true (get resp "ok"))))))
+
+(defn- run-on-close-callback-test!
+  "Tests that make-client-callbacks :on-close resets channel-id, conn-atom, and state-atom."
+  []
+  (let [cid (atom "active-cid")
+        conn-atom (atom {:ok? true :channel-id cid})
+        state-atom (atom {:connected? true})
+        send-fn-atom (atom (fn [_] true))
+        connected? (promise)
+        cbs (light-shell/make-client-callbacks nil cid connected? send-fn-atom
+                                               {:conn-atom conn-atom
+                                                :state-atom state-atom})]
+    ((:on-close cbs) nil)
+    (is (nil? @cid))
+    (is (= false (:ok? @conn-atom)))
+    (is (= "connection-closed" (:error @conn-atom)))
+    (is (= false (:connected? @state-atom)))
+    (is (= "connection-closed" (:connection-error @state-atom)))))
+
+(deftest test-mid-session-disconnect-and-reconnect
+  (testing "Mid-session disconnect, lazy reconnect, fail-closed handling, and failed send detection"
+    (let [temp-dir (Files/createTempDirectory "bitecho-test-recon" (into-array FileAttribute []))
+          state-dir (str temp-dir)
+          identity (light-shell/load-or-create-light-identity! state-dir)
+          descriptor {:network :devnet
+                      :nodes {:node1 {:node-id :node1
+                                      :ip "127.0.0.1"
+                                      :agent-port 5010
+                                      :fingerprint (:fingerprint identity)
+                                      :ice-ufrag "u1" :ice-pwd "p1"}}}]
+      (try
+        (run-lazy-reconnect-test! identity descriptor state-dir)
+        (run-fail-closed-test! identity descriptor state-dir)
+        (run-failed-send-test! identity descriptor state-dir)
+        (run-on-close-callback-test!)
+        (finally
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file state-dir)))))))))

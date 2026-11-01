@@ -15,7 +15,7 @@ Built under the strict Sans-IO architectural pattern, the core protocol logic (`
 
 - **Identity & Keys**: Ed25519 signing keypair for node identity and gossip authentication; self-signed X.509 certificate and DTLS fingerprint for WebRTC DataChannel mutual authentication.
 - **Sealed Channel Encryption**: Ephemeral X25519 ECDH exchange per channel session, RFC 5869 HKDF-SHA256 derivation of directional keys (`tx-key` and `rx-key`), and ChaCha20-Poly1305 AEAD authenticated encryption.
-- **Anti-Replay & Anti-Skew**: Gap-tolerant 64-bit sliding replay window and strict 2-epoch skew tolerance on wire payloads.
+- **Anti-Replay & Anti-Skew**: Gap-tolerant 64-entry sliding replay window (seen-set) and strict 2-epoch skew tolerance on wire payloads.
 - **Ephemeral Key Isolation**: Ephemeral session private keys (`:ephemeral-priv`) are retained only in volatile memory during active sessions and are stripped prior to disk serialization. State and identity files are protected with POSIX `0600` permissions.
 
 ---
@@ -189,7 +189,7 @@ Manually accepts a pending channel offer received from an initiator (automatical
 ---
 
 ### `send`
-Encrypts and dispatches a sealed payload or plaintext message over an open channel session using ChaCha20-Poly1305 AEAD.
+Encrypts and dispatches a sealed message (from UTF-8 text or raw hex bytes) over an open channel session using ChaCha20-Poly1305 AEAD.
 
 - **CLI**: `clojure -M:light-node send --session <session-id> --text "Hello peer" [--burn <burn-amt>]`
 - **CLI (raw bytes)**: `clojure -M:light-node send --session <session-id> --payload-hex <hex-data>`
