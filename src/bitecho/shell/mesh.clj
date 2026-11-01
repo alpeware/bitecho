@@ -554,6 +554,16 @@
                           TimeUnit/MILLISECONDS)
     executor))
 
+(defn- forward-gossip-to-agents!
+  "Forwards a frozen gossip network event to all connected agent DataChannels, optionally excluding a sender."
+  [agent-conns frozen-evt exclude-sender]
+  (when agent-conns
+    (doseq [[pk conn] @agent-conns
+            :when (not= pk exclude-sender)]
+      (when-let [cid (or @(:channel-id conn) 0)]
+        (try (api/send! (:node conn) frozen-evt cid)
+             (catch Exception _ nil))))))
+
 (defn- start-net-out-loop!
   "Consumes net-out commands, transforms them to peer events, and delivers to targets."
   [ctx]
@@ -577,11 +587,10 @@
                                     (when agent-conns (get @agent-conns target)))]
                   (when-let [cid @(:channel-id conn)]
                     (api/send! (:node conn) frozen cid)))))
-            (when (and (= (:type cmd) :send-gossip) agent-conns)
-              (doseq [[_ conn] @agent-conns]
-                (when-let [cid @(:channel-id conn)]
-                  (try (api/send! (:node conn) frozen cid)
-                       (catch Exception _ nil))))))
+            (when (and (or (= (:type cmd) :send-gossip)
+                           (= (:type evt) :receive-gossip))
+                       agent-conns)
+              (forward-gossip-to-agents! agent-conns frozen nil)))
           (catch Exception e
             (log-mesh-error "Net-out loop error" e)))
         (recur)))))
@@ -596,7 +605,7 @@
       (if-not peer-fp
         (log-mesh-error (format "Invalid peer fingerprint for %s" pid)
                         (ex-info "Invalid peer fingerprint" {:peer pid :fingerprint raw-fp}))
-        (let [{:keys [node-id identity node-idx nodes-cfg shell-node peer-conns]} ctx
+        (let [{:keys [node-id identity node-idx nodes-cfg shell-node peer-conns agent-conns]} ctx
               peer-hex (:pubkey peer-cfg)]
           (when-let [old-conn (get @peer-conns peer-hex)]
             (when-let [old-node (:node old-conn)]
@@ -632,7 +641,9 @@
                                                                 :sender peer-hex
                                                                 :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
                                                                 :rng (java.util.Random.))]
-                                               (async/put! (:network-in shell-node) event)))))
+                                               (async/put! (:network-in shell-node) event)
+                                               (when (= :receive-gossip (:type msg))
+                                                 (forward-gossip-to-agents! agent-conns (:payload evt) nil))))))
                            :on-close (fn [_]
                                        (reset! channel-id nil))}]
             (api/start! node remote-sdp callbacks)
@@ -644,18 +655,40 @@
       (log-mesh-error (format "Failed to connect to peer %s" pid) e)
       nil)))
 
+(defn- replay-cached-gossip-to-agent!
+  "Replays all cached epoch gossip messages to a newly connected or identified agent DataChannel,
+   deduplicating per agent connection via replayed-msg-ids atom."
+  ([shell-node agent-node cid]
+   (replay-cached-gossip-to-agent! shell-node agent-node cid nil))
+  ([shell-node agent-node cid replayed-msg-ids]
+   (when-let [st (query-node-state shell-node 200)]
+     (let [messages-map (or (:messages st) {})
+           epochs-map (or (:message-epochs st) {})
+           sorted-msgs (sort-by (fn [[mid _]] [(long (get epochs-map mid 0)) (str mid)]) messages-map)]
+       (doseq [[mid message] sorted-msgs]
+         (when (or (nil? replayed-msg-ids)
+                   (not (contains? @replayed-msg-ids mid)))
+           (let [frozen (nippy/freeze {:type :receive-gossip :message message})]
+             (when (try (api/send! agent-node frozen cid)
+                        true
+                        (catch Exception _ nil))
+               (when replayed-msg-ids
+                 (swap! replayed-msg-ids conj mid))))))))))
+
 (defn- make-agent-connection-handler
   "Returns a connection handler function for an incoming agent node.
    Works identically for UDP and TCP agent connections."
   [shell-node agent-conns]
   (fn [agent-node]
     (let [channel-id (atom 0)
-          agent-sender (atom nil)]
+          agent-sender (atom nil)
+          replayed-msg-ids (atom #{})]
       (api/set-callbacks!
        agent-node
        {:on-open (fn [evt]
-                   (when-let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                     (reset! channel-id cid))
+                   (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                     (reset! channel-id cid)
+                     (replay-cached-gossip-to-agent! shell-node agent-node cid replayed-msg-ids))
                    (when agent-conns
                      (let [anon-key [:anon (System/identityHashCode agent-node)]]
                        (reset! agent-sender anon-key)
@@ -663,11 +696,12 @@
                                                           :channel-id channel-id
                                                           :last-rx-at (atom (System/currentTimeMillis))}))))
         :on-data-channel (fn [evt]
-                           (when-let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                             (reset! channel-id cid)))
+                           (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                             (reset! channel-id cid)
+                             (replay-cached-gossip-to-agent! shell-node agent-node cid replayed-msg-ids)))
         :on-message
         (fn [evt]
-          (when-let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+          (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
             (reset! channel-id cid))
           (when-let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
             (when-let [sender (:sender unwrapped)]
@@ -680,16 +714,12 @@
                                              (dissoc old-key)
                                              (assoc sender {:node agent-node
                                                             :channel-id channel-id
-                                                            :last-rx-at (atom (System/currentTimeMillis))}))))))))
+                                                            :last-rx-at (atom (System/currentTimeMillis))}))))
+                    (when-let [cid (or @channel-id 0)]
+                      (replay-cached-gossip-to-agent! shell-node agent-node cid replayed-msg-ids))))))
             (async/put! (:network-in shell-node) unwrapped)
             (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
-              (let [frozen (:payload evt)
-                    sender (:sender unwrapped)]
-                (doseq [[pk conn] @agent-conns
-                        :when (not= pk sender)]
-                  (when-let [cid (or @(:channel-id conn) 0)]
-                    (try (api/send! (:node conn) frozen cid)
-                         (catch Exception _ nil))))))))
+              (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped)))))
         :on-close (fn [_]
                     (reset! channel-id nil)
                     (when-let [k @agent-sender]

@@ -190,6 +190,32 @@
 ;; Validator Connection Manager
 ;; -----------------------------------------------------------------------------
 
+(defn ordered-validator-candidates
+  "Builds a deterministic, failover-prioritized list of validator candidate nodes.
+   Prioritizes active home-set candidates, followed by the remaining bootstrap nodes
+   sorted deterministically by name, and rotates the candidate list by validator-cursor."
+  [bootstrap-descriptor home-set validator-cursor]
+  (let [nodes-map (get bootstrap-descriptor :nodes {})
+        norm-node-id (fn [item]
+                       (cond
+                         (keyword? item) item
+                         (string? item) (keyword item)
+                         (map? item) (recur (or (:node-id item) (:id item) (:node item)))
+                         :else nil))
+        normalized-home (vec (distinct (keep norm-node-id home-set)))
+        all-node-keys (vec (sort-by name (keys nodes-map)))
+        home-in-desc (filterv #(contains? nodes-map %) normalized-home)
+        remainder-keys (remove (set home-in-desc) all-node-keys)
+        ordered-keys (into (vec home-in-desc) remainder-keys)
+        base-candidates (mapv (fn [k] (assoc (get nodes-map k) :node-id k)) ordered-keys)]
+    (if (empty? base-candidates)
+      []
+      (let [n (count base-candidates)
+            cursor (long (max 0 (or validator-cursor 0)))
+            rot (mod cursor n)]
+        (into (subvec base-candidates rot)
+              (subvec base-candidates 0 rot))))))
+
 (defn init-conn-state
   "Initializes the pure single-authority connection lifecycle state map."
   []
@@ -203,6 +229,9 @@
    :last-error nil
    :dropped 0
    :ignored-stale 0
+   :validator-id nil
+   :validator-cursor 0
+   :failover-count 0
    :diagnostics []})
 
 (defn- push-diagnostic
@@ -247,17 +276,31 @@
         :dial-ok
         (let [node-to-close (:node conn)
               target-gen (long (or (:generation event) (:generation conn 0)))
-              effects (if (and node-to-close (not= node-to-close (:node event)))
-                        [{:effect :close-node :node node-to-close :generation (:generation conn 0)}]
-                        [])
-              new-conn (assoc conn
-                              :generation target-gen
-                              :phase :open
-                              :ok? true
-                              :channel-id (:channel-id event)
-                              :send-fn (:send-fn event)
-                              :node (:node event)
-                              :error nil)]
+              failed-nodes (vec (or (:failed-nodes event) []))
+              failover-attempts (long (or (:failover-attempts event) (count failed-nodes)))
+              failed-drop-count (long (count failed-nodes))
+              diag-effects (mapv (fn [fn-info]
+                                   {:effect :diagnose
+                                    :reason :dial-failover
+                                    :validator-id (:validator-id fn-info)
+                                    :error (or (:error fn-info) "listener-disabled")})
+                                 failed-nodes)
+              effects (cond-> (if (and node-to-close (not= node-to-close (:node event)))
+                                [{:effect :close-node :node node-to-close :generation (:generation conn 0)}]
+                                [])
+                        (seq diag-effects) (into diag-effects))
+              new-conn (-> (assoc conn
+                                  :generation target-gen
+                                  :phase :open
+                                  :ok? true
+                                  :channel-id (:channel-id event)
+                                  :send-fn (:send-fn event)
+                                  :node (:node event)
+                                  :validator-id (:validator-id event)
+                                  :failover-count (+ (long (:failover-count conn 0)) failover-attempts)
+                                  :dropped (+ (long (:dropped conn 0)) failed-drop-count)
+                                  :error nil)
+                           (as-> c (reduce push-diagnostic c diag-effects)))]
           [new-conn effects])
 
         :dial-failed
@@ -273,6 +316,8 @@
                                   :channel-id nil
                                   :send-fn nil
                                   :node nil
+                                  :validator-id nil
+                                  :validator-cursor (inc (long (:validator-cursor conn 0)))
                                   :error err
                                   :last-error err
                                   :dropped (inc (:dropped conn 0)))
@@ -292,6 +337,8 @@
                                   :channel-id nil
                                   :send-fn nil
                                   :node nil
+                                  :validator-id nil
+                                  :validator-cursor (inc (long (:validator-cursor conn 0)))
                                   :error err
                                   :last-error err)
                            (push-diagnostic diag-eff))]
@@ -310,6 +357,8 @@
                                   :channel-id nil
                                   :send-fn nil
                                   :node nil
+                                  :validator-id nil
+                                  :validator-cursor (inc (long (:validator-cursor conn 0)))
                                   :error err
                                   :last-error err
                                   :dropped (inc (:dropped conn 0)))
@@ -377,6 +426,9 @@
              :last_error (:last-error conn)
              :dropped (:dropped conn 0)
              :ignored_stale (:ignored-stale conn 0)
+             :validator_id (when-let [vid (:validator-id conn)] (name vid))
+             :validator_cursor (:validator-cursor conn 0)
+             :failover_count (:failover-count conn 0)
              :diagnostics_buffered (long diag-count)}
       (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn)))))
 
@@ -455,7 +507,7 @@
 (defn make-client-callbacks
   "Creates callback handlers for client DataChannel connection."
   [client-node channel-id connected? send-fn-atom ctx]
-  (let [{:keys [identity state-atom conn-atom event-out reconnect-fn generation diagnostics-atom diagnose-fn]} ctx
+  (let [{:keys [identity state-atom conn-atom event-out reconnect-fn generation diagnostics-atom diagnose-fn state-file]} ctx
         cb-opts (cond-> {}
                   diagnostics-atom (assoc :diagnostics-atom diagnostics-atom)
                   diagnose-fn (assoc :diagnose-fn diagnose-fn))]
@@ -482,6 +534,8 @@
                            (let [st @state-atom
                                  res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
                              (reset! state-atom (:state res))
+                             (when (and state-file (not= st (:state res)))
+                               (try (save-light-state! state-file (:state res)) (catch Exception _ nil)))
                              (when (and event-out (seq (:stdout-events res)))
                                (doseq [ev (:stdout-events res)]
                                  (event-out ev)))
@@ -531,6 +585,7 @@
                                           :event-out (:event-out opts)
                                           :reconnect-fn (:reconnect-fn opts)
                                           :generation (:generation opts)
+                                          :state-file (:state-file opts)
                                           :diagnostics-atom (:diagnostics-atom opts)
                                           :diagnose-fn (:diagnose-fn opts)})
         transport (:transport opts)
@@ -581,23 +636,42 @@
 
 (defn connect-validators!
   "Establishes WebRTC DataChannel connections to validators in bootstrap-descriptor.
+   Rotates through candidates using home-set priority and validator-cursor.
    Returns connection result or error map (:bad-fingerprint or :listener-disabled)."
   [identity bootstrap-descriptor opts]
   (if-let [err (validate-node-fingerprints bootstrap-descriptor)]
     err
     (if-let [dialer (:dialer-fn opts)]
       (dialer identity bootstrap-descriptor opts)
-      (let [nodes (vals (get bootstrap-descriptor :nodes {}))]
-        (if (empty? nodes)
+      (let [home-set (or (:home-set opts)
+                         (when-let [sa (:state-atom opts)] (:home-set @sa)))
+            cursor (or (:validator-cursor opts)
+                       (when-let [ca (:conn-atom opts)] (:validator-cursor @ca 0))
+                       0)
+            candidates (ordered-validator-candidates bootstrap-descriptor home-set cursor)]
+        (if (empty? candidates)
           {:ok? false :error "no-nodes-in-descriptor"}
-          (loop [rem-nodes nodes]
-            (if-let [node (first rem-nodes)]
+          (loop [rem-candidates candidates
+                 failed-nodes []]
+            (if-let [node (first rem-candidates)]
               (let [res (dial-single-node! identity node opts)]
                 (cond
-                  (:ok? res) res
-                  (= (:error res) "bad-fingerprint") res
-                  :else (recur (rest rem-nodes))))
-              {:ok? false :error "listener-disabled"})))))))
+                  (:ok? res)
+                  (assoc res
+                         :validator-id (:node-id node)
+                         :failover-attempts (count failed-nodes)
+                         :failed-nodes failed-nodes)
+
+                  (= (:error res) "bad-fingerprint")
+                  res
+
+                  :else
+                  (recur (rest rem-candidates)
+                         (conj failed-nodes {:validator-id (:node-id node)
+                                             :error (or (:error res) "listener-disabled")}))))
+              {:ok? false
+               :error "listener-disabled"
+               :failed-nodes failed-nodes})))))))
 
 ;; -----------------------------------------------------------------------------
 ;; CLI Runner (Serve & One-Shot Modes)
@@ -630,26 +704,33 @@
             (when conn-atom
               (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
             (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
-                  opts-with-gen (assoc (or conn-opts {}) :generation target-gen)
+                  cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
+                  home-set (if state-atom (:home-set @state-atom) [])
+                  opts-with-gen (assoc (or conn-opts {})
+                                       :generation target-gen
+                                       :validator-cursor cursor
+                                       :home-set home-set)
                   reconn (connect-validators! identity bootstrap opts-with-gen)]
               (if (:ok? reconn)
                 (do
                   (when conn-atom
                     (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
-                  (if (send-all-envelopes! (:send-fn reconn) (:net-envelopes res))
-                    (do
-                      (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
-                      (sync-conn-diagnostics! state-atom conn-atom)
-                      (save-light-state! state-file @state-atom)
-                      (when-let [resp (:response res)]
-                        (emit-json-line! out-writer resp)))
-                    (let [err "send-failed"]
-                      (when conn-atom
-                        (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
-                      (when state-atom
-                        (swap! state-atom assoc :connected? false :connection-error err))
-                      (sync-conn-diagnostics! state-atom conn-atom)
-                      (emit-json-line! out-writer {"ok" false "error" err}))))
+                  (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
+                        all-envs (into (vec replay-envs) (:net-envelopes res))]
+                    (if (send-all-envelopes! (:send-fn reconn) all-envs)
+                      (do
+                        (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                        (sync-conn-diagnostics! state-atom conn-atom)
+                        (save-light-state! state-file @state-atom)
+                        (when-let [resp (:response res)]
+                          (emit-json-line! out-writer resp)))
+                      (let [err "send-failed"]
+                        (when conn-atom
+                          (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
+                        (when state-atom
+                          (swap! state-atom assoc :connected? false :connection-error err))
+                        (sync-conn-diagnostics! state-atom conn-atom)
+                        (emit-json-line! out-writer {"ok" false "error" err})))))
                 (let [err (or (:error reconn) "listener-disabled")]
                   (when conn-atom
                     (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
@@ -685,7 +766,12 @@
                        (when conn-atom
                          (apply-conn-event! conn-atom {:type :dial-started} @conn-opts-atom))
                        (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
-                             opts-with-gen (assoc (or @conn-opts-atom {}) :generation target-gen)
+                             cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
+                             home-set (if state-atom (:home-set @state-atom) [])
+                             opts-with-gen (assoc (or @conn-opts-atom {})
+                                                  :generation target-gen
+                                                  :validator-cursor cursor
+                                                  :home-set home-set)
                              reconn (connect-validators! identity bootstrap opts-with-gen)]
                          (if (:ok? reconn)
                            (do
@@ -695,6 +781,9 @@
                                     :connected? true
                                     :connection-error nil)
                              (sync-conn-diagnostics! state-atom conn-atom)
+                             (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))]
+                               (when (seq replay-envs)
+                                 (send-all-envelopes! (:send-fn reconn) replay-envs)))
                              reconn)
                            (let [err (or (:error reconn) "listener-disabled")]
                              (when conn-atom
@@ -708,7 +797,8 @@
                          :state-atom state-atom
                          :conn-atom conn-atom
                          :event-out event-out
-                         :reconnect-fn reconnect-fn)
+                         :reconnect-fn reconnect-fn
+                         :state-file state-file)
         _ (reset! conn-opts-atom conn-opts)
         conn-res (reconnect-fn)
         ctx {:state-atom state-atom

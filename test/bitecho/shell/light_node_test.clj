@@ -1258,3 +1258,79 @@
       (is (= 100 (get-in (light-shell/parse-light-node-args ["transfer" "--amount" "100"]) [:cmd-map "amount"])))
       (is (= 7 (get-in (light-shell/parse-light-node-args ["transfer" "--seq" "7"]) [:cmd-map "seq"])))
       (is (= ["n1" "n2"] (get-in (light-shell/parse-light-node-args ["register-home-set" "--nodes" "n1,n2"]) [:cmd-map "home_nodes"]))))))
+
+;; -----------------------------------------------------------------------------
+;; 13. Candidate Ordering, Failover Rotation & Session Durability Tests (Priority 2)
+;; -----------------------------------------------------------------------------
+
+(deftest test-ordered-validator-candidates-and-failover-rotation
+  (testing "ordered-validator-candidates prioritizes home-set, sorts remainder deterministically, and rotates with cursor"
+    (let [desc {:network :devnet
+                :nodes {:node1 {:node-id :node1 :ip "127.0.0.1" :agent-port 5010}
+                        :node2 {:node-id :node2 :ip "127.0.0.2" :agent-port 5010}
+                        :node3 {:node-id :node3 :ip "127.0.0.3" :agent-port 5010}}}]
+      ;; 1. Empty home-set -> sorted by name (:node1, :node2, :node3)
+      (let [cands-base (light-shell/ordered-validator-candidates desc [] 0)
+            ids-base (mapv :node-id cands-base)]
+        (is (= [:node1 :node2 :node3] ids-base)))
+
+      ;; 2. Home-set [:node2] -> :node2 first, then remainder sorted [:node1 :node3]
+      (let [cands-hs (light-shell/ordered-validator-candidates desc [:node2] 0)
+            ids-hs (mapv :node-id cands-hs)]
+        (is (= [:node2 :node1 :node3] ids-hs)))
+
+      ;; 3. Normalization: supports strings and map forms in home-set
+      (let [cands-str (light-shell/ordered-validator-candidates desc ["node2"] 0)]
+        (is (= [:node2 :node1 :node3] (mapv :node-id cands-str))))
+      (let [cands-map (light-shell/ordered-validator-candidates desc [{:node-id :node3}] 0)]
+        (is (= [:node3 :node1 :node2] (mapv :node-id cands-map))))
+
+      ;; 4. Cursor rotation
+      (let [cands-cur1 (light-shell/ordered-validator-candidates desc [:node2] 1)]
+        (is (= [:node1 :node3 :node2] (mapv :node-id cands-cur1))))
+      (let [cands-cur2 (light-shell/ordered-validator-candidates desc [:node2] 2)]
+        (is (= [:node3 :node2 :node1] (mapv :node-id cands-cur2))))
+      (let [cands-cur3 (light-shell/ordered-validator-candidates desc [:node2] 3)]
+        (is (= [:node2 :node1 :node3] (mapv :node-id cands-cur3)))))))
+
+(defspec ^{:doc "Property: Multi-peer failover rotation, failover count diagnostics, and cursor tracking"}
+  prop-multi-peer-session-failover-convergence 30
+  (prop/for-all [attempts (gen/choose 0 5)
+                 initial-cursor (gen/choose 0 10)]
+                (let [conn0 (assoc (light-shell/init-conn-state) :validator-cursor initial-cursor)
+                      failed-nodes (vec (for [i (range attempts)]
+                                          {:validator-id (keyword (str "node-" i))
+                                           :error "listener-disabled"}))
+                      connected-vid :node-connected
+                      mock-node {:node-id connected-vid}
+                      mock-cid (atom "cid-1")
+                      mock-send (constantly true)
+                      event {:type :dial-ok
+                             :generation 1
+                             :validator-id connected-vid
+                             :failover-attempts attempts
+                             :failed-nodes failed-nodes
+                             :node mock-node
+                             :channel-id mock-cid
+                             :send-fn mock-send}
+                      [conn1 effects] (light-shell/transition-conn conn0 event)
+                      summary1 (light-shell/conn-diagnostics-summary conn1)]
+      ;; Verification of dial-ok failover recording
+                  (and (= :open (:phase conn1))
+                       (= connected-vid (:validator-id conn1))
+                       (= (name connected-vid) (:validator_id summary1))
+                       (= attempts (:failover-count conn1))
+                       (= attempts (:failover_count summary1))
+                       (= attempts (:dropped conn1))
+                       (= attempts (:dropped summary1))
+                       (= initial-cursor (:validator-cursor conn1))
+                       (= initial-cursor (:validator_cursor summary1))
+                       (= attempts (count (filter #(= :diagnose (:effect %)) effects)))
+           ;; Next: failure event (:on-close or :send-failed or :dial-failed)
+                       (let [[conn2 _eff2] (light-shell/transition-conn conn1 {:type :on-close :generation 1})
+                             summary2 (light-shell/conn-diagnostics-summary conn2)]
+                         (and (= :failed (:phase conn2))
+                              (nil? (:validator-id conn2))
+                              (nil? (:validator_id summary2))
+                              (= (inc initial-cursor) (:validator-cursor conn2))
+                              (= (inc initial-cursor) (:validator_cursor summary2))))))))

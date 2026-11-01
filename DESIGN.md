@@ -146,3 +146,28 @@ In Streamlet consensus clusters, nodes operate a dual-phase execution pipeline:
 2. **Post-Finality Execution**: Proposers pack unfinalized receipts into block payloads. Upon 3-chain block finalization, `execute-finalized-blocks` iterates through newly finalized blocks in ascending chain order, applying transfers, deducting signaling burns, executing settlement takes, settling vouchers, and driving demand-gated treasury minting.
 3. **FIFO Replay-Protection Horizon**: Receipt and block tracking sets (`:known-receipt-ids`, `:executed-receipt-ids`, `:executed-finalized-blocks`) utilize deterministic FIFO eviction (`fifo-track`) bounded by `:max-tracked-receipts` (default `10,000`), establishing an explicit, deterministic replay-protection horizon while eliminating unbounded set growth.
 4. **Burn Digest Diagnostics**: Nodes expose consensus convergence via `burn_digest` (cross-node comparable at the same `finalized_epoch` height) and `finalized_epoch` in `render-statusz` and the `/burnsz` HTTP endpoint, ensuring verifiable, cross-node auditability.
+
+### F. Multi-Peer Session Durability, Failover Rotation & Idempotent Session Replay
+Light nodes (AI agents) and edge participants maintain zero-loss, zero-duplication session durability across arbitrary validator restarts, network partitions, and failover rotations:
+
+1. **Deterministic Home-Node & Bootstrap Rotation**:
+   - `ordered-validator-candidates` prioritizes registered `:home-set` nodes, followed by remainder bootstrap nodes sorted deterministically by node ID.
+   - Rotates candidate order using `:validator-cursor` upon connection failure (`:dial-failed`, `:on-close`, `:send-failed`).
+   - Surfaces connection telemetry (`:validator_id`, `:validator_cursor`, `:failover_count`) in connection diagnostics (`conn-diagnostics-summary`).
+   - Inbound wire events immediately trigger durable persistence to `state.nippy` via `make-client-callbacks`.
+
+2. **Session Outbox Buffering & Deterministic FIFO Eviction**:
+   - Open sessions buffer outgoing sealed messages in `:outbox` (`seq -> {:seq seq :msg-payload msg-payload :burn burn-amt}`) and `:outbox-order`.
+   - Buffering is strictly bounded by `:max-outbox-size` (default `64`) with deterministic FIFO eviction of the oldest sequence on overflow.
+
+3. **Signed SACK Reconciliation & Idempotent Deduplication**:
+   - Receiver checks sliding replay window (`sealed/check-and-advance-replay-window`) before ChaCha20-Poly1305 decryption, dropping invalid or stale sequence numbers immediately without cryptographic amplification.
+   - On accepted messages, advances `:rx-high-seq`, calculates contiguous received horizon `:contiguous-rx-seq`, and responds with a signed `:session-ack` envelope containing cumulative `:ack-seq`, message `:acked-seq`, selective ack vector `:seen-seqs`, and Ed25519 signature over `"ack-<sid>-<ack-seq>-<acked-seq>-<seen-seqs>"`.
+   - On duplicate message arrival (`:replayed-seq`), receiver increments `:replays-deduped`, suppresses duplicate inbox entries and stdout events, and re-emits signed `:session-ack` to clear the sender's outbox.
+   - Sender validates peer Ed25519 signature on `:session-ack`, advances contiguous `:acked-seq`, and purges selectively and cumulatively acknowledged sequences from `:outbox` and `:outbox-order`.
+
+4. **Outbox Replay Across Failover & Epoch Skew Tolerance**:
+   - Reconnection triggers `build-unacked-replay-envelopes`, replaying unacknowledged outbox messages across open sessions.
+   - Replay envelopes advance envelope `:epoch` to at least the current state epoch to prevent skew rejection if failover spans epoch ticks.
+   - Consensus validators forward peer-received gossip to connected agents (`forward-gossip-to-agents!`) and replay cached epoch gossip (`replay-cached-gossip-to-agent!`) upon agent connection and DataChannel identification with connection-scoped message deduplication.
+

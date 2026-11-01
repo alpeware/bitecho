@@ -2754,6 +2754,7 @@
               s1-rec (nth states-ep7 1)
               s2-rec (nth states-ep7 2)]
           (is (= 0 (count (:pending-receipts s0-rec))))
+          (is (seq (:finalized-blocks s0-rec)))
           (is (>= (:last-executed-finalized-epoch s0-rec) 4))
           (is (= (:last-executed-finalized-epoch s0-rec)
                  (:last-executed-finalized-epoch s1-rec)

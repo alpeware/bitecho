@@ -308,3 +308,198 @@
       ;; inbox keys
       (is (= "s1" (or (get first-msg "session_id") (get first-msg :session_id))))
       (is (= "aabb" (or (get first-msg "payload_hex") (get first-msg :payload_hex)))))))
+
+(defspec ^{:doc "Property: Outbox buffering, unacked replay across failover, idempotent deduplication, and signed session-ack reconciliation"}
+  prop-idempotent-session-replay-and-ack-reconciliation 25
+  (prop/for-all [msg-texts (gen/vector gen-text-message 1 5)
+                 epoch-advance (gen/choose 0 3)]
+                (let [alice (test-identity)
+                      bob (test-identity)
+                      descriptor {:network :devnet
+                                  :nodes {:node1 {:node-id :node1 :ip "127.0.0.1" :agent-port 5010
+                                                  :fingerprint (:fingerprint (:identity alice))
+                                                  :ice-ufrag "u1" :ice-pwd "p1"}}}
+                      st-alice0 (light-core/init-light-state (:identity alice) {:bootstrap descriptor :epoch 1})
+                      st-bob0 (light-core/init-light-state (:identity bob) {:bootstrap descriptor :epoch 1 :autonomous? true})
+          ;; Alice creates offer
+                      offer-res (light-core/handle-command st-alice0 {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 10} (:privkey-bytes alice))
+                      session-id (get-in offer-res [:response "session_id"])
+                      offer-env (first (filter gossip-env? (:net-envelopes offer-res)))
+          ;; Bob accepts (autonomous)
+                      bob-accept-res (light-core/handle-wire-payload st-bob0 offer-env (:privkey-bytes bob))
+                      accept-env (first (filter gossip-env? (:net-envelopes bob-accept-res)))
+          ;; Alice opens session
+                      alice-accept-res (light-core/handle-wire-payload (:state offer-res) accept-env (:privkey-bytes alice))
+                      st-a1 (:state alice-accept-res)
+                      st-b1 (:state bob-accept-res)
+                      a-sess0 (get-in st-a1 [:sessions session-id])
+                      b-sess0 (get-in st-b1 [:sessions session-id])]
+                  (and (= "open" (:state a-sess0))
+                       (= "open" (:state b-sess0))
+                       (= 0 (:acked-seq a-sess0))
+                       (= 0 (:rx-high-seq b-sess0))
+                       (= 0 (:replays-deduped b-sess0))
+                       (map? (:outbox a-sess0))
+                       (vector? (:outbox-order a-sess0))
+             ;; Now Alice sends each message
+                       (let [send-res (reduce (fn [{:keys [state a-envelopes]} txt]
+                                                (let [res (light-core/handle-command state {"cmd" "send" "session_id" session-id "text" txt} (:privkey-bytes alice))
+                                                      env (first (filter gossip-env? (:net-envelopes res)))]
+                                                  {:state (:state res)
+                                                   :a-envelopes (conj a-envelopes env)}))
+                                              {:state st-a1 :a-envelopes []}
+                                              msg-texts)
+                             st-a2 (:state send-res)
+                             envs (:a-envelopes send-res)
+                             n (count msg-texts)
+                             a-sess2 (get-in st-a2 [:sessions session-id])]
+               ;; All N messages must be buffered in Alice's outbox before acks
+                         (and (= n (count (:outbox a-sess2)))
+                              (= (vec (range 1 (inc n))) (:outbox-order a-sess2))
+                    ;; First delivery: deliver the envelopes to Bob
+                              (let [rx1-res (reduce (fn [{:keys [state acks events]} env]
+                                                      (let [res (light-core/handle-wire-payload state env (:privkey-bytes bob))]
+                                                        {:state (:state res)
+                                                         :acks (into acks (filter gossip-env? (:net-envelopes res)))
+                                                         :events (into events (:stdout-events res))}))
+                                                    {:state st-b1 :acks [] :events []}
+                                                    envs)
+                                    st-b2 (:state rx1-res)
+                                    b-inbox1 (:inbox st-b2)
+                                    b-sess2 (get-in st-b2 [:sessions session-id])]
+                      ;; Bob inbox has exactly N messages, rx-high-seq = N, 0 replays deduped, N ack envelopes produced
+                                (and (= n (count b-inbox1))
+                                     (= n (count (:events rx1-res)))
+                                     (= n (:rx-high-seq b-sess2))
+                                     (= 0 (:replays-deduped b-sess2))
+                                     (= n (count (:acks rx1-res)))
+                           ;; Advance epoch across network (simulating epoch progression during failover)
+                                     (let [st-a-advanced (update st-a2 :epoch + epoch-advance)
+                                           st-b-advanced (update st-b2 :epoch + epoch-advance)
+                                           replay-envs (light-core/build-unacked-replay-envelopes st-a-advanced (:privkey-bytes alice))]
+                             ;; build-unacked-replay-envelopes returns N replay envelopes
+                                       (and (= n (count replay-envs))
+                                  ;; Second delivery (Replay/Duplicate after failover):
+                                  ;; Deliver replay-envs to Bob again!
+                                            (let [rx2-res (reduce (fn [{:keys [state acks events]} env]
+                                                                    (let [res (light-core/handle-wire-payload state env (:privkey-bytes bob))]
+                                                                      {:state (:state res)
+                                                                       :acks (into acks (filter gossip-env? (:net-envelopes res)))
+                                                                       :events (into events (:stdout-events res))}))
+                                                                  {:state st-b-advanced :acks [] :events []}
+                                                                  replay-envs)
+                                                  st-b3 (:state rx2-res)
+                                                  b-sess3 (get-in st-b3 [:sessions session-id])]
+                                    ;; Strict Idempotency:
+                                    ;; 1. Bob's inbox STILL has exactly N messages (no duplicates)
+                                    ;; 2. No duplicate message-received stdout events emitted
+                                    ;; 3. replays-deduped incremented by N
+                                    ;; 4. Duplicate acks are still emitted so sender can clear outbox
+                                              (and (= n (count (:inbox st-b3)))
+                                                   (= 0 (count (:events rx2-res)))
+                                                   (= n (:replays-deduped b-sess3))
+                                                   (= n (count (:acks rx2-res)))
+                                         ;; Now Alice receives Bob's acks (delivering all emitted acks to Alice)
+                                                   (let [ack-envs (into (:acks rx1-res) (:acks rx2-res))
+                                                         ack-res (reduce (fn [st a-env]
+                                                                           (:state (light-core/handle-wire-payload st a-env (:privkey-bytes alice))))
+                                                                         st-a-advanced
+                                                                         ack-envs)
+                                                         a-sess-final (get-in ack-res [:sessions session-id])
+                                                         empty-replays (light-core/build-unacked-replay-envelopes ack-res (:privkey-bytes alice))]
+                                           ;; Alice's outbox is completely drained!
+                                                     (and (= 0 (count (:outbox a-sess-final)))
+                                                          (= 0 (count (:outbox-order a-sess-final)))
+                                                          (= n (:acked-seq a-sess-final))
+                                                          (= 0 (count empty-replays))))))))))))))))
+
+(deftest test-out-of-order-sack-and-contiguous-reconciliation
+  (testing "Out-of-order delivery SACK purges only received sequence, preserves unreceived sequences in outbox, and contiguous ack reconciles all"
+    (let [alice (test-identity)
+          bob (test-identity)
+          descriptor {:network :devnet
+                      :nodes {:node1 {:node-id :node1 :ip "127.0.0.1" :agent-port 5010
+                                      :fingerprint (:fingerprint (:identity alice))
+                                      :ice-ufrag "u1" :ice-pwd "p1"}}}
+          st-alice0 (light-core/init-light-state (:identity alice) {:bootstrap descriptor :epoch 1})
+          st-bob0 (light-core/init-light-state (:identity bob) {:bootstrap descriptor :epoch 1 :autonomous? true})
+          offer-res (light-core/handle-command st-alice0 {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 10} (:privkey-bytes alice))
+          session-id (get-in offer-res [:response "session_id"])
+          offer-env (first (filter gossip-env? (:net-envelopes offer-res)))
+          bob-accept-res (light-core/handle-wire-payload st-bob0 offer-env (:privkey-bytes bob))
+          accept-env (first (filter gossip-env? (:net-envelopes bob-accept-res)))
+          alice-accept-res (light-core/handle-wire-payload (:state offer-res) accept-env (:privkey-bytes alice))
+          st-a0 (:state alice-accept-res)
+          st-b0 (:state bob-accept-res)]
+      (is (= "open" (get-in st-a0 [:sessions session-id :state])))
+      (is (= "open" (get-in st-b0 [:sessions session-id :state])))
+
+      ;; Alice sends seq 1, seq 2, seq 3
+      (let [res1 (light-core/handle-command st-a0 {"cmd" "send" "session_id" session-id "text" "msg1"} (:privkey-bytes alice))
+            env1 (first (filter gossip-env? (:net-envelopes res1)))
+            res2 (light-core/handle-command (:state res1) {"cmd" "send" "session_id" session-id "text" "msg2"} (:privkey-bytes alice))
+            env2 (first (filter gossip-env? (:net-envelopes res2)))
+            res3 (light-core/handle-command (:state res2) {"cmd" "send" "session_id" session-id "text" "msg3"} (:privkey-bytes alice))
+            env3 (first (filter gossip-env? (:net-envelopes res3)))
+            st-a-sent (:state res3)
+            a-sess-sent (get-in st-a-sent [:sessions session-id])]
+        (is (= [1 2 3] (:outbox-order a-sess-sent)))
+        (is (= #{1 2 3} (set (keys (:outbox a-sess-sent)))))
+
+        ;; Simulate packet loss: env1 and env2 are lost, only env3 reaches Bob!
+        (let [rx-res3 (light-core/handle-wire-payload st-b0 env3 (:privkey-bytes bob))
+              st-b-after-3 (:state rx-res3)
+              b-sess-after-3 (get-in st-b-after-3 [:sessions session-id])
+              ack-env3 (first (filter gossip-env? (:net-envelopes rx-res3)))]
+          ;; Bob received seq 3 out-of-order:
+          ;; rx-high-seq is 3, but contiguous-rx-seq is still 0!
+          (is (= 3 (:rx-high-seq b-sess-after-3)))
+          (is (= 0 (:contiguous-rx-seq b-sess-after-3)))
+          (is (some? ack-env3))
+
+          ;; Alice receives Bob's SACK for seq 3
+          (let [ack-res3 (light-core/handle-wire-payload st-a-sent ack-env3 (:privkey-bytes alice))
+                st-a-after-sack (:state ack-res3)
+                a-sess-after-sack (get-in st-a-after-sack [:sessions session-id])]
+            ;; SACK purges ONLY seq 3 from Alice's outbox!
+            ;; seq 1 and seq 2 MUST remain in outbox!
+            (is (= #{1 2} (set (keys (:outbox a-sess-after-sack)))))
+            (is (= [1 2] (:outbox-order a-sess-after-sack)))
+            (is (= 0 (:acked-seq a-sess-after-sack)))
+
+            ;; Replaying unacked envelopes returns exactly seq 1 and seq 2 (NOT seq 3)!
+            (let [replays (light-core/build-unacked-replay-envelopes st-a-after-sack (:privkey-bytes alice))]
+              (is (= 2 (count replays)))
+
+              ;; Now deliver seq 1 to Bob
+              (let [rx-res1 (light-core/handle-wire-payload st-b-after-3 env1 (:privkey-bytes bob))
+                    st-b-after-1 (:state rx-res1)
+                    b-sess-after-1 (get-in st-b-after-1 [:sessions session-id])
+                    ack-env1 (first (filter gossip-env? (:net-envelopes rx-res1)))]
+                ;; Now seq 1 received: contiguous-rx-seq is 1
+                (is (= 1 (:contiguous-rx-seq b-sess-after-1)))
+
+                ;; Alice processes ack for seq 1
+                (let [ack-res1 (light-core/handle-wire-payload st-a-after-sack ack-env1 (:privkey-bytes alice))
+                      st-a-after-ack1 (:state ack-res1)
+                      a-sess-after-ack1 (get-in st-a-after-ack1 [:sessions session-id])]
+                  (is (= #{2} (set (keys (:outbox a-sess-after-ack1)))))
+                  (is (= [2] (:outbox-order a-sess-after-ack1)))
+                  (is (= 1 (:acked-seq a-sess-after-ack1)))
+
+                  ;; Finally deliver seq 2 to Bob
+                  (let [rx-res2 (light-core/handle-wire-payload st-b-after-1 env2 (:privkey-bytes bob))
+                        st-b-after-2 (:state rx-res2)
+                        b-sess-after-2 (get-in st-b-after-2 [:sessions session-id])
+                        ack-env2 (first (filter gossip-env? (:net-envelopes rx-res2)))]
+                    ;; Now that seq 2 arrived, contiguous-rx-seq jumps from 1 straight to 3!
+                    (is (= 3 (:contiguous-rx-seq b-sess-after-2)))
+
+                    ;; Alice processes ack for seq 2: outbox is completely drained, acked-seq is 3!
+                    (let [ack-res2 (light-core/handle-wire-payload st-a-after-ack1 ack-env2 (:privkey-bytes alice))
+                          st-a-final (:state ack-res2)
+                          a-sess-final (get-in st-a-final [:sessions session-id])]
+                      (is (= 0 (count (:outbox a-sess-final))))
+                      (is (= [] (:outbox-order a-sess-final)))
+                      (is (= 3 (:acked-seq a-sess-final)))
+                      (is (empty? (light-core/build-unacked-replay-envelopes st-a-final (:privkey-bytes alice)))))))))))))))

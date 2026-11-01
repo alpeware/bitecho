@@ -231,6 +231,12 @@
                            :role :responder
                            :state "open"
                            :tx-seq 0
+                           :acked-seq 0
+                           :rx-high-seq 0
+                           :contiguous-rx-seq 0
+                           :replays-deduped 0
+                           :outbox {}
+                           :outbox-order []
                            :epoch epoch
                            :tx-key (:tx-key keys)
                            :rx-key (:rx-key keys)
@@ -266,8 +272,21 @@
                          :nonce (basalt/bytes->hex (:nonce sealed))
                          :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
             gossip-env (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze msg-payload) burn-amt)
+            max-outbox (long (or (:max-outbox-size state) 64))
+            curr-outbox (or (:outbox session) {})
+            curr-order (or (:outbox-order session) [])
+            next-order (conj curr-order seq-num)
+            next-outbox (assoc curr-outbox seq-num {:seq seq-num :msg-payload msg-payload :burn burn-amt})
+            [final-outbox final-order] (if (> (count next-order) max-outbox)
+                                         (let [overflow (- (count next-order) max-outbox)
+                                               evicted (subvec next-order 0 overflow)
+                                               kept (subvec next-order overflow)]
+                                           [(apply dissoc next-outbox evicted) kept])
+                                         [next-outbox next-order])
             new-state (-> state
                           (assoc-in [:sessions session-id :tx-seq] seq-num)
+                          (assoc-in [:sessions session-id :outbox] final-outbox)
+                          (assoc-in [:sessions session-id :outbox-order] final-order)
                           (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
         {:state new-state
          :response {"ok" true
@@ -336,7 +355,8 @@
 
 (defn- exec-status [state]
   (let [sessions-summary (vec (for [[_ s] (:sessions state)]
-                                (select-keys s [:session-id :peer :role :state :tx-seq :epoch])))]
+                                (-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped])
+                                    (assoc :unacked-count (count (:outbox s))))))]
     {:state state
      :response (cond-> {"ok" true
                         "connected" (boolean (:connected? state false))
@@ -450,6 +470,13 @@
                   keys (sealed/derive-channel-keys shared-sec session-id :initiator)
                   updated-sess (-> session
                                    (assoc :state "open"
+                                          :tx-seq 0
+                                          :acked-seq 0
+                                          :rx-high-seq 0
+                                          :contiguous-rx-seq 0
+                                          :replays-deduped 0
+                                          :outbox {}
+                                          :outbox-order []
                                           :tx-key (:tx-key keys)
                                           :rx-key (:rx-key keys)
                                           :replay-window (sealed/init-replay-window))
@@ -462,7 +489,41 @@
                :net-envelopes []
                :stdout-events [event]})))))))
 
-(defn- handle-wire-sealed-msg [state msg]
+(defn- advance-contiguous-rx-seq
+  "Advances the contiguous received sequence number starting from contiguous-seq
+   as long as contiguous-seq + 1 is present in seen-set or past the window horizon."
+  [contiguous-seq seen-set ^long highest-seq]
+  (let [window-size 64
+        horizon (- highest-seq window-size)]
+    (loop [curr (long (or contiguous-seq 0))]
+      (let [next-seq (inc curr)]
+        (cond
+          (contains? seen-set next-seq) (recur next-seq)
+          (and (pos? horizon) (<= next-seq horizon)) (recur next-seq)
+          :else curr)))))
+
+(defn build-session-ack-envelope
+  "Builds and signs a :session-ack envelope wrapping Ed25519 signature."
+  ([state session-id peer-pub contiguous-ack-seq msg-seq privkey-bytes]
+   (build-session-ack-envelope state session-id peer-pub contiguous-ack-seq msg-seq nil privkey-bytes))
+  ([state session-id peer-pub contiguous-ack-seq msg-seq seen-seqs privkey-bytes]
+   (when privkey-bytes
+     (let [seen-vec (vec (sort (or seen-seqs [])))
+           ack-sign-bytes (.getBytes (str "ack-" session-id "-" contiguous-ack-seq "-" msg-seq "-" (str/join "," seen-vec)) "UTF-8")
+           sig (crypto/sign privkey-bytes ack-sign-bytes)
+           sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
+           ack-payload {:bitecho/type :session-ack
+                        :session-id session-id
+                        :sender (:pubkey state)
+                        :recipient peer-pub
+                        :epoch (:epoch state)
+                        :ack-seq contiguous-ack-seq
+                        :acked-seq msg-seq
+                        :seen-seqs seen-vec
+                        :signature sig-hex}]
+       (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze ack-payload) 100)))))
+
+(defn- handle-wire-sealed-msg [state msg privkey-bytes]
   (if-not (= (:recipient msg) (:pubkey state))
     {:state state :net-envelopes [] :stdout-events []}
     (let [session-id (:session-id msg)
@@ -470,13 +531,19 @@
       (if-not (and session (= "open" (:state session)))
         {:state state :net-envelopes [] :stdout-events []}
         (let [chk (sealed/check-and-advance-replay-window (:replay-window session) (:seq msg))]
-          (if-not (:accepted? chk)
-            {:state state :net-envelopes [] :stdout-events []}
+          (cond
+            (:accepted? chk)
             (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch Exception _ nil))
                   decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (.getBytes session-id "UTF-8")))]
               (if-not decrypted
                 {:state state :net-envelopes [] :stdout-events []}
-                (let [text (try (String. ^bytes decrypted "UTF-8") (catch Exception _ nil))
+                (let [new-rx-high-seq (max (long (:rx-high-seq session 0)) (long (:seq msg)))
+                      new-contiguous (advance-contiguous-rx-seq (:contiguous-rx-seq session 0)
+                                                                (:seen (:window chk))
+                                                                (:highest-seq (:window chk) 0))
+                      seen-seqs (vec (sort (:seen (:window chk))))
+                      ack-env (build-session-ack-envelope state session-id (:sender msg) new-contiguous (:seq msg) seen-seqs privkey-bytes)
+                      text (try (String. ^bytes decrypted "UTF-8") (catch Exception _ nil))
                       inbox-item {:session-id session-id
                                   :session_id session-id
                                   :from (:sender msg)
@@ -484,7 +551,10 @@
                                   :text text
                                   :payload-hex (basalt/bytes->hex decrypted)
                                   :payload_hex (basalt/bytes->hex decrypted)}
-                      updated-sess (assoc session :replay-window (:window chk))
+                      updated-sess (assoc session
+                                          :replay-window (:window chk)
+                                          :rx-high-seq new-rx-high-seq
+                                          :contiguous-rx-seq new-contiguous)
                       new-state (-> state
                                     (assoc-in [:sessions session-id] updated-sess)
                                     (update :inbox (fnil conj []) inbox-item))
@@ -494,8 +564,92 @@
                                      "seq" (:seq msg)}
                               text (assoc "text" text))]
                   {:state new-state
-                   :net-envelopes []
-                   :stdout-events [event]})))))))))
+                   :net-envelopes (if ack-env [ack-env] [])
+                   :stdout-events [event]})))
+
+            (= :replayed-seq (:error chk))
+            (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch Exception _ nil))
+                  decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (.getBytes session-id "UTF-8")))]
+              (if-not decrypted
+                {:state state :net-envelopes [] :stdout-events []}
+                (let [contig (:contiguous-rx-seq session 0)
+                      seen-seqs (vec (sort (:seen (:replay-window session))))
+                      ack-env (build-session-ack-envelope state session-id (:sender msg) contig (:seq msg) seen-seqs privkey-bytes)
+                      new-state (update-in state [:sessions session-id :replays-deduped] (fnil inc 0))]
+                  {:state new-state
+                   :net-envelopes (if ack-env [ack-env] [])
+                   :stdout-events []})))
+
+            :else
+            {:state state :net-envelopes [] :stdout-events []}))))))
+
+(defn- handle-wire-session-ack [state msg]
+  (if-not (= (:recipient msg) (:pubkey state))
+    {:state state :net-envelopes [] :stdout-events []}
+    (let [session-id (:session-id msg)
+          session (get-in state [:sessions session-id])]
+      (if-not (and session
+                   (= "open" (:state session))
+                   (= (:sender msg) (:peer session)))
+        {:state state :net-envelopes [] :stdout-events []}
+        (let [peer-pub (try (basalt/hex->bytes (:peer session)) (catch Exception _ nil))
+              sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+              ack-seq (long (or (:ack-seq msg) 0))
+              acked-seq (long (or (:acked-seq msg) 0))
+              seen-vec (vec (sort (or (:seen-seqs msg) [])))
+              data-bytes (.getBytes (str "ack-" session-id "-" ack-seq "-" acked-seq "-" (str/join "," seen-vec)) "UTF-8")
+              legacy-bytes (.getBytes (str "ack-" session-id "-" ack-seq "-" acked-seq) "UTF-8")
+              valid-sig? (and peer-pub sig-bytes
+                              (or (crypto/verify peer-pub data-bytes sig-bytes)
+                                  (crypto/verify peer-pub legacy-bytes sig-bytes)))]
+          (if-not valid-sig?
+            {:state state :net-envelopes [] :stdout-events []}
+            (let [new-acked-seq (max (long (:acked-seq session 0)) ack-seq)
+                  curr-outbox (or (:outbox session) {})
+                  curr-order (or (:outbox-order session) [])
+                  seen-set (set (map long seen-vec))
+                  acked? (fn [s] (or (<= (long s) ack-seq) (= (long s) acked-seq) (contains? seen-set (long s))))
+                  purged-outbox (reduce-kv (fn [m s item]
+                                             (if (acked? s)
+                                               m
+                                               (assoc m s item)))
+                                           {}
+                                           curr-outbox)
+                  purged-order (filterv #(not (acked? %)) curr-order)
+                  updated-sess (assoc session
+                                      :acked-seq new-acked-seq
+                                      :outbox purged-outbox
+                                      :outbox-order purged-order)
+                  new-state (assoc-in state [:sessions session-id] updated-sess)]
+              {:state new-state
+               :net-envelopes []
+               :stdout-events []})))))))
+
+(defn build-unacked-replay-envelopes
+  "Extracts unacknowledged session outbox messages, advances their epoch to the current state epoch,
+   and wraps them in signed gossip envelopes for failover/reconnect replay."
+  ([state privkey-bytes]
+   (build-unacked-replay-envelopes state privkey-bytes nil))
+  ([state privkey-bytes session-id-filter]
+   (if-not privkey-bytes
+     []
+     (let [sessions (into (sorted-map)
+                          (filter (fn [[sid s]]
+                                    (and (= "open" (:state s))
+                                         (or (nil? session-id-filter)
+                                             (= sid session-id-filter))))
+                                  (:sessions state)))]
+       (vec
+        (for [[_ sess] sessions
+              seq-num (or (seq (:outbox-order sess)) (sort (keys (or (:outbox sess) {}))))
+              :let [item (get-in sess [:outbox seq-num])]
+              :when item
+              :let [msg (:msg-payload item)
+                    burn (or (:burn item) 500)
+                    curr-ep (:epoch state 0)
+                    upd-epoch (max (long (or (:epoch msg) 0)) (long curr-ep))
+                    upd-msg (assoc msg :epoch upd-epoch)]]
+          (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze upd-msg) burn)))))))
 
 (defn- handle-wire-close [state msg]
   (let [session-id (:session-id msg)
@@ -538,7 +692,8 @@
           (let [res (case (:bitecho/type msg)
                       :channel-offer (handle-wire-offer state msg privkey-bytes)
                       :channel-accept (handle-wire-accept state msg)
-                      :sealed-message (handle-wire-sealed-msg state msg)
+                      :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
+                      :session-ack (handle-wire-session-ack state msg)
                       :channel-close (handle-wire-close state msg)
                       {:state state :net-envelopes [] :stdout-events []})]
             (if (and msg-epoch (not (:epoch-initialized? (:state res))))
