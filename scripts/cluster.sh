@@ -709,13 +709,13 @@ TXT_BOOTSTRAP_EOF
 
 cmd_status() {
   echo "=== 3-Node Bitecho Devnet Cluster Status ==="
-  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
-    "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns"
-  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
-    "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-----------------------"
+  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
+    "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns" "FinEpoch" "BurnDigest" "Pending"
+  printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
+    "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-------------------------" "----------" "------------------" "-------"
 
   for node in "${NODES[@]}"; do
-    local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics
+    local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics fin_epoch burn_dig pending_rcpts
     ip="$(get_ip "$node")"
     if [[ -z "$ip" ]]; then
       ip="UNRESOLVED"
@@ -728,6 +728,9 @@ cmd_status() {
       blocks="N/A"
       peers="N/A"
       tokenomics="N/A"
+      fin_epoch="N/A"
+      burn_dig="N/A"
+      pending_rcpts="N/A"
     else
       local proj
       proj="$(get_project "$node")"
@@ -758,6 +761,9 @@ REMOTE_STATUS
           blocks="N/A"
           peers="N/A"
           tokenomics="N/A"
+          fin_epoch="N/A"
+          burn_dig="N/A"
+          pending_rcpts="N/A"
         else
           local raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz
           IFS='|' read -r raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz <<< "$raw_metrics"
@@ -800,6 +806,9 @@ REMOTE_STATUS
           else
             tokenomics="N/A"
           fi
+          fin_epoch="${r_finalized_epoch:-0}"
+          burn_dig="${r_burn_digest:-N/A}"
+          pending_rcpts="${r_pending_receipts:-0}"
         fi
       else
         state="${vm_state:-OFFLINE}"
@@ -811,11 +820,14 @@ REMOTE_STATUS
         blocks="N/A"
         peers="N/A"
         tokenomics="N/A"
+        fin_epoch="N/A"
+        burn_dig="N/A"
+        pending_rcpts="N/A"
       fi
     fi
 
-    printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %s\n" \
-      "$node" "$ip" "$state" "$cpu_usage" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics"
+    printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
+      "$node" "$ip" "$state" "$cpu_usage" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics" "$fin_epoch" "$burn_dig" "$pending_rcpts"
   done
 }
 

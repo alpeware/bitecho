@@ -202,7 +202,16 @@
    :error nil
    :last-error nil
    :dropped 0
-   :ignored-stale 0})
+   :ignored-stale 0
+   :diagnostics []})
+
+(defn- push-diagnostic
+  "Appends a diagnostic effect to conn's pure :diagnostics vector (capped at 64 entries)
+   and sets :last-diagnostic."
+  [conn eff]
+  (-> conn
+      (assoc :last-diagnostic eff)
+      (update :diagnostics (fn [ds] (vec (take-last 64 (conj (vec ds) eff)))))))
 
 (defn transition-conn
   "Pure reducer transitioning connection lifecycle state and returning [new-conn effects].
@@ -216,7 +225,7 @@
       (let [eff {:effect :ignore-stale :generation (:generation event)}]
         [(-> conn
              (update :ignored-stale (fnil inc 0))
-             (assoc :last-diagnostic eff))
+             (push-diagnostic eff))
          [eff]])
       (case (:type event)
         :dial-started
@@ -258,16 +267,16 @@
               effects (cond-> []
                         node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
                         true (conj diag-eff))
-              new-conn (assoc conn
-                              :phase :failed
-                              :ok? false
-                              :channel-id nil
-                              :send-fn nil
-                              :node nil
-                              :error err
-                              :last-error err
-                              :last-diagnostic diag-eff
-                              :dropped (inc (:dropped conn 0)))]
+              new-conn (-> conn
+                           (assoc :phase :failed
+                                  :ok? false
+                                  :channel-id nil
+                                  :send-fn nil
+                                  :node nil
+                                  :error err
+                                  :last-error err
+                                  :dropped (inc (:dropped conn 0)))
+                           (push-diagnostic diag-eff))]
           [new-conn effects])
 
         :on-close
@@ -277,15 +286,15 @@
               effects (cond-> []
                         node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
                         true (conj diag-eff))
-              new-conn (assoc conn
-                              :phase :failed
-                              :ok? false
-                              :channel-id nil
-                              :send-fn nil
-                              :node nil
-                              :error err
-                              :last-error err
-                              :last-diagnostic diag-eff)]
+              new-conn (-> conn
+                           (assoc :phase :failed
+                                  :ok? false
+                                  :channel-id nil
+                                  :send-fn nil
+                                  :node nil
+                                  :error err
+                                  :last-error err)
+                           (push-diagnostic diag-eff))]
           [new-conn effects])
 
         :send-failed
@@ -295,16 +304,16 @@
               effects (cond-> []
                         node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
                         true (conj diag-eff))
-              new-conn (assoc conn
-                              :phase :failed
-                              :ok? false
-                              :channel-id nil
-                              :send-fn nil
-                              :node nil
-                              :error err
-                              :last-error err
-                              :last-diagnostic diag-eff
-                              :dropped (inc (:dropped conn 0)))]
+              new-conn (-> conn
+                           (assoc :phase :failed
+                                  :ok? false
+                                  :channel-id nil
+                                  :send-fn nil
+                                  :node nil
+                                  :error err
+                                  :last-error err
+                                  :dropped (inc (:dropped conn 0)))
+                           (push-diagnostic diag-eff))]
           [new-conn effects])
 
         :shutdown
@@ -342,7 +351,7 @@
              (try (dfn eff) (catch Exception _ nil))))
          (when-let [datom (:diagnostics-atom opts)]
            (when (instance? clojure.lang.IAtom datom)
-             (swap! datom conj eff))))
+             (swap! datom (fn [curr] (vec (take-last 64 (conj (vec curr) eff))))))))
 
        nil))))
 
@@ -356,19 +365,20 @@
                         (let [[new-conn effects] (transition-conn conn event)]
                           (reset! effects-ref effects)
                           new-conn)))
-     (let [effective-opts (merge (select-keys @conn-atom [:diagnostics-atom :diagnose-fn]) opts)]
-       (execute-conn-effects! @effects-ref effective-opts))
+     (execute-conn-effects! @effects-ref opts)
      @conn-atom)))
 
 (defn conn-diagnostics-summary
   "Constructs diagnostic summary map from a connection state map."
   [conn]
-  (cond-> {:phase (name (or (:phase conn) :down))
-           :generation (:generation conn 0)
-           :last_error (:last-error conn)
-           :dropped (:dropped conn 0)
-           :ignored_stale (:ignored-stale conn 0)}
-    (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn))))
+  (let [diag-count (count (or (:diagnostics conn) []))]
+    (cond-> {:phase (name (or (:phase conn) :down))
+             :generation (:generation conn 0)
+             :last_error (:last-error conn)
+             :dropped (:dropped conn 0)
+             :ignored_stale (:ignored-stale conn 0)
+             :diagnostics_buffered (long diag-count)}
+      (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn)))))
 
 (defn- sync-conn-diagnostics!
   "Updates state-atom with connection liveness and conn-diagnostics summary."
@@ -667,7 +677,6 @@
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (:autonomous? opts false)}))
         state-atom (atom initial-state)
-        diagnostics-atom (atom [])
         conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
         event-out (fn [ev] (emit-json-line! out-writer ev))
@@ -698,7 +707,6 @@
         conn-opts (assoc opts
                          :state-atom state-atom
                          :conn-atom conn-atom
-                         :diagnostics-atom diagnostics-atom
                          :event-out event-out
                          :reconnect-fn reconnect-fn)
         _ (reset! conn-opts-atom conn-opts)

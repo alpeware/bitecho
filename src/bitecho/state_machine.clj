@@ -86,7 +86,9 @@
       :known-receipt-ids #{}
       :executed-receipt-ids #{}
       :executed-finalized-blocks #{}
-      :last-executed-finalized-epoch 0})))
+      :last-executed-finalized-epoch 0
+      :receipt-seq 0
+      :failed-receipts-count 0})))
 
 (defn consensus-mode?
   "Returns true if the node is operating in Streamlet BFT consensus mode with configured peers."
@@ -131,6 +133,7 @@
    Returns {:ok? true/false :state state}."
   [state receipt]
   (let [max-cap (long (or (get-in state [:config :max-pending-receipts]) 4096))
+        max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
         rid (:receipt-id receipt)]
     (cond
       (or (contains? (or (:known-receipt-ids state) #{}) rid)
@@ -141,19 +144,25 @@
       {:ok? false :state state}
 
       :else
-      {:ok? true
-       :state (-> state
-                  (update :pending-receipts (fnil conj []) receipt)
-                  (update :known-receipt-ids (fnil conj #{}) rid))})))
+      (let [next-known (conj (or (:known-receipt-ids state) #{}) rid)
+            bounded-known (if (> (count next-known) max-tracked)
+                            (into #{} (take-last max-tracked next-known))
+                            next-known)]
+        {:ok? true
+         :state (-> state
+                    (update :pending-receipts (fnil conj []) receipt)
+                    (assoc :known-receipt-ids bounded-known)
+                    (update :receipt-seq (fnil inc 0)))}))))
 
 (defn extract-burn-window
-  "Extracts the trailing burn and settlement take window up to the authoritative anchor epoch."
+  "Extracts the trailing burn and settlement take window up to the authoritative anchor epoch,
+   bounded by at most n entries."
   [state]
   (let [anchor-epoch (long (if (consensus-mode? state)
                              (or (:last-executed-finalized-epoch state) 0)
                              (or (:epoch state) 0)))
         n (long (or (get-in state [:config :treasury-trailing-epochs]) 168))
-        start-ep (max 0 (- anchor-epoch (max 1 n)))
+        start-ep (max 0 (inc (- anchor-epoch (max 1 n))))
         window (mapv (fn [ep]
                        [ep
                         (long (or (get-in state [:epoch-burns ep]) 0))
@@ -436,7 +445,24 @@
         expired-frozen-epochs (filterv #(< % frozen-cutoff) (keys (or (:frozen-epoch-messages state) {})))
         pruned-frozen-messages (reduce dissoc (or (:frozen-epoch-messages state) {}) expired-frozen-epochs)
         pruned-frozen-roles (reduce dissoc (or (:frozen-epoch-message-roles state) {}) expired-frozen-epochs)
-        rdv-cutoff (- (dec new-epoch) frozen-retention)]
+        rdv-cutoff (- (dec new-epoch) frozen-retention)
+        max-tracked (long (or (:max-tracked-receipts cfg) 10000))
+        pruned-tracked-known (let [k (or (:known-receipt-ids state) #{})]
+                               (if (> (count k) max-tracked) (into #{} (take-last max-tracked k)) k))
+        pruned-tracked-exec (let [e (or (:executed-receipt-ids state) #{})]
+                              (if (> (count e) max-tracked) (into #{} (take-last max-tracked e)) e))
+        pruned-exec-blocks (let [cutoff (- new-epoch frozen-retention)
+                                 blocks (or (:blocks state) {})
+                                 eb (or (:executed-finalized-blocks state) #{})
+                                 filtered (into #{}
+                                                (filter (fn [h]
+                                                          (if-let [b (get blocks h)]
+                                                            (>= (long (or (:epoch b) 0)) cutoff)
+                                                            false))
+                                                        eb))]
+                             (if (> (count filtered) max-tracked)
+                               (into #{} (take-last max-tracked filtered))
+                               filtered))]
     (-> (assoc state
                :epoch-to-messages pruned-epoch-to-messages
                :epoch-to-message-roles pruned-epoch-to-roles
@@ -452,7 +478,10 @@
                :local-ready-set pruned-local-ready-set
                :delivered-set pruned-delivered-set
                :frozen-epoch-messages pruned-frozen-messages
-               :frozen-epoch-message-roles pruned-frozen-roles)
+               :frozen-epoch-message-roles pruned-frozen-roles
+               :known-receipt-ids pruned-tracked-known
+               :executed-receipt-ids pruned-tracked-exec
+               :executed-finalized-blocks pruned-exec-blocks)
         (prune-rendezvous-retention-state rdv-cutoff))))
 
 (defn- collect-ancestor-receipt-ids
@@ -943,161 +972,241 @@
               {:state state-with-echo :commands []}))
           {:state state :commands []})))))
 
-(defn- apply-payload-to-ledger
-  "Attempts to parse a payload and apply any transfer to the ledger.
-   Returns the updated state if successful, or the original state on failure."
-  [state payload-bytes]
-  (let [payload-str (try (String. ^bytes payload-bytes "UTF-8") (catch Exception _ nil))
-        payload-edn (try (when payload-str
-                           (edn/read-string {:default tagged-literal
-                                             :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                       'bitecho.economy.account.AccountState account/map->AccountState}} payload-str))
-                         (catch Exception _ nil))]
-    (if (and (map? payload-edn) (:transfer payload-edn))
-      (try
-        (let [raw-transfer (:transfer payload-edn)
-              transfer-map (if (instance? clojure.lang.TaggedLiteral raw-transfer)
-                             (:form raw-transfer)
-                             (if (map? raw-transfer)
-                               (into {} raw-transfer)
-                               (into {} raw-transfer)))
-              transfer-map (if (vector? (:signature transfer-map))
-                             (assoc transfer-map :signature (byte-array (map byte (:signature transfer-map))))
-                             transfer-map)
-              transfer-map (if (string? (:signature transfer-map))
-                             (assoc transfer-map :signature (.getBytes ^String (:signature transfer-map) "UTF-8"))
-                             transfer-map)
-              transfer-map (if (and (seqable? (:signature transfer-map))
-                                    (every? number? (:signature transfer-map)))
-                             (assoc transfer-map :signature (byte-array (map byte (:signature transfer-map))))
-                             transfer-map)
-              transfer-map (if (not (bytes? (:signature transfer-map)))
-                             (assoc transfer-map :signature (byte-array 0))
-                             transfer-map)
+(defn- apply-transfer-payload-to-ledger
+  "Deserializes a transfer from payload-bytes and applies it to ledger if valid.
+   Returns the updated ledger map, or nil if invalid/failed."
+  [ledger payload-bytes]
+  (try
+    (let [payload-str (String. ^bytes payload-bytes "UTF-8")
+          payload-edn (edn/read-string {:default tagged-literal
+                                        :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                  'bitecho.economy.account.AccountState account/map->AccountState}} payload-str)
+          transfer-map (cond
+                         (and (map? payload-edn) (:transfer payload-edn)) (:transfer payload-edn)
+                         (instance? bitecho.economy.account.Transfer payload-edn) payload-edn
+                         :else nil)]
+      (if transfer-map
+        (let [transfer-map (if (instance? clojure.lang.TaggedLiteral transfer-map)
+                             (:form transfer-map)
+                             (into {} transfer-map))
+              sig (cond
+                    (vector? (:signature transfer-map)) (byte-array (map byte (:signature transfer-map)))
+                    (string? (:signature transfer-map)) (.getBytes ^String (:signature transfer-map) "UTF-8")
+                    (and (seqable? (:signature transfer-map)) (every? number? (:signature transfer-map))) (byte-array (map byte (:signature transfer-map)))
+                    (bytes? (:signature transfer-map)) (:signature transfer-map)
+                    :else (byte-array 0))
+              transfer-map (assoc transfer-map :signature sig)
               transfer (account/map->Transfer transfer-map)
-              ledger (or (:ledger state) {})
               sender (:sender transfer)
               sender-state (get ledger sender)]
           (if (and sender-state (account/validate-transfer sender-state transfer))
             (let [ledger-with-receiver (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
                                          (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                         ledger)
-                  new-ledger (account/apply-transfer ledger-with-receiver transfer)]
-              (assoc state :ledger new-ledger))
-            state))
-        (catch Exception _
-          state))
-      state)))
+                                         ledger)]
+              (account/apply-transfer ledger-with-receiver transfer))
+            nil))
+        nil))
+    (catch Exception _
+      nil)))
+
+(defn- apply-payload-to-ledger
+  "Attempts to parse a payload and apply any transfer to the ledger.
+   Returns the updated state if successful, or the original state on failure."
+  [state payload-bytes]
+  (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger state) payload-bytes)]
+    (assoc state :ledger new-ledger)
+    state))
+
+(defn- projected-ledger
+  "Projects pending receipts (:burn, :settle-intent, :transfer) onto (:ledger state)
+   so sequential pipelined transactions validate against uncommitted sender state."
+  [state]
+  (let [base-ledger (or (:ledger state) {})
+        pending (or (:pending-receipts state) [])]
+    (reduce
+     (fn [ledger r]
+       (case (:type r)
+         :burn
+         (let [sender (:sender r)
+               amt (:amount r)
+               sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))]
+           (if-let [res (when (and sender-hex amt) (burn/deduct-signaling-burn ledger sender-hex amt))]
+             (:ledger res)
+             ledger))
+
+         :settle-intent
+         (let [payer (:payer r)
+               receiver (:receiver r)
+               amount (:amount r)
+               payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
+               receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
+               payer-acct (when payer-hex (get ledger payer-hex))
+               payer-bal (or (:balance payer-acct) 0)]
+           (if (and payer-hex receiver-hex (integer? amount) (pos? amount) payer-acct (>= payer-bal amount))
+             (let [configured-bps (or (:settlement-take-bps state)
+                                      (get-in state [:config :settlement-take-bps])
+                                      burn/default-settlement-take-bps)
+                   take-bps (max 1 configured-bps)
+                   take-amt (burn/calculate-settlement-take amount take-bps)
+                   net-amt (- amount take-amt)
+                   receiver-acct (get ledger receiver-hex (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                   new-payer (assoc payer-acct :balance (- payer-bal amount))
+                   new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))]
+               (assoc ledger payer-hex new-payer receiver-hex new-receiver))
+             ledger))
+
+         :transfer
+         (if-let [pb (:payload-bytes r)]
+           (if-let [new-ledger (apply-transfer-payload-to-ledger ledger (byte-array (map byte pb)))]
+             new-ledger
+             ledger)
+           ledger)
+
+         ledger))
+     base-ledger
+     pending)))
+
+(defn- canonical-unexecuted-finalized-chain
+  "Walks the canonical ancestor chain from :latest-finalized-block-hash backwards via :parent-hash,
+   stopping at genesis or an executed finalized block.
+   Returns unexecuted canonical blocks in oldest-first order."
+  [state]
+  (let [latest-hash (:latest-finalized-block-hash state)
+        executed-hashes (or (:executed-finalized-blocks state) #{})
+        blocks (or (:blocks state) {})]
+    (if (and latest-hash (get blocks latest-hash))
+      (loop [curr latest-hash
+             acc ()]
+        (if (or (nil? curr)
+                (= curr "genesis")
+                (= curr "0000000000000000000000000000000000000000000000000000000000000000")
+                (contains? executed-hashes curr))
+          (vec acc)
+          (if-let [b (get blocks curr)]
+            (recur (:parent-hash b) (cons (assoc b :hash curr) acc))
+            (vec acc))))
+      ;; Fallback if :latest-finalized-block-hash not set or not in :blocks
+      (let [pending-hashes (set/difference (or (:finalized-blocks state) #{}) executed-hashes)]
+        (->> pending-hashes
+             (keep (fn [h] (when-let [b (get blocks h)] (assoc b :hash h))))
+             (sort-by (juxt (comp long :epoch) :hash))
+             vec)))))
 
 (defn execute-finalized-blocks
-  "Executes finalized Streamlet blocks in ascending order of [(epoch, hash)].
+  "Executes finalized Streamlet blocks along the canonical chain in ascending order.
    Applies receipts, advances epoch vouchers, and executes treasury boundaries."
   [state]
-  (let [finalized-hashes (or (:finalized-blocks state) #{})
-        executed-hashes (or (:executed-finalized-blocks state) #{})
-        blocks (:blocks state)
-        pending-hashes (set/difference finalized-hashes executed-hashes)
-        unexecuted-blocks (->> pending-hashes
-                               (keep (fn [h] (when-let [b (get blocks h)] (assoc b :hash h))))
-                               (sort-by (juxt (comp long :epoch) :hash)))]
+  (let [unexecuted-blocks (canonical-unexecuted-finalized-chain state)
+        max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))]
     (reduce
      (fn [st b]
        (let [b-hash (:hash b)
              b-epoch (long (:epoch b))
-             last-exec (long (or (:last-executed-finalized-epoch st) 0))]
-         (if (> b-epoch last-exec)
-           (let [;; 1. For each skipped epoch ep in (range (inc last-exec) b-epoch)
-                 st-skipped (reduce (fn [s ep]
-                                      (let [closing-ep (dec ep)
-                                            s-v (apply-epoch-voucher-settlement s closing-ep)]
-                                        (apply-epoch-treasury-boundary s-v ep)))
-                                    st
-                                    (range (inc last-exec) b-epoch))
-                 ;; 2. For b-epoch (with closing-ep = (dec b-epoch))
-                 closing-ep (dec b-epoch)
-                 payload (:payload b)
-                 receipts (filter #(and (map? %) (:receipt-id %)) (when (sequential? payload) payload))
-                 st-applied (reduce
-                             (fn [s r]
-                               (let [rid (:receipt-id r)]
-                                 (if (contains? (or (:executed-receipt-ids s) #{}) rid)
-                                   s
-                                   (let [s-effect
-                                         (case (:type r)
-                                           :burn
-                                           (let [sender (:sender r)
-                                                 amt (:amount r)
-                                                 sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))]
-                                             (if-let [res (when (and sender-hex amt) (burn/deduct-signaling-burn (:ledger s) sender-hex amt))]
-                                               (-> s
-                                                   (assoc :ledger (:ledger res))
-                                                   (update-in [:epoch-burns closing-ep] (fnil + 0) (:burn-amount res)))
-                                               s))
+             last-exec (long (or (:last-executed-finalized-epoch st) 0))
+             closing-ep (max 0 (dec b-epoch))
+             st-skipped (if (> b-epoch last-exec)
+                          (reduce (fn [s ep]
+                                    (let [s-v (apply-epoch-voucher-settlement s (dec ep))]
+                                      (apply-epoch-treasury-boundary s-v ep)))
+                                  st
+                                  (range (inc last-exec) b-epoch))
+                          st)
+             payload (:payload b)
+             receipts (filter #(and (map? %) (:receipt-id %)) (when (sequential? payload) payload))
+             st-applied (reduce
+                         (fn [s r]
+                           (let [rid (:receipt-id r)]
+                             (if (contains? (or (:executed-receipt-ids s) #{}) rid)
+                               s
+                               (let [s-effect
+                                     (case (:type r)
+                                       :burn
+                                       (let [sender (:sender r)
+                                             amt (:amount r)
+                                             sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))]
+                                         (if-let [res (when (and sender-hex amt) (burn/deduct-signaling-burn (:ledger s) sender-hex amt))]
+                                           (-> s
+                                               (assoc :ledger (:ledger res))
+                                               (update-in [:epoch-burns closing-ep] (fnil + 0) (:burn-amount res)))
+                                           (update s :failed-receipts-count (fnil inc 0))))
 
-                                           :transfer
-                                           (if-let [pb (:payload-bytes r)]
-                                             (apply-payload-to-ledger s (byte-array (map byte pb)))
-                                             s)
+                                       :transfer
+                                       (if-let [pb (:payload-bytes r)]
+                                         (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger s) (byte-array (map byte pb)))]
+                                           (assoc s :ledger new-ledger)
+                                           (update s :failed-receipts-count (fnil inc 0)))
+                                         (update s :failed-receipts-count (fnil inc 0)))
 
-                                           :settle-intent
-                                           (let [payer (:payer r)
-                                                 receiver (:receiver r)
-                                                 amount (:amount r)
-                                                 payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
-                                                 receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
-                                                 payer-acct (when payer-hex (get-in s [:ledger payer-hex]))
-                                                 payer-bal (or (:balance payer-acct) 0)]
-                                             (if (and payer-hex receiver-hex (integer? amount) (pos? amount) payer-acct (>= payer-bal amount))
-                                               (let [configured-bps (or (:settlement-take-bps s)
-                                                                        (get-in s [:config :settlement-take-bps])
-                                                                        burn/default-settlement-take-bps)
-                                                     take-bps (max 1 configured-bps)
-                                                     take-amt (burn/calculate-settlement-take amount take-bps)
-                                                     net-amt (- amount take-amt)
-                                                     receiver-acct (get-in s [:ledger receiver-hex]
-                                                                           (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                                     new-payer (assoc payer-acct :balance (- payer-bal amount))
-                                                     new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
-                                                     new-ledger (assoc (:ledger s)
-                                                                       payer-hex new-payer
-                                                                       receiver-hex new-receiver)]
-                                                 (-> s
-                                                     (assoc :ledger new-ledger)
-                                                     (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt)))
-                                               s))
-
-                                           :register-home-set
-                                           (let [tuple [(:callee r) (or (:epoch r) closing-ep)]
-                                                 reg-res (rendezvous/register-home-set (:candidates r) (:price r) (or (:price-max r) (:price r)))]
-                                             (assoc-in s [:home-sets tuple] reg-res))
-
-                                           :voucher
-                                           (let [tuple [(:callee r) (:home-node r) (:epoch r)]]
+                                       :settle-intent
+                                       (let [payer (:payer r)
+                                             receiver (:receiver r)
+                                             amount (:amount r)
+                                             payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
+                                             receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
+                                             payer-acct (when payer-hex (get-in s [:ledger payer-hex]))
+                                             payer-bal (or (:balance payer-acct) 0)]
+                                         (if (and payer-hex receiver-hex (integer? amount) (pos? amount) payer-acct (>= payer-bal amount))
+                                           (let [configured-bps (or (:settlement-take-bps s)
+                                                                    (get-in s [:config :settlement-take-bps])
+                                                                    burn/default-settlement-take-bps)
+                                                 take-bps (max 1 configured-bps)
+                                                 take-amt (burn/calculate-settlement-take amount take-bps)
+                                                 net-amt (- amount take-amt)
+                                                 receiver-acct (get-in s [:ledger receiver-hex]
+                                                                       (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                                 new-payer (assoc payer-acct :balance (- payer-bal amount))
+                                                 new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+                                                 new-ledger (assoc (:ledger s)
+                                                                   payer-hex new-payer
+                                                                   receiver-hex new-receiver)]
                                              (-> s
-                                                 (assoc-in [:voucher-seqs tuple] (:seq r))
-                                                 (update :pending-vouchers (fnil conj []) (:ack r))))
+                                                 (assoc :ledger new-ledger)
+                                                 (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt)))
+                                           (update s :failed-receipts-count (fnil inc 0))))
 
-                                           s)]
-                                     (-> s-effect
-                                         (update :executed-receipt-ids (fnil conj #{}) rid)
-                                         (update :known-receipt-ids (fnil conj #{}) rid))))))
-                             st-skipped
-                             receipts)
-                 exec-rids (or (:executed-receipt-ids st-applied) #{})
-                 st-clean (assoc st-applied
-                                 :pending-receipts (filterv #(not (contains? exec-rids (:receipt-id %)))
-                                                            (or (:pending-receipts st-applied) []))
-                                 :mempool (filterv #(if (and (map? %) (:receipt-id %))
-                                                      (not (contains? exec-rids (:receipt-id %)))
-                                                      true)
-                                                   (or (:mempool st-applied) [])))
-                 st-settled (apply-epoch-voucher-settlement st-clean closing-ep)
-                 st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)]
-             (-> st-treasury
-                 (assoc :last-executed-finalized-epoch b-epoch)
-                 (update :executed-finalized-blocks (fnil conj #{}) b-hash)))
-           ;; Else (b-epoch <= last-exec)
-           (update st :executed-finalized-blocks (fnil conj #{}) b-hash))))
+                                       :register-home-set
+                                       (let [tuple [(:callee r) (or (:epoch r) closing-ep)]
+                                             reg-res (rendezvous/register-home-set (:candidates r) (:price r) (or (:price-max r) (:price r)))]
+                                         (assoc-in s [:home-sets tuple] reg-res))
+
+                                       :voucher
+                                       (let [tuple [(:callee r) (:home-node r) (:epoch r)]]
+                                         (-> s
+                                             (assoc-in [:voucher-seqs tuple] (:seq r))
+                                             (update :pending-vouchers (fnil conj []) (:ack r))))
+
+                                       s)
+                                     next-exec (conj (or (:executed-receipt-ids s-effect) #{}) rid)
+                                     bounded-exec (if (> (count next-exec) max-tracked)
+                                                    (into #{} (take-last max-tracked next-exec))
+                                                    next-exec)
+                                     next-known (conj (or (:known-receipt-ids s-effect) #{}) rid)
+                                     bounded-known (if (> (count next-known) max-tracked)
+                                                     (into #{} (take-last max-tracked next-known))
+                                                     next-known)]
+                                 (assoc s-effect
+                                        :executed-receipt-ids bounded-exec
+                                        :known-receipt-ids bounded-known)))))
+                         st-skipped
+                         receipts)
+             exec-rids (or (:executed-receipt-ids st-applied) #{})
+             st-clean (assoc st-applied
+                             :pending-receipts (filterv #(not (contains? exec-rids (:receipt-id %)))
+                                                        (or (:pending-receipts st-applied) []))
+                             :mempool (filterv #(if (and (map? %) (:receipt-id %))
+                                                  (not (contains? exec-rids (:receipt-id %)))
+                                                  true)
+                                               (or (:mempool st-applied) [])))
+             st-advanced (if (> b-epoch last-exec)
+                           (let [st-settled (apply-epoch-voucher-settlement st-clean closing-ep)
+                                 st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)]
+                             (assoc st-treasury :last-executed-finalized-epoch b-epoch))
+                           st-clean)
+             next-blocks (conj (or (:executed-finalized-blocks st-advanced) #{}) b-hash)
+             bounded-blocks (if (> (count next-blocks) max-tracked)
+                              (into #{} (take-last max-tracked next-blocks))
+                              next-blocks)]
+         (assoc st-advanced :executed-finalized-blocks bounded-blocks)))
      state
      unexecuted-blocks)))
 
@@ -1185,7 +1294,8 @@
                              (assoc m :signature sig)))
             transfer (when transfer-map (account/map->Transfer transfer-map))
             sender (when transfer (:sender transfer))
-            sender-state (when (and sender (:ledger state)) (get (:ledger state) sender))
+            proj-ledger (projected-ledger state)
+            sender-state (when (and sender proj-ledger) (get proj-ledger sender))
             valid-transfer? (and transfer
                                  sender-state
                                  (account/validate-transfer sender-state transfer)
@@ -1223,7 +1333,7 @@
                  (>= burn-amt burn/min-signaling-burn)
                  (>= (spendable-balance state sender-hex) burn-amt))
           (let [rid (or (:receipt-id event)
-                        (str "burn:" sender-hex ":" (or (:epoch state) 0) ":" (count (or (:pending-receipts state) []))))
+                        (str "burn:" sender-hex ":" (or (:epoch state) 0) ":" (:receipt-seq state 0)))
                 staged (stage-receipt state {:receipt-id rid :type :burn :sender sender-hex :amount burn-amt})]
             (if (:ok? staged)
               {:state (:state staged) :commands []}
@@ -1329,7 +1439,7 @@
       (let [reg-result (rendezvous/register-home-set candidates p-b p-b-max)]
         (if (consensus-mode? state)
           (let [rid (str "home-set:" callee ":" current-epoch)
-                staged (stage-receipt (assoc-in state [:home-sets tuple] reg-result)
+                staged (stage-receipt state
                                       {:receipt-id rid
                                        :type :register-home-set
                                        :callee callee
@@ -1337,8 +1447,11 @@
                                        :candidates candidates
                                        :price p-b
                                        :price-max p-b-max})]
-            {:state (if (:ok? staged) (:state staged) (assoc-in state [:home-sets tuple] reg-result))
-             :commands []})
+            (if (:ok? staged)
+              {:state (assoc-in (:state staged) [:home-sets tuple] reg-result)
+               :commands []}
+              {:state state
+               :commands []}))
           {:state (assoc-in state [:home-sets tuple] reg-result)
            :commands []})))))
 
@@ -1388,7 +1501,7 @@
             (if (= :ok (:status res))
               (if (consensus-mode? state)
                 (let [rid (str "voucher:" callee ":" home-node ":" current-epoch ":" seq-num)
-                      staged (stage-receipt (assoc-in state [:voucher-seqs tuple] seq-num)
+                      staged (stage-receipt state
                                             {:receipt-id rid
                                              :type :voucher
                                              :callee callee
@@ -1397,8 +1510,11 @@
                                              :seq seq-num
                                              :cumulative-debit cum-debit
                                              :ack (:delivery-ack res)})]
-                  {:state (if (:ok? staged) (:state staged) (assoc-in state [:voucher-seqs tuple] seq-num))
-                   :commands []})
+                  (if (:ok? staged)
+                    {:state (assoc-in (:state staged) [:voucher-seqs tuple] seq-num)
+                     :commands []}
+                    {:state state
+                     :commands []}))
                 {:state (-> state
                             (assoc-in [:voucher-seqs tuple] seq-num)
                             (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
@@ -1426,7 +1542,7 @@
                  payer-acct
                  (>= (spendable-balance state payer-hex) amount))
           (let [rid (or (:receipt-id event)
-                        (str "intent:" payer-hex ":" receiver-hex ":" amount ":" (count (or (:pending-receipts state) []))))
+                        (str "intent:" payer-hex ":" receiver-hex ":" amount ":" (or (:epoch state) 0) ":" (:receipt-seq state 0)))
                 staged (stage-receipt state {:receipt-id rid
                                              :type :settle-intent
                                              :payer payer-hex

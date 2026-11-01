@@ -11,6 +11,7 @@
             [bitecho.sieve.core :as sieve]
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
+            [clojure.set :as set]
             [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -2724,5 +2725,213 @@
       (is (= 2 (count (:pending-receipts s2))))
       (is (= 1000 (:balance (get-in s2 [:ledger client-pub]))))
       (is (= 300 (sm/spendable-balance s2 client-pub)))
-      (is (empty? (:epoch-burns s2))))))
+      (is (empty? (:epoch-burns s2)))
+      ;; 4. Recovery phase: Drive 3-node cluster across consecutive epochs with block proposals and votes
+      (let [init-s1 (sm/init-state [] pub1 (assoc cfg :keypair (nth sorted-kps 1)))
+            init-s2 (sm/init-state [] pub2 (assoc cfg :keypair (nth sorted-kps 2)))
+            ;; Epoch 1 (proposer node 1)
+            states-ep1 (exchange-block-and-votes [s2 init-s1 init-s2] sorted-pubs 1)
+            ;; Epoch 2 (proposer node 2)
+            states-ep2 (exchange-block-and-votes states-ep1 sorted-pubs 2)
+            ;; Epoch 3 (proposer node 0: proposes block 3 with node 0's pending receipts)
+            states-ep3 (exchange-block-and-votes states-ep2 sorted-pubs 3)
+            ;; Epoch 4 (proposer node 1)
+            states-ep4 (exchange-block-and-votes states-ep3 sorted-pubs 4)
+            ;; Epoch 5 (proposer node 2: notarizes 3-chain, finalizing block 3)
+            states-ep5 (exchange-block-and-votes states-ep4 sorted-pubs 5)
+            s0-rec (nth states-ep5 0)
+            s1-rec (nth states-ep5 1)
+            s2-rec (nth states-ep5 2)]
+        (is (= 0 (count (:pending-receipts s0-rec))))
+        (is (pos? (:last-executed-finalized-epoch s0-rec)))
+        (is (= (:last-executed-finalized-epoch s0-rec)
+               (:last-executed-finalized-epoch s1-rec)
+               (:last-executed-finalized-epoch s2-rec)))
+        (is (= 300 (:balance (get-in s0-rec [:ledger client-pub]))))
+        (is (= (:ledger s0-rec) (:ledger s1-rec) (:ledger s2-rec)))
+        (is (pos? (:balance (get-in s0-rec [:ledger receiver-pub]))))
+        (is (pos? (get-in s0-rec [:epoch-burns 2] 0)))
+        (is (pos? (get-in s0-rec [:epoch-settlement-takes 2] 0)))))))
+
+(deftest test-monotonic-fallback-receipt-ids-across-drains
+  (testing "two burns and two settle-intents in same epoch separated by block execution do not collide on fallback receipt-id"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          receiver-kp (crypto/generate-keypair)
+          receiver-pub (basalt/bytes->hex (:public receiver-kp))
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      receiver-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                     :peers-map {pub (:public kp)})
+          s0 (sm/init-state [] pub (assoc cfg :keypair kp))
+          ;; 1. Stage first burn and first settle intent in epoch 0
+          s1 (:state (sm/handle-event s0 {:type :signaling-burn :sender pub :burn 100}))
+          s2 (:state (sm/handle-event s1 {:type :settle-intent :payer pub :receiver receiver-pub :amount 200}))
+          rids-1 (mapv :receipt-id (:pending-receipts s2))]
+      (is (= 2 (count rids-1)))
+      (is (distinct? (set rids-1)))
+      ;; Simulate block finalization draining pending-receipts
+      (let [block {:epoch 1
+                   :parent-hash "genesis"
+                   :payload (:pending-receipts s2)}
+            block-hash (streamlet/hash-block block)
+            s-finalized (-> s2
+                            (assoc-in [:blocks block-hash] block)
+                            (assoc :latest-finalized-block-hash block-hash
+                                   :finalized-blocks #{block-hash})
+                            sm/execute-finalized-blocks)]
+        (is (empty? (:pending-receipts s-finalized)))
+        (is (= 9700 (:balance (get-in s-finalized [:ledger pub]))))
+        ;; 2. In same epoch 0 (or before tick), stage a second burn and second settle-intent
+        (let [s3 (:state (sm/handle-event s-finalized {:type :signaling-burn :sender pub :burn 100}))
+              s4 (:state (sm/handle-event s3 {:type :settle-intent :payer pub :receiver receiver-pub :amount 150}))
+              rids-2 (mapv :receipt-id (:pending-receipts s4))]
+          (is (= 2 (count rids-2)))
+          ;; Must not collide with rids-1!
+          (is (empty? (set/intersection (set rids-1) (set rids-2))))
+          ;; Execute second block
+          (let [block2 {:epoch 2
+                        :parent-hash block-hash
+                        :payload (:pending-receipts s4)}
+                block2-hash (streamlet/hash-block block2)
+                s-finalized2 (-> s4
+                                 (assoc-in [:blocks block2-hash] block2)
+                                 (assoc :latest-finalized-block-hash block2-hash
+                                        :finalized-blocks #{block-hash block2-hash})
+                                 sm/execute-finalized-blocks)]
+            (is (empty? (:pending-receipts s-finalized2)))
+            (is (= 9450 (:balance (get-in s-finalized2 [:ledger pub]))))))))))
+
+(deftest test-fail-closed-staging-at-capacity
+  (testing "at max-pending-receipts 0, handle-register-home-set does not mutate :home-sets and handle-receive-offer-header does not burn :voucher-seqs"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          home-kp (crypto/generate-keypair)
+          home-pub (basalt/bytes->hex (:public home-kp))
+          candidates [{:node-id home-pub :price 10}
+                      {:node-id "n2" :price 10}
+                      {:node-id "n3" :price 10}]
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      home-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})}
+                     :peers-map {pub (:public kp)}
+                     :max-pending-receipts 0)
+          s0 (sm/init-state [] pub (assoc cfg :keypair kp))
+          tuple-hs [pub 0]
+          ;; 1. Register home set at capacity 0 fails closed without mutating :home-sets
+          res-hs (sm/handle-event s0 {:type :register-home-set
+                                      :callee pub
+                                      :candidates candidates
+                                      :price 10})
+          s-hs (:state res-hs)]
+      (is (nil? (get-in s-hs [:home-sets tuple-hs])))
+      (is (empty? (:pending-receipts s-hs)))
+
+      ;; Now with capacity 10, register home set succeeds
+      (let [s-hs-ok (:state (sm/handle-event (assoc-in s0 [:config :max-pending-receipts] 10)
+                                             {:type :register-home-set
+                                              :callee pub
+                                              :candidates candidates
+                                              :price 10}))
+            tuple-vs [pub home-pub 0]]
+        (is (some? (get-in s-hs-ok [:home-sets tuple-hs])))
+        ;; 2. Offer header at capacity 0 fails closed without mutating :voucher-seqs
+        (let [s-full (assoc-in s-hs-ok [:config :max-pending-receipts] 0)
+              res-oh (sm/handle-event s-full {:type :receive-offer-header
+                                              :callee pub
+                                              :callee-privkey (:private kp)
+                                              :home-node home-pub
+                                              :seq 1})
+              s-oh (:state res-oh)]
+          (is (nil? (get-in s-oh [:voucher-seqs tuple-vs])))
+          ;; Retry at normal capacity succeeds with seq 1
+          (let [s-retry (:state (sm/handle-event (assoc-in s-oh [:config :max-pending-receipts] 10)
+                                                 {:type :receive-offer-header
+                                                  :callee pub
+                                                  :callee-privkey (:private kp)
+                                                  :home-node home-pub
+                                                  :seq 1}))]
+            (is (= 1 (get-in s-retry [:voucher-seqs tuple-vs])))))))))
+
+(deftest test-failed-receipts-count-increments-on-overspend
+  (testing "failed-receipts-count increments when overspent receipt in finalized block is executed"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          receiver-kp (crypto/generate-keypair)
+          receiver-pub (basalt/bytes->hex (:public receiver-kp))
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub (account/map->AccountState {:balance 100 :seq 0 :deps []})
+                                      receiver-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                     :peers-map {pub (:public kp)})
+          s0 (sm/init-state [] pub (assoc cfg :keypair kp))
+          ;; Block with overspending settle-intent (amount 500 > balance 100) and overspending burn (200 > 100)
+          bad-receipt1 {:receipt-id "intent:bad:1" :type :settle-intent :payer pub :receiver receiver-pub :amount 500}
+          bad-receipt2 {:receipt-id "burn:bad:2" :type :burn :sender pub :amount 200}
+          block {:epoch 1
+                 :parent-hash "genesis"
+                 :payload [bad-receipt1 bad-receipt2]}
+          block-hash (streamlet/hash-block block)
+          s1 (-> s0
+                 (assoc-in [:blocks block-hash] block)
+                 (assoc :latest-finalized-block-hash block-hash
+                        :finalized-blocks #{block-hash})
+                 sm/execute-finalized-blocks)]
+      (is (= 2 (:failed-receipts-count s1)))
+      (is (= 100 (:balance (get-in s1 [:ledger pub]))))
+      (is (contains? (:executed-receipt-ids s1) "intent:bad:1"))
+      (is (contains? (:executed-receipt-ids s1) "burn:bad:2")))))
+
+(deftest test-pipelined-transfers-validate-sequential-seq-and-deps
+  (testing "pipelined transfers from same sender in same epoch validate against projected seq and deps"
+    (let [sender-kp (crypto/generate-keypair)
+          sender-pub (basalt/bytes->hex (:public sender-kp))
+          receiver-kp (crypto/generate-keypair)
+          receiver-pub (basalt/bytes->hex (:public receiver-kp))
+          node-kp (crypto/generate-keypair)
+          node-pub (basalt/bytes->hex (:public node-kp))
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {sender-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                                      receiver-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})
+                                      node-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})}
+                     :peers-map {node-pub (:public node-kp)})
+          s0 (sm/init-state [] node-pub (assoc cfg :keypair node-kp))
+          ;; Transfer 1: seq 1, deps []
+          tx1 (account/create-transfer (:private sender-kp)
+                                       {:sender sender-pub
+                                        :receiver receiver-pub
+                                        :amount 100
+                                        :seq 1
+                                        :deps []})
+          payload1 (.getBytes (pr-str {:transfer tx1}) "UTF-8")
+          res1 (sm/handle-event s0 {:type :on-deliver :payload payload1 :message-id "tx1"})
+          s1 (:state res1)
+          _ (is (= 1 (count (:pending-receipts s1))))
+          ;; Sender's projected deps after tx1:
+          tx1-hash (account/transfer-hash tx1)
+          ;; Transfer 2: seq 2, deps [tx1-hash]
+          tx2 (account/create-transfer (:private sender-kp)
+                                       {:sender sender-pub
+                                        :receiver receiver-pub
+                                        :amount 200
+                                        :seq 2
+                                        :deps [tx1-hash]})
+          payload2 (.getBytes (pr-str {:transfer tx2}) "UTF-8")
+          res2 (sm/handle-event s1 {:type :on-deliver :payload payload2 :message-id "tx2"})
+          s2 (:state res2)]
+      (is (= 2 (count (:pending-receipts s2))))
+      (is (= 700 (sm/spendable-balance s2 sender-pub)))
+      ;; Both transfers execute upon block finalization
+      (let [block {:epoch 1
+                   :parent-hash "genesis"
+                   :payload (:pending-receipts s2)}
+            block-hash (streamlet/hash-block block)
+            s-final (-> s2
+                        (assoc-in [:blocks block-hash] block)
+                        (assoc :latest-finalized-block-hash block-hash
+                               :finalized-blocks #{block-hash})
+                        sm/execute-finalized-blocks)]
+        (is (empty? (:pending-receipts s-final)))
+        (is (= 700 (:balance (get-in s-final [:ledger sender-pub]))))
+        (is (= 2 (:seq (get-in s-final [:ledger sender-pub]))))
+        (is (= 300 (:balance (get-in s-final [:ledger receiver-pub]))))))))
 

@@ -240,6 +240,6 @@ In consensus mode (`consensus-mode?` = `true`), incoming economic events (`:sign
 
 ### 11.2 Cross-Node Comparable Burn Digest & Diagnostics
 Nodes expose their trailing burn window and state convergence metrics through embedded HTTP endpoints:
-- **`burn_digest`**: A 16-character hexadecimal SHA-256 hash of the canonical trailing burn and settlement take window (`extract-burn-window`). All converged nodes in the consensus cluster produce an identical `burn_digest`.
+- **`burn_digest`**: A 16-character hexadecimal SHA-256 hash of the canonical trailing burn and settlement take window (`extract-burn-window`, bounded by at most $N$ epochs). All converged nodes in the consensus cluster produce an identical `burn_digest` at the same `finalized_epoch` height.
 - **`/statusz`**: Exposes `finalized_epoch=%d burn_digest=%s pending_receipts=%d` alongside core metrics.
 - **`/burnsz`**: Returns the EDN serialization of `(extract-burn-window state)` for deep cross-node inspection.

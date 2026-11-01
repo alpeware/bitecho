@@ -403,10 +403,24 @@
         (doseq [_ (range 4)]
           (doseq [n [node-a node-b node-c]]
             (async/put! (:events-in (:shell-node n)) {:type :tick :rng (java.util.Random.)}))
-          (Thread/sleep 150))
-        (let [st-a (#'mesh/query-node-state (:shell-node node-a) 1000)
-              st-b (#'mesh/query-node-state (:shell-node node-b) 1000)
-              st-c (#'mesh/query-node-state (:shell-node node-c) 1000)]
+          (Thread/sleep 50))
+        (let [deadline (+ (System/currentTimeMillis) 2000)
+              [st-a st-b st-c] (loop []
+                                 (let [sa (#'mesh/query-node-state (:shell-node node-a) 500)
+                                       sb (#'mesh/query-node-state (:shell-node node-b) 500)
+                                       sc (#'mesh/query-node-state (:shell-node node-c) 500)]
+                                   (if (and sa sb sc
+                                            (seq (:finalized-blocks sa))
+                                            (seq (:finalized-blocks sb))
+                                            (seq (:finalized-blocks sc))
+                                            (pos? (long (or (:last-executed-finalized-epoch sa) 0)))
+                                            (= (sm/compute-burn-map-digest sa)
+                                               (sm/compute-burn-map-digest sb)
+                                               (sm/compute-burn-map-digest sc)))
+                                     [sa sb sc]
+                                     (if (< (System/currentTimeMillis) deadline)
+                                       (do (Thread/sleep 25) (recur))
+                                       [sa sb sc]))))]
           (is (some? st-a))
           (is (some? st-b))
           (is (some? st-c))

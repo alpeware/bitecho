@@ -1145,6 +1145,16 @@
             ((:on-close cbs-stale) nil)
             (is (= [{:effect :ignore-stale :generation 1}] @diag-log)))
 
+          ;; Verify that pure :diagnostics vector and optional :diagnostics-atom are bounded to 64 entries and expose :diagnostics_buffered
+          (let [capped-conn-atom (atom (assoc (light-shell/init-conn-state) :generation 100))
+                ext-diag-atom (atom [])]
+            (dotimes [i 70]
+              (light-shell/apply-conn-event! capped-conn-atom {:type :on-close :generation i} {:diagnostics-atom ext-diag-atom}))
+            (is (= 64 (count (:diagnostics @capped-conn-atom))))
+            (is (= 64 (count @ext-diag-atom)))
+            (let [summary (light-shell/conn-diagnostics-summary @capped-conn-atom)]
+              (is (= 64 (:diagnostics_buffered summary)))))
+
           ;; 3. Verify strip-sensitive-keys and state persistence never save transient runtime liveness
           (swap! state-atom assoc
                  :connected? true
