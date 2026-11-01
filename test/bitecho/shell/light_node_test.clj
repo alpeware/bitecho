@@ -876,9 +876,13 @@
           state-dir (str temp-dir)
           identity (light-shell/load-or-create-light-identity! state-dir)
           descriptor {:network :devnet
+                      :treasury-pubkey (:pubkey-hex identity)
+                      :custody-pubkey (:pubkey-hex identity)
                       :nodes {:node1 {:node-id :node1
                                       :ip "127.0.0.1"
+                                      :port 5000
                                       :agent-port 5010
+                                      :pubkey (:pubkey-hex identity)
                                       :fingerprint (:fingerprint identity)
                                       :ice-ufrag "u1" :ice-pwd "p1"}}}]
       (try
@@ -886,6 +890,50 @@
         (run-fail-closed-test! identity descriptor state-dir)
         (run-failed-send-test! identity descriptor state-dir)
         (run-on-close-callback-test!)
+        (finally
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file state-dir)))))))))
+
+;; -----------------------------------------------------------------------------
+;; 8. Autonomous Flag Overlay on Saved State Test
+;; -----------------------------------------------------------------------------
+
+(deftest test-autonomous-flag-overlay-on-saved-state
+  (testing "Saved state with autonomous? false gets autonomous? true when loaded with --autonomous"
+    (let [temp-dir (Files/createTempDirectory "bitecho-test-auto" (into-array FileAttribute []))
+          state-dir (str temp-dir)
+          state-file (str (io/file state-dir "state.nippy"))
+          identity (light-shell/load-or-create-light-identity! state-dir)
+          descriptor {:network :devnet
+                      :treasury-pubkey (:pubkey-hex identity)
+                      :custody-pubkey (:pubkey-hex identity)
+                      :nodes {:node1 {:node-id :node1
+                                      :ip "127.0.0.1"
+                                      :port 5000
+                                      :agent-port 5010
+                                      :pubkey (:pubkey-hex identity)
+                                      :fingerprint (:fingerprint identity)
+                                      :ice-ufrag "u1" :ice-pwd "p1"}}}
+          saved-st (assoc (light-core/init-light-state identity {:bootstrap descriptor :epoch 1 :autonomous? false})
+                          :autonomous? false)]
+      (try
+        (light-shell/save-light-state! state-file saved-st)
+        (let [raw-loaded (light-shell/load-light-state! state-file)]
+          (is (= false (:autonomous? raw-loaded))))
+
+        (let [sw (StringWriter.)
+              pw (PrintWriter. sw true)]
+          (binding [*out* pw]
+            (let [resp (light-shell/run-one-shot! {:state-dir state-dir
+                                                   :bootstrap descriptor
+                                                   :autonomous? true
+                                                   :cmd-map {"cmd" "status"}})]
+              (is (= true (get resp "ok")))
+              (is (= true (get resp "autonomous")))))
+
+          (let [updated-st (light-shell/load-light-state! state-file)]
+            (is (= true (:autonomous? updated-st)))))
+
         (finally
           (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
                 (reverse (file-seq (io/file state-dir)))))))))

@@ -400,7 +400,8 @@
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
-        initial-state (or loaded-state
+        initial-state (or (cond-> loaded-state
+                            (:autonomous? opts) (assoc :autonomous? true))
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (:autonomous? opts false)}))
         state-atom (atom initial-state)
@@ -452,7 +453,8 @@
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
-        initial-state (or loaded-state
+        initial-state (or (cond-> loaded-state
+                            (:autonomous? opts) (assoc :autonomous? true))
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (:autonomous? opts false)}))
         cmd-map (:cmd-map opts)
