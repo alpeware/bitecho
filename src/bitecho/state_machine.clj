@@ -84,11 +84,32 @@
       :keypair (or (:keypair cfg) nil)
       :pending-receipts []
       :known-receipt-ids #{}
+      :known-receipt-order []
       :executed-receipt-ids #{}
+      :executed-receipt-order []
       :executed-finalized-blocks #{}
+      :executed-finalized-blocks-order []
       :last-executed-finalized-epoch 0
       :receipt-seq 0
       :failed-receipts-count 0})))
+
+(defn fifo-track
+  "Maintains a bounded set and order vector with deterministic FIFO eviction.
+   Returns [new-set new-order]."
+  [set-val order-vec item max-tracked]
+  (let [s (or set-val #{})
+        ord (or order-vec [])
+        max-cap (long (max 1 (or max-tracked 10000)))]
+    (if (contains? s item)
+      [s ord]
+      (let [next-set (conj s item)
+            next-order (conj ord item)]
+        (if (> (count next-order) max-cap)
+          (let [overflow (- (count next-order) max-cap)
+                evicted (subvec next-order 0 overflow)
+                kept (subvec next-order overflow)]
+            [(reduce disj next-set evicted) kept])
+          [next-set next-order])))))
 
 (defn consensus-mode?
   "Returns true if the node is operating in Streamlet BFT consensus mode with configured peers."
@@ -144,14 +165,15 @@
       {:ok? false :state state}
 
       :else
-      (let [next-known (conj (or (:known-receipt-ids state) #{}) rid)
-            bounded-known (if (> (count next-known) max-tracked)
-                            (into #{} (take-last max-tracked next-known))
-                            next-known)]
+      (let [[next-known next-known-ord] (fifo-track (:known-receipt-ids state)
+                                                    (:known-receipt-order state)
+                                                    rid
+                                                    max-tracked)]
         {:ok? true
          :state (-> state
                     (update :pending-receipts (fnil conj []) receipt)
-                    (assoc :known-receipt-ids bounded-known)
+                    (assoc :known-receipt-ids next-known
+                           :known-receipt-order next-known-ord)
                     (update :receipt-seq (fnil inc 0)))}))))
 
 (defn extract-burn-window
@@ -447,22 +469,42 @@
         pruned-frozen-roles (reduce dissoc (or (:frozen-epoch-message-roles state) {}) expired-frozen-epochs)
         rdv-cutoff (- (dec new-epoch) frozen-retention)
         max-tracked (long (or (:max-tracked-receipts cfg) 10000))
-        pruned-tracked-known (let [k (or (:known-receipt-ids state) #{})]
-                               (if (> (count k) max-tracked) (into #{} (take-last max-tracked k)) k))
-        pruned-tracked-exec (let [e (or (:executed-receipt-ids state) #{})]
-                              (if (> (count e) max-tracked) (into #{} (take-last max-tracked e)) e))
-        pruned-exec-blocks (let [cutoff (- new-epoch frozen-retention)
-                                 blocks (or (:blocks state) {})
-                                 eb (or (:executed-finalized-blocks state) #{})
-                                 filtered (into #{}
-                                                (filter (fn [h]
-                                                          (if-let [b (get blocks h)]
-                                                            (>= (long (or (:epoch b) 0)) cutoff)
-                                                            false))
-                                                        eb))]
-                             (if (> (count filtered) max-tracked)
-                               (into #{} (take-last max-tracked filtered))
-                               filtered))]
+        [pruned-tracked-known pruned-known-ord]
+        (let [k (or (:known-receipt-ids state) #{})
+              ord (or (:known-receipt-order state) [])]
+          (if (> (count ord) max-tracked)
+            (let [overflow (- (count ord) max-tracked)
+                  evicted (subvec ord 0 overflow)
+                  kept (subvec ord overflow)]
+              [(reduce disj k evicted) kept])
+            [k ord]))
+        [pruned-tracked-exec pruned-exec-ord]
+        (let [e (or (:executed-receipt-ids state) #{})
+              ord (or (:executed-receipt-order state) [])]
+          (if (> (count ord) max-tracked)
+            (let [overflow (- (count ord) max-tracked)
+                  evicted (subvec ord 0 overflow)
+                  kept (subvec ord overflow)]
+              [(reduce disj e evicted) kept])
+            [e ord]))
+        [pruned-exec-blocks pruned-exec-blocks-ord]
+        (let [cutoff (- new-epoch frozen-retention)
+              blocks (or (:blocks state) {})
+              eb (or (:executed-finalized-blocks state) #{})
+              ord (or (:executed-finalized-blocks-order state) [])
+              filtered-set (into #{}
+                                 (filter (fn [h]
+                                           (if-let [b (get blocks h)]
+                                             (>= (long (or (:epoch b) 0)) cutoff)
+                                             false))
+                                         eb))
+              filtered-ord (filterv #(contains? filtered-set %) ord)]
+          (if (> (count filtered-ord) max-tracked)
+            (let [overflow (- (count filtered-ord) max-tracked)
+                  evicted (subvec filtered-ord 0 overflow)
+                  kept (subvec filtered-ord overflow)]
+              [(reduce disj filtered-set evicted) kept])
+            [filtered-set filtered-ord]))]
     (-> (assoc state
                :epoch-to-messages pruned-epoch-to-messages
                :epoch-to-message-roles pruned-epoch-to-roles
@@ -480,8 +522,11 @@
                :frozen-epoch-messages pruned-frozen-messages
                :frozen-epoch-message-roles pruned-frozen-roles
                :known-receipt-ids pruned-tracked-known
+               :known-receipt-order pruned-known-ord
                :executed-receipt-ids pruned-tracked-exec
-               :executed-finalized-blocks pruned-exec-blocks)
+               :executed-receipt-order pruned-exec-ord
+               :executed-finalized-blocks pruned-exec-blocks
+               :executed-finalized-blocks-order pruned-exec-blocks-ord)
         (prune-rendezvous-retention-state rdv-cutoff))))
 
 (defn- collect-ancestor-receipt-ids
@@ -1176,17 +1221,19 @@
                                              (update :pending-vouchers (fnil conj []) (:ack r))))
 
                                        s)
-                                     next-exec (conj (or (:executed-receipt-ids s-effect) #{}) rid)
-                                     bounded-exec (if (> (count next-exec) max-tracked)
-                                                    (into #{} (take-last max-tracked next-exec))
-                                                    next-exec)
-                                     next-known (conj (or (:known-receipt-ids s-effect) #{}) rid)
-                                     bounded-known (if (> (count next-known) max-tracked)
-                                                     (into #{} (take-last max-tracked next-known))
-                                                     next-known)]
+                                     [next-exec next-exec-ord] (fifo-track (:executed-receipt-ids s-effect)
+                                                                           (:executed-receipt-order s-effect)
+                                                                           rid
+                                                                           max-tracked)
+                                     [next-known next-known-ord] (fifo-track (:known-receipt-ids s-effect)
+                                                                             (:known-receipt-order s-effect)
+                                                                             rid
+                                                                             max-tracked)]
                                  (assoc s-effect
-                                        :executed-receipt-ids bounded-exec
-                                        :known-receipt-ids bounded-known)))))
+                                        :executed-receipt-ids next-exec
+                                        :executed-receipt-order next-exec-ord
+                                        :known-receipt-ids next-known
+                                        :known-receipt-order next-known-ord)))))
                          st-skipped
                          receipts)
              exec-rids (or (:executed-receipt-ids st-applied) #{})
@@ -1202,11 +1249,13 @@
                                  st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)]
                              (assoc st-treasury :last-executed-finalized-epoch b-epoch))
                            st-clean)
-             next-blocks (conj (or (:executed-finalized-blocks st-advanced) #{}) b-hash)
-             bounded-blocks (if (> (count next-blocks) max-tracked)
-                              (into #{} (take-last max-tracked next-blocks))
-                              next-blocks)]
-         (assoc st-advanced :executed-finalized-blocks bounded-blocks)))
+             [next-blocks next-blocks-ord] (fifo-track (:executed-finalized-blocks st-advanced)
+                                                       (:executed-finalized-blocks-order st-advanced)
+                                                       b-hash
+                                                       max-tracked)]
+         (assoc st-advanced
+                :executed-finalized-blocks next-blocks
+                :executed-finalized-blocks-order next-blocks-ord)))
      state
      unexecuted-blocks)))
 

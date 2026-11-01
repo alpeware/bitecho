@@ -2726,32 +2726,83 @@
       (is (= 1000 (:balance (get-in s2 [:ledger client-pub]))))
       (is (= 300 (sm/spendable-balance s2 client-pub)))
       (is (empty? (:epoch-burns s2)))
-      ;; 4. Recovery phase: Drive 3-node cluster across consecutive epochs with block proposals and votes
+      ;; 4. Stall Phase (Epochs 1 and 2): Drive all 3 nodes through :tick without delivering proposals or votes
       (let [init-s1 (sm/init-state [] pub1 (assoc cfg :keypair (nth sorted-kps 1)))
             init-s2 (sm/init-state [] pub2 (assoc cfg :keypair (nth sorted-kps 2)))
-            ;; Epoch 1 (proposer node 1)
-            states-ep1 (exchange-block-and-votes [s2 init-s1 init-s2] sorted-pubs 1)
-            ;; Epoch 2 (proposer node 2)
-            states-ep2 (exchange-block-and-votes states-ep1 sorted-pubs 2)
-            ;; Epoch 3 (proposer node 0: proposes block 3 with node 0's pending receipts)
-            states-ep3 (exchange-block-and-votes states-ep2 sorted-pubs 3)
-            ;; Epoch 4 (proposer node 1)
-            states-ep4 (exchange-block-and-votes states-ep3 sorted-pubs 4)
-            ;; Epoch 5 (proposer node 2: notarizes 3-chain, finalizing block 3)
-            states-ep5 (exchange-block-and-votes states-ep4 sorted-pubs 5)
-            s0-rec (nth states-ep5 0)
-            s1-rec (nth states-ep5 1)
-            s2-rec (nth states-ep5 2)]
-        (is (= 0 (count (:pending-receipts s0-rec))))
-        (is (pos? (:last-executed-finalized-epoch s0-rec)))
-        (is (= (:last-executed-finalized-epoch s0-rec)
-               (:last-executed-finalized-epoch s1-rec)
-               (:last-executed-finalized-epoch s2-rec)))
-        (is (= 300 (:balance (get-in s0-rec [:ledger client-pub]))))
-        (is (= (:ledger s0-rec) (:ledger s1-rec) (:ledger s2-rec)))
-        (is (pos? (:balance (get-in s0-rec [:ledger receiver-pub]))))
-        (is (pos? (get-in s0-rec [:epoch-burns 2] 0)))
-        (is (pos? (get-in s0-rec [:epoch-settlement-takes 2] 0)))))))
+            ;; Epoch 1 ticks
+            s0-ep1 (:state (sm/handle-event s2 {:type :tick :rng (java.util.Random. 1)}))
+            s1-ep1 (:state (sm/handle-event init-s1 {:type :tick :rng (java.util.Random. 1)}))
+            s2-ep1 (:state (sm/handle-event init-s2 {:type :tick :rng (java.util.Random. 1)}))
+            ;; Epoch 2 ticks
+            s0-stalled (:state (sm/handle-event s0-ep1 {:type :tick :rng (java.util.Random. 2)}))
+            s1-stalled (:state (sm/handle-event s1-ep1 {:type :tick :rng (java.util.Random. 2)}))
+            s2-stalled (:state (sm/handle-event s2-ep1 {:type :tick :rng (java.util.Random. 2)}))]
+        ;; Assert stall state:
+        (is (= 2 (:epoch s0-stalled)))
+        (is (empty? (:finalized-blocks s0-stalled)))
+        (is (= 0 (:last-executed-finalized-epoch s0-stalled)))
+        (is (= 2 (count (:pending-receipts s0-stalled))))
+        (is (= 1000 (:balance (get-in s0-stalled [:ledger client-pub]))))
+
+        ;; 5. Recovery Phase (Epochs 3, 4, 5, 6, 7): Propose and vote across consecutive epochs
+        (let [states-ep3 (exchange-block-and-votes [s0-stalled s1-stalled s2-stalled] sorted-pubs 3)
+              states-ep4 (exchange-block-and-votes states-ep3 sorted-pubs 4)
+              states-ep5 (exchange-block-and-votes states-ep4 sorted-pubs 5)
+              states-ep6 (exchange-block-and-votes states-ep5 sorted-pubs 6)
+              states-ep7 (exchange-block-and-votes states-ep6 sorted-pubs 7)
+              s0-rec (nth states-ep7 0)
+              s1-rec (nth states-ep7 1)
+              s2-rec (nth states-ep7 2)]
+          (is (= 0 (count (:pending-receipts s0-rec))))
+          (is (>= (:last-executed-finalized-epoch s0-rec) 4))
+          (is (= (:last-executed-finalized-epoch s0-rec)
+                 (:last-executed-finalized-epoch s1-rec)
+                 (:last-executed-finalized-epoch s2-rec)))
+          (is (= 300 (:balance (get-in s0-rec [:ledger client-pub]))))
+          (is (= (:ledger s0-rec) (:ledger s1-rec) (:ledger s2-rec)))
+          (is (pos? (:balance (get-in s0-rec [:ledger receiver-pub]))))
+          (is (pos? (get-in s0-rec [:epoch-burns 2] 0)))
+          (is (pos? (get-in s0-rec [:epoch-settlement-takes 2] 0))))))))
+
+(deftest test-fifo-receipt-tracking-eviction
+  (testing "at max-tracked-receipts 5, staging 7 distinct receipts evicts oldest 2 (r0, r1) and retains newest 5 (r2..r6)"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub (account/map->AccountState {:balance 100000 :seq 0 :deps []})}
+                     :peers-map {pub (:public kp)}
+                     :max-tracked-receipts 5)
+          s0 (sm/init-state [] pub (assoc cfg :keypair kp))
+          ;; Stage 7 distinct receipts (r0 .. r6)
+          receipts (mapv (fn [i] {:receipt-id (str "burn:r" i)
+                                  :type :burn
+                                  :sender pub
+                                  :amount 100})
+                         (range 7))
+          s-staged (reduce (fn [st r] (:state (sm/stage-receipt st r))) s0 receipts)]
+      ;; :known-receipt-ids must only contain r2..r6
+      (is (= 5 (count (:known-receipt-ids s-staged))))
+      (is (= (mapv #(str "burn:r" %) (range 2 7)) (:known-receipt-order s-staged)))
+      (is (not (contains? (:known-receipt-ids s-staged) "burn:r0")))
+      (is (not (contains? (:known-receipt-ids s-staged) "burn:r1")))
+      (doseq [i (range 2 7)]
+        (is (contains? (:known-receipt-ids s-staged) (str "burn:r" i))))
+      ;; Now execute a block containing the receipts
+      (let [block {:epoch 1
+                   :parent-hash "genesis"
+                   :payload (:pending-receipts s-staged)}
+            block-hash (streamlet/hash-block block)
+            s-executed (-> s-staged
+                           (assoc-in [:blocks block-hash] block)
+                           (assoc :latest-finalized-block-hash block-hash
+                                  :finalized-blocks #{block-hash})
+                           sm/execute-finalized-blocks)]
+        (is (= 5 (count (:executed-receipt-ids s-executed))))
+        (is (= (mapv #(str "burn:r" %) (range 2 7)) (:executed-receipt-order s-executed)))
+        (is (not (contains? (:executed-receipt-ids s-executed) "burn:r0")))
+        (is (not (contains? (:executed-receipt-ids s-executed) "burn:r1")))
+        (doseq [i (range 2 7)]
+          (is (contains? (:executed-receipt-ids s-executed) (str "burn:r" i))))))))
 
 (deftest test-monotonic-fallback-receipt-ids-across-drains
   (testing "two burns and two settle-intents in same epoch separated by block execution do not collide on fallback receipt-id"

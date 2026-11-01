@@ -356,6 +356,7 @@
       (is (str/includes? out "finalized_epoch=0"))
       (is (str/includes? out "burn_digest="))
       (is (str/includes? out "pending_receipts=0"))
+      (is (str/includes? out "failed_receipts=0"))
       (is (str/ends-with? out "\n"))))
 
   (testing "statusz line format accounts for pruned counts"
@@ -482,6 +483,54 @@
         (doseq [f (reverse (file-seq temp-dir))]
           (.delete ^File f))))))
 
+(deftest test-http-accountz-endpoint
+  (testing "/accountz and /accountz?pubkey=<hex> query functionality"
+    (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-http-acc-test-" (into-array FileAttribute [])))
+          state-root (.getAbsolutePath temp-dir)
+          id (identity/load-or-create-node-identity! state-root :node-1)
+          pk-alice "302a300506032b6570032100aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          pk-bob   "302a300506032b6570032100bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          cfg {:node/id :node-1
+               :state-dir state-root
+               :genesis-ledger {pk-alice {:balance 5000 :seq 1 :deps ["dep-a"]}
+                                pk-bob   {:balance 2000 :seq 0 :deps []}}
+               :http {:enabled? true :port 0 :host "127.0.0.1"}
+               :transport :in-memory}
+          node (mesh/start-mesh-node! cfg {:identity id})]
+      (try
+        (let [server ^com.sun.net.httpserver.HttpServer (:http-server node)
+              port (.getPort (.getAddress server))
+              base-url (str "http://127.0.0.1:" port)
+
+              ;; 1. GET /accountz returns all accounts
+              all-resp (edn/read-string (slurp (str base-url "/accountz")))
+              _ (do
+                  (is (map? all-resp))
+                  (is (= 0 (:finalized-epoch all-resp)))
+                  (is (contains? (:accounts all-resp) pk-alice))
+                  (is (= 5000 (get-in all-resp [:accounts pk-alice :balance])))
+                  (is (= 2000 (get-in all-resp [:accounts pk-bob :balance]))))
+
+              ;; 2. GET /accountz?pubkey=pk-alice returns single account with spendable balance
+              alice-resp (edn/read-string (slurp (str base-url "/accountz?pubkey=" pk-alice)))
+              _ (do
+                  (is (= pk-alice (:pubkey alice-resp)))
+                  (is (= 5000 (:spendable alice-resp)))
+                  (is (= 1 (get-in alice-resp [:account :seq])))
+                  (is (= ["dep-a"] (get-in alice-resp [:account :deps])))
+                  (is (= 0 (:finalized-epoch alice-resp))))
+
+              ;; 3. GET /accountz?pubkey=unknown returns nil account and 0 spendable
+              unknown-resp (edn/read-string (slurp (str base-url "/accountz?pubkey=unknown-hex")))]
+          (is (= "unknown-hex" (:pubkey unknown-resp)))
+          (is (nil? (:account unknown-resp)))
+          (is (= 0 (:spendable unknown-resp)))
+          (is (= 0 (:finalized-epoch unknown-resp))))
+        (finally
+          ((:stop! node))
+          (doseq [f (reverse (file-seq temp-dir))]
+            (.delete ^File f)))))))
+
 (deftest test-snapshot-strips-secrets-and-rebinds-on-restore
   (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-snap-test-" (into-array FileAttribute [])))
         snap-file (io/file temp-dir "snapshot.bin")
@@ -522,6 +571,44 @@
       (finally
         (doseq [f (reverse (file-seq temp-dir))]
           (.delete ^File f))))))
+
+(deftest test-rebind-restored-state-upgrade-safety-and-genesis-ledger-merge
+  (testing "rebind-restored-state initializes missing finalized epoch & blocks and merges new genesis accounts safely"
+    (let [kp (crypto/generate-keypair)
+          id-map {:node-id :node-1
+                  :pubkey-hex (basalt/bytes->hex (:public kp))
+                  :privkey-hex (basalt/bytes->hex (:private kp))
+                  :keypair kp}
+          pk-custody "302a300506032b65700321001111111111111111111111111111111111111111111111111111111111111111"
+          pk-new-agent "302a300506032b65700321002222222222222222222222222222222222222222222222222222222222222222"
+          ;; Legacy state loaded from disk missing :last-executed-finalized-epoch and :executed-finalized-blocks
+          loaded-state {:epoch 14
+                        :head-hash "h14"
+                        :finalized-blocks #{"b10" "b11" "b12"}
+                        :last-executed-finalized-epoch nil
+                        :executed-finalized-blocks nil
+                        :ledger {pk-custody (account/map->AccountState {:balance 4190000000 :seq 5 :deps ["prev-tx"]})}}
+          ;; Config with genesis ledger containing both an update for custody (which must be ignored!) and a new agent
+          cfg {:node/id :node-1
+               :genesis-ledger {pk-custody {:balance 4197000000 :seq 0 :deps []}
+                                pk-new-agent {:balance 1000000 :seq 0 :deps []}}}
+          rebound (mesh/rebind-restored-state loaded-state cfg id-map)]
+
+      ;; Upgrade safety: missing finalized epoch initialized to loaded epoch (not 0!)
+      (is (= 14 (:last-executed-finalized-epoch rebound)))
+      ;; Upgrade safety: missing executed blocks initialized to finalized-blocks
+      (is (= #{"b10" "b11" "b12"} (:executed-finalized-blocks rebound)))
+
+      ;; Non-destructive merge: existing account state preserved exactly as-is
+      (is (= 4190000000 (get-in rebound [:ledger pk-custody :balance])))
+      (is (= 5 (get-in rebound [:ledger pk-custody :seq])))
+      (is (= ["prev-tx"] (get-in rebound [:ledger pk-custody :deps])))
+
+      ;; Additive merge: new agent seeded from genesis-ledger as AccountState
+      (is (instance? bitecho.economy.account.AccountState (get-in rebound [:ledger pk-new-agent])))
+      (is (= 1000000 (get-in rebound [:ledger pk-new-agent :balance])))
+      (is (= 0 (get-in rebound [:ledger pk-new-agent :seq])))
+      (is (= [] (get-in rebound [:ledger pk-new-agent :deps]))))))
 
 (deftest test-peer-init-malformed-fingerprint-resilient
   (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-malformed-peer-" (into-array FileAttribute [])))

@@ -516,6 +516,18 @@ REMOTE_ID
 
   # 5. Render and upload per-node config.edn
   echo "--> Step 5/7: Rendering and uploading /etc/bitecho/config.edn..."
+  local devnet_agent_pubkeys="${DEVNET_AGENT_PUBKEYS:-"302a300506032b65700321007b5d0f2dc8aa3a1728408a7f5d546fb68ed1031aa5633da2fb6a2d0ba45dd55b 302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"}"
+  local agent_ledger_lines=""
+  local agent_count=0
+  for apk in $devnet_agent_pubkeys; do
+    if [[ -n "$apk" ]]; then
+      agent_ledger_lines="${agent_ledger_lines}                  \"${apk}\" {:balance 1000000 :seq 0 :deps []}\n"
+      agent_count=$((agent_count + 1))
+    fi
+  done
+  local custody_bal=$((4197000000 - agent_count * 1000000))
+  echo "Devnet Agent Pubkeys: ${agent_count} agent(s) configured (Custody allocation: ${custody_bal} ECH)."
+
   for node in "${NODES[@]}"; do
     local ip
     ip="$(get_ip "$node")"
@@ -539,13 +551,14 @@ REMOTE_ID
  :treasury-privkey "${TREASURY_PRIV}"
  :custody-pubkey "${CUSTODY_PUB}"
  :custody-privkey "${CUSTODY_PRIV}"
- :genesis-ledger {"${CUSTODY_PUB}" {:balance 4197000000 :seq 0 :deps []}
+ :genesis-ledger {"${CUSTODY_PUB}" {:balance ${custody_bal} :seq 0 :deps []}
                   "genesis-core-team" {:balance 6300000000 :seq 0 :deps []}
                   "genesis-partners" {:balance 4200000000 :seq 0 :deps []}
                   "genesis-ecosystem" {:balance 4200000000 :seq 0 :deps []}
                   "${PUBKEY[node1]}" {:balance 1000000 :seq 0 :deps []}
                   "${PUBKEY[node2]}" {:balance 1000000 :seq 0 :deps []}
-                  "${PUBKEY[node3]}" {:balance 1000000 :seq 0 :deps []}}
+                  "${PUBKEY[node3]}" {:balance 1000000 :seq 0 :deps []}
+$(printf "%b" "${agent_ledger_lines}")}
  :protocol {:tick-interval-ms ${TICK_INTERVAL_MS}
             :epoch-length-ms ${TICK_INTERVAL_MS}}
  :http {:enabled? true
@@ -710,12 +723,12 @@ TXT_BOOTSTRAP_EOF
 cmd_status() {
   echo "=== 3-Node Bitecho Devnet Cluster Status ==="
   printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
-    "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns" "FinEpoch" "BurnDigest" "Pending"
+    "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns" "FinEpoch" "BurnDigest" "Pending/Failed"
   printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
-    "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-------------------------" "----------" "------------------" "-------"
+    "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-------------------------" "----------" "------------------" "--------------"
 
   for node in "${NODES[@]}"; do
-    local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics fin_epoch burn_dig pending_rcpts
+    local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics fin_epoch burn_dig pending_failed
     ip="$(get_ip "$node")"
     if [[ -z "$ip" ]]; then
       ip="UNRESOLVED"
@@ -730,7 +743,7 @@ cmd_status() {
       tokenomics="N/A"
       fin_epoch="N/A"
       burn_dig="N/A"
-      pending_rcpts="N/A"
+      pending_failed="N/A"
     else
       local proj
       proj="$(get_project "$node")"
@@ -763,7 +776,7 @@ REMOTE_STATUS
           tokenomics="N/A"
           fin_epoch="N/A"
           burn_dig="N/A"
-          pending_rcpts="N/A"
+          pending_failed="N/A"
         else
           local raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz
           IFS='|' read -r raw_svc raw_cpu raw_mem raw_disk raw_nic raw_statusz <<< "$raw_metrics"
@@ -780,8 +793,8 @@ REMOTE_STATUS
           fi
 
           # Parse statusz line:
-          # role=validator epoch=1 head=genesis notarized=0 finalized=0 peers=2/2 supply=18900000000 minted=0 burns=0 finalized_epoch=0 burn_digest=... pending_receipts=0
-          local r_role="" r_epoch="" r_notarized="" r_finalized="" r_peers="" r_supply="" r_minted="" r_burns="" r_finalized_epoch="" r_burn_digest="" r_pending_receipts=""
+          # role=validator epoch=1 head=genesis notarized=0 finalized=0 peers=2/2 supply=18900000000 minted=0 burns=0 finalized_epoch=0 burn_digest=... pending_receipts=0 failed_receipts=0
+          local r_role="" r_epoch="" r_notarized="" r_finalized="" r_peers="" r_supply="" r_minted="" r_burns="" r_finalized_epoch="" r_burn_digest="" r_pending_receipts="" r_failed_receipts=""
           for kv in $raw_statusz; do
             case "$kv" in
               role=*) r_role="${kv#role=}" ;;
@@ -795,6 +808,7 @@ REMOTE_STATUS
               finalized_epoch=*) r_finalized_epoch="${kv#finalized_epoch=}" ;;
               burn_digest=*) r_burn_digest="${kv#burn_digest=}" ;;
               pending_receipts=*) r_pending_receipts="${kv#pending_receipts=}" ;;
+              failed_receipts=*) r_failed_receipts="${kv#failed_receipts=}" ;;
             esac
           done
 
@@ -808,7 +822,7 @@ REMOTE_STATUS
           fi
           fin_epoch="${r_finalized_epoch:-0}"
           burn_dig="${r_burn_digest:-N/A}"
-          pending_rcpts="${r_pending_receipts:-0}"
+          pending_failed="${r_pending_receipts:-0}/${r_failed_receipts:-0}"
         fi
       else
         state="${vm_state:-OFFLINE}"
@@ -822,12 +836,12 @@ REMOTE_STATUS
         tokenomics="N/A"
         fin_epoch="N/A"
         burn_dig="N/A"
-        pending_rcpts="N/A"
+        pending_failed="N/A"
       fi
     fi
 
     printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %s\n" \
-      "$node" "$ip" "$state" "$cpu_usage" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics" "$fin_epoch" "$burn_dig" "$pending_rcpts"
+      "$node" "$ip" "$state" "$cpu_usage" "$mem_usage" "$disk_usage" "$egress_nic" "$epoch" "$blocks" "$peers" "$tokenomics" "$fin_epoch" "$burn_dig" "$pending_failed"
   done
 }
 
@@ -966,6 +980,93 @@ cmd_simulate() {
   cmd_status
 }
 
+cmd_fund() {
+  local recipient="${1:-}"
+  local amount="${2:-1000000}"
+
+  if [[ -z "$recipient" ]]; then
+    echo "Usage: ./scripts/cluster.sh fund <recipient-pubkey-hex> [amount]" >&2
+    return 1
+  fi
+
+  if [[ ! -f "${ROOT_DIR}/devnet/bootstrap.edn" ]]; then
+    echo "Error: devnet/bootstrap.edn not found. Run ./scripts/cluster.sh deploy first." >&2
+    return 1
+  fi
+  if [[ ! -f "${CUSTODY_KEY_FILE}" ]]; then
+    echo "Error: Custody keypair not found at ${CUSTODY_KEY_FILE}." >&2
+    return 1
+  fi
+
+  local CUSTODY_PUB
+  CUSTODY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${CUSTODY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
+  if [[ -z "${CUSTODY_PUB:-}" ]]; then
+    echo "Error: Could not extract Custody pubkey from ${CUSTODY_KEY_FILE}" >&2
+    return 1
+  fi
+
+  echo "=== Funding Agent via Devnet Custody Account ==="
+  echo "Recipient: ${recipient}"
+  echo "Amount:    ${amount} ECH"
+  echo "Custody:   ${CUSTODY_PUB:0:16}..."
+
+  echo "--> Querying current Custody state from node1 /accountz..."
+  local custody_edn
+  custody_edn="$(ssh_cmd node1 curl -sf "http://127.0.0.1:8080/accountz?pubkey=${CUSTODY_PUB}" 2>/dev/null || echo "")"
+  if [[ -z "$custody_edn" ]]; then
+    echo "Error: Failed to query /accountz from node1." >&2
+    return 1
+  fi
+
+  local next_seq deps_edn
+  read -r next_seq deps_edn < <(python3 -c "
+import sys, re
+raw = '''$custody_edn'''
+m_seq = re.search(r':seq\s+(\d+)', raw)
+seq = int(m_seq.group(1)) + 1 if m_seq else 1
+m_deps = re.search(r':deps\s+(\[[^\]]*\])', raw)
+deps = m_deps.group(1) if m_deps else '[]'
+print(f'{seq} {deps}')
+" 2>/dev/null || clojure -M -e "(let [m (clojure.edn/read-string \"$custody_edn\") a (get m :account)] (println (inc (or (:seq a) 0)) (pr-str (or (:deps a) []))))")
+
+  echo "Custody next :seq = ${next_seq}, :deps = ${deps_edn}"
+
+  local local_java
+  local_java="$(resolve_local_java)"
+  if [[ ! -f "${ROOT_DIR}/target/bitecho.jar" ]]; then
+    echo "Building ${ROOT_DIR}/target/bitecho.jar..."
+    (cd "${ROOT_DIR}" && clojure -T:build uber)
+  fi
+
+  echo "--> Broadcasting signed fund-agent transfer..."
+  "$local_java" --enable-native-access=ALL-UNNAMED \
+    --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+    --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+    -jar "${ROOT_DIR}/target/bitecho.jar" fund-agent \
+    "${ROOT_DIR}/devnet/bootstrap.edn" "${CUSTODY_KEY_FILE}" \
+    "$recipient" "$amount" --seq "$next_seq" --deps "$deps_edn"
+
+  echo "--> Waiting for Streamlet finalization..."
+  local funded=false
+  for _ in {1..15}; do
+    sleep 2
+    local rec_edn
+    rec_edn="$(ssh_cmd node1 curl -sf "http://127.0.0.1:8080/accountz?pubkey=${recipient}" 2>/dev/null || echo "")"
+    local bal
+    bal="$(echo "$rec_edn" | grep -o ':balance [0-9]*' | awk '{print $2}')"
+    if [[ -n "$bal" && "$bal" -gt 0 ]]; then
+      echo "Verified: Recipient ${recipient:0:16}... balance is now ${bal} ECH."
+      funded=true
+      break
+    fi
+  done
+
+  if [[ "$funded" != "true" ]]; then
+    echo "Warning: Recipient balance did not update within timeout. Check logs with ./scripts/cluster.sh logs node1" >&2
+    return 1
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # CLI Dispatcher & Usage
 # ------------------------------------------------------------------------------
@@ -982,6 +1083,7 @@ Commands:
   deploy [--reset-state]              Build local uberjar, sync configs/keys/binaries, and restart bitecho services
   status                              Display live status table across all 3 cluster nodes
   simulate [--agents N] [--messages M] [--burn B] Run light agent swarm simulator against Devnet
+  fund <recipient> [amount]           Send ECH from Devnet custody to an agent public key (default: 1000000)
   chaos [--rounds N] [--interval SEC] Run chaos monkey restarting random nodes and checking convergence
   logs [node1|node2|node3]            Stream systemd journal logs from a cluster node
   bootstrap-sdp                       Display WebRTC DataChannel bootstrap connection parameters for agents
@@ -1016,6 +1118,9 @@ main() {
       ;;
     simulate)
       cmd_simulate "$@"
+      ;;
+    fund)
+      cmd_fund "$@"
       ;;
     chaos)
       cmd_chaos "$@"

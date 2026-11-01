@@ -94,6 +94,65 @@
 
               (throw (ex-info (str "Unknown flag: " flag) {:flag flag})))))))))
 
+(defn parse-fund-args
+  "Parses CLI arguments for fund-agent:
+   <bootstrap.edn> <keypair.edn> <recipient-pubkey-hex> <amount> [--seq S] [--deps D] [--burn B].
+   Defaults: :seq 1, :deps [], :burn 100."
+  [args]
+  (let [[bootstrap-file keypair-file recipient amount-str & flag-args] args]
+    (when (or (nil? bootstrap-file) (nil? keypair-file) (nil? recipient) (nil? amount-str)
+              (str/starts-with? bootstrap-file "-")
+              (str/starts-with? keypair-file "-")
+              (str/starts-with? recipient "-")
+              (str/starts-with? amount-str "-"))
+      (throw (ex-info "Usage: fund-agent <bootstrap.edn> <keypair.edn> <recipient-pubkey-hex> <amount> [--seq S] [--deps D] [--burn B]"
+                      {:args args})))
+    (let [amount (try (let [v (Long/parseLong amount-str)]
+                        (when-not (pos? v)
+                          (throw (ex-info "Amount must be positive" {:amount v})))
+                        v)
+                      (catch Exception e
+                        (if (instance? clojure.lang.ExceptionInfo e)
+                          (throw e)
+                          (throw (ex-info (str "Invalid integer for amount: " amount-str)
+                                          {:amount amount-str})))))]
+      (loop [remaining flag-args
+             opts {:seq 1 :deps [] :burn 100}]
+        (if (empty? remaining)
+          {:bootstrap-file bootstrap-file
+           :keypair-file keypair-file
+           :recipient recipient
+           :amount amount
+           :opts opts}
+          (let [flag (first remaining)
+                val-str (second remaining)]
+            (when (or (nil? val-str) (str/starts-with? val-str "--"))
+              (throw (ex-info (str "Missing argument for flag " flag) {:flag flag :remaining remaining})))
+            (case flag
+              ("--seq" "-s")
+              (let [s (try (Long/parseLong val-str)
+                           (catch Exception _
+                             (throw (ex-info (str "Invalid integer for flag " flag ": " val-str)
+                                             {:flag flag :val val-str}))))]
+                (recur (nnext remaining) (assoc opts :seq s)))
+
+              ("--deps" "-d")
+              (let [d (try (let [parsed (edn/read-string val-str)]
+                             (if (coll? parsed) (vec parsed) [parsed]))
+                           (catch Exception _
+                             (throw (ex-info (str "Invalid EDN vector for flag " flag ": " val-str)
+                                             {:flag flag :val val-str}))))]
+                (recur (nnext remaining) (assoc opts :deps d)))
+
+              ("--burn" "-b")
+              (let [b (try (Long/parseLong val-str)
+                           (catch Exception _
+                             (throw (ex-info (str "Invalid integer for flag " flag ": " val-str)
+                                             {:flag flag :val val-str}))))]
+                (recur (nnext remaining) (assoc opts :burn b)))
+
+              (throw (ex-info (str "Unknown flag: " flag) {:flag flag})))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Boundary Light Agent Swarm Runner
 ;; ---------------------------------------------------------------------------
@@ -222,3 +281,63 @@
                             (:messages-sent summary)
                             (:total-burn-submitted summary)))
            summary))))))
+
+(defn run-fund-agent!
+  "Boundary fund runner: connects to bootstrap validators, constructs a signed transfer envelope,
+   and broadcasts to all connected validators."
+  ([bootstrap-file keypair-file recipient amount]
+   (run-fund-agent! bootstrap-file keypair-file recipient amount {}))
+  ([bootstrap-file keypair-file recipient amount opts]
+   (let [bootstrap-cfg (if (string? bootstrap-file)
+                         (edn/read-string (slurp bootstrap-file))
+                         bootstrap-file)
+         keypair-map (if (string? keypair-file)
+                       (edn/read-string (slurp keypair-file))
+                       keypair-file)
+         val-map (or (:nodes bootstrap-cfg) {})
+         val-nodes (vec (sort-by :ip (vals val-map)))]
+     (when (empty? val-nodes)
+       (throw (ex-info "No validator nodes found in bootstrap config" {:bootstrap-cfg bootstrap-cfg})))
+     (let [sender-pub-hex (or (:pubkey-hex keypair-map) (:pubkey keypair-map))
+           sender-priv-hex (or (:privkey-hex keypair-map) (:privkey keypair-map))
+           sender-priv-bytes (if (bytes? sender-priv-hex)
+                               sender-priv-hex
+                               (basalt/hex->bytes sender-priv-hex))
+           seq-num (long (or (:seq opts) 1))
+           deps (vec (or (:deps opts) []))
+           burn-amount (long (or (:burn opts) 100))
+           amt (long amount)
+           transfer-opts {:receiver recipient
+                          :amount amt
+                          :seq seq-num
+                          :deps deps}
+           {:keys [envelope transfer-hash]} (build-transfer-gossip-envelope sender-pub-hex
+                                                                            sender-priv-bytes
+                                                                            transfer-opts
+                                                                            burn-amount)
+           frozen (nippy/freeze envelope)
+           _ (println (format "Connecting to %d validator nodes..." (count val-nodes)))
+           connections (connect-swarm! val-nodes (count val-nodes) 10000)
+           active-conns (filterv :connected? connections)
+           connected-count (count active-conns)]
+       (println (format "%d/%d validators successfully connected via WebRTC DataChannel."
+                        connected-count (count val-nodes)))
+       (when (pos? connected-count)
+         (println (format "Broadcasting transfer %s (%d ECH, seq=%d) to %d validators..."
+                          transfer-hash amt seq-num connected-count))
+         (doseq [conn active-conns]
+           (when-let [cid @(:channel-id conn)]
+             (try
+               (api/send! (:node conn) frozen cid)
+               (catch Exception _ nil)))))
+       (Thread/sleep 1500)
+       (close-swarm! connections)
+       (let [summary {:ok true
+                      :recipient recipient
+                      :amount amt
+                      :seq seq-num
+                      :transfer-hash transfer-hash
+                      :validators-reached connected-count}]
+         (println (format "Fund agent complete: transfer %s (%d ECH, seq=%d) reached %d validators."
+                          transfer-hash amt seq-num connected-count))
+         summary)))))

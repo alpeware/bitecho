@@ -237,9 +237,10 @@ In consensus mode (`consensus-mode?` = `true`), incoming economic events (`:sign
    - Executes pending voucher compaction and settlement.
    - Computes demand-gated treasury minting and fee distributions at epoch boundaries.
    - Cleanses executed receipts from `:pending-receipts` and `:mempool`.
+3. **FIFO Replay-Protection Horizon**: To bound memory usage permanently, receipt and block tracking sets (`:known-receipt-ids`, `:executed-receipt-ids`, and `:executed-finalized-blocks`) are maintained via deterministic FIFO eviction (`fifo-track`) bounded by `:max-tracked-receipts` (default `10,000`). This ensures an explicit, deterministic replay-protection horizon of 10,000 receipts while preventing memory leaks.
 
 ### 11.2 Cross-Node Comparable Burn Digest & Diagnostics
 Nodes expose their trailing burn window and state convergence metrics through embedded HTTP endpoints:
 - **`burn_digest`**: A 16-character hexadecimal SHA-256 hash of the canonical trailing burn and settlement take window (`extract-burn-window`, bounded by at most $N$ epochs). All converged nodes in the consensus cluster produce an identical `burn_digest` at the same `finalized_epoch` height.
-- **`/statusz`**: Exposes `finalized_epoch=%d burn_digest=%s pending_receipts=%d` alongside core metrics.
+- **`/statusz`**: Exposes `finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d` alongside core metrics.
 - **`/burnsz`**: Returns the EDN serialization of `(extract-burn-window state)` for deep cross-node inspection.

@@ -6,6 +6,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.account :as account]
             [bitecho.shell.core :as core]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.persistence :as persistence]
@@ -245,12 +246,46 @@
   (let [cluster-cfg (get config :cluster {})
         overrides (extract-top-level-overrides config cluster-cfg)
         privkey-bytes (resolve-pubkey-bytes (get-in identity [:keypair :private]))
-        pubkey-hex (:pubkey-hex identity)]
+        pubkey-hex (:pubkey-hex identity)
+        genesis-ledger (or (:genesis-ledger overrides)
+                           (get-in cluster-cfg [:genesis-ledger])
+                           (:genesis-ledger config))
+        custody-pk (or (:custody-pubkey overrides)
+                       (get-in cluster-cfg [:custody-pubkey])
+                       (:custody-pubkey config)
+                       (:custody-pubkey loaded-state))
+        loaded-ledger (or (:ledger loaded-state) {})
+        has-existing-custody? (and custody-pk (contains? loaded-ledger custody-pk))
+        merged-ledger (if (map? genesis-ledger)
+                        (reduce-kv (fn [m pk acct]
+                                     (if (contains? m pk)
+                                       m
+                                       (let [acct-rec (if (instance? bitecho.economy.account.AccountState acct)
+                                                        acct
+                                                        (account/map->AccountState acct))
+                                             amt (long (or (:balance acct-rec) 0))
+                                             m-with-acct (assoc m pk acct-rec)]
+                                         (if (and has-existing-custody?
+                                                  (not= pk custody-pk)
+                                                  (pos? amt)
+                                                  (>= (long (or (get-in m-with-acct [custody-pk :balance]) 0)) amt))
+                                           (update-in m-with-acct [custody-pk :balance] - amt)
+                                           m-with-acct))))
+                                   loaded-ledger
+                                   genesis-ledger)
+                        loaded-ledger)]
     (merge loaded-state
            overrides
            {:node-pubkey pubkey-hex
             :node-private-key privkey-bytes
-            :keypair (:keypair identity)})))
+            :keypair (:keypair identity)
+            :last-executed-finalized-epoch (long (or (:last-executed-finalized-epoch loaded-state)
+                                                     (:epoch loaded-state)
+                                                     0))
+            :executed-finalized-blocks (or (:executed-finalized-blocks loaded-state)
+                                           (:finalized-blocks loaded-state)
+                                           #{})
+            :ledger merged-ledger})))
 
 (defn- validate-peer-node-entry
   "Validates a single peer node entry in cluster config.
@@ -342,9 +377,10 @@
         burns (long (reduce + 0 (vals (or (:epoch-burns state) {}))))
         finalized-epoch (long (or (:last-executed-finalized-epoch state) 0))
         burn-digest (sm/compute-burn-map-digest state)
-        pending-receipts (long (count (or (:pending-receipts state) [])))]
-    (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d\n"
-            role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts)))
+        pending-receipts (long (count (or (:pending-receipts state) [])))
+        failed-receipts (long (or (:failed-receipts-count state) 0))]
+    (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d\n"
+            role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts)))
 
 ;; ---------------------------------------------------------------------------
 ;; Embedded HTTP Server (/healthz & /statusz)
@@ -365,7 +401,7 @@
         val))))
 
 (defn- make-http-handler
-  "Creates an HttpHandler for healthz, statusz, and burnsz endpoints."
+  "Creates an HttpHandler for healthz, statusz, burnsz, and accountz endpoints."
   [ctx total-peers fallback-state]
   (let [{:keys [shell-node peer-conns transport in-mem-bus]} ctx]
     (reify HttpHandler
@@ -385,6 +421,20 @@
                               (= path "/burnsz")
                               (let [st (or (query-node-state shell-node 500) fallback-state)]
                                 [200 (str (pr-str (sm/extract-burn-window st)) "\n")])
+
+                              (= path "/accountz")
+                              (let [st (or (query-node-state shell-node 500) fallback-state)
+                                    query (.getQuery (.getRequestURI ^HttpExchange exchange))
+                                    pubkey (when query
+                                             (second (re-find #"(?:^|&)pubkey=([^&]+)" query)))
+                                    resp (if pubkey
+                                           {:pubkey pubkey
+                                            :account (when-let [a (get (:ledger st) pubkey)] (into {} a))
+                                            :spendable (sm/spendable-balance st pubkey)
+                                            :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
+                                           {:accounts (into {} (map (fn [[k v]] [k (into {} v)]) (:ledger st)))
+                                            :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))})]
+                                [200 (str (pr-str resp) "\n")])
 
                               :else
                               [404 "not found\n"])
@@ -406,6 +456,7 @@
       (.createContext server "/healthz" handler)
       (.createContext server "/statusz" handler)
       (.createContext server "/burnsz" handler)
+      (.createContext server "/accountz" handler)
       (.setExecutor server (Executors/newVirtualThreadPerTaskExecutor))
       (.start server)
       server)))

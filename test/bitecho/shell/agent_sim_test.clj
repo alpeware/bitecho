@@ -191,3 +191,47 @@
   (testing "parse-sim-args throws ex-info on missing positional arguments"
     (is (thrown? Exception (sim/parse-sim-args [])))
     (is (thrown? Exception (sim/parse-sim-args ["only-one.edn"])))))
+
+(deftest test-parse-fund-args
+  (testing "parse-fund-args applies defaults when optional flags are omitted"
+    (let [args ["devnet/bootstrap.edn" ".ssh/custody.edn" "target-pubkey-hex" "1000000"]
+          parsed (sim/parse-fund-args args)]
+      (is (= "devnet/bootstrap.edn" (:bootstrap-file parsed)))
+      (is (= ".ssh/custody.edn" (:keypair-file parsed)))
+      (is (= "target-pubkey-hex" (:recipient parsed)))
+      (is (= 1000000 (:amount parsed)))
+      (is (= 1 (get-in parsed [:opts :seq])))
+      (is (= [] (get-in parsed [:opts :deps])))
+      (is (= 100 (get-in parsed [:opts :burn])))))
+
+  (testing "parse-fund-args parses explicit flags"
+    (let [args ["bootstrap.edn" "keypair.edn" "target-hex" "50000"
+                "--seq" "3" "--deps" "[\"hash-1\" \"hash-2\"]" "--burn" "250"]
+          parsed (sim/parse-fund-args args)]
+      (is (= "bootstrap.edn" (:bootstrap-file parsed)))
+      (is (= "keypair.edn" (:keypair-file parsed)))
+      (is (= "target-hex" (:recipient parsed)))
+      (is (= 50000 (:amount parsed)))
+      (is (= 3 (get-in parsed [:opts :seq])))
+      (is (= ["hash-1" "hash-2"] (get-in parsed [:opts :deps])))
+      (is (= 250 (get-in parsed [:opts :burn])))))
+
+  (testing "parse-fund-args parses short flags"
+    (let [args ["bootstrap.edn" "keypair.edn" "target-hex" "20000"
+                "-s" "7" "-d" "[\"hash-prev\"]" "-b" "150"]
+          parsed (sim/parse-fund-args args)]
+      (is (= 7 (get-in parsed [:opts :seq])))
+      (is (= ["hash-prev"] (get-in parsed [:opts :deps])))
+      (is (= 150 (get-in parsed [:opts :burn])))))
+
+  (testing "parse-fund-args throws ex-info on missing positional arguments"
+    (is (thrown? Exception (sim/parse-fund-args [])))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn"])))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn"])))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex"]))))
+
+  (testing "parse-fund-args throws ex-info on invalid amount or flags"
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "not-a-number"])))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "-100"])))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "1000" "--unknown" "foo"])))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "1000" "--seq"])))))

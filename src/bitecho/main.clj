@@ -18,6 +18,7 @@
   (println "  bitecho gen-keypair [output-file.edn]")
   (println "  bitecho validate-config <config.edn>")
   (println "  bitecho simulate-agents <bootstrap.edn> <keypair.edn> [--agents N] [--messages M] [--burn B]")
+  (println "  bitecho fund-agent <bootstrap.edn> <keypair.edn> <recipient-pubkey-hex> <amount> [--seq S] [--deps D] [--burn B]")
   (println "  bitecho light-node <serve|verb> [options]"))
 
 (defn- cmd-run
@@ -113,6 +114,19 @@
         (println (str "Error: " (.getMessage e))))
       (System/exit 1))))
 
+(defn- cmd-fund-agent
+  "Sends a signed transfer from keypair to recipient across bootstrap nodes."
+  [args]
+  (try
+    (let [{:keys [bootstrap-file keypair-file recipient amount opts]} (agent-sim/parse-fund-args args)]
+      (agent-sim/run-fund-agent! bootstrap-file keypair-file recipient amount opts)
+      (shutdown-agents)
+      (System/exit 0))
+    (catch Exception e
+      (binding [*out* *err*]
+        (println (str "Error: " (.getMessage e))))
+      (System/exit 1))))
+
 (defn -main
   "Main CLI entrypoint."
   [& args]
@@ -138,6 +152,9 @@
 
       "simulate-agents"
       (cmd-simulate-agents rest-args)
+
+      "fund-agent"
+      (cmd-fund-agent rest-args)
 
       "light-node"
       (light-node/run-light-node-cli! rest-args)
