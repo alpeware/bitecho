@@ -918,7 +918,9 @@
                                       :fingerprint (:fingerprint identity)
                                       :ice-ufrag "u1" :ice-pwd "p1"}}}
           saved-st (assoc (light-core/init-light-state identity {:bootstrap descriptor :epoch 1 :autonomous? false})
-                          :autonomous? false)]
+                          :autonomous? false)
+          bootstrap-file (str (io/file state-dir "bootstrap.edn"))
+          _ (spit bootstrap-file (pr-str descriptor))]
       (try
         (light-shell/save-light-state! state-file saved-st)
         (let [raw-loaded (light-shell/load-light-state! state-file)]
@@ -928,7 +930,7 @@
               pw (PrintWriter. sw true)]
           (binding [*out* pw]
             (let [resp (light-shell/run-one-shot! {:state-dir state-dir
-                                                   :bootstrap descriptor
+                                                   :bootstrap bootstrap-file
                                                    :autonomous? true
                                                    :cmd-map {"cmd" "status"}})]
               (is (= true (get resp "ok")))
@@ -1122,7 +1124,15 @@
             (is (nil? (:connection-error @state-atom)))
             (is (= 1 (:ignored-stale @conn-atom)))
             ;; node-gen2 must NOT be closed by stale callback
-            (is (= [node-gen1] @closed-nodes)))
+            (is (= [node-gen1] @closed-nodes))
+            ;; Verify :ignore-stale effect was consumed into :last-diagnostic and summary
+            (is (= {:effect :ignore-stale :generation 1} (:last-diagnostic @conn-atom)))
+            (is (= {:effect :ignore-stale :generation 1} (:last_diagnostic (light-shell/conn-diagnostics-summary @conn-atom)))))
+
+          ;; Verify :diagnostics-atom and :diagnose-fn consumption in execute-conn-effects! / apply-conn-event!
+          (let [diag-log (atom [])]
+            (light-shell/apply-conn-event! conn-atom {:type :on-close :generation 1} {:diagnostics-atom diag-log})
+            (is (= [{:effect :ignore-stale :generation 1}] @diag-log)))
 
           ;; 3. Verify strip-sensitive-keys and state persistence never save transient runtime liveness
           (swap! state-atom assoc
@@ -1140,7 +1150,39 @@
                 (reverse (file-seq (io/file state-dir)))))))))
 
 ;; -----------------------------------------------------------------------------
-;; 11. CLI & skill/SKILL.md Flag/Verb Inventory Test (Rule 6)
+;; 11. Explicit Home Nodes Validation Test
+;; -----------------------------------------------------------------------------
+
+(deftest test-explicit-home-nodes-validation
+  (testing "Explicit home_nodes validation against bootstrap descriptor"
+    (let [temp-dir (Files/createTempDirectory "bitecho-test-hset" (into-array FileAttribute []))
+          state-dir (str temp-dir)
+          id (light-shell/load-or-create-light-identity! state-dir)
+          desc {:network :devnet
+                :nodes {:node1 {:node-id :node1
+                                :ip "127.0.0.1"
+                                :agent-port 5010
+                                :fingerprint (:fingerprint id)
+                                :ice-ufrag "u1" :ice-pwd "p1"}}}
+          st (light-core/init-light-state id {:bootstrap desc :epoch 1})]
+      (try
+        ;; 1. Valid explicit node ID succeeds
+        (let [res-valid (light-core/handle-command st {"cmd" "register-home-set" "home_nodes" ["node1"]} (:privkey-bytes id))]
+          (is (= true (get-in res-valid [:response "ok"])))
+          (is (= ["node1"] (get-in res-valid [:response "home_nodes"])))
+          (is (seq (:net-envelopes res-valid))))
+
+        ;; 2. Bogus node ID fails closed with "unknown-home-node" and [] envelopes
+        (let [res-bogus (light-core/handle-command st {"cmd" "register-home-set" "home_nodes" ["bogus-node-99"]} (:privkey-bytes id))]
+          (is (= false (get-in res-bogus [:response "ok"])))
+          (is (= "unknown-home-node" (get-in res-bogus [:response "error"])))
+          (is (= [] (:net-envelopes res-bogus))))
+        (finally
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file state-dir)))))))))
+
+;; -----------------------------------------------------------------------------
+;; 12. CLI & skill/SKILL.md Flag/Verb Inventory Test (Rule 6)
 ;; -----------------------------------------------------------------------------
 
 (deftest test-cli-and-skill-flag-inventory
@@ -1180,7 +1222,9 @@
       (is (= 5000 (:timeout-ms (light-shell/parse-light-node-args ["status" "--timeout-ms" "5000"]))))
       (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["offer" "--callee" "deadbeef"]) [:cmd-map "callee"])))
       (is (= 42 (get-in (light-shell/parse-light-node-args ["offer" "--price" "42"]) [:cmd-map "price"])))
+      (is (= 0 (get-in (light-shell/parse-light-node-args ["offer" "--callee" "deadbeef"]) [:cmd-map "price"])))
       (is (= 10 (get-in (light-shell/parse-light-node-args ["register-home-set" "--price" "10" "--price-max" "25"]) [:cmd-map "price"])))
+      (is (= 0 (get-in (light-shell/parse-light-node-args ["register-home-set"]) [:cmd-map "price"])))
       (is (= 25 (get-in (light-shell/parse-light-node-args ["register-home-set" "--price" "10" "--price-max" "25"]) [:cmd-map "price_max"])))
       (is (= 700 (get-in (light-shell/parse-light-node-args ["offer" "--burn" "700"]) [:cmd-map "burn"])))
       (is (= "val-node-1" (get-in (light-shell/parse-light-node-args ["offer" "--home-node" "val-node-1"]) [:cmd-map "home_node"])))

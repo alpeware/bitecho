@@ -57,7 +57,7 @@
                    "inbox"    {"cmd" "inbox"}
                    "offer"    (let [m {"cmd" "offer"
                                        "callee" (extract-flag-value args "--callee" nil)
-                                       "price" (extract-long-flag args "--price" 10)
+                                       "price" (extract-long-flag args "--price" 0)
                                        "burn" (extract-long-flag args "--burn" 500)}
                                     hn (extract-flag-value args "--home-node" nil)]
                                 (if hn (assoc m "home_node" hn) m))
@@ -85,7 +85,7 @@
                                "seq" (extract-long-flag args "--seq" nil)
                                "burn" (extract-long-flag args "--burn" 500)}
                    "register-home-set" (let [nodes (extract-flag-value args "--nodes" nil)
-                                             p (extract-long-flag args "--price" 10)
+                                             p (extract-long-flag args "--price" 0)
                                              p-max (extract-long-flag args "--price-max" nil)
                                              m {"cmd" "register-home-set"
                                                 "price" p
@@ -207,14 +207,17 @@
 (defn transition-conn
   "Pure reducer transitioning connection lifecycle state and returning [new-conn effects].
    Phases: :down, :dialing, :open, :closing, :failed.
-   Ignores stale generation callbacks (< (:generation event) (:generation conn)) without mutating state."
+   Ignores stale generation callbacks (< (:generation event) (:generation conn)) without mutating connection phase, liveness, or active resources, incrementing only :ignored-stale."
   [conn event]
   (let [conn (merge (init-conn-state) conn)]
     (if (and (contains? event :generation)
              (some? (:generation event))
              (< (:generation event) (:generation conn 0)))
-      [(update conn :ignored-stale (fnil inc 0))
-       [{:effect :ignore-stale :generation (:generation event)}]]
+      (let [eff {:effect :ignore-stale :generation (:generation event)}]
+        [(-> conn
+             (update :ignored-stale (fnil inc 0))
+             (assoc :last-diagnostic eff))
+         [eff]])
       (case (:type event)
         :dial-started
         (let [next-gen (long (or (:generation event) (inc (:generation conn 0))))
@@ -251,9 +254,10 @@
         :dial-failed
         (let [err (or (:error event) "listener-disabled")
               node-to-close (or (:node event) (:node conn))
+              diag-eff {:effect :diagnose :reason :dial-failed :error err}
               effects (cond-> []
                         node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
-                        true (conj {:effect :diagnose :reason :dial-failed :error err}))
+                        true (conj diag-eff))
               new-conn (assoc conn
                               :phase :failed
                               :ok? false
@@ -262,31 +266,17 @@
                               :node nil
                               :error err
                               :last-error err
+                              :last-diagnostic diag-eff
                               :dropped (inc (:dropped conn 0)))]
           [new-conn effects])
 
         :on-close
         (let [err (or (:error event) "connection-closed")
               node-to-close (:node conn)
+              diag-eff {:effect :diagnose :reason :on-close :error err}
               effects (cond-> []
                         node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
-                        true (conj {:effect :diagnose :reason :on-close :error err}))
-              new-conn (assoc conn
-                              :phase :failed
-                              :ok? false
-                              :channel-id nil
-                              :send-fn nil
-                              :node nil
-                              :error err
-                              :last-error err)]
-          [new-conn effects])
-
-        :send-failed
-        (let [err (or (:error event) "send-failed")
-              node-to-close (:node conn)
-              effects (cond-> []
-                        node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
-                        true (conj {:effect :diagnose :reason :send-failed :error err}))
+                        true (conj diag-eff))
               new-conn (assoc conn
                               :phase :failed
                               :ok? false
@@ -295,6 +285,25 @@
                               :node nil
                               :error err
                               :last-error err
+                              :last-diagnostic diag-eff)]
+          [new-conn effects])
+
+        :send-failed
+        (let [err (or (:error event) "send-failed")
+              node-to-close (:node conn)
+              diag-eff {:effect :diagnose :reason :send-failed :error err}
+              effects (cond-> []
+                        node-to-close (conj {:effect :close-node :node node-to-close :generation (:generation conn 0)})
+                        true (conj diag-eff))
+              new-conn (assoc conn
+                              :phase :failed
+                              :ok? false
+                              :channel-id nil
+                              :send-fn nil
+                              :node nil
+                              :error err
+                              :last-error err
+                              :last-diagnostic diag-eff
                               :dropped (inc (:dropped conn 0)))]
           [new-conn effects])
 
@@ -315,32 +324,50 @@
         [conn []]))))
 
 (defn execute-conn-effects!
-  "Executes boundary side-effects resulting from connection state machine transitions."
-  [effects]
-  (doseq [eff effects]
-    (when (= :close-node (:effect eff))
-      (when-let [n (:node eff)]
-        (try (api/close! n) (catch Exception _ nil))))))
+  "Executes boundary side-effects resulting from connection state machine transitions.
+   Handles :close-node, :diagnose, and :ignore-stale effects."
+  ([effects]
+   (execute-conn-effects! effects nil))
+  ([effects opts]
+   (doseq [eff effects]
+     (case (:effect eff)
+       :close-node
+       (when-let [n (:node eff)]
+         (try (api/close! n) (catch Exception _ nil)))
+
+       (:diagnose :ignore-stale)
+       (do
+         (when-let [dfn (:diagnose-fn opts)]
+           (when (fn? dfn)
+             (try (dfn eff) (catch Exception _ nil))))
+         (when-let [datom (:diagnostics-atom opts)]
+           (when (instance? clojure.lang.IAtom datom)
+             (swap! datom conj eff))))
+
+       nil))))
 
 (defn apply-conn-event!
   "Atomically transitions conn-atom via transition-conn, executes effects outside the swap, and returns @conn-atom."
-  [conn-atom event]
-  (let [effects-ref (atom [])]
-    (swap! conn-atom (fn [conn]
-                       (let [[new-conn effects] (transition-conn conn event)]
-                         (reset! effects-ref effects)
-                         new-conn)))
-    (execute-conn-effects! @effects-ref)
-    @conn-atom))
+  ([conn-atom event]
+   (apply-conn-event! conn-atom event nil))
+  ([conn-atom event opts]
+   (let [effects-ref (atom [])]
+     (swap! conn-atom (fn [conn]
+                        (let [[new-conn effects] (transition-conn conn event)]
+                          (reset! effects-ref effects)
+                          new-conn)))
+     (execute-conn-effects! @effects-ref opts)
+     @conn-atom)))
 
 (defn conn-diagnostics-summary
   "Constructs diagnostic summary map from a connection state map."
   [conn]
-  {:phase (name (or (:phase conn) :down))
-   :generation (:generation conn 0)
-   :last_error (:last-error conn)
-   :dropped (:dropped conn 0)
-   :ignored_stale (:ignored-stale conn 0)})
+  (cond-> {:phase (name (or (:phase conn) :down))
+           :generation (:generation conn 0)
+           :last_error (:last-error conn)
+           :dropped (:dropped conn 0)
+           :ignored_stale (:ignored-stale conn 0)}
+    (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn))))
 
 (defn- sync-conn-diagnostics!
   "Updates state-atom with connection liveness and conn-diagnostics summary."

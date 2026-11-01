@@ -74,23 +74,42 @@
 (defn- exec-register-home-set [state cmd-map privkey-bytes]
   (let [p-b (long (or (get cmd-map "price") 0))
         p-b-max (long (or (get cmd-map "price_max") p-b 0))
-        explicit-nodes (seq (remove str/blank? (map str (get cmd-map "home_nodes"))))
-        candidates (if explicit-nodes
-                     (mapv keyword explicit-nodes)
-                     (vec (keys (get-in state [:bootstrap :nodes]))))
-        candidate-maps (mapv (fn [cid] {:node-id cid :responsive? true :latency-ms 10 :price p-b}) candidates)
-        hs (rendezvous/register-home-set candidate-maps p-b p-b-max)
-        my-pub (:pubkey state)
-        curr-epoch (:epoch state)
-        env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b curr-epoch)
-        env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b nil)]
-    {:state (assoc state :home-set (:home-nodes hs))
-     :response {"ok" true
-                "status" (name (:status hs :ok))
-                "price" (:price hs p-b)
-                "home_nodes" (vec (for [n (:home-nodes hs)] (name (or (:node-id n) n))))}
-     :net-envelopes [env-curr env-nil]
-     :stdout-events []}))
+        explicit-nodes (seq (remove str/blank? (map str (get cmd-map "home_nodes"))))]
+    (if explicit-nodes
+      (let [known-nodes (set (keys (get-in state [:bootstrap :nodes])))
+            requested-nodes (mapv keyword explicit-nodes)]
+        (if (or (empty? known-nodes) (not-every? known-nodes requested-nodes))
+          {:state state
+           :response {"ok" false "error" "unknown-home-node"}
+           :net-envelopes []
+           :stdout-events []}
+          (let [candidate-maps (mapv (fn [cid] {:node-id cid :responsive? true :latency-ms 10 :price p-b}) requested-nodes)
+                hs (rendezvous/register-home-set candidate-maps p-b p-b-max)
+                my-pub (:pubkey state)
+                curr-epoch (:epoch state)
+                env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b curr-epoch)
+                env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b nil)]
+            {:state (assoc state :home-set (:home-nodes hs))
+             :response {"ok" true
+                        "status" (name (:status hs :ok))
+                        "price" (:price hs p-b)
+                        "home_nodes" (vec (for [n (:home-nodes hs)] (name (or (:node-id n) n))))}
+             :net-envelopes [env-curr env-nil]
+             :stdout-events []})))
+      (let [candidates (vec (keys (get-in state [:bootstrap :nodes])))
+            candidate-maps (mapv (fn [cid] {:node-id cid :responsive? true :latency-ms 10 :price p-b}) candidates)
+            hs (rendezvous/register-home-set candidate-maps p-b p-b-max)
+            my-pub (:pubkey state)
+            curr-epoch (:epoch state)
+            env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b curr-epoch)
+            env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b nil)]
+        {:state (assoc state :home-set (:home-nodes hs))
+         :response {"ok" true
+                    "status" (name (:status hs :ok))
+                    "price" (:price hs p-b)
+                    "home_nodes" (vec (for [n (:home-nodes hs)] (name (or (:node-id n) n))))}
+         :net-envelopes [env-curr env-nil]
+         :stdout-events []}))))
 
 (defn compute-session-id
   "Computes deterministic session-id from caller, callee, and caller-ephemeral-pub."
