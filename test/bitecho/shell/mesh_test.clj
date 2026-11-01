@@ -353,6 +353,9 @@
       (is (str/includes? out "supply=1000"))
       (is (str/includes? out "minted=2000"))
       (is (str/includes? out "burns=50"))
+      (is (str/includes? out "finalized_epoch=0"))
+      (is (str/includes? out "burn_digest="))
+      (is (str/includes? out "pending_receipts=0"))
       (is (str/ends-with? out "\n"))))
 
   (testing "statusz line format accounts for pruned counts"
@@ -414,7 +417,12 @@
           (is (seq (:notarized-blocks st-c)))
           (is (seq (:finalized-blocks st-a)))
           (is (seq (:finalized-blocks st-b)))
-          (is (seq (:finalized-blocks st-c))))
+          (is (seq (:finalized-blocks st-c)))
+          (is (= (sm/compute-burn-map-digest st-a)
+                 (sm/compute-burn-map-digest st-b)
+                 (sm/compute-burn-map-digest st-c)))
+          (is (string? (sm/compute-burn-map-digest st-a)))
+          (is (= 16 (count (sm/compute-burn-map-digest st-a)))))
         (finally
           ((:stop! node-a))
           ((:stop! node-b))

@@ -356,7 +356,8 @@
                         (let [[new-conn effects] (transition-conn conn event)]
                           (reset! effects-ref effects)
                           new-conn)))
-     (execute-conn-effects! @effects-ref opts)
+     (let [effective-opts (merge (select-keys @conn-atom [:diagnostics-atom :diagnose-fn]) opts)]
+       (execute-conn-effects! @effects-ref effective-opts))
      @conn-atom)))
 
 (defn conn-diagnostics-summary
@@ -415,7 +416,7 @@
 
 (defn- dispatch-auto-reply!
   "Sends auto-reply envelopes, attempting reconnect if connection is lost, or failing closed."
-  [envelopes send-fn-atom state-atom conn-atom event-out reconnect-fn]
+  [envelopes send-fn-atom state-atom conn-atom event-out reconnect-fn conn-opts]
   (let [live? (and @send-fn-atom (not (false? (:connected? @state-atom))))
         sent? (when live?
                 (send-all-envelopes! @send-fn-atom envelopes))]
@@ -426,7 +427,7 @@
                          (send-all-envelopes! (:send-fn reconn) envelopes))
             (let [err (or (:error reconn) "connection-closed")]
               (when conn-atom
-                (apply-conn-event! conn-atom {:type :send-failed :error err}))
+                (apply-conn-event! conn-atom {:type :send-failed :error err} conn-opts))
               (when state-atom
                 (swap! state-atom assoc :connected? false :connection-error err))
               (sync-conn-diagnostics! state-atom conn-atom)
@@ -434,7 +435,7 @@
                 (event-out {"event" "connection-failed" "connected" false "error" err})))))
         (let [err "connection-closed"]
           (when conn-atom
-            (apply-conn-event! conn-atom {:type :send-failed :error err}))
+            (apply-conn-event! conn-atom {:type :send-failed :error err} conn-opts))
           (when state-atom
             (swap! state-atom assoc :connected? false :connection-error err))
           (sync-conn-diagnostics! state-atom conn-atom)
@@ -444,11 +445,14 @@
 (defn make-client-callbacks
   "Creates callback handlers for client DataChannel connection."
   [client-node channel-id connected? send-fn-atom ctx]
-  (let [{:keys [identity state-atom conn-atom event-out reconnect-fn generation]} ctx]
+  (let [{:keys [identity state-atom conn-atom event-out reconnect-fn generation diagnostics-atom diagnose-fn]} ctx
+        cb-opts (cond-> {}
+                  diagnostics-atom (assoc :diagnostics-atom diagnostics-atom)
+                  diagnose-fn (assoc :diagnose-fn diagnose-fn))]
     {:on-open (fn [evt]
                 (if (and conn-atom (some? generation) (< generation (:generation @conn-atom 0)))
                   (do
-                    (apply-conn-event! conn-atom {:type :on-open :generation generation})
+                    (apply-conn-event! conn-atom {:type :on-open :generation generation} cb-opts)
                     (sync-conn-diagnostics! state-atom conn-atom))
                   (do
                     (if-let [cid (:channel-id evt)]
@@ -458,7 +462,7 @@
      :on-message (fn [evt]
                    (if (and conn-atom (some? generation) (< generation (:generation @conn-atom 0)))
                      (do
-                       (apply-conn-event! conn-atom {:type :on-message :generation generation})
+                       (apply-conn-event! conn-atom {:type :on-message :generation generation} cb-opts)
                        (sync-conn-diagnostics! state-atom conn-atom))
                      (do
                        (when-let [cid (:channel-id evt)]
@@ -472,7 +476,7 @@
                                (doseq [ev (:stdout-events res)]
                                  (event-out ev)))
                              (when (seq (:net-envelopes res))
-                               (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn))))))))
+                               (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts))))))))
      :on-error (fn [evt]
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (deliver connected? :bad-fingerprint)))
@@ -482,13 +486,15 @@
                             (pos? (:generation @conn-atom 0))
                             (not= generation (:generation @conn-atom)))
                      (do
-                       (apply-conn-event! conn-atom {:type :on-close :generation generation})
+                       (apply-conn-event! conn-atom {:type :on-close :generation generation} cb-opts)
                        (sync-conn-diagnostics! state-atom conn-atom))
                      (do
                        (when (instance? clojure.lang.Atom channel-id)
                          (reset! channel-id nil))
-                       (apply-conn-event! conn-atom (cond-> {:type :on-close}
-                                                      (some? generation) (assoc :generation generation)))
+                       (apply-conn-event! conn-atom
+                                          (cond-> {:type :on-close}
+                                            (some? generation) (assoc :generation generation))
+                                          cb-opts)
                        (when state-atom
                          (swap! state-atom assoc :connected? false :connection-error "connection-closed"))
                        (sync-conn-diagnostics! state-atom conn-atom)))
@@ -514,7 +520,9 @@
                                           :conn-atom (:conn-atom opts)
                                           :event-out (:event-out opts)
                                           :reconnect-fn (:reconnect-fn opts)
-                                          :generation (:generation opts)})
+                                          :generation (:generation opts)
+                                          :diagnostics-atom (:diagnostics-atom opts)
+                                          :diagnose-fn (:diagnose-fn opts)})
         transport (:transport opts)
         target-host (if (= transport :connect)
                       (or (:ingress-host node) (:ip node) "127.0.0.1")
@@ -610,14 +618,14 @@
               (emit-json-line! out-writer resp)))
           (do
             (when conn-atom
-              (apply-conn-event! conn-atom {:type :dial-started}))
+              (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
             (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
                   opts-with-gen (assoc (or conn-opts {}) :generation target-gen)
                   reconn (connect-validators! identity bootstrap opts-with-gen)]
               (if (:ok? reconn)
                 (do
                   (when conn-atom
-                    (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen)))
+                    (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
                   (if (send-all-envelopes! (:send-fn reconn) (:net-envelopes res))
                     (do
                       (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
@@ -627,14 +635,14 @@
                         (emit-json-line! out-writer resp)))
                     (let [err "send-failed"]
                       (when conn-atom
-                        (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen}))
+                        (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
                       (when state-atom
                         (swap! state-atom assoc :connected? false :connection-error err))
                       (sync-conn-diagnostics! state-atom conn-atom)
                       (emit-json-line! out-writer {"ok" false "error" err}))))
                 (let [err (or (:error reconn) "listener-disabled")]
                   (when conn-atom
-                    (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen}))
+                    (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
                   (when state-atom
                     (swap! state-atom assoc :connected? false :connection-error err))
                   (sync-conn-diagnostics! state-atom conn-atom)
@@ -659,20 +667,21 @@
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (:autonomous? opts false)}))
         state-atom (atom initial-state)
+        diagnostics-atom (atom [])
         conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
         event-out (fn [ev] (emit-json-line! out-writer ev))
         conn-opts-atom (atom nil)
         reconnect-fn (fn []
                        (when conn-atom
-                         (apply-conn-event! conn-atom {:type :dial-started}))
+                         (apply-conn-event! conn-atom {:type :dial-started} @conn-opts-atom))
                        (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
                              opts-with-gen (assoc (or @conn-opts-atom {}) :generation target-gen)
                              reconn (connect-validators! identity bootstrap opts-with-gen)]
                          (if (:ok? reconn)
                            (do
                              (when conn-atom
-                               (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen)))
+                               (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) @conn-opts-atom))
                              (swap! state-atom assoc
                                     :connected? true
                                     :connection-error nil)
@@ -680,7 +689,7 @@
                              reconn)
                            (let [err (or (:error reconn) "listener-disabled")]
                              (when conn-atom
-                               (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen}))
+                               (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} @conn-opts-atom))
                              (swap! state-atom assoc
                                     :connected? false
                                     :connection-error err)
@@ -689,6 +698,7 @@
         conn-opts (assoc opts
                          :state-atom state-atom
                          :conn-atom conn-atom
+                         :diagnostics-atom diagnostics-atom
                          :event-out event-out
                          :reconnect-fn reconnect-fn)
         _ (reset! conn-opts-atom conn-opts)

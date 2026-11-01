@@ -16,7 +16,10 @@
             [bitecho.streamlet.core :as streamlet]
             [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.string :as string]))
+            [clojure.string :as string])
+  (:import [java.nio.charset StandardCharsets]))
+
+(declare apply-payload-to-ledger execute-finalized-blocks)
 
 (defn- peer-hex
   "Normalizes a peer's pubkey to a hex string."
@@ -78,7 +81,95 @@
       :blocks {} :notarized-blocks #{} :finalized-blocks #{}
       :block-votes {} :voted-epochs #{} :head-hash "genesis" :mempool []
       :peers-map (or (:peers-map cfg) {})
-      :keypair (or (:keypair cfg) nil)})))
+      :keypair (or (:keypair cfg) nil)
+      :pending-receipts []
+      :known-receipt-ids #{}
+      :executed-receipt-ids #{}
+      :executed-finalized-blocks #{}
+      :last-executed-finalized-epoch 0})))
+
+(defn consensus-mode?
+  "Returns true if the node is operating in Streamlet BFT consensus mode with configured peers."
+  [state]
+  (boolean (seq (:peers-map state))))
+
+(defn spendable-balance
+  "Computes spendable balance for pubkey in consensus mode by subtracting unfinalized pending debits."
+  [state pubkey]
+  (let [pk (if (string? pubkey) pubkey (when pubkey (basalt/bytes->hex pubkey)))
+        auth-bal (long (or (get-in state [:ledger pk :balance]) 0))
+        pending (or (:pending-receipts state) [])
+        burn-debit (reduce (fn [acc r]
+                             (if (and (= (:type r) :burn) (= (:sender r) pk))
+                               (+ acc (long (or (:amount r) 0)))
+                               acc))
+                           0 pending)
+        transfer-debit (reduce (fn [acc r]
+                                 (if (and (= (:type r) :transfer) (= (:sender r) pk))
+                                   (+ acc (long (or (:amount r) 0)))
+                                   acc))
+                               0 pending)
+        intent-debit (reduce (fn [acc r]
+                               (if (and (= (:type r) :settle-intent) (= (:payer r) pk))
+                                 (+ acc (long (or (:amount r) 0)))
+                                 acc))
+                             0 pending)
+        voucher-tuples (reduce (fn [acc r]
+                                 (if (and (= (:type r) :voucher) (= (:callee r) pk))
+                                   (let [k [(:callee r) (:home-node r) (:epoch r)]
+                                         prev (get acc k 0)
+                                         curr (long (or (:cumulative-debit r) 0))]
+                                     (assoc acc k (max prev curr)))
+                                   acc))
+                               {} pending)
+        voucher-debit (reduce + 0 (vals voucher-tuples))
+        total-debit (+ burn-debit transfer-debit intent-debit voucher-debit)]
+    (- auth-bal total-debit)))
+
+(defn stage-receipt
+  "Stages a receipt into :pending-receipts bounded by :max-pending-receipts.
+   Returns {:ok? true/false :state state}."
+  [state receipt]
+  (let [max-cap (long (or (get-in state [:config :max-pending-receipts]) 4096))
+        rid (:receipt-id receipt)]
+    (cond
+      (or (contains? (or (:known-receipt-ids state) #{}) rid)
+          (contains? (or (:executed-receipt-ids state) #{}) rid))
+      {:ok? true :state state}
+
+      (>= (count (or (:pending-receipts state) [])) max-cap)
+      {:ok? false :state state}
+
+      :else
+      {:ok? true
+       :state (-> state
+                  (update :pending-receipts (fnil conj []) receipt)
+                  (update :known-receipt-ids (fnil conj #{}) rid))})))
+
+(defn extract-burn-window
+  "Extracts the trailing burn and settlement take window up to the authoritative anchor epoch."
+  [state]
+  (let [anchor-epoch (long (if (consensus-mode? state)
+                             (or (:last-executed-finalized-epoch state) 0)
+                             (or (:epoch state) 0)))
+        n (long (or (get-in state [:config :treasury-trailing-epochs]) 168))
+        start-ep (max 0 (- anchor-epoch (max 1 n)))
+        window (mapv (fn [ep]
+                       [ep
+                        (long (or (get-in state [:epoch-burns ep]) 0))
+                        (long (or (get-in state [:epoch-settlement-takes ep]) 0))])
+                     (range start-ep (inc anchor-epoch)))]
+    {:anchor-epoch anchor-epoch
+     :window window}))
+
+(defn compute-burn-map-digest
+  "Computes a 16-hex-character digest of the trailing burn and settlement take window."
+  [state]
+  (let [w (extract-burn-window state)
+        s (pr-str w)
+        b (.getBytes ^String s StandardCharsets/UTF_8)
+        h (basalt/bytes->hex (crypto/sha256 b))]
+    (subs h 0 16)))
 
 (defn- build-tick-treasury-ctx
   "Extracts trailing revenues and builds the treasury context for an epoch tick boundary."
@@ -364,16 +455,59 @@
                :frozen-epoch-message-roles pruned-frozen-roles)
         (prune-rendezvous-retention-state rdv-cutoff))))
 
+(defn- collect-ancestor-receipt-ids
+  "Collects receipt IDs present in notarized ancestor blocks along the chain back to genesis,
+   stopping at genesis, missing blocks, or executed finalized blocks."
+  [state]
+  (let [blocks (:blocks state)
+        executed-blocks (or (:executed-finalized-blocks state) #{})]
+    (loop [curr (get state :head-hash "genesis")
+           visited #{}
+           acc #{}]
+      (cond
+        (= curr "genesis") acc
+        (contains? visited curr) acc
+        (contains? executed-blocks curr) acc
+        :else
+        (if-let [block (get blocks curr)]
+          (let [payload (:payload block)
+                rids (set (keep (fn [x] (when (and (map? x) (:receipt-id x)) (:receipt-id x)))
+                                (when (sequential? payload) payload)))]
+            (recur (:parent-hash block) (conj visited curr) (into acc rids)))
+          acc)))))
+
 (defn- apply-streamlet-tick
   "Steps Streamlet BFT tick if peers-map is configured, advancing consensus state and commands."
-  [treasury-state commands closing-epoch]
-  (if (seq (:peers-map treasury-state))
-    (let [streamlet-res (streamlet/handle-streamlet-event
-                         (assoc treasury-state :epoch closing-epoch)
-                         {:type :tick})]
-      {:state (:state streamlet-res)
+  [state commands closing-epoch]
+  (if (consensus-mode? state)
+    (let [ancestor-rids (collect-ancestor-receipt-ids state)
+          exec-rids (or (:executed-receipt-ids state) #{})
+          filtered-receipts (->> (or (:pending-receipts state) [])
+                                 (remove (fn [r]
+                                           (let [rid (:receipt-id r)]
+                                             (or (contains? exec-rids rid)
+                                                 (contains? ancestor-rids rid)))))
+                                 (sort-by (fn [r]
+                                            [(case (:type r)
+                                               :register-home-set 0
+                                               :burn 1
+                                               :transfer 2
+                                               :settle-intent 3
+                                               :voucher 4
+                                               5)
+                                             (long (or (:seq r) 0))
+                                             (str (:receipt-id r))]))
+                                 vec)
+          should-set-mempool? (or (seq filtered-receipts)
+                                  (empty? (:mempool state))
+                                  (boolean (seq (filter #(and (map? %) (:receipt-id %)) (:mempool state)))))
+          tick-state (cond-> (assoc state :epoch closing-epoch)
+                       should-set-mempool? (assoc :mempool filtered-receipts))
+          streamlet-res (streamlet/handle-streamlet-event tick-state {:type :tick})
+          post-exec-state (execute-finalized-blocks (:state streamlet-res))]
+      {:state post-exec-state
        :commands (into (or commands []) (:commands streamlet-res))})
-    {:state treasury-state
+    {:state state
      :commands commands}))
 
 (defn- handle-tick
@@ -430,10 +564,12 @@
                           :global-echo-sample (:echo-sample sampling-res)
                           :global-ready-sample (:ready-sample sampling-res)
                           :global-delivery-sample (:delivery-sample sampling-res))
-        pruned-state (prune-expired-tick-state base-state new-epoch cfg)
-        tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)
-        treasury-state (apply-epoch-treasury-boundary tick-state-settled new-epoch)]
-    (apply-streamlet-tick treasury-state commands closing-epoch)))
+        pruned-state (prune-expired-tick-state base-state new-epoch cfg)]
+    (if (consensus-mode? pruned-state)
+      (apply-streamlet-tick pruned-state commands closing-epoch)
+      (let [tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)
+            treasury-state (apply-epoch-treasury-boundary tick-state-settled new-epoch)]
+        (apply-streamlet-tick treasury-state commands closing-epoch)))))
 
 (defn- apply-broadcast-burn
   "Enforces a mandatory signaling burn (>= burn/min-signaling-burn) on every broadcast.
@@ -462,53 +598,117 @@
   "Handles an internal request to broadcast a payload.
    Deducts mandatory signaling burn; drops broadcast if burn deduction fails."
   [state event]
-  (let [current-epoch (or (:epoch state) 0)]
-    (if-let [burn-res (apply-broadcast-burn state event current-epoch)]
-      (let [state (:state burn-res)
-            burn-amt (:burn-amount burn-res)
-            cfg (:config state)
-            murmur-k (:murmur-k cfg)
-            murmur-max-cache-size (:murmur-max-cache-size cfg)
-            payload (:payload event)
-            rng (:rng event)
-            extracted-peers (basalt/extract-peers (:basalt-view state))
-            sieve-message (if (and (:private-key event) (:public-key event))
-                            (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
-                            {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
-            broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
-            message-id (:message-id broadcast-result)
-            message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
-            commands (if (seq (:targets broadcast-result))
-                       [{:type :send-gossip
-                         :targets (:targets broadcast-result)
-                         :message message}]
-                       [])
-            ;; We implicitly add our own broadcasts to the known ids and cache
-            new-cache-set (conj (:set (:murmur-cache state)) message-id)
-            new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
-            new-cache-queue-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
-                                      (pop new-cache-queue)
-                                      new-cache-queue)
-            new-cache-set-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
-                                    (disj new-cache-set (peek new-cache-queue))
-                                    new-cache-set)
-            new-cache {:set new-cache-set-evicted :queue new-cache-queue-evicted}
-            new-known-ids (conj (:contagion-known-ids state) message-id)
-            new-messages (assoc (:messages state) message-id message)
-            new-epochs (assoc (or (:message-epochs state) {}) message-id current-epoch)
-            new-epoch-to-messages (update (or (:epoch-to-messages state) {})
-                                          current-epoch (fnil conj #{}) message-id)
-            new-epoch-to-roles (assoc-in (or (:epoch-to-message-roles state) {})
-                                         [current-epoch message-id] :gossip)]
-        {:state (assoc state
-                       :murmur-cache new-cache
-                       :contagion-known-ids new-known-ids
-                       :messages new-messages
-                       :message-epochs new-epochs
-                       :epoch-to-messages new-epoch-to-messages
-                       :epoch-to-message-roles new-epoch-to-roles)
-         :commands commands})
-      {:state state :commands []})))
+  (let [current-epoch (or (:epoch state) 0)
+        burn-spec (if (contains? event :burn) (:burn event) (:signaling-burn event))
+        burn-amt (cond
+                   (number? burn-spec) (when (>= burn-spec burn/min-signaling-burn) burn-spec)
+                   (false? burn-spec) nil
+                   :else burn/min-signaling-burn)
+        sender (or (:sender event)
+                   (when-let [pk (:public-key event)]
+                     (if (string? pk) pk (basalt/bytes->hex pk)))
+                   (:node-pubkey state))
+        sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))]
+    (if (consensus-mode? state)
+      (if (and burn-amt
+               sender-hex
+               (get-in state [:ledger sender-hex])
+               (>= (spendable-balance state sender-hex) burn-amt))
+        (let [cfg (:config state)
+              murmur-k (:murmur-k cfg)
+              murmur-max-cache-size (:murmur-max-cache-size cfg)
+              payload (:payload event)
+              rng (:rng event)
+              extracted-peers (basalt/extract-peers (:basalt-view state))
+              sieve-message (if (and (:private-key event) (:public-key event))
+                              (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
+                              {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
+              broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
+              message-id (:message-id broadcast-result)
+              message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
+              staged (stage-receipt state {:receipt-id (str "gossip-burn:" message-id)
+                                           :type :burn
+                                           :sender sender-hex
+                                           :amount burn-amt})]
+          (if (:ok? staged)
+            (let [staged-state (:state staged)
+                  commands (if (seq (:targets broadcast-result))
+                             [{:type :send-gossip
+                               :targets (:targets broadcast-result)
+                               :message message}]
+                             [])
+                  new-cache-set (conj (:set (:murmur-cache staged-state)) message-id)
+                  new-cache-queue (conj (:queue (:murmur-cache staged-state)) message-id)
+                  new-cache-queue-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                            (pop new-cache-queue)
+                                            new-cache-queue)
+                  new-cache-set-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                          (disj new-cache-set (peek new-cache-queue))
+                                          new-cache-set)
+                  new-cache {:set new-cache-set-evicted :queue new-cache-queue-evicted}
+                  new-known-ids (conj (:contagion-known-ids staged-state) message-id)
+                  new-messages (assoc (:messages staged-state) message-id message)
+                  new-epochs (assoc (or (:message-epochs staged-state) {}) message-id current-epoch)
+                  new-epoch-to-messages (update (or (:epoch-to-messages staged-state) {})
+                                                current-epoch (fnil conj #{}) message-id)
+                  new-epoch-to-roles (assoc-in (or (:epoch-to-message-roles staged-state) {})
+                                               [current-epoch message-id] :gossip)]
+              {:state (assoc staged-state
+                             :murmur-cache new-cache
+                             :contagion-known-ids new-known-ids
+                             :messages new-messages
+                             :message-epochs new-epochs
+                             :epoch-to-messages new-epoch-to-messages
+                             :epoch-to-message-roles new-epoch-to-roles)
+               :commands commands})
+            {:state state :commands []}))
+        {:state state :commands []})
+      ;; Non-consensus standalone mode
+      (if-let [burn-res (apply-broadcast-burn state event current-epoch)]
+        (let [state (:state burn-res)
+              burn-amt (:burn-amount burn-res)
+              cfg (:config state)
+              murmur-k (:murmur-k cfg)
+              murmur-max-cache-size (:murmur-max-cache-size cfg)
+              payload (:payload event)
+              rng (:rng event)
+              extracted-peers (basalt/extract-peers (:basalt-view state))
+              sieve-message (if (and (:private-key event) (:public-key event))
+                              (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
+                              {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
+              broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
+              message-id (:message-id broadcast-result)
+              message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
+              commands (if (seq (:targets broadcast-result))
+                         [{:type :send-gossip
+                           :targets (:targets broadcast-result)
+                           :message message}]
+                         [])
+              new-cache-set (conj (:set (:murmur-cache state)) message-id)
+              new-cache-queue (conj (:queue (:murmur-cache state)) message-id)
+              new-cache-queue-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                        (pop new-cache-queue)
+                                        new-cache-queue)
+              new-cache-set-evicted (if (> (count new-cache-queue) murmur-max-cache-size)
+                                      (disj new-cache-set (peek new-cache-queue))
+                                      new-cache-set)
+              new-cache {:set new-cache-set-evicted :queue new-cache-queue-evicted}
+              new-known-ids (conj (:contagion-known-ids state) message-id)
+              new-messages (assoc (:messages state) message-id message)
+              new-epochs (assoc (or (:message-epochs state) {}) message-id current-epoch)
+              new-epoch-to-messages (update (or (:epoch-to-messages state) {})
+                                            current-epoch (fnil conj #{}) message-id)
+              new-epoch-to-roles (assoc-in (or (:epoch-to-message-roles state) {})
+                                           [current-epoch message-id] :gossip)]
+          {:state (assoc state
+                         :murmur-cache new-cache
+                         :contagion-known-ids new-known-ids
+                         :messages new-messages
+                         :message-epochs new-epochs
+                         :epoch-to-messages new-epoch-to-messages
+                         :epoch-to-message-roles new-epoch-to-roles)
+           :commands commands})
+        {:state state :commands []}))))
 
 (declare handle-event)
 
@@ -657,17 +857,39 @@
             new-message? (some? (:message gossip-result))
             sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
             node-pk (when-let [np (:node-pubkey state)] (if (string? np) np (basalt/bytes->hex np)))
-            burn-deduction (when (and new-message? (not= sender node-pk) sender)
-                             (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
-        (if (and new-message? (not= sender node-pk) (nil? burn-deduction))
-          {:state state :commands []}
-          (let [current-epoch (or (:epoch state) 0)
-                state-with-burn (if burn-deduction
-                                  (-> state
-                                      (assoc :ledger (:ledger burn-deduction))
-                                      (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt))
-                                  state)]
-            (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch))))
+            current-epoch (or (:epoch state) 0)]
+        (if (consensus-mode? state)
+          (if new-message?
+            (if (and (not= sender node-pk) sender)
+              (if (and (get-in state [:ledger sender])
+                       (>= (spendable-balance state sender) burn-amt))
+                (let [staged (stage-receipt state {:receipt-id (str "gossip-burn:" msg-id)
+                                                   :type :burn
+                                                   :sender sender
+                                                   :amount burn-amt})]
+                  (if (:ok? staged)
+                    (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
+                    {:state state :commands []}))
+                {:state state :commands []})
+              (let [staged (stage-receipt state {:receipt-id (str "gossip-burn:" msg-id)
+                                                 :type :burn
+                                                 :sender sender
+                                                 :amount burn-amt})]
+                (if (:ok? staged)
+                  (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
+                  {:state state :commands []})))
+            (record-accepted-gossip state message gossip-result new-message? current-epoch))
+          ;; Standalone non-consensus mode
+          (let [burn-deduction (when (and new-message? (not= sender node-pk) sender)
+                                 (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
+            (if (and new-message? (not= sender node-pk) (nil? burn-deduction))
+              {:state state :commands []}
+              (let [state-with-burn (if burn-deduction
+                                      (-> state
+                                          (assoc :ledger (:ledger burn-deduction))
+                                          (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt))
+                                      state)]
+                (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch))))))
       {:state state :commands []})))
 
 (defn- transition-to-ready
@@ -767,6 +989,118 @@
           state))
       state)))
 
+(defn execute-finalized-blocks
+  "Executes finalized Streamlet blocks in ascending order of [(epoch, hash)].
+   Applies receipts, advances epoch vouchers, and executes treasury boundaries."
+  [state]
+  (let [finalized-hashes (or (:finalized-blocks state) #{})
+        executed-hashes (or (:executed-finalized-blocks state) #{})
+        blocks (:blocks state)
+        pending-hashes (set/difference finalized-hashes executed-hashes)
+        unexecuted-blocks (->> pending-hashes
+                               (keep (fn [h] (when-let [b (get blocks h)] (assoc b :hash h))))
+                               (sort-by (juxt (comp long :epoch) :hash)))]
+    (reduce
+     (fn [st b]
+       (let [b-hash (:hash b)
+             b-epoch (long (:epoch b))
+             last-exec (long (or (:last-executed-finalized-epoch st) 0))]
+         (if (> b-epoch last-exec)
+           (let [;; 1. For each skipped epoch ep in (range (inc last-exec) b-epoch)
+                 st-skipped (reduce (fn [s ep]
+                                      (let [closing-ep (dec ep)
+                                            s-v (apply-epoch-voucher-settlement s closing-ep)]
+                                        (apply-epoch-treasury-boundary s-v ep)))
+                                    st
+                                    (range (inc last-exec) b-epoch))
+                 ;; 2. For b-epoch (with closing-ep = (dec b-epoch))
+                 closing-ep (dec b-epoch)
+                 payload (:payload b)
+                 receipts (filter #(and (map? %) (:receipt-id %)) (when (sequential? payload) payload))
+                 st-applied (reduce
+                             (fn [s r]
+                               (let [rid (:receipt-id r)]
+                                 (if (contains? (or (:executed-receipt-ids s) #{}) rid)
+                                   s
+                                   (let [s-effect
+                                         (case (:type r)
+                                           :burn
+                                           (let [sender (:sender r)
+                                                 amt (:amount r)
+                                                 sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))]
+                                             (if-let [res (when (and sender-hex amt) (burn/deduct-signaling-burn (:ledger s) sender-hex amt))]
+                                               (-> s
+                                                   (assoc :ledger (:ledger res))
+                                                   (update-in [:epoch-burns closing-ep] (fnil + 0) (:burn-amount res)))
+                                               s))
+
+                                           :transfer
+                                           (if-let [pb (:payload-bytes r)]
+                                             (apply-payload-to-ledger s (byte-array (map byte pb)))
+                                             s)
+
+                                           :settle-intent
+                                           (let [payer (:payer r)
+                                                 receiver (:receiver r)
+                                                 amount (:amount r)
+                                                 payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
+                                                 receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
+                                                 payer-acct (when payer-hex (get-in s [:ledger payer-hex]))
+                                                 payer-bal (or (:balance payer-acct) 0)]
+                                             (if (and payer-hex receiver-hex (integer? amount) (pos? amount) payer-acct (>= payer-bal amount))
+                                               (let [configured-bps (or (:settlement-take-bps s)
+                                                                        (get-in s [:config :settlement-take-bps])
+                                                                        burn/default-settlement-take-bps)
+                                                     take-bps (max 1 configured-bps)
+                                                     take-amt (burn/calculate-settlement-take amount take-bps)
+                                                     net-amt (- amount take-amt)
+                                                     receiver-acct (get-in s [:ledger receiver-hex]
+                                                                           (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                                     new-payer (assoc payer-acct :balance (- payer-bal amount))
+                                                     new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+                                                     new-ledger (assoc (:ledger s)
+                                                                       payer-hex new-payer
+                                                                       receiver-hex new-receiver)]
+                                                 (-> s
+                                                     (assoc :ledger new-ledger)
+                                                     (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt)))
+                                               s))
+
+                                           :register-home-set
+                                           (let [tuple [(:callee r) (or (:epoch r) closing-ep)]
+                                                 reg-res (rendezvous/register-home-set (:candidates r) (:price r) (or (:price-max r) (:price r)))]
+                                             (assoc-in s [:home-sets tuple] reg-res))
+
+                                           :voucher
+                                           (let [tuple [(:callee r) (:home-node r) (:epoch r)]]
+                                             (-> s
+                                                 (assoc-in [:voucher-seqs tuple] (:seq r))
+                                                 (update :pending-vouchers (fnil conj []) (:ack r))))
+
+                                           s)]
+                                     (-> s-effect
+                                         (update :executed-receipt-ids (fnil conj #{}) rid)
+                                         (update :known-receipt-ids (fnil conj #{}) rid))))))
+                             st-skipped
+                             receipts)
+                 exec-rids (or (:executed-receipt-ids st-applied) #{})
+                 st-clean (assoc st-applied
+                                 :pending-receipts (filterv #(not (contains? exec-rids (:receipt-id %)))
+                                                            (or (:pending-receipts st-applied) []))
+                                 :mempool (filterv #(if (and (map? %) (:receipt-id %))
+                                                      (not (contains? exec-rids (:receipt-id %)))
+                                                      true)
+                                                   (or (:mempool st-applied) [])))
+                 st-settled (apply-epoch-voucher-settlement st-clean closing-ep)
+                 st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)]
+             (-> st-treasury
+                 (assoc :last-executed-finalized-epoch b-epoch)
+                 (update :executed-finalized-blocks (fnil conj #{}) b-hash)))
+           ;; Else (b-epoch <= last-exec)
+           (update st :executed-finalized-blocks (fnil conj #{}) b-hash))))
+     state
+     unexecuted-blocks)))
+
 (defn- check-contagion-delivery
   "Checks if D-hat is reached, transitioning to delivered and calling on-deliver."
   [state message-id delivery-votes D-hat]
@@ -828,27 +1162,82 @@
   "Handles the internal delivery event, updating the ledger with the payload and emitting an app-event."
   [state event]
   (let [payload-bytes (or (:payload event) (byte-array 0))
-        message-id (:message-id event)
-        state-with-applied-ledger (apply-payload-to-ledger state payload-bytes)]
-    {:state state-with-applied-ledger
-     :commands [{:type :app-event :event-name :on-deliver
-                 :payload (:payload event) :message-id message-id}]}))
+        message-id (:message-id event)]
+    (if (consensus-mode? state)
+      (let [payload-str (try (String. ^bytes payload-bytes "UTF-8") (catch Exception _ nil))
+            payload-edn (try (when payload-str
+                               (edn/read-string {:default tagged-literal
+                                                 :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                           'bitecho.economy.account.AccountState account/map->AccountState}} payload-str))
+                             (catch Exception _ nil))
+            raw-transfer (when (and (map? payload-edn) (:transfer payload-edn))
+                           (:transfer payload-edn))
+            transfer-map (when raw-transfer
+                           (let [m (if (instance? clojure.lang.TaggedLiteral raw-transfer)
+                                     (:form raw-transfer)
+                                     (into {} raw-transfer))
+                                 sig (cond
+                                       (vector? (:signature m)) (byte-array (map byte (:signature m)))
+                                       (string? (:signature m)) (.getBytes ^String (:signature m) "UTF-8")
+                                       (and (seqable? (:signature m)) (every? number? (:signature m))) (byte-array (map byte (:signature m)))
+                                       (bytes? (:signature m)) (:signature m)
+                                       :else (byte-array 0))]
+                             (assoc m :signature sig)))
+            transfer (when transfer-map (account/map->Transfer transfer-map))
+            sender (when transfer (:sender transfer))
+            sender-state (when (and sender (:ledger state)) (get (:ledger state) sender))
+            valid-transfer? (and transfer
+                                 sender-state
+                                 (account/validate-transfer sender-state transfer)
+                                 (>= (spendable-balance state sender) (long (or (:amount transfer) 0))))
+            state-staged (if valid-transfer?
+                           (let [rid (str "transfer:" (or message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))))
+                                 staged (stage-receipt state {:receipt-id rid
+                                                              :type :transfer
+                                                              :sender sender
+                                                              :seq (:seq transfer)
+                                                              :amount (:amount transfer)
+                                                              :payload-bytes (vec payload-bytes)})]
+                             (if (:ok? staged) (:state staged) state))
+                           state)]
+        {:state state-staged
+         :commands [{:type :app-event :event-name :on-deliver
+                     :payload (:payload event) :message-id message-id}]})
+      (let [state-with-applied-ledger (apply-payload-to-ledger state payload-bytes)]
+        {:state state-with-applied-ledger
+         :commands [{:type :app-event :event-name :on-deliver
+                     :payload (:payload event) :message-id message-id}]}))))
 
 (defn- handle-signaling-burn
   "Handles a direct signaling burn event, deducting burn from the sender's account
    and incrementing the epoch's burn accumulator."
   [state event]
   (let [sender (:sender event)
-        burn-amt (or (:burn event) (:burn-amount event) burn/min-signaling-burn)
-        ledger (or (:ledger state) {})
-        res (burn/deduct-signaling-burn ledger sender burn-amt)]
-    (if res
-      (let [current-epoch (or (:epoch state) 0)]
-        {:state (-> state
-                    (assoc :ledger (:ledger res))
-                    (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
-         :commands []})
-      {:state state :commands []})))
+        sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))
+        burn-amt (or (:burn event) (:burn-amount event) burn/min-signaling-burn)]
+    (if (consensus-mode? state)
+      (let [sender-acct (when sender-hex (get-in state [:ledger sender-hex]))]
+        (if (and sender-hex
+                 sender-acct
+                 (number? burn-amt)
+                 (>= burn-amt burn/min-signaling-burn)
+                 (>= (spendable-balance state sender-hex) burn-amt))
+          (let [rid (or (:receipt-id event)
+                        (str "burn:" sender-hex ":" (or (:epoch state) 0) ":" (count (or (:pending-receipts state) []))))
+                staged (stage-receipt state {:receipt-id rid :type :burn :sender sender-hex :amount burn-amt})]
+            (if (:ok? staged)
+              {:state (:state staged) :commands []}
+              {:state state :commands []}))
+          {:state state :commands []}))
+      (let [ledger (or (:ledger state) {})
+            res (when sender-hex (burn/deduct-signaling-burn ledger sender-hex burn-amt))]
+        (if res
+          (let [current-epoch (or (:epoch state) 0)]
+            {:state (-> state
+                        (assoc :ledger (:ledger res))
+                        (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
+             :commands []})
+          {:state state :commands []})))))
 
 (defn- handle-epoch-mint
   "Handles an authorized epoch mint event, applying demand-gated mint allocations."
@@ -929,17 +1318,29 @@
    at a different price is rejected unless targeting a new epoch."
   [state event]
   (let [callee (:callee event)
-        epoch (or (:epoch event) (:epoch state) 0)
+        current-epoch (or (:epoch event) (:epoch state) 0)
         candidates (or (:candidates event) [])
         p-b (or (:price event) (:p-b event) 0)
         p-b-max (or (:price-max event) (:p-b-max event) p-b)
-        tuple [callee epoch]
+        tuple [callee current-epoch]
         existing (get-in state [:home-sets tuple])]
     (if (and existing (some? (:price existing)) (not= (:price existing) p-b))
       {:state state :commands []}
       (let [reg-result (rendezvous/register-home-set candidates p-b p-b-max)]
-        {:state (assoc-in state [:home-sets tuple] reg-result)
-         :commands []}))))
+        (if (consensus-mode? state)
+          (let [rid (str "home-set:" callee ":" current-epoch)
+                staged (stage-receipt (assoc-in state [:home-sets tuple] reg-result)
+                                      {:receipt-id rid
+                                       :type :register-home-set
+                                       :callee callee
+                                       :epoch current-epoch
+                                       :candidates candidates
+                                       :price p-b
+                                       :price-max p-b-max})]
+            {:state (if (:ok? staged) (:state staged) (assoc-in state [:home-sets tuple] reg-result))
+             :commands []})
+          {:state (assoc-in state [:home-sets tuple] reg-result)
+           :commands []})))))
 
 (defn- node-in-home-set?
   "Checks if a home-node is present in the registered home set."
@@ -973,7 +1374,9 @@
       {:state state :commands []}
       (let [price (:price home-set)
             cum-debit (* seq-num price)
-            callee-bal (or (get-in state [:ledger callee :balance]) 0)]
+            callee-bal (if (consensus-mode? state)
+                         (spendable-balance state callee)
+                         (or (get-in state [:ledger callee :balance]) 0))]
         (if (< callee-bal cum-debit)
           {:state state :commands []}
           (let [offer-ctx (assoc event
@@ -983,10 +1386,23 @@
                                  :epoch current-epoch)
                 res (rendezvous/process-offer-header offer-ctx)]
             (if (= :ok (:status res))
-              {:state (-> state
-                          (assoc-in [:voucher-seqs tuple] seq-num)
-                          (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
-               :commands []}
+              (if (consensus-mode? state)
+                (let [rid (str "voucher:" callee ":" home-node ":" current-epoch ":" seq-num)
+                      staged (stage-receipt (assoc-in state [:voucher-seqs tuple] seq-num)
+                                            {:receipt-id rid
+                                             :type :voucher
+                                             :callee callee
+                                             :home-node home-node
+                                             :epoch current-epoch
+                                             :seq seq-num
+                                             :cumulative-debit cum-debit
+                                             :ack (:delivery-ack res)})]
+                  {:state (if (:ok? staged) (:state staged) (assoc-in state [:voucher-seqs tuple] seq-num))
+                   :commands []})
+                {:state (-> state
+                            (assoc-in [:voucher-seqs tuple] seq-num)
+                            (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
+                 :commands []})
               {:state state :commands []})))))))
 
 (defn- handle-settle-intent
@@ -1000,34 +1416,53 @@
         receiver (:receiver event)
         amount (:amount event)
         payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
-        receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
-        payer-acct (when payer-hex (get-in state [:ledger payer-hex]))
-        payer-bal (or (:balance payer-acct) 0)]
-    (if (and payer-hex
-             receiver-hex
-             (integer? amount)
-             (pos? amount)
-             payer-acct
-             (>= payer-bal amount))
-      (let [configured-bps (or (:settlement-take-bps state)
-                               (get-in state [:config :settlement-take-bps])
-                               burn/default-settlement-take-bps)
-            take-bps (max 1 configured-bps)
-            take-amt (burn/calculate-settlement-take amount take-bps)
-            net-amt (- amount take-amt)
-            current-epoch (or (:epoch event) (:epoch state) 0)
-            receiver-acct (get-in state [:ledger receiver-hex]
-                                  (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-            new-payer (assoc payer-acct :balance (- payer-bal amount))
-            new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
-            new-ledger (assoc (:ledger state)
-                              payer-hex new-payer
-                              receiver-hex new-receiver)]
-        {:state (-> state
-                    (assoc :ledger new-ledger)
-                    (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
-         :commands []})
-      {:state state :commands []})))
+        receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))]
+    (if (consensus-mode? state)
+      (let [payer-acct (when payer-hex (get-in state [:ledger payer-hex]))]
+        (if (and payer-hex
+                 receiver-hex
+                 (integer? amount)
+                 (pos? amount)
+                 payer-acct
+                 (>= (spendable-balance state payer-hex) amount))
+          (let [rid (or (:receipt-id event)
+                        (str "intent:" payer-hex ":" receiver-hex ":" amount ":" (count (or (:pending-receipts state) []))))
+                staged (stage-receipt state {:receipt-id rid
+                                             :type :settle-intent
+                                             :payer payer-hex
+                                             :receiver receiver-hex
+                                             :amount amount})]
+            (if (:ok? staged)
+              {:state (:state staged) :commands []}
+              {:state state :commands []}))
+          {:state state :commands []}))
+      (let [payer-acct (when payer-hex (get-in state [:ledger payer-hex]))
+            payer-bal (or (:balance payer-acct) 0)]
+        (if (and payer-hex
+                 receiver-hex
+                 (integer? amount)
+                 (pos? amount)
+                 payer-acct
+                 (>= payer-bal amount))
+          (let [configured-bps (or (:settlement-take-bps state)
+                                   (get-in state [:config :settlement-take-bps])
+                                   burn/default-settlement-take-bps)
+                take-bps (max 1 configured-bps)
+                take-amt (burn/calculate-settlement-take amount take-bps)
+                net-amt (- amount take-amt)
+                current-epoch (or (:epoch event) (:epoch state) 0)
+                receiver-acct (get-in state [:ledger receiver-hex]
+                                      (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                new-payer (assoc payer-acct :balance (- payer-bal amount))
+                new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+                new-ledger (assoc (:ledger state)
+                                  payer-hex new-payer
+                                  receiver-hex new-receiver)]
+            {:state (-> state
+                        (assoc :ledger new-ledger)
+                        (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
+             :commands []})
+          {:state state :commands []})))))
 
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
@@ -1051,7 +1486,11 @@
     :receive-gossip (handle-receive-gossip state event)
     :receive-sieve-echo (handle-receive-sieve-echo state event)
     :receive-contagion-ready (handle-receive-contagion-ready state event)
-    :receive-propose (streamlet/handle-streamlet-event state event)
-    :receive-vote (streamlet/handle-streamlet-event state event)
+    :receive-propose (let [res (streamlet/handle-streamlet-event state event)]
+                       {:state (execute-finalized-blocks (:state res))
+                        :commands (:commands res)})
+    :receive-vote (let [res (streamlet/handle-streamlet-event state event)]
+                    {:state (execute-finalized-blocks (:state res))
+                     :commands (:commands res)})
     :on-deliver (handle-on-deliver state event)
     {:state state :commands []}))

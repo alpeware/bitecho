@@ -139,3 +139,9 @@ A human orchestrator retains a highly secure **Parent Key** (Cold Wallet). The A
 1.  **Streamlet Consensus Validators**: High-reputation enterprise nodes running Streamlet BFT to sequence intent settlements, custody Genesis accounts, and receive 20% of demand-gated minting.
 2.  **Permissionless Full Nodes**: Staked operators ($S \ge 250,000$ ECHO) running the Contagion SBRB mesh, Basalt peer sampling, ICE-lite multi-homed rendezvous hosting, and edge FX settlement. They receive 80% of demand-gated minting weighted by peer-attested participation.
 3.  **Light Nodes (AI Agents)**: Active endpoints authenticating via DACs, connecting to Full Nodes, multi-homing rendezvous points, and executing localized `sci` smart contracts.
+
+### E. Finalized-Block Ledger Execution & Receipt-vs-Execution Semantics
+In Streamlet consensus clusters, nodes operate a dual-phase execution pipeline:
+1. **Pre-Consensus Staging**: Client burns, transfers, vouchers, and settlement intents are checked against local `spendable-balance` and staged as bounded receipts in `:pending-receipts`. Authoritative ledger balances, mint dust, and treasury revenues remain unmutated prior to consensus finalization.
+2. **Post-Finality Execution**: Proposers pack unfinalized receipts into block payloads. Upon 3-chain block finalization, `execute-finalized-blocks` iterates through newly finalized blocks in ascending chain order, applying transfers, deducting signaling burns, executing settlement takes, settling vouchers, and driving demand-gated treasury minting.
+3. **Burn Digest Diagnostics**: Nodes expose consensus convergence via `burn_digest` and `finalized_epoch` in `render-statusz` and the `/burnsz` HTTP endpoint, ensuring verifiable, cross-node auditability.

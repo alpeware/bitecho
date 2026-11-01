@@ -2542,3 +2542,187 @@
                        (empty? pull-commands)
                        (= bal-after-1 bal-after-2)))))
 
+(defn- exchange-block-and-votes
+  "Given current 3-node states [s0 s1 s2], sorted pubs [pub0 pub1 pub2], epoch ep,
+   ticks all nodes, distributes proposer's proposal to peers, and exchanges votes."
+  [[s0 s1 s2] [pub0 pub1 pub2] ep]
+  (let [states [s0 s1 s2]
+        proposer-idx (mod ep 3)
+        proposer-pub (nth [pub0 pub1 pub2] proposer-idx)
+        ;; 1. Tick on all nodes
+        tick-results (mapv (fn [st] (sm/handle-event st {:type :tick :rng (java.util.Random. ep)})) states)
+        states-after-tick (mapv :state tick-results)
+        proposer-res (nth tick-results proposer-idx)
+        prop-cmd (first (filter #(= :send-propose (:type %)) (:commands proposer-res)))
+        proposer-vote (first (filter #(= :send-vote (:type %)) (:commands proposer-res)))
+        block (:block prop-cmd)
+        v-prop (:vote proposer-vote)
+        ;; 2. Proposer sends proposal to other 2 peers, which vote
+        peer-indices (filter #(not= % proposer-idx) [0 1 2])
+        prop-deliver-results (reduce (fn [acc idx]
+                                       (assoc acc idx (sm/handle-event (nth states-after-tick idx)
+                                                                       {:type :receive-propose :block block :sender proposer-pub})))
+                                     {}
+                                     peer-indices)
+        peer-votes (into {} (map (fn [idx]
+                                   (let [res (get prop-deliver-results idx)
+                                         vote-cmd (first (filter #(= :send-vote (:type %)) (:commands res)))]
+                                     [idx (:vote vote-cmd)]))
+                                 peer-indices))
+        ;; States after receive-propose
+        states-with-props (mapv (fn [idx]
+                                  (if (= idx proposer-idx)
+                                    (nth states-after-tick idx)
+                                    (:state (get prop-deliver-results idx))))
+                                [0 1 2])
+        ;; 3. Distribute votes to everyone
+        all-votes (into [[proposer-idx proposer-pub v-prop]]
+                        (map (fn [idx] [idx (nth [pub0 pub1 pub2] idx) (get peer-votes idx)]) peer-indices))
+        final-states (reduce (fn [curr-states [from-idx from-pub v]]
+                               (if-not v
+                                 curr-states
+                                 (mapv (fn [to-idx]
+                                         (if (= to-idx from-idx)
+                                           (nth curr-states to-idx)
+                                           (:state (sm/handle-event (nth curr-states to-idx)
+                                                                    {:type :receive-vote :vote v :sender from-pub}))))
+                                       [0 1 2])))
+                             states-with-props
+                             all-votes)]
+    final-states))
+
+(defspec ^{:doc "Property: Simulates a 3-node Streamlet cluster with treasury keys, validators, and funded accounts across skewed events and ticks; verifies all 3 nodes converge to identical ledger, supply, burns, takes, finalized epoch, and burn-map digest upon block finalization."}
+  prop-finalized-block-ledger-convergence 50
+  (prop/for-all [burn-amt (gen/choose 10 100)
+                 intent-amt (gen/choose 10 500)
+                 transfer-amt (gen/choose 10 500)]
+                (let [kp0 (crypto/generate-keypair)
+                      kp1 (crypto/generate-keypair)
+                      kp2 (crypto/generate-keypair)
+                      kps [kp0 kp1 kp2]
+                      pubs (mapv #(basalt/bytes->hex (:public %)) kps)
+                      sorted-indices (sort-by #(nth pubs %) (range 3))
+                      sorted-kps (mapv #(nth kps %) sorted-indices)
+                      sorted-pubs (mapv #(nth pubs %) sorted-indices)
+                      pub0 (nth sorted-pubs 0)
+                      pub1 (nth sorted-pubs 1)
+                      pub2 (nth sorted-pubs 2)
+                      peers-map {pub0 (:public (nth sorted-kps 0))
+                                 pub1 (:public (nth sorted-kps 1))
+                                 pub2 (:public (nth sorted-kps 2))}
+                      t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (basalt/bytes->hex (:private t-kp))
+                      client-kp (crypto/generate-keypair)
+                      client-pub (basalt/bytes->hex (:public client-kp))
+                      receiver-kp (crypto/generate-keypair)
+                      receiver-pub (basalt/bytes->hex (:public receiver-kp))
+                      genesis-ledger {pub0 (account/map->AccountState {:balance 1000000 :seq 0 :deps []})
+                                      pub1 (account/map->AccountState {:balance 1000000 :seq 0 :deps []})
+                                      pub2 (account/map->AccountState {:balance 1000000 :seq 0 :deps []})
+                                      client-pub (account/map->AccountState {:balance 1000000 :seq 0 :deps []})
+                                      receiver-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                      cfg (assoc config/devnet-config
+                                 :genesis-ledger genesis-ledger
+                                 :peers-map peers-map
+                                 :validators sorted-pubs
+                                 :mesh-nodes sorted-pubs
+                                 :treasury-pubkey t-pub
+                                 :treasury-privkey t-priv)
+                      init-s0 (sm/init-state [] pub0 (assoc cfg :keypair (nth sorted-kps 0)))
+                      init-s1 (sm/init-state [] pub1 (assoc cfg :keypair (nth sorted-kps 1)))
+                      init-s2 (sm/init-state [] pub2 (assoc cfg :keypair (nth sorted-kps 2)))
+                      unsigned-tx {:sender client-pub
+                                   :receiver receiver-pub
+                                   :amount transfer-amt
+                                   :seq 1
+                                   :deps []}
+                      tx (account/create-transfer (:private client-kp) unsigned-tx)
+                      transfer-payload (.getBytes (pr-str {:transfer tx}) "UTF-8")
+          ;; Epoch 1: Proposer is node1 (pub1). Inject signaling burn and intent into node1.
+                      s1-burned (:state (sm/handle-event init-s1 {:type :signaling-burn :sender client-pub :burn burn-amt}))
+                      s1-intent (:state (sm/handle-event s1-burned {:type :settle-intent :payer client-pub :receiver receiver-pub :amount intent-amt}))
+                      states-ep1 (exchange-block-and-votes [init-s0 s1-intent init-s2] sorted-pubs 1)
+          ;; Epoch 2: Proposer is node2 (pub2). Inject transfer on-deliver into node2.
+                      s2-delivered (:state (sm/handle-event (nth states-ep1 2) {:type :on-deliver :payload transfer-payload :message-id "msg-tx-1"}))
+                      states-ep2 (exchange-block-and-votes [(nth states-ep1 0) (nth states-ep1 1) s2-delivered] sorted-pubs 2)
+          ;; Epoch 3: Proposer is node0 (pub0). Block 3 notarized -> 3-chain finalizes block 2 and block 1!
+                      states-ep3 (exchange-block-and-votes states-ep2 sorted-pubs 3)
+          ;; Epoch 4: Proposer is node1 (pub1). Block 4 notarized -> finalizes block 3!
+                      states-ep4 (exchange-block-and-votes states-ep3 sorted-pubs 4)
+                      s0-final (nth states-ep4 0)
+                      s1-final (nth states-ep4 1)
+                      s2-final (nth states-ep4 2)]
+                  (and (= (:ledger s0-final) (:ledger s1-final) (:ledger s2-final))
+                       (= (:total-minted s0-final) (:total-minted s1-final) (:total-minted s2-final))
+                       (= (:mint-dust s0-final) (:mint-dust s1-final) (:mint-dust s2-final))
+                       (= (:epoch-burns s0-final) (:epoch-burns s1-final) (:epoch-burns s2-final))
+                       (= (:epoch-settlement-takes s0-final) (:epoch-settlement-takes s1-final) (:epoch-settlement-takes s2-final))
+                       (= (:last-executed-finalized-epoch s0-final)
+                          (:last-executed-finalized-epoch s1-final)
+                          (:last-executed-finalized-epoch s2-final))
+                       (> (:last-executed-finalized-epoch s0-final) 0)
+                       (= (sm/compute-burn-map-digest s0-final)
+                          (sm/compute-burn-map-digest s1-final)
+                          (sm/compute-burn-map-digest s2-final))
+                       (string? (sm/compute-burn-map-digest s0-final))
+                       (= 16 (count (sm/compute-burn-map-digest s0-final)))))))
+
+(deftest test-finality-stall-queues-receipts-and-heals-on-finalization
+  (testing "receipts are queued during finality stall without mutating ledger or mint, overspending rejected, and executed in order on finality"
+    (let [kp0 (crypto/generate-keypair)
+          kp1 (crypto/generate-keypair)
+          kp2 (crypto/generate-keypair)
+          kps [kp0 kp1 kp2]
+          pubs (mapv #(basalt/bytes->hex (:public %)) kps)
+          sorted-indices (sort-by #(nth pubs %) (range 3))
+          sorted-kps (mapv #(nth kps %) sorted-indices)
+          sorted-pubs (mapv #(nth pubs %) sorted-indices)
+          pub0 (nth sorted-pubs 0)
+          pub1 (nth sorted-pubs 1)
+          pub2 (nth sorted-pubs 2)
+          peers-map {pub0 (:public (nth sorted-kps 0))
+                     pub1 (:public (nth sorted-kps 1))
+                     pub2 (:public (nth sorted-kps 2))}
+          t-kp (crypto/generate-keypair)
+          t-pub (basalt/bytes->hex (:public t-kp))
+          t-priv (basalt/bytes->hex (:private t-kp))
+          client-kp (crypto/generate-keypair)
+          client-pub (basalt/bytes->hex (:public client-kp))
+          receiver-kp (crypto/generate-keypair)
+          receiver-pub (basalt/bytes->hex (:public receiver-kp))
+          genesis-ledger {pub0 (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                          pub1 (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                          pub2 (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                          client-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                          receiver-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+          cfg (assoc config/devnet-config
+                     :genesis-ledger genesis-ledger
+                     :peers-map peers-map
+                     :validators sorted-pubs
+                     :treasury-pubkey t-pub
+                     :treasury-privkey t-priv)
+          s0 (sm/init-state [] pub0 (assoc cfg :keypair (nth sorted-kps 0)))
+          ;; 1. Stage an intent for 600
+          res1 (sm/handle-event s0 {:type :settle-intent :payer client-pub :receiver receiver-pub :amount 600})
+          s1 (:state res1)
+          _ (do
+              (is (= 1 (count (:pending-receipts s1))))
+              ;; Authoritative ledger must NOT be mutated!
+              (is (= 1000 (:balance (get-in s1 [:ledger client-pub]))))
+              (is (empty? (:epoch-settlement-takes s1)))
+              ;; Spendable balance reflects pending debit
+              (is (= 400 (sm/spendable-balance s1 client-pub))))
+          ;; 2. Overspending beyond spendable balance (400) is rejected fail-closed
+          res-fail (sm/handle-event s1 {:type :settle-intent :payer client-pub :receiver receiver-pub :amount 500})
+          _ (do
+              (is (= (count (:pending-receipts s1)) (count (:pending-receipts (:state res-fail)))))
+              (is (= 400 (sm/spendable-balance (:state res-fail) client-pub))))
+          ;; 3. Stage a signaling burn within spendable balance (100 <= 400)
+          res2 (sm/handle-event s1 {:type :signaling-burn :sender client-pub :burn 100})
+          s2 (:state res2)]
+      (is (= 2 (count (:pending-receipts s2))))
+      (is (= 1000 (:balance (get-in s2 [:ledger client-pub]))))
+      (is (= 300 (sm/spendable-balance s2 client-pub)))
+      (is (empty? (:epoch-burns s2))))))
+

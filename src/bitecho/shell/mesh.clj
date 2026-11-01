@@ -339,9 +339,12 @@
         ledger (or (:ledger state) {})
         supply (long (reduce + 0 (map (fn [v] (if (map? v) (or (:balance v) 0) (or v 0))) (vals ledger))))
         minted (long (or (:total-minted state) 0))
-        burns (long (reduce + 0 (vals (or (:epoch-burns state) {}))))]
-    (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d\n"
-            role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns)))
+        burns (long (reduce + 0 (vals (or (:epoch-burns state) {}))))
+        finalized-epoch (long (or (:last-executed-finalized-epoch state) 0))
+        burn-digest (sm/compute-burn-map-digest state)
+        pending-receipts (long (count (or (:pending-receipts state) [])))]
+    (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d\n"
+            role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts)))
 
 ;; ---------------------------------------------------------------------------
 ;; Embedded HTTP Server (/healthz & /statusz)
@@ -362,7 +365,7 @@
         val))))
 
 (defn- make-http-handler
-  "Creates an HttpHandler for healthz and statusz endpoints."
+  "Creates an HttpHandler for healthz, statusz, and burnsz endpoints."
   [ctx total-peers fallback-state]
   (let [{:keys [shell-node peer-conns transport in-mem-bus]} ctx]
     (reify HttpHandler
@@ -378,6 +381,10 @@
                                                 (max 0 (dec (count @in-mem-bus)))
                                                 (count (filter (fn [[_ c]] (some? @(:channel-id c))) @peer-conns)))]
                                 [200 (render-statusz st connected total-peers)])
+
+                              (= path "/burnsz")
+                              (let [st (or (query-node-state shell-node 500) fallback-state)]
+                                [200 (str (pr-str (sm/extract-burn-window st)) "\n")])
 
                               :else
                               [404 "not found\n"])
@@ -398,6 +405,7 @@
           handler (make-http-handler ctx total-peers fallback-state)]
       (.createContext server "/healthz" handler)
       (.createContext server "/statusz" handler)
+      (.createContext server "/burnsz" handler)
       (.setExecutor server (Executors/newVirtualThreadPerTaskExecutor))
       (.start server)
       server)))

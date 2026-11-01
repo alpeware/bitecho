@@ -223,3 +223,23 @@ The table below catalogs every deprecated v1 mechanism that has been removed, al
 | **Minimum Node Stake ($S_{\min}$)** | `250,000` ECHO | `attestation/default-min-stake` |
 | **Maximum Stake Multiplier ($S_{\max}$)** | `4.0` | `attestation/max-stake-multiplier` |
 | **Minimum Multi-Home Redundancy ($m$)** | $\ge 3$ nodes | `rendezvous/register-home-set` |
+
+---
+
+## 11. Finalized-Block Ledger Execution & Burn Diagnostics
+
+### 11.1 Receipt-vs-Execution Consensus Semantics
+In consensus mode (`consensus-mode?` = `true`), incoming economic events (`:signaling-burn`, `:broadcast`, `:receive-gossip`, `:on-deliver` transfers, `:settle-intent`, `:register-home-set`, and `:receive-offer-header`) are verified against **spendable balance** and staged as bounded receipts in `:pending-receipts`. Authoritative state—specifically `:ledger`, `:epoch-burns`, `:epoch-settlement-takes`, `:total-minted`, `:mint-dust`, and `:unclaimed-mint`—is mutated strictly upon the finalization of Streamlet BFT blocks.
+
+1. **Spendable Balance Protection**: Unfinalized debits in `:pending-receipts` decrease local spendable balance in real time, preventing double-spend and over-draft attempts fail-closed.
+2. **Deterministic Block Execution**: When a block prefix is finalized via the 3-chain rule, `execute-finalized-blocks` iterates through newly finalized blocks in ascending `[(epoch, hash)]` order:
+   - Evaluates receipts sequentially at the block's closing epoch `(dec b-epoch)`.
+   - Executes pending voucher compaction and settlement.
+   - Computes demand-gated treasury minting and fee distributions at epoch boundaries.
+   - Cleanses executed receipts from `:pending-receipts` and `:mempool`.
+
+### 11.2 Cross-Node Comparable Burn Digest & Diagnostics
+Nodes expose their trailing burn window and state convergence metrics through embedded HTTP endpoints:
+- **`burn_digest`**: A 16-character hexadecimal SHA-256 hash of the canonical trailing burn and settlement take window (`extract-burn-window`). All converged nodes in the consensus cluster produce an identical `burn_digest`.
+- **`/statusz`**: Exposes `finalized_epoch=%d burn_digest=%s pending_receipts=%d` alongside core metrics.
+- **`/burnsz`**: Returns the EDN serialization of `(extract-burn-window state)` for deep cross-node inspection.

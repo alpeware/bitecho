@@ -1134,6 +1134,17 @@
             (light-shell/apply-conn-event! conn-atom {:type :on-close :generation 1} {:diagnostics-atom diag-log})
             (is (= [{:effect :ignore-stale :generation 1}] @diag-log)))
 
+          ;; Verify that make-client-callbacks and handle-serve-line! wire :diagnostics-atom through to apply-conn-event!
+          (let [diag-log (atom [])
+                cbs-stale (light-shell/make-client-callbacks node-gen1 cid1 (promise) (atom (constantly true))
+                                                             {:identity identity
+                                                              :state-atom state-atom
+                                                              :conn-atom conn-atom
+                                                              :diagnostics-atom diag-log
+                                                              :generation 1})]
+            ((:on-close cbs-stale) nil)
+            (is (= [{:effect :ignore-stale :generation 1}] @diag-log)))
+
           ;; 3. Verify strip-sensitive-keys and state persistence never save transient runtime liveness
           (swap! state-atom assoc
                  :connected? true

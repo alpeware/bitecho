@@ -618,7 +618,7 @@ Node: node1 (us-west1)
   Agent Ingress:     ${ip1}:5010 (UDP DataChannel)
   Agent TCP Ingress: ${ip1}:5010 (TCP DataChannel)
   Agent HTTPS/Proxy Ingress: node1.ingress.bitecho.org:443 (TCP DataChannel)
-  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz, /burnsz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node1]}
   DTLS Fingerprint:  ${FINGERPRINT[node1]}
   ICE Credentials:   ufrag=${ICE_UFRAG[node1]} pwd=${ICE_PWD[node1]}
@@ -628,7 +628,7 @@ Node: node2 (us-central1)
   Agent Ingress:     ${ip2}:5010 (UDP DataChannel)
   Agent TCP Ingress: ${ip2}:5010 (TCP DataChannel)
   Agent HTTPS/Proxy Ingress: node2.ingress.bitecho.org:443 (TCP DataChannel)
-  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz, /burnsz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node2]}
   DTLS Fingerprint:  ${FINGERPRINT[node2]}
   ICE Credentials:   ufrag=${ICE_UFRAG[node2]} pwd=${ICE_PWD[node2]}
@@ -638,7 +638,7 @@ Node: node3 (us-east1)
   Agent Ingress:     ${ip3}:5010 (UDP DataChannel)
   Agent TCP Ingress: ${ip3}:5010 (TCP DataChannel)
   Agent HTTPS/Proxy Ingress: node3.ingress.bitecho.org:443 (TCP DataChannel)
-  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz (bound to localhost)
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz, /burnsz (bound to localhost)
   Ed25519 Pubkey:    ${PUBKEY[node3]}
   DTLS Fingerprint:  ${FINGERPRINT[node3]}
   ICE Credentials:   ufrag=${ICE_UFRAG[node3]} pwd=${ICE_PWD[node3]}
@@ -774,8 +774,8 @@ REMOTE_STATUS
           fi
 
           # Parse statusz line:
-          # role=validator epoch=1 head=genesis notarized=0 finalized=0 peers=2/2 supply=18900000000 minted=0 burns=0
-          local r_role="" r_epoch="" r_notarized="" r_finalized="" r_peers="" r_supply="" r_minted="" r_burns=""
+          # role=validator epoch=1 head=genesis notarized=0 finalized=0 peers=2/2 supply=18900000000 minted=0 burns=0 finalized_epoch=0 burn_digest=... pending_receipts=0
+          local r_role="" r_epoch="" r_notarized="" r_finalized="" r_peers="" r_supply="" r_minted="" r_burns="" r_finalized_epoch="" r_burn_digest="" r_pending_receipts=""
           for kv in $raw_statusz; do
             case "$kv" in
               role=*) r_role="${kv#role=}" ;;
@@ -786,6 +786,9 @@ REMOTE_STATUS
               supply=*) r_supply="${kv#supply=}" ;;
               minted=*) r_minted="${kv#minted=}" ;;
               burns=*) r_burns="${kv#burns=}" ;;
+              finalized_epoch=*) r_finalized_epoch="${kv#finalized_epoch=}" ;;
+              burn_digest=*) r_burn_digest="${kv#burn_digest=}" ;;
+              pending_receipts=*) r_pending_receipts="${kv#pending_receipts=}" ;;
             esac
           done
 
