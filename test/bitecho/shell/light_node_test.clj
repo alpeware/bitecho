@@ -948,7 +948,7 @@
 ;; -----------------------------------------------------------------------------
 
 (def ^:private gen-event-type
-  (gen/elements [:dial-started :dial-ok :dial-failed :on-close :send-failed :shutdown]))
+  (gen/elements [:dial-started :dial-ok :dial-failed :on-close :send-failed :persist-failed :shutdown]))
 
 (def ^:private gen-gen-mode
   (gen/frequency [[60 (gen/return :current)]
@@ -1027,7 +1027,7 @@
                                                 (:node new-conn) (conj (:node new-conn))))))
 
                 ;; Invariant 4 (No Silent Drops)
-                            inv4 (if (and (not stale?) (#{:dial-failed :send-failed} evt-type))
+                            inv4 (if (and (not stale?) (#{:dial-failed :send-failed :persist-failed} evt-type))
                                    (and (= (:dropped new-conn) (inc (:dropped conn 0)))
                                         (boolean (some (fn [eff] (and (= :diagnose (:effect eff)) (some? (:error eff)))) effects)))
                                    true)]
@@ -1035,6 +1035,28 @@
                         (if (and inv1 inv2 inv3 inv4)
                           (recur (inc idx) new-conn new-installed new-closed)
                           false)))))))
+
+(deftest test-persist-failed-diagnostic-and-drop-counter
+  (testing ":persist-failed transition records diagnostic and increments :dropped without closing connection"
+    (let [conn0 {:generation 2
+                 :phase :open
+                 :ok? true
+                 :channel-id (atom "cid-1")
+                 :send-fn (constantly true)
+                 :node {:node-id :n1}
+                 :dropped 3
+                 :error nil}
+          event {:type :persist-failed :error "disk-full"}
+          [conn1 effects] (light-shell/transition-conn conn0 event)
+          diag-summary (light-shell/conn-diagnostics-summary conn1)]
+      (is (= :open (:phase conn1)))
+      (is (= true (:ok? conn1)))
+      (is (= {:node-id :n1} (:node conn1)))
+      (is (= 4 (:dropped conn1)))
+      (is (= "disk-full" (:last-error conn1)))
+      (is (= 4 (:dropped diag-summary)))
+      (is (= "disk-full" (:last_error diag-summary)))
+      (is (= [{:effect :diagnose :reason :persist-failed :error "disk-full"}] effects)))))
 
 ;; -----------------------------------------------------------------------------
 ;; 10. Stale Callback Isolation & Superseded Node Cleanup Test (Rule 4, 5)

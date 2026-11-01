@@ -503,3 +503,94 @@
                       (is (= [] (:outbox-order a-sess-final)))
                       (is (= 3 (:acked-seq a-sess-final)))
                       (is (empty? (light-core/build-unacked-replay-envelopes st-a-final (:privkey-bytes alice)))))))))))))))
+
+(deftest test-duplicate-offer-does-not-reset-open-session-or-rekey
+  (testing "Duplicate offer arrives at autonomous responder with open session: no rekeying, outbox preserved, no envelopes, replays-deduped incremented"
+    (let [alice (test-identity)
+          bob (test-identity)
+          descriptor {:network :devnet
+                      :nodes {:node1 {:node-id :node1 :ip "127.0.0.1" :agent-port 5010
+                                      :fingerprint (:fingerprint (:identity alice))
+                                      :ice-ufrag "u1" :ice-pwd "p1"}}}
+          st-alice0 (light-core/init-light-state (:identity alice) {:bootstrap descriptor :epoch 1})
+          st-bob0 (light-core/init-light-state (:identity bob) {:bootstrap descriptor :epoch 1 :autonomous? true})
+          offer-res (light-core/handle-command st-alice0 {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 10} (:privkey-bytes alice))
+          session-id (get-in offer-res [:response "session_id"])
+          offer-env (first (filter gossip-env? (:net-envelopes offer-res)))
+          bob-accept-res (light-core/handle-wire-payload st-bob0 offer-env (:privkey-bytes bob))
+          accept-env (first (filter gossip-env? (:net-envelopes bob-accept-res)))
+          alice-accept-res (light-core/handle-wire-payload (:state offer-res) accept-env (:privkey-bytes alice))
+          st-a0 (:state alice-accept-res)
+          st-b0 (:state bob-accept-res)]
+      (is (= "open" (get-in st-a0 [:sessions session-id :state])))
+      (is (= "open" (get-in st-b0 [:sessions session-id :state])))
+
+      ;; Bob sends a message to Alice so Bob's session has tx-seq > 0 and non-empty outbox
+      (let [send-res (light-core/handle-command st-b0 {"cmd" "send" "session_id" session-id "text" "bob-msg1"} (:privkey-bytes bob))
+            st-b-open (:state send-res)
+            b-sess-before (get-in st-b-open [:sessions session-id])]
+        (is (= 1 (:tx-seq b-sess-before)))
+        (is (= 1 (count (:outbox b-sess-before))))
+        (is (some? (:tx-key b-sess-before)))
+        (is (some? (:rx-key b-sess-before)))
+        (is (= 0 (:replays-deduped b-sess-before)))
+
+        ;; Now deliver the SAME offer-env again to Bob (simulating gossip replay / duplicate offer)
+        (let [dup-res (light-core/handle-wire-payload st-b-open offer-env (:privkey-bytes bob))
+              st-b-after (:state dup-res)
+              b-sess-after (get-in st-b-after [:sessions session-id])]
+          ;; Invariants:
+          ;; 1. No new envelopes emitted (do NOT emit duplicate channel-accept!)
+          (is (empty? (:net-envelopes dup-res)))
+          ;; 2. No stdout events emitted
+          (is (empty? (:stdout-events dup-res)))
+          ;; 3. Session state is still "open"
+          (is (= "open" (:state b-sess-after)))
+          ;; 4. Keys and seqs NOT reset: tx-seq is still 1, outbox is still intact
+          (is (= 1 (:tx-seq b-sess-after)))
+          (is (= (:tx-key b-sess-before) (:tx-key b-sess-after)))
+          (is (= (:rx-key b-sess-before) (:rx-key b-sess-after)))
+          (is (= (:outbox b-sess-before) (:outbox b-sess-after)))
+          ;; 5. replays-deduped incremented to 1
+          (is (= 1 (:replays-deduped b-sess-after)))
+
+          ;; Also test manual exec-accept on existing session
+          (let [manual-accept-res (light-core/handle-command st-b-after {"cmd" "accept" "session_id" session-id} (:privkey-bytes bob))]
+            (is (= false (get-in manual-accept-res [:response "ok"])))
+            (is (= "session-already-exists" (get-in manual-accept-res [:response "error"])))
+            (is (empty? (:net-envelopes manual-accept-res)))))))))
+
+(deftest test-outbox-eviction-counter-and-status
+  (testing "Outbox eviction counter increments when outbox exceeds max-outbox-size and surfaces in exec-status"
+    (let [alice (test-identity)
+          bob (test-identity)
+          descriptor {:network :devnet
+                      :nodes {:node1 {:node-id :node1 :ip "127.0.0.1" :agent-port 5010
+                                      :fingerprint (:fingerprint (:identity alice))
+                                      :ice-ufrag "u1" :ice-pwd "p1"}}}
+          st-alice0 (assoc (light-core/init-light-state (:identity alice) {:bootstrap descriptor :epoch 1})
+                           :max-outbox-size 2)
+          st-bob0 (light-core/init-light-state (:identity bob) {:bootstrap descriptor :epoch 1 :autonomous? true})
+          offer-res (light-core/handle-command st-alice0 {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 10} (:privkey-bytes alice))
+          session-id (get-in offer-res [:response "session_id"])
+          offer-env (first (filter gossip-env? (:net-envelopes offer-res)))
+          bob-accept-res (light-core/handle-wire-payload st-bob0 offer-env (:privkey-bytes bob))
+          accept-env (first (filter gossip-env? (:net-envelopes bob-accept-res)))
+          alice-accept-res (light-core/handle-wire-payload (:state offer-res) accept-env (:privkey-bytes alice))
+          st-a0 (:state alice-accept-res)]
+      (is (= 0 (get-in st-a0 [:sessions session-id :outbox-evicted])))
+
+      ;; Send 4 messages with max-outbox-size = 2 without acks:
+      (let [st1 (:state (light-core/handle-command st-a0 {"cmd" "send" "session_id" session-id "text" "m1"} (:privkey-bytes alice)))
+            st2 (:state (light-core/handle-command st1 {"cmd" "send" "session_id" session-id "text" "m2"} (:privkey-bytes alice)))
+            st3 (:state (light-core/handle-command st2 {"cmd" "send" "session_id" session-id "text" "m3"} (:privkey-bytes alice)))
+            st4 (:state (light-core/handle-command st3 {"cmd" "send" "session_id" session-id "text" "m4"} (:privkey-bytes alice)))
+            sess4 (get-in st4 [:sessions session-id])
+            status-res (light-core/handle-command st4 {"cmd" "status"} (:privkey-bytes alice))
+            sess-summary (first (filter #(= session-id (:session-id %)) (get-in status-res [:response "sessions"])))]
+        (is (= 4 (:tx-seq sess4)))
+        (is (= [3 4] (:outbox-order sess4)))
+        (is (= #{3 4} (set (keys (:outbox sess4)))))
+        (is (= 2 (:outbox-evicted sess4)))
+        (is (= 2 (:outbox-evicted sess-summary)))
+        (is (= 2 (:unacked-count sess-summary)))))))

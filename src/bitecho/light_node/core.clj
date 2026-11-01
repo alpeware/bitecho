@@ -188,11 +188,20 @@
      :stdout-events []}))
 
 (defn- exec-accept [state cmd-map privkey-bytes]
-  (let [session-id (get cmd-map "session_id")
-        offer (get-in state [:pending-offers session-id])]
-    (if-not offer
+  (let [session-id (get cmd-map "session_id")]
+    (cond
+      (contains? (:sessions state) session-id)
+      {:state (update state :pending-offers dissoc session-id)
+       :response {"ok" false "error" "session-already-exists"}
+       :net-envelopes []
+       :stdout-events []}
+
+      (not (get-in state [:pending-offers session-id]))
       {:state state :response {"ok" false "error" "offer-not-found"} :net-envelopes [] :stdout-events []}
-      (let [caller (:caller offer)
+
+      :else
+      (let [offer (get-in state [:pending-offers session-id])
+            caller (:caller offer)
             kp-resp (sealed/generate-x25519-keypair)
             caller-eph (basalt/hex->bytes (:caller-ephemeral-pub offer))
             shared-sec (sealed/x25519-shared-secret (:private kp-resp) caller-eph)
@@ -235,6 +244,7 @@
                            :rx-high-seq 0
                            :contiguous-rx-seq 0
                            :replays-deduped 0
+                           :outbox-evicted 0
                            :outbox {}
                            :outbox-order []
                            :epoch epoch
@@ -277,17 +287,19 @@
             curr-order (or (:outbox-order session) [])
             next-order (conj curr-order seq-num)
             next-outbox (assoc curr-outbox seq-num {:seq seq-num :msg-payload msg-payload :burn burn-amt})
-            [final-outbox final-order] (if (> (count next-order) max-outbox)
-                                         (let [overflow (- (count next-order) max-outbox)
-                                               evicted (subvec next-order 0 overflow)
-                                               kept (subvec next-order overflow)]
-                                           [(apply dissoc next-outbox evicted) kept])
-                                         [next-outbox next-order])
-            new-state (-> state
-                          (assoc-in [:sessions session-id :tx-seq] seq-num)
-                          (assoc-in [:sessions session-id :outbox] final-outbox)
-                          (assoc-in [:sessions session-id :outbox-order] final-order)
-                          (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
+            [final-outbox final-order overflow] (if (> (count next-order) max-outbox)
+                                                  (let [overflow (- (count next-order) max-outbox)
+                                                        evicted (subvec next-order 0 overflow)
+                                                        kept (subvec next-order overflow)]
+                                                    [(apply dissoc next-outbox evicted) kept overflow])
+                                                  [next-outbox next-order 0])
+            new-state (cond-> (-> state
+                                  (assoc-in [:sessions session-id :tx-seq] seq-num)
+                                  (assoc-in [:sessions session-id :outbox] final-outbox)
+                                  (assoc-in [:sessions session-id :outbox-order] final-order)
+                                  (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
+                        (pos? overflow)
+                        (update-in [:sessions session-id :outbox-evicted] (fnil + 0) overflow))]
         {:state new-state
          :response {"ok" true
                     "session_id" session-id
@@ -355,7 +367,7 @@
 
 (defn- exec-status [state]
   (let [sessions-summary (vec (for [[_ s] (:sessions state)]
-                                (-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped])
+                                (-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped :outbox-evicted])
                                     (assoc :unacked-count (count (:outbox s))))))]
     {:state state
      :response (cond-> {"ok" true
@@ -434,28 +446,47 @@
                           (crypto/verify caller-pub (.getBytes ^String (:offer-hash msg) "UTF-8") sig-bytes))]
       (if-not valid-sig?
         {:state state :net-envelopes [] :stdout-events []}
-        (if (:autonomous? state)
-          (let [accept-res (exec-accept (assoc-in state [:pending-offers (:session-id msg)] msg)
-                                        {"session_id" (:session-id msg)}
-                                        privkey-bytes)]
-            {:state (:state accept-res)
-             :net-envelopes (:net-envelopes accept-res)
-             :stdout-events (:stdout-events accept-res)})
-          (let [event {"event" "offer-received"
-                       "session_id" (:session-id msg)
-                       "caller" (:caller msg)
-                       "price" (:price msg)}]
-            {:state (assoc-in state [:pending-offers (:session-id msg)] msg)
-             :net-envelopes []
-             :stdout-events [event]}))))))
+        (let [sid (:session-id msg)]
+          (cond
+            (contains? (:sessions state) sid)
+            (let [new-state (update-in state [:sessions sid :replays-deduped] (fnil inc 0))]
+              {:state new-state :net-envelopes [] :stdout-events []})
+
+            (contains? (:pending-offers state) sid)
+            {:state state :net-envelopes [] :stdout-events []}
+
+            (:autonomous? state)
+            (let [accept-res (exec-accept (assoc-in state [:pending-offers sid] msg)
+                                          {"session_id" sid}
+                                          privkey-bytes)]
+              {:state (:state accept-res)
+               :net-envelopes (:net-envelopes accept-res)
+               :stdout-events (:stdout-events accept-res)})
+
+            :else
+            (let [event {"event" "offer-received"
+                         "session_id" sid
+                         "caller" (:caller msg)
+                         "price" (:price msg)}]
+              {:state (assoc-in state [:pending-offers sid] msg)
+               :net-envelopes []
+               :stdout-events [event]})))))))
 
 (defn- handle-wire-accept [state msg]
   (if-not (= (:caller msg) (:pubkey state))
     {:state state :net-envelopes [] :stdout-events []}
     (let [session-id (:session-id msg)
           session (get-in state [:sessions session-id])]
-      (if-not (and session (= "offered" (:state session)))
+      (cond
+        (and session (= "open" (:state session)))
+        {:state (update-in state [:sessions session-id :replays-deduped] (fnil inc 0))
+         :net-envelopes []
+         :stdout-events []}
+
+        (not (and session (= "offered" (:state session))))
         {:state state :net-envelopes [] :stdout-events []}
+
+        :else
         (let [callee-pub (try (basalt/hex->bytes (:callee msg)) (catch Exception _ nil))
               sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
               valid-ack? (rendezvous/verify-delivery-ack (:delivery-ack msg) (:callee msg))
@@ -475,6 +506,7 @@
                                           :rx-high-seq 0
                                           :contiguous-rx-seq 0
                                           :replays-deduped 0
+                                          :outbox-evicted 0
                                           :outbox {}
                                           :outbox-order []
                                           :tx-key (:tx-key keys)
@@ -597,11 +629,9 @@
               ack-seq (long (or (:ack-seq msg) 0))
               acked-seq (long (or (:acked-seq msg) 0))
               seen-vec (vec (sort (or (:seen-seqs msg) [])))
-              data-bytes (.getBytes (str "ack-" session-id "-" ack-seq "-" acked-seq "-" (str/join "," seen-vec)) "UTF-8")
-              legacy-bytes (.getBytes (str "ack-" session-id "-" ack-seq "-" acked-seq) "UTF-8")
+              canonical-bytes (.getBytes (str "ack-" session-id "-" ack-seq "-" acked-seq "-" (str/join "," seen-vec)) "UTF-8")
               valid-sig? (and peer-pub sig-bytes
-                              (or (crypto/verify peer-pub data-bytes sig-bytes)
-                                  (crypto/verify peer-pub legacy-bytes sig-bytes)))]
+                              (crypto/verify peer-pub canonical-bytes sig-bytes))]
           (if-not valid-sig?
             {:state state :net-envelopes [] :stdout-events []}
             (let [new-acked-seq (max (long (:acked-seq session 0)) ack-seq)

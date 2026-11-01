@@ -554,15 +554,45 @@
                           TimeUnit/MILLISECONDS)
     executor))
 
+(defn- extract-gossip-msg-id
+  "Extracts or computes a deterministic message ID from a frozen or thawed gossip event/envelope."
+  [evt-or-bytes]
+  (let [thawed (cond
+                 (bytes? evt-or-bytes) (try (nippy/thaw evt-or-bytes) (catch Exception _ nil))
+                 (map? evt-or-bytes) evt-or-bytes
+                 :else nil)
+        msg (cond
+              (map? (:message thawed)) (:message thawed)
+              (and (map? (:event thawed)) (map? (:message (:event thawed)))) (:message (:event thawed))
+              :else nil)]
+    (or (:message-id msg)
+        (:message_id msg)
+        (when-let [p (:payload msg)]
+          (let [b (cond
+                    (bytes? p) p
+                    (string? p) (.getBytes ^String p StandardCharsets/UTF_8)
+                    :else (try (nippy/freeze p) (catch Exception _ nil)))]
+            (when b
+              (basalt/bytes->hex (crypto/sha256 b)))))
+        (when (bytes? evt-or-bytes)
+          (basalt/bytes->hex (crypto/sha256 evt-or-bytes))))))
+
 (defn- forward-gossip-to-agents!
-  "Forwards a frozen gossip network event to all connected agent DataChannels, optionally excluding a sender."
+  "Forwards a frozen gossip network event to all connected agent DataChannels, optionally excluding a sender.
+   Deduplicates messages per agent connection using :sent-msg-ids atom."
   [agent-conns frozen-evt exclude-sender]
   (when agent-conns
-    (doseq [[pk conn] @agent-conns
-            :when (not= pk exclude-sender)]
-      (when-let [cid (or @(:channel-id conn) 0)]
-        (try (api/send! (:node conn) frozen-evt cid)
-             (catch Exception _ nil))))))
+    (let [msg-id (extract-gossip-msg-id frozen-evt)]
+      (doseq [[pk conn] @agent-conns
+              :when (not= pk exclude-sender)]
+        (let [sent-ids-atom (:sent-msg-ids conn)]
+          (when-not (and msg-id sent-ids-atom (contains? @sent-ids-atom msg-id))
+            (when-let [cid (or @(:channel-id conn) 0)]
+              (when (try (api/send! (:node conn) frozen-evt cid)
+                         true
+                         (catch Exception _ nil))
+                (when (and msg-id sent-ids-atom)
+                  (swap! sent-ids-atom conj msg-id))))))))))
 
 (defn- start-net-out-loop!
   "Consumes net-out commands, transforms them to peer events, and delivers to targets."
@@ -694,6 +724,7 @@
                        (reset! agent-sender anon-key)
                        (swap! agent-conns assoc anon-key {:node agent-node
                                                           :channel-id channel-id
+                                                          :sent-msg-ids replayed-msg-ids
                                                           :last-rx-at (atom (System/currentTimeMillis))}))))
         :on-data-channel (fn [evt]
                            (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
@@ -714,6 +745,7 @@
                                              (dissoc old-key)
                                              (assoc sender {:node agent-node
                                                             :channel-id channel-id
+                                                            :sent-msg-ids replayed-msg-ids
                                                             :last-rx-at (atom (System/currentTimeMillis))}))))
                     (when-let [cid (or @channel-id 0)]
                       (replay-cached-gossip-to-agent! shell-node agent-node cid replayed-msg-ids))))))

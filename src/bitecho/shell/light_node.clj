@@ -365,6 +365,15 @@
                            (push-diagnostic diag-eff))]
           [new-conn effects])
 
+        :persist-failed
+        (let [err (or (:error event) "persist-failed")
+              diag-eff {:effect :diagnose :reason :persist-failed :error err}
+              new-conn (-> conn
+                           (assoc :last-error err
+                                  :dropped (inc (long (:dropped conn 0))))
+                           (push-diagnostic diag-eff))]
+          [new-conn [diag-eff]])
+
         :shutdown
         (let [node-to-close (:node conn)
               effects (if node-to-close
@@ -535,7 +544,15 @@
                                  res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
                              (reset! state-atom (:state res))
                              (when (and state-file (not= st (:state res)))
-                               (try (save-light-state! state-file (:state res)) (catch Exception _ nil)))
+                               (try
+                                 (save-light-state! state-file (:state res))
+                                 (catch Exception e
+                                   (when conn-atom
+                                     (apply-conn-event! conn-atom
+                                                        {:type :persist-failed
+                                                         :error (or (.getMessage e) "persist-failed")}
+                                                        cb-opts)
+                                     (sync-conn-diagnostics! state-atom conn-atom)))))
                              (when (and event-out (seq (:stdout-events res)))
                                (doseq [ev (:stdout-events res)]
                                  (event-out ev)))
