@@ -2316,4 +2316,94 @@
                        (= 1 (count inbox))
                        (= text (:text (first inbox)))))))
 
+(deftest test-flag-c-compute-offer-hash-exact-format
+  (testing "Flag C: compute-offer-hash reproduces exact 2d21308 base format (session-id-caller-callee-eph-epoch-price-homenode) with optional |<dac-id>"
+    (let [no-dac {:session-id "s1"
+                  :caller "c1"
+                  :callee "c2"
+                  :caller-ephemeral-pub "eph1"
+                  :epoch 5
+                  :price 10
+                  :home-node "node1"}
+          with-dac (assoc no-dac :dac {:dac-id "d1"})
+          expected-no-dac (basalt/bytes->hex (crypto/sha256 (.getBytes "s1-c1-c2-eph1-5-10-node1" "UTF-8")))
+          expected-with-dac (basalt/bytes->hex (crypto/sha256 (.getBytes "s1-c1-c2-eph1-5-10-node1|d1" "UTF-8")))]
+      (is (= expected-no-dac (light-core/compute-offer-hash no-dac)))
+      (is (= expected-with-dac (light-core/compute-offer-hash with-dac))))))
+
+(deftest test-flag-d-string-typed-numerics-and-rejection
+  (testing "Flag D: string-typed numbers succeed, and unparseable/negative strings fail closed without ClassCastException"
+    (let [agent-id (test-identity)
+          _agent-pub (:pubkey-hex agent-id)
+          agent-priv (:privkey-bytes agent-id)
+          peer-id (test-identity)
+          peer-pub (:pubkey-hex peer-id)
+          st (light-core/init-light-state (:identity agent-id) {:epoch 10})]
+
+      ;; 1. rendezvous-policy with string integers succeeds
+      (let [res (light-core/handle-command st {"cmd" "rendezvous-policy"
+                                               "min_burn" "100"
+                                               "price" "20"}
+                                           agent-priv)]
+        (is (= true (get-in res [:response "ok"])))
+        (is (= 100 (get-in res [:response "rendezvous_policy" "min_burn"])))
+        (is (= 20 (get-in res [:response "rendezvous_policy" "price"]))))
+
+      ;; 2. rendezvous-policy with invalid non-numeric strings returns error cleanly
+      (let [res-bad-burn (light-core/handle-command st {"cmd" "rendezvous-policy" "min_burn" "not-a-number"} agent-priv)
+            res-bad-price (light-core/handle-command st {"cmd" "rendezvous-policy" "price" "invalid"} agent-priv)
+            res-neg-burn (light-core/handle-command st {"cmd" "rendezvous-policy" "min_burn" -5} agent-priv)]
+        (is (= false (get-in res-bad-burn [:response "ok"])))
+        (is (= "invalid-policy-numeric" (get-in res-bad-burn [:response "error"])))
+        (is (= false (get-in res-bad-price [:response "ok"])))
+        (is (= "invalid-policy-numeric" (get-in res-bad-price [:response "error"])))
+        (is (= false (get-in res-neg-burn [:response "ok"])))
+        (is (= "invalid-policy-numeric" (get-in res-neg-burn [:response "error"]))))
+
+      ;; 3. rendezvous-offer with string burn succeeds
+      (let [res-ok (light-core/handle-command st {"cmd" "rendezvous-offer"
+                                                  "callee" peer-pub
+                                                  "burn" "500"}
+                                              agent-priv)]
+        (is (= true (get-in res-ok [:response "ok"])))
+        (is (= 500 (get-in res-ok [:response "burn"]))))
+
+      ;; 4. rendezvous-offer with invalid non-numeric burn returns error cleanly
+      (let [res-bad (light-core/handle-command st {"cmd" "rendezvous-offer"
+                                                   "callee" peer-pub
+                                                   "burn" "bad-burn"}
+                                               agent-priv)
+            res-neg (light-core/handle-command st {"cmd" "rendezvous-offer"
+                                                   "callee" peer-pub
+                                                   "burn" -10}
+                                               agent-priv)]
+        (is (= false (get-in res-bad [:response "ok"])))
+        (is (= "invalid-burn" (get-in res-bad [:response "error"])))
+        (is (= false (get-in res-neg [:response "ok"])))
+        (is (= "invalid-burn" (get-in res-neg [:response "error"]))))
+
+      ;; 5. offer with string price and burn succeeds
+      (let [res-offer-ok (light-core/handle-command st {"cmd" "offer"
+                                                        "callee" peer-pub
+                                                        "price" "10"
+                                                        "burn" "500"}
+                                                    agent-priv)]
+        (is (= true (get-in res-offer-ok [:response "ok"])))
+        (is (= 10 (get-in res-offer-ok [:response "price"])))
+        (is (= 500 (get-in res-offer-ok [:response "burn"]))))
+
+      ;; 6. offer with invalid non-numeric price or burn returns error cleanly
+      (let [res-offer-bad (light-core/handle-command st {"cmd" "offer"
+                                                         "callee" peer-pub
+                                                         "price" "bad-price"}
+                                                     agent-priv)
+            res-offer-neg (light-core/handle-command st {"cmd" "offer"
+                                                         "callee" peer-pub
+                                                         "price" -50}
+                                                     agent-priv)]
+        (is (= false (get-in res-offer-bad [:response "ok"])))
+        (is (= "invalid-numeric-parameter" (get-in res-offer-bad [:response "error"])))
+        (is (= false (get-in res-offer-neg [:response "ok"])))
+        (is (= "invalid-numeric-parameter" (get-in res-offer-neg [:response "error"])))))))
+
 

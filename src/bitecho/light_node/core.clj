@@ -704,13 +704,14 @@
          :stdout-events []}))))
 
 (defn- parse-long-safe
-  "Parses a number or string into a long safely. Returns default-val on failure or nil."
-  [v default-val]
-  (cond
-    (integer? v) (long v)
-    (number? v) (long v)
-    (string? v) (try (Long/parseLong (str/trim v)) (catch Exception _ default-val))
-    :else default-val))
+  "Parses a number or string into a long safely. Returns default-val (default nil) on failure or nil."
+  ([v] (parse-long-safe v nil))
+  ([v default-val]
+   (cond
+     (integer? v) (long v)
+     (number? v) (long v)
+     (string? v) (try (Long/parseLong (str/trim v)) (catch Exception _ default-val))
+     :else default-val)))
 
 (defn compute-session-id
   "Computes deterministic session-id from caller, callee, and caller-ephemeral-pub."
@@ -720,16 +721,29 @@
 
 (defn compute-offer-hash
   "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, home-node, and optional DAC.
-   Uses (str caller \"-\" callee \"-\" caller-x25519 \"-\" epoch \"-\" burn (when (and (string? dac-id) (not (str/blank? dac-id))) (str \"|\" dac-id)))."
+   Recreates the exact 2d21308 base format (session-id-caller-callee-eph-epoch-price-homenode)
+   with optional |<dac-id> appended when DAC is present."
   [offer-map]
   (let [caller (str (or (:caller offer-map) (get offer-map "caller") ""))
         callee (str (or (:callee offer-map) (get offer-map "callee") ""))
-        caller-x25519 (str (or (:caller-ephemeral-pub offer-map) (get offer-map "caller_ephemeral_pub") (get offer-map "caller-ephemeral-pub") ""))
+        eph-pub (str (or (:caller-ephemeral-pub offer-map) (get offer-map "caller_ephemeral_pub") (get offer-map "caller-ephemeral-pub")
+                         (:caller-x25519 offer-map) (get offer-map "caller_x25519") (get offer-map "caller-x25519") ""))
+        sid (str (or (:session-id offer-map) (get offer-map "session_id") (get offer-map "session-id")
+                     (when (and (seq caller) (seq callee) (seq eph-pub))
+                       (compute-session-id caller callee eph-pub))
+                     ""))
         epoch (parse-long-safe (or (:epoch offer-map) (get offer-map "epoch")) 0)
-        burn (parse-long-safe (or (:price offer-map) (get offer-map "price") (:burn offer-map) (get offer-map "burn")) 0)
+        price-or-burn (parse-long-safe (or (:price offer-map) (get offer-map "price")
+                                           (:burn offer-map) (get offer-map "burn")) 0)
+        home-node (or (:home-node offer-map) (get offer-map "home_node") (get offer-map "home-node") "")
+        hn-str (cond
+                 (string? home-node) home-node
+                 (or (keyword? home-node) (symbol? home-node)) (name home-node)
+                 :else (str (or home-node "")))
         dac (or (:dac offer-map) (get offer-map "dac"))
-        dac-id (when dac (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id") (:dac_id dac)))
-        hash-input (str caller "-" callee "-" caller-x25519 "-" epoch "-" burn
+        dac-id (or (:dac-id offer-map) (get offer-map "dac_id") (get offer-map "dac-id")
+                   (when dac (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id") (:dac_id dac))))
+        hash-input (str sid "-" caller "-" callee "-" eph-pub "-" epoch "-" price-or-burn "-" hn-str
                         (when (and (string? dac-id) (not (str/blank? dac-id)))
                           (str "|" dac-id)))]
     (basalt/bytes->hex (crypto/sha256 (.getBytes ^String hash-input "UTF-8")))))
@@ -761,51 +775,57 @@
   [state cmd-map]
   (let [curr-pol (or (:rendezvous-policy state)
                      {:auto-accept? false :min-burn 0 :price 10 :allowlist #{} :home-node "default-home"})
-        min-burn-val (let [mb (or (get cmd-map "min_burn") (get cmd-map "min-burn")
-                                  (:min_burn cmd-map) (:min-burn cmd-map))]
-                       (when (some? mb) (long mb)))
-        price-val (let [p (or (get cmd-map "price") (:price cmd-map))]
-                    (when (some? p) (long p)))
-        allowlist-raw (or (get cmd-map "allowlist") (:allowlist cmd-map))
-        allowlist-resolved (when (some? allowlist-raw)
-                             (let [items (cond (sequential? allowlist-raw) allowlist-raw
-                                               (set? allowlist-raw) (vec allowlist-raw)
-                                               (string? allowlist-raw) (str/split allowlist-raw #",")
-                                               :else [])]
-                               (into #{}
-                                     (keep (fn [item]
-                                             (let [s (str/trim (str item))]
-                                               (when (seq s)
-                                                 (let [res (resolve-counterparty state s)]
-                                                   (if (:ok? res)
-                                                     (:pubkey res)
-                                                     (normalize-pubkey-hex s))))))
-                                           items))))
-        home-node-val (let [hn (or (get cmd-map "home_node") (get cmd-map "home-node")
-                                   (:home_node cmd-map) (:home-node cmd-map))]
-                        (when (some? hn)
-                          (if (keyword? hn) (name hn) (str hn))))
-        auto-accept-val (let [aa (or (get cmd-map "auto_accept") (get cmd-map "auto-accept")
-                                     (get cmd-map "auto_accept?") (get cmd-map "auto-accept?")
-                                     (:auto_accept cmd-map) (:auto-accept cmd-map)
-                                     (:auto_accept? cmd-map) (:auto-accept? cmd-map))]
-                          (when (some? aa) (boolean aa)))
-        updated-pol (cond-> curr-pol
-                      (some? min-burn-val) (assoc :min-burn min-burn-val)
-                      (some? price-val) (assoc :price price-val)
-                      (some? allowlist-resolved) (assoc :allowlist allowlist-resolved)
-                      (some? home-node-val) (assoc :home-node home-node-val)
-                      (some? auto-accept-val) (assoc :auto-accept? auto-accept-val))
-        new-state (assoc state :rendezvous-policy updated-pol)]
-    {:state new-state
-     :response {"ok" true
-                "rendezvous_policy" {"min_burn" (:min-burn updated-pol)
-                                     "price" (:price updated-pol)
-                                     "allowlist" (vec (sort (:allowlist updated-pol #{})))
-                                     "home_node" (:home-node updated-pol)
-                                     "auto_accept" (:auto-accept? updated-pol)}}
-     :net-envelopes []
-     :stdout-events []}))
+        raw-min-burn (or (get cmd-map "min_burn") (get cmd-map "min-burn")
+                         (:min_burn cmd-map) (:min-burn cmd-map))
+        raw-price (or (get cmd-map "price") (:price cmd-map))
+        min-burn-val (when (some? raw-min-burn) (parse-long-safe raw-min-burn :invalid))
+        price-val (when (some? raw-price) (parse-long-safe raw-price :invalid))]
+    (if (or (and (some? raw-min-burn) (or (= min-burn-val :invalid) (< min-burn-val 0)))
+            (and (some? raw-price) (or (= price-val :invalid) (< price-val 0))))
+      {:state state
+       :response {"ok" false "error" "invalid-policy-numeric"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [allowlist-raw (or (get cmd-map "allowlist") (:allowlist cmd-map))
+            allowlist-resolved (when (some? allowlist-raw)
+                                 (let [items (cond (sequential? allowlist-raw) allowlist-raw
+                                                   (set? allowlist-raw) (vec allowlist-raw)
+                                                   (string? allowlist-raw) (str/split allowlist-raw #",")
+                                                   :else [])]
+                                   (into #{}
+                                         (keep (fn [item]
+                                                 (let [s (str/trim (str item))]
+                                                   (when (seq s)
+                                                     (let [res (resolve-counterparty state s)]
+                                                       (if (:ok? res)
+                                                         (:pubkey res)
+                                                         (normalize-pubkey-hex s))))))
+                                               items))))
+            home-node-val (let [hn (or (get cmd-map "home_node") (get cmd-map "home-node")
+                                       (:home_node cmd-map) (:home-node cmd-map))]
+                            (when (some? hn)
+                              (if (keyword? hn) (name hn) (str hn))))
+            auto-accept-val (let [aa (or (get cmd-map "auto_accept") (get cmd-map "auto-accept")
+                                         (get cmd-map "auto_accept?") (get cmd-map "auto-accept?")
+                                         (:auto_accept cmd-map) (:auto-accept cmd-map)
+                                         (:auto_accept? cmd-map) (:auto-accept? cmd-map))]
+                              (when (some? aa) (boolean aa)))
+            updated-pol (cond-> curr-pol
+                          (some? min-burn-val) (assoc :min-burn min-burn-val)
+                          (some? price-val) (assoc :price price-val)
+                          (some? allowlist-resolved) (assoc :allowlist allowlist-resolved)
+                          (some? home-node-val) (assoc :home-node home-node-val)
+                          (some? auto-accept-val) (assoc :auto-accept? auto-accept-val))
+            new-state (assoc state :rendezvous-policy updated-pol)]
+        {:state new-state
+         :response {"ok" true
+                    "rendezvous_policy" {"min_burn" (:min-burn updated-pol)
+                                         "price" (:price updated-pol)
+                                         "allowlist" (vec (sort (:allowlist updated-pol #{})))
+                                         "home_node" (:home-node updated-pol)
+                                         "auto_accept" (:auto-accept? updated-pol)}}
+         :net-envelopes []
+         :stdout-events []}))))
 
 (defn- exec-rendezvous-offer
   "Phase 1 introduction: Caller initiates two-phase rendezvous offer header,
@@ -819,76 +839,83 @@
        :response {"ok" false "error" (:error resolved)}
        :net-envelopes []
        :stdout-events []}
-      (let [callee (:pubkey resolved)
-            pname (:petname resolved)
-            burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) 500))
-            topic (str (or (get cmd-map "topic") (:topic cmd-map) ""))
-            default-home (or (first (keys (get-in state [:bootstrap :nodes]))) :node1)
-            home-node (name (or (get cmd-map "home_node") (get cmd-map "home-node")
-                                (:home_node cmd-map) (:home-node cmd-map)
-                                default-home))
-            text (or (get cmd-map "text") (:text cmd-map))
-            caller (:pubkey state)
-            kp-eph (sealed/generate-x25519-keypair)
-            caller-x25519-pub (basalt/bytes->hex (:public kp-eph))
-            session-id (compute-session-id caller callee caller-x25519-pub)
-            epoch (:epoch state)
-            active-dac (when-let [d (:dac state)]
-                         (when (and (:ok? (verify-dac d {:expected-agent-pubkey caller
-                                                         :current-epoch epoch
-                                                         :revoked-dac-ids (:revoked-dacs state)}))
-                                    (let [sc (set (map name (:scopes d)))]
-                                      (or (contains? sc "offer") (contains? sc "rendezvous"))))
-                           d))
-            dac-id (when active-dac (or (:dac-id active-dac) (get active-dac "dac_id")))
-            offer-hash (compute-offer-hash {:session-id session-id
-                                            :caller caller
-                                            :callee callee
-                                            :caller-ephemeral-pub caller-x25519-pub
-                                            :epoch epoch
-                                            :price burn-amt
-                                            :burn burn-amt
-                                            :home-node home-node
-                                            :dac active-dac})
-            header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id)
-            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes header-str "UTF-8")))
-            wire-payload (cond-> {:bitecho/type :rendezvous-offer-header
-                                  :type :rendezvous-offer-header
-                                  :caller caller
-                                  :callee callee
-                                  :offer-hash offer-hash
-                                  :epoch epoch
-                                  :burn burn-amt
-                                  :topic topic
-                                  :home-node home-node
-                                  :signature sig-hex}
-                           active-dac (assoc :dac active-dac))
-            gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze wire-payload) burn-amt)
-            outbound-entry {:offer-hash offer-hash
-                            :session-id session-id
-                            :caller caller
-                            :callee callee
-                            :caller-x25519-priv (:private kp-eph)
-                            :caller-x25519-pub caller-x25519-pub
-                            :initial-text text
-                            :epoch epoch
-                            :burn burn-amt
-                            :topic topic
-                            :home-node home-node
-                            :dac active-dac}
-            new-state (-> state
-                          (assoc-in [:outbound-rendezvous offer-hash] outbound-entry)
-                          (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
-        {:state new-state
-         :response (cond-> {"ok" true
-                            "offer_hash" offer-hash
-                            "session_id" session-id
-                            "caller" caller
-                            "callee" callee
-                            "burn" burn-amt}
-                     pname (assoc "callee_petname" pname "peer_petname" pname))
-         :net-envelopes [gossip-env]
-         :stdout-events []}))))
+      (let [raw-burn (or (get cmd-map "burn") (:burn cmd-map))
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) 500)]
+        (if (or (= parsed-burn :invalid) (< parsed-burn 0))
+          {:state state
+           :response {"ok" false "error" "invalid-burn"}
+           :net-envelopes []
+           :stdout-events []}
+          (let [callee (:pubkey resolved)
+                pname (:petname resolved)
+                burn-amt parsed-burn
+                topic (str (or (get cmd-map "topic") (:topic cmd-map) ""))
+                default-home (or (first (keys (get-in state [:bootstrap :nodes]))) :node1)
+                home-node (name (or (get cmd-map "home_node") (get cmd-map "home-node")
+                                    (:home_node cmd-map) (:home-node cmd-map)
+                                    default-home))
+                text (or (get cmd-map "text") (:text cmd-map))
+                caller (:pubkey state)
+                kp-eph (sealed/generate-x25519-keypair)
+                caller-x25519-pub (basalt/bytes->hex (:public kp-eph))
+                session-id (compute-session-id caller callee caller-x25519-pub)
+                epoch (:epoch state)
+                active-dac (when-let [d (:dac state)]
+                             (when (and (:ok? (verify-dac d {:expected-agent-pubkey caller
+                                                             :current-epoch epoch
+                                                             :revoked-dac-ids (:revoked-dacs state)}))
+                                        (let [sc (set (map name (:scopes d)))]
+                                          (or (contains? sc "offer") (contains? sc "rendezvous"))))
+                               d))
+                dac-id (when active-dac (or (:dac-id active-dac) (get active-dac "dac_id")))
+                offer-hash (compute-offer-hash {:session-id session-id
+                                                :caller caller
+                                                :callee callee
+                                                :caller-ephemeral-pub caller-x25519-pub
+                                                :epoch epoch
+                                                :price burn-amt
+                                                :burn burn-amt
+                                                :home-node home-node
+                                                :dac active-dac})
+                header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id)
+                sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes header-str "UTF-8")))
+                wire-payload (cond-> {:bitecho/type :rendezvous-offer-header
+                                      :type :rendezvous-offer-header
+                                      :caller caller
+                                      :callee callee
+                                      :offer-hash offer-hash
+                                      :epoch epoch
+                                      :burn burn-amt
+                                      :topic topic
+                                      :home-node home-node
+                                      :signature sig-hex}
+                               active-dac (assoc :dac active-dac))
+                gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze wire-payload) burn-amt)
+                outbound-entry {:offer-hash offer-hash
+                                :session-id session-id
+                                :caller caller
+                                :callee callee
+                                :caller-x25519-priv (:private kp-eph)
+                                :caller-x25519-pub caller-x25519-pub
+                                :initial-text text
+                                :epoch epoch
+                                :burn burn-amt
+                                :topic topic
+                                :home-node home-node
+                                :dac active-dac}
+                new-state (-> state
+                              (assoc-in [:outbound-rendezvous offer-hash] outbound-entry)
+                              (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
+            {:state new-state
+             :response (cond-> {"ok" true
+                                "offer_hash" offer-hash
+                                "session_id" session-id
+                                "caller" caller
+                                "callee" callee
+                                "burn" burn-amt}
+                         pname (assoc "callee_petname" pname "peer_petname" pname))
+             :net-envelopes [gossip-env]
+             :stdout-events []}))))))
 
 (defn- callee-issue-rendezvous-ack
   "Pure helper for Callee accepting an offer header, signing a DeliveryAck voucher,
@@ -986,78 +1013,88 @@
        :response {"ok" false "error" (:error resolved)}
        :net-envelopes []
        :stdout-events []}
-      (let [callee (:pubkey resolved)
-            pname (:petname resolved)
-            price (long (or (get cmd-map "price") (:price cmd-map) 0))
-            default-home (or (first (keys (get-in state [:bootstrap :nodes]))) :node1)
-            home-node (name (or (get cmd-map "home_node") (:home_node cmd-map) default-home))
-            burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) 500))
-            kp-eph (sealed/generate-x25519-keypair)
-            caller (:pubkey state)
-            eph-pub-hex (basalt/bytes->hex (:public kp-eph))
-            session-id (compute-session-id caller callee eph-pub-hex)
-            epoch (:epoch state)
-            active-dac (when-let [d (:dac state)]
-                         (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
-                                                    :current-epoch epoch
-                                                    :revoked-dac-ids (:revoked-dacs state)
-                                                    :required-scope "offer"}))
-                           d))
-            offer-hash (compute-offer-hash {:session-id session-id
-                                            :caller caller
-                                            :callee callee
-                                            :caller-ephemeral-pub eph-pub-hex
-                                            :epoch epoch
-                                            :price price
-                                            :home-node home-node
-                                            :dac active-dac})
-            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
-            offer-payload (cond-> {:bitecho/type :channel-offer
-                                   :session-id session-id
-                                   :caller caller
-                                   :callee callee
-                                   :caller-ephemeral-pub eph-pub-hex
-                                   :epoch epoch
-                                   :price price
-                                   :home-node home-node
-                                   :offer-hash offer-hash
-                                   :burn burn-amt
-                                   :signature sig-hex}
-                            active-dac (assoc :dac active-dac))
-            gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze offer-payload) burn-amt)
-            header-event {:type :receive-offer-header
-                          :caller caller
-                          :callee callee
-                          :home-node home-node
-                          :epoch epoch
-                          :price price
-                          :offer-hash offer-hash
-                          :session-id session-id}
-            header-env (mesh/wrap-agent-event header-event caller privkey-bytes)
-            session-entry {:session-id session-id
-                           :peer callee
-                           :role :initiator
-                           :state "offered"
-                           :tx-seq 0
-                           :epoch epoch
-                           :ephemeral-pub (:public kp-eph)
-                           :ephemeral-priv (:private kp-eph)
-                           :price price
-                           :home-node home-node
-                           :offer-hash offer-hash}
-            new-state (-> state
-                          (assoc-in [:sessions session-id] session-entry)
-                          (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
-        {:state new-state
-         :response (cond-> {"ok" true
-                            "session_id" session-id
-                            "state" "offered"
-                            "callee" callee
-                            "price" price
-                            "burn" burn-amt}
-                     pname (assoc "callee_petname" pname "peer_petname" pname))
-         :net-envelopes [header-env gossip-env]
-         :stdout-events []}))))
+      (let [raw-price (or (get cmd-map "price") (:price cmd-map))
+            raw-burn (or (get cmd-map "burn") (:burn cmd-map))
+            parsed-price (if (some? raw-price) (parse-long-safe raw-price :invalid) 0)
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) 500)]
+        (if (or (= parsed-price :invalid) (< parsed-price 0)
+                (= parsed-burn :invalid) (< parsed-burn 0))
+          {:state state
+           :response {"ok" false "error" "invalid-numeric-parameter"}
+           :net-envelopes []
+           :stdout-events []}
+          (let [callee (:pubkey resolved)
+                pname (:petname resolved)
+                price parsed-price
+                default-home (or (first (keys (get-in state [:bootstrap :nodes]))) :node1)
+                home-node (name (or (get cmd-map "home_node") (:home_node cmd-map) default-home))
+                burn-amt parsed-burn
+                kp-eph (sealed/generate-x25519-keypair)
+                caller (:pubkey state)
+                eph-pub-hex (basalt/bytes->hex (:public kp-eph))
+                session-id (compute-session-id caller callee eph-pub-hex)
+                epoch (:epoch state)
+                active-dac (when-let [d (:dac state)]
+                             (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
+                                                        :current-epoch epoch
+                                                        :revoked-dac-ids (:revoked-dacs state)
+                                                        :required-scope "offer"}))
+                               d))
+                offer-hash (compute-offer-hash {:session-id session-id
+                                                :caller caller
+                                                :callee callee
+                                                :caller-ephemeral-pub eph-pub-hex
+                                                :epoch epoch
+                                                :price price
+                                                :home-node home-node
+                                                :dac active-dac})
+                sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
+                offer-payload (cond-> {:bitecho/type :channel-offer
+                                       :session-id session-id
+                                       :caller caller
+                                       :callee callee
+                                       :caller-ephemeral-pub eph-pub-hex
+                                       :epoch epoch
+                                       :price price
+                                       :home-node home-node
+                                       :offer-hash offer-hash
+                                       :burn burn-amt
+                                       :signature sig-hex}
+                                active-dac (assoc :dac active-dac))
+                gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze offer-payload) burn-amt)
+                header-event {:type :receive-offer-header
+                              :caller caller
+                              :callee callee
+                              :home-node home-node
+                              :epoch epoch
+                              :price price
+                              :offer-hash offer-hash
+                              :session-id session-id}
+                header-env (mesh/wrap-agent-event header-event caller privkey-bytes)
+                session-entry {:session-id session-id
+                               :peer callee
+                               :role :initiator
+                               :state "offered"
+                               :tx-seq 0
+                               :epoch epoch
+                               :ephemeral-pub (:public kp-eph)
+                               :ephemeral-priv (:private kp-eph)
+                               :price price
+                               :home-node home-node
+                               :offer-hash offer-hash}
+                new-state (-> state
+                              (assoc-in [:sessions session-id] session-entry)
+                              (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
+            {:state new-state
+             :response (cond-> {"ok" true
+                                "session_id" session-id
+                                "state" "offered"
+                                "callee" callee
+                                "price" price
+                                "burn" burn-amt}
+                         pname (assoc "callee_petname" pname "peer_petname" pname))
+             :net-envelopes [header-env gossip-env]
+             :stdout-events []}))))))
 
 (defn- exec-accept [state cmd-map privkey-bytes]
   (let [session-id (resolve-accept-session-id state cmd-map)]
@@ -1829,9 +1866,16 @@
             expected-sid (compute-session-id (:caller msg) (:callee msg) (:caller-ephemeral-pub msg))
             expected-hash-legacy (compute-offer-hash msg)
             expected-hash-sealed (sealed/offer-hash msg)
+            wire-dac (or (:dac msg) (get msg "dac"))
+            dac-id (or (:dac-id msg) (get msg "dac_id")
+                       (when wire-dac (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id"))))
+            burn-num (parse-long-safe (or (:price msg) (:burn msg)) 0)
+            epoch-num (parse-long-safe (:epoch msg) 0)
+            expected-hash-5field (basalt/bytes->hex (crypto/sha256 (.getBytes ^String (str (:caller msg) "-" (:callee msg) "-" (:caller-ephemeral-pub msg) "-" epoch-num "-" burn-num (when (and (string? dac-id) (not (str/blank? dac-id))) (str "|" dac-id))) "UTF-8")))
             valid-hashes? (and (= (:session-id msg) expected-sid)
                                (or (= (:offer-hash msg) expected-hash-legacy)
-                                   (= (:offer-hash msg) expected-hash-sealed)))
+                                   (= (:offer-hash msg) expected-hash-sealed)
+                                   (= (:offer-hash msg) expected-hash-5field)))
             valid-sig? (and valid-hashes?
                             caller-pub sig-bytes
                             (crypto/verify caller-pub (.getBytes ^String (:offer-hash msg) "UTF-8") sig-bytes))
