@@ -201,3 +201,14 @@ Full-node WebRTC DataChannel mesh connections (peer-to-peer full-mesh and agent 
    - HTTP endpoint `GET /connz` returns full structured EDN diagnostic summaries for all active peer and agent connections.
    - HTTP endpoint `GET /statusz` surfaces aggregate `conn_dropped` and `conn_stale` metrics alongside consensus and tokenomics telemetry.
 
+### H. Live Signed $ECHO Transfers, DeliveryAck Voucher Settlement & Protocol Settlement Take
+1. **Light-Node Account State & Economic Commands**:
+   - `account` & `sync-account`: Synchronizes on-chain balance, sequence (`seq`), causal dependencies (`deps`), and spendable balance via `fetch-validator-accountz!` from validator `/accountz` endpoints.
+   - `transfer`: Validates spendable balance, generates signed transfer gossiped to peers and wrapped in an authenticated `:on-deliver` agent ingress event.
+   - `settle-intent`: Dispatches payment intents with mandatory protocol take $\tau = 0.5\%$, debits payer spendable balance, and records burn window contributions upon block finalization.
+   - `submit-vouchers`: Compacts valid signed `DeliveryAck` vouchers per channel tuple `[callee home-node epoch]` retaining max `:seq`, submitting to validators via authenticated `:submit-vouchers` events for on-chain settlement debit/credit execution.
+
+2. **Validator Ingress Authentication & Consensus Execution**:
+   - `unwrap-authenticated-agent-event` strictly enforces sender identity binding for `:on-deliver`, `:settle-intent`, `:submit-vouchers`, and `:register-home-set`, rejecting signature forgery and parameter spoofing.
+   - Consensus state machine stages `:voucher` and `:intent` receipts, checks spendable balances, and applies atomic balance transitions upon block finalization.
+

@@ -1233,10 +1233,18 @@
                                          (assoc-in s [:home-sets tuple] reg-res))
 
                                        :voucher
-                                       (let [tuple [(:callee r) (:home-node r) (:epoch r)]]
-                                         (-> s
-                                             (assoc-in [:voucher-seqs tuple] (:seq r))
-                                             (update :pending-vouchers (fnil conj []) (:ack r))))
+                                       (let [tuple [(:callee r) (:home-node r) (:epoch r)]
+                                             raw (:ack r)
+                                             ack (when raw
+                                                   (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
+                                                     raw
+                                                     (try (rendezvous/map->DeliveryAck raw)
+                                                          (catch Exception _ nil))))]
+                                         (if (and ack (rendezvous/verify-delivery-ack ack))
+                                           (-> s
+                                               (assoc-in [:voucher-seqs tuple] (:seq r))
+                                               (update :pending-vouchers (fnil conj []) ack))
+                                           (update s :failed-receipts-count (fnil inc 0))))
 
                                        s)
                                      [next-exec next-exec-ord] (fifo-track (:executed-receipt-ids s-effect)
@@ -1337,10 +1345,15 @@
 (defn- handle-on-deliver
   "Handles the internal delivery event, updating the ledger with the payload and emitting an app-event."
   [state event]
-  (let [payload-bytes (or (:payload event) (byte-array 0))
-        message-id (:message-id event)]
+  (let [p (:payload event)
+        payload-bytes (cond
+                        (bytes? p) p
+                        (sequential? p) (byte-array (map byte p))
+                        :else (byte-array 0))
+        message-id (:message-id event)
+        event-sender (:sender event)]
     (if (consensus-mode? state)
-      (let [payload-str (try (String. ^bytes payload-bytes "UTF-8") (catch Exception _ nil))
+      (let [payload-str (try (String. ^bytes payload-bytes StandardCharsets/UTF_8) (catch Exception _ nil))
             payload-edn (try (when payload-str
                                (edn/read-string {:default tagged-literal
                                                  :readers {'bitecho.economy.account.Transfer account/map->Transfer
@@ -1361,9 +1374,11 @@
                              (assoc m :signature sig)))
             transfer (when transfer-map (account/map->Transfer transfer-map))
             sender (when transfer (:sender transfer))
+            sender-authorized? (or (nil? event-sender) (= sender event-sender))
             proj-ledger (projected-ledger state)
             sender-state (when (and sender proj-ledger) (get proj-ledger sender))
             valid-transfer? (and transfer
+                                 sender-authorized?
                                  sender-state
                                  (account/validate-transfer sender-state transfer)
                                  (>= (spendable-balance state sender) (long (or (:amount transfer) 0))))
@@ -1380,7 +1395,23 @@
         {:state state-staged
          :commands [{:type :app-event :event-name :on-deliver
                      :payload (:payload event) :message-id message-id}]})
-      (let [state-with-applied-ledger (apply-payload-to-ledger state payload-bytes)]
+      (let [sender-authorized? (or (nil? event-sender)
+                                   (let [payload-str (try (String. ^bytes payload-bytes StandardCharsets/UTF_8) (catch Exception _ nil))
+                                         payload-edn (try (when payload-str
+                                                            (edn/read-string {:default tagged-literal
+                                                                              :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                                                        'bitecho.economy.account.AccountState account/map->AccountState}} payload-str))
+                                                          (catch Exception _ nil))
+                                         raw-transfer (when (and (map? payload-edn) (:transfer payload-edn))
+                                                        (:transfer payload-edn))
+                                         transfer-map (when raw-transfer
+                                                        (if (instance? clojure.lang.TaggedLiteral raw-transfer)
+                                                          (:form raw-transfer)
+                                                          (into {} raw-transfer)))]
+                                     (= (:sender transfer-map) event-sender)))
+            state-with-applied-ledger (if sender-authorized?
+                                        (apply-payload-to-ledger state payload-bytes)
+                                        state)]
         {:state state-with-applied-ledger
          :commands [{:type :app-event :event-name :on-deliver
                      :payload (:payload event) :message-id message-id}]}))))
@@ -1525,14 +1556,26 @@
 (defn- node-in-home-set?
   "Checks if a home-node is present in the registered home set."
   [home-node home-set]
-  (let [nodes (:home-nodes home-set)]
+  (let [nodes (or (:home-nodes home-set) (:nodes home-set) (:candidates home-set))
+        norm (fn [x] (if (or (keyword? x) (string? x)) (name x) x))]
     (boolean
      (some (fn [n]
              (let [id (cond
                         (map? n) (or (:node-id n) (:pubkey n) (:id n) (:address n))
                         :else n)]
-               (= id home-node)))
+               (= (norm id) (norm home-node))))
            nodes))))
+
+(defn- pending-tuple-voucher-debit
+  "Returns the maximum cumulative debit already staged in :pending-receipts for a given [callee home-node epoch] tuple."
+  [state tuple]
+  (reduce (fn [mx r]
+            (if (and (= (:type r) :voucher)
+                     (= [(:callee r) (:home-node r) (:epoch r)] tuple))
+              (max mx (long (or (:cumulative-debit r) 0)))
+              mx))
+          0
+          (or (:pending-receipts state) [])))
 
 (defn- handle-receive-offer-header
   "Processes an incoming offer header, validating home set membership and
@@ -1555,7 +1598,8 @@
       (let [price (:price home-set)
             cum-debit (* seq-num price)
             callee-bal (if (consensus-mode? state)
-                         (spendable-balance state callee)
+                         (+ (spendable-balance state callee)
+                            (pending-tuple-voucher-debit state tuple))
                          (or (get-in state [:ledger callee :balance]) 0))]
         (if (< callee-bal cum-debit)
           {:state state :commands []}
@@ -1567,7 +1611,8 @@
                 res (rendezvous/process-offer-header offer-ctx)]
             (if (= :ok (:status res))
               (if (consensus-mode? state)
-                (let [rid (str "voucher:" callee ":" home-node ":" current-epoch ":" seq-num)
+                (let [hn-str (if (or (keyword? home-node) (string? home-node)) (name home-node) (str home-node))
+                      rid (str "voucher:" callee ":" hn-str ":" current-epoch ":" seq-num)
                       staged (stage-receipt state
                                             {:receipt-id rid
                                              :type :voucher
@@ -1587,6 +1632,81 @@
                             (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
                  :commands []})
               {:state state :commands []})))))))
+
+(defn- handle-submit-vouchers
+  "Processes an incoming :submit-vouchers event from an agent or node.
+   Validates signatures, sequence monotonicity, home-set membership, and balances,
+   staging valid vouchers into :pending-receipts (consensus mode) or :pending-vouchers (standalone mode)."
+  [state event]
+  (let [raw-vouchers (or (:vouchers event) [])
+        compacted (->> raw-vouchers
+                       (keep (fn [raw]
+                               (let [ack (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
+                                           raw
+                                           (try (rendezvous/map->DeliveryAck raw)
+                                                (catch Exception _ nil)))]
+                                 (when (and ack (rendezvous/verify-delivery-ack ack))
+                                   ack))))
+                       (group-by (fn [ack] [(:callee ack) (:home-node ack) (:epoch ack)]))
+                       vals
+                       (mapv (fn [group] (apply max-key (comp long :seq) group)))
+                       (sort-by (juxt (comp long :epoch) :callee :home-node (comp long :seq))))
+        final-state
+        (reduce
+         (fn [curr-st ack]
+           (let [callee (:callee ack)
+                 home-node (:home-node ack)
+                 ack-epoch (long (or (:epoch ack) 0))
+                 seq-num (long (or (:seq ack) 0))
+                 debit (long (or (:cumulative-debit ack) 0))
+                 tuple [callee home-node ack-epoch]
+                 last-seq (long (get-in curr-st [:voucher-seqs tuple] 0))
+                 settled? (contains? (or (:settled-voucher-tuples curr-st) #{}) tuple)
+                 home-set (get-in curr-st [:home-sets [callee ack-epoch]])
+                 home-set-ok? (or (nil? home-set)
+                                  (and (not= :rejected (:status home-set))
+                                       (node-in-home-set? home-node home-set)
+                                       (or (nil? (:price home-set))
+                                           (= debit (* seq-num (long (:price home-set)))))))
+                 balance-ok? (if (consensus-mode? curr-st)
+                               (>= (+ (spendable-balance curr-st callee)
+                                      (pending-tuple-voucher-debit curr-st tuple))
+                                   debit)
+                               (>= (or (get-in curr-st [:ledger callee :balance]) 0) debit))
+                 valid? (and (string? callee)
+                             (some? home-node)
+                             (>= ack-epoch 0)
+                             (pos? seq-num)
+                             (> seq-num last-seq)
+                             (pos? debit)
+                             (not settled?)
+                             home-set-ok?
+                             balance-ok?)]
+             (if valid?
+               (if (consensus-mode? curr-st)
+                 (let [hn-str (if (or (keyword? home-node) (string? home-node))
+                                (name home-node)
+                                (str home-node))
+                       rid (str "voucher:" callee ":" hn-str ":" ack-epoch ":" seq-num)
+                       staged (stage-receipt curr-st
+                                             {:receipt-id rid
+                                              :type :voucher
+                                              :callee callee
+                                              :home-node home-node
+                                              :epoch ack-epoch
+                                              :seq seq-num
+                                              :cumulative-debit debit
+                                              :ack (into {} ack)})]
+                   (if (:ok? staged)
+                     (assoc-in (:state staged) [:voucher-seqs tuple] seq-num)
+                     curr-st))
+                 (-> curr-st
+                     (assoc-in [:voucher-seqs tuple] seq-num)
+                     (update :pending-vouchers (fnil conj []) ack)))
+               curr-st)))
+         state
+         compacted)]
+    {:state final-state :commands []}))
 
 (defn- handle-settle-intent
   "Handles an internal or external request to settle a payment intent with protocol take.
@@ -1676,4 +1796,5 @@
                     {:state (execute-finalized-blocks (:state res))
                      :commands (:commands res)})
     :on-deliver (handle-on-deliver state event)
+    :submit-vouchers (handle-submit-vouchers state event)
     {:state state :commands []}))

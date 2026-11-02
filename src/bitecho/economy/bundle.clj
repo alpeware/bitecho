@@ -35,9 +35,20 @@
        :state state})))
 
 (defn compact-vouchers
-  "Compacts vouchers for current-epoch (2-arity) or across the [min-epoch, current-epoch]
-   window (3-arity), retaining only the highest :seq DeliveryAck per [callee home-node epoch]
-   channel tuple. 3-arity sorts chronologically by (juxt :epoch :callee :home-node :seq)."
+  "Compacts vouchers:
+   1-arity: compacts all vouchers across all epochs, retaining highest :seq per [callee home-node epoch].
+   2-arity: compacts vouchers for current-epoch.
+   3-arity: compacts vouchers across the [min-epoch, current-epoch] window, retaining only the highest
+   :seq DeliveryAck per [callee home-node epoch] channel tuple. Sorts chronologically."
+  ([vouchers]
+   (if (empty? vouchers)
+     []
+     (->> vouchers
+          (group-by (juxt :callee :home-node :epoch))
+          vals
+          (mapv #(apply max-key :seq %))
+          (sort-by (juxt :epoch :callee :home-node :seq))
+          vec)))
   ([vouchers current-epoch]
    (if (empty? vouchers)
      []

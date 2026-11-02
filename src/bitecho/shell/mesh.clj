@@ -7,6 +7,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.core :as core]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.persistence :as persistence]
@@ -79,7 +80,10 @@
     :receive-summary
     :receive-pull-request
     :register-home-set
-    :receive-offer-header})
+    :receive-offer-header
+    :on-deliver
+    :submit-vouchers
+    :settle-intent})
 
 (defn canonicalize-for-signing
   "Recursively converts a data structure into a content-deterministic
@@ -142,11 +146,101 @@
           (when (and (some? agent-pub-bytes)
                      (some? sig-bytes)
                      (crypto/verify agent-pub-bytes sb sig-bytes))
-            (-> event
-                (dissoc :sender :sender-pubkey-bytes :rng)
-                (assoc :sender agent-pub-hex
-                       :sender-pubkey-bytes agent-pub-bytes
-                       :rng (java.util.Random.)))))))
+            (let [ev-type (:type event)]
+              (case ev-type
+                :settle-intent
+                (let [payer (:payer event)
+                      receiver (:receiver event)
+                      amount (:amount event)]
+                  (when (and (or (nil? payer) (= payer agent-pub-hex))
+                             (string? receiver)
+                             (not (str/blank? receiver))
+                             (integer? amount)
+                             (pos? amount))
+                    (-> event
+                        (dissoc :sender :sender-pubkey-bytes :rng)
+                        (assoc :sender agent-pub-hex
+                               :payer agent-pub-hex
+                               :sender-pubkey-bytes agent-pub-bytes
+                               :rng (java.util.Random.)))))
+
+                :register-home-set
+                (let [callee (:callee event)]
+                  (when (or (nil? callee) (= callee agent-pub-hex))
+                    (-> event
+                        (dissoc :sender :sender-pubkey-bytes :rng)
+                        (assoc :sender agent-pub-hex
+                               :callee agent-pub-hex
+                               :sender-pubkey-bytes agent-pub-bytes
+                               :rng (java.util.Random.)))))
+
+                :on-deliver
+                (let [p (:payload event)
+                      p-bytes (cond
+                                (bytes? p) p
+                                (sequential? p) (byte-array (map byte p))
+                                :else nil)]
+                  (when p-bytes
+                    (let [p-str (try (String. ^bytes p-bytes StandardCharsets/UTF_8) (catch Exception _ nil))
+                          p-edn (try (when p-str
+                                       (edn/read-string {:default tagged-literal
+                                                         :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                                   'bitecho.economy.account.AccountState account/map->AccountState}}
+                                                        p-str))
+                                     (catch Exception _ nil))
+                          raw-transfer (when (and (map? p-edn) (:transfer p-edn))
+                                         (:transfer p-edn))
+                          transfer-map (when raw-transfer
+                                         (if (instance? clojure.lang.TaggedLiteral raw-transfer)
+                                           (:form raw-transfer)
+                                           (into {} raw-transfer)))
+                          sig (:signature transfer-map)
+                          tx-sig-bytes (cond
+                                         (bytes? sig) sig
+                                         (and (sequential? sig) (seq sig)) (byte-array (map byte sig))
+                                         (and (string? sig) (not (str/blank? sig)))
+                                         (if (re-matches #"^[0-9a-fA-F]+$" sig)
+                                           (basalt/hex->bytes sig)
+                                           (.getBytes ^String sig StandardCharsets/UTF_8))
+                                         :else nil)
+                          unsigned-tx (when (map? transfer-map)
+                                        (into (sorted-map) (dissoc transfer-map :signature)))
+                          tx-payload-bytes (when unsigned-tx
+                                             (.getBytes (pr-str unsigned-tx) StandardCharsets/UTF_8))]
+                      (when (and (map? transfer-map)
+                                 (= (:sender transfer-map) agent-pub-hex)
+                                 (some? tx-sig-bytes)
+                                 (some? tx-payload-bytes)
+                                 (crypto/verify agent-pub-bytes tx-payload-bytes tx-sig-bytes))
+                        (-> event
+                            (dissoc :sender :sender-pubkey-bytes :rng)
+                            (assoc :sender agent-pub-hex
+                                   :payload p-bytes
+                                   :sender-pubkey-bytes agent-pub-bytes
+                                   :rng (java.util.Random.)))))))
+
+                :submit-vouchers
+                (let [vouchers (:vouchers event)]
+                  (when (and (sequential? vouchers)
+                             (seq vouchers)
+                             (every? (fn [v]
+                                       (let [ack (if (instance? bitecho.rendezvous.core.DeliveryAck v)
+                                                   v
+                                                   (try (rendezvous/map->DeliveryAck v) (catch Exception _ nil)))]
+                                         (and ack (rendezvous/verify-delivery-ack ack))))
+                                     vouchers))
+                    (-> event
+                        (dissoc :sender :sender-pubkey-bytes :rng)
+                        (assoc :sender agent-pub-hex
+                               :sender-pubkey-bytes agent-pub-bytes
+                               :rng (java.util.Random.)))))
+
+                ;; Default for other allowed events: :receive-gossip, :receive-summary, :receive-pull-request, :receive-offer-header
+                (-> event
+                    (dissoc :sender :sender-pubkey-bytes :rng)
+                    (assoc :sender agent-pub-hex
+                           :sender-pubkey-bytes agent-pub-bytes
+                           :rng (java.util.Random.)))))))))
     (catch Exception _ nil)))
 
 ;; ---------------------------------------------------------------------------
@@ -861,8 +955,11 @@
                                          (mapcat keys (vals node-ep-maps))))
           epoch-mismatches (vec (sort (filter (fn [ep]
                                                 (let [vals (keep #(get % ep) (vals node-ep-maps))]
-                                                  (and (>= (count vals) 2)
-                                                       (not (apply = vals)))))
+                                                  (if (>= (count parsed-snapshots) 2)
+                                                    (or (< (count vals) (count parsed-snapshots))
+                                                        (not (apply = vals)))
+                                                    (and (>= (count vals) 2)
+                                                         (not (apply = vals))))))
                                               candidate-epochs)))
           window-burns-converged? (empty? epoch-mismatches)
 
@@ -895,9 +992,15 @@
                                                        (map (fn [[k v]] [k (if (map? v) (into {} v) v)]))
                                                        accounts)])))
                                       parsed-snapshots)))
-          accountz-converged? (if (and has-accountz? (zero? fin-epoch-skew))
-                                (and (= (count accountz-maps) (count parsed-snapshots))
-                                     (<= (count (distinct (vals accountz-maps))) 1))
+          accountz-converged? (if has-accountz?
+                                (let [parse-failed? (< (count accountz-maps) (count parsed-snapshots))
+                                      empty-mismatch? (and (some empty? (vals accountz-maps))
+                                                           (some seq (vals accountz-maps)))]
+                                  (cond
+                                    parse-failed? false
+                                    empty-mismatch? false
+                                    (zero? fin-epoch-skew) (<= (count (distinct (vals accountz-maps))) 1)
+                                    :else true))
                                 true)
 
           max-failed (if (seq (vals parsed-snapshots))

@@ -1,9 +1,16 @@
 (ns bitecho.light-node.core-test
   "Tests and generative invariants for the pure light-node protocol state machine."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
+            [bitecho.economy.account :as account]
+            [bitecho.economy.burn :as burn]
             [bitecho.light-node.core :as light-core]
+            [bitecho.rendezvous.core :as rdv]
+            [bitecho.shell.mesh :as mesh]
+            [bitecho.state-machine :as sm]
+            [bitecho.streamlet.core :as streamlet]
             [clojure.data.json :as json]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -594,3 +601,103 @@
         (is (= 2 (:outbox-evicted sess4)))
         (is (= 2 (:outbox-evicted sess-summary)))
         (is (= 2 (:unacked-count sess-summary)))))))
+
+(defspec ^{:doc "Property: End-to-end light-node economic lifecycle across sync-account, transfer, settle-intent, and submit-vouchers with consensus finalization"}
+  prop-light-node-economic-envelopes-e2e 25
+  (prop/for-all [transfer-amt (gen/choose 10 500)
+                 burn-amt (gen/elements [500 1000])
+                 intent-amt (gen/choose 100 2000)
+                 voucher-seq (gen/choose 1 10)
+                 voucher-price (gen/elements [5 10])]
+                (let [voucher-debit (* voucher-seq voucher-price)
+                      init-balance (+ transfer-amt burn-amt intent-amt voucher-debit 10000)
+                      alice (test-identity)
+                      alice-pub (:pubkey-hex alice)
+                      alice-priv (:privkey-bytes alice)
+                      bob (test-identity)
+                      bob-pub (:pubkey-hex bob)
+                      validator (test-identity)
+                      val-pub (:pubkey-hex validator)
+
+                      ;; Consensus-mode validator setup
+                      cfg (config/make-config
+                           {:mode :consensus
+                            :genesis-ledger {alice-pub (account/map->AccountState {:balance init-balance :seq 0 :deps []})
+                                             bob-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})
+                                             val-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                            :peers-map {val-pub (:public (:keypair validator))}})
+                      val-st0 (sm/init-state [] val-pub (assoc cfg :keypair (:keypair validator)))
+                      val-st1 (assoc-in val-st0 [:home-sets [alice-pub 1]]
+                                        {:status :active
+                                         :callee alice-pub
+                                         :epoch 1
+                                         :nodes [:node1 :node2 :node3]
+                                         :price voucher-price})
+
+                      ;; Light node: 1. sync-account
+                      st-a0 (light-core/init-light-state (:identity alice) {:epoch 1})
+                      sync-res (light-core/handle-command st-a0 {"cmd" "sync-account" "balance" init-balance "spendable" init-balance "seq" 0 "deps" [] "finalized_epoch" 1} alice-priv)
+                      st-a1 (:state sync-res)
+
+                      ;; 2. transfer
+                      tf-res (light-core/handle-command st-a1 {"cmd" "transfer" "receiver" bob-pub "amount" transfer-amt "burn" burn-amt} alice-priv)
+                      st-a2 (:state tf-res)
+                      deliver-env (second (:net-envelopes tf-res))
+                      deliver-ev (mesh/unwrap-authenticated-agent-event deliver-env)
+                      val-st2 (:state (sm/handle-event val-st1 deliver-ev))
+
+                      ;; 3. settle-intent
+                      intent-res (light-core/handle-command st-a2 {"cmd" "settle-intent" "receiver" bob-pub "amount" intent-amt} alice-priv)
+                      st-a3 (:state intent-res)
+                      intent-env (first (:net-envelopes intent-res))
+                      intent-ev (mesh/unwrap-authenticated-agent-event intent-env)
+                      val-st3 (:state (sm/handle-event val-st2 intent-ev))
+
+                      ;; 4. submit-vouchers
+                      ack (rdv/create-delivery-ack alice-priv alice-pub :node1 1 "offer-hash" voucher-seq voucher-debit)
+                      vouchers-res (light-core/handle-command st-a3 {"cmd" "submit-vouchers" "vouchers" [ack]} alice-priv)
+                      voucher-env (first (:net-envelopes vouchers-res))
+                      voucher-ev (mesh/unwrap-authenticated-agent-event voucher-env)
+                      val-st4 (:state (sm/handle-event val-st3 voucher-ev))
+
+                      ;; 5. Finalize consensus blocks: b1 executes transfers/intents, b2 settles epoch 1 vouchers
+                      b1 {:epoch 1
+                          :parent-hash "genesis"
+                          :payload (:pending-receipts val-st4)}
+                      b1-hash (streamlet/hash-block b1)
+                      b2 {:epoch 2
+                          :parent-hash b1-hash
+                          :payload []}
+                      b2-hash (streamlet/hash-block b2)
+                      val-final (-> val-st4
+                                    (assoc-in [:blocks b1-hash] b1)
+                                    (assoc-in [:blocks b2-hash] b2)
+                                    (assoc :latest-finalized-block-hash b2-hash
+                                           :finalized-blocks #{b1-hash b2-hash})
+                                    sm/execute-finalized-blocks)
+
+                      ;; Calculated economic expectations
+                      take-amt (burn/calculate-settlement-take intent-amt burn/default-settlement-take-bps)
+                      net-intent (- intent-amt take-amt)
+                      expected-alice-bal (- init-balance transfer-amt intent-amt voucher-debit)
+                      expected-bob-bal (+ transfer-amt net-intent)
+                      burn-win (:window (sm/extract-burn-window val-final))
+                      win-entry-0 (first (filter #(= 0 (first %)) burn-win))]
+                  (and (= 3 (count (:pending-receipts val-st4)))
+                       (empty? (:pending-receipts val-final))
+                       ;; Causal sequence advances
+                       (= 1 (:seq (get-in val-final [:ledger alice-pub])))
+                       (= [(get-in tf-res [:response "transfer_hash"])] (:deps (get-in val-final [:ledger alice-pub])))
+                       ;; Sender balance debited by transfer + intent + voucher
+                       (= expected-alice-bal (:balance (get-in val-final [:ledger alice-pub])))
+                       ;; Receiver credited by transfer + net-intent
+                       (= expected-bob-bal (:balance (get-in val-final [:ledger bob-pub])))
+                       ;; Home node credited by voucher-debit
+                       (= voucher-debit (or (get-in val-final [:ledger :node1 :balance])
+                                            (get-in val-final [:ledger "node1" :balance])
+                                            0))
+                       ;; Protocol settlement take recorded
+                       (= take-amt (get-in val-final [:epoch-settlement-takes 0] 0))
+                       ;; Total burn window includes take-amt
+                       (= take-amt (nth win-entry-0 2))))))
+

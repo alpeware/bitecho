@@ -109,6 +109,21 @@
             signed-ack (assoc unsigned-ack :signature sig)]
         {:status :ok :delivery-ack signed-ack}))))
 
+(defn create-delivery-ack
+  "Creates and signs a DeliveryAck record."
+  [privkey callee home-node epoch offer-hash seq-num cumulative-debit]
+  (let [unsigned-ack (map->DeliveryAck
+                      {:callee callee
+                       :home-node home-node
+                       :epoch epoch
+                       :offer-hash offer-hash
+                       :seq seq-num
+                       :cumulative-debit cumulative-debit
+                       :signature nil})
+        payload (ack-payload-bytes unsigned-ack)
+        sig (basalt/bytes->hex (crypto/sign (to-bytes privkey) payload))]
+    (assoc unsigned-ack :signature sig)))
+
 (defn verify-delivery-ack
   "Verifies the cryptographic signature of a DeliveryAck.
    Accepts [ack] (using (:callee ack) as public key) or [ack callee-pubkey]."

@@ -1009,7 +1009,7 @@ for win in node_windows.values():
 
 for e in sorted(all_eps):
     vals = [win[e] for win in node_windows.values() if e in win]
-    if len(vals) >= 2 and len(set(vals)) > 1:
+    if len(vals) < len(nodes) or len(set(vals)) > 1:
         mismatches.append((e, vals))
 
 digest_mismatch = False
@@ -1036,7 +1036,9 @@ for n in nodes:
     node_accounts[n] = parse_accounts(data[n].get('accountz', ''))
 
 accountz_mismatch = False
-if skew == 0:
+if any(not node_accounts[n] for n in nodes):
+    accountz_mismatch = True
+elif skew == 0:
     acc_signatures = [tuple(sorted(node_accounts[n].items())) for n in nodes]
     if len(set(acc_signatures)) > 1:
         accountz_mismatch = True

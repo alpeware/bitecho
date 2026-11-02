@@ -1233,11 +1233,12 @@
     (let [skill-md (slurp "skill/SKILL.md")
           documented-flags (set (re-seq #"--[a-z][a-z-]*" skill-md))
           verbs ["serve" "identity" "status" "discover" "register-home-set"
-                 "offer" "accept" "send" "inbox" "close" "transfer"]
+                 "offer" "accept" "send" "inbox" "close" "transfer"
+                 "account" "sync-account" "settle-intent" "submit-vouchers"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
-                  "--recipient" "--amount" "--seq" "--nodes"}]
+                  "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1256,7 +1257,11 @@
       (is (= {"cmd" "inbox"} (:cmd-map (light-shell/parse-light-node-args ["inbox"]))))
       (is (= "close" (get-in (light-shell/parse-light-node-args ["close"]) [:cmd-map "cmd"])))
       (is (= "transfer" (get-in (light-shell/parse-light-node-args ["transfer"]) [:cmd-map "cmd"])))
-      ;; Flags (all 20 flags tested end-to-end)
+      (is (= "account" (get-in (light-shell/parse-light-node-args ["account"]) [:cmd-map "cmd"])))
+      (is (= "sync-account" (get-in (light-shell/parse-light-node-args ["sync-account"]) [:cmd-map "cmd"])))
+      (is (= "settle-intent" (get-in (light-shell/parse-light-node-args ["settle-intent" "--receiver" "recv-pub" "--amount" "1000"]) [:cmd-map "cmd"])))
+      (is (= "submit-vouchers" (get-in (light-shell/parse-light-node-args ["submit-vouchers"]) [:cmd-map "cmd"])))
+      ;; Flags (all 22 flags tested end-to-end)
       (is (= "foo/bar" (:state-dir (light-shell/parse-light-node-args ["status" "--state-dir" "foo/bar"]))))
       (is (= "boot.edn" (:bootstrap (light-shell/parse-light-node-args ["status" "--bootstrap" "boot.edn"]))))
       (is (true? (:autonomous? (light-shell/parse-light-node-args ["serve" "--autonomous"]))))
@@ -1279,7 +1284,9 @@
       (is (= "rcpt-pub" (get-in (light-shell/parse-light-node-args ["transfer" "--recipient" "rcpt-pub"]) [:cmd-map "recipient"])))
       (is (= 100 (get-in (light-shell/parse-light-node-args ["transfer" "--amount" "100"]) [:cmd-map "amount"])))
       (is (= 7 (get-in (light-shell/parse-light-node-args ["transfer" "--seq" "7"]) [:cmd-map "seq"])))
-      (is (= ["n1" "n2"] (get-in (light-shell/parse-light-node-args ["register-home-set" "--nodes" "n1,n2"]) [:cmd-map "home_nodes"]))))))
+      (is (= ["n1" "n2"] (get-in (light-shell/parse-light-node-args ["register-home-set" "--nodes" "n1,n2"]) [:cmd-map "home_nodes"])))
+      (is (= 5000 (get-in (light-shell/parse-light-node-args ["account" "--balance" "5000"]) [:cmd-map "balance"])))
+      (is (true? (get-in (light-shell/parse-light-node-args ["account" "--sync"]) [:cmd-map "sync"]))))))
 
 ;; -----------------------------------------------------------------------------
 ;; 13. Candidate Ordering, Failover Rotation & Session Durability Tests (Priority 2)

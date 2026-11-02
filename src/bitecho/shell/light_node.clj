@@ -7,13 +7,17 @@
             [bitecho.shell.discovery :as discovery]
             [bitecho.shell.identity :as identity]
             [clojure.data.json :as json]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datachannel.api :as api]
             [taoensso.nippy :as nippy])
   (:import [java.io BufferedReader InputStreamReader PrintWriter]
+           [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
            [java.nio.file Files StandardCopyOption]
-           [java.nio.file.attribute PosixFilePermissions]))
+           [java.nio.file.attribute PosixFilePermissions]
+           [java.time Duration]))
 
 ;; -----------------------------------------------------------------------------
 ;; Pure State Sanitization & Argument Parsing
@@ -93,6 +97,27 @@
                                                 "burn" (extract-long-flag args "--burn" 500)}]
                                          (cond-> m
                                            p-max (assoc "price_max" p-max)))
+                   "account"   (let [sync? (boolean (some #{"--sync"} args))
+                                     b (extract-long-flag args "--balance" nil)
+                                     s (extract-long-flag args "--seq" nil)
+                                     m {"cmd" "account"}]
+                                 (cond-> m
+                                   sync? (assoc "sync" true)
+                                   b (assoc "balance" b)
+                                   s (assoc "seq" s)))
+                   "sync-account" (let [b (extract-long-flag args "--balance" nil)
+                                        s (extract-long-flag args "--seq" nil)
+                                        m {"cmd" "sync-account"}]
+                                    (cond-> m
+                                      b (assoc "balance" b)
+                                      s (assoc "seq" s)))
+                   "settle-intent" {"cmd" "settle-intent"
+                                    "receiver" (or (extract-flag-value args "--receiver" nil)
+                                                   (extract-flag-value args "--recipient" nil))
+                                    "recipient" (or (extract-flag-value args "--receiver" nil)
+                                                    (extract-flag-value args "--recipient" nil))
+                                    "amount" (extract-long-flag args "--amount" 0)}
+                   "submit-vouchers" {"cmd" "submit-vouchers"}
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -215,6 +240,51 @@
             rot (mod cursor n)]
         (into (subvec base-candidates rot)
               (subvec base-candidates 0 rot))))))
+
+(defn fetch-validator-accountz!
+  "Fetches accountz info from a validator node via HTTP GET or :accountz-fetcher.
+   Returns parsed EDN map or nil if unreachable."
+  [bootstrap pubkey opts]
+  (if-let [fetcher (:accountz-fetcher opts)]
+    (fetcher pubkey)
+    (let [candidates (ordered-validator-candidates bootstrap nil 0)
+          client (-> (HttpClient/newBuilder)
+                     (.connectTimeout (Duration/ofMillis 1500))
+                     (.build))]
+      (some (fn [cand]
+              (let [ip (:ip cand)
+                    http-port (or (:http-port cand) (:http_port cand) 8080)
+                    url-str (str "http://" ip ":" http-port "/accountz?pubkey=" pubkey)]
+                (try
+                  (let [req (-> (HttpRequest/newBuilder)
+                                (.uri (URI/create url-str))
+                                (.timeout (Duration/ofMillis 1500))
+                                (.GET)
+                                (.build))
+                        resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+                    (when (= 200 (.statusCode resp))
+                      (let [body (.body resp)]
+                        (try
+                          (edn/read-string body)
+                          (catch Exception _ nil)))))
+                  (catch Exception _ nil))))
+            candidates))))
+
+(defn maybe-sync-account-state!
+  "Attempts to fetch account state from validators via fetch-validator-accountz!
+   and applies sync-account command to state-atom if successful."
+  [state-atom bootstrap pubkey privkey-bytes opts]
+  (when-let [resp (fetch-validator-accountz! bootstrap pubkey opts)]
+    (when (:account resp)
+      (let [cmd {"cmd" "sync-account"
+                 "balance" (get-in resp [:account :balance] 0)
+                 "spendable" (:spendable resp)
+                 "seq" (get-in resp [:account :seq] 0)
+                 "deps" (vec (get-in resp [:account :deps] []))
+                 "finalized_epoch" (:finalized-epoch resp 0)}
+            res (light-core/handle-command @state-atom cmd privkey-bytes)]
+        (reset! state-atom (:state res))
+        (:state res)))))
 
 (defn init-conn-state
   "Initializes the pure single-authority connection lifecycle state map."
@@ -704,6 +774,11 @@
   "Processes a single STDIN JSON line in serve mode, handling network retries if required."
   [line ctx]
   (let [{:keys [state-atom conn-atom out-writer state-file identity bootstrap conn-opts]} ctx
+        cmd-map (try (json/read-str line) (catch Exception _ nil))
+        verb (when (map? cmd-map) (get cmd-map "cmd"))
+        _ (when (or (and (= verb "sync-account") (nil? (get cmd-map "balance")))
+                    (and (= verb "account") (or (get cmd-map "sync") (:sync? cmd-map))))
+            (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) conn-opts))
         res (light-core/process-jsonl-line @state-atom line (:privkey-bytes identity))
         needs-net? (seq (:net-envelopes res))]
     (if needs-net?
@@ -852,10 +927,15 @@
                             (:autonomous? opts) (assoc :autonomous? true))
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (:autonomous? opts false)}))
+        state-atom (atom initial-state)
         cmd-map (:cmd-map opts)
+        verb (when (map? cmd-map) (get cmd-map "cmd"))
+        _ (when (or (and (= verb "sync-account") (nil? (get cmd-map "balance")))
+                    (and (= verb "account") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map))))
+            (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) opts))
         out-writer (PrintWriter. System/out true)]
     (binding [*out* *err*]
-      (let [res (light-core/handle-command initial-state cmd-map (:privkey-bytes identity))
+      (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
             new-state (:state res)
             needs-network? (and (seq (:net-envelopes res)) (:connect? opts true))]
         (if needs-network?

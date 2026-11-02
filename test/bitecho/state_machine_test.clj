@@ -3141,3 +3141,55 @@
         (is (= 2 (:seq (get-in s-final [:ledger sender-pub]))))
         (is (= 300 (:balance (get-in s-final [:ledger receiver-pub]))))))))
 
+(deftest test-submit-vouchers-consensus-staging-and-finalization
+  (let [callee-kp (crypto/generate-keypair)
+        callee-pub (basalt/bytes->hex (:public callee-kp))
+        callee-priv (:private callee-kp)
+        node-kp (crypto/generate-keypair)
+        node-pub (basalt/bytes->hex (:public node-kp))
+        cfg (config/make-config
+             {:mode :consensus
+              :genesis-ledger {callee-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                               node-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+              :peers-map {node-pub (:public node-kp)}})
+        s0 (sm/init-state [] node-pub (assoc cfg :keypair node-kp))
+        ;; Register home set for callee with keyword :node1 at price 10
+        s1 (assoc-in s0 [:home-sets [callee-pub 1]]
+                     {:status :active
+                      :callee callee-pub
+                      :epoch 1
+                      :nodes [:node1 :node2 :node3]
+                      :price 10})
+        ;; Create a valid DeliveryAck signed by callee, using string "node1" to verify normalization
+        ack (rdv/create-delivery-ack callee-priv callee-pub "node1" 1 "offer-hash" 2 20)
+        res (sm/handle-event s1 {:type :submit-vouchers :vouchers [ack]})
+        s2 (:state res)]
+    (testing "Stages voucher receipt into :pending-receipts and updates voucher-seqs"
+      (is (= 1 (count (:pending-receipts s2))))
+      (let [r (first (:pending-receipts s2))]
+        (is (= :voucher (:type r)))
+        (is (= callee-pub (:callee r)))
+        (is (= 20 (:cumulative-debit r)))
+        (is (= 2 (:seq r)))))
+    (testing "Spendable balance reflects staged voucher debit"
+      (is (= 980 (sm/spendable-balance s2 callee-pub))))
+    (testing "Finalized block execution executes voucher debit and credit"
+      (let [b1 {:epoch 1
+                :parent-hash "genesis"
+                :payload (:pending-receipts s2)}
+            b1-hash (streamlet/hash-block b1)
+            b2 {:epoch 2
+                :parent-hash b1-hash
+                :payload []}
+            b2-hash (streamlet/hash-block b2)
+            s-final (-> s2
+                        (assoc-in [:blocks b1-hash] b1)
+                        (assoc-in [:blocks b2-hash] b2)
+                        (assoc :latest-finalized-block-hash b2-hash
+                               :finalized-blocks #{b1-hash b2-hash})
+                        sm/execute-finalized-blocks)]
+        (is (empty? (:pending-receipts s-final)))
+        (is (= 980 (:balance (get-in s-final [:ledger callee-pub]))))
+        (is (= 20 (:balance (get-in s-final [:ledger "node1"] 0))))))))
+
+

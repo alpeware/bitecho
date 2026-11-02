@@ -5,6 +5,8 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
+            [bitecho.economy.bundle :as bundle]
+            [bitecho.economy.burn :as burn]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.mesh :as mesh]
@@ -33,6 +35,8 @@
    :inbox []
    :local-accounting {:burned-ech 0}
    :vouchers []
+   :account nil
+   :intent-seq 0
    :transfer-seq 0
    :last-transfer-hash nil})
 
@@ -339,31 +343,217 @@
          :net-envelopes [gossip-env]
          :stdout-events []}))))
 
+(defn- exec-sync-account [state cmd-map]
+  (if (or (contains? cmd-map "balance")
+          (contains? cmd-map :balance)
+          (contains? cmd-map "seq")
+          (contains? cmd-map :seq)
+          (contains? cmd-map "spendable")
+          (contains? cmd-map :spendable)
+          (map? (get cmd-map "account"))
+          (map? (get cmd-map :account)))
+    (let [acct (or (when (map? (get cmd-map "account")) (get cmd-map "account"))
+                   (when (map? (get cmd-map :account)) (get cmd-map :account))
+                   cmd-map)
+          bal (long (or (get acct "balance")
+                        (:balance acct)
+                        (get-in state [:account :balance])
+                        0))
+          spendable (long (or (get cmd-map "spendable")
+                              (:spendable cmd-map)
+                              (get acct "spendable")
+                              (:spendable acct)
+                              bal))
+          seq-num (long (or (get acct "seq")
+                            (:seq acct)
+                            (:transfer-seq state)
+                            0))
+          deps (vec (map str (or (get acct "deps")
+                                 (:deps acct)
+                                 (when-let [h (:last-transfer-hash state)] [h])
+                                 [])))
+          fin-ep (long (or (get cmd-map "finalized_epoch")
+                           (:finalized-epoch cmd-map)
+                           (get acct "finalized_epoch")
+                           (:epoch state)
+                           0))
+          new-state (cond-> (assoc state
+                                   :account {:balance bal
+                                             :spendable spendable
+                                             :seq seq-num
+                                             :deps deps
+                                             :finalized-epoch fin-ep}
+                                   :transfer-seq seq-num
+                                   :last-transfer-hash (last deps))
+                      (pos? fin-ep)
+                      (assoc :epoch (max (long (:epoch state 0)) fin-ep)
+                             :epoch-initialized? true))]
+      {:state new-state
+       :response {"ok" true
+                  "pubkey" (:pubkey state)
+                  "balance" bal
+                  "spendable" spendable
+                  "seq" seq-num
+                  "deps" deps
+                  "finalized_epoch" fin-ep
+                  "synced" true}
+       :net-envelopes []
+       :stdout-events []})
+    (let [acct (:account state)
+          bal (long (or (:balance acct) 0))
+          spendable (long (or (:spendable acct) bal))
+          seq-num (long (or (:seq acct) (:transfer-seq state 0)))
+          deps (vec (or (:deps acct) (when-let [h (:last-transfer-hash state)] [h]) []))
+          fin-ep (long (or (:finalized-epoch acct) (:epoch state 0)))]
+      {:state state
+       :response {"ok" true
+                  "pubkey" (:pubkey state)
+                  "balance" bal
+                  "spendable" spendable
+                  "seq" seq-num
+                  "deps" deps
+                  "finalized_epoch" fin-ep
+                  "synced" (some? acct)}
+       :net-envelopes []
+       :stdout-events []})))
+
 (defn- exec-transfer [state cmd-map privkey-bytes]
-  (let [receiver (or (get cmd-map "receiver") (get cmd-map "recipient"))
-        amount (long (or (get cmd-map "amount") 0))
-        seq-num (long (or (get cmd-map "seq") (inc (:transfer-seq state 0))))
-        deps (vec (or (get cmd-map "deps") (when-let [prev (:last-transfer-hash state)] [prev]) []))
-        burn-amt (long (or (get cmd-map "burn") 500))
-        res (agent-sim/build-transfer-gossip-envelope
-             (:pubkey state)
-             privkey-bytes
-             {:receiver receiver :amount amount :seq seq-num :deps deps}
-             burn-amt)
-        new-state (-> state
-                      (assoc :transfer-seq seq-num
-                             :last-transfer-hash (:transfer-hash res))
-                      (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
-    {:state new-state
-     :response {"ok" true
-                "transfer_hash" (:transfer-hash res)
-                "tx_id" (:transfer-hash res)
-                "receiver" receiver
-                "recipient" receiver
-                "amount" amount
-                "seq" seq-num}
-     :net-envelopes [(:envelope res)]
-     :stdout-events []}))
+  (let [receiver (or (get cmd-map "receiver") (get cmd-map "recipient")
+                     (:receiver cmd-map) (:recipient cmd-map))
+        amount (long (or (get cmd-map "amount") (:amount cmd-map) 0))]
+    (if (or (str/blank? receiver) (<= amount 0))
+      {:state state
+       :response {"ok" false "error" "invalid-transfer-params"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) 500))
+            acct (:account state)
+            spendable (when acct (long (or (:spendable acct) (:balance acct) 0)))]
+        (if (and acct (< spendable (+ amount burn-amt)))
+          {:state state
+           :response {"ok" false "error" "insufficient-balance"}
+           :net-envelopes []
+           :stdout-events []}
+          (let [seq-num (long (or (get cmd-map "seq")
+                                  (:seq cmd-map)
+                                  (inc (long (or (when acct (:seq acct))
+                                                 (:transfer-seq state)
+                                                 0)))))
+                deps (vec (or (get cmd-map "deps")
+                              (:deps cmd-map)
+                              (when (and acct (seq (:deps acct))) (:deps acct))
+                              (when-let [prev (:last-transfer-hash state)] [prev])
+                              []))
+                res (agent-sim/build-transfer-gossip-envelope
+                     (:pubkey state)
+                     privkey-bytes
+                     {:receiver receiver :amount amount :seq seq-num :deps deps}
+                     burn-amt)
+                deliver-payload (vec (.getBytes ^String (pr-str {:transfer (into {} (:transfer res))}) "UTF-8"))
+                deliver-env (mesh/wrap-agent-event
+                             {:type :on-deliver
+                              :payload deliver-payload
+                              :message-id (:transfer-hash res)}
+                             (:pubkey state)
+                             privkey-bytes)
+                new-state (cond-> (-> state
+                                      (assoc :transfer-seq seq-num
+                                             :last-transfer-hash (:transfer-hash res))
+                                      (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
+                            acct (-> (assoc-in [:account :seq] seq-num)
+                                     (assoc-in [:account :deps] [(:transfer-hash res)])
+                                     (update-in [:account :spendable] - (+ amount burn-amt))))]
+            {:state new-state
+             :response {"ok" true
+                        "transfer_hash" (:transfer-hash res)
+                        "tx_id" (:transfer-hash res)
+                        "receiver" receiver
+                        "recipient" receiver
+                        "amount" amount
+                        "seq" seq-num}
+             :net-envelopes [(:envelope res) deliver-env]
+             :stdout-events []}))))))
+
+(defn- exec-settle-intent [state cmd-map privkey-bytes]
+  (let [receiver (or (get cmd-map "receiver") (get cmd-map "recipient")
+                     (:receiver cmd-map) (:recipient cmd-map))
+        amount (long (or (get cmd-map "amount") (:amount cmd-map) 0))]
+    (if (or (str/blank? receiver) (<= amount 0))
+      {:state state
+       :response {"ok" false "error" "invalid-intent-params"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [acct (:account state)
+            spendable (when acct (long (or (:spendable acct) (:balance acct) 0)))]
+        (if (and acct (< spendable amount))
+          {:state state
+           :response {"ok" false "error" "insufficient-balance"}
+           :net-envelopes []
+           :stdout-events []}
+          (let [next-intent-seq (inc (long (:intent-seq state 0)))
+                rid (or (get cmd-map "receipt_id")
+                        (:receipt_id cmd-map)
+                        (str "intent:" (:pubkey state) ":" receiver ":" amount ":" (:epoch state 0) ":" next-intent-seq))
+                take-amt (burn/calculate-settlement-take amount burn/default-settlement-take-bps)
+                net-amt (- amount take-amt)
+                intent-env (mesh/wrap-agent-event
+                            {:type :settle-intent
+                             :payer (:pubkey state)
+                             :receiver receiver
+                             :amount amount
+                             :epoch (:epoch state 0)
+                             :receipt-id rid}
+                            (:pubkey state)
+                            privkey-bytes)
+                new-state (cond-> (assoc state :intent-seq next-intent-seq)
+                            acct (update-in [:account :spendable] - amount))]
+            {:state new-state
+             :response {"ok" true
+                        "receipt_id" rid
+                        "payer" (:pubkey state)
+                        "receiver" receiver
+                        "amount" amount
+                        "take" take-amt
+                        "net_amount" net-amt}
+             :net-envelopes [intent-env]
+             :stdout-events []}))))))
+
+(defn- exec-submit-vouchers [state cmd-map privkey-bytes]
+  (let [raw-vouchers (or (get cmd-map "vouchers")
+                         (:vouchers cmd-map)
+                         (:vouchers state)
+                         [])
+        compacted (->> raw-vouchers
+                       (keep (fn [raw]
+                               (let [ack-map (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
+                                               (into {} raw)
+                                               {:callee (or (get raw "callee") (:callee raw))
+                                                :home-node (or (get raw "home_node") (get raw "home-node") (:home-node raw))
+                                                :epoch (long (or (get raw "epoch") (:epoch raw) 0))
+                                                :offer-hash (or (get raw "offer_hash") (get raw "offer-hash") (:offer-hash raw))
+                                                :seq (long (or (get raw "seq") (:seq raw) 0))
+                                                :cumulative-debit (long (or (get raw "cumulative_debit") (get raw "cumulative-debit") (:cumulative-debit raw) 0))
+                                                :signature (or (get raw "signature") (:signature raw))})
+                                     ack (try (rendezvous/map->DeliveryAck ack-map) (catch Exception _ nil))]
+                                 (when (and ack (rendezvous/verify-delivery-ack ack))
+                                   ack))))
+                       bundle/compact-vouchers)]
+    (if (empty? compacted)
+      {:state state
+       :response {"ok" false "error" "no-valid-vouchers"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [voucher-env (mesh/wrap-agent-event
+                         {:type :submit-vouchers
+                          :vouchers (mapv #(into {} %) compacted)
+                          :epoch (:epoch state 0)}
+                         (:pubkey state)
+                         privkey-bytes)
+            new-state (assoc state :vouchers [])]
+        {:state new-state
+         :response {"ok" true "submitted_count" (count compacted)}
+         :net-envelopes [voucher-env]
+         :stdout-events []}))))
 
 (defn- exec-status [state]
   (let [sessions-summary (vec (for [[_ s] (:sessions state)]
@@ -379,6 +569,7 @@
                         "sessions" sessions-summary
                         "pending_offers_count" (count (:pending-offers state))
                         "inbox_count" (count (:inbox state))
+                        "account" (:account state)
                         "accounting" {"scope" "local-non-consensus"
                                       "note" "Locally computed devnet totals; never consensus finalized"
                                       "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
@@ -404,6 +595,10 @@
       "inbox" (exec-inbox state)
       "close" (exec-close state effective-map privkey-bytes)
       "transfer" (exec-transfer state effective-map privkey-bytes)
+      "account" (exec-sync-account state effective-map)
+      "sync-account" (exec-sync-account state effective-map)
+      "settle-intent" (exec-settle-intent state effective-map privkey-bytes)
+      "submit-vouchers" (exec-submit-vouchers state effective-map privkey-bytes)
       "status" (exec-status state)
       {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})))
 

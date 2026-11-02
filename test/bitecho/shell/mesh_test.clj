@@ -4,6 +4,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.mesh :as mesh]
             [bitecho.shell.persistence :as persistence]
@@ -453,7 +454,14 @@
         priv (:private kp)]
     (testing "all allowed event types successfully authenticate and unwrap"
       (doseq [t mesh/allowed-agent-events]
-        (let [evt {:type t :sample "data"}
+        (let [evt (case t
+                    :settle-intent {:type t :payer pub :receiver "302a300506032b6570032100" :amount 100}
+                    :on-deliver (let [tf (account/create-transfer priv {:sender pub :receiver "302a300506032b6570032100" :amount 50 :seq 1 :deps []})
+                                      p (vec (.getBytes ^String (pr-str {:transfer (into {} tf)}) "UTF-8"))]
+                                  {:type t :payload p :message-id "msg-1"})
+                    :submit-vouchers (let [ack (rendezvous/create-delivery-ack priv pub :node1 1 "offer-hash" 1 10)]
+                                       {:type t :vouchers [ack]})
+                    {:type t :sample "data"})
               env (mesh/wrap-agent-event evt pub priv)
               res (mesh/unwrap-authenticated-agent-event env)]
           (is (some? res))
@@ -1377,5 +1385,109 @@
           res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
       (is (false? (:converged? res)))
       (is (= 2 (get-in res [:soak-summary :max_failed_receipts]))))))
+
+(deftest test-evaluate-cluster-convergence-edge-cases
+  (testing "Single-node-epoch silence: flags candidate epoch if present on node1 but absent on node2"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[8 100 0] [10 300 0]]}}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 300 0]]}} ; silent at epoch 8!
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (false? (:window-burns-converged? res)))
+      (is (= [8] (:epoch-mismatches res)))))
+
+  (testing "Fail-closed on unparseable /accountz"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz "not-valid-edn {{"}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz {:accounts {"alice" {:balance 100 :seq 0 :deps []}}}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (false? (:accountz-converged? res)))))
+
+  (testing "Fail-closed on empty accounts when another node has accounts"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz {:accounts {}}}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz {:accounts {"alice" {:balance 100 :seq 0 :deps []}}}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (false? (:accountz-converged? res))))))
+
+(deftest test-unwrap-authenticated-agent-event-spoofing-rejection
+  (let [alice-kp (crypto/generate-keypair)
+        alice-pub-hex (basalt/bytes->hex (:public alice-kp))
+        alice-priv (:private alice-kp)
+        bob-kp (crypto/generate-keypair)
+        bob-pub-hex (basalt/bytes->hex (:public bob-kp))
+        bob-priv (:private bob-kp)]
+
+    (testing ":settle-intent rejects spoofed payer != signer"
+      (let [spoofed-intent {:type :settle-intent
+                            :payer bob-pub-hex
+                            :receiver alice-pub-hex
+                            :amount 1000
+                            :epoch 1}
+            env (mesh/wrap-agent-event spoofed-intent alice-pub-hex alice-priv)]
+        (is (nil? (mesh/unwrap-authenticated-agent-event env)))))
+
+    (testing ":settle-intent accepts valid intent matching signer"
+      (let [valid-intent {:type :settle-intent
+                          :payer alice-pub-hex
+                          :receiver bob-pub-hex
+                          :amount 1000
+                          :epoch 1}
+            env (mesh/wrap-agent-event valid-intent alice-pub-hex alice-priv)
+            unwrapped (mesh/unwrap-authenticated-agent-event env)]
+        (is (some? unwrapped))
+        (is (= alice-pub-hex (:sender unwrapped)))
+        (is (= alice-pub-hex (:payer unwrapped)))))
+
+    (testing ":on-deliver rejects inner transfer sender != outer signer"
+      (let [tf (account/create-transfer bob-priv {:sender bob-pub-hex :receiver alice-pub-hex :amount 100 :seq 1 :deps []})
+            payload (vec (.getBytes ^String (pr-str {:transfer (into {} tf)}) "UTF-8"))
+            env (mesh/wrap-agent-event {:type :on-deliver :payload payload :message-id "msg-1"} alice-pub-hex alice-priv)]
+        (is (nil? (mesh/unwrap-authenticated-agent-event env)))))
+
+    (testing ":on-deliver accepts inner transfer matching outer signer"
+      (let [tf (account/create-transfer alice-priv {:sender alice-pub-hex :receiver bob-pub-hex :amount 100 :seq 1 :deps []})
+            payload (vec (.getBytes ^String (pr-str {:transfer (into {} tf)}) "UTF-8"))
+            env (mesh/wrap-agent-event {:type :on-deliver :payload payload :message-id "msg-1"} alice-pub-hex alice-priv)
+            unwrapped (mesh/unwrap-authenticated-agent-event env)]
+        (is (some? unwrapped))
+        (is (= alice-pub-hex (:sender unwrapped)))))
+
+    (testing ":register-home-set rejects callee != signer"
+      (let [spoofed {:type :register-home-set :callee bob-pub-hex :home-nodes [:node1 :node2 :node3] :price 10}
+            env (mesh/wrap-agent-event spoofed alice-pub-hex alice-priv)]
+        (is (nil? (mesh/unwrap-authenticated-agent-event env)))))
+
+    (testing ":register-home-set accepts callee matching signer"
+      (let [valid {:type :register-home-set :callee alice-pub-hex :home-nodes [:node1 :node2 :node3] :price 10}
+            env (mesh/wrap-agent-event valid alice-pub-hex alice-priv)
+            unwrapped (mesh/unwrap-authenticated-agent-event env)]
+        (is (some? unwrapped))
+        (is (= alice-pub-hex (:sender unwrapped)))
+        (is (= alice-pub-hex (:callee unwrapped)))))
+
+    (testing ":submit-vouchers rejects forged or invalid DeliveryAck signature"
+      (let [forged-ack (rendezvous/create-delivery-ack bob-priv alice-pub-hex :node1 1 "offer-hash" 1 10)
+            tampered-ack (assoc forged-ack :cumulative-debit 999999)
+            env (mesh/wrap-agent-event {:type :submit-vouchers :vouchers [tampered-ack] :epoch 1} alice-pub-hex alice-priv)]
+        (is (nil? (mesh/unwrap-authenticated-agent-event env)))))
+
+    (testing ":submit-vouchers accepts valid signed DeliveryAck vouchers"
+      (let [valid-ack (rendezvous/create-delivery-ack alice-priv alice-pub-hex :node1 1 "offer-hash" 1 10)
+            env (mesh/wrap-agent-event {:type :submit-vouchers :vouchers [valid-ack] :epoch 1} alice-pub-hex alice-priv)
+            unwrapped (mesh/unwrap-authenticated-agent-event env)]
+        (is (some? unwrapped))
+        (is (= alice-pub-hex (:sender unwrapped)))
+        (is (= 1 (count (:vouchers unwrapped))))))))
+
 
 

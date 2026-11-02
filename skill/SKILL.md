@@ -270,6 +270,83 @@ Submits an account balance transfer to another public key. Consecutive transfers
 
 ---
 
+### `account`
+Queries or inspects the node's synced on-chain account state (spendable balance, sequence, causal dependencies, and finalized epoch). With `--sync`, queries the active validator cluster `/accountz` endpoint to refresh state.
+
+- **CLI**: `clojure -M:light-node account [--sync] [--balance <num>] [--seq <num>]`
+- **JSONL**: `{"cmd": "account"}` or `{"cmd": "account", "sync": true}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "pubkey": "<pubkey-hex>",
+    "balance": 10000,
+    "spendable": 10000,
+    "seq": 0,
+    "deps": [],
+    "finalized_epoch": 5,
+    "synced": true
+  }
+  ```
+
+---
+
+### `sync-account`
+Explicitly synchronizes the node's account state with the validator mesh or updates local cached account parameters.
+
+- **CLI**: `clojure -M:light-node sync-account [--balance <num>] [--seq <num>]`
+- **JSONL**: `{"cmd": "sync-account"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "pubkey": "<pubkey-hex>",
+    "balance": 10000,
+    "spendable": 10000,
+    "seq": 0,
+    "deps": [],
+    "finalized_epoch": 5,
+    "synced": true
+  }
+  ```
+
+---
+
+### `settle-intent`
+Dispatches a signed payment intent to settle with protocol take directly via the validator mesh.
+
+- **CLI**: `clojure -M:light-node settle-intent --receiver <pubkey-hex> --amount 1000` (also accepts `--recipient <pubkey-hex>`)
+- **JSONL**: `{"cmd": "settle-intent", "receiver": "<pubkey-hex>", "amount": 1000}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "receipt_id": "intent:<pubkey-hex>:<receiver-hex>:1000:5:1",
+    "payer": "<pubkey-hex>",
+    "receiver": "<receiver-hex>",
+    "amount": 1000,
+    "take": 5,
+    "net_amount": 995
+  }
+  ```
+
+---
+
+### `submit-vouchers`
+Compacts and submits signed delivery acknowledgment vouchers collected during rendezvous sessions to the validator mesh for on-chain settlement.
+
+- **CLI**: `clojure -M:light-node submit-vouchers`
+- **JSONL**: `{"cmd": "submit-vouchers"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "submitted_count": 3
+  }
+  ```
+
+---
+
 ### `status`
 Inspects local node accounting, active and pending sessions, burned ECHO, and validator connection health.
 
