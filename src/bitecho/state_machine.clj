@@ -96,7 +96,8 @@
       :receipt-seq 0
       :failed-receipts-count 0
       :escrows {}
-      :settled-escrow-ids #{}})))
+      :settled-escrow-ids #{}
+      :settled-escrow-order []})))
 
 (defn fifo-track
   "Maintains a bounded set and order vector with deterministic FIFO eviction.
@@ -616,7 +617,25 @@
                   evicted (subvec filtered-ord 0 overflow)
                   kept (subvec filtered-ord overflow)]
               [(reduce disj filtered-set evicted) kept])
-            [filtered-set filtered-ord]))]
+            [filtered-set filtered-ord]))
+        escrow-horizon (long (or (:max-escrow-horizon cfg) 168))
+        escrow-cutoff (- new-epoch escrow-horizon)
+        pruned-escrows (reduce-kv (fn [m eid v]
+                                    (if (and (contains? #{:released :refunded} (:status v))
+                                             (<= (long (or (:settled-epoch v) (:expires-epoch v) 0)) escrow-cutoff))
+                                      m
+                                      (assoc m eid v)))
+                                  {}
+                                  (or (:escrows state) {}))
+        [pruned-tracked-settled-escrows pruned-settled-escrows-ord]
+        (let [s (or (:settled-escrow-ids state) #{})
+              ord (or (:settled-escrow-order state) [])]
+          (if (> (count ord) max-tracked)
+            (let [overflow (- (count ord) max-tracked)
+                  evicted (subvec ord 0 overflow)
+                  kept (subvec ord overflow)]
+              [(reduce disj s evicted) kept])
+            [s ord]))]
     (-> (assoc state
                :epoch-to-messages pruned-epoch-to-messages
                :epoch-to-message-roles pruned-epoch-to-roles
@@ -642,7 +661,10 @@
                :executed-receipt-ids pruned-tracked-exec
                :executed-receipt-order pruned-exec-ord
                :executed-finalized-blocks pruned-exec-blocks
-               :executed-finalized-blocks-order pruned-exec-blocks-ord)
+               :executed-finalized-blocks-order pruned-exec-blocks-ord
+               :escrows pruned-escrows
+               :settled-escrow-ids pruned-tracked-settled-escrows
+               :settled-escrow-order pruned-settled-escrows-ord)
         (prune-rendezvous-retention-state rdv-cutoff))))
 
 (defn- collect-ancestor-receipt-ids
@@ -1371,10 +1393,10 @@
                                        (let [escrow-id (:escrow-id r)
                                              payer (:payer r)
                                              receiver (:receiver r)
-                                             amount (long (or (:amount r) 0))
+                                             amount (if (integer? (:amount r)) (long (:amount r)) 0)
                                              deliverable-hash (:deliverable-hash r)
-                                             created-epoch (long (or (:created-epoch r) closing-ep))
-                                             expires-epoch (long (or (:expires-epoch r) 0))
+                                             created-epoch (if (integer? (:created-epoch r)) (long (:created-epoch r)) closing-ep)
+                                             expires-epoch (if (integer? (:expires-epoch r)) (long (:expires-epoch r)) 0)
                                              payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
                                              receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
                                              payer-acct (when payer-hex (get-in s [:ledger payer-hex]))
@@ -1387,7 +1409,10 @@
                                                   payer-hex receiver-hex (not= payer-hex receiver-hex)
                                                   (pos? amount)
                                                   (escrow/valid-deliverable-hash? deliverable-hash)
+                                                  (integer? (:expires-epoch r))
                                                   (> expires-epoch created-epoch)
+                                                  (>= created-epoch (- closing-ep 168))
+                                                  (<= (- expires-epoch created-epoch) 168)
                                                   payer-acct (>= payer-bal amount))
                                            (let [new-payer (assoc payer-acct :balance (- payer-bal amount))
                                                  escrow-entry {:escrow-id escrow-id
@@ -1437,11 +1462,16 @@
                                                                            :settled-epoch closing-ep
                                                                            :take-amount take-amt
                                                                            :net-amount net-amt
-                                                                           :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))]
+                                                                           :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))
+                                                     [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
+                                                                                                     (:settled-escrow-order s)
+                                                                                                     escrow-id
+                                                                                                     max-tracked)]
                                                  (-> s
                                                      (assoc-in [:ledger receiver] new-receiver)
                                                      (assoc-in [:escrows escrow-id] updated-escrow)
-                                                     (update :settled-escrow-ids (fnil conj #{}) escrow-id)
+                                                     (assoc :settled-escrow-ids next-settled-ids
+                                                            :settled-escrow-order next-settled-ord)
                                                      (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt)))
                                                (update s :failed-receipts-count (fnil inc 0))))
                                            (update s :failed-receipts-count (fnil inc 0))))
@@ -1456,7 +1486,8 @@
                                                  receiver (:receiver escrow)
                                                  expires-epoch (long (or (:expires-epoch escrow) 0))
                                                  amount (long (:amount escrow))
-                                                 timeout? (> closing-ep expires-epoch)
+                                                 timeout? (and (> closing-ep expires-epoch)
+                                                               (or (nil? sender-hex) (contains? #{payer receiver} sender-hex)))
                                                  receiver-voluntary? (= sender-hex receiver)]
                                              (if (or timeout? receiver-voluntary?)
                                                (let [payer-acct (get-in s [:ledger payer]
@@ -1466,11 +1497,16 @@
                                                                            :status :refunded
                                                                            :settled-epoch closing-ep
                                                                            :refund-amount amount
-                                                                           :refund-reason (if receiver-voluntary? :receiver-voluntary :timeout))]
+                                                                           :refund-reason (if receiver-voluntary? :receiver-voluntary :timeout))
+                                                     [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
+                                                                                                     (:settled-escrow-order s)
+                                                                                                     escrow-id
+                                                                                                     max-tracked)]
                                                  (-> s
                                                      (assoc-in [:ledger payer] new-payer)
                                                      (assoc-in [:escrows escrow-id] updated-escrow)
-                                                     (update :settled-escrow-ids (fnil conj #{}) escrow-id)))
+                                                     (assoc :settled-escrow-ids next-settled-ids
+                                                            :settled-escrow-order next-settled-ord)))
                                                (update s :failed-receipts-count (fnil inc 0))))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
@@ -2281,166 +2317,190 @@
    Enforces sender authentication, positive integer amount, valid deliverable-hash,
    expires-epoch > created-epoch, and sufficient payer balance."
   [state event]
-  (let [payer (:payer event)
-        receiver (:receiver event)
-        amount (:amount event)
-        deliverable-hash (:deliverable-hash event)
-        created-epoch (long (or (:created-epoch event) (:epoch event) (:epoch state) 0))
-        expires-epoch (long (or (:expires-epoch event) 0))
-        nonce (str (or (:nonce event) "0"))
-        event-sender (:sender event)
-        sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
-        payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
-        receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
-        escrow-id (or (:escrow-id event)
-                      (when (and payer-hex receiver-hex (integer? amount) (pos? amount)
-                                 deliverable-hash (escrow/valid-deliverable-hash? deliverable-hash)
-                                 (> expires-epoch created-epoch))
-                        (escrow/compute-escrow-id payer-hex receiver-hex amount deliverable-hash created-epoch expires-epoch nonce)))
-        already-exists? (or (contains? (or (:escrows state) #{}) escrow-id)
-                            (contains? (or (:settled-escrow-ids state) #{}) escrow-id))]
-    (if-not (or (nil? sender-hex) (= payer-hex sender-hex))
-      {:state state :commands []}
-      (if (or (nil? payer-hex) (nil? receiver-hex) (= payer-hex receiver-hex)
-              (not (integer? amount)) (not (pos? amount))
-              (not (escrow/valid-deliverable-hash? deliverable-hash))
-              (<= expires-epoch created-epoch)
-              (nil? escrow-id)
-              already-exists?)
+  (if-not (and (or (nil? (:epoch event)) (integer? (:epoch event)))
+               (or (nil? (:created-epoch event)) (integer? (:created-epoch event)))
+               (integer? (:expires-epoch event)))
+    {:state state :commands []}
+    (let [payer (:payer event)
+          receiver (:receiver event)
+          amount (:amount event)
+          deliverable-hash (:deliverable-hash event)
+          current-epoch (long (or (:epoch event) (:epoch state) 0))
+          created-epoch (long (or (:created-epoch event) current-epoch))
+          expires-epoch (long (:expires-epoch event))
+          nonce (str (or (:nonce event) "0"))
+          event-sender (:sender event)
+          sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
+          payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
+          receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
+          escrow-id (or (:escrow-id event)
+                        (when (and payer-hex receiver-hex (integer? amount) (pos? amount)
+                                   deliverable-hash (escrow/valid-deliverable-hash? deliverable-hash)
+                                   (> expires-epoch created-epoch))
+                          (escrow/compute-escrow-id payer-hex receiver-hex amount deliverable-hash created-epoch expires-epoch nonce)))
+          already-exists? (or (contains? (or (:escrows state) #{}) escrow-id)
+                              (contains? (or (:settled-escrow-ids state) #{}) escrow-id))]
+      (if-not (or (nil? sender-hex) (= payer-hex sender-hex))
         {:state state :commands []}
-        (if (consensus-mode? state)
-          (let [payer-acct (get-in state [:ledger payer-hex])]
-            (if (and payer-acct (>= (spendable-balance state payer-hex) amount))
-              (let [rid (or (:receipt-id event) (str "lock:" escrow-id))
-                    staged (stage-receipt state {:receipt-id rid
-                                                 :type :lock-intent
-                                                 :escrow-id escrow-id
-                                                 :payer payer-hex
-                                                 :receiver receiver-hex
-                                                 :amount amount
-                                                 :deliverable-hash (escrow/normalize-hex deliverable-hash)
-                                                 :created-epoch created-epoch
-                                                 :expires-epoch expires-epoch})]
-                (if (:ok? staged)
-                  {:state (:state staged) :commands []}
-                  {:state state :commands []}))
-              {:state state :commands []}))
-          (let [payer-acct (get-in state [:ledger payer-hex])
-                payer-bal (or (:balance payer-acct) 0)]
-            (if (and payer-acct (>= payer-bal amount))
-              (let [new-payer (assoc payer-acct :balance (- payer-bal amount))
-                    escrow-entry {:escrow-id escrow-id
-                                  :payer payer-hex
-                                  :receiver receiver-hex
-                                  :amount amount
-                                  :deliverable-hash (escrow/normalize-hex deliverable-hash)
-                                  :created-epoch created-epoch
-                                  :expires-epoch expires-epoch
-                                  :status :locked}]
-                {:state (-> state
-                            (assoc-in [:ledger payer-hex] new-payer)
-                            (assoc-in [:escrows escrow-id] escrow-entry))
-                 :commands []})
-              {:state state :commands []})))))))
+        (if (or (nil? payer-hex) (nil? receiver-hex) (= payer-hex receiver-hex)
+                (not (integer? amount)) (not (pos? amount))
+                (not (escrow/valid-deliverable-hash? deliverable-hash))
+                (<= expires-epoch created-epoch)
+                (< created-epoch (- current-epoch 168))
+                (> (- expires-epoch created-epoch) 168)
+                (nil? escrow-id)
+                already-exists?)
+          {:state state :commands []}
+          (if (consensus-mode? state)
+            (let [payer-acct (get-in state [:ledger payer-hex])]
+              (if (and payer-acct (>= (spendable-balance state payer-hex) amount))
+                (let [rid (or (:receipt-id event) (str "lock:" escrow-id))
+                      staged (stage-receipt state {:receipt-id rid
+                                                   :type :lock-intent
+                                                   :escrow-id escrow-id
+                                                   :payer payer-hex
+                                                   :receiver receiver-hex
+                                                   :amount amount
+                                                   :deliverable-hash (escrow/normalize-hex deliverable-hash)
+                                                   :created-epoch created-epoch
+                                                   :expires-epoch expires-epoch})]
+                  (if (:ok? staged)
+                    {:state (:state staged) :commands []}
+                    {:state state :commands []}))
+                {:state state :commands []}))
+            (let [payer-acct (get-in state [:ledger payer-hex])
+                  payer-bal (or (:balance payer-acct) 0)]
+              (if (and payer-acct (>= payer-bal amount))
+                (let [new-payer (assoc payer-acct :balance (- payer-bal amount))
+                      escrow-entry {:escrow-id escrow-id
+                                    :payer payer-hex
+                                    :receiver receiver-hex
+                                    :amount amount
+                                    :deliverable-hash (escrow/normalize-hex deliverable-hash)
+                                    :created-epoch created-epoch
+                                    :expires-epoch expires-epoch
+                                    :status :locked}]
+                  {:state (-> state
+                              (assoc-in [:ledger payer-hex] new-payer)
+                              (assoc-in [:escrows escrow-id] escrow-entry))
+                   :commands []})
+                {:state state :commands []}))))))))
 
 (defn- handle-release-intent
   "Handles request to release escrowed funds upon verified outcome or payer authorization."
   [state event]
-  (let [escrow-id (:escrow-id event)
-        escrow (get-in state [:escrows escrow-id])
-        preimage (:preimage event)
-        payer-sig (:payer-signature event)
-        event-sender (:sender event)
-        sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
-        current-epoch (long (or (:epoch event) (:epoch state) 0))]
-    (if-not (and escrow (= :locked (:status escrow)))
-      {:state state :commands []}
-      (let [payer (:payer escrow)
-            receiver (:receiver escrow)
-            d-hash (:deliverable-hash escrow)
-            expires-epoch (long (or (:expires-epoch escrow) 0))
-            amount (long (:amount escrow))
-            payer-auth? (or (= sender-hex payer)
-                            (and (string? payer-sig)
-                                 (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig)))
-            preimage-auth? (and (string? preimage)
-                                (escrow/verify-deliverable-preimage preimage d-hash)
-                                (<= current-epoch expires-epoch)
-                                (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))]
-        (if-not (or payer-auth? preimage-auth?)
-          {:state state :commands []}
-          (if (consensus-mode? state)
-            (let [rid (or (:receipt-id event) (str "release:" escrow-id))
-                  staged (stage-receipt state {:receipt-id rid
-                                               :type :release-intent
-                                               :escrow-id escrow-id
-                                               :preimage preimage
-                                               :payer-signature payer-sig
-                                               :sender sender-hex})]
-              (if (:ok? staged)
-                {:state (:state staged) :commands []}
-                {:state state :commands []}))
-            (let [configured-bps (or (:settlement-take-bps state)
-                                     (get-in state [:config :settlement-take-bps])
-                                     burn/default-settlement-take-bps)
-                  take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
-                  net-amt (- amount take-amt)
-                  receiver-acct (get-in state [:ledger receiver]
-                                        (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                  new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
-                  updated-escrow (assoc escrow
-                                        :status :released
-                                        :settled-epoch current-epoch
-                                        :take-amount take-amt
-                                        :net-amount net-amt
-                                        :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))]
-              {:state (-> state
-                          (assoc-in [:ledger receiver] new-receiver)
-                          (assoc-in [:escrows escrow-id] updated-escrow)
-                          (update :settled-escrow-ids (fnil conj #{}) escrow-id)
-                          (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
-               :commands []})))))))
+  (if-not (or (nil? (:epoch event)) (integer? (:epoch event)))
+    {:state state :commands []}
+    (let [escrow-id (:escrow-id event)
+          escrow (get-in state [:escrows escrow-id])
+          preimage (:preimage event)
+          payer-sig (:payer-signature event)
+          event-sender (:sender event)
+          sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
+          current-epoch (long (or (:epoch event) (:epoch state) 0))]
+      (if-not (and escrow (= :locked (:status escrow)))
+        {:state state :commands []}
+        (let [payer (:payer escrow)
+              receiver (:receiver escrow)
+              d-hash (:deliverable-hash escrow)
+              expires-epoch (long (or (:expires-epoch escrow) 0))
+              amount (long (:amount escrow))
+              payer-auth? (or (= sender-hex payer)
+                              (and (string? payer-sig)
+                                   (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig)))
+              preimage-auth? (and (string? preimage)
+                                  (escrow/verify-deliverable-preimage preimage d-hash)
+                                  (<= current-epoch expires-epoch)
+                                  (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))]
+          (if-not (or payer-auth? preimage-auth?)
+            {:state state :commands []}
+            (if (consensus-mode? state)
+              (let [rid (or (:receipt-id event) (str "release:" escrow-id))
+                    staged (stage-receipt state {:receipt-id rid
+                                                 :type :release-intent
+                                                 :escrow-id escrow-id
+                                                 :preimage preimage
+                                                 :payer-signature payer-sig
+                                                 :sender sender-hex})]
+                (if (:ok? staged)
+                  {:state (:state staged) :commands []}
+                  {:state state :commands []}))
+              (let [configured-bps (or (:settlement-take-bps state)
+                                       (get-in state [:config :settlement-take-bps])
+                                       burn/default-settlement-take-bps)
+                    take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
+                    net-amt (- amount take-amt)
+                    receiver-acct (get-in state [:ledger receiver]
+                                          (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                    new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+                    updated-escrow (assoc escrow
+                                          :status :released
+                                          :settled-epoch current-epoch
+                                          :take-amount take-amt
+                                          :net-amount net-amt
+                                          :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))
+                    max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
+                    [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids state)
+                                                                    (:settled-escrow-order state)
+                                                                    escrow-id
+                                                                    max-tracked)]
+                {:state (-> state
+                            (assoc-in [:ledger receiver] new-receiver)
+                            (assoc-in [:escrows escrow-id] updated-escrow)
+                            (assoc :settled-escrow-ids next-settled-ids
+                                   :settled-escrow-order next-settled-ord)
+                            (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
+                 :commands []}))))))))
 
 (defn- handle-refund-intent
   "Handles request to refund escrowed funds on timeout or receiver voluntary refund."
   [state event]
-  (let [escrow-id (:escrow-id event)
-        escrow (get-in state [:escrows escrow-id])
-        event-sender (:sender event)
-        sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
-        current-epoch (long (or (:epoch event) (:epoch state) 0))]
-    (if-not (and escrow (= :locked (:status escrow)))
-      {:state state :commands []}
-      (let [payer (:payer escrow)
-            receiver (:receiver escrow)
-            expires-epoch (long (or (:expires-epoch escrow) 0))
-            amount (long (:amount escrow))
-            timeout? (> current-epoch expires-epoch)
-            receiver-voluntary? (= sender-hex receiver)]
-        (if-not (or timeout? receiver-voluntary?)
-          {:state state :commands []}
-          (if (consensus-mode? state)
-            (let [rid (or (:receipt-id event) (str "refund:" escrow-id))
-                  staged (stage-receipt state {:receipt-id rid
-                                               :type :refund-intent
-                                               :escrow-id escrow-id
-                                               :sender sender-hex})]
-              (if (:ok? staged)
-                {:state (:state staged) :commands []}
-                {:state state :commands []}))
-            (let [payer-acct (get-in state [:ledger payer]
-                                     (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                  new-payer (assoc payer-acct :balance (+ (or (:balance payer-acct) 0) amount))
-                  updated-escrow (assoc escrow
-                                        :status :refunded
-                                        :settled-epoch current-epoch
-                                        :refund-amount amount
-                                        :refund-reason (if receiver-voluntary? :receiver-voluntary :timeout))]
-              {:state (-> state
-                          (assoc-in [:ledger payer] new-payer)
-                          (assoc-in [:escrows escrow-id] updated-escrow)
-                          (update :settled-escrow-ids (fnil conj #{}) escrow-id))
-               :commands []})))))))
+  (if-not (or (nil? (:epoch event)) (integer? (:epoch event)))
+    {:state state :commands []}
+    (let [escrow-id (:escrow-id event)
+          escrow (get-in state [:escrows escrow-id])
+          event-sender (:sender event)
+          sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
+          current-epoch (long (or (:epoch event) (:epoch state) 0))]
+      (if-not (and escrow (= :locked (:status escrow)))
+        {:state state :commands []}
+        (let [payer (:payer escrow)
+              receiver (:receiver escrow)
+              expires-epoch (long (or (:expires-epoch escrow) 0))
+              amount (long (:amount escrow))
+              timeout? (and (> current-epoch expires-epoch)
+                            (or (nil? sender-hex) (contains? #{payer receiver} sender-hex)))
+              receiver-voluntary? (= sender-hex receiver)]
+          (if-not (or timeout? receiver-voluntary?)
+            {:state state :commands []}
+            (if (consensus-mode? state)
+              (let [rid (or (:receipt-id event) (str "refund:" escrow-id))
+                    staged (stage-receipt state {:receipt-id rid
+                                                 :type :refund-intent
+                                                 :escrow-id escrow-id
+                                                 :sender sender-hex})]
+                (if (:ok? staged)
+                  {:state (:state staged) :commands []}
+                  {:state state :commands []}))
+              (let [payer-acct (get-in state [:ledger payer]
+                                       (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                    new-payer (assoc payer-acct :balance (+ (or (:balance payer-acct) 0) amount))
+                    updated-escrow (assoc escrow
+                                          :status :refunded
+                                          :settled-epoch current-epoch
+                                          :refund-amount amount
+                                          :refund-reason (if receiver-voluntary? :receiver-voluntary :timeout))
+                    max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
+                    [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids state)
+                                                                    (:settled-escrow-order state)
+                                                                    escrow-id
+                                                                    max-tracked)]
+                {:state (-> state
+                            (assoc-in [:ledger payer] new-payer)
+                            (assoc-in [:escrows escrow-id] updated-escrow)
+                            (assoc :settled-escrow-ids next-settled-ids
+                                   :settled-escrow-order next-settled-ord))
+                 :commands []}))))))))
 
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,

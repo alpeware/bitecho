@@ -304,6 +304,7 @@ Bitecho is strictly single-currency (`$ECHO`). Milestone 3 implements a pure, de
    - **`:lock-intent`**:
      - Locks `$ECHO` amount from payer's balance into `[:escrows escrow-id]`.
      - Fails closed on self-dealing (`payer == receiver`), non-positive amounts, invalid deliverable hashes, expired epochs (`expires-epoch <= created-epoch`), insufficient payer balance, or duplicate escrow IDs.
+     - Enforces 168-epoch horizon (`max-escrow-horizon = 168`): requires `(>= created-epoch (- current-epoch 168))` and `(<= (- expires-epoch created-epoch) 168)` so stale or ancient escrows cannot be locked or re-locked after pruning.
      - In consensus mode, pending `:lock-intent` receipts staged in `:pending-receipts` immediately deduct from payer's `spendable-balance`, preventing unfinalized double-locking.
    - **`:release-intent`**:
      - Verified release operates in two supported modes:
@@ -311,15 +312,18 @@ Bitecho is strictly single-currency (`$ECHO`). Milestone 3 implements a pure, de
        2. **Cryptographic Preimage / Hash-Lock Release**: Receiver submits non-blank `:preimage` whose SHA-256 equals `:deliverable-hash` (`verify-deliverable-preimage`), guarded by `epoch <= expires-epoch`.
      - Burns mandatory protocol settlement take $\tau = 0.5\%$ (`take-bps = (max 1 configured-bps)`, minimum 1 unit burned for positive amounts via `calculate-escrow-settlement-take`).
      - Net amount is credited to receiver ledger balance; take is recorded into `[:epoch-settlement-takes closing-epoch]`, feeding trailing revenue $R_{\text{trailing}}$ and demand-gated minting.
-     - Escrow status transitions to `:released`.
+     - Escrow status transitions to `:released`, recording `:settled-epoch`.
    - **`:refund-intent`**:
-     - Timeout refund after `expires-epoch` (`epoch > expires-epoch`), callable by payer or receiver.
+     - Timeout refund after `expires-epoch` (`epoch > expires-epoch`), callable by payer or receiver (when sender is present, strictly required that `sender in #{payer receiver}`).
      - Voluntary early cancellation/refund callable by receiver (`:sender == receiver`).
      - Refunds 100% of escrow amount back to payer with zero take burned.
-     - Escrow status transitions to `:refunded`.
+     - Escrow status transitions to `:refunded`, recording `:settled-epoch`.
    - **Mutual Exclusion & Supply Conservation**:
      - Escrows settle at most once: once `:released` or `:refunded`, subsequent competing receipts fail closed and never double-credit.
      - Supply conservation identity holds across all states: $\text{initial\_supply} - \sum \text{released\_takes} = \sum \text{balances} + \sum_{\text{locked}} \text{amount}$.
+   - **Bounded Retention & Epoch Pruning (`prune-expired-tick-state`)**:
+     - Settled escrows (`:released` or `:refunded`) record `:settled-epoch` and are retained up to `max-escrow-horizon` (168 epochs). Advancing ticks past the cutoff (`cutoff = current-epoch - 168`) prunes settled entries from `:escrows`, while active `:locked` escrows are preserved until settled.
+     - Settled escrow IDs are tracked in `:settled-escrow-ids` with deterministic FIFO eviction via `fifo-track` on `:settled-escrow-order`, bounded by `max-tracked-receipts` (default 10,000).
 
 3. **Light-Node State, DAC Spend Authorization & CLI**:
    - Commands: `lock-intent`, `release-intent`, `refund-intent`, `escrows`.

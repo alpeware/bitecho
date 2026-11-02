@@ -34,9 +34,13 @@
                                          :deliverable-hash d-hash
                                          :created-epoch c-ep
                                          :expires-epoch e-ep
-                                         :nonce nonce})]
+                                         :nonce nonce})
+          payer-bytes (basalt/hex->bytes payer)
+          receiver-bytes (basalt/hex->bytes receiver)
+          id-bytes (escrow/compute-escrow-id payer-bytes receiver-bytes amount d-hash c-ep e-ep nonce)]
       (is (= 64 (count id1)))
-      (is (= id1 id2)))))
+      (is (= id1 id2))
+      (is (= id1 id-bytes)))))
 
 (deftest test-preimage-verification
   (testing "verify-deliverable-preimage validates correct preimages and rejects corrupted ones"

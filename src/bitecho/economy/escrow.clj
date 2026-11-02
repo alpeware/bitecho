@@ -19,19 +19,29 @@
 (defn normalize-hex
   "Trims and lower-cases a hex string."
   [s]
-  (when s
-    (str/lower-case (str/trim (str s)))))
+  (cond
+    (string? s) (str/lower-case (str/trim s))
+    (bytes? s) (str/lower-case (basalt/bytes->hex s))
+    :else nil))
+
+(defn normalize-party
+  "Normalizes a public key party identifier (string hex or byte array) to lower-case hex string."
+  [p]
+  (cond
+    (string? p) (str/lower-case (str/trim p))
+    (bytes? p) (str/lower-case (basalt/bytes->hex p))
+    :else nil))
 
 (defn canonical-escrow-id-str
   "Formats canonical string for escrow identification."
   [payer receiver amount deliverable-hash created-epoch expires-epoch nonce]
   (str "bitecho-escrow-v1|"
-       (normalize-hex payer) "|"
-       (normalize-hex receiver) "|"
-       (long amount) "|"
+       (normalize-party payer) "|"
+       (normalize-party receiver) "|"
+       (long (if (integer? amount) amount (or amount 0))) "|"
        (normalize-hex deliverable-hash) "|"
-       (long created-epoch) "|"
-       (long expires-epoch) "|"
+       (long (if (integer? created-epoch) created-epoch (or created-epoch 0))) "|"
+       (long (if (integer? expires-epoch) expires-epoch (or expires-epoch 0))) "|"
        (or nonce "0")))
 
 (defn compute-escrow-id
