@@ -148,6 +148,36 @@
     (catch Exception _ nil)))
 
 ;; -----------------------------------------------------------------------------
+;; Offer Hash Binding & DAC Integrity (SPEC §4)
+;; -----------------------------------------------------------------------------
+
+(defn offer-hash
+  "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, and home-node.
+   When :dac is absent, uses canonical format bitecho-sealed-offer-v1|...
+   When :dac is present, appends |<dac-id> to cryptographically bind the offer signature to the specific DAC."
+  [offer-map]
+  (let [sid (str (or (:session-id offer-map) (get offer-map "session_id") (get offer-map "session-id") ""))
+        caller (str (or (:caller offer-map) (get offer-map "caller") ""))
+        callee (str (or (:callee offer-map) (get offer-map "callee") ""))
+        eph (str (or (:caller-ephemeral-pub offer-map) (get offer-map "caller_ephemeral_pub") (get offer-map "caller-ephemeral-pub") ""))
+        epoch (long (or (:epoch offer-map) (get offer-map "epoch") 0))
+        price (long (or (:price offer-map) (get offer-map "price") 0))
+        home-node (or (:home-node offer-map) (get offer-map "home_node") (get offer-map "home-node") "")
+        hn-str (if (keyword? home-node) (name home-node) (str home-node))
+        dac (or (:dac offer-map) (get offer-map "dac"))
+        dac-id (when dac (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id") (:dac_id dac)))
+        base-str (str "bitecho-sealed-offer-v1|" sid "|" caller "|" callee "|" eph "|" epoch "|" price "|" hn-str)
+        canonical-str (if (and dac (seq (str dac-id)))
+                        (str base-str "|" dac-id)
+                        base-str)
+        md (java.security.MessageDigest/getInstance "SHA-256")
+        digest (.digest md (.getBytes canonical-str "UTF-8"))
+        sb (StringBuilder.)]
+    (doseq [b digest]
+      (.append sb (format "%02x" (Byte/toUnsignedInt b))))
+    (.toString sb)))
+
+;; -----------------------------------------------------------------------------
 ;; Gap-Tolerant Replay Window (SPEC §7)
 ;; -----------------------------------------------------------------------------
 

@@ -131,7 +131,7 @@
                                       "pubkey" (extract-flag-value args "--pubkey" nil)}
                    "dac-attach" {"cmd" "dac-attach"}
                    "dac-revoke" {"cmd" "dac-revoke"}
-                   "directory-verify" (let [pk (extract-flag-value args "--pubkey" nil)]
+                   "directory-verify" (let [pk (extract-flag-value args "--directory-pubkey" nil)]
                                         (cond-> {"cmd" "directory-verify"}
                                           pk (assoc "directory_pubkey" pk)))
                    {"cmd" verb})]

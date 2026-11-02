@@ -1468,4 +1468,490 @@
                    (= false (:ok? (light-core/verify-dac dac {:revoked-dac-ids #{(:dac-id dac)} :current-epoch issued-ep})))
                    (= "dac-revoked" (:error (light-core/verify-dac dac {:revoked-dac-ids #{(:dac-id dac)} :current-epoch issued-ep})))))))
 
+;; -----------------------------------------------------------------------------
+;; Axiom Step 2B Hardening: String-Keyed Continuity, Mistyped Fields, Spend Limits, Offer Binding
+;; -----------------------------------------------------------------------------
+
+(deftest test-directory-verify-string-keys-continuity
+  (testing "FLAG 1: directory-verify key continuity and caching with string-keyed JSONL descriptors"
+    (let [agent-id (test-identity)
+          agent-pub (:pubkey-hex agent-id)
+          agent-priv (:privkey-bytes agent-id)
+          dir-id (test-identity)
+          dir-pub (:pubkey-hex dir-id)
+          dir-priv (:privkey-bytes dir-id)
+          init-st (light-core/init-light-state (:identity agent-id) {:epoch 10 :bootstrap {:custody-pubkey dir-pub}})
+          nick "alice"
+          pop1 (light-core/create-directory-pop agent-priv {:domain "bitecho.org"
+                                                            :nickname nick
+                                                            :pubkey agent-pub
+                                                            :home-set ["node1"]
+                                                            :epoch 10})
+          desc1 (light-core/sign-directory-descriptor dir-priv dir-pub pop1 {:issued-epoch 10
+                                                                             :expires-epoch 20})
+          str-desc1 (json/read-str (json/write-str desc1))
+          res1 (light-core/handle-command init-st {"cmd" "directory-verify"
+                                                   "descriptor" str-desc1
+                                                   "directory_pubkey" dir-pub}
+                                          agent-priv)
+          st1 (:state res1)
+          cached1 (get-in st1 [:directory-cache nick])]
+
+      ;; 1. First directory-verify with string-keyed descriptor succeeds and caches normalized keyword map
+      (is (= true (get-in res1 [:response "ok"])))
+      (is (= nick (get-in res1 [:response "nickname"])))
+      (is (= agent-pub (get-in res1 [:response "pubkey"])))
+      (is (map? cached1))
+      (is (= agent-pub (:pubkey cached1)))
+      (is (= :directory-descriptor (:bitecho/type cached1)))
+
+      ;; 2. Re-verifying the EXACT same string-keyed descriptor a second time succeeds (idempotent re-verification)
+      (let [res2 (light-core/handle-command st1 {"cmd" "directory-verify"
+                                                 "descriptor" str-desc1
+                                                 "directory_pubkey" dir-pub}
+                                            agent-priv)]
+        (is (= true (get-in res2 [:response "ok"])))
+        (is (= agent-pub (get-in res2 [:response "pubkey"])))
+        (is (= agent-pub (get-in res2 [:state :directory-cache nick :pubkey]))))
+
+        ;; 3. Verifying a rotated string-keyed descriptor succeeds and updates :directory-cache
+      (let [agent-id2 (test-identity)
+            agent-pub2 (:pubkey-hex agent-id2)
+            agent-priv2 (:privkey-bytes agent-id2)
+            rot-pop (light-core/create-directory-pop agent-priv2 {:domain "bitecho.org"
+                                                                  :nickname nick
+                                                                  :pubkey agent-pub2
+                                                                  :home-set ["node1" "node2"]
+                                                                  :epoch 11
+                                                                  :prev-pubkey agent-pub
+                                                                  :prev-privkey-bytes agent-priv})
+            rot-desc (light-core/sign-directory-descriptor dir-priv dir-pub rot-pop {:issued-epoch 11
+                                                                                     :expires-epoch 25})
+            str-rot-desc (json/read-str (json/write-str rot-desc))
+            res3 (light-core/handle-command st1 {"cmd" "directory-verify"
+                                                 "descriptor" str-rot-desc
+                                                 "directory_pubkey" dir-pub}
+                                            agent-priv2)
+            st3 (:state res3)
+            cached3 (get-in st3 [:directory-cache nick])]
+        (is (= true (get-in res3 [:response "ok"])))
+        (is (= agent-pub2 (get-in res3 [:response "pubkey"])))
+        (is (= agent-pub2 (:pubkey cached3)))
+        (is (= agent-pub (:prev-pubkey cached3)))
+
+          ;; 4. Verifying a string-keyed descriptor with a different pubkey and no valid rotation link fails closed
+        (let [agent-id3 (test-identity)
+              agent-pub3 (:pubkey-hex agent-id3)
+              agent-priv3 (:privkey-bytes agent-id3)
+              unlinked-pop (light-core/create-directory-pop agent-priv3 {:domain "bitecho.org"
+                                                                         :nickname nick
+                                                                         :pubkey agent-pub3
+                                                                         :home-set ["node1"]
+                                                                         :epoch 11})
+              unlinked-desc (light-core/sign-directory-descriptor dir-priv dir-pub unlinked-pop {:issued-epoch 11
+                                                                                                 :expires-epoch 25})
+              str-unlinked (json/read-str (json/write-str unlinked-desc))
+              res4 (light-core/handle-command st3 {"cmd" "directory-verify"
+                                                   "descriptor" str-unlinked
+                                                   "directory_pubkey" dir-pub}
+                                              agent-priv3)]
+          (is (= false (get-in res4 [:response "ok"])))
+          (is (= "broken-key-continuity" (get-in res4 [:response "error"])))
+            ;; Cache retains the legitimately rotated pubkey2
+          (is (= agent-pub2 (get-in res4 [:state :directory-cache nick :pubkey]))))))))
+
+(defspec ^{:doc "Property: directory-verify with string-keyed JSON roundtrip preserves continuity and rejects unauthorized replacement"}
+  prop-directory-verify-string-keys-continuity 25
+  (prop/for-all [nick-suffix (gen/choose 1000 9999)
+                 epoch (gen/choose 1 50)
+                 validity (gen/choose 5 30)]
+                (let [agent-id1 (test-identity)
+                      agent-pub1 (:pubkey-hex agent-id1)
+                      agent-priv1 (:privkey-bytes agent-id1)
+                      agent-id2 (test-identity)
+                      agent-pub2 (:pubkey-hex agent-id2)
+                      agent-priv2 (:privkey-bytes agent-id2)
+                      agent-id3 (test-identity)
+                      agent-pub3 (:pubkey-hex agent-id3)
+                      agent-priv3 (:privkey-bytes agent-id3)
+                      dir-id (test-identity)
+                      dir-pub (:pubkey-hex dir-id)
+                      dir-priv (:privkey-bytes dir-id)
+                      nick (str "spec-agent-" nick-suffix)
+                      init-st (light-core/init-light-state (:identity agent-id1) {:epoch epoch :bootstrap {:custody-pubkey dir-pub}})
+                      pop1 (light-core/create-directory-pop agent-priv1 {:domain "bitecho.org"
+                                                                         :nickname nick
+                                                                         :pubkey agent-pub1
+                                                                         :home-set ["node1"]
+                                                                         :epoch epoch})
+                      desc1 (light-core/sign-directory-descriptor dir-priv dir-pub pop1 {:issued-epoch epoch
+                                                                                         :expires-epoch (+ epoch validity)})
+                      str-desc1 (json/read-str (json/write-str desc1))
+                      res1 (light-core/handle-command init-st {"cmd" "directory-verify" "descriptor" str-desc1 "directory-pubkey" dir-pub} agent-priv1)
+                      st1 (:state res1)
+                      res-idem (light-core/handle-command st1 {"cmd" "directory-verify" "descriptor" str-desc1 "directory-pubkey" dir-pub} agent-priv1)
+                      rot-pop (light-core/create-directory-pop agent-priv2 {:domain "bitecho.org"
+                                                                            :nickname nick
+                                                                            :pubkey agent-pub2
+                                                                            :home-set ["node1"]
+                                                                            :epoch (inc epoch)
+                                                                            :prev-pubkey agent-pub1
+                                                                            :prev-privkey-bytes agent-priv1})
+                      rot-desc (light-core/sign-directory-descriptor dir-priv dir-pub rot-pop {:issued-epoch (inc epoch)
+                                                                                               :expires-epoch (+ epoch validity 5)})
+                      str-rot (json/read-str (json/write-str rot-desc))
+                      res-rot (light-core/handle-command st1 {"cmd" "directory-verify" "descriptor" str-rot "directory-pubkey" dir-pub} agent-priv2)
+                      st-rot (:state res-rot)
+                      hijack-pop (light-core/create-directory-pop agent-priv3 {:domain "bitecho.org"
+                                                                               :nickname nick
+                                                                               :pubkey agent-pub3
+                                                                               :home-set ["node1"]
+                                                                               :epoch (inc epoch)})
+                      hijack-desc (light-core/sign-directory-descriptor dir-priv dir-pub hijack-pop {:issued-epoch (inc epoch)
+                                                                                                     :expires-epoch (+ epoch validity 5)})
+                      str-hijack (json/read-str (json/write-str hijack-desc))
+                      res-hijack (light-core/handle-command st-rot {"cmd" "directory-verify" "descriptor" str-hijack "directory-pubkey" dir-pub} agent-priv3)]
+                  (and (= true (get-in res1 [:response "ok"]))
+                       (= true (get-in res-idem [:response "ok"]))
+                       (= true (get-in res-rot [:response "ok"]))
+                       (= false (get-in res-hijack [:response "ok"]))
+                       (= "broken-key-continuity" (get-in res-hijack [:response "error"]))))))
+
+(deftest test-verifiers-fail-closed-on-mistyped-wire-fields
+  (testing "FLAG 2: Pure verifiers fail closed with zero exceptions on mistyped wire fields"
+    (let [agent-id (test-identity)
+          agent-pub (:pubkey-hex agent-id)
+          agent-priv (:privkey-bytes agent-id)
+          anchor-id (test-identity)
+          anchor-pub (:pubkey-hex anchor-id)
+          anchor-priv (:privkey-bytes anchor-id)
+          dir-id (test-identity)
+          dir-pub (:pubkey-hex dir-id)
+          dir-priv (:privkey-bytes dir-id)
+          valid-pop (light-core/create-directory-pop agent-priv {:domain "bitecho.org"
+                                                                 :nickname "tester"
+                                                                 :pubkey agent-pub
+                                                                 :home-set ["node1"]
+                                                                 :epoch 10})
+          valid-desc (light-core/sign-directory-descriptor dir-priv dir-pub valid-pop {:issued-epoch 10
+                                                                                       :expires-epoch 20})
+          valid-dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                        :agent-pubkey agent-pub
+                                                        :issued-epoch 10
+                                                        :expires-epoch 20
+                                                        :max-spend-per-epoch 50000
+                                                        :scopes ["gossip" "offer" "transfer"]})
+          valid-rev (light-core/create-dac-revocation anchor-priv {:anchor-pubkey anchor-pub
+                                                                   :agent-pubkey agent-pub
+                                                                   :dac-id (:dac-id valid-dac)
+                                                                   :revoked-epoch 10})]
+
+      ;; 1. verify-directory-pop with mistyped fields
+      (is (= false (light-core/verify-directory-pop nil)))
+      (is (= false (light-core/verify-directory-pop "not-a-map")))
+      (is (= false (light-core/verify-directory-pop 12345)))
+      (is (= false (light-core/verify-directory-pop [])))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :epoch "10"))))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :pubkey 12345))))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :domain 42))))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :home-set 123))))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :home-set ["node1" 123]))))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :pop-signature 999))))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :prev-pubkey 123))))
+      (is (= false (light-core/verify-directory-pop (assoc valid-pop :rotation-signature 123))))
+
+      ;; 2. verify-directory-descriptor with mistyped fields
+      (is (= false (:ok? (light-core/verify-directory-descriptor nil dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor "string" dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor 123 dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :issued-epoch "10") dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :expires-epoch "20") dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :epoch "10") dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor valid-desc dir-pub "not-integer-epoch"))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :home-set "not-a-coll") dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :home-set [123 {}]) dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :domain 123) dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :nickname 456) dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :pubkey 789) dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor (assoc valid-desc :directory-pubkey 111) dir-pub 10))))
+      (is (= false (:ok? (light-core/verify-directory-descriptor valid-desc 99999 10))))
+
+      ;; 3. verify-dac-revocation with mistyped fields
+      (is (= false (light-core/verify-dac-revocation nil)))
+      (is (= false (light-core/verify-dac-revocation "str")))
+      (is (= false (light-core/verify-dac-revocation 123)))
+      (is (= false (light-core/verify-dac-revocation (assoc valid-rev :revoked-epoch "10"))))
+      (is (= false (light-core/verify-dac-revocation (assoc valid-rev :anchor-pubkey 123))))
+      (is (= false (light-core/verify-dac-revocation (assoc valid-rev :agent-pubkey 456))))
+      (is (= false (light-core/verify-dac-revocation (assoc valid-rev :dac-id 789))))
+      (is (= false (light-core/verify-dac-revocation (assoc valid-rev :signature 999))))
+
+      ;; 4. verify-dac with mistyped fields
+      (is (= false (:ok? (light-core/verify-dac nil {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac "str" {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac 123 {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :issued-epoch "10") {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :expires-epoch "20") {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :max-spend-per-epoch "50000") {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :max-spend-per-epoch -10) {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac valid-dac {:current-epoch "bad-epoch"}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :scopes "not-coll") {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :scopes [123 {}]) {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :scopes []) {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :anchor-pubkey 123) {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :agent-pubkey 456) {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :dac-id 789) {:current-epoch 10}))))
+      (is (= false (:ok? (light-core/verify-dac (assoc valid-dac :signature 999) {:current-epoch 10}))))
+
+      ;; 5. Inbound wire offer with malformed :dac drops cleanly with zero exceptions
+      (let [init-st (light-core/init-light-state (:identity agent-id) {:epoch 10})
+            wire-offer {:bitecho/type :channel-offer
+                        :session-id "sess-1"
+                        :caller anchor-pub
+                        :callee agent-pub
+                        :caller-ephemeral-pub (basalt/bytes->hex (:public (sealed/generate-x25519-keypair)))
+                        :epoch 10
+                        :price 0
+                        :home-node "node1"
+                        :offer-hash "hash"
+                        :burn 500
+                        :signature (apply str (repeat 128 "0"))
+                        :dac "not-a-map"}
+            res (light-core/handle-wire-payload init-st wire-offer agent-priv)]
+        (is (= init-st (:state res)))
+        (is (empty? (:net-envelopes res)))))))
+
+(deftest test-note-2-dac-max-spend-per-epoch-enforcement
+  (testing "Note 2: DAC max-spend-per-epoch enforcement, epoch rollover, expiry, and scope denial in transfer and settle-intent"
+    (let [agent-id (test-identity)
+          agent-pub (:pubkey-hex agent-id)
+          agent-priv (:privkey-bytes agent-id)
+          anchor-id (test-identity)
+          anchor-pub (:pubkey-hex anchor-id)
+          anchor-priv (:privkey-bytes anchor-id)
+          recipient-id (test-identity)
+          recipient-pub (:pubkey-hex recipient-id)
+          dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                  :agent-pubkey agent-pub
+                                                  :issued-epoch 10
+                                                  :expires-epoch 20
+                                                  :max-spend-per-epoch 50000
+                                                  :scopes ["transfer" "settle-intent"]})
+          init-st (-> (light-core/init-light-state (:identity agent-id) {:epoch 10})
+                      (assoc :dac dac
+                             :account {:balance 200000 :spendable 200000 :seq 0 :deps []}))
+          res1 (light-core/handle-command init-st {"cmd" "transfer"
+                                                   "recipient" recipient-pub
+                                                   "amount" "30000"
+                                                   "burn" "500"}
+                                          agent-priv)
+          st1 (:state res1)]
+
+      ;; 1. Transfer 30,000 within budget (30,000 <= 50,000) -> succeeds
+      (is (= true (get-in res1 [:response "ok"])))
+      (is (= {:epoch 10 :spent 30000} (:dac-spend st1)))
+
+      ;; 2. Second transfer 25,000 exceeds epoch budget (30,000 + 25,000 = 55,000 > 50,000) -> fails closed
+      (let [res2 (light-core/handle-command st1 {"cmd" "transfer"
+                                                 "recipient" recipient-pub
+                                                 "amount" "25000"}
+                                            agent-priv)]
+        (is (= false (get-in res2 [:response "ok"])))
+        (is (= "dac-max-spend-exceeded" (get-in res2 [:response "error"])))
+        (is (= {:epoch 10 :spent 30000} (:dac-spend (:state res2))))
+
+          ;; 3. Transfer remaining 20,000 in same epoch (30,000 + 20,000 = 50,000 <= 50,000) -> succeeds
+        (let [res3 (light-core/handle-command st1 {"cmd" "transfer"
+                                                   "recipient" recipient-pub
+                                                   "amount" "20000"
+                                                   "burn" "500"}
+                                              agent-priv)
+              st3 (:state res3)]
+          (is (= true (get-in res3 [:response "ok"])))
+          (is (= {:epoch 10 :spent 50000} (:dac-spend st3)))
+
+            ;; 4. Any further spend in epoch 10 fails closed
+          (let [res-over (light-core/handle-command st3 {"cmd" "transfer"
+                                                         "recipient" recipient-pub
+                                                         "amount" "1"}
+                                                    agent-priv)]
+            (is (= false (get-in res-over [:response "ok"])))
+            (is (= "dac-max-spend-exceeded" (get-in res-over [:response "error"]))))
+
+            ;; 5. Advance epoch: rollover resets spend counter for new epoch
+          (let [st-ep11 (assoc st3 :epoch 11)
+                res-ep11 (light-core/handle-command st-ep11 {"cmd" "transfer"
+                                                             "recipient" recipient-pub
+                                                             "amount" "35000"
+                                                             "burn" "500"}
+                                                    agent-priv)
+                st-after-ep11 (:state res-ep11)]
+            (is (= true (get-in res-ep11 [:response "ok"])))
+            (is (= {:epoch 11 :spent 35000} (:dac-spend st-after-ep11)))
+
+              ;; 6. settle-intent in epoch 11: 20,000 exceeds (35,000 + 20,000 = 55,000 > 50,000) -> fails closed
+            (let [res-settle-fail (light-core/handle-command st-after-ep11 {"cmd" "settle-intent"
+                                                                            "receiver" recipient-pub
+                                                                            "amount" "20000"}
+                                                             agent-priv)]
+              (is (= false (get-in res-settle-fail [:response "ok"])))
+              (is (= "dac-max-spend-exceeded" (get-in res-settle-fail [:response "error"]))))
+
+              ;; 7. settle-intent 15,000 (35,000 + 15,000 = 50,000 <= 50,000) -> succeeds
+            (let [res-settle-ok (light-core/handle-command st-after-ep11 {"cmd" "settle-intent"
+                                                                          "receiver" recipient-pub
+                                                                          "amount" "15000"}
+                                                           agent-priv)]
+              (is (= true (get-in res-settle-ok [:response "ok"])))
+              (is (= {:epoch 11 :spent 50000} (:dac-spend (:state res-settle-ok))))))))
+
+        ;; 8. DAC expired at epoch 25 -> fails closed with dac-expired
+      (let [st-exp (assoc st1 :epoch 25)
+            res-exp (light-core/handle-command st-exp {"cmd" "transfer"
+                                                       "recipient" recipient-pub
+                                                       "amount" "1000"}
+                                               agent-priv)]
+        (is (= false (get-in res-exp [:response "ok"])))
+        (is (= "dac-expired" (get-in res-exp [:response "error"]))))
+
+        ;; 9. Scope denial: DAC with only "gossip" scope cannot transfer or settle
+      (let [dac-gossip-only (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                                :agent-pubkey agent-pub
+                                                                :issued-epoch 10
+                                                                :expires-epoch 20
+                                                                :max-spend-per-epoch 50000
+                                                                :scopes ["gossip" "offer"]})
+            st-gossip (assoc init-st :dac dac-gossip-only)
+            res-tx (light-core/handle-command st-gossip {"cmd" "transfer"
+                                                         "recipient" recipient-pub
+                                                         "amount" "1000"}
+                                              agent-priv)
+            res-settle (light-core/handle-command st-gossip {"cmd" "settle-intent"
+                                                             "receiver" recipient-pub
+                                                             "amount" "1000"}
+                                                  agent-priv)]
+        (is (= false (get-in res-tx [:response "ok"])))
+        (is (= "dac-scope-denied" (get-in res-tx [:response "error"])))
+        (is (= false (get-in res-settle [:response "ok"])))
+        (is (= "dac-scope-denied" (get-in res-settle [:response "error"])))))))
+
+(deftest test-note-3-offer-hash-dac-binding
+  (testing "Note 3: offer-hash cryptographically binds :dac when present and rejects stripping/tampering"
+    (let [caller-id (test-identity)
+          caller-pub (:pubkey-hex caller-id)
+          callee-id (test-identity)
+          callee-pub (:pubkey-hex callee-id)
+          anchor-id (test-identity)
+          anchor-pub (:pubkey-hex anchor-id)
+          anchor-priv (:privkey-bytes anchor-id)
+          dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                  :agent-pubkey caller-pub
+                                                  :issued-epoch 10
+                                                  :expires-epoch 20
+                                                  :max-spend-per-epoch 50000
+                                                  :scopes ["offer"]})
+          kp-eph (sealed/generate-x25519-keypair)
+          eph-pub (basalt/bytes->hex (:public kp-eph))
+          session-id (light-core/compute-session-id caller-pub callee-pub eph-pub)
+          base-offer {:session-id session-id
+                      :caller caller-pub
+                      :callee callee-pub
+                      :caller-ephemeral-pub eph-pub
+                      :epoch 10
+                      :price 100
+                      :home-node "node1"}
+          hash-without-dac (sealed/offer-hash base-offer)
+          hash-with-dac (sealed/offer-hash (assoc base-offer :dac dac))]
+
+      ;; Invariant 1: Hash without DAC matches canonical format
+      (is (string? hash-without-dac))
+      ;; Invariant 2: Hash with DAC appends |<dac-id> and differs from hash without DAC
+      (is (string? hash-with-dac))
+      (is (not= hash-without-dac hash-with-dac))
+
+      ;; Invariant 3: Stripping DAC invalidates signature on wire offer
+      (let [callee-st (light-core/init-light-state (:identity callee-id) {:epoch 10})
+            sig-with-dac (basalt/bytes->hex (crypto/sign (:privkey-bytes caller-id) (.getBytes hash-with-dac "UTF-8")))
+            wire-offer {:bitecho/type :channel-offer
+                        :session-id session-id
+                        :caller caller-pub
+                        :callee callee-pub
+                        :caller-ephemeral-pub eph-pub
+                        :epoch 10
+                        :price 100
+                        :home-node "node1"
+                        :offer-hash hash-with-dac
+                        :burn 500
+                        :signature sig-with-dac
+                        :dac dac}
+            ;; Valid offer with DAC arrives and is accepted
+            res-ok (light-core/handle-wire-payload callee-st wire-offer (:privkey-bytes callee-id))]
+        (is (= 1 (count (:pending-offers (:state res-ok)))))
+
+        ;; Adversary strips :dac from the wire offer
+        (let [stripped-offer (dissoc wire-offer :dac)
+              res-stripped (light-core/handle-wire-payload callee-st stripped-offer (:privkey-bytes callee-id))]
+          ;; compute-offer-hash without DAC produces hash-without-dac != hash-with-dac -> dropped!
+          (is (= 0 (count (:pending-offers (:state res-stripped)))))
+          (is (empty? (:net-envelopes res-stripped))))))))
+
+(deftest test-note-1-unwrap-authenticated-agent-event-opts-and-dac-epoch
+  (testing "Note 1: unwrap-authenticated-agent-event accepts 2-arity opts and fails closed when DAC is present without valid epoch"
+    (let [agent-id (test-identity)
+          agent-pub (:pubkey-hex agent-id)
+          agent-priv (:privkey-bytes agent-id)
+          anchor-id (test-identity)
+          anchor-pub (:pubkey-hex anchor-id)
+          anchor-priv (:privkey-bytes anchor-id)
+          dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                  :agent-pubkey agent-pub
+                                                  :issued-epoch 10
+                                                  :expires-epoch 20
+                                                  :max-spend-per-epoch 50000
+                                                  :scopes ["settle-intent" "gossip"]})
+          raw-event {:type :settle-intent
+                     :payer agent-pub
+                     :receiver "302a000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                     :amount 1000
+                     :epoch 15
+                     :receipt-id "rec-1"}
+          env-no-dac (mesh/wrap-agent-event raw-event agent-pub agent-priv)
+          env-with-dac (mesh/wrap-agent-event (assoc raw-event :dac dac) agent-pub agent-priv)]
+
+      ;; 1. Event without DAC unwraps in 1-arity cleanly
+      (let [unwrapped (mesh/unwrap-authenticated-agent-event env-no-dac)]
+        (is (some? unwrapped))
+        (is (= agent-pub (:sender unwrapped))))
+
+      ;; 2. Event with DAC and valid epoch unwraps in 1-arity cleanly
+      (let [unwrapped (mesh/unwrap-authenticated-agent-event env-with-dac)]
+        (is (some? unwrapped))
+        (is (= agent-pub (:sender unwrapped))))
+
+      ;; 3. Event with DAC and MISSING epoch in 1-arity fails closed (returns nil)
+      (let [event-no-ep {:type :settle-intent
+                         :payer agent-pub
+                         :receiver "302a000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                         :amount 1000
+                         :receipt-id "rec-2"
+                         :dac dac}
+            env-no-ep (mesh/wrap-agent-event event-no-ep agent-pub agent-priv)]
+        (is (nil? (mesh/unwrap-authenticated-agent-event env-no-ep)))
+
+        ;; But succeeds in 2-arity when opts supplies :current-epoch 15
+        (let [unwrapped (mesh/unwrap-authenticated-agent-event env-no-ep {:current-epoch 15
+                                                                          :required-scope "settle-intent"})]
+          (is (some? unwrapped))
+          (is (= agent-pub (:sender unwrapped))))
+
+        ;; And fails closed in 2-arity when required-scope is not permitted by DAC
+        (let [unwrapped-denied (mesh/unwrap-authenticated-agent-event env-no-ep {:current-epoch 15
+                                                                                 :required-scope "admin"})]
+          (is (nil? unwrapped-denied)))
+
+        ;; And fails closed in 2-arity when DAC is revoked
+        (let [unwrapped-revoked (mesh/unwrap-authenticated-agent-event env-no-ep {:current-epoch 15
+                                                                                  :revoked-dacs #{(:dac-id dac)}})]
+          (is (nil? unwrapped-revoked)))))))
+
 

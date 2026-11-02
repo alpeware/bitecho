@@ -1241,7 +1241,7 @@
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
                   "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"
-                  "--petname" "--pubkey" "--overwrite"}]
+                  "--petname" "--pubkey" "--overwrite" "--directory-pubkey"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1271,7 +1271,8 @@
       (is (= "dac-attach" (get-in (light-shell/parse-light-node-args ["dac-attach"]) [:cmd-map "cmd"])))
       (is (= "dac-revoke" (get-in (light-shell/parse-light-node-args ["dac-revoke"]) [:cmd-map "cmd"])))
       (is (= "directory-verify" (get-in (light-shell/parse-light-node-args ["directory-verify"]) [:cmd-map "cmd"])))
-      ;; Flags (all 25 flags tested end-to-end)
+      ;; Flags (all 26 flags tested end-to-end)
+      (is (= "dir-key-1" (get-in (light-shell/parse-light-node-args ["directory-verify" "--directory-pubkey" "dir-key-1"]) [:cmd-map "directory_pubkey"])))
       (is (= "alice" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "petname"])))
       (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "pubkey"])))
       (is (true? (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "overwrite"])))

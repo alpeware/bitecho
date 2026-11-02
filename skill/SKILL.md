@@ -490,7 +490,7 @@ Submits a cryptographic DAC revocation signed by the anchor key, immediately inv
 ### `directory-verify`
 Cryptographically verifies an authority-signed directory attestation descriptor and caches it in local directory cache without mutating local petnames.
 
-- **CLI**: `clojure -M:light-node directory-verify '{"descriptor": {...}}' [--pubkey <directory-pubkey>]`
+- **CLI**: `clojure -M:light-node directory-verify '{"descriptor": {...}}' [--directory-pubkey <directory-pubkey>]`
 - **JSONL**: `{"cmd": "directory-verify", "descriptor": {"domain": "bitecho.org", "nickname": "alice", "uri": "bitecho.org/alice", "pubkey": "...", "home_set": ["node1"], "epoch": 10, "issued_epoch": 10, "expires_epoch": 30, "pop_signature": "...", "directory_pubkey": "...", "directory_signature": "..."}}`
 - **Response**:
   ```json
