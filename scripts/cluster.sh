@@ -852,6 +852,185 @@ REMOTE_STATUS
 }
 
 # ------------------------------------------------------------------------------
+# Subcommand: audit
+# ------------------------------------------------------------------------------
+
+cmd_audit() {
+  echo "=== Bitecho 3-Node Cluster Convergence & Soak Audit ==="
+  local tmp_data
+  tmp_data="$(mktemp -d /tmp/bitecho-audit-XXXXXX)"
+
+  local healthy=true
+
+  printf "%-6s %-16s %-10s %-8s %-10s %-10s %-10s %-18s %-10s %-14s %s\n" \
+    "Node" "IP" "State" "RSS" "Epoch" "FinEpoch" "Minted" "BurnDigest" "FailedRcpt" "Conn(Drop/Stale)" "Health"
+  printf "%-6s %-16s %-10s %-8s %-10s %-10s %-10s %-18s %-10s %-14s %s\n" \
+    "------" "----------------" "----------" "--------" "----------" "----------" "----------" "------------------" "----------" "--------------" "------"
+
+  for node in "${NODES[@]}"; do
+    local ip
+    ip="$(get_ip "$node")"
+    if [[ -z "$ip" ]]; then
+      echo "Cannot resolve IP for $node" >&2
+      healthy=false
+      continue
+    fi
+
+    # Fetch statusz, burnsz, accountz, connz, rss from node
+    local raw_metrics
+    raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_AUDIT' 2>/dev/null || echo "SSH_FAILED"
+statusz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/statusz 2>/dev/null || true)
+burnsz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/burnsz 2>/dev/null || true)
+connz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/connz 2>/dev/null || true)
+rss=$(ps -o rss= -C java 2>/dev/null | awk '{printf "%.1fMB", $1/1024}' || echo "N/A")
+echo "METRIC_DELIM"
+echo "$statusz"
+echo "METRIC_DELIM"
+echo "$burnsz"
+echo "METRIC_DELIM"
+echo "$connz"
+echo "METRIC_DELIM"
+echo "$rss"
+REMOTE_AUDIT
+)"
+    if [[ -z "$raw_metrics" || "$raw_metrics" == "SSH_FAILED" ]]; then
+      printf "%-6s %-16s %-10s %-8s %-10s %-10s %-10s %-18s %-10s %-14s %s\n" \
+        "$node" "$ip" "UNREACHABLE" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "FAIL"
+      healthy=false
+      continue
+    fi
+
+    echo "$ip" > "${tmp_data}/${node}.ip"
+    python3 -c "
+import sys
+parts = sys.stdin.read().split('METRIC_DELIM\n')
+if len(parts) >= 5:
+    with open('${tmp_data}/${node}.statusz', 'w') as f:
+        f.write(parts[1])
+    with open('${tmp_data}/${node}.burnsz', 'w') as f:
+        f.write(parts[2])
+    with open('${tmp_data}/${node}.connz', 'w') as f:
+        f.write(parts[3])
+    with open('${tmp_data}/${node}.rss', 'w') as f:
+        f.write(parts[4].strip())
+" <<< "$raw_metrics"
+
+  done
+
+  local rc=0
+  python3 -c "
+import glob, sys, re
+
+nodes = ['node1', 'node2', 'node3']
+data = {}
+for n in nodes:
+    try:
+        with open(f'${tmp_data}/{n}.ip') as f:
+            ip = f.read().strip()
+        with open(f'${tmp_data}/{n}.statusz') as f:
+            st = f.read().strip()
+        with open(f'${tmp_data}/{n}.burnsz') as f:
+            bz = f.read().strip()
+        with open(f'${tmp_data}/{n}.connz') as f:
+            cz = f.read().strip()
+        with open(f'${tmp_data}/{n}.rss') as f:
+            rss = f.read().strip()
+        data[n] = {'ip': ip, 'statusz': st, 'burnsz': bz, 'connz': cz, 'rss': rss}
+    except Exception as e:
+        pass
+
+if len(data) < len(nodes):
+    print(f'Error: Only {len(data)}/{len(nodes)} nodes provided audit telemetry.')
+    sys.exit(1)
+
+parsed = {}
+for n, d in data.items():
+    st = {}
+    for kv in d['statusz'].split():
+        if '=' in kv:
+            k, v = kv.split('=', 1)
+            st[k] = v
+    parsed[n] = st
+
+all_ok = True
+fin_epochs = {}
+minted_vals = {}
+burn_digests = {}
+failed_rcpts = {}
+
+for n in nodes:
+    st = parsed.get(n, {})
+    ep = st.get('epoch', 'N/A')
+    fin_ep = int(st.get('finalized_epoch', 0))
+    fin_epochs[n] = fin_ep
+    minted = int(st.get('minted', 0))
+    minted_vals[n] = minted
+    bdig = st.get('burn_digest', 'N/A')
+    burn_digests[n] = bdig
+    failed = int(st.get('failed_receipts', 0))
+    failed_rcpts[n] = failed
+    drop = st.get('conn_dropped', '0')
+    stale = st.get('conn_stale', '0')
+    rss = data[n]['rss']
+    
+    node_ok = (failed == 0)
+    if not node_ok:
+        all_ok = False
+    
+    print(f'{n:<6} {data[n].get(\"ip\",\"127.0.0.1\"):<16} running    {rss:<8} {ep:<10} {fin_ep:<10} {minted:<10} {bdig:<18} {failed:<10} {drop}/{stale:<14} {\"OK\" if node_ok else \"FAIL\"}')
+
+min_fin = min(fin_epochs.values())
+max_fin = max(fin_epochs.values())
+skew = max_fin - min_fin
+minted_skew = max(minted_vals.values()) - min(minted_vals.values())
+
+node_windows = {}
+for n in nodes:
+    bz = data[n]['burnsz']
+    w_match = re.search(r':window\s+\[(.*)\]', bz, re.DOTALL)
+    win_dict = {}
+    if w_match:
+        entries = re.findall(r'\[(\d+)\s+(\d+)\s+(\d+)\]', w_match.group(1))
+        for e_str, b_str, t_str in entries:
+            win_dict[int(e_str)] = (int(b_str), int(t_str))
+    node_windows[n] = win_dict
+
+mismatches = []
+all_eps = set()
+for win in node_windows.values():
+    all_eps.update([e for e in win.keys() if e <= min_fin])
+
+for e in sorted(all_eps):
+    vals = [win[e] for win in node_windows.values() if e in win]
+    if len(vals) >= 2 and len(set(vals)) > 1:
+        mismatches.append((e, vals))
+
+digest_mismatch = False
+for fep in set(fin_epochs.values()):
+    digs = set(bdig for n, bdig in burn_digests.items() if fin_epochs[n] == fep)
+    if len(digs) > 1:
+        digest_mismatch = True
+
+print('\n--- Convergence & Soak Assessment ---')
+print(f'Common Finalized Epoch: {min_fin}')
+print(f'Finalized Epoch Skew:   {skew} (healthy <= 2)')
+print(f'Minted Values / Skew:   {minted_vals} (skew={minted_skew})')
+print(f'Burn Digest Parity:     {\"PASSED\" if not digest_mismatch else \"FAILED\"}')
+print(f'Window Burns Converged: {\"PASSED\" if not mismatches else f\"FAILED (mismatches: {len(mismatches)})\"}')
+print(f'Failed Receipts Max:    {max(failed_rcpts.values())} (healthy == 0)')
+
+if skew > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0:
+    print('\nVerdict: DIVERGENCE DETECTED')
+    sys.exit(1)
+else:
+    print('\nVerdict: CLUSTER 100% CONVERGED AND HEALTHY')
+    sys.exit(0)
+" || rc=$?
+  rm -rf "$tmp_data"
+  return "$rc"
+}
+
+# ------------------------------------------------------------------------------
 # Subcommand: logs
 # ------------------------------------------------------------------------------
 
@@ -1088,6 +1267,7 @@ Commands:
   init                                Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
   deploy [--reset-state]              Build local uberjar, sync configs/keys/binaries, and restart bitecho services
   status                              Display live status table across all 3 cluster nodes
+  audit                               Audit /statusz, /burnsz, /accountz, /connz, and memory convergence across all 3 nodes
   simulate [--agents N] [--messages M] [--burn B] Run light agent swarm simulator against Devnet
   fund <recipient> [amount]           Send ECH from Devnet custody to an agent public key (default: 1000000)
   chaos [--rounds N] [--interval SEC] Run chaos monkey restarting random nodes and checking convergence
@@ -1121,6 +1301,9 @@ main() {
       ;;
     status)
       cmd_status "$@"
+      ;;
+    audit)
+      cmd_audit "$@"
       ;;
     simulate)
       cmd_simulate "$@"

@@ -146,6 +146,12 @@ In Streamlet consensus clusters, nodes operate a dual-phase execution pipeline:
 2. **Post-Finality Execution**: Proposers pack unfinalized receipts into block payloads. Upon 3-chain block finalization, `execute-finalized-blocks` iterates through newly finalized blocks in ascending chain order, applying transfers, deducting signaling burns, executing settlement takes, settling vouchers, and driving demand-gated treasury minting.
 3. **FIFO Replay-Protection Horizon**: Receipt and block tracking sets (`:known-receipt-ids`, `:executed-receipt-ids`, `:executed-finalized-blocks`) utilize deterministic FIFO eviction (`fifo-track`) bounded by `:max-tracked-receipts` (default `10,000`), establishing an explicit, deterministic replay-protection horizon while eliminating unbounded set growth.
 4. **Burn Digest Diagnostics**: Nodes expose consensus convergence via `burn_digest` (cross-node comparable at the same `finalized_epoch` height) and `finalized_epoch` in `render-statusz` and the `/burnsz` HTTP endpoint, ensuring verifiable, cross-node auditability.
+5. **Cross-Node Convergence Audit & Unrooted Finalized-Chain Guard**:
+   - `canonical-unexecuted-finalized-chain` enforces an ancestor-continuity guard: when walking backwards from `:latest-finalized-block-hash`, unrooted finalized block suffixes across missing intermediate ancestor blocks are held unexecuted until missing ancestors are synced, preventing premature execution skips (`st-skipped`).
+   - Cluster convergence is continuously evaluable via pure `evaluate-cluster-convergence` (`bitecho.shell.mesh`) and `./scripts/cluster.sh audit`:
+     - Compares `/burnsz` trailing windows across all nodes for all epochs $e \le \text{common\_finalized\_epoch}$.
+     - Asserts finalized epoch skew $\le 2$ epochs and zero failed receipts.
+     - Verifies identical `burn_digest` across all nodes at matching finalized epoch heights.
 
 ### F. Multi-Peer Session Durability, Failover Rotation & Idempotent Session Replay
 Light nodes (AI agents) and edge participants maintain zero-loss, zero-duplication session durability across arbitrary validator restarts, network partitions, and failover rotations:

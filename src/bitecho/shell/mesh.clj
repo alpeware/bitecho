@@ -772,6 +772,136 @@
      (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d conn_dropped=%d conn_stale=%d\n"
              role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts conn-dropped conn-stale))))
 
+(defn parse-statusz-line
+  "Parses a statusz line string into a keyword map with numeric fields parsed as longs."
+  [line]
+  (when (and (string? line) (not (str/blank? line)))
+    (let [kvs (str/split (str/trim line) #"\s+")
+          numeric-keys #{:epoch :notarized :finalized :supply :minted :burns
+                         :finalized_epoch :pending_receipts :failed_receipts
+                         :conn_dropped :conn_stale}]
+      (reduce
+       (fn [m kv]
+         (let [[k-str v-str] (str/split kv #"=" 2)]
+           (if (and k-str v-str)
+             (let [k (keyword k-str)
+                   v (if (contains? numeric-keys k)
+                       (try (Long/parseLong v-str) (catch Exception _ 0))
+                       v-str)]
+               (assoc m k v))
+             m)))
+       {}
+       kvs))))
+
+(defn evaluate-cluster-convergence
+  "Pure function evaluating consensus, burn window, and soak convergence across cluster node snapshots.
+   Takes {node-id {:statusz <map-or-str> :burnsz {:anchor-epoch ... :window [[ep burn take] ...]} ...}}
+   and returns structured convergence telemetry."
+  [node-snapshots]
+  (if (empty? node-snapshots)
+    {:common-finalized-epoch 0
+     :finalized-epoch-skew 0
+     :epoch-mismatches []
+     :window-burns-converged? true
+     :minted-values {}
+     :minted-skew 0
+     :burn-digest-converged? true
+     :soak-summary {:max_failed_receipts 0
+                    :total_conn_dropped 0
+                    :total_conn_stale 0
+                    :finality_healthy? true}
+     :converged? true}
+    (let [parsed-snapshots
+          (into {}
+                (map (fn [[nid snap]]
+                       (let [raw-st (:statusz snap)
+                             st-map (if (string? raw-st)
+                                      (parse-statusz-line raw-st)
+                                      (or raw-st {}))
+                             fin-epoch (long (or (:finalized_epoch st-map)
+                                                 (get-in snap [:burnsz :anchor-epoch])
+                                                 0))
+                             minted (long (or (:minted st-map) 0))
+                             burn-digest (:burn_digest st-map)
+                             failed-rcpts (long (or (:failed_receipts st-map) 0))
+                             conn-drop (long (or (get-in snap [:connz :conn_dropped])
+                                                 (:conn_dropped st-map)
+                                                 0))
+                             conn-stale (long (or (get-in snap [:connz :conn_stale])
+                                                  (:conn_stale st-map)
+                                                  0))]
+                         [nid {:statusz st-map
+                               :burnsz (:burnsz snap)
+                               :accountz (:accountz snap)
+                               :connz (:connz snap)
+                               :fin-epoch fin-epoch
+                               :minted minted
+                               :burn-digest burn-digest
+                               :failed-rcpts failed-rcpts
+                               :conn-drop conn-drop
+                               :conn-stale conn-stale}]))
+                     node-snapshots))
+          fin-epochs (mapv :fin-epoch (vals parsed-snapshots))
+          common-fin-epoch (if (seq fin-epochs) (apply min fin-epochs) 0)
+          max-fin-epoch (if (seq fin-epochs) (apply max fin-epochs) 0)
+          fin-epoch-skew (- max-fin-epoch common-fin-epoch)
+
+          ;; Extract node windows and check per-epoch convergence for ep <= common-finalized-epoch
+          node-ep-maps (into {}
+                             (map (fn [[nid snap]]
+                                    [nid (into {}
+                                               (map (fn [[ep b t]]
+                                                      [(long ep) [(long (or b 0)) (long (or t 0))]]))
+                                               (get-in snap [:burnsz :window]))])
+                                  parsed-snapshots))
+          candidate-epochs (into (sorted-set)
+                                 (filter #(<= (long %) common-fin-epoch)
+                                         (mapcat keys (vals node-ep-maps))))
+          epoch-mismatches (vec (sort (filter (fn [ep]
+                                                (let [vals (keep #(get % ep) (vals node-ep-maps))]
+                                                  (and (>= (count vals) 2)
+                                                       (not (apply = vals)))))
+                                              candidate-epochs)))
+          window-burns-converged? (empty? epoch-mismatches)
+
+          minted-values (into {} (map (fn [[nid p]] [nid (:minted p)]) parsed-snapshots))
+          minted-skew (if (seq (vals minted-values))
+                        (- (apply max (vals minted-values)) (apply min (vals minted-values)))
+                        0)
+
+          ;; Check burn digest convergence across nodes at the same finalized-epoch
+          nodes-by-fin-epoch (group-by :fin-epoch (vals parsed-snapshots))
+          burn-digest-converged? (every? (fn [[_ nodes]]
+                                           (let [digests (distinct (keep :burn-digest nodes))]
+                                             (<= (count digests) 1)))
+                                         nodes-by-fin-epoch)
+
+          max-failed (if (seq (vals parsed-snapshots))
+                       (apply max (map :failed-rcpts (vals parsed-snapshots)))
+                       0)
+          total-dropped (reduce + 0 (map :conn-drop (vals parsed-snapshots)))
+          total-stale (reduce + 0 (map :conn-stale (vals parsed-snapshots)))
+          finality-healthy? (<= fin-epoch-skew 2)
+
+          soak-summary {:max_failed_receipts max-failed
+                        :total_conn_dropped total-dropped
+                        :total_conn_stale total-stale
+                        :finality_healthy? finality-healthy?}
+
+          converged? (and window-burns-converged?
+                          burn-digest-converged?
+                          finality-healthy?
+                          (zero? max-failed))]
+      {:common-finalized-epoch common-fin-epoch
+       :finalized-epoch-skew fin-epoch-skew
+       :epoch-mismatches epoch-mismatches
+       :window-burns-converged? window-burns-converged?
+       :minted-values minted-values
+       :minted-skew minted-skew
+       :burn-digest-converged? burn-digest-converged?
+       :soak-summary soak-summary
+       :converged? converged?})))
+
 ;; ---------------------------------------------------------------------------
 ;; Embedded HTTP Server (/healthz & /statusz)
 ;; ---------------------------------------------------------------------------

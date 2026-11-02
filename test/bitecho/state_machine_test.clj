@@ -2805,6 +2805,64 @@
         (doseq [i (range 2 7)]
           (is (contains? (:executed-receipt-ids s-executed) (str "burn:r" i))))))))
 
+(deftest test-unrooted-finalized-chain-waits-for-missing-ancestor
+  (testing "execute-finalized-blocks holds unrooted finalized suffix when an intermediate ancestor block is missing, then executes in order once ancestor arrives"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})}
+                     :peers-map {pub (:public kp)})
+          s0 (sm/init-state [] pub (assoc cfg :keypair kp))
+          ;; 1. Block 0 at epoch 0 with genesis parent, executed
+          b0 {:epoch 0 :parent-hash "genesis" :payload []}
+          b0-hash (streamlet/hash-block b0)
+          s-init (-> s0
+                     (assoc-in [:blocks b0-hash] b0)
+                     (assoc :latest-finalized-block-hash b0-hash
+                            :finalized-blocks #{b0-hash})
+                     sm/execute-finalized-blocks)]
+      (is (= 0 (:last-executed-finalized-epoch s-init)))
+      (is (contains? (:executed-finalized-blocks s-init) b0-hash))
+      (is (= 10000 (:balance (get-in s-init [:ledger pub]))))
+
+      ;; 2. Block 1 at epoch 1 containing a signaling burn of 500
+      (let [burn-receipt {:receipt-id "burn:node:1:1"
+                          :type :burn
+                          :sender pub
+                          :amount 500}
+            b1 {:epoch 1 :parent-hash b0-hash :payload [burn-receipt]}
+            b1-hash (streamlet/hash-block b1)
+            b2 {:epoch 2 :parent-hash b1-hash :payload []}
+            b2-hash (streamlet/hash-block b2)
+            b3 {:epoch 3 :parent-hash b2-hash :payload []}
+            b3-hash (streamlet/hash-block b3)
+            ;; 3. Node receives finalization for b3, has b2 and b3 in :blocks, but b1 is missing!
+            s-missing-b1 (-> s-init
+                             (assoc-in [:blocks b2-hash] b2)
+                             (assoc-in [:blocks b3-hash] b3)
+                             (assoc :latest-finalized-block-hash b3-hash
+                                    :finalized-blocks #{b0-hash b1-hash b2-hash b3-hash})
+                             sm/execute-finalized-blocks)]
+        ;; MUST NOT execute b2/b3 and MUST NOT skip b1!
+        (is (= 0 (:last-executed-finalized-epoch s-missing-b1)))
+        (is (not (contains? (:executed-finalized-blocks s-missing-b1) b2-hash)))
+        (is (not (contains? (:executed-finalized-blocks s-missing-b1) b3-hash)))
+        (is (= 10000 (:balance (get-in s-missing-b1 [:ledger pub]))))
+        (is (zero? (get-in s-missing-b1 [:epoch-burns 1] 0)))
+
+        ;; 4. Now b1 is synced and added to :blocks
+        (let [s-recovered (-> s-missing-b1
+                              (assoc-in [:blocks b1-hash] b1)
+                              sm/execute-finalized-blocks)]
+          ;; Now b1, b2, b3 execute in order!
+          (is (= 3 (:last-executed-finalized-epoch s-recovered)))
+          (is (contains? (:executed-finalized-blocks s-recovered) b1-hash))
+          (is (contains? (:executed-finalized-blocks s-recovered) b2-hash))
+          (is (contains? (:executed-finalized-blocks s-recovered) b3-hash))
+          ;; Burn from b1 was properly executed, not skipped!
+          (is (= 9500 (:balance (get-in s-recovered [:ledger pub]))))
+          (is (= 500 (get-in s-recovered [:epoch-burns 0]))))))))
+
 (deftest test-monotonic-fallback-receipt-ids-across-drains
   (testing "two burns and two settle-intents in same epoch separated by block execution do not collide on fallback receipt-id"
     (let [kp (crypto/generate-keypair)

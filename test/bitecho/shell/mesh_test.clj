@@ -1232,4 +1232,126 @@
           (#'mesh/forward-gossip-to-agents! agent-conns frozen-m3 nil)
           (is (= 3 (count @sends)) "No duplicate gossip forwarded on second call"))))))
 
+(def ^:private gen-cluster-node-snapshot
+  (gen/let [role (gen/elements ["validator" "mesh"])
+            epoch (gen/choose 10 200)
+            fin-epoch (gen/choose 5 50)
+            minted (gen/elements [1000 2000 5000])
+            burns (gen/choose 100 500)
+            bdig (gen/elements ["d-alpha" "d-beta" "d-gamma"])
+            failed-rcpts (gen/elements [0 0 0 1 3])
+            conn-drop (gen/choose 0 5)
+            conn-stale (gen/choose 0 5)
+            win-burns (gen/choose 10 50)
+            win-takes (gen/choose 0 10)]
+    {:statusz {:role role :epoch epoch :notarized epoch :finalized fin-epoch
+               :peers "2/2" :supply 18900000000 :minted minted :burns burns
+               :finalized_epoch fin-epoch :burn_digest bdig
+               :pending_receipts 0 :failed_receipts failed-rcpts
+               :conn_dropped conn-drop :conn_stale conn-stale}
+     :burnsz {:anchor-epoch fin-epoch
+              :window [[(max 0 (dec fin-epoch)) win-burns win-takes]
+                       [fin-epoch win-burns win-takes]]}
+     :connz {:conn_dropped conn-drop :conn_stale conn-stale}}))
+
+(defspec ^{:doc "Property: Pure cluster convergence evaluator invariants"}
+  prop-evaluate-cluster-convergence-invariants 50
+  (prop/for-all [snap1 gen-cluster-node-snapshot
+                 snap2 gen-cluster-node-snapshot
+                 snap3 gen-cluster-node-snapshot]
+                (let [snapshots {"node1" snap1 "node2" snap2 "node3" snap3}
+                      result (mesh/evaluate-cluster-convergence snapshots)
+                      fin-epochs (mapv #(get-in % [1 :statusz :finalized_epoch]) snapshots)
+                      min-fin (apply min fin-epochs)
+                      max-fin (apply max fin-epochs)
+                      expected-skew (- max-fin min-fin)
+                      max-failed (apply max (mapv #(get-in % [1 :statusz :failed_receipts]) snapshots))]
+                  (and (boolean? (:converged? result))
+                       (boolean? (:burn-digest-converged? result))
+                       (boolean? (:window-burns-converged? result))
+                       (= min-fin (:common-finalized-epoch result))
+                       (= expected-skew (:finalized-epoch-skew result))
+                       (= max-failed (get-in result [:soak-summary :max_failed_receipts]))
+                       (= (<= expected-skew 2) (get-in result [:soak-summary :finality_healthy?]))
+                       (= (:converged? result)
+                          (and (:window-burns-converged? result)
+                               (:burn-digest-converged? result)
+                               (<= expected-skew 2)
+                               (zero? max-failed)))))))
+
+(deftest test-parse-statusz-and-evaluate-cluster-convergence
+  (testing "parse-statusz-line parses render-statusz format into typed map"
+    (let [line "role=validator epoch=100 head=b-hash notarized=95 finalized=90 peers=2/2 supply=18900000000 minted=5000 burns=250 finalized_epoch=88 burn_digest=d-abc pending_receipts=4 failed_receipts=0 conn_dropped=1 conn_stale=0\n"
+          parsed (mesh/parse-statusz-line line)]
+      (is (= "validator" (:role parsed)))
+      (is (= 100 (:epoch parsed)))
+      (is (= "b-hash" (:head parsed)))
+      (is (= 95 (:notarized parsed)))
+      (is (= 90 (:finalized parsed)))
+      (is (= "2/2" (:peers parsed)))
+      (is (= 18900000000 (:supply parsed)))
+      (is (= 5000 (:minted parsed)))
+      (is (= 250 (:burns parsed)))
+      (is (= 88 (:finalized_epoch parsed)))
+      (is (= "d-abc" (:burn_digest parsed)))
+      (is (= 4 (:pending_receipts parsed)))
+      (is (= 0 (:failed_receipts parsed)))
+      (is (= 1 (:conn_dropped parsed)))
+      (is (= 0 (:conn_stale parsed)))))
+
+  (testing "evaluate-cluster-convergence on 3 100% converged nodes"
+    (let [statusz-str "role=validator epoch=10 head=genesis notarized=8 finalized=8 peers=2/2 supply=18900000000 minted=0 burns=100 finalized_epoch=8 burn_digest=digest-1 pending_receipts=0 failed_receipts=0 conn_dropped=0 conn_stale=0"
+          burn-window [[6 50 0] [7 25 0] [8 25 0]]
+          snapshots {"node1" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}
+                     "node2" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}
+                     "node3" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}}
+          res (mesh/evaluate-cluster-convergence snapshots)]
+      (is (true? (:converged? res)))
+      (is (true? (:window-burns-converged? res)))
+      (is (true? (:burn-digest-converged? res)))
+      (is (= 8 (:common-finalized-epoch res)))
+      (is (= 0 (:finalized-epoch-skew res)))
+      (is (empty? (:epoch-mismatches res)))
+      (is (= 0 (:minted-skew res)))
+      (is (= 0 (get-in res [:soak-summary :max_failed_receipts])))
+      (is (true? (get-in res [:soak-summary :finality_healthy?])))))
+
+  (testing "evaluate-cluster-convergence detects burn window mismatch at ep <= common-finalized-epoch"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[8 100 0] [9 200 0] [10 300 0]]}}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[8 100 0] [9 999 0] [10 300 0]]}} ; mismatch at epoch 9!
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (false? (:window-burns-converged? res)))
+      (is (= [9] (:epoch-mismatches res)))))
+
+  (testing "evaluate-cluster-convergence detects burn digest mismatch at same finalized-epoch"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d2" :failed_receipts 0} ; digest mismatch!
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (false? (:burn-digest-converged? res)))))
+
+  (testing "evaluate-cluster-convergence detects excessive finalized-epoch skew > 2"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}}
+          s2 {:statusz {:finalized_epoch 13 :burn_digest "d2" :failed_receipts 0} ; skew = 3!
+              :burnsz {:anchor-epoch 13 :window [[10 100 0]]}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (= 3 (:finalized-epoch-skew res)))
+      (is (false? (get-in res [:soak-summary :finality_healthy?])))))
+
+  (testing "evaluate-cluster-convergence detects failed receipts > 0"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 2} ; failed = 2!
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (= 2 (get-in res [:soak-summary :max_failed_receipts]))))))
+
 

@@ -628,7 +628,8 @@
                           update-head-hash
                           finalize-prefix)
                 targets (extract-targets state)
-                ancestors (extract-notarized-ancestors state (:parent-hash block) 6)
+                ancestor-depth (long (or (get-in state [:config :max-ancestor-sync-depth]) (:max-ancestor-sync-depth state) 32))
+                ancestors (extract-notarized-ancestors state (:parent-hash block) ancestor-depth)
                 commands (if vote
                            [{:type :send-propose :targets targets :block block :ancestors ancestors}
                             {:type :send-vote :targets targets :vote vote}]

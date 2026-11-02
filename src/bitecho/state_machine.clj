@@ -1118,22 +1118,36 @@
   [state]
   (let [latest-hash (:latest-finalized-block-hash state)
         executed-hashes (or (:executed-finalized-blocks state) #{})
-        blocks (or (:blocks state) {})]
+        blocks (or (:blocks state) {})
+        genesis-equiv? (fn [h]
+                         (or (= h "genesis")
+                             (= h "0000000000000000000000000000000000000000000000000000000000000000")))
+        valid-root? (fn [h]
+                      (or (genesis-equiv? h)
+                          (contains? executed-hashes h)))]
     (if (and latest-hash (get blocks latest-hash))
       (loop [curr latest-hash
              acc ()]
-        (if (or (nil? curr)
-                (= curr "genesis")
-                (= curr "0000000000000000000000000000000000000000000000000000000000000000")
-                (contains? executed-hashes curr))
+        (if (valid-root? curr)
           (vec acc)
           (if-let [b (get blocks curr)]
             (recur (:parent-hash b) (cons (assoc b :hash curr) acc))
-            (vec acc))))
+            ;; Walk hit a missing block before reaching a valid root
+            (if (and (empty? executed-hashes)
+                     (zero? (long (or (:last-executed-finalized-epoch state) 0))))
+              (vec acc)
+              []))))
       ;; Fallback if :latest-finalized-block-hash not set or not in :blocks
-      (let [pending-hashes (set/difference (or (:finalized-blocks state) #{}) executed-hashes)]
+      (let [pending-hashes (set/difference (or (:finalized-blocks state) #{}) executed-hashes)
+            valid-parent? (fn [ph]
+                            (or (valid-root? ph)
+                                (contains? pending-hashes ph)))]
         (->> pending-hashes
              (keep (fn [h] (when-let [b (get blocks h)] (assoc b :hash h))))
+             (filter (fn [b]
+                       (or (and (empty? executed-hashes)
+                                (zero? (long (or (:last-executed-finalized-epoch state) 0))))
+                           (valid-parent? (:parent-hash b)))))
              (sort-by (juxt (comp long :epoch) :hash))
              vec)))))
 
