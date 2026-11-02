@@ -1,5 +1,6 @@
 (ns bitecho.economy.bundle
-  "Pure functions for a Full Node to buffer and bundle micro-transfers.")
+  "Pure functions for a Full Node to buffer and bundle micro-transfers."
+  (:require [bitecho.rendezvous.core :as rdv]))
 
 (defn add-to-buffer
   "Adds a transfer to the bundling buffer.
@@ -43,31 +44,46 @@
   ([vouchers]
    (if (empty? vouchers)
      []
-     (->> vouchers
-          (group-by (juxt :callee :home-node :epoch))
-          vals
-          (mapv #(apply max-key :seq %))
-          (sort-by (juxt :epoch :callee :home-node :seq))
-          vec)))
+     (let [normed (mapv (fn [v]
+                          (if (contains? v :home-node)
+                            (assoc v :home-node (rdv/normalize-home-node (:home-node v)))
+                            v))
+                        vouchers)]
+       (->> normed
+            (group-by (fn [v] [(:callee v) (rdv/normalize-home-node (:home-node v)) (:epoch v)]))
+            vals
+            (mapv (fn [grp] (apply max-key (comp long #(or (:seq %) 0)) grp)))
+            (sort-by (juxt (comp long #(or (:epoch %) 0)) (comp str :callee) (comp str rdv/normalize-home-node :home-node) (comp long #(or (:seq %) 0))))
+            vec))))
   ([vouchers current-epoch]
    (if (empty? vouchers)
      []
-     (->> vouchers
-          (filter #(= current-epoch (:epoch %)))
-          (group-by (juxt :callee :home-node :epoch))
-          vals
-          (mapv #(apply max-key :seq %))
-          (sort-by (juxt :callee :home-node :seq))
-          vec)))
+     (let [normed (mapv (fn [v]
+                          (if (contains? v :home-node)
+                            (assoc v :home-node (rdv/normalize-home-node (:home-node v)))
+                            v))
+                        vouchers)]
+       (->> normed
+            (filter #(= current-epoch (:epoch %)))
+            (group-by (fn [v] [(:callee v) (rdv/normalize-home-node (:home-node v)) (:epoch v)]))
+            vals
+            (mapv (fn [grp] (apply max-key (comp long #(or (:seq %) 0)) grp)))
+            (sort-by (juxt (comp str :callee) (comp str rdv/normalize-home-node :home-node) (comp long #(or (:seq %) 0))))
+            vec))))
   ([vouchers current-epoch min-epoch]
    (if (empty? vouchers)
      []
-     (->> vouchers
-          (filter (fn [v]
-                    (let [ep (:epoch v)]
-                      (and (integer? ep) (<= min-epoch ep current-epoch)))))
-          (group-by (juxt :callee :home-node :epoch))
-          vals
-          (mapv #(apply max-key :seq %))
-          (sort-by (juxt :epoch :callee :home-node :seq))
-          vec))))
+     (let [normed (mapv (fn [v]
+                          (if (contains? v :home-node)
+                            (assoc v :home-node (rdv/normalize-home-node (:home-node v)))
+                            v))
+                        vouchers)]
+       (->> normed
+            (filter (fn [v]
+                      (let [ep (:epoch v)]
+                        (and (integer? ep) (<= min-epoch ep current-epoch)))))
+            (group-by (fn [v] [(:callee v) (rdv/normalize-home-node (:home-node v)) (:epoch v)]))
+            vals
+            (mapv (fn [grp] (apply max-key (comp long #(or (:seq %) 0)) grp)))
+            (sort-by (juxt (comp long #(or (:epoch %) 0)) (comp str :callee) (comp str rdv/normalize-home-node :home-node) (comp long #(or (:seq %) 0))))
+            vec)))))

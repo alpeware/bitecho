@@ -139,7 +139,7 @@
                              0 pending)
         voucher-tuples (reduce (fn [acc r]
                                  (if (and (= (:type r) :voucher) (= (:callee r) pk))
-                                   (let [k [(:callee r) (:home-node r) (:epoch r)]
+                                   (let [k [(:callee r) (rendezvous/normalize-home-node (:home-node r)) (:epoch r)]
                                          prev (get acc k 0)
                                          curr (long (or (:cumulative-debit r) 0))]
                                      (assoc acc k (max prev curr)))
@@ -226,48 +226,85 @@
      :treasury-pubkey (or (:treasury-pubkey state) (:treasury-pubkey cfg))
      :treasury-privkey (or (:treasury-privkey state) (:treasury-privkey cfg))}))
 
+(defn- node-in-home-set?
+  "Checks if a home-node is present in the registered home set."
+  [home-node home-set]
+  (let [nodes (or (:home-nodes home-set) (:nodes home-set) (:candidates home-set))
+        norm rendezvous/normalize-home-node]
+    (boolean
+     (some (fn [n]
+             (let [id (cond
+                        (map? n) (or (:node-id n) (:pubkey n) (:id n) (:address n))
+                        :else n)]
+               (= (norm id) (norm home-node))))
+           nodes))))
+
 (defn- settle-single-voucher
   "Settles a single compacted DeliveryAck voucher against state, updating ledger and settled tuples.
    Fails closed: requires callee balance >= debit; records failure in :failed-vouchers and queues valid
    underfunded vouchers in :retry-vouchers for retry in subsequent epochs."
   [acc ack closing-epoch min-epoch]
   (let [callee (:callee ack)
-        home-node (:home-node ack)
+        home-node (rendezvous/normalize-home-node (:home-node ack))
+        ack (if (contains? ack :home-node) (assoc ack :home-node home-node) ack)
         ack-epoch (:epoch ack)
         tuple [callee home-node ack-epoch]
         reg-set (get-in acc [:home-sets [callee ack-epoch]])
-        reg-price (:price reg-set)
-        v-res (rendezvous/verify-ack-for-settlement
-               ack
-               {:settlement-epoch closing-epoch
-                :min-settlement-epoch min-epoch
-                :registered-price reg-price
-                :settled-tuples (:settled-voucher-tuples acc)})]
-    (if (:valid? v-res)
-      (let [debit (:debit v-res)
-            ledger (:ledger acc)
-            callee-st (get ledger callee (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-            callee-bal (or (:balance callee-st) 0)]
-        (if (>= callee-bal debit)
-          (let [home-st (get ledger home-node (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                new-callee (assoc callee-st :balance (- callee-bal debit))
-                new-home (assoc home-st :balance (+ (or (:balance home-st) 0) debit))
-                new-ledger (assoc ledger callee new-callee home-node new-home)]
-            (-> acc
-                (assoc :ledger new-ledger)
-                (update :settled-voucher-tuples conj tuple)))
-          (-> acc
-              (update :failed-vouchers (fnil conj [])
-                      {:voucher ack
-                       :epoch ack-epoch
-                       :debit debit
-                       :callee-balance callee-bal
-                       :reason :insufficient-callee-balance})
-              (update :retry-vouchers (fnil conj []) ack))))
+        reg-price (:price reg-set)]
+    (cond
+      (if (some? min-epoch)
+        (or (nil? ack-epoch)
+            (< ack-epoch min-epoch)
+            (and (some? closing-epoch) (> ack-epoch closing-epoch)))
+        (and (some? closing-epoch) (not= ack-epoch closing-epoch)))
       (update acc :failed-vouchers (fnil conj [])
               {:voucher ack
                :epoch ack-epoch
-               :reason (or (:reason v-res) (:error v-res) :invalid-voucher)}))))
+               :reason :expired-epoch})
+
+      (or (nil? reg-set)
+          (= :rejected (:status reg-set))
+          (not (node-in-home-set? home-node reg-set))
+          (nil? reg-price)
+          (not (integer? reg-price))
+          (neg? (long reg-price)))
+      (update acc :failed-vouchers (fnil conj [])
+              {:voucher ack
+               :epoch ack-epoch
+               :reason :unregistered-home-set})
+
+      :else
+      (let [v-res (rendezvous/verify-ack-for-settlement
+                   ack
+                   {:settlement-epoch closing-epoch
+                    :min-settlement-epoch min-epoch
+                    :registered-price reg-price
+                    :settled-tuples (:settled-voucher-tuples acc)})]
+        (if (:valid? v-res)
+          (let [debit (:debit v-res)
+                ledger (:ledger acc)
+                callee-st (get ledger callee (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                callee-bal (or (:balance callee-st) 0)]
+            (if (>= callee-bal debit)
+              (let [home-st (get ledger home-node (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                    new-callee (assoc callee-st :balance (- callee-bal debit))
+                    new-home (assoc home-st :balance (+ (or (:balance home-st) 0) debit))
+                    new-ledger (assoc ledger callee new-callee home-node new-home)]
+                (-> acc
+                    (assoc :ledger new-ledger)
+                    (update :settled-voucher-tuples conj tuple)))
+              (-> acc
+                  (update :failed-vouchers (fnil conj [])
+                          {:voucher ack
+                           :epoch ack-epoch
+                           :debit debit
+                           :callee-balance callee-bal
+                           :reason :insufficient-callee-balance})
+                  (update :retry-vouchers (fnil conj []) ack))))
+          (update acc :failed-vouchers (fnil conj [])
+                  {:voucher ack
+                   :epoch ack-epoch
+                   :reason (or (:reason v-res) (:error v-res) :invalid-voucher)}))))))
 
 (defn- apply-epoch-voucher-settlement
   "Compacts pending vouchers from epoch 0 through closing-epoch and settles valid vouchers within [min-epoch, closing-epoch], recording and evicting expired vouchers."
@@ -1229,20 +1266,39 @@
 
                                        :register-home-set
                                        (let [tuple [(:callee r) (or (:epoch r) closing-ep)]
-                                             reg-res (rendezvous/register-home-set (:candidates r) (:price r) (or (:price-max r) (:price r)))]
+                                             cands (mapv (fn [c] (if (contains? c :node-id) (assoc c :node-id (rendezvous/normalize-home-node (:node-id c))) c)) (:candidates r))
+                                             reg-res (rendezvous/register-home-set cands (:price r) (or (:price-max r) (:price r)))]
                                          (assoc-in s [:home-sets tuple] reg-res))
 
                                        :voucher
-                                       (let [tuple [(:callee r) (:home-node r) (:epoch r)]
+                                       (let [home-node (rendezvous/normalize-home-node (:home-node r))
+                                             tuple [(:callee r) home-node (:epoch r)]
                                              raw (:ack r)
-                                             ack (when raw
-                                                   (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
-                                                     raw
-                                                     (try (rendezvous/map->DeliveryAck raw)
-                                                          (catch Exception _ nil))))]
-                                         (if (and ack (rendezvous/verify-delivery-ack ack))
+                                             raw-ack (when raw
+                                                       (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
+                                                         raw
+                                                         (try (rendezvous/map->DeliveryAck raw)
+                                                              (catch Exception _ nil))))
+                                             ack (when raw-ack
+                                                   (if (contains? raw-ack :home-node)
+                                                     (assoc raw-ack :home-node (rendezvous/normalize-home-node (:home-node raw-ack)))
+                                                     raw-ack))
+                                             home-set (get-in s [:home-sets [(:callee r) (:epoch r)]])
+                                             price (:price home-set)
+                                             seq-val (long (or (:seq ack) (:seq r) 0))
+                                             debit (long (or (:cumulative-debit ack) (:cumulative-debit r) 0))
+                                             prev-seq (long (get-in s [:voucher-seqs tuple] 0))]
+                                         (if (and ack
+                                                  (rendezvous/verify-delivery-ack ack)
+                                                  (some? home-set)
+                                                  (not= :rejected (:status home-set))
+                                                  (node-in-home-set? home-node home-set)
+                                                  (integer? price)
+                                                  (not (neg? (long price)))
+                                                  (= debit (* seq-val (long price)))
+                                                  (> seq-val prev-seq))
                                            (-> s
-                                               (assoc-in [:voucher-seqs tuple] (:seq r))
+                                               (assoc-in [:voucher-seqs tuple] seq-val)
                                                (update :pending-vouchers (fnil conj []) ack))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
@@ -1527,7 +1583,8 @@
   [state event]
   (let [callee (:callee event)
         current-epoch (or (:epoch event) (:epoch state) 0)
-        candidates (or (:candidates event) [])
+        raw-candidates (or (:candidates event) [])
+        candidates (mapv (fn [c] (if (contains? c :node-id) (assoc c :node-id (rendezvous/normalize-home-node (:node-id c))) c)) raw-candidates)
         p-b (or (:price event) (:p-b event) 0)
         p-b-max (or (:price-max event) (:p-b-max event) p-b)
         tuple [callee current-epoch]
@@ -1553,29 +1610,31 @@
           {:state (assoc-in state [:home-sets tuple] reg-result)
            :commands []})))))
 
-(defn- node-in-home-set?
-  "Checks if a home-node is present in the registered home set."
-  [home-node home-set]
-  (let [nodes (or (:home-nodes home-set) (:nodes home-set) (:candidates home-set))
-        norm (fn [x] (if (or (keyword? x) (string? x)) (name x) x))]
-    (boolean
-     (some (fn [n]
-             (let [id (cond
-                        (map? n) (or (:node-id n) (:pubkey n) (:id n) (:address n))
-                        :else n)]
-               (= (norm id) (norm home-node))))
-           nodes))))
-
 (defn- pending-tuple-voucher-debit
   "Returns the maximum cumulative debit already staged in :pending-receipts for a given [callee home-node epoch] tuple."
   [state tuple]
-  (reduce (fn [mx r]
-            (if (and (= (:type r) :voucher)
-                     (= [(:callee r) (:home-node r) (:epoch r)] tuple))
-              (max mx (long (or (:cumulative-debit r) 0)))
-              mx))
-          0
-          (or (:pending-receipts state) [])))
+  (let [[callee home-node epoch] tuple
+        norm-tuple [callee (rendezvous/normalize-home-node home-node) epoch]]
+    (reduce (fn [mx r]
+              (if (and (= (:type r) :voucher)
+                       (= [(:callee r) (rendezvous/normalize-home-node (:home-node r)) (:epoch r)] norm-tuple))
+                (max mx (long (or (:cumulative-debit r) 0)))
+                mx))
+            0
+            (or (:pending-receipts state) []))))
+
+(defn- pending-tuple-voucher-seq
+  "Returns the maximum sequence number already staged in :pending-receipts for a given [callee home-node epoch] tuple."
+  [state tuple]
+  (let [[callee home-node epoch] tuple
+        norm-tuple [callee (rendezvous/normalize-home-node home-node) epoch]]
+    (reduce (fn [mx r]
+              (if (and (= (:type r) :voucher)
+                       (= [(:callee r) (rendezvous/normalize-home-node (:home-node r)) (:epoch r)] norm-tuple))
+                (max mx (long (or (:seq r) 0)))
+                mx))
+            0
+            (or (:pending-receipts state) []))))
 
 (defn- handle-receive-offer-header
   "Processes an incoming offer header, validating home set membership and
@@ -1583,7 +1642,7 @@
    Rejects offer header if callee is absent from ledger or underfunded for cumulative debit."
   [state event]
   (let [callee (:callee event)
-        home-node (:home-node event)
+        home-node (rendezvous/normalize-home-node (:home-node event))
         current-epoch (or (:epoch event) (:epoch state) 0)
         home-set (get-in state [:home-sets [callee current-epoch]])
         tuple [callee home-node current-epoch]
@@ -1604,33 +1663,34 @@
         (if (< callee-bal cum-debit)
           {:state state :commands []}
           (let [offer-ctx (assoc event
+                                 :home-node home-node
                                  :last-seq last-seq
                                  :p-b price
                                  :cumulative-debit cum-debit
                                  :epoch current-epoch)
                 res (rendezvous/process-offer-header offer-ctx)]
             (if (= :ok (:status res))
-              (if (consensus-mode? state)
-                (let [hn-str (if (or (keyword? home-node) (string? home-node)) (name home-node) (str home-node))
-                      rid (str "voucher:" callee ":" hn-str ":" current-epoch ":" seq-num)
-                      staged (stage-receipt state
-                                            {:receipt-id rid
-                                             :type :voucher
-                                             :callee callee
-                                             :home-node home-node
-                                             :epoch current-epoch
-                                             :seq seq-num
-                                             :cumulative-debit cum-debit
-                                             :ack (:delivery-ack res)})]
-                  (if (:ok? staged)
-                    {:state (assoc-in (:state staged) [:voucher-seqs tuple] seq-num)
-                     :commands []}
-                    {:state state
-                     :commands []}))
-                {:state (-> state
-                            (assoc-in [:voucher-seqs tuple] seq-num)
-                            (update :pending-vouchers (fnil conj []) (:delivery-ack res)))
-                 :commands []})
+              (let [ack (:delivery-ack res)]
+                (if (consensus-mode? state)
+                  (let [rid (str "voucher:" callee ":" home-node ":" current-epoch ":" seq-num)
+                        staged (stage-receipt state
+                                              {:receipt-id rid
+                                               :type :voucher
+                                               :callee callee
+                                               :home-node home-node
+                                               :epoch current-epoch
+                                               :seq seq-num
+                                               :cumulative-debit cum-debit
+                                               :ack ack})]
+                    (if (:ok? staged)
+                      {:state (assoc-in (:state staged) [:voucher-seqs tuple] seq-num)
+                       :commands []}
+                      {:state state
+                       :commands []}))
+                  {:state (-> state
+                              (assoc-in [:voucher-seqs tuple] seq-num)
+                              (update :pending-vouchers (fnil conj []) ack))
+                   :commands []}))
               {:state state :commands []})))))))
 
 (defn- handle-submit-vouchers
@@ -1646,28 +1706,32 @@
                                            (try (rendezvous/map->DeliveryAck raw)
                                                 (catch Exception _ nil)))]
                                  (when (and ack (rendezvous/verify-delivery-ack ack))
-                                   ack))))
-                       (group-by (fn [ack] [(:callee ack) (:home-node ack) (:epoch ack)]))
+                                   (assoc ack :home-node (rendezvous/normalize-home-node (:home-node ack)))))))
+                       (group-by (fn [ack] [(:callee ack) (rendezvous/normalize-home-node (:home-node ack)) (long (or (:epoch ack) 0))]))
                        vals
                        (mapv (fn [group] (apply max-key (comp long :seq) group)))
-                       (sort-by (juxt (comp long :epoch) :callee :home-node (comp long :seq))))
+                       (sort-by (juxt (comp long :epoch) (comp str :callee) (comp str rendezvous/normalize-home-node :home-node) (comp long :seq))))
         final-state
         (reduce
          (fn [curr-st ack]
            (let [callee (:callee ack)
-                 home-node (:home-node ack)
+                 home-node (rendezvous/normalize-home-node (:home-node ack))
                  ack-epoch (long (or (:epoch ack) 0))
                  seq-num (long (or (:seq ack) 0))
                  debit (long (or (:cumulative-debit ack) 0))
                  tuple [callee home-node ack-epoch]
-                 last-seq (long (get-in curr-st [:voucher-seqs tuple] 0))
+                 last-seq (if (consensus-mode? curr-st)
+                            (max (long (get-in curr-st [:voucher-seqs tuple] 0))
+                                 (pending-tuple-voucher-seq curr-st tuple))
+                            (long (get-in curr-st [:voucher-seqs tuple] 0)))
                  settled? (contains? (or (:settled-voucher-tuples curr-st) #{}) tuple)
                  home-set (get-in curr-st [:home-sets [callee ack-epoch]])
-                 home-set-ok? (or (nil? home-set)
-                                  (and (not= :rejected (:status home-set))
-                                       (node-in-home-set? home-node home-set)
-                                       (or (nil? (:price home-set))
-                                           (= debit (* seq-num (long (:price home-set)))))))
+                 home-set-ok? (and (some? home-set)
+                                   (not= :rejected (:status home-set))
+                                   (node-in-home-set? home-node home-set)
+                                   (integer? (:price home-set))
+                                   (not (neg? (long (:price home-set))))
+                                   (= debit (* seq-num (long (:price home-set)))))
                  balance-ok? (if (consensus-mode? curr-st)
                                (>= (+ (spendable-balance curr-st callee)
                                       (pending-tuple-voucher-debit curr-st tuple))
@@ -1684,10 +1748,7 @@
                              balance-ok?)]
              (if valid?
                (if (consensus-mode? curr-st)
-                 (let [hn-str (if (or (keyword? home-node) (string? home-node))
-                                (name home-node)
-                                (str home-node))
-                       rid (str "voucher:" callee ":" hn-str ":" ack-epoch ":" seq-num)
+                 (let [rid (str "voucher:" callee ":" home-node ":" ack-epoch ":" seq-num)
                        staged (stage-receipt curr-st
                                              {:receipt-id rid
                                               :type :voucher
@@ -1698,7 +1759,7 @@
                                               :cumulative-debit debit
                                               :ack (into {} ack)})]
                    (if (:ok? staged)
-                     (assoc-in (:state staged) [:voucher-seqs tuple] seq-num)
+                     (:state staged)
                      curr-st))
                  (-> curr-st
                      (assoc-in [:voucher-seqs tuple] seq-num)

@@ -3192,4 +3192,126 @@
         (is (= 980 (:balance (get-in s-final [:ledger callee-pub]))))
         (is (= 20 (:balance (get-in s-final [:ledger "node1"] 0))))))))
 
+(deftest test-mixed-keyword-string-home-node-state-machine
+  (testing "Mixed keyword (:node1) and string (\"node1\") home-node representations coalesce and settle cleanly"
+    (let [callee-kp (crypto/generate-keypair)
+          callee-pub (basalt/bytes->hex (:public callee-kp))
+          callee-priv (:private callee-kp)
+          node-kp (crypto/generate-keypair)
+          node-pub (basalt/bytes->hex (:public node-kp))
+          cfg (config/make-config
+               {:mode :consensus
+                :genesis-ledger {callee-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                                 node-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                :peers-map {node-pub (:public node-kp)}})
+          s0 (sm/init-state [] node-pub (assoc cfg :keypair node-kp))
+          ;; 1. Register home set with mixed keyword candidates [:node1 :node2]
+          s1 (assoc-in s0 [:home-sets [callee-pub 1]]
+                       {:status :ok
+                        :callee callee-pub
+                        :epoch 1
+                        :home-nodes [{:node-id :node1 :price 10}
+                                     {:node-id "node2" :price 10}
+                                     {:node-id :node3 :price 10}]
+                        :price 10})
+          ;; 2. Submit voucher signed with keyword :node1 and string "node1" in submit-vouchers
+          ack1 (rdv/create-delivery-ack callee-priv callee-pub :node1 1 "offer-hash" 2 20)
+          ack2 (rdv/create-delivery-ack callee-priv callee-pub "node1" 1 "offer-hash" 3 30)
+          res (sm/handle-event s1 {:type :submit-vouchers :vouchers [ack1 ack2]})
+          s2 (:state res)]
+      ;; Compacted and staged into [callee-pub "node1" 1] with seq 3
+      (is (= 1 (count (:pending-receipts s2))))
+      (let [r (first (:pending-receipts s2))]
+        (is (= "node1" (:home-node r)))
+        (is (= 30 (:cumulative-debit r)))
+        (is (= 3 (:seq r))))
+      ;; 3. Finalize block and verify settlement credits "node1"
+      (let [b1 {:epoch 1
+                :parent-hash "genesis"
+                :payload (:pending-receipts s2)}
+            b1-hash (streamlet/hash-block b1)
+            b2 {:epoch 2
+                :parent-hash b1-hash
+                :payload []}
+            b2-hash (streamlet/hash-block b2)
+            s-final (-> s2
+                        (assoc-in [:blocks b1-hash] b1)
+                        (assoc-in [:blocks b2-hash] b2)
+                        (assoc :latest-finalized-block-hash b2-hash
+                               :finalized-blocks #{b1-hash b2-hash})
+                        sm/execute-finalized-blocks)]
+        (is (empty? (:pending-receipts s-final)))
+        (is (= 970 (:balance (get-in s-final [:ledger callee-pub]))))
+        (is (= 30 (:balance (get-in s-final [:ledger "node1"] 0))))
+        (is (= 3 (get-in s-final [:voucher-seqs [callee-pub "node1" 1]])))))))
+
+(deftest test-unregistered-epoch-voucher-fails-closed
+  (testing "Unregistered-epoch 999-debit voucher probe fails closed across all layers with 0 debit to callee"
+    (let [callee-kp (crypto/generate-keypair)
+          callee-pub (basalt/bytes->hex (:public callee-kp))
+          callee-priv (:private callee-kp)
+          node-kp (crypto/generate-keypair)
+          node-pub (basalt/bytes->hex (:public node-kp))
+          cfg (config/make-config
+               {:mode :consensus
+                :genesis-ledger {callee-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                                 node-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                :peers-map {node-pub (:public node-kp)}})
+          s0 (sm/init-state [] node-pub (assoc cfg :keypair node-kp))
+          ;; Notice: NO home set is registered for callee for epoch 1
+          ;; Create a 999-debit signed voucher for unregistered epoch 1
+          ack (rdv/create-delivery-ack callee-priv callee-pub "node1" 1 "offer-hash" 1 999)]
+
+      ;; Layer 1: handle-submit-vouchers fails closed
+      (testing "Layer 1: handle-submit-vouchers fails closed on missing registration"
+        (let [res (sm/handle-event s0 {:type :submit-vouchers :vouchers [ack]})
+              s1 (:state res)]
+          (is (empty? (:pending-receipts s1)))
+          (is (empty? (:pending-vouchers s1)))
+          (is (= 1000 (:balance (get-in s1 [:ledger callee-pub]))))
+          (is (= 1000 (sm/spendable-balance s1 callee-pub)))))
+
+      ;; Layer 2: execute-finalized-blocks fails closed when voucher is injected directly into finalized block payload
+      (testing "Layer 2: execute-finalized-blocks fails closed on unregistered voucher in block payload"
+        (let [raw-receipt {:receipt-id "voucher:probe:999"
+                           :type :voucher
+                           :callee callee-pub
+                           :home-node "node1"
+                           :epoch 1
+                           :seq 1
+                           :cumulative-debit 999
+                           :ack ack}
+              b1 {:epoch 1
+                  :parent-hash "genesis"
+                  :payload [raw-receipt]}
+              b1-hash (streamlet/hash-block b1)
+              b2 {:epoch 2
+                  :parent-hash b1-hash
+                  :payload []}
+              b2-hash (streamlet/hash-block b2)
+              b3 {:epoch 3
+                  :parent-hash b2-hash
+                  :payload []}
+              b3-hash (streamlet/hash-block b3)
+              s-final (-> s0
+                          (assoc-in [:blocks b1-hash] b1)
+                          (assoc-in [:blocks b2-hash] b2)
+                          (assoc-in [:blocks b3-hash] b3)
+                          (assoc :latest-finalized-block-hash b3-hash
+                                 :finalized-blocks #{b1-hash b2-hash b3-hash})
+                          sm/execute-finalized-blocks)]
+          (is (= 1 (long (or (:failed-receipts-count s-final) 0))))
+          (is (empty? (:pending-vouchers s-final)))
+          (is (= 1000 (:balance (get-in s-final [:ledger callee-pub]))))
+          (is (= 0 (or (:balance (get-in s-final [:ledger "node1"])) 0)))))
+
+      ;; Layer 3: settle-single-voucher fails closed with :reason :unregistered-home-set
+      (testing "Layer 3: settle-single-voucher fails closed on missing registration"
+        (let [s-settled (#'sm/settle-single-voucher s0 ack 1 0)]
+          (is (= 1000 (:balance (get-in s-settled [:ledger callee-pub]))))
+          (is (= 0 (or (:balance (get-in s-settled [:ledger "node1"])) 0)))
+          (is (= 1 (count (:failed-vouchers s-settled))))
+          (let [fv (first (:failed-vouchers s-settled))]
+            (is (= :unregistered-home-set (:reason fv)))))))))
+
 

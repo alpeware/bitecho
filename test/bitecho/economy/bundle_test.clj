@@ -155,3 +155,48 @@
                                        max-seq (apply max (map :seq matching))]
                                    (= (:seq v) max-seq)))
                                compacted)))))
+
+(deftest mixed-keyword-string-home-node-compact-vouchers-test
+  (testing "Mixed keyword (:node1) and string (\"node1\") home-nodes coalesce without ClassCastException"
+    (let [vouchers [{:callee "callee-b" :home-node :node1 :epoch 5 :seq 1 :cumulative-debit 10}
+                    {:callee "callee-b" :home-node "node1" :epoch 5 :seq 3 :cumulative-debit 30}
+                    {:callee "callee-b" :home-node :node1 :epoch 5 :seq 2 :cumulative-debit 20}
+                    {:callee "callee-b" :home-node "node2" :epoch 5 :seq 4 :cumulative-debit 40}
+                    {:callee "callee-b" :home-node :node2 :epoch 5 :seq 1 :cumulative-debit 10}]]
+      ;; 1-arity
+      (let [c1 (bundle/compact-vouchers vouchers)]
+        (is (= 2 (count c1)))
+        (is (= ["node1" "node2"] (mapv :home-node c1)))
+        (is (= [3 4] (mapv :seq c1))))
+      ;; 2-arity
+      (let [c2 (bundle/compact-vouchers vouchers 5)]
+        (is (= 2 (count c2)))
+        (is (= ["node1" "node2"] (mapv :home-node c2)))
+        (is (= [3 4] (mapv :seq c2))))
+      ;; 3-arity
+      (let [c3 (bundle/compact-vouchers vouchers 5 1)]
+        (is (= 2 (count c3)))
+        (is (= ["node1" "node2"] (mapv :home-node c3)))
+        (is (= [3 4] (mapv :seq c3)))))))
+
+(defspec ^{:doc "Property: mixed keyword/string home-nodes coalesce into normalized string entries without throwing ClassCastException"}
+  prop-compact-vouchers-mixed-home-node 50
+  (prop/for-all [callees (gen/vector (gen/elements ["callee-1" "callee-2"]) 12)
+                 home-nodes (gen/vector (gen/elements [:node1 "node1" :node2 "node2"]) 12)
+                 epochs (gen/vector (gen/choose 1 6) 12)
+                 seqs (gen/vector (gen/choose 1 30) 12)]
+                (let [vouchers (mapv (fn [c h ep s]
+                                       {:callee c :home-node h :epoch ep :seq s :cumulative-debit (* s 10)})
+                                     callees home-nodes epochs seqs)
+                      compacted (bundle/compact-vouchers vouchers)
+                      norm-name (fn [x] (if (or (keyword? x) (symbol? x)) (name x) (str x)))
+                      norm-vouchers (mapv #(assoc % :home-node (norm-name (:home-node %))) vouchers)
+                      expected-keys (set (map (fn [v] [(:callee v) (:home-node v) (:epoch v)]) norm-vouchers))]
+                  (and (= (count expected-keys) (count compacted))
+                       (every? (comp string? :home-node) compacted)
+                       (every? (fn [v]
+                                 (let [k [(:callee v) (:home-node v) (:epoch v)]
+                                       matching (filter #(= k [(:callee %) (:home-node %) (:epoch %)]) norm-vouchers)
+                                       max-seq (apply max (map :seq matching))]
+                                   (= (:seq v) max-seq)))
+                               compacted)))))

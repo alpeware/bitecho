@@ -5,6 +5,15 @@
 
 (defrecord DeliveryAck [callee home-node epoch offer-hash seq cumulative-debit signature])
 
+(defn normalize-home-node
+  "Normalizes a home-node identifier to a string (converting keywords/symbols via name, or non-nil values via str)."
+  [hn]
+  (cond
+    (nil? hn) nil
+    (string? hn) hn
+    (or (keyword? hn) (symbol? hn)) (name hn)
+    :else (str hn)))
+
 (defn- to-bytes
   "Normalizes a byte array, vector of numbers, or hex string into a byte-array."
   [x]
@@ -34,7 +43,12 @@
            {:status :degraded ...} if 1 <= m < 3 at p_B_max,
            {:status :rejected ...} if m = 0 at p_B_max."
   [candidates p-b p-b-max]
-  (let [at-max (filterv #(<= (:price %) p-b-max) candidates)
+  (let [candidates (mapv (fn [c]
+                           (if (contains? c :node-id)
+                             (assoc c :node-id (normalize-home-node (:node-id c)))
+                             c))
+                         candidates)
+        at-max (filterv #(<= (:price %) p-b-max) candidates)
         m (count at-max)]
     (cond
       (>= m 3)
@@ -97,7 +111,7 @@
       :else
       (let [unsigned-ack (map->DeliveryAck
                           {:callee (:callee offer-ctx)
-                           :home-node (:home-node offer-ctx)
+                           :home-node (normalize-home-node (:home-node offer-ctx))
                            :epoch (:epoch offer-ctx)
                            :offer-hash (:offer-hash offer-ctx)
                            :seq seq-num
@@ -114,7 +128,7 @@
   [privkey callee home-node epoch offer-hash seq-num cumulative-debit]
   (let [unsigned-ack (map->DeliveryAck
                       {:callee callee
-                       :home-node home-node
+                       :home-node (normalize-home-node home-node)
                        :epoch epoch
                        :offer-hash offer-hash
                        :seq seq-num
@@ -133,8 +147,17 @@
    (try
      (let [pub-bytes (to-bytes (or callee-pubkey (:callee ack)))
            sig-bytes (to-bytes (:signature ack))
-           payload-bytes (ack-payload-bytes ack)]
-       (boolean (crypto/verify pub-bytes payload-bytes sig-bytes)))
+           verify-payload (fn [payload]
+                            (try
+                              (boolean (crypto/verify pub-bytes payload sig-bytes))
+                              (catch Exception _ false)))]
+       (boolean
+        (or (verify-payload (ack-payload-bytes ack))
+            (when (and (:home-node ack) (or (string? (:home-node ack)) (keyword? (:home-node ack))))
+              (let [norm (normalize-home-node (:home-node ack))
+                    kw (keyword norm)]
+                (or (verify-payload (ack-payload-bytes (assoc ack :home-node kw)))
+                    (verify-payload (ack-payload-bytes (assoc ack :home-node norm)))))))))
      (catch Exception _
        false))))
 
@@ -145,16 +168,19 @@
    Returns {:valid? true :debit ... :tuple ...} or {:valid? false :error ...}."
   [ack settlement-ctx]
   (let [callee (:callee ack)
-        home-node (:home-node ack)
+        raw-home-node (:home-node ack)
+        home-node (normalize-home-node raw-home-node)
         epoch (:epoch ack)
         seq-num (:seq ack)
         debit (:cumulative-debit ack)
         tuple [callee home-node epoch]
+        raw-tuple [callee raw-home-node epoch]
         settlement-epoch (or (:settlement-epoch settlement-ctx) (:current-epoch settlement-ctx))
         settled-tuples (or (:settled-tuples settlement-ctx) #{})
         reg-price (:registered-price settlement-ctx)]
     (cond
-      (contains? settled-tuples tuple)
+      (or (contains? settled-tuples tuple)
+          (contains? settled-tuples raw-tuple))
       {:valid? false :error :replayed-tuple}
 
       (if (some? (:min-settlement-epoch settlement-ctx))
@@ -168,7 +194,10 @@
       {:valid? false :error :invalid-debit}
 
       (or (nil? debit)
-          (and reg-price (not= debit (* seq-num reg-price))))
+          (nil? reg-price)
+          (not (integer? reg-price))
+          (neg? (long reg-price))
+          (not= debit (* (long seq-num) (long reg-price))))
       {:valid? false :error :invalid-debit}
 
       (not (verify-delivery-ack ack))

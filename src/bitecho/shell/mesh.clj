@@ -165,12 +165,19 @@
                                :rng (java.util.Random.)))))
 
                 :register-home-set
-                (let [callee (:callee event)]
+                (let [callee (:callee event)
+                      raw-candidates (or (:candidates event) [])
+                      candidates (mapv (fn [c]
+                                         (if (contains? c :node-id)
+                                           (assoc c :node-id (rendezvous/normalize-home-node (:node-id c)))
+                                           c))
+                                       raw-candidates)]
                   (when (or (nil? callee) (= callee agent-pub-hex))
                     (-> event
                         (dissoc :sender :sender-pubkey-bytes :rng)
                         (assoc :sender agent-pub-hex
                                :callee agent-pub-hex
+                               :candidates candidates
                                :sender-pubkey-bytes agent-pub-bytes
                                :rng (java.util.Random.)))))
 
@@ -220,22 +227,46 @@
                                    :rng (java.util.Random.)))))))
 
                 :submit-vouchers
-                (let [vouchers (:vouchers event)]
-                  (when (and (sequential? vouchers)
-                             (seq vouchers)
+                (let [vouchers (:vouchers event)
+                      norm-vouchers (when (and (sequential? vouchers) (seq vouchers))
+                                      (mapv (fn [v]
+                                              (let [hn (rendezvous/normalize-home-node (:home-node v))]
+                                                (when (and (string? hn) (not (str/blank? hn)))
+                                                  (assoc v :home-node hn))))
+                                            vouchers))]
+                  (when (and (sequential? norm-vouchers)
+                             (seq norm-vouchers)
+                             (every? some? norm-vouchers)
                              (every? (fn [v]
                                        (let [ack (if (instance? bitecho.rendezvous.core.DeliveryAck v)
                                                    v
                                                    (try (rendezvous/map->DeliveryAck v) (catch Exception _ nil)))]
                                          (and ack (rendezvous/verify-delivery-ack ack))))
-                                     vouchers))
+                                     norm-vouchers))
                     (-> event
                         (dissoc :sender :sender-pubkey-bytes :rng)
                         (assoc :sender agent-pub-hex
+                               :vouchers norm-vouchers
                                :sender-pubkey-bytes agent-pub-bytes
                                :rng (java.util.Random.)))))
 
-                ;; Default for other allowed events: :receive-gossip, :receive-summary, :receive-pull-request, :receive-offer-header
+                :receive-offer-header
+                (if (contains? event :home-node)
+                  (let [hn (rendezvous/normalize-home-node (:home-node event))]
+                    (when (and (string? hn) (not (str/blank? hn)))
+                      (-> event
+                          (dissoc :sender :sender-pubkey-bytes :rng)
+                          (assoc :sender agent-pub-hex
+                                 :home-node hn
+                                 :sender-pubkey-bytes agent-pub-bytes
+                                 :rng (java.util.Random.)))))
+                  (-> event
+                      (dissoc :sender :sender-pubkey-bytes :rng)
+                      (assoc :sender agent-pub-hex
+                             :sender-pubkey-bytes agent-pub-bytes
+                             :rng (java.util.Random.))))
+
+                ;; Default for other allowed events: :receive-gossip, :receive-summary, :receive-pull-request
                 (-> event
                     (dissoc :sender :sender-pubkey-bytes :rng)
                     (assoc :sender agent-pub-hex

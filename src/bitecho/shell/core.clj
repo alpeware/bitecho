@@ -23,7 +23,11 @@
     :receive-propose
     :receive-vote
     :register-home-set
-    :receive-offer-header})
+    :receive-offer-header
+    :on-deliver
+    :submit-vouchers
+    :settle-intent
+    :submit-transcript})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."
@@ -78,24 +82,46 @@
            (nil? val) (recur state)
            (= port network-in)
            (if (valid-network-event? val)
-             (let [{new-state :state commands :commands} (sm/handle-event state val)]
+             (let [res (try
+                         (sm/handle-event state val)
+                         (catch Throwable t
+                           {:exception t}))]
+               (if-let [t (:exception res)]
+                 (let [new-state (-> state
+                                     (update :event-errors-count (fnil inc 0))
+                                     (assoc :last-event-error (or (.getMessage ^Throwable t) (str (class t)))))]
+                   (reset! state-atom new-state)
+                   (recur new-state))
+                 (let [{new-state :state commands :commands} res]
+                   (reset! state-atom new-state)
+                   (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
+                   (when (and persist? persist-every?)
+                     (async/put! persist-ch new-state))
+                   (recur new-state))))
+             (let [new-state (update state :dropped-network-events-count (fnil inc 0))]
                (reset! state-atom new-state)
-               (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
-               (when (and persist? persist-every?)
-                 (async/put! persist-ch new-state))
-               (recur new-state))
-             (recur state))
+               (recur new-state)))
 
            (and (= port events-in) (= (:type val) :query-state))
            (do (async/put! (:reply-chan val) state) (recur state))
 
            (= port events-in)
-           (let [{new-state :state commands :commands} (sm/handle-event state val)]
-             (reset! state-atom new-state)
-             (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
-             (when (and persist? (or persist-every? (= (:type val) :tick)))
-               (async/put! persist-ch new-state))
-             (recur new-state)))))
+           (let [res (try
+                       (sm/handle-event state val)
+                       (catch Throwable t
+                         {:exception t}))]
+             (if-let [t (:exception res)]
+               (let [new-state (-> state
+                                   (update :event-errors-count (fnil inc 0))
+                                   (assoc :last-event-error (or (.getMessage ^Throwable t) (str (class t)))))]
+                 (reset! state-atom new-state)
+                 (recur new-state))
+               (let [{new-state :state commands :commands} res]
+                 (reset! state-atom new-state)
+                 (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
+                 (when (and persist? (or persist-every? (= (:type val) :tick)))
+                   (async/put! persist-ch new-state))
+                 (recur new-state)))))))
      {:events-in events-in
       :network-in network-in
       :net-out net-out
