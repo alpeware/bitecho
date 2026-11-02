@@ -3,26 +3,26 @@
 **Date:** 2026-11-01  
 **Authors:** Antigravity & Axiom (Sociocratic Consent Round `seq=22` $\leftrightarrow$ `seq=31` $\leftrightarrow$ `seq=23` $\leftrightarrow$ `seq=32`)  
 **Status:** Ratified by Sociocratic Consent (zero paramount objections)  
-**References:** [`DESIGN.md`](DESIGN.md), [`TOKENOMICS.md`](TOKENOMICS.md), [`master-plan-vision-roadmap.md`](master-plan-vision-roadmap.md), [`AGENTS.md`](AGENTS.md)
+**References:** [`DESIGN.md`](DESIGN.md), [`TOKENOMICS.md`](TOKENOMICS.md), `master-plan-vision-roadmap.md` (workspace draft), [`AGENTS.md`](AGENTS.md)
 
 ---
 
 ## 1. Where We Stand (Updated Honest Status Ledger — 2026-11-01)
 
-Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (§11), the transport, consensus execution, and light-node session layers have advanced from `[DESIGNED]` / `[BUILT]` to **`[LIVE]`** and **`[BUILT]`**:
+Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace draft) (§11), the transport, consensus execution, and light-node session layers have advanced from `[DESIGNED]` / `[BUILT]` to **`[LIVE]`** and **`[BUILT]`**:
 
 | Area | Oct 30 Status | Nov 1 Status | Evidence |
 | :--- | :--- | :--- | :--- |
-| **3-Node GCP Devnet + Streamlet + Finalized-Block Ledger Execution** | `[LIVE, closing]` | **`[BUILT -> READY FOR REDEPLOY & CONVERGENCE AUDIT]`** | Priority 1 (`df99b96` / `ef61ef5`): Dual-phase receipt-vs-execution pipeline (`:pending-receipts` staged against `spendable-balance`, authoritative ledger/burns/mint mutated strictly on 3-chain finality in `execute-finalized-blocks`), FIFO 10,000 replay-protection horizon (`fifo-track`), cross-node comparable `burn_digest`, `/burnsz`, and `/accountz`. |
+| **3-Node GCP Devnet + Streamlet + Finalized-Block Ledger Execution** | `[LIVE, closing]` | **`[BUILT -> READY FOR REDEPLOY & CONVERGENCE AUDIT]`** | Priority 1 (`38b93f9` / `78b0e98`): Dual-phase receipt-vs-execution pipeline (`:pending-receipts` staged against `spendable-balance`, authoritative ledger/burns/mint mutated strictly on 3-chain finality in `execute-finalized-blocks`), FIFO 10,000 replay-protection horizon (`fifo-track`), cross-node comparable `burn_digest`, `/burnsz`, and `/accountz`. |
 | **Full-Node Mesh Shell Lifecycle Discipline (Rules 4 & 5)** | *(Unbuilt)* | **`[BUILT]`** | Priority 3 (`142d1de` / `c01966e`): Single-authority generation-tagged reducer (`transition-mesh-conn`) for `@peer-conns` and `@agent-conns`, atomic sender rebinding (`rebind-agent-conn-sender`) with strictly advancing generations, stale/superseded node callback isolation, bounded tombstones (`prune-closed-conn-tombstones` at 64 with cumulative counter roll-up), FIFO 1,024 gossip deduplication, `/connz`, and `conn_dropped` / `conn_stale` in `/statusz` and `scripts/cluster.sh`. |
 | **Agent Skill v1 + E2E Sealed Channels** | `[DESIGNED]` | **`[LIVE & OPERATING]`** | `bitecho.crypto.sealed` (ephemeral X25519 + HKDF-SHA256 + ChaCha20-Poly1305 + 64-bit sliding replay window) and `bitecho.light_node.core` / `bitecho.shell.light_node` (UDP, TCP, HTTP CONNECT proxy). Priority 2 (`abeb21d` / `80572da`): 64-entry FIFO session outbox, signed SACK `:session-ack` reconciliation (`:ack-seq` + `:seen-seqs`), pre-AEAD replay window filtering, duplicate `:channel-offer` idempotence, deterministic home-set + bootstrap failover rotation, and immediate `state.nippy` persistence. Antigravity and Axiom are actively collaborating over a live sealed session (`91e454...`) on the funded devnet. |
 
 ---
 
-## 2. Delta Analysis vs. `DESIGN.md`, `TOKENOMICS.md`, and `master-plan-vision-roadmap.md`
+## 2. Delta Analysis vs. `DESIGN.md`, `TOKENOMICS.md`, and `master-plan-vision-roadmap.md` (workspace draft)
 
 ### 2.1 Live Cluster Convergence & Soak Verification (`DESIGN.md` Phase 5.E + Axiom Priority)
-- Priority 1 (`ef61ef5`), Priority 2 (`80572da`), and Priority 3 (`c01966e`) are verified in the automated test suite (`284 tests, 1,943 assertions, 0 failures, 0 lint warnings`), but the 3-node GCP devnet (`ns1`, `ns2`, `ns3`) must be redeployed to the latest `main`, audited for per-epoch `/burnsz` burn-map and `minted` convergence across all 3 nodes, and soak-tested (verifying memory plateau vs. creep under bounded FIFO caches and tombstones).
+- Priority 1 (`38b93f9` / `78b0e98`), Priority 2 (`80572da`), and Priority 3 (`c01966e`) are verified in the automated test suite (`284 tests, 1,943 assertions, 0 failures, 0 lint warnings`), but the 3-node GCP devnet (`ns1`, `ns2`, `ns3`) must be redeployed to the latest `main`, audited for per-epoch `/burnsz` burn-map and `minted` convergence across all 3 nodes, and soak-tested (verifying memory plateau vs. creep under bounded FIFO caches and tombstones).
 
 ### 2.2 Live Wire Economic Gap (`DESIGN.md` Phase 2 & 4 / `TOKENOMICS.md` §§3–7)
 - **Built in Pure Core (`bitecho.state-machine`)**:
@@ -35,12 +35,13 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (§11), the
   - Light nodes cannot yet initiate signed `$ECHO` account transfers (`transfer`), submit/settle `DeliveryAck` vouchers, or trigger `:settle-intent` over the live devnet.
   - Full nodes do not yet exchange and submit bilateral `EpochTranscript` attestations (`:submit-transcript`) at epoch close over live DataChannels.
 
-### 2.3 Identity, Petnames, Directory Attestation, DACs & Rendezvous-to-Sealed Handoff (`DESIGN.md` Phase 3 & 5.C / `master-plan-vision-roadmap.md` §§4, 7, 8)
+### 2.3 Identity, Petnames, Directory Attestation, DACs & Rendezvous-to-Sealed Handoff (`DESIGN.md` Phase 3 & 5.C / `master-plan-vision-roadmap.md` (workspace draft) §§4, 7, 8)
 - Counterparties are still addressed by raw 88-character hex Ed25519 public keys.
 - Local 1:1 **Petnames** in light-node state, **Directory-signed attestations** (signed by the directory authority after proof-of-possession, where the agent's self-signature proves continuity/rotation only), **Delegated Agent Certificates (DACs)** (`Parent Anchor Cold Key -> Agent Node Hot Key`), and wiring two-phase **Callee-Pays Rendezvous Introduction** (`OfferHeader -> DeliveryAck voucher -> reveal`) directly into the **Sealed-Channel X25519 Key-Exchange** are `[DESIGNED]` and ready to be built.
 
-### 2.4 Verified-Outcome Escrow / Swap Lock Primitive (`master-plan-vision-roadmap.md` Principles 2 & 3 / M4–M6)
-- Escrow-first conditional settlement (locking `$ECHO` against a verified deliverable/hash and releasing with the mandatory $\tau = 0.5\%$ protocol take burned on verified outcome, or deterministic refund on timeout) and domain-parameterized currencies/swaps (`D8`) are `[DESIGNED]`.
+### 2.4 Verified-Outcome `$ECHO` Escrow Settlement Primitive (`lock-intent` / `release-intent` / `refund-intent`) (`master-plan-vision-roadmap.md` (workspace draft) Principles 2 & 3 / M4–M6)
+- Bitecho is strictly single-currency (`$ECHO`) per Simon's architectural decision; multi-currency, external swap locks, and domain-parameterized currencies (`D8`) are omitted.
+- Escrow-first conditional settlement (locking `$ECHO` against a verified deliverable/hash and releasing with the mandatory $\tau = 0.5\%$ protocol take burned on verified outcome, or deterministic refund on timeout) is `[DESIGNED]`.
 
 ---
 
@@ -84,7 +85,7 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (§11), the
 
 ### Milestone 2: Identity Ergonomics, Directory-Signed Attestation, DACs & Rendezvous-to-Sealed Handoff
 
-#### Step 2A — Local Petnames (`master-plan-vision-roadmap.md` §4)
+#### Step 2A — Local Petnames (`master-plan-vision-roadmap.md` (workspace draft) §4)
 - Add a local 1:1 `:petnames` address book in `bitecho.light_node.core` (`petname-set`, `petname-list`, `petname-remove`, and bidirectional resolution) so `offer`, `send`, `transfer`, `inbox`, and `status` accept and display human- and agent-legible petnames while never trusting unverified global nicknames.
 
 #### Step 2B — Directory-Signed Attestation & DAC Anchor Delegation *(Axiom Amendment 2)*
@@ -96,6 +97,7 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (§11), the
 
 ---
 
-### Milestone 3: Verified-Outcome Escrow / Swap Lock Primitive (`master-plan-vision-roadmap.md` Principles 2 & 3 / M4–M6 Bridge)
+### Milestone 3: Verified-Outcome `$ECHO` Escrow Settlement Primitive (`lock-intent` / `release-intent` / `refund-intent`) (`master-plan-vision-roadmap.md` (workspace draft) Principles 2 & 3 / M4–M6 Bridge)
 
+- Bitecho is strictly single-currency (`$ECHO`) per Simon's architectural decision; multi-currency and cross-currency swap locks are omitted.
 - Implement a pure, deterministic escrow/hash-lock settlement primitive (`lock-intent` / `release-intent` / `refund-intent`) in `bitecho.economy` and `bitecho.state-machine` with the mandatory $\tau = 0.5\%$ settlement take burned upon verified outcome release and deterministic timeout refund, enabling two agents (e.g., Antigravity and Axiom) to lock `$ECHO` against a verified deliverable (commit/recipe/proof hash) and settle atomically on finalized blocks.

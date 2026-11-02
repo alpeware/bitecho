@@ -881,12 +881,15 @@ cmd_audit() {
     raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_AUDIT' 2>/dev/null || echo "SSH_FAILED"
 statusz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/statusz 2>/dev/null || true)
 burnsz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/burnsz 2>/dev/null || true)
+accountz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/accountz 2>/dev/null || true)
 connz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/connz 2>/dev/null || true)
 rss=$(ps -o rss= -C java 2>/dev/null | awk '{printf "%.1fMB", $1/1024}' || echo "N/A")
 echo "METRIC_DELIM"
 echo "$statusz"
 echo "METRIC_DELIM"
 echo "$burnsz"
+echo "METRIC_DELIM"
+echo "$accountz"
 echo "METRIC_DELIM"
 echo "$connz"
 echo "METRIC_DELIM"
@@ -904,15 +907,17 @@ REMOTE_AUDIT
     python3 -c "
 import sys
 parts = sys.stdin.read().split('METRIC_DELIM\n')
-if len(parts) >= 5:
+if len(parts) >= 6:
     with open('${tmp_data}/${node}.statusz', 'w') as f:
         f.write(parts[1])
     with open('${tmp_data}/${node}.burnsz', 'w') as f:
         f.write(parts[2])
-    with open('${tmp_data}/${node}.connz', 'w') as f:
+    with open('${tmp_data}/${node}.accountz', 'w') as f:
         f.write(parts[3])
+    with open('${tmp_data}/${node}.connz', 'w') as f:
+        f.write(parts[4])
     with open('${tmp_data}/${node}.rss', 'w') as f:
-        f.write(parts[4].strip())
+        f.write(parts[5].strip())
 " <<< "$raw_metrics"
 
   done
@@ -931,11 +936,13 @@ for n in nodes:
             st = f.read().strip()
         with open(f'${tmp_data}/{n}.burnsz') as f:
             bz = f.read().strip()
+        with open(f'${tmp_data}/{n}.accountz') as f:
+            az = f.read().strip()
         with open(f'${tmp_data}/{n}.connz') as f:
             cz = f.read().strip()
         with open(f'${tmp_data}/{n}.rss') as f:
             rss = f.read().strip()
-        data[n] = {'ip': ip, 'statusz': st, 'burnsz': bz, 'connz': cz, 'rss': rss}
+        data[n] = {'ip': ip, 'statusz': st, 'burnsz': bz, 'accountz': az, 'connz': cz, 'rss': rss}
     except Exception as e:
         pass
 
@@ -1011,15 +1018,39 @@ for fep in set(fin_epochs.values()):
     if len(digs) > 1:
         digest_mismatch = True
 
+def parse_accounts(az_str):
+    accounts = {}
+    entries = re.findall(r'\"([^\"]+)\"\s*\{([^}]+)\}', az_str)
+    for pub, body in entries:
+        bal_m = re.search(r':balance\s+(-?\d+)', body)
+        seq_m = re.search(r':seq\s+(-?\d+)', body)
+        deps_m = re.search(r':deps\s+(\[[^\]]*\])', body)
+        bal = int(bal_m.group(1)) if bal_m else 0
+        seq = int(seq_m.group(1)) if seq_m else 0
+        deps = deps_m.group(1).strip() if deps_m else '[]'
+        accounts[pub] = (bal, seq, deps)
+    return accounts
+
+node_accounts = {}
+for n in nodes:
+    node_accounts[n] = parse_accounts(data[n].get('accountz', ''))
+
+accountz_mismatch = False
+if skew == 0:
+    acc_signatures = [tuple(sorted(node_accounts[n].items())) for n in nodes]
+    if len(set(acc_signatures)) > 1:
+        accountz_mismatch = True
+
 print('\n--- Convergence & Soak Assessment ---')
 print(f'Common Finalized Epoch: {min_fin}')
 print(f'Finalized Epoch Skew:   {skew} (healthy <= 2)')
 print(f'Minted Values / Skew:   {minted_vals} (skew={minted_skew})')
 print(f'Burn Digest Parity:     {\"PASSED\" if not digest_mismatch else \"FAILED\"}')
+print(f'Accountz Ledger Parity: {\"PASSED\" if not accountz_mismatch else \"FAILED\"}')
 print(f'Window Burns Converged: {\"PASSED\" if not mismatches else f\"FAILED (mismatches: {len(mismatches)})\"}')
 print(f'Failed Receipts Max:    {max(failed_rcpts.values())} (healthy == 0)')
 
-if skew > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0:
+if skew > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch:
     print('\nVerdict: DIVERGENCE DETECTED')
     sys.exit(1)
 else:

@@ -12,6 +12,7 @@
             [bitecho.shell.persistence :as persistence]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datachannel.api :as api]
@@ -806,6 +807,7 @@
      :minted-values {}
      :minted-skew 0
      :burn-digest-converged? true
+     :accountz-converged? true
      :soak-summary {:max_failed_receipts 0
                     :total_conn_dropped 0
                     :total_conn_stale 0
@@ -876,6 +878,28 @@
                                              (<= (count digests) 1)))
                                          nodes-by-fin-epoch)
 
+          ;; Check ledger /accountz parity across all nodes when fin-epoch-skew == 0
+          has-accountz? (boolean (some (fn [[_ snap]] (some? (:accountz snap))) parsed-snapshots))
+          accountz-maps (when has-accountz?
+                          (into {}
+                                (keep (fn [[nid snap]]
+                                        (let [raw-ac (:accountz snap)
+                                              ac-map (cond
+                                                       (string? raw-ac) (try (edn/read-string raw-ac) (catch Exception _ nil))
+                                                       (map? raw-ac) raw-ac
+                                                       :else nil)
+                                              accounts (when (map? ac-map)
+                                                         (or (:accounts ac-map) ac-map))]
+                                          (when (map? accounts)
+                                            [nid (into {}
+                                                       (map (fn [[k v]] [k (if (map? v) (into {} v) v)]))
+                                                       accounts)])))
+                                      parsed-snapshots)))
+          accountz-converged? (if (and has-accountz? (zero? fin-epoch-skew))
+                                (and (= (count accountz-maps) (count parsed-snapshots))
+                                     (<= (count (distinct (vals accountz-maps))) 1))
+                                true)
+
           max-failed (if (seq (vals parsed-snapshots))
                        (apply max (map :failed-rcpts (vals parsed-snapshots)))
                        0)
@@ -891,7 +915,8 @@
           converged? (and window-burns-converged?
                           burn-digest-converged?
                           finality-healthy?
-                          (zero? max-failed))]
+                          (zero? max-failed)
+                          accountz-converged?)]
       {:common-finalized-epoch common-fin-epoch
        :finalized-epoch-skew fin-epoch-skew
        :epoch-mismatches epoch-mismatches
@@ -899,6 +924,7 @@
        :minted-values minted-values
        :minted-skew minted-skew
        :burn-digest-converged? burn-digest-converged?
+       :accountz-converged? accountz-converged?
        :soak-summary soak-summary
        :converged? converged?})))
 

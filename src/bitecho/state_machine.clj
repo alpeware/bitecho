@@ -1120,34 +1120,38 @@
         executed-hashes (or (:executed-finalized-blocks state) #{})
         blocks (or (:blocks state) {})
         genesis-equiv? (fn [h]
-                         (or (= h "genesis")
+                         (or (nil? h)
+                             (= h "genesis")
                              (= h "0000000000000000000000000000000000000000000000000000000000000000")))
         valid-root? (fn [h]
                       (or (genesis-equiv? h)
-                          (contains? executed-hashes h)))]
+                          (contains? executed-hashes h)))
+        walk-rooted-chain (fn [start-hash]
+                            (loop [curr start-hash
+                                   visited #{}
+                                   acc ()]
+                              (cond
+                                (valid-root? curr)
+                                (vec acc)
+
+                                (contains? visited curr)
+                                []
+
+                                :else
+                                (if-let [b (get blocks curr)]
+                                  (recur (:parent-hash b)
+                                         (conj visited curr)
+                                         (cons (assoc b :hash curr) acc))
+                                  []))))]
     (if (and latest-hash (get blocks latest-hash))
-      (loop [curr latest-hash
-             acc ()]
-        (if (valid-root? curr)
-          (vec acc)
-          (if-let [b (get blocks curr)]
-            (recur (:parent-hash b) (cons (assoc b :hash curr) acc))
-            ;; Walk hit a missing block before reaching a valid root
-            (if (and (empty? executed-hashes)
-                     (zero? (long (or (:last-executed-finalized-epoch state) 0))))
-              (vec acc)
-              []))))
+      (walk-rooted-chain latest-hash)
       ;; Fallback if :latest-finalized-block-hash not set or not in :blocks
-      (let [pending-hashes (set/difference (or (:finalized-blocks state) #{}) executed-hashes)
-            valid-parent? (fn [ph]
-                            (or (valid-root? ph)
-                                (contains? pending-hashes ph)))]
+      (let [pending-hashes (set/difference (or (:finalized-blocks state) #{}) executed-hashes)]
         (->> pending-hashes
-             (keep (fn [h] (when-let [b (get blocks h)] (assoc b :hash h))))
-             (filter (fn [b]
-                       (or (and (empty? executed-hashes)
-                                (zero? (long (or (:last-executed-finalized-epoch state) 0))))
-                           (valid-parent? (:parent-hash b)))))
+             (keep (fn [h]
+                     (when (seq (walk-rooted-chain h))
+                       (when-let [b (get blocks h)]
+                         (assoc b :hash h)))))
              (sort-by (juxt (comp long :epoch) :hash))
              vec)))))
 

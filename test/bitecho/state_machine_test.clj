@@ -2863,6 +2863,102 @@
           (is (= 9500 (:balance (get-in s-recovered [:ledger pub]))))
           (is (= 500 (get-in s-recovered [:epoch-burns 0]))))))))
 
+(deftest test-unrooted-finalized-chain-fallback-and-fresh-genesis
+  (let [kp (crypto/generate-keypair)
+        pub (basalt/bytes->hex (:public kp))
+        cfg (assoc config/devnet-config
+                   :genesis-ledger {pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})}
+                   :peers-map {pub (:public kp)})
+        s0 (sm/init-state [] pub (assoc cfg :keypair kp))
+        burn-receipt {:receipt-id "burn:node:1:1"
+                      :type :burn
+                      :sender pub
+                      :amount 500}]
+
+    (testing "Fallback path (nil :latest-finalized-block-hash) at fresh genesis holds unrooted b2 until b1 arrives"
+      (let [b1 {:epoch 1 :parent-hash "genesis" :payload [burn-receipt]}
+            b1-hash (streamlet/hash-block b1)
+            b2 {:epoch 2 :parent-hash b1-hash :payload []}
+            b2-hash (streamlet/hash-block b2)
+            ;; b1 missing from :blocks, but both hashes in :finalized-blocks
+            s-missing (-> s0
+                          (assoc-in [:blocks b2-hash] b2)
+                          (assoc :latest-finalized-block-hash nil
+                                 :finalized-blocks #{b1-hash b2-hash})
+                          sm/execute-finalized-blocks)]
+        (is (= 0 (:last-executed-finalized-epoch s-missing)))
+        (is (not (contains? (:executed-finalized-blocks s-missing) b2-hash)))
+        (is (= 10000 (:balance (get-in s-missing [:ledger pub]))))
+        (is (zero? (get-in s-missing [:epoch-burns 0] 0)))
+
+        ;; Once b1 arrives in :blocks, b1 and b2 execute in order
+        (let [s-recovered (-> s-missing
+                              (assoc-in [:blocks b1-hash] b1)
+                              sm/execute-finalized-blocks)]
+          (is (= 2 (:last-executed-finalized-epoch s-recovered)))
+          (is (contains? (:executed-finalized-blocks s-recovered) b1-hash))
+          (is (contains? (:executed-finalized-blocks s-recovered) b2-hash))
+          (is (= 9500 (:balance (get-in s-recovered [:ledger pub]))))
+          (is (= 500 (get-in s-recovered [:epoch-burns 0]))))))
+
+    (testing "Fallback path (nil :latest-finalized-block-hash) after b0 executed holds unrooted b2 until b1 arrives"
+      (let [b0 {:epoch 0 :parent-hash "genesis" :payload []}
+            b0-hash (streamlet/hash-block b0)
+            s-init (-> s0
+                       (assoc-in [:blocks b0-hash] b0)
+                       (assoc :latest-finalized-block-hash b0-hash
+                              :finalized-blocks #{b0-hash})
+                       sm/execute-finalized-blocks)
+            b1 {:epoch 1 :parent-hash b0-hash :payload [burn-receipt]}
+            b1-hash (streamlet/hash-block b1)
+            b2 {:epoch 2 :parent-hash b1-hash :payload []}
+            b2-hash (streamlet/hash-block b2)
+            ;; b1 missing from :blocks, b0 executed, :latest-finalized-block-hash nil
+            s-missing (-> s-init
+                          (assoc-in [:blocks b2-hash] b2)
+                          (assoc :latest-finalized-block-hash nil
+                                 :finalized-blocks #{b0-hash b1-hash b2-hash})
+                          sm/execute-finalized-blocks)]
+        (is (= 0 (:last-executed-finalized-epoch s-missing)))
+        (is (not (contains? (:executed-finalized-blocks s-missing) b2-hash)))
+        (is (= 10000 (:balance (get-in s-missing [:ledger pub]))))
+        (is (zero? (get-in s-missing [:epoch-burns 0] 0)))
+
+        ;; Once b1 arrives in :blocks, b1 and b2 execute in order
+        (let [s-recovered (-> s-missing
+                              (assoc-in [:blocks b1-hash] b1)
+                              sm/execute-finalized-blocks)]
+          (is (= 2 (:last-executed-finalized-epoch s-recovered)))
+          (is (contains? (:executed-finalized-blocks s-recovered) b1-hash))
+          (is (contains? (:executed-finalized-blocks s-recovered) b2-hash))
+          (is (= 9500 (:balance (get-in s-recovered [:ledger pub]))))
+          (is (= 500 (get-in s-recovered [:epoch-burns 0]))))))
+
+    (testing "Fresh genesis with :latest-finalized-block-hash set to b2-hash holds b2 until b1 arrives"
+      (let [b1 {:epoch 1 :parent-hash "genesis" :payload [burn-receipt]}
+            b1-hash (streamlet/hash-block b1)
+            b2 {:epoch 2 :parent-hash b1-hash :payload []}
+            b2-hash (streamlet/hash-block b2)
+            s-missing (-> s0
+                          (assoc-in [:blocks b2-hash] b2)
+                          (assoc :latest-finalized-block-hash b2-hash
+                                 :finalized-blocks #{b1-hash b2-hash})
+                          sm/execute-finalized-blocks)]
+        (is (= 0 (:last-executed-finalized-epoch s-missing)))
+        (is (not (contains? (:executed-finalized-blocks s-missing) b2-hash)))
+        (is (= 10000 (:balance (get-in s-missing [:ledger pub]))))
+        (is (zero? (get-in s-missing [:epoch-burns 0] 0)))
+
+        ;; Once b1 arrives in :blocks, b1 and b2 execute in order
+        (let [s-recovered (-> s-missing
+                              (assoc-in [:blocks b1-hash] b1)
+                              sm/execute-finalized-blocks)]
+          (is (= 2 (:last-executed-finalized-epoch s-recovered)))
+          (is (contains? (:executed-finalized-blocks s-recovered) b1-hash))
+          (is (contains? (:executed-finalized-blocks s-recovered) b2-hash))
+          (is (= 9500 (:balance (get-in s-recovered [:ledger pub]))))
+          (is (= 500 (get-in s-recovered [:epoch-burns 0]))))))))
+
 (deftest test-monotonic-fallback-receipt-ids-across-drains
   (testing "two burns and two settle-intents in same epoch separated by block execution do not collide on fallback receipt-id"
     (let [kp (crypto/generate-keypair)

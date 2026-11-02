@@ -1277,7 +1277,8 @@
                           (and (:window-burns-converged? result)
                                (:burn-digest-converged? result)
                                (<= expected-skew 2)
-                               (zero? max-failed)))))))
+                               (zero? max-failed)
+                               (:accountz-converged? result)))))))
 
 (deftest test-parse-statusz-and-evaluate-cluster-convergence
   (testing "parse-statusz-line parses render-statusz format into typed map"
@@ -1309,12 +1310,35 @@
       (is (true? (:converged? res)))
       (is (true? (:window-burns-converged? res)))
       (is (true? (:burn-digest-converged? res)))
+      (is (true? (:accountz-converged? res)))
       (is (= 8 (:common-finalized-epoch res)))
       (is (= 0 (:finalized-epoch-skew res)))
       (is (empty? (:epoch-mismatches res)))
       (is (= 0 (:minted-skew res)))
       (is (= 0 (get-in res [:soak-summary :max_failed_receipts])))
       (is (true? (get-in res [:soak-summary :finality_healthy?])))))
+
+  (testing "evaluate-cluster-convergence detects accountz ledger mismatch at same finalized-epoch (fin-epoch-skew == 0)"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz {:accounts {"alice" {:balance 100 :seq 0 :deps []}}}}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz {:accounts {"alice" {:balance 90 :seq 0 :deps []}}}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (false? (:converged? res)))
+      (is (false? (:accountz-converged? res)))))
+
+  (testing "evaluate-cluster-convergence passes with identical accountz (both as EDN string and map)"
+    (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz "{:accounts {\"alice\" {:balance 100, :seq 0, :deps []}}}"}
+          s2 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 10 :window [[10 100 0]]}
+              :accountz {:accounts {"alice" {:balance 100 :seq 0 :deps []}}}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (true? (:converged? res)))
+      (is (true? (:accountz-converged? res)))))
 
   (testing "evaluate-cluster-convergence detects burn window mismatch at ep <= common-finalized-epoch"
     (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}
