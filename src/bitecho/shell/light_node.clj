@@ -68,6 +68,44 @@
                    "accept"   {"cmd" "accept"
                                "session_id" (or (extract-flag-value args "--session-id" nil)
                                                 (extract-flag-value args "--session" nil))}
+                   "rendezvous-policy" (let [min-burn (extract-long-flag args "--min-burn" nil)
+                                             price (extract-long-flag args "--price" nil)
+                                             allowlist (extract-flag-value args "--allowlist" nil)
+                                             hn (extract-flag-value args "--home-node" nil)
+                                             auto-acc (extract-flag-value args "--auto-accept" nil)
+                                             auto-acc-bool (if (some #{"--auto-accept"} args)
+                                                             (if (and auto-acc (re-matches #"(?i)false" auto-acc))
+                                                               false
+                                                               true)
+                                                             nil)
+                                             m {"cmd" "rendezvous-policy"}]
+                                         (cond-> m
+                                           min-burn (assoc "min_burn" min-burn)
+                                           price (assoc "price" price)
+                                           allowlist (assoc "allowlist" (if (str/includes? allowlist ",")
+                                                                          (mapv str/trim (str/split allowlist #","))
+                                                                          [(str/trim allowlist)]))
+                                           hn (assoc "home_node" hn)
+                                           (some? auto-acc-bool) (assoc "auto_accept" auto-acc-bool)))
+                   "rendezvous-offer" (let [callee (or (extract-flag-value args "--callee" nil)
+                                                       (extract-flag-value args "--to" nil))
+                                            burn (extract-long-flag args "--burn" nil)
+                                            topic (extract-flag-value args "--topic" nil)
+                                            hn (extract-flag-value args "--home-node" nil)
+                                            text (extract-flag-value args "--text" nil)
+                                            m {"cmd" "rendezvous-offer"
+                                               "callee" callee}]
+                                        (cond-> m
+                                          burn (assoc "burn" burn)
+                                          topic (assoc "topic" topic)
+                                          hn (assoc "home_node" hn)
+                                          text (assoc "text" text)))
+                   "rendezvous-accept" (let [oh (extract-flag-value args "--offer-hash" nil)
+                                             from (extract-flag-value args "--from" nil)
+                                             m {"cmd" "rendezvous-accept"}]
+                                         (cond-> m
+                                           oh (assoc "offer_hash" oh)
+                                           from (assoc "from" from)))
                    "send"     (let [m {"cmd" "send"
                                        "session_id" (or (extract-flag-value args "--session-id" nil)
                                                         (extract-flag-value args "--session" nil))

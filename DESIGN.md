@@ -264,4 +264,33 @@ Per Axiom Amendment 2, global directory attestation must be signed by the direct
    - Mesh ingress boundary (`unwrap-authenticated-agent-event`) validates attached envelope DACs against agent identity and epoch, failing closed on signature or validity failure.
    - Verified directory descriptors are cached in `:directory-cache` without mutating local `:petnames`, maintaining sovereign separation between global directory namespaces and local petnames.
 
+### K. Two-Phase Callee-Pays Rendezvous -> Sealed-Channel Key-Exchange Handoff (Milestone 2 — Step 2C)
+Connects `bitecho.rendezvous.core` Callee-Pays introduction directly into the ChaCha20-Poly1305 / X25519 sealed channel handshake:
+
+1. **Phase 1: Caller OfferHeader Commitment Binding (`rendezvous-offer` / `:rendezvous-offer-header`)**:
+   - Caller generates ephemeral X25519 keypair and deterministic `offer-hash`.
+   - Caller cryptographically binds session ID, counterparty identities, epoch, signaling burn, and optional DAC.
+   - Caller signs the canonical Phase 1 header string (`bitecho-rendezvous-header-v1|<caller>|<callee>|<offer-hash>|<epoch>|<burn>|<topic>|<home-node>|<dac-id>`).
+   - Ephemeral X25519 public key is strictly withheld during Phase 1, stored locally in `:outbound-rendezvous` alongside optional queued initial payload text.
+
+2. **Phase 1b: Callee Policy Verification & DeliveryAck Voucher Issuance (`rendezvous-policy`, `handle-wire-rendezvous-header`, `rendezvous-accept`)**:
+   - Callee evaluates incoming offer headers against local pure rendezvous policy (`:min-burn`, `:price`, `:allowlist`, `:home-node`, `:auto-accept?`).
+   - Header is rejected fail-closed if burn is insufficient or caller is denied by allowlist.
+   - Upon acceptance, Callee generates its own ephemeral X25519 keypair, increments monotonic per-`(home-node, epoch)` sequence counter, and signs a `DeliveryAck` voucher via `rendezvous/create-delivery-ack`.
+   - Callee returns `:rendezvous-ack-voucher` containing the signed voucher and callee signature over `bitecho-rendezvous-ack-v1|<caller>|<callee>|<offer-hash>|<callee-x25519>|<epoch>|<ack-sig>`.
+
+3. **Phase 2: Caller Voucher Verification & Key Reveal (`handle-wire-rendezvous-ack`)**:
+   - Caller verifies Callee envelope signature and verifies `DeliveryAck` voucher via `rendezvous/verify-delivery-ack`.
+   - Verified voucher is recorded into caller's `:vouchers` for future settlement.
+   - Caller derives directional session keys (`:tx-key`, `:rx-key`) via `sealed/derive-session-keys` and opens active session.
+   - Caller broadcasts `:rendezvous-reveal` containing `:caller-x25519` signed over `bitecho-rendezvous-reveal-v1|<session-id>|<caller>|<callee>|<offer-hash>|<caller-x25519>|<epoch>`.
+   - If initial text was queued at offer time, Caller immediately seals the first message via `sealed/seal-message` and emits `:sealed-message` right behind the reveal.
+
+4. **Phase 2b: Callee Commitment Verification & Encrypted Session Establishment (`handle-wire-rendezvous-reveal`)**:
+   - Callee verifies caller's revealed `:caller-x25519` against the Phase 1 `offer-hash` commitment (`expected-hash == offer-hash`). Swapped or tampered ephemeral keys fail closed.
+   - Callee derives matching symmetric session keys via `sealed/derive-session-keys` (`caller.tx == callee.rx`, `caller.rx == callee.tx`).
+   - Callee transitions session state to `"open"`.
+   - Inbound queued `:sealed-message` payloads are immediately decrypted and surfaced in Callee's `:inbox`.
+
+
 

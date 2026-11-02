@@ -2,6 +2,8 @@
   "Pure sealed-channel cryptographic primitives using JDK standard library only.
    Provides X25519 key agreement, HKDF-SHA256 (RFC 5869), ChaCha20-Poly1305 AEAD,
    deterministic nonce derivation, and gap-tolerant replay window."
+  (:require [bitecho.basalt.core :as basalt]
+            [clojure.string :as str])
   (:import [java.nio ByteBuffer]
            [java.security KeyFactory KeyPairGenerator]
            [java.security.spec PKCS8EncodedKeySpec X509EncodedKeySpec]
@@ -102,6 +104,20 @@
       {:tx-key k-i2r :rx-key k-r2i}
       {:tx-key k-r2i :rx-key k-i2r})))
 
+(defn derive-session-keys
+  "Derives directional channel keys for a rendezvous sealed-channel handoff.
+   Accepts [my-priv peer-pub caller-pub callee-pub offer-hash role] or [my-priv peer-pub caller-pub callee-pub offer-hash].
+   Uses X25519 Diffie-Hellman to derive the shared secret and derives directional keys
+   bound to offer-hash salt."
+  ([my-priv peer-pub caller-pub callee-pub offer-hash]
+   (derive-session-keys my-priv peer-pub caller-pub callee-pub offer-hash :initiator))
+  ([my-priv peer-pub _caller-pub _callee-pub offer-hash role]
+   (let [priv-bytes (if (string? my-priv) (basalt/hex->bytes my-priv) my-priv)
+         peer-bytes (if (string? peer-pub) (basalt/hex->bytes peer-pub) peer-pub)
+         shared-secret (x25519-shared-secret priv-bytes peer-bytes)
+         salt-str (str (or offer-hash ""))]
+     (derive-channel-keys shared-secret salt-str role))))
+
 (defn seq->nonce
   "Deterministically encodes a 64-bit sequence number into a 12-byte (96-bit) nonce:
    4 zero prefix bytes followed by 8-byte big-endian sequence number."
@@ -151,6 +167,13 @@
 ;; Offer Hash Binding & DAC Integrity (SPEC §4)
 ;; -----------------------------------------------------------------------------
 
+(defn- safe-long [v default-val]
+  (cond
+    (integer? v) (long v)
+    (number? v) (long v)
+    (string? v) (try (Long/parseLong (str/trim v)) (catch Exception _ default-val))
+    :else default-val))
+
 (defn offer-hash
   "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, and home-node.
    When :dac is absent, uses canonical format bitecho-sealed-offer-v1|...
@@ -160,8 +183,8 @@
         caller (str (or (:caller offer-map) (get offer-map "caller") ""))
         callee (str (or (:callee offer-map) (get offer-map "callee") ""))
         eph (str (or (:caller-ephemeral-pub offer-map) (get offer-map "caller_ephemeral_pub") (get offer-map "caller-ephemeral-pub") ""))
-        epoch (long (or (:epoch offer-map) (get offer-map "epoch") 0))
-        price (long (or (:price offer-map) (get offer-map "price") 0))
+        epoch (safe-long (or (:epoch offer-map) (get offer-map "epoch")) 0)
+        price (safe-long (or (:price offer-map) (get offer-map "price") (:burn offer-map) (get offer-map "burn")) 0)
         home-node (or (:home-node offer-map) (get offer-map "home_node") (get offer-map "home-node") "")
         hn-str (if (keyword? home-node) (name home-node) (str home-node))
         dac (or (:dac offer-map) (get offer-map "dac"))

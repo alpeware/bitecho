@@ -135,8 +135,28 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
    - `test-dac-creation-revocation-and-commands`: DAC creation, verification, revocation, command handlers, wire offer DAC attachment, and mesh envelope verification.
    - `prop-directory-attestation-and-dac-security-invariants`: 50-run generative property test verifying directory attestation PoP & authority security, key rotation continuity, and DAC delegation invariants.
 
-#### Step 2C — Two-Phase Callee-Pays Rendezvous $\rightarrow$ Sealed-Channel Key-Exchange Handoff *(Axiom Priority)*
-- Wire `bitecho.rendezvous.core` (`OfferHeader` + signaling burn $\rightarrow$ policy-gated `DeliveryAck` voucher $\rightarrow$ payload reveal) directly into the X25519 `:channel-offer` / `:channel-accept` handshake so a callee-pays rendezvous introduction seamlessly transitions into an E2E encrypted sealed conversation.
+#### Step 2C — Two-Phase Callee-Pays Rendezvous $\rightarrow$ Sealed-Channel Key-Exchange Handoff *(Axiom Priority)* — COMPLETED
+- Wired `bitecho.rendezvous.core` (`OfferHeader` + signaling burn $\rightarrow$ policy-gated `DeliveryAck` voucher $\rightarrow$ payload reveal) directly into the X25519 sealed channel handshake so a callee-pays rendezvous introduction seamlessly transitions into an E2E encrypted sealed conversation.
+1. **Phase 1 Caller Introduction (`rendezvous-offer` / `:rendezvous-offer-header`)**:
+   - Caller generates ephemeral X25519 keypair and deterministic `offer-hash`.
+   - Caller withholds ephemeral public key, storing private state and optional initial payload text in `:outbound-rendezvous`.
+   - Emits `:rendezvous-offer-header` signed over canonical Phase 1 header string (`bitecho-rendezvous-header-v1|...`).
+2. **Phase 1b Callee Evaluation & Voucher Issuance (`rendezvous-policy` / `:rendezvous-ack-voucher`)**:
+   - Callee evaluates header against pure policy (`:min-burn`, `:price`, `:allowlist`, `:home-node`, `:auto-accept?`), failing closed on policy violation.
+   - Generates callee ephemeral X25519 keypair, signs `DeliveryAck` voucher bound to monotonic sequence counter via `rendezvous/create-delivery-ack`, and buffers accept in `:pending-rendezvous-accepts`.
+   - Emits `:rendezvous-ack-voucher` signed over canonical Phase 1b string (`bitecho-rendezvous-ack-v1|...`).
+3. **Phase 2 Caller Voucher Verification & Reveal (`handle-wire-rendezvous-ack`)**:
+   - Caller verifies callee envelope signature and verifies `DeliveryAck` voucher via `rendezvous/verify-delivery-ack`, recording voucher into `:vouchers`.
+   - Derives session keys via `sealed/derive-session-keys` and opens active session.
+   - Broadcasts `:rendezvous-reveal` containing `:caller-x25519`. If initial text was queued, immediately seals and emits `:sealed-message`.
+4. **Phase 2b Callee Commitment Verification & Session Establishment (`handle-wire-rendezvous-reveal`)**:
+   - Callee verifies caller's revealed `:caller-x25519` matches Phase 1 `offer-hash` commitment (`compute-offer-hash`). Tampered or swapped ephemeral keys fail closed.
+   - Derives matching symmetric session keys via `sealed/derive-session-keys` and opens active session.
+   - Inbound queued initial `:sealed-message` is decrypted and delivered directly into Callee's `:inbox`.
+5. **Quality Gates & Invariants (Rules 1, 3, 6)**:
+   - CLI verbs `rendezvous-policy`, `rendezvous-offer`, `rendezvous-accept` and flags documented in `skill/SKILL.md` with 100% bidirectional parity in `test-cli-and-skill-flag-inventory` (25 verbs and 33 flags).
+   - Generative `test.check` property `prop-two-phase-rendezvous-to-sealed-handoff` (50 runs) verifying bidirectional key symmetry, voucher recording, and message delivery.
+   - Comprehensive unit and fail-closed security tests in `test-rendezvous-policy-command-and-enforcement`, `test-two-phase-rendezvous-handshake-end-to-end`, and `test-rendezvous-tamper-resistance-and-fail-closed`.
 
 ---
 

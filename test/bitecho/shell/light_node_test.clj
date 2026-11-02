@@ -1236,12 +1236,15 @@
                  "offer" "accept" "send" "inbox" "close" "transfer"
                  "account" "sync-account" "settle-intent" "submit-vouchers"
                  "petname-set" "petname-list" "petname-remove" "petname-resolve"
-                 "dac-attach" "dac-revoke" "directory-verify"]
+                 "dac-attach" "dac-revoke" "directory-verify"
+                 "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
                   "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"
-                  "--petname" "--pubkey" "--overwrite" "--directory-pubkey"}]
+                  "--petname" "--pubkey" "--overwrite" "--directory-pubkey"
+                  "--min-burn" "--allowlist" "--auto-accept" "--topic" "--to"
+                  "--offer-hash" "--from"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1256,6 +1259,9 @@
       (is (= "register-home-set" (get-in (light-shell/parse-light-node-args ["register-home-set"]) [:cmd-map "cmd"])))
       (is (= "offer" (get-in (light-shell/parse-light-node-args ["offer"]) [:cmd-map "cmd"])))
       (is (= "accept" (get-in (light-shell/parse-light-node-args ["accept"]) [:cmd-map "cmd"])))
+      (is (= "rendezvous-policy" (get-in (light-shell/parse-light-node-args ["rendezvous-policy"]) [:cmd-map "cmd"])))
+      (is (= "rendezvous-offer" (get-in (light-shell/parse-light-node-args ["rendezvous-offer" "--to" "bob"]) [:cmd-map "cmd"])))
+      (is (= "rendezvous-accept" (get-in (light-shell/parse-light-node-args ["rendezvous-accept" "--from" "alice"]) [:cmd-map "cmd"])))
       (is (= "send" (get-in (light-shell/parse-light-node-args ["send"]) [:cmd-map "cmd"])))
       (is (= {"cmd" "inbox"} (:cmd-map (light-shell/parse-light-node-args ["inbox"]))))
       (is (= "close" (get-in (light-shell/parse-light-node-args ["close"]) [:cmd-map "cmd"])))
@@ -1271,7 +1277,14 @@
       (is (= "dac-attach" (get-in (light-shell/parse-light-node-args ["dac-attach"]) [:cmd-map "cmd"])))
       (is (= "dac-revoke" (get-in (light-shell/parse-light-node-args ["dac-revoke"]) [:cmd-map "cmd"])))
       (is (= "directory-verify" (get-in (light-shell/parse-light-node-args ["directory-verify"]) [:cmd-map "cmd"])))
-      ;; Flags (all 26 flags tested end-to-end)
+      ;; Flags (all 33 flags tested end-to-end)
+      (is (= 100 (get-in (light-shell/parse-light-node-args ["rendezvous-policy" "--min-burn" "100"]) [:cmd-map "min_burn"])))
+      (is (= ["alice" "bob"] (get-in (light-shell/parse-light-node-args ["rendezvous-policy" "--allowlist" "alice,bob"]) [:cmd-map "allowlist"])))
+      (is (true? (get-in (light-shell/parse-light-node-args ["rendezvous-policy" "--auto-accept"]) [:cmd-map "auto_accept"])))
+      (is (= "support" (get-in (light-shell/parse-light-node-args ["rendezvous-offer" "--topic" "support"]) [:cmd-map "topic"])))
+      (is (= "bob" (get-in (light-shell/parse-light-node-args ["rendezvous-offer" "--to" "bob"]) [:cmd-map "callee"])))
+      (is (= "h123" (get-in (light-shell/parse-light-node-args ["rendezvous-accept" "--offer-hash" "h123"]) [:cmd-map "offer_hash"])))
+      (is (= "alice" (get-in (light-shell/parse-light-node-args ["rendezvous-accept" "--from" "alice"]) [:cmd-map "from"])))
       (is (= "dir-key-1" (get-in (light-shell/parse-light-node-args ["directory-verify" "--directory-pubkey" "dir-key-1"]) [:cmd-map "directory_pubkey"])))
       (is (= "alice" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "petname"])))
       (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "pubkey"])))

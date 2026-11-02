@@ -113,6 +113,19 @@
                        (= seq-num (:seq sealed-i2r))
                        (= 12 (alength ^bytes (:nonce sealed-i2r)))))))
 
+(deftest test-derive-session-keys-symmetry
+  (testing "derive-session-keys produces symmetric directional keys for initiator and responder"
+    (let [kp-caller (sealed/generate-x25519-keypair)
+          kp-callee (sealed/generate-x25519-keypair)
+          caller-pub "caller-pub-1"
+          callee-pub "callee-pub-2"
+          offer-hash "offer-hash-abc-123"
+          caller-keys (sealed/derive-session-keys (:private kp-caller) (:public kp-callee) caller-pub callee-pub offer-hash :initiator)
+          callee-keys (sealed/derive-session-keys (:private kp-callee) (:public kp-caller) caller-pub callee-pub offer-hash :responder)]
+      (is (= (basalt/bytes->hex (:tx-key caller-keys)) (basalt/bytes->hex (:rx-key callee-keys))))
+      (is (= (basalt/bytes->hex (:rx-key caller-keys)) (basalt/bytes->hex (:tx-key callee-keys))))
+      (is (not= (basalt/bytes->hex (:tx-key caller-keys)) (basalt/bytes->hex (:rx-key caller-keys)))))))
+
 (defspec ^{:doc "Property: Sealed channel fail-closed on tampered ciphertext, tampered AAD, wrong sequence, or third-party key"}
   prop-sealed-channel-tamper-resistance 50
   (prop/for-all [plaintext gen-non-empty-bytes

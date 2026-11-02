@@ -1719,7 +1719,43 @@
                         :dac "not-a-map"}
             res (light-core/handle-wire-payload init-st wire-offer agent-priv)]
         (is (= init-st (:state res)))
-        (is (empty? (:net-envelopes res)))))))
+        (is (empty? (:net-envelopes res))))
+
+      ;; 6. LOW Flag (seq 61/62): sealed/offer-hash and handle-wire-payload on mistyped epoch/price
+      ;; 6a. sealed/offer-hash with string and boolean epoch/price never throws ClassCastException
+      (is (string? (sealed/offer-hash {:epoch "1" :price "10" :caller agent-pub :callee anchor-pub})))
+      (is (string? (sealed/offer-hash {:epoch true :burn false :caller agent-pub :callee anchor-pub})))
+      (is (string? (light-core/compute-offer-hash {:epoch "1" :price "10" :caller agent-pub :callee anchor-pub})))
+      (is (string? (light-core/compute-offer-hash {:epoch true :burn false :caller agent-pub :callee anchor-pub})))
+
+      ;; 6b. create-directory-pop with mistyped epoch returns nil cleanly without throwing
+      (is (nil? (light-core/create-directory-pop agent-priv {:domain "bitecho.org" :nickname "tester" :pubkey agent-pub :epoch "10"})))
+      (is (nil? (light-core/create-directory-pop agent-priv {:domain "bitecho.org" :nickname "tester" :pubkey agent-pub :epoch true})))
+
+      ;; 6c. handle-wire-payload with mistyped epoch and burn in :channel-offer drops cleanly with zero exceptions
+      (let [init-st (light-core/init-light-state (:identity agent-id) {:epoch 10})
+            offer-str-ep {:bitecho/type :channel-offer
+                          :session-id "sess-1"
+                          :caller anchor-pub
+                          :callee agent-pub
+                          :caller-ephemeral-pub "eph-pub"
+                          :epoch "1"
+                          :burn "10"
+                          :offer-hash "oh"
+                          :signature "sig"}
+            offer-bool-ep {:bitecho/type :channel-offer
+                           :session-id "sess-1"
+                           :caller anchor-pub
+                           :callee agent-pub
+                           :caller-ephemeral-pub "eph-pub"
+                           :epoch true
+                           :burn false
+                           :offer-hash "oh"
+                           :signature "sig"}
+            res-str (light-core/handle-wire-payload init-st offer-str-ep agent-priv)
+            res-bool (light-core/handle-wire-payload init-st offer-bool-ep agent-priv)]
+        (is (= 0 (count (:pending-offers (:state res-str)))))
+        (is (= 0 (count (:pending-offers (:state res-bool)))))))))
 
 (deftest test-note-2-dac-max-spend-per-epoch-enforcement
   (testing "Note 2: DAC max-spend-per-epoch enforcement, epoch rollover, expiry, and scope denial in transfer and settle-intent"
@@ -1749,7 +1785,7 @@
 
       ;; 1. Transfer 30,000 within budget (30,000 <= 50,000) -> succeeds
       (is (= true (get-in res1 [:response "ok"])))
-      (is (= {:epoch 10 :spent 30000} (:dac-spend st1)))
+      (is (= {:epoch 10 :spent 30000} (get-in st1 [:dac-spend (:dac-id dac)])))
 
       ;; 2. Second transfer 25,000 exceeds epoch budget (30,000 + 25,000 = 55,000 > 50,000) -> fails closed
       (let [res2 (light-core/handle-command st1 {"cmd" "transfer"
@@ -1758,7 +1794,7 @@
                                             agent-priv)]
         (is (= false (get-in res2 [:response "ok"])))
         (is (= "dac-max-spend-exceeded" (get-in res2 [:response "error"])))
-        (is (= {:epoch 10 :spent 30000} (:dac-spend (:state res2))))
+        (is (= {:epoch 10 :spent 30000} (get-in (:state res2) [:dac-spend (:dac-id dac)])))
 
           ;; 3. Transfer remaining 20,000 in same epoch (30,000 + 20,000 = 50,000 <= 50,000) -> succeeds
         (let [res3 (light-core/handle-command st1 {"cmd" "transfer"
@@ -1768,7 +1804,7 @@
                                               agent-priv)
               st3 (:state res3)]
           (is (= true (get-in res3 [:response "ok"])))
-          (is (= {:epoch 10 :spent 50000} (:dac-spend st3)))
+          (is (= {:epoch 10 :spent 50000} (get-in st3 [:dac-spend (:dac-id dac)])))
 
             ;; 4. Any further spend in epoch 10 fails closed
           (let [res-over (light-core/handle-command st3 {"cmd" "transfer"
@@ -1787,7 +1823,7 @@
                                                     agent-priv)
                 st-after-ep11 (:state res-ep11)]
             (is (= true (get-in res-ep11 [:response "ok"])))
-            (is (= {:epoch 11 :spent 35000} (:dac-spend st-after-ep11)))
+            (is (= {:epoch 11 :spent 35000} (get-in st-after-ep11 [:dac-spend (:dac-id dac)])))
 
               ;; 6. settle-intent in epoch 11: 20,000 exceeds (35,000 + 20,000 = 55,000 > 50,000) -> fails closed
             (let [res-settle-fail (light-core/handle-command st-after-ep11 {"cmd" "settle-intent"
@@ -1803,7 +1839,7 @@
                                                                           "amount" "15000"}
                                                            agent-priv)]
               (is (= true (get-in res-settle-ok [:response "ok"])))
-              (is (= {:epoch 11 :spent 50000} (:dac-spend (:state res-settle-ok))))))))
+              (is (= {:epoch 11 :spent 50000} (get-in (:state res-settle-ok) [:dac-spend (:dac-id dac)])))))))
 
         ;; 8. DAC expired at epoch 25 -> fails closed with dac-expired
       (let [st-exp (assoc st1 :epoch 25)
@@ -1953,5 +1989,331 @@
         (let [unwrapped-revoked (mesh/unwrap-authenticated-agent-event env-no-ep {:current-epoch 15
                                                                                   :revoked-dacs #{(:dac-id dac)}})]
           (is (nil? unwrapped-revoked)))))))
+
+;; -----------------------------------------------------------------------------
+;; Step 2C: Two-Phase Callee-Pays Rendezvous -> Sealed-Channel Key-Exchange Handoff
+;; -----------------------------------------------------------------------------
+
+(deftest test-rendezvous-policy-command-and-enforcement
+  (testing "Callee rendezvous-policy command, query, and wire header enforcement (min-burn & allowlist)"
+    (let [callee-id (test-identity)
+          callee-pub (:pubkey-hex callee-id)
+          callee-priv (:privkey-bytes callee-id)
+          caller-allowed-id (test-identity)
+          caller-allowed-pub (:pubkey-hex caller-allowed-id)
+          caller-denied-id (test-identity)
+          caller-denied-pub (:pubkey-hex caller-denied-id)
+          caller-denied-priv (:privkey-bytes caller-denied-id)
+          init-st (light-core/init-light-state (:identity callee-id) {:epoch 10})
+
+          ;; 1. Configure policy
+          pol-cmd {"cmd" "rendezvous-policy"
+                   "min-burn" 250
+                   "price" 15
+                   "allowlist" [caller-allowed-pub]
+                   "auto-accept" false
+                   "home-node" "node1"}
+          pol-res (light-core/handle-command init-st pol-cmd callee-priv)
+          pol-st (:state pol-res)
+          st-resp (light-core/handle-command pol-st {"cmd" "status"} callee-priv)]
+
+      (is (= true (get-in pol-res [:response "ok"])))
+      (is (= 250 (get-in pol-res [:response "rendezvous_policy" "min_burn"])))
+      (is (= 15 (get-in pol-res [:response "rendezvous_policy" "price"])))
+      (is (= [caller-allowed-pub] (get-in pol-res [:response "rendezvous_policy" "allowlist"])))
+      (is (= "node1" (get-in pol-res [:response "rendezvous_policy" "home_node"])))
+      (is (= false (get-in pol-res [:response "rendezvous_policy" "auto_accept"])))
+      ;; status reflects rendezvous_policy
+      (is (= 250 (:min-burn (get-in st-resp [:response "rendezvous_policy"]))))
+
+      ;; 2. Wire offer header from denied caller rejected fail-closed by allowlist
+      (let [kp-eph (sealed/generate-x25519-keypair)
+            eph-pub (basalt/bytes->hex (:public kp-eph))
+            sid (light-core/compute-session-id caller-denied-pub callee-pub eph-pub)
+            oh (light-core/compute-offer-hash {:session-id sid :caller caller-denied-pub :callee callee-pub
+                                               :caller-ephemeral-pub eph-pub :epoch 10 :price 300 :burn 300})
+            hdr-str (light-core/canonical-rendezvous-header-str caller-denied-pub callee-pub oh 10 300 "" "node1" nil)
+            sig (basalt/bytes->hex (crypto/sign caller-denied-priv (.getBytes hdr-str "UTF-8")))
+            denied-hdr {:bitecho/type :rendezvous-offer-header
+                        :caller caller-denied-pub
+                        :callee callee-pub
+                        :offer-hash oh
+                        :epoch 10
+                        :burn 300
+                        :topic ""
+                        :home-node "node1"
+                        :signature sig}
+            recv-denied (light-core/handle-wire-payload pol-st denied-hdr callee-priv)]
+        (is (empty? (:stdout-events recv-denied)))
+        (is (empty? (:pending-rendezvous (:state recv-denied)))))
+
+      ;; 3. Wire offer header with burn < min-burn rejected fail-closed
+      (let [kp-eph (sealed/generate-x25519-keypair)
+            eph-pub (basalt/bytes->hex (:public kp-eph))
+            sid (light-core/compute-session-id caller-allowed-pub callee-pub eph-pub)
+            oh (light-core/compute-offer-hash {:session-id sid :caller caller-allowed-pub :callee callee-pub
+                                               :caller-ephemeral-pub eph-pub :epoch 10 :price 100 :burn 100})
+            hdr-str (light-core/canonical-rendezvous-header-str caller-allowed-pub callee-pub oh 10 100 "" "node1" nil)
+            sig (basalt/bytes->hex (crypto/sign (:privkey-bytes caller-allowed-id) (.getBytes hdr-str "UTF-8")))
+            low-burn-hdr {:bitecho/type :rendezvous-offer-header
+                          :caller caller-allowed-pub
+                          :callee callee-pub
+                          :offer-hash oh
+                          :epoch 10
+                          :burn 100
+                          :topic ""
+                          :home-node "node1"
+                          :signature sig}
+            recv-low (light-core/handle-wire-payload pol-st low-burn-hdr callee-priv)]
+        (is (empty? (:stdout-events recv-low)))
+        (is (empty? (:pending-rendezvous (:state recv-low)))))
+
+      ;; 4. Valid wire offer header meeting policy accepted and buffered in :pending-rendezvous
+      (let [kp-eph (sealed/generate-x25519-keypair)
+            eph-pub (basalt/bytes->hex (:public kp-eph))
+            sid (light-core/compute-session-id caller-allowed-pub callee-pub eph-pub)
+            oh (light-core/compute-offer-hash {:session-id sid :caller caller-allowed-pub :callee callee-pub
+                                               :caller-ephemeral-pub eph-pub :epoch 10 :price 300 :burn 300})
+            hdr-str (light-core/canonical-rendezvous-header-str caller-allowed-pub callee-pub oh 10 300 "chat" "node1" nil)
+            sig (basalt/bytes->hex (crypto/sign (:privkey-bytes caller-allowed-id) (.getBytes hdr-str "UTF-8")))
+            valid-hdr {:bitecho/type :rendezvous-offer-header
+                       :caller caller-allowed-pub
+                       :callee callee-pub
+                       :offer-hash oh
+                       :epoch 10
+                       :burn 300
+                       :topic "chat"
+                       :home-node "node1"
+                       :signature sig}
+            recv-valid (light-core/handle-wire-payload pol-st valid-hdr callee-priv)]
+        (is (= 1 (count (:pending-rendezvous (:state recv-valid)))))
+        (is (some? (get-in recv-valid [:state :pending-rendezvous oh])))))))
+
+(deftest test-two-phase-rendezvous-handshake-end-to-end
+  (testing "Two-Phase Callee-Pays Rendezvous -> Sealed-Channel Key-Exchange Handoff with initial message"
+    (let [caller-id (test-identity)
+          _caller-pub (:pubkey-hex caller-id)
+          caller-priv (:privkey-bytes caller-id)
+          callee-id (test-identity)
+          callee-pub (:pubkey-hex callee-id)
+          callee-priv (:privkey-bytes callee-id)
+          init-caller (light-core/init-light-state (:identity caller-id) {:epoch 10})
+          init-callee (light-core/init-light-state (:identity callee-id) {:epoch 10})
+
+          ;; 1. Caller initiates Phase 1 rendezvous-offer with initial text
+          offer-res (light-core/handle-command init-caller
+                                               {"cmd" "rendezvous-offer"
+                                                "callee" callee-pub
+                                                "burn" 500
+                                                "topic" "secret-chat"
+                                                "text" "Hello Callee via sealed rendezvous!"}
+                                               caller-priv)
+          st-caller-1 (:state offer-res)
+          offer-hash (get-in offer-res [:response "offer_hash"])
+          sid (get-in offer-res [:response "session_id"])
+          hdr-gossip-env (first (:net-envelopes offer-res))
+          hdr-payload (nippy/thaw (get-in hdr-gossip-env [:event :message :payload]))]
+
+      (is (= true (get-in offer-res [:response "ok"])))
+      (is (string? offer-hash))
+      (is (string? sid))
+      (is (= 1 (count (:outbound-rendezvous st-caller-1))))
+      (is (= :rendezvous-offer-header (:bitecho/type hdr-payload)))
+      ;; Ephemeral key withheld in Phase 1!
+      (is (nil? (:caller-x25519 hdr-payload)))
+      (is (nil? (:caller-ephemeral-pub hdr-payload)))
+
+      ;; 2. Callee receives Phase 1 offer header
+      (let [callee-recv-hdr (light-core/handle-wire-payload init-callee hdr-payload callee-priv)
+            st-callee-1 (:state callee-recv-hdr)
+            inbox-res1 (light-core/handle-command st-callee-1 {"cmd" "inbox"} callee-priv)]
+        (is (= 1 (count (:pending-rendezvous st-callee-1))))
+        (is (= 1 (count (get-in inbox-res1 [:response "pending_rendezvous"]))))
+
+        ;; 3. Callee accepts offer via rendezvous-accept
+        (let [accept-res (light-core/handle-command st-callee-1
+                                                    {"cmd" "rendezvous-accept"
+                                                     "offer_hash" offer-hash}
+                                                    callee-priv)
+              st-callee-2 (:state accept-res)
+              ack-gossip-env (first (:net-envelopes accept-res))
+              ack-payload (nippy/thaw (get-in ack-gossip-env [:event :message :payload]))]
+          (is (= true (get-in accept-res [:response "ok"])))
+          (is (= 1 (count (:pending-rendezvous-accepts st-callee-2))))
+          (is (= 0 (count (:pending-rendezvous st-callee-2))))
+          (is (= :rendezvous-ack-voucher (:bitecho/type ack-payload)))
+          (is (some? (:delivery-ack ack-payload)))
+          (is (string? (:callee-x25519 ack-payload)))
+
+          ;; 4. Caller receives Phase 1b :rendezvous-ack-voucher
+          (let [caller-recv-ack (light-core/handle-wire-payload st-caller-1 ack-payload caller-priv)
+                st-caller-2 (:state caller-recv-ack)
+                reveal-env (first (:net-envelopes caller-recv-ack))
+                msg-env (second (:net-envelopes caller-recv-ack))
+                reveal-payload (nippy/thaw (get-in reveal-env [:event :message :payload]))
+                sealed-payload (nippy/thaw (get-in msg-env [:event :message :payload]))]
+            (is (= 0 (count (:outbound-rendezvous st-caller-2))))
+            (is (= 1 (count (:vouchers st-caller-2))))
+            (is (= "open" (get-in st-caller-2 [:sessions sid :state])))
+            (is (= :rendezvous-reveal (:bitecho/type reveal-payload)))
+            (is (string? (:caller-x25519 reveal-payload)))
+            (is (= :sealed-message (:bitecho/type sealed-payload)))
+
+            ;; 5. Callee receives Phase 2 :rendezvous-reveal
+            (let [callee-recv-reveal (light-core/handle-wire-payload st-callee-2 reveal-payload callee-priv)
+                  st-callee-3 (:state callee-recv-reveal)]
+              (is (= 0 (count (:pending-rendezvous-accepts st-callee-3))))
+              (is (= "open" (get-in st-callee-3 [:sessions sid :state])))
+
+              ;; 6. Callee receives initial :sealed-message
+              (let [callee-recv-msg (light-core/handle-wire-payload st-callee-3 sealed-payload callee-priv)
+                    st-callee-4 (:state callee-recv-msg)
+                    inbox-res2 (light-core/handle-command st-callee-4 {"cmd" "inbox"} callee-priv)]
+                (is (= 1 (count (get-in inbox-res2 [:response "messages"]))))
+                (is (= "Hello Callee via sealed rendezvous!" (:text (first (get-in inbox-res2 [:response "messages"])))))
+
+                ;; 7. Bidirectional encrypted conversation: Callee replies to Caller
+                (let [reply-res (light-core/handle-command st-callee-4
+                                                           {"cmd" "send"
+                                                            "session_id" sid
+                                                            "text" "Welcome to the encrypted channel!"}
+                                                           callee-priv)
+                      _st-callee-5 (:state reply-res)
+                      reply-env (first (:net-envelopes reply-res))
+                      reply-payload (nippy/thaw (get-in reply-env [:event :message :payload]))
+                      caller-recv-reply (light-core/handle-wire-payload st-caller-2 reply-payload caller-priv)
+                      st-caller-3 (:state caller-recv-reply)
+                      caller-inbox (light-core/handle-command st-caller-3 {"cmd" "inbox"} caller-priv)]
+                  (is (= true (get-in reply-res [:response "ok"])))
+                  (is (= 1 (count (get-in caller-inbox [:response "messages"]))))
+                  (is (= "Welcome to the encrypted channel!" (:text (first (get-in caller-inbox [:response "messages"]))))))))))))))
+
+(deftest test-rendezvous-tamper-resistance-and-fail-closed
+  (testing "Phase 2 commitment binding tamper resistance, signature verification, and fail-closed behavior"
+    (let [caller-id (test-identity)
+          _caller-pub (:pubkey-hex caller-id)
+          caller-priv (:privkey-bytes caller-id)
+          callee-id (test-identity)
+          callee-pub (:pubkey-hex callee-id)
+          callee-priv (:privkey-bytes callee-id)
+          init-caller (light-core/init-light-state (:identity caller-id) {:epoch 10})
+          init-callee (light-core/init-light-state (:identity callee-id) {:epoch 10})
+
+          offer-res (light-core/handle-command init-caller
+                                               {"cmd" "rendezvous-offer"
+                                                "callee" callee-pub
+                                                "burn" 500}
+                                               caller-priv)
+          st-caller (:state offer-res)
+          offer-hash (get-in offer-res [:response "offer_hash"])
+          _sid (get-in offer-res [:response "session_id"])
+          hdr-payload (nippy/thaw (get-in (first (:net-envelopes offer-res)) [:event :message :payload]))
+          st-callee-1 (:state (light-core/handle-wire-payload init-callee hdr-payload callee-priv))
+          accept-res (light-core/handle-command st-callee-1 {"cmd" "rendezvous-accept" "offer_hash" offer-hash} callee-priv)
+          st-callee-2 (:state accept-res)
+          ack-payload (nippy/thaw (get-in (first (:net-envelopes accept-res)) [:event :message :payload]))
+          caller-res (light-core/handle-wire-payload st-caller ack-payload caller-priv)
+          reveal-payload (nippy/thaw (get-in (first (:net-envelopes caller-res)) [:event :message :payload]))]
+
+      ;; 1. Reveal with swapped :caller-x25519 fails offer-hash commitment verification -> drops cleanly
+      (let [swapped-eph (basalt/bytes->hex (:public (sealed/generate-x25519-keypair)))
+            tampered-reveal (assoc reveal-payload :caller-x25519 swapped-eph)
+            res (light-core/handle-wire-payload st-callee-2 tampered-reveal callee-priv)]
+        (is (= 0 (count (:sessions (:state res)))))
+        (is (empty? (:stdout-events res))))
+
+      ;; 2. Reveal with forged signature -> drops cleanly
+      (let [forged-sig (apply str (repeat 128 "0"))
+            tampered-reveal (assoc reveal-payload :signature forged-sig)
+            res (light-core/handle-wire-payload st-callee-2 tampered-reveal callee-priv)]
+        (is (= 0 (count (:sessions (:state res)))))
+        (is (empty? (:stdout-events res))))
+
+      ;; 3. Ack voucher with forged DeliveryAck -> caller drops cleanly
+      (let [tampered-ack (assoc-in ack-payload [:delivery-ack :signature] (apply str (repeat 128 "0")))
+            res (light-core/handle-wire-payload st-caller tampered-ack caller-priv)]
+        (is (= 0 (count (:vouchers (:state res)))))
+        (is (= 0 (count (:sessions (:state res))))))
+
+      ;; 4. Phase 1 header with forged caller signature -> callee drops cleanly
+      (let [tampered-hdr (assoc hdr-payload :signature (apply str (repeat 128 "0")))
+            res (light-core/handle-wire-payload init-callee tampered-hdr callee-priv)]
+        (is (= 0 (count (:pending-rendezvous (:state res))))))
+
+      ;; 5. Mistyped wire fields fail closed with zero exceptions
+      (let [mistyped-hdr (assoc hdr-payload :epoch "10" :burn true)
+            mistyped-ack (assoc ack-payload :epoch true)
+            mistyped-rev (assoc reveal-payload :epoch "bad-epoch")
+            res-h (light-core/handle-wire-payload init-callee mistyped-hdr callee-priv)
+            res-a (light-core/handle-wire-payload st-caller mistyped-ack caller-priv)
+            res-r (light-core/handle-wire-payload st-callee-2 mistyped-rev callee-priv)]
+        (is (= init-callee (:state res-h)))
+        (is (= st-caller (:state res-a)))
+        (is (= st-callee-2 (:state res-r)))))))
+
+(defspec ^{:doc "Property: Two-phase callee-pays rendezvous -> sealed-channel key-exchange handoff"}
+  prop-two-phase-rendezvous-to-sealed-handoff 50
+  (prop/for-all [epoch (gen/choose 1 50)
+                 burn (gen/choose 200 800)
+                 topic (gen/elements ["greeting" "file-transfer" "query" "attest"])
+                 text (gen/not-empty gen/string-ascii)]
+                (let [caller-id (test-identity)
+                      _caller-pub (:pubkey-hex caller-id)
+                      caller-priv (:privkey-bytes caller-id)
+                      callee-id (test-identity)
+                      callee-pub (:pubkey-hex callee-id)
+                      callee-priv (:privkey-bytes callee-id)
+                      init-caller (light-core/init-light-state (:identity caller-id) {:epoch epoch})
+                      init-callee (light-core/init-light-state (:identity callee-id) {:epoch epoch})
+
+          ;; 1. Caller creates offer
+                      offer-res (light-core/handle-command init-caller
+                                                           {"cmd" "rendezvous-offer"
+                                                            "callee" callee-pub
+                                                            "burn" burn
+                                                            "topic" topic
+                                                            "text" text}
+                                                           caller-priv)
+                      st-caller-1 (:state offer-res)
+                      offer-hash (get-in offer-res [:response "offer_hash"])
+                      sid (get-in offer-res [:response "session_id"])
+                      hdr-payload (nippy/thaw (get-in (first (:net-envelopes offer-res)) [:event :message :payload]))
+
+          ;; 2. Callee receives header
+                      callee-recv-hdr (light-core/handle-wire-payload init-callee hdr-payload callee-priv)
+                      st-callee-1 (:state callee-recv-hdr)
+
+          ;; 3. Callee accepts
+                      accept-res (light-core/handle-command st-callee-1 {"cmd" "rendezvous-accept" "offer_hash" offer-hash} callee-priv)
+                      st-callee-2 (:state accept-res)
+                      ack-payload (nippy/thaw (get-in (first (:net-envelopes accept-res)) [:event :message :payload]))
+
+          ;; 4. Caller receives ack
+                      caller-recv-ack (light-core/handle-wire-payload st-caller-1 ack-payload caller-priv)
+                      st-caller-2 (:state caller-recv-ack)
+                      reveal-payload (nippy/thaw (get-in (first (:net-envelopes caller-recv-ack)) [:event :message :payload]))
+                      msg-payload (nippy/thaw (get-in (second (:net-envelopes caller-recv-ack)) [:event :message :payload]))
+
+          ;; 5. Callee receives reveal
+                      callee-recv-reveal (light-core/handle-wire-payload st-callee-2 reveal-payload callee-priv)
+                      st-callee-3 (:state callee-recv-reveal)
+
+          ;; 6. Callee receives sealed message
+                      callee-recv-msg (light-core/handle-wire-payload st-callee-3 msg-payload callee-priv)
+                      st-callee-4 (:state callee-recv-msg)
+
+                      caller-sess (get-in st-caller-2 [:sessions sid])
+                      callee-sess (get-in st-callee-4 [:sessions sid])
+                      inbox (get-in st-callee-4 [:inbox])]
+
+                  (and (= "open" (:state caller-sess))
+                       (= "open" (:state callee-sess))
+                       (= 1 (count (:vouchers st-caller-2)))
+           ;; Key symmetry: caller TX == callee RX, caller RX == callee TX
+                       (java.util.Arrays/equals ^bytes (:tx-key caller-sess) ^bytes (:rx-key callee-sess))
+                       (java.util.Arrays/equals ^bytes (:rx-key caller-sess) ^bytes (:tx-key callee-sess))
+           ;; Message delivery: initial text successfully decrypted in Callee's inbox
+                       (= 1 (count inbox))
+                       (= text (:text (first inbox)))))))
 
 

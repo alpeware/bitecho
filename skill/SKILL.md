@@ -454,7 +454,7 @@ Resolves a petname to its public key or a public key to its configured petname.
 ---
 
 ### `dac-attach`
-Attaches a verified Delegated Agent Certificate (DAC) issued by a cold anchor key to this agent node.
+Attaches a verified Delegated Agent Certificate (DAC) issued by a cold anchor key to this agent node. Scopes may include `transfer`, `offer`, `settle`, `settle-intent`, and `gossip`.
 
 - **CLI**: `clojure -M:light-node dac-attach '{"dac": {...}}'`
 - **JSONL**: `{"cmd": "dac-attach", "dac": {"dac_id": "...", "anchor_pubkey": "...", "agent_pubkey": "...", "issued_epoch": 10, "expires_epoch": 30, "signature": "..."}}`
@@ -502,6 +502,65 @@ Cryptographically verifies an authority-signed directory attestation descriptor 
     "home_set": ["node1"],
     "directory_pubkey": "<pubkey-hex>",
     "expires_epoch": 30
+  }
+  ```
+
+---
+
+### `rendezvous-policy`
+Configures local callee policy for two-phase callee-pays rendezvous introduction introductions.
+
+- **CLI**: `clojure -M:light-node rendezvous-policy [--min-burn <ech>] [--price <ech>] [--allowlist <pubkeys-or-petnames>] [--home-node <node-id>] [--auto-accept]`
+- **JSONL**: `{"cmd": "rendezvous-policy", "min_burn": 100, "price": 10, "allowlist": ["alice", "bob"], "home_node": "node1", "auto_accept": true}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "rendezvous_policy": {
+      "min_burn": 100,
+      "price": 10,
+      "allowlist": ["<pubkey-hex>"],
+      "home_node": "node1",
+      "auto_accept": true
+    }
+  }
+  ```
+
+---
+
+### `rendezvous-offer`
+Initiates Phase 1 of a two-phase callee-pays introduction by creating and broadcasting an offer header while withholding the caller's ephemeral X25519 key until callee DeliveryAck voucher is returned.
+
+- **CLI**: `clojure -M:light-node rendezvous-offer (--callee <pubkey-or-petname> | --to <pubkey-or-petname>) [--burn <ech>] [--topic <intent>] [--home-node <node-id>] [--text <initial-msg>]`
+- **JSONL**: `{"cmd": "rendezvous-offer", "callee": "bob", "burn": 500, "topic": "support", "home_node": "node1", "text": "hello"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "offer_hash": "<hex>",
+    "session_id": "<hex>",
+    "caller": "<pubkey-hex>",
+    "callee": "<pubkey-hex>",
+    "burn": 500
+  }
+  ```
+
+---
+
+### `rendezvous-accept`
+Accepts a pending Phase 1 rendezvous offer header, generates callee ephemeral X25519 keypair, signs a DeliveryAck voucher, and emits the Phase 1b voucher envelope to complete the sealed-channel handoff.
+
+- **CLI**: `clojure -M:light-node rendezvous-accept (--offer-hash <hex> | --from <pubkey-or-petname>)`
+- **JSONL**: `{"cmd": "rendezvous-accept", "offer_hash": "<hex>", "from": "alice"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "offer_hash": "<hex>",
+    "caller": "<pubkey-hex>",
+    "callee": "<pubkey-hex>",
+    "seq": 1,
+    "cumulative_debit": 10
   }
   ```
 
