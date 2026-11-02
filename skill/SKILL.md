@@ -428,7 +428,9 @@ Removes a petname mapping from the local address book by petname or public key.
   ```json
   {
     "ok": true,
-    "removed": "alice"
+    "removed": true,
+    "petname": "alice",
+    "pubkey": "<pubkey-hex>"
   }
   ```
 

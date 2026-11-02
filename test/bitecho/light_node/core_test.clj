@@ -715,6 +715,8 @@
       (is (true? (light-core/valid-pubkey-hex? pub-alice)))
       (is (true? (light-core/valid-pubkey-hex? (str/upper-case pub-alice))))
       (is (true? (light-core/valid-pubkey-hex? (str "  " pub-alice "  "))))
+      (is (false? (light-core/valid-pubkey-hex? (apply str (repeat 88 "a")))) "88-char hex without Ed25519 SPKI prefix must be rejected")
+      (is (false? (light-core/valid-pubkey-hex? (apply str (repeat 88 "0")))))
       (is (false? (light-core/valid-pubkey-hex? "")))
       (is (false? (light-core/valid-pubkey-hex? nil)))
       (is (false? (light-core/valid-pubkey-hex? "not-a-hex")))
@@ -805,7 +807,15 @@
           (is (= "bob" (get-in res-conf2 [:response "existing_petname"])))
           (is (= (:petnames st1) (:petnames (:state res-conf2)))))
 
-        ;; 7. Overwrite allows re-keying and preserves 1:1 bijection
+        ;; 6b. Explicit overwrite false or "false" also rejects conflict
+        (let [r-false-bool (light-core/handle-command st1 {"cmd" "petname-set" "petname" "bob" "pubkey" pub-charlie "overwrite" false} priv-alice)
+              r-false-str (light-core/handle-command st1 {"cmd" "petname-set" "petname" "bob" "pubkey" pub-charlie "overwrite" "false"} priv-alice)]
+          (is (= false (get-in r-false-bool [:response "ok"])))
+          (is (= "petname-conflict" (get-in r-false-bool [:response "error"])))
+          (is (= false (get-in r-false-str [:response "ok"])))
+          (is (= "petname-conflict" (get-in r-false-str [:response "error"]))))
+
+        ;; 7. Overwrite allows re-keying and preserves 1:1 bijection (tested with true and "true")
         (let [res-over (light-core/handle-command st1 {"cmd" "petname-set" "petname" "robert" "pubkey" pub-bob "overwrite" true} priv-alice)
               st-over (:state res-over)]
           (is (= true (get-in res-over [:response "ok"])))
@@ -859,13 +869,30 @@
 
         ;; Inbound wire offer at Bob: event enriched with caller_petname "alice", wire petname ignored
         (let [gossip-offer (second (:net-envelopes res-offer))
-              wire-payload (assoc (nippy/thaw (get-in gossip-offer [:event :message :payload])) :petname "spoofed-attacker-name")
+              wire-payload (assoc (nippy/thaw (get-in gossip-offer [:event :message :payload]))
+                                  :petname "spoofed-attacker-name"
+                                  :nickname "spoofed-nick")
               res-b-wire (light-core/handle-wire-payload st-b0 wire-payload priv-bob)
               st-b1 (:state res-b-wire)
               ev (first (:stdout-events res-b-wire))]
           (is (= "offer-received" (get ev "event")))
           (is (= "alice" (get ev "caller_petname")))
           (is (= {"alice" pub-alice} (:petnames st-b1)) "Wire-claimed petname was NEVER imported")
+          (is (nil? (get-in st-b1 [:pending-offers sid :petname])) "Wire offer in pending-offers must NOT store :petname")
+          (is (nil? (get-in st-b1 [:pending-offers sid :nickname])) "Wire offer in pending-offers must NOT store :nickname")
+
+          ;; Dedicated check: When caller has NO local petname, wire offer must NOT surface spoofed petname/nickname in inbox pending_offers
+          (let [res-wire-anon (light-core/handle-wire-payload (assoc st-b0 :petnames {}) wire-payload priv-bob)
+                st-anon (:state res-wire-anon)
+                inbox-anon (light-core/handle-command st-anon {"cmd" "inbox"} priv-bob)
+                anon-offers (get-in inbox-anon [:response "pending_offers"])]
+            (is (= 1 (count anon-offers)))
+            (is (nil? (:petname (first anon-offers))))
+            (is (nil? (:nickname (first anon-offers))))
+            (is (nil? (get (first anon-offers) "petname")))
+            (is (nil? (get (first anon-offers) "nickname")))
+            (is (nil? (:caller_petname (first anon-offers))))
+            (is (nil? (get (first anon-offers) "caller_petname"))))
 
           ;; 2. Bob accepts offer
           (let [res-accept (light-core/handle-command st-b1 {"cmd" "accept" "session_id" sid} priv-bob)
@@ -899,8 +926,17 @@
                       b-msg-ev (first (:stdout-events res-b-msg))]
                   (is (= "message-received" (get b-msg-ev "event")))
                   (is (= "alice" (get b-msg-ev "from_petname")))
+                  (is (nil? (:from_petname (first (:inbox st-b3)))) "Stored inbox item must not permanently store :from_petname")
 
-                  ;; Bob's inbox is enriched with from_petname
+                  ;; Note 1: If petname is removed before inbox is read, inbox does NOT show stale :from_petname
+                  (let [st-b3-unnamed (update st-b3 :petnames dissoc "alice")
+                        res-inbox-unnamed (light-core/handle-command st-b3-unnamed {"cmd" "inbox"} priv-bob)
+                        msgs-unnamed (get-in res-inbox-unnamed [:response "messages"])]
+                    (is (= 1 (count msgs-unnamed)))
+                    (is (nil? (:from_petname (first msgs-unnamed))))
+                    (is (nil? (get (first msgs-unnamed) "from_petname"))))
+
+                  ;; When petname is present, Bob's inbox is dynamically enriched with from_petname
                   (let [res-inbox (light-core/handle-command st-b3 {"cmd" "inbox"} priv-bob)
                         inbox-msgs (get-in res-inbox [:response "messages"])]
                     (is (= 1 (count inbox-msgs)))
@@ -940,7 +976,33 @@
             sess-summary (first (get-in res-status [:response "sessions"]))]
         (is (= {"bob" pub-bob} (get-in res-status [:response "petnames"])))
         (is (= 1 (get-in res-status [:response "petnames_count"])))
-        (is (= "bob" (:peer_petname sess-summary)))))))
+        (is (= "bob" (:peer_petname sess-summary)))))
+
+    (testing "4. resolve-session-id fails closed on ambiguous multiple active sessions"
+      (let [tx-k (byte-array 32)
+            st-multi (-> st-a0
+                         (assoc-in [:sessions "sess-1"] {:session-id "sess-1" :peer pub-bob :state "open" :tx-key tx-k :replay-window (sealed/init-replay-window)})
+                         (assoc-in [:sessions "sess-2"] {:session-id "sess-2" :peer pub-bob :state "open" :tx-key tx-k :replay-window (sealed/init-replay-window)}))]
+        ;; Ambiguous: 2 open sessions to bob -> send by petname fails closed
+        (let [res-ambig (light-core/handle-command st-multi {"cmd" "send" "peer" "@bob" "text" "hi"} priv-alice)]
+          (is (= false (get-in res-ambig [:response "ok"])))
+          (is (= "session-not-open" (get-in res-ambig [:response "error"]))))
+
+        ;; Ambiguous: 2 active sessions to bob -> close by petname fails closed
+        (let [res-ambig-close (light-core/handle-command st-multi {"cmd" "close" "peer" "bob"} priv-alice)]
+          (is (= false (get-in res-ambig-close [:response "ok"])))
+          (is (= "session-not-found" (get-in res-ambig-close [:response "error"]))))
+
+        ;; Explicit session ID succeeds
+        (let [res-exp (light-core/handle-command st-multi {"cmd" "close" "session_id" "sess-2"} priv-alice)
+              st-after-close (:state res-exp)]
+          (is (= true (get-in res-exp [:response "ok"])))
+          (is (= "sess-2" (get-in res-exp [:response "session_id"])))
+
+          ;; Now only 1 open session (sess-1) remains -> send by petname @bob resolves cleanly to sess-1
+          (let [res-one-open (light-core/handle-command st-after-close {"cmd" "send" "peer" "@bob" "text" "hi"} priv-alice)]
+            (is (= true (get-in res-one-open [:response "ok"])))
+            (is (= "sess-1" (get-in res-one-open [:response "session_id"])))))))))
 
 (defspec ^{:doc "Property: Strict 1:1 petname bijection, conflict isolation without overwrite, and bidirectional resolution across arbitrary command sequences"}
   prop-petname-bijection-and-bidirectional-resolution 50

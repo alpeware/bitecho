@@ -50,12 +50,14 @@
 
 (defn valid-pubkey-hex?
   "Returns true iff s is a string whose trimmed form is an 88-char hex string
-   that cleanly decodes to bytes via basalt/hex->bytes."
+   starting with canonical Ed25519 SPKI prefix 302a300506032b6570032100
+   and cleanly decodes to 44 bytes via basalt/hex->bytes."
   [s]
   (boolean
    (when (and (string? s) (not (str/blank? s)))
      (let [t (str/trim s)]
-       (when (re-matches pubkey-pattern t)
+       (when (and (re-matches pubkey-pattern t)
+                  (str/starts-with? (str/lower-case t) "302a300506032b6570032100"))
          (try
            (let [b (basalt/hex->bytes t)]
              (and (some? b) (= 44 (alength ^bytes b))))
@@ -123,7 +125,8 @@
 
 (defn- resolve-session-id
   "Resolves a session id from cmd-map or counterparty identifier (petname/pubkey).
-   Supports :open (prefers open sessions) or :active (prefers non-closed sessions)."
+   Supports :open (prefers open sessions) or :active (prefers non-closed sessions).
+   Fails closed (returns nil) if multiple preferred sessions exist for the counterparty."
   [state cmd-map preference]
   (let [raw-sid (or (get cmd-map "session_id") (get cmd-map "session")
                     (:session_id cmd-map) (:session cmd-map))]
@@ -133,18 +136,24 @@
                        (:peer cmd-map) (:callee cmd-map))
             resolved (when target (resolve-counterparty state target))]
         (when (:ok? resolved)
-          (let [matching (filter (fn [[_ s]] (= (:peer s) (:pubkey resolved))) (:sessions state))]
+          (let [matching (filterv (fn [[_ s]] (= (:peer s) (:pubkey resolved))) (:sessions state))
+                preferred-pred (case preference
+                                 :open (fn [[_ s]] (= "open" (:state s)))
+                                 :active (fn [[_ s]] (not= "closed" (:state s)))
+                                 (constantly true))
+                preferred-matching (filterv preferred-pred matching)]
             (cond
-              (= preference :open)
-              (or (first (keep (fn [[sid s]] (when (= "open" (:state s)) sid)) matching))
-                  (first (map first matching)))
+              (= 1 (count preferred-matching))
+              (first (first preferred-matching))
 
-              (= preference :active)
-              (or (first (keep (fn [[sid s]] (when (not= "closed" (:state s)) sid)) matching))
-                  (first (map first matching)))
+              (> (count preferred-matching) 1)
+              nil
+
+              (= 1 (count matching))
+              (first (first matching))
 
               :else
-              (first (map first matching)))))))))
+              nil)))))))
 
 (defn- resolve-accept-session-id
   "Resolves an accept session id from cmd-map or caller identifier in pending-offers."
@@ -453,15 +462,18 @@
 
 (defn- exec-inbox [state]
   (let [enriched-msgs (mapv (fn [m]
-                              (let [sender (or (:from m) (get m "from"))
+                              (let [clean-m (dissoc m :from_petname :from-petname "from_petname" "from-petname")
+                                    sender (or (:from clean-m) (get clean-m "from"))
                                     pname (when sender (pubkey->petname state sender))]
-                                (cond-> m
+                                (cond-> clean-m
                                   pname (assoc :from_petname pname "from_petname" pname))))
                             (:inbox state))
         enriched-offers (mapv (fn [o]
-                                (let [caller (or (:caller o) (get o "caller"))
+                                (let [clean-o (dissoc o :petname :nickname :caller_petname :caller-petname
+                                                      "petname" "nickname" "caller_petname" "caller-petname")
+                                      caller (or (:caller clean-o) (get clean-o "caller"))
                                       pname (when caller (pubkey->petname state caller))]
-                                  (cond-> o
+                                  (cond-> clean-o
                                     pname (assoc :caller_petname pname "caller_petname" pname))))
                               (vec (vals (:pending-offers state))))]
     {:state (assoc state :inbox [])
@@ -731,9 +743,11 @@
         raw-pub (or (get cmd-map "pubkey") (:pubkey cmd-map))
         pname (normalize-petname raw-pname)
         pub (normalize-pubkey-hex raw-pub)
-        overwrite? (boolean (or (get cmd-map "overwrite")
-                                (:overwrite cmd-map)
-                                (= "true" (str (get cmd-map "overwrite")))))]
+        ov (if (contains? cmd-map "overwrite")
+             (get cmd-map "overwrite")
+             (:overwrite cmd-map))
+        overwrite? (boolean (or (true? ov)
+                                (and (string? ov) (= "true" (str/lower-case (str/trim ov))))))]
     (cond
       (nil? pname)
       {:state state
@@ -930,7 +944,8 @@
                           (crypto/verify caller-pub (.getBytes ^String (:offer-hash msg) "UTF-8") sig-bytes))]
       (if-not valid-sig?
         {:state state :net-envelopes [] :stdout-events []}
-        (let [sid (:session-id msg)]
+        (let [sid (:session-id msg)
+              clean-offer (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature])]
           (cond
             (contains? (:sessions state) sid)
             (let [new-state (update-in state [:sessions sid :replays-deduped] (fnil inc 0))]
@@ -940,7 +955,7 @@
             {:state state :net-envelopes [] :stdout-events []}
 
             (:autonomous? state)
-            (let [accept-res (exec-accept (assoc-in state [:pending-offers sid] msg)
+            (let [accept-res (exec-accept (assoc-in state [:pending-offers sid] clean-offer)
                                           {"session_id" sid}
                                           privkey-bytes)]
               {:state (:state accept-res)
@@ -948,13 +963,13 @@
                :stdout-events (:stdout-events accept-res)})
 
             :else
-            (let [caller-pname (pubkey->petname state (:caller msg))
+            (let [caller-pname (pubkey->petname state (:caller clean-offer))
                   event (cond-> {"event" "offer-received"
                                  "session_id" sid
-                                 "caller" (:caller msg)
-                                 "price" (:price msg)}
+                                 "caller" (:caller clean-offer)
+                                 "price" (:price clean-offer)}
                           caller-pname (assoc "caller_petname" caller-pname))]
-              {:state (assoc-in state [:pending-offers sid] msg)
+              {:state (assoc-in state [:pending-offers sid] clean-offer)
                :net-envelopes []
                :stdout-events [event]})))))))
 
@@ -1065,16 +1080,13 @@
                       ack-env (build-session-ack-envelope state session-id (:sender msg) new-contiguous (:seq msg) seen-seqs privkey-bytes)
                       text (try (String. ^bytes decrypted "UTF-8") (catch Exception _ nil))
                       sender-pname (pubkey->petname state (:sender msg))
-                      inbox-item (cond-> {:session-id session-id
-                                          :session_id session-id
-                                          :from (:sender msg)
-                                          :seq (:seq msg)
-                                          :text text
-                                          :payload-hex (basalt/bytes->hex decrypted)
-                                          :payload_hex (basalt/bytes->hex decrypted)}
-                                   sender-pname (assoc :from_petname sender-pname
-                                                       :from-petname sender-pname
-                                                       "from_petname" sender-pname))
+                      inbox-item {:session-id session-id
+                                  :session_id session-id
+                                  :from (:sender msg)
+                                  :seq (:seq msg)
+                                  :text text
+                                  :payload-hex (basalt/bytes->hex decrypted)
+                                  :payload_hex (basalt/bytes->hex decrypted)}
                       updated-sess (assoc session
                                           :replay-window (:window chk)
                                           :rx-high-seq new-rx-high-seq

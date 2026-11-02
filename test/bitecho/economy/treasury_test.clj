@@ -431,7 +431,7 @@
     (testing "Rejects when signature is tampered"
       (let [allocs {"node1" 400}
             sig (treasury/sign-epoch-mint t-priv 6 allocs)
-            tampered-sig (str "ff" (subs sig 2))
+            tampered-sig (if (.startsWith ^String sig "ff") (str "00" (subs sig 2)) (str "ff" (subs sig 2)))
             invalid-ctx {:epoch 6
                          :epoch-gate 500
                          :allocations allocs
