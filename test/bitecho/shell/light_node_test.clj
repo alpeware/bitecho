@@ -1234,11 +1234,13 @@
           documented-flags (set (re-seq #"--[a-z][a-z-]*" skill-md))
           verbs ["serve" "identity" "status" "discover" "register-home-set"
                  "offer" "accept" "send" "inbox" "close" "transfer"
-                 "account" "sync-account" "settle-intent" "submit-vouchers"]
+                 "account" "sync-account" "settle-intent" "submit-vouchers"
+                 "petname-set" "petname-list" "petname-remove" "petname-resolve"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
-                  "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"}]
+                  "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"
+                  "--petname" "--pubkey" "--overwrite"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1261,6 +1263,14 @@
       (is (= "sync-account" (get-in (light-shell/parse-light-node-args ["sync-account"]) [:cmd-map "cmd"])))
       (is (= "settle-intent" (get-in (light-shell/parse-light-node-args ["settle-intent" "--receiver" "recv-pub" "--amount" "1000"]) [:cmd-map "cmd"])))
       (is (= "submit-vouchers" (get-in (light-shell/parse-light-node-args ["submit-vouchers"]) [:cmd-map "cmd"])))
+      (is (= "petname-set" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "cmd"])))
+      (is (= "petname-list" (get-in (light-shell/parse-light-node-args ["petname-list"]) [:cmd-map "cmd"])))
+      (is (= "petname-remove" (get-in (light-shell/parse-light-node-args ["petname-remove" "--petname" "alice"]) [:cmd-map "cmd"])))
+      (is (= "petname-resolve" (get-in (light-shell/parse-light-node-args ["petname-resolve" "--petname" "alice"]) [:cmd-map "cmd"])))
+      ;; Flags (all 25 flags tested end-to-end)
+      (is (= "alice" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "petname"])))
+      (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "pubkey"])))
+      (is (true? (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "overwrite"])))
       ;; Flags (all 22 flags tested end-to-end)
       (is (= "foo/bar" (:state-dir (light-shell/parse-light-node-args ["status" "--state-dir" "foo/bar"]))))
       (is (= "boot.edn" (:bootstrap (light-shell/parse-light-node-args ["status" "--bootstrap" "boot.edn"]))))

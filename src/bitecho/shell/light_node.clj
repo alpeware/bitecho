@@ -118,6 +118,17 @@
                                                     (extract-flag-value args "--recipient" nil))
                                     "amount" (extract-long-flag args "--amount" 0)}
                    "submit-vouchers" {"cmd" "submit-vouchers"}
+                   "petname-set" {"cmd" "petname-set"
+                                  "petname" (extract-flag-value args "--petname" nil)
+                                  "pubkey" (extract-flag-value args "--pubkey" nil)
+                                  "overwrite" (boolean (some #{"--overwrite"} args))}
+                   "petname-list" {"cmd" "petname-list"}
+                   "petname-remove" {"cmd" "petname-remove"
+                                     "petname" (extract-flag-value args "--petname" nil)
+                                     "pubkey" (extract-flag-value args "--pubkey" nil)}
+                   "petname-resolve" {"cmd" "petname-resolve"
+                                      "petname" (extract-flag-value args "--petname" nil)
+                                      "pubkey" (extract-flag-value args "--pubkey" nil)}
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})

@@ -701,3 +701,302 @@
                        ;; Total burn window includes take-amt
                        (= take-amt (nth win-entry-0 2))))))
 
+;; -----------------------------------------------------------------------------
+;; 13. Local Petnames, 1:1 Bijection, and Bidirectional Resolution (Step 2A)
+;; -----------------------------------------------------------------------------
+
+(deftest test-petname-pure-validation-and-resolution-helpers
+  (let [alice-id (test-identity)
+        bob-id (test-identity)
+        pub-alice (:pubkey-hex alice-id)
+        pub-bob (:pubkey-hex bob-id)
+        st0 (light-core/init-light-state (:identity alice-id) {})]
+    (testing "valid-pubkey-hex? and normalize-pubkey-hex"
+      (is (true? (light-core/valid-pubkey-hex? pub-alice)))
+      (is (true? (light-core/valid-pubkey-hex? (str/upper-case pub-alice))))
+      (is (true? (light-core/valid-pubkey-hex? (str "  " pub-alice "  "))))
+      (is (false? (light-core/valid-pubkey-hex? "")))
+      (is (false? (light-core/valid-pubkey-hex? nil)))
+      (is (false? (light-core/valid-pubkey-hex? "not-a-hex")))
+      (is (false? (light-core/valid-pubkey-hex? (subs pub-alice 0 87))))
+      (is (= (str/lower-case pub-alice) (light-core/normalize-pubkey-hex pub-alice)))
+      (is (= (str/lower-case pub-alice) (light-core/normalize-pubkey-hex (str "  " (str/upper-case pub-alice) "  ")))))
+
+    (testing "valid-petname? and normalize-petname"
+      (is (true? (light-core/valid-petname? "alice")))
+      (is (true? (light-core/valid-petname? "@alice")))
+      (is (true? (light-core/valid-petname? "bob-node.1_2")))
+      (is (false? (light-core/valid-petname? "")))
+      (is (false? (light-core/valid-petname? "@")))
+      (is (false? (light-core/valid-petname? nil)))
+      (is (false? (light-core/valid-petname? "has spaces")))
+      (is (false? (light-core/valid-petname? pub-alice)) "Raw pubkey hex must NOT be a valid petname")
+      (is (= "alice" (light-core/normalize-petname "alice")))
+      (is (= "alice" (light-core/normalize-petname "@Alice")))
+      (is (= "alice" (light-core/normalize-petname "  @ALICE  "))))
+
+    (testing "pubkey->petname and petname->pubkey lookups"
+      (let [st (assoc st0 :petnames {"bob" pub-bob})]
+        (is (= pub-bob (light-core/petname->pubkey st "bob")))
+        (is (= pub-bob (light-core/petname->pubkey st "@Bob")))
+        (is (nil? (light-core/petname->pubkey st "charlie")))
+        (is (= "bob" (light-core/pubkey->petname st pub-bob)))
+        (is (= "bob" (light-core/pubkey->petname st (str/upper-case pub-bob))))
+        (is (nil? (light-core/pubkey->petname st pub-alice)))))
+
+    (testing "resolve-counterparty"
+      (let [st (assoc st0 :petnames {"bob" pub-bob})]
+        (is (= {:ok? false :error "missing-counterparty"} (light-core/resolve-counterparty st "")))
+        (is (= {:ok? false :error "missing-counterparty"} (light-core/resolve-counterparty st nil)))
+        (is (= {:ok? true :pubkey pub-bob :petname "bob"} (light-core/resolve-counterparty st "bob")))
+        (is (= {:ok? true :pubkey pub-bob :petname "bob"} (light-core/resolve-counterparty st "@BOB")))
+        (is (= {:ok? true :pubkey pub-bob :petname "bob"} (light-core/resolve-counterparty st pub-bob)))
+        (is (= {:ok? true :pubkey pub-alice :petname nil} (light-core/resolve-counterparty st pub-alice)))
+        (is (= {:ok? false :error "unknown-petname"} (light-core/resolve-counterparty st "unknown-agent")))))))
+
+(deftest test-petname-commands-and-bijection
+  (let [alice-id (test-identity)
+        bob-id (test-identity)
+        charlie-id (test-identity)
+        pub-bob (:pubkey-hex bob-id)
+        pub-charlie (:pubkey-hex charlie-id)
+        priv-alice (:privkey-bytes alice-id)
+        st0 (light-core/init-light-state (:identity alice-id) {})]
+
+    (testing "petname-set, petname-list, petname-resolve, and petname-remove"
+      ;; 1. Initial list empty
+      (let [res (light-core/handle-command st0 {"cmd" "petname-list"} priv-alice)]
+        (is (= true (get-in res [:response "ok"])))
+        (is (= 0 (get-in res [:response "count"])))
+        (is (= {} (get-in res [:response "petnames"]))))
+
+      ;; 2. Invalid petname or pubkey
+      (let [r1 (light-core/handle-command st0 {"cmd" "petname-set" "petname" "" "pubkey" pub-bob} priv-alice)
+            r2 (light-core/handle-command st0 {"cmd" "petname-set" "petname" "bob" "pubkey" "bad-key"} priv-alice)]
+        (is (= false (get-in r1 [:response "ok"])))
+        (is (= "invalid-petname" (get-in r1 [:response "error"])))
+        (is (= false (get-in r2 [:response "ok"])))
+        (is (= "invalid-pubkey" (get-in r2 [:response "error"]))))
+
+      ;; 3. Valid set
+      (let [res1 (light-core/handle-command st0 {"cmd" "petname-set" "petname" "@Bob" "pubkey" pub-bob} priv-alice)
+            st1 (:state res1)]
+        (is (= true (get-in res1 [:response "ok"])))
+        (is (= "bob" (get-in res1 [:response "petname"])))
+        (is (= pub-bob (get-in res1 [:response "pubkey"])))
+        (is (= {"bob" pub-bob} (:petnames st1)))
+
+        ;; 4. Idempotent set of identical binding
+        (let [res-idemp (light-core/handle-command st1 {"cmd" "petname-set" "petname" "bob" "pubkey" pub-bob} priv-alice)]
+          (is (= true (get-in res-idemp [:response "ok"])))
+          (is (= (:petnames st1) (:petnames (:state res-idemp)))))
+
+        ;; 5. Conflict: same petname to different pubkey without overwrite fails
+        (let [res-conf1 (light-core/handle-command st1 {"cmd" "petname-set" "petname" "bob" "pubkey" pub-charlie} priv-alice)]
+          (is (= false (get-in res-conf1 [:response "ok"])))
+          (is (= "petname-conflict" (get-in res-conf1 [:response "error"])))
+          (is (= pub-bob (get-in res-conf1 [:response "existing_pubkey"])))
+          (is (= (:petnames st1) (:petnames (:state res-conf1)))))
+
+        ;; 6. Conflict: different petname to same pubkey without overwrite fails
+        (let [res-conf2 (light-core/handle-command st1 {"cmd" "petname-set" "petname" "robert" "pubkey" pub-bob} priv-alice)]
+          (is (= false (get-in res-conf2 [:response "ok"])))
+          (is (= "petname-conflict" (get-in res-conf2 [:response "error"])))
+          (is (= "bob" (get-in res-conf2 [:response "existing_petname"])))
+          (is (= (:petnames st1) (:petnames (:state res-conf2)))))
+
+        ;; 7. Overwrite allows re-keying and preserves 1:1 bijection
+        (let [res-over (light-core/handle-command st1 {"cmd" "petname-set" "petname" "robert" "pubkey" pub-bob "overwrite" true} priv-alice)
+              st-over (:state res-over)]
+          (is (= true (get-in res-over [:response "ok"])))
+          (is (= {"robert" pub-bob} (:petnames st-over))))
+
+        ;; 8. petname-resolve forward and reverse
+        (let [r-pname (light-core/handle-command st1 {"cmd" "petname-resolve" "petname" "bob"} priv-alice)
+              r-pub (light-core/handle-command st1 {"cmd" "petname-resolve" "pubkey" pub-bob} priv-alice)
+              r-tgt (light-core/handle-command st1 {"cmd" "petname-resolve" "target" "@bob"} priv-alice)
+              r-miss (light-core/handle-command st1 {"cmd" "petname-resolve" "petname" "ghost"} priv-alice)]
+          (is (= true (get-in r-pname [:response "ok"])))
+          (is (= pub-bob (get-in r-pname [:response "pubkey"])))
+          (is (= true (get-in r-pub [:response "ok"])))
+          (is (= "bob" (get-in r-pub [:response "petname"])))
+          (is (= true (get-in r-tgt [:response "ok"])))
+          (is (= false (get-in r-miss [:response "ok"])))
+          (is (= "petname-not-found" (get-in r-miss [:response "error"]))))
+
+        ;; 9. petname-remove by petname and by pubkey
+        (let [r-rm (light-core/handle-command st1 {"cmd" "petname-remove" "petname" "bob"} priv-alice)
+              st-empty (:state r-rm)]
+          (is (= true (get-in r-rm [:response "ok"])))
+          (is (= true (get-in r-rm [:response "removed"])))
+          (is (= {} (:petnames st-empty))))
+
+        (let [st2 (assoc st0 :petnames {"charlie" pub-charlie})
+              r-rm2 (light-core/handle-command st2 {"cmd" "petname-remove" "pubkey" pub-charlie} priv-alice)]
+          (is (= true (get-in r-rm2 [:response "ok"])))
+          (is (= {} (:petnames (:state r-rm2)))))))))
+
+(deftest test-petname-bidirectional-counterparty-resolution-and-events
+  (let [alice-id (test-identity)
+        bob-id (test-identity)
+        pub-alice (:pubkey-hex alice-id)
+        pub-bob (:pubkey-hex bob-id)
+        priv-alice (:privkey-bytes alice-id)
+        priv-bob (:privkey-bytes bob-id)
+        st-a0 (assoc (light-core/init-light-state (:identity alice-id) {:epoch 1})
+                     :petnames {"bob" pub-bob})
+        st-b0 (assoc (light-core/init-light-state (:identity bob-id) {:epoch 1})
+                     :petnames {"alice" pub-alice})]
+
+    (testing "1. offer addressed by petname @bob"
+      (let [res-offer (light-core/handle-command st-a0 {"cmd" "offer" "callee" "@bob" "price" 10} priv-alice)
+            st-a1 (:state res-offer)
+            sid (get-in res-offer [:response "session_id"])]
+        (is (= true (get-in res-offer [:response "ok"])))
+        (is (= pub-bob (get-in res-offer [:response "callee"])))
+        (is (= "bob" (get-in res-offer [:response "callee_petname"])))
+        (is (= "bob" (get-in res-offer [:response "peer_petname"])))
+
+        ;; Inbound wire offer at Bob: event enriched with caller_petname "alice", wire petname ignored
+        (let [gossip-offer (second (:net-envelopes res-offer))
+              wire-payload (assoc (nippy/thaw (get-in gossip-offer [:event :message :payload])) :petname "spoofed-attacker-name")
+              res-b-wire (light-core/handle-wire-payload st-b0 wire-payload priv-bob)
+              st-b1 (:state res-b-wire)
+              ev (first (:stdout-events res-b-wire))]
+          (is (= "offer-received" (get ev "event")))
+          (is (= "alice" (get ev "caller_petname")))
+          (is (= {"alice" pub-alice} (:petnames st-b1)) "Wire-claimed petname was NEVER imported")
+
+          ;; 2. Bob accepts offer
+          (let [res-accept (light-core/handle-command st-b1 {"cmd" "accept" "session_id" sid} priv-bob)
+                st-b2 (:state res-accept)
+                accept-ev (first (:stdout-events res-accept))]
+            (is (= true (get-in res-accept [:response "ok"])))
+            (is (= "alice" (get-in res-accept [:response "peer_petname"])))
+            (is (= "alice" (get accept-ev "peer_petname")))
+
+            ;; Inbound wire accept at Alice: event enriched with peer_petname "bob"
+            (let [accept-gossip (first (:net-envelopes res-accept))
+                  accept-wire (assoc (nippy/thaw (get-in accept-gossip [:event :message :payload])) :nickname "fake-bob")
+                  res-a-wire (light-core/handle-wire-payload st-a1 accept-wire priv-alice)
+                  st-a2 (:state res-a-wire)
+                  a-ev (first (:stdout-events res-a-wire))]
+              (is (= "channel-opened" (get a-ev "event")))
+              (is (= "bob" (get a-ev "peer_petname")))
+              (is (= {"bob" pub-bob} (:petnames st-a2)) "Wire-claimed nickname was NEVER imported")
+
+              ;; 3. Alice sends message addressing session by petname "bob"
+              (let [res-send (light-core/handle-command st-a2 {"cmd" "send" "peer" "@bob" "text" "hello bob"} priv-alice)
+                    st-a3 (:state res-send)]
+                (is (= true (get-in res-send [:response "ok"])))
+                (is (= sid (get-in res-send [:response "session_id"])))
+                (is (= "bob" (get-in res-send [:response "peer_petname"])))
+
+                ;; Inbound sealed message at Bob: enriched with from_petname "alice"
+                (let [msg-gossip (first (:net-envelopes res-send))
+                      res-b-msg (light-core/handle-wire-payload st-b2 msg-gossip priv-bob)
+                      st-b3 (:state res-b-msg)
+                      b-msg-ev (first (:stdout-events res-b-msg))]
+                  (is (= "message-received" (get b-msg-ev "event")))
+                  (is (= "alice" (get b-msg-ev "from_petname")))
+
+                  ;; Bob's inbox is enriched with from_petname
+                  (let [res-inbox (light-core/handle-command st-b3 {"cmd" "inbox"} priv-bob)
+                        inbox-msgs (get-in res-inbox [:response "messages"])]
+                    (is (= 1 (count inbox-msgs)))
+                    (is (= "alice" (:from_petname (first inbox-msgs)))))
+
+                  ;; 4. Bob closes session addressing by petname "alice"
+                  (let [res-close (light-core/handle-command st-b3 {"cmd" "close" "peer" "alice"} priv-bob)
+                        _st-b4 (:state res-close)]
+                    (is (= true (get-in res-close [:response "ok"])))
+                    (is (= "alice" (get-in res-close [:response "peer_petname"])))
+
+                    ;; Alice handles wire close
+                    (let [close-gossip (first (:net-envelopes res-close))
+                          res-a-close (light-core/handle-wire-payload st-a3 close-gossip priv-alice)
+                          close-ev (first (:stdout-events res-a-close))]
+                      (is (= "channel-closed" (get close-ev "event")))
+                      (is (= "bob" (get close-ev "peer_petname"))))))))))))
+
+    (testing "2. transfer and settle-intent addressed by petname"
+      (let [st-funded (assoc st-a0 :account {:balance 50000 :spendable 50000 :seq 0 :deps []})
+            res-tf (light-core/handle-command st-funded {"cmd" "transfer" "receiver" "@bob" "amount" 1000} priv-alice)
+            res-si (light-core/handle-command st-funded {"cmd" "settle-intent" "receiver" "bob" "amount" 500} priv-alice)
+            res-tf-unknown (light-core/handle-command st-funded {"cmd" "transfer" "receiver" "nobody" "amount" 100} priv-alice)]
+        (is (= true (get-in res-tf [:response "ok"])))
+        (is (= pub-bob (get-in res-tf [:response "receiver"])))
+        (is (= "bob" (get-in res-tf [:response "receiver_petname"])))
+        (is (= true (get-in res-si [:response "ok"])))
+        (is (= pub-bob (get-in res-si [:response "receiver"])))
+        (is (= "bob" (get-in res-si [:response "receiver_petname"])))
+        (is (= false (get-in res-tf-unknown [:response "ok"])))
+        (is (= "unknown-petname" (get-in res-tf-unknown [:response "error"])))))
+
+    (testing "3. status command surfaces petnames and enriches sessions"
+      (let [dummy-sess {:session-id "s1" :peer pub-bob :role :initiator :state "open" :tx-seq 1 :epoch 1 :outbox {}}
+            st (assoc st-a0 :sessions {"s1" dummy-sess})
+            res-status (light-core/handle-command st {"cmd" "status"} priv-alice)
+            sess-summary (first (get-in res-status [:response "sessions"]))]
+        (is (= {"bob" pub-bob} (get-in res-status [:response "petnames"])))
+        (is (= 1 (get-in res-status [:response "petnames_count"])))
+        (is (= "bob" (:peer_petname sess-summary)))))))
+
+(defspec ^{:doc "Property: Strict 1:1 petname bijection, conflict isolation without overwrite, and bidirectional resolution across arbitrary command sequences"}
+  prop-petname-bijection-and-bidirectional-resolution 50
+  (prop/for-all [actions (gen/vector (gen/tuple (gen/elements [:set :remove :resolve :transfer])
+                                                (gen/elements ["alice" "bob" "charlie" "dave" "eve"])
+                                                (gen/choose 0 3)
+                                                gen/boolean)
+                                     5 25)]
+                (let [alice-id (test-identity)
+                      priv-alice (:privkey-bytes alice-id)
+                      kps (vec (repeatedly 4 test-identity))
+                      pubs (mapv :pubkey-hex kps)
+                      init-st (assoc (light-core/init-light-state (:identity alice-id) {:epoch 1})
+                                     :account {:balance 1000000 :spendable 1000000 :seq 0 :deps []})
+                      final-st (reduce (fn [curr-st [action petname pub-idx overwrite?]]
+                                         (let [pub (nth pubs pub-idx)]
+                                           (case action
+                                             :set
+                                             (:state (light-core/handle-command curr-st
+                                                                                {"cmd" "petname-set"
+                                                                                 "petname" petname
+                                                                                 "pubkey" pub
+                                                                                 "overwrite" overwrite?}
+                                                                                priv-alice))
+
+                                             :remove
+                                             (:state (light-core/handle-command curr-st
+                                                                                {"cmd" "petname-remove"
+                                                                                 "petname" petname}
+                                                                                priv-alice))
+
+                                             :resolve
+                                             (let [res (light-core/handle-command curr-st
+                                                                                  {"cmd" "petname-resolve"
+                                                                                   "petname" petname}
+                                                                                  priv-alice)]
+                                               ;; resolve must be side-effect free
+                                               (:state res))
+
+                                             :transfer
+                                             (let [res (light-core/handle-command curr-st
+                                                                                  {"cmd" "transfer"
+                                                                                   "receiver" petname
+                                                                                   "amount" 10}
+                                                                                  priv-alice)]
+                                               (:state res)))))
+                                       init-st
+                                       actions)
+                      pnames (:petnames final-st)]
+                  ;; 1. Strict 1:1 bijection invariant holds at all times
+                  (and (= (count pnames) (count (distinct (vals pnames))))
+                       (every? (fn [[pn pk]]
+                                 (and (light-core/valid-petname? pn)
+                                      (light-core/valid-pubkey-hex? pk)
+                                      (= pn (light-core/pubkey->petname final-st pk))
+                                      (= pk (light-core/petname->pubkey final-st pn))))
+                               pnames)))))
+
+

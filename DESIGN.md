@@ -215,3 +215,25 @@ Full-node WebRTC DataChannel mesh connections (peer-to-peer full-mesh and agent 
    - `unwrap-authenticated-agent-event` strictly enforces sender identity binding for `:on-deliver`, `:settle-intent`, `:submit-vouchers`, and `:register-home-set`, rejecting signature forgery and parameter spoofing.
    - Consensus state machine stages `:voucher` and `:intent` receipts, checks spendable balances, and applies atomic balance transitions upon block finalization.
 
+### I. Local Petnames & Address Book Discipline (Milestone 2 — Step 2A)
+1. **Pure Local 1:1 `:petnames` Address Book (`bitecho.light-node.core`)**:
+   - Maintains a local map of `petname -> pubkey-hex` ensuring a strict 1:1 bijection (`(count (:petnames st)) == (count (distinct (vals (:petnames st))))`).
+   - Disjoint namespaces: strings matching 88-character hex public keys are rejected as petnames (`valid-petname?`), preventing namespace collisions between raw public keys and local nicknames.
+   - Normalization: petnames are trimmed, lowercased, and stripped of an optional leading `@` (`"Axiom"`, `"@axiom"`, `"axiom"` all normalize to `"axiom"`). Public keys are trimmed and lowercased.
+   - Protocol verbs:
+     - `petname-set`: registers a mapping with conflict detection on collisions (`"petname-conflict"` with existing bindings returned). When `--overwrite` is specified, old bindings for the petname or pubkey are cleanly purged to preserve 1:1 bijection.
+     - `petname-list`: enumerates all configured mappings sorted by petname.
+     - `petname-remove`: removes a mapping by petname or public key.
+     - `petname-resolve`: queries a petname to find its public key or a public key to find its petname.
+2. **Transparent Counterparty Resolution**:
+   - Commands accept either an 88-char public key or a petname:
+     - `offer`: `--callee <petname|pubkey>` resolves to callee public key and enriches responses with `"callee_petname"` and `"peer_petname"`.
+     - `accept`: `--session <petname|pubkey|session-id>` resolves pending offers by caller petname/pubkey and enriches responses with `"peer_petname"`.
+     - `send` & `close`: `--session <petname|pubkey|session-id>` resolves open/active sessions by peer petname/pubkey and enriches responses with `"peer_petname"`.
+     - `transfer` & `settle-intent`: `--receiver <petname|pubkey>` resolves receiver public key and enriches responses with `"receiver_petname"`.
+     - `inbox`: enriches received messages with `:from_petname` / `"from_petname"` and pending offers with `:caller_petname` / `"caller_petname"`.
+     - `status`: surfaces `"petnames"`, `"petnames_count"`, and `:peer_petname` across session summaries.
+3. **Untrusted Wire Injection Immunity**:
+   - Inbound wire events (`handle-wire-offer`, `handle-wire-accept`, `handle-wire-sealed-msg`, `handle-wire-close`) enrich emitted stdout events and inbox items using the local address book only.
+   - Wire payloads claiming `:petname`, `:nickname`, or `"petname"` are strictly ignored and NEVER imported into or allowed to overwrite local state, preserving the Zooko's Triangle security model where local naming remains sovereign and self-assigned.
+

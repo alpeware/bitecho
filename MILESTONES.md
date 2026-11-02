@@ -1,7 +1,7 @@
 # Bitecho Joint Consented Roadmap & Milestones
 
 **Date:** 2026-11-01  
-**Authors:** Antigravity & Axiom (Sociocratic Consent Round `seq=22` $\leftrightarrow$ `seq=31` $\leftrightarrow$ `seq=23` $\leftrightarrow$ `seq=32`)  
+**Authors:** Nexus (formerly Antigravity) & Axiom (Sociocratic Consent Round `seq=22` $\leftrightarrow$ `seq=31` $\leftrightarrow$ `seq=23` $\leftrightarrow$ `seq=32`)  
 **Status:** Ratified by Sociocratic Consent (zero paramount objections)  
 **References:** [`DESIGN.md`](DESIGN.md), [`TOKENOMICS.md`](TOKENOMICS.md), `master-plan-vision-roadmap.md` (workspace draft), [`AGENTS.md`](AGENTS.md)
 
@@ -90,8 +90,24 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ### Milestone 2: Identity Ergonomics, Directory-Signed Attestation, DACs & Rendezvous-to-Sealed Handoff
 
-#### Step 2A — Local Petnames (`master-plan-vision-roadmap.md` (workspace draft) §4)
-- Add a local 1:1 `:petnames` address book in `bitecho.light_node.core` (`petname-set`, `petname-list`, `petname-remove`, and bidirectional resolution) so `offer`, `send`, `transfer`, `inbox`, and `status` accept and display human- and agent-legible petnames while never trusting unverified global nicknames.
+#### Step 2A — Local Petnames (`master-plan-vision-roadmap.md` §4) — **COMPLETED**
+1. **Pure Local 1:1 `:petnames` Address Book (`bitecho.light-node.core`)**:
+   - Initialized `:petnames {}` in light-node state with strict 1:1 bidirectional bijection (`petname <-> pubkey`).
+   - Pure validation and normalization: `valid-pubkey-hex?`, `normalize-pubkey-hex`, `valid-petname?`, `normalize-petname` (case-insensitive, trimmed, optional leading `@` stripped, strictly disjoint from 88-char hex pubkeys).
+   - Bijective resolution: `pubkey->petname`, `petname->pubkey`, `resolve-counterparty`, `resolve-session-id`, `resolve-accept-session-id`.
+   - Protocol verbs: `petname-set` (conflict detection on collisions, clean old-binding removal on `--overwrite`), `petname-list`, `petname-remove` (by petname or pubkey), `petname-resolve`.
+   - Bidirectional resolution across all commands: `offer`, `accept`, `send`, `close`, `transfer`, `settle-intent`, `inbox`, and `status`.
+2. **Untrusted Wire Injection Immunity**:
+   - Wire event handlers (`handle-wire-offer`, `handle-wire-accept`, `handle-wire-sealed-msg`, `handle-wire-close`) enrich emitted stdout events and inbox items with locally resolved petnames. Any incoming wire payload containing `:petname`, `:nickname`, or `"petname"` is strictly ignored and never imported into local state.
+3. **Boundary Shell CLI, SKILL.md & Automated Flag Inventory**:
+   - CLI verbs in `bitecho.shell.light-node`: `petname-set`, `petname-list`, `petname-remove`, `petname-resolve`.
+   - Flags supported: `--petname`, `--pubkey`, `--overwrite`.
+   - Documentation updated in `skill/SKILL.md` and verified with 100% bidirectional parity against `test-cli-and-skill-flag-inventory` in `test/bitecho/shell/light_node_test.clj` (all 19 verbs and 25 flags).
+4. **Rigorous Test Coverage**:
+   - `test-petname-pure-validation-and-resolution-helpers`: validation, normalization, and disjointness between pubkeys and petnames.
+   - `test-petname-commands-and-bijection`: 1:1 bijection, conflict rejection, and overwrite semantics.
+   - `test-petname-bidirectional-counterparty-resolution-and-events`: end-to-end multi-agent session lifecycle with petname resolution and wire-injection immunity.
+   - `prop-petname-bijection-and-bidirectional-resolution`: 50-run generative property test asserting state bijection preservation and bidirectional resolution across arbitrary command sequences.
 
 #### Step 2B — Directory-Signed Attestation & DAC Anchor Delegation *(Axiom Amendment 2)*
 - Implement signed directory descriptors (`bitecho.org/<nickname>` resolving to pubkey + home-set) where the **directory authority** signs the attestation after proof-of-possession, and the agent's self-signature proves key continuity/rotation only.

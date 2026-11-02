@@ -30,6 +30,7 @@
    :epoch-initialized? (contains? opts :epoch)
    :bootstrap (:bootstrap opts)
    :home-set []
+   :petnames {}
    :sessions {}
    :pending-offers {}
    :inbox []
@@ -39,6 +40,129 @@
    :intent-seq 0
    :transfer-seq 0
    :last-transfer-hash nil})
+
+;; -----------------------------------------------------------------------------
+;; Petnames Address Book & Counterparty Resolution (Pure Helpers)
+;; -----------------------------------------------------------------------------
+
+(def ^:private pubkey-pattern #"(?i)^[0-9a-f]{88}$")
+(def ^:private petname-pattern #"^[a-zA-Z0-9._-]{1,64}$")
+
+(defn valid-pubkey-hex?
+  "Returns true iff s is a string whose trimmed form is an 88-char hex string
+   that cleanly decodes to bytes via basalt/hex->bytes."
+  [s]
+  (boolean
+   (when (and (string? s) (not (str/blank? s)))
+     (let [t (str/trim s)]
+       (when (re-matches pubkey-pattern t)
+         (try
+           (let [b (basalt/hex->bytes t)]
+             (and (some? b) (= 44 (alength ^bytes b))))
+           (catch Exception _ false)))))))
+
+(defn normalize-pubkey-hex
+  "Returns lower-case trimmed pubkey hex string when valid-pubkey-hex?, else nil."
+  [s]
+  (when (valid-pubkey-hex? s)
+    (str/lower-case (str/trim s))))
+
+(defn valid-petname?
+  "Returns true iff s is a string whose trimmed form (allowing an optional leading @)
+   is non-blank, is NOT a valid-pubkey-hex?, and matches ^[a-zA-Z0-9._-]{1,64}$."
+  [s]
+  (boolean
+   (when (and (string? s) (not (str/blank? s)))
+     (let [t (str/trim s)
+           stripped (if (str/starts-with? t "@") (subs t 1) t)]
+       (and (not (str/blank? stripped))
+            (not (valid-pubkey-hex? t))
+            (not (valid-pubkey-hex? stripped))
+            (boolean (re-matches petname-pattern stripped)))))))
+
+(defn normalize-petname
+  "Trims s, strips a single leading @ if present, and returns lower-case string
+   when valid-petname?, else nil."
+  [s]
+  (when (valid-petname? s)
+    (let [t (str/trim s)
+          stripped (if (str/starts-with? t "@") (subs t 1) t)]
+      (str/lower-case stripped))))
+
+(defn pubkey->petname
+  "Reverse lookup in (:petnames state) returning the canonical petname
+   bound to (normalize-pubkey-hex pubkey), or nil."
+  [state pubkey]
+  (when-let [norm-pub (normalize-pubkey-hex pubkey)]
+    (some (fn [[p k]] (when (= k norm-pub) p)) (:petnames state))))
+
+(defn petname->pubkey
+  "Forward lookup in (:petnames state) returning the pubkey
+   bound to (normalize-petname petname), or nil."
+  [state petname]
+  (when-let [norm-pname (normalize-petname petname)]
+    (get-in state [:petnames norm-pname])))
+
+(defn resolve-counterparty
+  "Resolves a counterparty identifier (petname or raw pubkey hex).
+   Returns:
+     {:ok? false :error \"missing-counterparty\"} when target is blank/nil
+     {:ok? true :pubkey bound-pubkey :petname canonical-petname} when target matches a petname
+     {:ok? true :pubkey (normalize-pubkey-hex target) :petname (pubkey->petname state target)} when valid pubkey hex
+     {:ok? false :error \"unknown-petname\"} otherwise."
+  [state target]
+  (if (or (nil? target) (and (string? target) (str/blank? target)))
+    {:ok? false :error "missing-counterparty"}
+    (let [norm-pname (normalize-petname target)]
+      (if (and norm-pname (contains? (:petnames state) norm-pname))
+        {:ok? true :pubkey (get-in state [:petnames norm-pname]) :petname norm-pname}
+        (if (valid-pubkey-hex? target)
+          (let [norm-pub (normalize-pubkey-hex target)]
+            {:ok? true :pubkey norm-pub :petname (pubkey->petname state norm-pub)})
+          {:ok? false :error "unknown-petname"})))))
+
+(defn- resolve-session-id
+  "Resolves a session id from cmd-map or counterparty identifier (petname/pubkey).
+   Supports :open (prefers open sessions) or :active (prefers non-closed sessions)."
+  [state cmd-map preference]
+  (let [raw-sid (or (get cmd-map "session_id") (get cmd-map "session")
+                    (:session_id cmd-map) (:session cmd-map))]
+    (if (and raw-sid (contains? (:sessions state) raw-sid))
+      raw-sid
+      (let [target (or raw-sid (get cmd-map "peer") (get cmd-map "callee")
+                       (:peer cmd-map) (:callee cmd-map))
+            resolved (when target (resolve-counterparty state target))]
+        (when (:ok? resolved)
+          (let [matching (filter (fn [[_ s]] (= (:peer s) (:pubkey resolved))) (:sessions state))]
+            (cond
+              (= preference :open)
+              (or (first (keep (fn [[sid s]] (when (= "open" (:state s)) sid)) matching))
+                  (first (map first matching)))
+
+              (= preference :active)
+              (or (first (keep (fn [[sid s]] (when (not= "closed" (:state s)) sid)) matching))
+                  (first (map first matching)))
+
+              :else
+              (first (map first matching)))))))))
+
+(defn- resolve-accept-session-id
+  "Resolves an accept session id from cmd-map or caller identifier in pending-offers."
+  [state cmd-map]
+  (let [raw-sid (or (get cmd-map "session_id") (:session_id cmd-map))]
+    (if (and raw-sid (or (contains? (:pending-offers state) raw-sid)
+                         (contains? (:sessions state) raw-sid)))
+      raw-sid
+      (let [target (or raw-sid (get cmd-map "caller") (get cmd-map "peer")
+                       (:caller cmd-map) (:peer cmd-map))
+            resolved (when target (resolve-counterparty state target))]
+        (if (and resolved (:ok? resolved))
+          (let [matching (filter (fn [[_ offer]] (= (:caller offer) (:pubkey resolved)))
+                                 (:pending-offers state))]
+            (if (= 1 (count matching))
+              (first (first matching))
+              raw-sid))
+          raw-sid)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Command Handlers (Pure Helpers)
@@ -128,71 +252,80 @@
     (basalt/bytes->hex (crypto/sha256 (.getBytes ^String hash-input "UTF-8")))))
 
 (defn- exec-offer [state cmd-map privkey-bytes]
-  (let [callee (get cmd-map "callee")
-        price (long (or (get cmd-map "price") 0))
-        default-home (or (first (keys (get-in state [:bootstrap :nodes]))) :node1)
-        home-node (name (or (get cmd-map "home_node") default-home))
-        burn-amt (long (or (get cmd-map "burn") 500))
-        kp-eph (sealed/generate-x25519-keypair)
-        caller (:pubkey state)
-        eph-pub-hex (basalt/bytes->hex (:public kp-eph))
-        session-id (compute-session-id caller callee eph-pub-hex)
-        epoch (:epoch state)
-        offer-hash (compute-offer-hash {:session-id session-id
-                                        :caller caller
-                                        :callee callee
-                                        :caller-ephemeral-pub eph-pub-hex
-                                        :epoch epoch
-                                        :price price
-                                        :home-node home-node})
-        sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
-        offer-payload {:bitecho/type :channel-offer
-                       :session-id session-id
-                       :caller caller
-                       :callee callee
-                       :caller-ephemeral-pub eph-pub-hex
-                       :epoch epoch
-                       :price price
-                       :home-node home-node
-                       :offer-hash offer-hash
-                       :burn burn-amt
-                       :signature sig-hex}
-        gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze offer-payload) burn-amt)
-        header-event {:type :receive-offer-header
-                      :caller caller
-                      :callee callee
-                      :home-node home-node
-                      :epoch epoch
-                      :price price
-                      :offer-hash offer-hash
-                      :session-id session-id}
-        header-env (mesh/wrap-agent-event header-event caller privkey-bytes)
-        session-entry {:session-id session-id
-                       :peer callee
-                       :role :initiator
-                       :state "offered"
-                       :tx-seq 0
-                       :epoch epoch
-                       :ephemeral-pub (:public kp-eph)
-                       :ephemeral-priv (:private kp-eph)
-                       :price price
-                       :home-node home-node
-                       :offer-hash offer-hash}
-        new-state (-> state
-                      (assoc-in [:sessions session-id] session-entry)
-                      (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
-    {:state new-state
-     :response {"ok" true
-                "session_id" session-id
-                "state" "offered"
-                "callee" callee
-                "price" price
-                "burn" burn-amt}
-     :net-envelopes [header-env gossip-env]
-     :stdout-events []}))
+  (let [callee-target (or (get cmd-map "callee") (:callee cmd-map))
+        resolved (resolve-counterparty state callee-target)]
+    (if-not (:ok? resolved)
+      {:state state
+       :response {"ok" false "error" (:error resolved)}
+       :net-envelopes []
+       :stdout-events []}
+      (let [callee (:pubkey resolved)
+            pname (:petname resolved)
+            price (long (or (get cmd-map "price") (:price cmd-map) 0))
+            default-home (or (first (keys (get-in state [:bootstrap :nodes]))) :node1)
+            home-node (name (or (get cmd-map "home_node") (:home_node cmd-map) default-home))
+            burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) 500))
+            kp-eph (sealed/generate-x25519-keypair)
+            caller (:pubkey state)
+            eph-pub-hex (basalt/bytes->hex (:public kp-eph))
+            session-id (compute-session-id caller callee eph-pub-hex)
+            epoch (:epoch state)
+            offer-hash (compute-offer-hash {:session-id session-id
+                                            :caller caller
+                                            :callee callee
+                                            :caller-ephemeral-pub eph-pub-hex
+                                            :epoch epoch
+                                            :price price
+                                            :home-node home-node})
+            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
+            offer-payload {:bitecho/type :channel-offer
+                           :session-id session-id
+                           :caller caller
+                           :callee callee
+                           :caller-ephemeral-pub eph-pub-hex
+                           :epoch epoch
+                           :price price
+                           :home-node home-node
+                           :offer-hash offer-hash
+                           :burn burn-amt
+                           :signature sig-hex}
+            gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze offer-payload) burn-amt)
+            header-event {:type :receive-offer-header
+                          :caller caller
+                          :callee callee
+                          :home-node home-node
+                          :epoch epoch
+                          :price price
+                          :offer-hash offer-hash
+                          :session-id session-id}
+            header-env (mesh/wrap-agent-event header-event caller privkey-bytes)
+            session-entry {:session-id session-id
+                           :peer callee
+                           :role :initiator
+                           :state "offered"
+                           :tx-seq 0
+                           :epoch epoch
+                           :ephemeral-pub (:public kp-eph)
+                           :ephemeral-priv (:private kp-eph)
+                           :price price
+                           :home-node home-node
+                           :offer-hash offer-hash}
+            new-state (-> state
+                          (assoc-in [:sessions session-id] session-entry)
+                          (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
+        {:state new-state
+         :response (cond-> {"ok" true
+                            "session_id" session-id
+                            "state" "offered"
+                            "callee" callee
+                            "price" price
+                            "burn" burn-amt}
+                     pname (assoc "callee_petname" pname "peer_petname" pname))
+         :net-envelopes [header-env gossip-env]
+         :stdout-events []}))))
 
 (defn- exec-accept [state cmd-map privkey-bytes]
-  (let [session-id (get cmd-map "session_id")]
+  (let [session-id (resolve-accept-session-id state cmd-map)]
     (cond
       (contains? (:sessions state) session-id)
       {:state (update state :pending-offers dissoc session-id)
@@ -206,6 +339,7 @@
       :else
       (let [offer (get-in state [:pending-offers session-id])
             caller (:caller offer)
+            caller-pname (pubkey->petname state caller)
             kp-resp (sealed/generate-x25519-keypair)
             caller-eph (basalt/hex->bytes (:caller-ephemeral-pub offer))
             shared-sec (sealed/x25519-shared-secret (:private kp-resp) caller-eph)
@@ -258,18 +392,21 @@
             new-state (-> state
                           (update :pending-offers dissoc session-id)
                           (assoc-in [:sessions session-id] session-entry))
-            event {"event" "channel-opened" "session_id" session-id "peer" caller}]
+            event (cond-> {"event" "channel-opened" "session_id" session-id "peer" caller}
+                    caller-pname (assoc "peer_petname" caller-pname))]
         {:state new-state
-         :response {"ok" true "session_id" session-id "state" "open" "peer" caller}
+         :response (cond-> {"ok" true "session_id" session-id "state" "open" "peer" caller}
+                     caller-pname (assoc "peer_petname" caller-pname))
          :net-envelopes [gossip-env]
          :stdout-events [event]}))))
 
 (defn- exec-send [state cmd-map privkey-bytes]
-  (let [session-id (get cmd-map "session_id")
+  (let [session-id (resolve-session-id state cmd-map :open)
         session (get-in state [:sessions session-id])]
     (if-not (and session (= "open" (:state session)))
       {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
-      (let [text (get cmd-map "text")
+      (let [pname (pubkey->petname state (:peer session))
+            text (get cmd-map "text")
             payload-hex (get cmd-map "payload_hex")
             payload-bytes (cond (some? text) (.getBytes ^String text "UTF-8")
                                 (some? payload-hex) (basalt/hex->bytes payload-hex)
@@ -305,28 +442,42 @@
                         (pos? overflow)
                         (update-in [:sessions session-id :outbox-evicted] (fnil + 0) overflow))]
         {:state new-state
-         :response {"ok" true
-                    "session_id" session-id
-                    "seq" seq-num
-                    "bytes_sent" (alength payload-bytes)
-                    "burn" burn-amt}
+         :response (cond-> {"ok" true
+                            "session_id" session-id
+                            "seq" seq-num
+                            "bytes_sent" (alength payload-bytes)
+                            "burn" burn-amt}
+                     pname (assoc "peer_petname" pname))
          :net-envelopes [gossip-env]
          :stdout-events []}))))
 
 (defn- exec-inbox [state]
-  {:state (assoc state :inbox [])
-   :response {"ok" true
-              "messages" (:inbox state)
-              "pending_offers" (vec (vals (:pending-offers state)))}
-   :net-envelopes []
-   :stdout-events []})
+  (let [enriched-msgs (mapv (fn [m]
+                              (let [sender (or (:from m) (get m "from"))
+                                    pname (when sender (pubkey->petname state sender))]
+                                (cond-> m
+                                  pname (assoc :from_petname pname "from_petname" pname))))
+                            (:inbox state))
+        enriched-offers (mapv (fn [o]
+                                (let [caller (or (:caller o) (get o "caller"))
+                                      pname (when caller (pubkey->petname state caller))]
+                                  (cond-> o
+                                    pname (assoc :caller_petname pname "caller_petname" pname))))
+                              (vec (vals (:pending-offers state))))]
+    {:state (assoc state :inbox [])
+     :response {"ok" true
+                "messages" enriched-msgs
+                "pending_offers" enriched-offers}
+     :net-envelopes []
+     :stdout-events []}))
 
 (defn- exec-close [state cmd-map privkey-bytes]
-  (let [session-id (get cmd-map "session_id")
+  (let [session-id (resolve-session-id state cmd-map :active)
         session (get-in state [:sessions session-id])]
     (if-not session
       {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
-      (let [sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes (str "close-" session-id) "UTF-8")))
+      (let [pname (pubkey->petname state (:peer session))
+            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes (str "close-" session-id) "UTF-8")))
             close-payload {:bitecho/type :channel-close
                            :session-id session-id
                            :sender (:pubkey state)
@@ -339,7 +490,8 @@
                             (dissoc :tx-key :rx-key :ephemeral-priv))
             new-state (assoc-in state [:sessions session-id] closed-sess)]
         {:state new-state
-         :response {"ok" true "session_id" session-id "state" "closed"}
+         :response (cond-> {"ok" true "session_id" session-id "state" "closed"}
+                     pname (assoc "peer_petname" pname))
          :net-envelopes [gossip-env]
          :stdout-events []}))))
 
@@ -418,105 +570,123 @@
        :stdout-events []})))
 
 (defn- exec-transfer [state cmd-map privkey-bytes]
-  (let [receiver (or (get cmd-map "receiver") (get cmd-map "recipient")
-                     (:receiver cmd-map) (:recipient cmd-map))
+  (let [raw-receiver (or (get cmd-map "receiver") (get cmd-map "recipient")
+                         (:receiver cmd-map) (:recipient cmd-map))
         amount (long (or (get cmd-map "amount") (:amount cmd-map) 0))]
-    (if (or (str/blank? receiver) (<= amount 0))
+    (if (or (nil? raw-receiver) (and (string? raw-receiver) (str/blank? raw-receiver)) (<= amount 0))
       {:state state
        :response {"ok" false "error" "invalid-transfer-params"}
        :net-envelopes []
        :stdout-events []}
-      (let [burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) 500))
-            acct (:account state)
-            spendable (when acct (long (or (:spendable acct) (:balance acct) 0)))]
-        (if (and acct (< spendable (+ amount burn-amt)))
+      (let [resolved (resolve-counterparty state raw-receiver)]
+        (if-not (:ok? resolved)
           {:state state
-           :response {"ok" false "error" "insufficient-balance"}
+           :response {"ok" false "error" (:error resolved)}
            :net-envelopes []
            :stdout-events []}
-          (let [seq-num (long (or (get cmd-map "seq")
-                                  (:seq cmd-map)
-                                  (inc (long (or (when acct (:seq acct))
-                                                 (:transfer-seq state)
-                                                 0)))))
-                deps (vec (or (get cmd-map "deps")
-                              (:deps cmd-map)
-                              (when (and acct (seq (:deps acct))) (:deps acct))
-                              (when-let [prev (:last-transfer-hash state)] [prev])
-                              []))
-                res (agent-sim/build-transfer-gossip-envelope
-                     (:pubkey state)
-                     privkey-bytes
-                     {:receiver receiver :amount amount :seq seq-num :deps deps}
-                     burn-amt)
-                deliver-payload (vec (.getBytes ^String (pr-str {:transfer (into {} (:transfer res))}) "UTF-8"))
-                deliver-env (mesh/wrap-agent-event
-                             {:type :on-deliver
-                              :payload deliver-payload
-                              :message-id (:transfer-hash res)}
-                             (:pubkey state)
-                             privkey-bytes)
-                new-state (cond-> (-> state
-                                      (assoc :transfer-seq seq-num
-                                             :last-transfer-hash (:transfer-hash res))
-                                      (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
-                            acct (-> (assoc-in [:account :seq] seq-num)
-                                     (assoc-in [:account :deps] [(:transfer-hash res)])
-                                     (update-in [:account :spendable] - (+ amount burn-amt))))]
-            {:state new-state
-             :response {"ok" true
-                        "transfer_hash" (:transfer-hash res)
-                        "tx_id" (:transfer-hash res)
-                        "receiver" receiver
-                        "recipient" receiver
-                        "amount" amount
-                        "seq" seq-num}
-             :net-envelopes [(:envelope res) deliver-env]
-             :stdout-events []}))))))
+          (let [receiver (:pubkey resolved)
+                pname (:petname resolved)
+                burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) 500))
+                acct (:account state)
+                spendable (when acct (long (or (:spendable acct) (:balance acct) 0)))]
+            (if (and acct (< spendable (+ amount burn-amt)))
+              {:state state
+               :response {"ok" false "error" "insufficient-balance"}
+               :net-envelopes []
+               :stdout-events []}
+              (let [seq-num (long (or (get cmd-map "seq")
+                                      (:seq cmd-map)
+                                      (inc (long (or (when acct (:seq acct))
+                                                     (:transfer-seq state)
+                                                     0)))))
+                    deps (vec (or (get cmd-map "deps")
+                                  (:deps cmd-map)
+                                  (when (and acct (seq (:deps acct))) (:deps acct))
+                                  (when-let [prev (:last-transfer-hash state)] [prev])
+                                  []))
+                    res (agent-sim/build-transfer-gossip-envelope
+                         (:pubkey state)
+                         privkey-bytes
+                         {:receiver receiver :amount amount :seq seq-num :deps deps}
+                         burn-amt)
+                    deliver-payload (vec (.getBytes ^String (pr-str {:transfer (into {} (:transfer res))}) "UTF-8"))
+                    deliver-env (mesh/wrap-agent-event
+                                 {:type :on-deliver
+                                  :payload deliver-payload
+                                  :message-id (:transfer-hash res)}
+                                 (:pubkey state)
+                                 privkey-bytes)
+                    new-state (cond-> (-> state
+                                          (assoc :transfer-seq seq-num
+                                                 :last-transfer-hash (:transfer-hash res))
+                                          (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
+                                acct (-> (assoc-in [:account :seq] seq-num)
+                                         (assoc-in [:account :deps] [(:transfer-hash res)])
+                                         (update-in [:account :spendable] - (+ amount burn-amt))))]
+                {:state new-state
+                 :response (cond-> {"ok" true
+                                    "transfer_hash" (:transfer-hash res)
+                                    "tx_id" (:transfer-hash res)
+                                    "receiver" receiver
+                                    "recipient" receiver
+                                    "amount" amount
+                                    "seq" seq-num}
+                             pname (assoc "receiver_petname" pname "recipient_petname" pname))
+                 :net-envelopes [(:envelope res) deliver-env]
+                 :stdout-events []}))))))))
 
 (defn- exec-settle-intent [state cmd-map privkey-bytes]
-  (let [receiver (or (get cmd-map "receiver") (get cmd-map "recipient")
-                     (:receiver cmd-map) (:recipient cmd-map))
+  (let [raw-receiver (or (get cmd-map "receiver") (get cmd-map "recipient")
+                         (:receiver cmd-map) (:recipient cmd-map))
         amount (long (or (get cmd-map "amount") (:amount cmd-map) 0))]
-    (if (or (str/blank? receiver) (<= amount 0))
+    (if (or (nil? raw-receiver) (and (string? raw-receiver) (str/blank? raw-receiver)) (<= amount 0))
       {:state state
        :response {"ok" false "error" "invalid-intent-params"}
        :net-envelopes []
        :stdout-events []}
-      (let [acct (:account state)
-            spendable (when acct (long (or (:spendable acct) (:balance acct) 0)))]
-        (if (and acct (< spendable amount))
+      (let [resolved (resolve-counterparty state raw-receiver)]
+        (if-not (:ok? resolved)
           {:state state
-           :response {"ok" false "error" "insufficient-balance"}
+           :response {"ok" false "error" (:error resolved)}
            :net-envelopes []
            :stdout-events []}
-          (let [next-intent-seq (inc (long (:intent-seq state 0)))
-                rid (or (get cmd-map "receipt_id")
-                        (:receipt_id cmd-map)
-                        (str "intent:" (:pubkey state) ":" receiver ":" amount ":" (:epoch state 0) ":" next-intent-seq))
-                take-amt (burn/calculate-settlement-take amount burn/default-settlement-take-bps)
-                net-amt (- amount take-amt)
-                intent-env (mesh/wrap-agent-event
-                            {:type :settle-intent
-                             :payer (:pubkey state)
-                             :receiver receiver
-                             :amount amount
-                             :epoch (:epoch state 0)
-                             :receipt-id rid}
-                            (:pubkey state)
-                            privkey-bytes)
-                new-state (cond-> (assoc state :intent-seq next-intent-seq)
-                            acct (update-in [:account :spendable] - amount))]
-            {:state new-state
-             :response {"ok" true
-                        "receipt_id" rid
-                        "payer" (:pubkey state)
-                        "receiver" receiver
-                        "amount" amount
-                        "take" take-amt
-                        "net_amount" net-amt}
-             :net-envelopes [intent-env]
-             :stdout-events []}))))))
+          (let [receiver (:pubkey resolved)
+                pname (:petname resolved)
+                acct (:account state)
+                spendable (when acct (long (or (:spendable acct) (:balance acct) 0)))]
+            (if (and acct (< spendable amount))
+              {:state state
+               :response {"ok" false "error" "insufficient-balance"}
+               :net-envelopes []
+               :stdout-events []}
+              (let [next-intent-seq (inc (long (:intent-seq state 0)))
+                    rid (or (get cmd-map "receipt_id")
+                            (:receipt_id cmd-map)
+                            (str "intent:" (:pubkey state) ":" receiver ":" amount ":" (:epoch state 0) ":" next-intent-seq))
+                    take-amt (burn/calculate-settlement-take amount burn/default-settlement-take-bps)
+                    net-amt (- amount take-amt)
+                    intent-env (mesh/wrap-agent-event
+                                {:type :settle-intent
+                                 :payer (:pubkey state)
+                                 :receiver receiver
+                                 :amount amount
+                                 :epoch (:epoch state 0)
+                                 :receipt-id rid}
+                                (:pubkey state)
+                                privkey-bytes)
+                    new-state (cond-> (assoc state :intent-seq next-intent-seq)
+                                acct (update-in [:account :spendable] - amount))]
+                {:state new-state
+                 :response (cond-> {"ok" true
+                                    "receipt_id" rid
+                                    "payer" (:pubkey state)
+                                    "receiver" receiver
+                                    "amount" amount
+                                    "take" take-amt
+                                    "net_amount" net-amt}
+                             pname (assoc "receiver_petname" pname))
+                 :net-envelopes [intent-env]
+                 :stdout-events []}))))))))
 
 (defn- exec-submit-vouchers [state cmd-map privkey-bytes]
   (let [raw-vouchers (or (get cmd-map "vouchers")
@@ -555,10 +725,123 @@
          :net-envelopes [voucher-env]
          :stdout-events []}))))
 
+(defn- exec-petname-set [state cmd-map]
+  (let [raw-pname (or (get cmd-map "petname") (get cmd-map "name")
+                      (:petname cmd-map) (:name cmd-map))
+        raw-pub (or (get cmd-map "pubkey") (:pubkey cmd-map))
+        pname (normalize-petname raw-pname)
+        pub (normalize-pubkey-hex raw-pub)
+        overwrite? (boolean (or (get cmd-map "overwrite")
+                                (:overwrite cmd-map)
+                                (= "true" (str (get cmd-map "overwrite")))))]
+    (cond
+      (nil? pname)
+      {:state state
+       :response {"ok" false "error" "invalid-petname"}
+       :net-envelopes []
+       :stdout-events []}
+
+      (nil? pub)
+      {:state state
+       :response {"ok" false "error" "invalid-pubkey"}
+       :net-envelopes []
+       :stdout-events []}
+
+      :else
+      (let [existing-pub (get-in state [:petnames pname])
+            existing-pname (pubkey->petname state pub)]
+        (cond
+          ;; Idempotent: already bound to the same pubkey
+          (= existing-pub pub)
+          {:state state
+           :response {"ok" true "petname" pname "pubkey" pub}
+           :net-envelopes []
+           :stdout-events []}
+
+          ;; Conflict without overwrite
+          (and (not overwrite?) (or (some? existing-pub) (some? existing-pname)))
+          {:state state
+           :response (cond-> {"ok" false "error" "petname-conflict"}
+                       existing-pub (assoc "existing_pubkey" existing-pub)
+                       existing-pname (assoc "existing_petname" existing-pname))
+           :net-envelopes []
+           :stdout-events []}
+
+          ;; Valid set or overwrite: clean old bindings and set new 1:1 binding
+          :else
+          (let [clean-petnames (cond-> (:petnames state {})
+                                 existing-pname (dissoc existing-pname))
+                new-petnames (assoc clean-petnames pname pub)
+                new-state (assoc state :petnames new-petnames)]
+            {:state new-state
+             :response {"ok" true "petname" pname "pubkey" pub}
+             :net-envelopes []
+             :stdout-events []}))))))
+
+(defn- exec-petname-list [state]
+  {:state state
+   :response {"ok" true
+              "petnames" (into (sorted-map) (:petnames state {}))
+              "count" (count (:petnames state {}))}
+   :net-envelopes []
+   :stdout-events []})
+
+(defn- exec-petname-remove [state cmd-map]
+  (let [raw-pname (or (get cmd-map "petname") (get cmd-map "name")
+                      (:petname cmd-map) (:name cmd-map))
+        raw-pub (or (get cmd-map "pubkey") (:pubkey cmd-map))
+        pname (or (when raw-pname (normalize-petname raw-pname))
+                  (when raw-pub (pubkey->petname state raw-pub)))
+        pub (when pname (get-in state [:petnames pname]))]
+    (if (and pname pub)
+      (let [new-state (update state :petnames dissoc pname)]
+        {:state new-state
+         :response {"ok" true "removed" true "petname" pname "pubkey" pub}
+         :net-envelopes []
+         :stdout-events []})
+      {:state state
+       :response {"ok" false "error" "petname-not-found"}
+       :net-envelopes []
+       :stdout-events []})))
+
+(defn- exec-petname-resolve [state cmd-map]
+  (let [raw-pname (or (get cmd-map "petname") (get cmd-map "name")
+                      (:petname cmd-map) (:name cmd-map))
+        raw-pub (or (get cmd-map "pubkey") (:pubkey cmd-map))
+        raw-tgt (or (get cmd-map "target") (:target cmd-map))
+        resolved (cond
+                   raw-pname
+                   (when-let [pname (normalize-petname raw-pname)]
+                     (when-let [pub (get-in state [:petnames pname])]
+                       {:petname pname :pubkey pub}))
+
+                   raw-pub
+                   (when-let [pub (normalize-pubkey-hex raw-pub)]
+                     (when-let [pname (pubkey->petname state pub)]
+                       {:petname pname :pubkey pub}))
+
+                   raw-tgt
+                   (let [res (resolve-counterparty state raw-tgt)]
+                     (when (and (:ok? res) (:petname res))
+                       {:petname (:petname res) :pubkey (:pubkey res)}))
+
+                   :else nil)]
+    (if resolved
+      {:state state
+       :response {"ok" true "petname" (:petname resolved) "pubkey" (:pubkey resolved)}
+       :net-envelopes []
+       :stdout-events []}
+      {:state state
+       :response {"ok" false "error" "petname-not-found"}
+       :net-envelopes []
+       :stdout-events []})))
+
 (defn- exec-status [state]
-  (let [sessions-summary (vec (for [[_ s] (:sessions state)]
-                                (-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped :outbox-evicted])
-                                    (assoc :unacked-count (count (:outbox s))))))]
+  (let [sessions-summary (vec (for [[_ s] (:sessions state)
+                                    :let [pname (pubkey->petname state (:peer s))]]
+                                (cond-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped :outbox-evicted])
+                                  true (assoc :unacked-count (count (:outbox s)))
+                                  pname (assoc :peer-petname pname :peer_petname pname))))]
     {:state state
      :response (cond-> {"ok" true
                         "connected" (boolean (:connected? state false))
@@ -570,6 +853,8 @@
                         "pending_offers_count" (count (:pending-offers state))
                         "inbox_count" (count (:inbox state))
                         "account" (:account state)
+                        "petnames" (into (sorted-map) (:petnames state {}))
+                        "petnames_count" (count (:petnames state {}))
                         "accounting" {"scope" "local-non-consensus"
                                       "note" "Locally computed devnet totals; never consensus finalized"
                                       "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
@@ -599,6 +884,10 @@
       "sync-account" (exec-sync-account state effective-map)
       "settle-intent" (exec-settle-intent state effective-map privkey-bytes)
       "submit-vouchers" (exec-submit-vouchers state effective-map privkey-bytes)
+      "petname-set" (exec-petname-set state effective-map)
+      "petname-list" (exec-petname-list state)
+      "petname-remove" (exec-petname-remove state effective-map)
+      "petname-resolve" (exec-petname-resolve state effective-map)
       "status" (exec-status state)
       {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})))
 
@@ -659,10 +948,12 @@
                :stdout-events (:stdout-events accept-res)})
 
             :else
-            (let [event {"event" "offer-received"
-                         "session_id" sid
-                         "caller" (:caller msg)
-                         "price" (:price msg)}]
+            (let [caller-pname (pubkey->petname state (:caller msg))
+                  event (cond-> {"event" "offer-received"
+                                 "session_id" sid
+                                 "caller" (:caller msg)
+                                 "price" (:price msg)}
+                          caller-pname (assoc "caller_petname" caller-pname))]
               {:state (assoc-in state [:pending-offers sid] msg)
                :net-envelopes []
                :stdout-events [event]})))))))
@@ -711,7 +1002,9 @@
                   new-state (-> state
                                 (assoc-in [:sessions session-id] updated-sess)
                                 (update :vouchers (fnil conj []) (:delivery-ack msg)))
-                  event {"event" "channel-opened" "session_id" session-id "peer" (:callee msg)}]
+                  callee-pname (pubkey->petname state (:callee msg))
+                  event (cond-> {"event" "channel-opened" "session_id" session-id "peer" (:callee msg)}
+                          callee-pname (assoc "peer_petname" callee-pname))]
               {:state new-state
                :net-envelopes []
                :stdout-events [event]})))))))
@@ -771,13 +1064,17 @@
                       seen-seqs (vec (sort (:seen (:window chk))))
                       ack-env (build-session-ack-envelope state session-id (:sender msg) new-contiguous (:seq msg) seen-seqs privkey-bytes)
                       text (try (String. ^bytes decrypted "UTF-8") (catch Exception _ nil))
-                      inbox-item {:session-id session-id
-                                  :session_id session-id
-                                  :from (:sender msg)
-                                  :seq (:seq msg)
-                                  :text text
-                                  :payload-hex (basalt/bytes->hex decrypted)
-                                  :payload_hex (basalt/bytes->hex decrypted)}
+                      sender-pname (pubkey->petname state (:sender msg))
+                      inbox-item (cond-> {:session-id session-id
+                                          :session_id session-id
+                                          :from (:sender msg)
+                                          :seq (:seq msg)
+                                          :text text
+                                          :payload-hex (basalt/bytes->hex decrypted)
+                                          :payload_hex (basalt/bytes->hex decrypted)}
+                                   sender-pname (assoc :from_petname sender-pname
+                                                       :from-petname sender-pname
+                                                       "from_petname" sender-pname))
                       updated-sess (assoc session
                                           :replay-window (:window chk)
                                           :rx-high-seq new-rx-high-seq
@@ -789,7 +1086,8 @@
                                      "session_id" session-id
                                      "from" (:sender msg)
                                      "seq" (:seq msg)}
-                              text (assoc "text" text))]
+                              text (assoc "text" text)
+                              sender-pname (assoc "from_petname" sender-pname))]
                   {:state new-state
                    :net-envelopes (if ack-env [ack-env] [])
                    :stdout-events [event]})))
@@ -891,7 +1189,9 @@
                                 (assoc :state "closed")
                                 (dissoc :tx-key :rx-key :ephemeral-priv))
                 new-state (assoc-in state [:sessions session-id] closed-sess)
-                event {"event" "channel-closed" "session_id" session-id "peer" (:sender msg)}]
+                peer-pname (pubkey->petname state (:sender msg))
+                event (cond-> {"event" "channel-closed" "session_id" session-id "peer" (:sender msg)}
+                        peer-pname (assoc "peer_petname" peer-pname))]
             {:state new-state
              :net-envelopes []
              :stdout-events [event]}))))))

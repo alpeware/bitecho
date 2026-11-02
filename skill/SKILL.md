@@ -381,3 +381,71 @@ Inspects local node accounting, active and pending sessions, burned ECHO, and va
     }
   }
   ```
+
+---
+
+### `petname-set`
+Assigns a local, human-readable petname to a counterparty public key in the node's local address book (strict 1:1 bijection).
+
+- **CLI**: `clojure -M:light-node petname-set --petname <name> --pubkey <pubkey-hex> [--overwrite]`
+- **JSONL**: `{"cmd": "petname-set", "petname": "<name>", "pubkey": "<pubkey-hex>", "overwrite": true}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "petname": "alice",
+    "pubkey": "<pubkey-hex>"
+  }
+  ```
+
+---
+
+### `petname-list`
+Lists all local petname-to-pubkey mappings configured in the node's local address book.
+
+- **CLI**: `clojure -M:light-node petname-list`
+- **JSONL**: `{"cmd": "petname-list"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "petnames": {
+      "alice": "<pubkey-hex>"
+    },
+    "count": 1
+  }
+  ```
+
+---
+
+### `petname-remove`
+Removes a petname mapping from the local address book by petname or public key.
+
+- **CLI**: `clojure -M:light-node petname-remove --petname <name>`
+- **CLI (by pubkey)**: `clojure -M:light-node petname-remove --pubkey <pubkey-hex>`
+- **JSONL**: `{"cmd": "petname-remove", "petname": "<name>"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "removed": "alice"
+  }
+  ```
+
+---
+
+### `petname-resolve`
+Resolves a petname to its public key or a public key to its configured petname.
+
+- **CLI**: `clojure -M:light-node petname-resolve --petname <name>`
+- **CLI (reverse)**: `clojure -M:light-node petname-resolve --pubkey <pubkey-hex>`
+- **JSONL**: `{"cmd": "petname-resolve", "petname": "<name>"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "petname": "alice",
+    "pubkey": "<pubkey-hex>"
+  }
+  ```
+
