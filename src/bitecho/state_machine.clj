@@ -1748,7 +1748,9 @@
                                  (account/validate-transfer sender-state transfer)
                                  (>= (spendable-balance state sender) (long (or (:amount transfer) 0))))
             state-staged (if valid-transfer?
-                           (let [rid (str "transfer:" (or message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))))
+                           (let [rid (str "transfer:" (or (account/transfer-hash transfer)
+                                                          message-id
+                                                          (basalt/bytes->hex (crypto/sha256 payload-bytes))))
                                  staged (stage-receipt state {:receipt-id rid
                                                               :type :transfer
                                                               :sender sender

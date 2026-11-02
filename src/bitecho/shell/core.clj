@@ -27,6 +27,9 @@
     :on-deliver
     :submit-vouchers
     :settle-intent
+    :lock-intent
+    :release-intent
+    :refund-intent
     :submit-transcript
     :receive-transcript-sig})
 

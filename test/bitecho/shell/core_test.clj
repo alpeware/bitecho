@@ -1,7 +1,12 @@
 (ns bitecho.shell.core-test
-  (:require [bitecho.shell.core :as core]
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]
+            [bitecho.economy.account :as account]
+            [bitecho.shell.core :as core]
+            [bitecho.shell.mesh :as mesh]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
+            [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]))
 
 (deftest ^{:doc "Network ingress filters external events correctly"}
@@ -35,7 +40,11 @@
   (is (#'core/valid-network-event? {:type :on-deliver}))
   (is (#'core/valid-network-event? {:type :submit-vouchers}))
   (is (#'core/valid-network-event? {:type :settle-intent}))
+  (is (#'core/valid-network-event? {:type :lock-intent}))
+  (is (#'core/valid-network-event? {:type :release-intent}))
+  (is (#'core/valid-network-event? {:type :refund-intent}))
   (is (#'core/valid-network-event? {:type :submit-transcript}))
+  (is (set/subset? mesh/allowed-agent-events @#'core/allowed-network-events))
   (is (not (#'core/valid-network-event? {:type :tick})))
   (is (not (#'core/valid-network-event? {:type :some-malicious-event}))))
 
@@ -100,4 +109,22 @@
         (is (= "test-pubkey" (:node-pubkey (core/query-node-state node-no-atom :timeout-ms 500)))))
 
       (core/stop-node node))))
+
+(deftest test-consensus-transfer-deduplicates-across-direct-and-gossip-message-ids
+  (testing "handle-on-deliver keys transfer receipt-id by transfer-hash so direct and gossip deliveries deduplicate"
+    (let [kp (crypto/generate-keypair)
+          sender (basalt/bytes->hex (:public kp))
+          receiver (apply str (repeat 64 "b"))
+          peer-pub (apply str (repeat 64 "c"))
+          init (-> (sm/init-state [{:pubkey peer-pub :ip "127.0.0.1" :port 5001}] sender)
+                   (assoc-in [:ledger sender] (account/map->AccountState {:balance 50000 :seq 0 :deps []})))
+          tx (account/create-transfer (:private kp) {:sender sender :receiver receiver :amount 1000 :seq 1 :deps []})
+          tx-hash (account/transfer-hash tx)
+          payload-bytes (.getBytes (pr-str {:transfer (into {} tx)}) "UTF-8")
+          s1 (:state (sm/handle-event init {:type :on-deliver :sender sender :message-id tx-hash :payload payload-bytes}))
+          s2 (:state (sm/handle-event s1 {:type :on-deliver :sender sender :message-id "gossip-msg-id-different" :payload payload-bytes}))]
+      (is (= 1 (count (:pending-receipts s1))))
+      (is (= 1 (count (:pending-receipts s2))))
+      (is (= (str "transfer:" tx-hash) (:receipt-id (first (:pending-receipts s2))))))))
+
 
