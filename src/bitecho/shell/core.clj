@@ -27,7 +27,8 @@
     :on-deliver
     :submit-vouchers
     :settle-intent
-    :submit-transcript})
+    :submit-transcript
+    :receive-transcript-sig})
 
 (defn- valid-network-event?
   "Validates if an incoming event map from the external network is in the whitelist."

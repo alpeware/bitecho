@@ -76,10 +76,15 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
    - Generative `test.check` properties verifying causal `seq`/`deps` conservation, replay rejection, finalized-block execution of agent transfers, `DeliveryAck` voucher compaction, and $\tau = 0.5\%$ settlement take burns feeding $R_{\text{trailing}}$ and demand-gated minting $M_t$.
 
 #### Step 1C — Live Full-Node Bilateral `EpochTranscript` Exchange & Mesh Reward Attestation
-1. **Live Bilateral Transcript Exchange (`src/bitecho/state_machine.clj`, `src/bitecho/shell/mesh.clj`)**:
-   - Wire full-node peers to compute deterministic `exchange_digest` over `:frozen-epoch-messages` at epoch close, exchange bilateral transcript signatures over the mesh (`:send-transcript-sig` / `:receive-transcript-sig`), and stage verified `EpochTranscript` receipts (`:submit-transcript`) into Streamlet consensus blocks so the 80% Full Node mesh reward pool is driven by real peer-attested traffic.
+1. **Live Bilateral Transcript Exchange (`src/bitecho/state_machine.clj`, `src/bitecho/shell/core.clj`, `src/bitecho/shell/mesh.clj`)**:
+   - Closed Axiom's `seq: 43` follow-up flag enforcing strict envelope sender authentication in `handle-settle-intent` (`(= payer-hex sender-hex)`) and `handle-register-home-set` (`(= callee-hex sender-hex)`), failing closed against sender spoofing in both consensus and standalone modes.
+   - Initialized and bounded state machine tracking for `:settled-transcript-pairs`, `:epoch-participation`, windowed `:attested-participation`, and `:peer-frozen-logs` with deterministic 168-epoch cutoff pruning in `prune-expired-tick-state`.
+   - Wired full-node peers to sign local frozen message logs (`attestation/sign-frozen-log`), construct half-signed transcripts (`attestation/create-transcript`), and exchange signatures over the mesh (`:send-transcript-sig` / `:receive-transcript-sig`).
+   - Implemented bilateral 3-way handshake with partial-overlap reconciliation (`:reconciled? true`), counterparty frozen log validation, and automatic cosigning (`attestation/cosign-transcript`).
+   - Wired Streamlet consensus staging & block execution (`:transcript` receipts), updating windowed participation, dynamically recalculating continuous linear stake weights in `:mesh-nodes` via `attestation/calculate-node-weight`, and applying fault strikes (`:fault-strikes`) for withholding peers.
 2. **Generative & Multi-Node Verification**:
-   - Generative `test.check` properties verifying bilateral transcript convergence, half-signed dispute recomputation against frozen epoch logs, and 20/80 validator/mesh reward conservation across finalized blocks.
+   - Unit tests in `test-settle-intent-and-register-home-set-reject-sender-spoofing` verifying fail-closed sender authentication.
+   - Generative `test.check` property `prop-bilateral-transcript-mesh-reward-convergence` (50 runs) simulating a 3-node Streamlet cluster across message injection, tick-driven transcript exchange, partial overlap reconciliation, half-signed dispute against signed frozen logs, and 3-chain block finalization, asserting identical convergence across all nodes for settled pairs, participation, weights, ledger balances, total minted (conserving the 20/80 validator/mesh split), and withholding strikes.
 
 ---
 

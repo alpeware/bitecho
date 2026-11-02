@@ -19,7 +19,7 @@
             [clojure.string :as string])
   (:import [java.nio.charset StandardCharsets]))
 
-(declare apply-payload-to-ledger execute-finalized-blocks)
+(declare apply-payload-to-ledger execute-finalized-blocks derive-authoritative-roles)
 
 (defn- peer-hex
   "Normalizes a peer's pubkey to a hex string."
@@ -73,6 +73,8 @@
       :total-minted 0 :minted-epochs #{} :mint-dust 0 :epoch-mint-dust {}
       :unclaimed-mint 0 :epoch-unclaimed-mint {}
       :frozen-epoch-messages {} :frozen-epoch-message-roles {}
+      :settled-transcript-pairs #{} :epoch-participation {}
+      :attested-participation {} :peer-frozen-logs {}
       :fault-strikes {} :home-sets {} :voucher-seqs {}
       :pending-vouchers [] :settled-voucher-tuples #{} :failed-vouchers []
       :skipped-custody-allocations []
@@ -452,6 +454,46 @@
      :delivery-sample updated-delivery-sample
      :subscribe-commands subscribe-commands}))
 
+(defn update-attested-mesh-weights
+  "Updates epoch and windowed attested participation for credited-peers,
+   recomputing mesh-nodes weights using continuous linear stake scaling
+   when any attested participation exists."
+  [state epoch credited-peers role-count]
+  (let [weight-delta (max 1 (long (or role-count 1)))
+        new-epoch-part (reduce (fn [ep-map p]
+                                 (update-in ep-map [epoch p] (fnil + 0) weight-delta))
+                               (or (:epoch-participation state) {})
+                               credited-peers)
+        new-attested (reduce (fn [acc [_ peer-counts]]
+                               (reduce-kv (fn [a p cnt]
+                                            (update a p (fnil + 0) cnt))
+                                          acc
+                                          peer-counts))
+                             {}
+                             new-epoch-part)
+        state' (assoc state
+                      :epoch-participation new-epoch-part
+                      :attested-participation new-attested)
+        base-peers (set/union (set (keys new-attested))
+                              (let [mn (or (:mesh-nodes state') (get-in state' [:config :mesh-nodes]))]
+                                (cond
+                                  (map? mn) (set (keys mn))
+                                  (coll? mn) (set mn)
+                                  :else #{}))
+                              (set (keys (:peers-map state'))))
+        s-min (double (or (get-in state' [:config :min-stake]) attestation/default-min-stake))
+        weights (reduce (fn [acc p]
+                          (let [part (double (get new-attested p 0))
+                                bal (get-in state' [:ledger p :balance])
+                                stake (double (max 1 (long (or bal attestation/default-min-stake))))
+                                w (attestation/calculate-node-weight part stake s-min)]
+                            (assoc acc p w)))
+                        {}
+                        base-peers)]
+    (if (some (fn [[_ w]] (pos? (double w))) weights)
+      (assoc state' :mesh-nodes weights)
+      state')))
+
 (defn- prune-rendezvous-retention-state
   "Prunes :home-sets and :voucher-seqs entries strictly older than rdv-cutoff,
    preserving entries within the active voucher retry window."
@@ -505,6 +547,31 @@
         pruned-frozen-messages (reduce dissoc (or (:frozen-epoch-messages state) {}) expired-frozen-epochs)
         pruned-frozen-roles (reduce dissoc (or (:frozen-epoch-message-roles state) {}) expired-frozen-epochs)
         rdv-cutoff (- (dec new-epoch) frozen-retention)
+        pruned-settled-transcripts (into #{}
+                                         (filter (fn [t]
+                                                   (let [ep (first t)]
+                                                     (and (integer? ep) (>= ep frozen-cutoff))))
+                                                 (or (:settled-transcript-pairs state) #{})))
+        pruned-epoch-part (reduce-kv (fn [m ep v]
+                                       (if (and (integer? ep) (< ep frozen-cutoff))
+                                         m
+                                         (assoc m ep v)))
+                                     {}
+                                     (or (:epoch-participation state) {}))
+        recomputed-attested-part (reduce (fn [acc [_ peer-counts]]
+                                           (reduce-kv (fn [a p cnt]
+                                                        (update a p (fnil + 0) cnt))
+                                                      acc
+                                                      peer-counts))
+                                         {}
+                                         pruned-epoch-part)
+        pruned-peer-frozen-logs (reduce-kv (fn [m k v]
+                                             (let [ep (first k)]
+                                               (if (and (integer? ep) (< ep frozen-cutoff))
+                                                 m
+                                                 (assoc m k v))))
+                                           {}
+                                           (or (:peer-frozen-logs state) {}))
         max-tracked (long (or (:max-tracked-receipts cfg) 10000))
         [pruned-tracked-known pruned-known-ord]
         (let [k (or (:known-receipt-ids state) #{})
@@ -558,6 +625,10 @@
                :delivered-set pruned-delivered-set
                :frozen-epoch-messages pruned-frozen-messages
                :frozen-epoch-message-roles pruned-frozen-roles
+               :settled-transcript-pairs pruned-settled-transcripts
+               :epoch-participation pruned-epoch-part
+               :attested-participation recomputed-attested-part
+               :peer-frozen-logs pruned-peer-frozen-logs
                :known-receipt-ids pruned-tracked-known
                :known-receipt-order pruned-known-ord
                :executed-receipt-ids pruned-tracked-exec
@@ -605,7 +676,8 @@
                                                :transfer 2
                                                :settle-intent 3
                                                :voucher 4
-                                               5)
+                                               :transcript 5
+                                               6)
                                              (long (or (:seq r) 0))
                                              (str (:receipt-id r))]))
                                  vec)
@@ -675,12 +747,32 @@
                           :global-echo-sample (:echo-sample sampling-res)
                           :global-ready-sample (:ready-sample sampling-res)
                           :global-delivery-sample (:delivery-sample sampling-res))
-        pruned-state (prune-expired-tick-state base-state new-epoch cfg)]
+        pruned-state (prune-expired-tick-state base-state new-epoch cfg)
+        transcript-commands (when (and (consensus-mode? pruned-state)
+                                       (seq closing-messages)
+                                       (or (:node-private-key pruned-state)
+                                           (get-in pruned-state [:keypair :private])))
+                              (let [my-pub (:node-pubkey pruned-state)
+                                    my-priv (or (:node-private-key pruned-state)
+                                                (get-in pruned-state [:keypair :private]))
+                                    auth-roles (attestation/canonicalize-message-roles
+                                                (derive-authoritative-roles closing-messages closing-roles))
+                                    my-frozen-log (attestation/sign-frozen-log closing-epoch my-pub closing-messages my-priv)
+                                    peer-pubs (sort (disj (set (keys (:peers-map pruned-state))) my-pub))]
+                                (mapv (fn [peer-pub]
+                                        (let [half-tx (attestation/create-transcript closing-epoch my-pub peer-pub auth-roles my-priv)]
+                                          {:type :send-transcript-sig
+                                           :target peer-pub
+                                           :epoch closing-epoch
+                                           :transcript (into {} half-tx)
+                                           :frozen-log my-frozen-log}))
+                                      peer-pubs)))
+        all-commands (into commands transcript-commands)]
     (if (consensus-mode? pruned-state)
-      (apply-streamlet-tick pruned-state commands closing-epoch)
+      (apply-streamlet-tick pruned-state all-commands closing-epoch)
       (let [tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)
             treasury-state (apply-epoch-treasury-boundary tick-state-settled new-epoch)]
-        (apply-streamlet-tick treasury-state commands closing-epoch)))))
+        (apply-streamlet-tick treasury-state all-commands closing-epoch)))))
 
 (defn- apply-broadcast-burn
   "Enforces a mandatory signaling burn (>= burn/min-signaling-burn) on every broadcast.
@@ -1302,6 +1394,69 @@
                                                (update :pending-vouchers (fnil conj []) ack))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
+                                       :transcript
+                                       (let [raw-tx (:transcript r)
+                                             tx (if (instance? bitecho.economy.attestation.EpochTranscript raw-tx)
+                                                  raw-tx
+                                                  (try (attestation/map->EpochTranscript raw-tx) (catch Exception _ nil)))
+                                             ep (long (or (when tx (:epoch tx)) (:epoch r) 0))
+                                             pa (when tx (:peer-a tx))
+                                             pb (when tx (:peer-b tx))
+                                             valid-shape? (and (string? pa)
+                                                               (string? pb)
+                                                               (not= pa pb)
+                                                               (seq (:message-roles tx)))
+                                             p1 (when (and pa pb) (first (sort [pa pb])))
+                                             p2 (when (and pa pb) (second (sort [pa pb])))
+                                             pair-tuple (when (and p1 p2) [ep p1 p2])]
+                                         (cond
+                                           (or (nil? tx) (not valid-shape?))
+                                           (update s :failed-receipts-count (fnil inc 0))
+
+                                           (contains? (or (:settled-transcript-pairs s) #{}) pair-tuple)
+                                           s
+
+                                           (attestation/mutually-signed? tx)
+                                           (let [credited #{pa pb}
+                                                 role-cnt (count (:message-roles tx))]
+                                             (-> s
+                                                 (update :settled-transcript-pairs (fnil conj #{}) pair-tuple)
+                                                 (update-attested-mesh-weights ep credited role-cnt)))
+
+                                           (attestation/half-signed? tx)
+                                           (let [prover-log (:prover-frozen-log r)
+                                                 cp-log (:counterparty-frozen-log r)
+                                                 prover-ok? (boolean
+                                                             (and prover-log
+                                                                  (attestation/verify-frozen-log prover-log)
+                                                                  (= ep (:epoch prover-log))
+                                                                  (= pa (:peer prover-log))))
+                                                 cp-ok? (if cp-log
+                                                          (boolean
+                                                           (and (attestation/verify-frozen-log cp-log)
+                                                                (= ep (:epoch cp-log))
+                                                                (= pb (:peer cp-log))))
+                                                          true)
+                                                 valid-proofs? (and prover-ok? cp-ok?)]
+                                             (if-not valid-proofs?
+                                               (update s :failed-receipts-count (fnil inc 0))
+                                               (let [ids-a (set (:frozen-ids prover-log))
+                                                     ids-b (if cp-log (set (:frozen-ids cp-log)) ids-a)
+                                                     reconciled (attestation/reconcile-message-roles ids-a ids-b (:message-roles tx))
+                                                     tx-valid? (attestation/verify-transcript-against-log tx reconciled)]
+                                                 (if tx-valid?
+                                                   (let [credited #{pa}
+                                                         strike-peer pb
+                                                         role-cnt (count (:message-roles tx))]
+                                                     (-> s
+                                                         (update :settled-transcript-pairs (fnil conj #{}) pair-tuple)
+                                                         (update-in [:fault-strikes strike-peer] (fnil inc 0))
+                                                         (update-attested-mesh-weights ep credited role-cnt)))
+                                                   (update s :failed-receipts-count (fnil inc 0))))))
+
+                                           :else
+                                           (update s :failed-receipts-count (fnil inc 0))))
+
                                        s)
                                      [next-exec next-exec-ord] (fifo-track (:executed-receipt-ids s-effect)
                                                                            (:executed-receipt-order s-effect)
@@ -1515,10 +1670,11 @@
    the role in local-frozen-roles-map, defaulting to :gossip if unmapped."
   [local-frozen-ids local-frozen-roles-map]
   (let [candidate-ids (set/union (set local-frozen-ids) (set (keys local-frozen-roles-map)))]
-    (reduce (fn [acc mid]
-              (conj acc [mid (get local-frozen-roles-map mid :gossip)]))
-            []
-            candidate-ids)))
+    (attestation/canonicalize-message-roles
+     (reduce (fn [acc mid]
+               (conj acc [mid (get local-frozen-roles-map mid :gossip)]))
+             []
+             candidate-ids))))
 
 (defn- resolve-counterparty-frozen-ids
   "Resolves counterparty frozen message IDs for transcript submission.
@@ -1529,52 +1685,217 @@
   [event transcript state]
   (let [has-raw? (or (contains? event :counterparty-frozen-ids)
                      (contains? event :peer-frozen-ids))
+        epoch (:epoch transcript)
+        node-pub (:node-pubkey state)
+        pa (:peer-a transcript)
+        pb (:peer-b transcript)
+        expected-cp (if (= node-pub pb) pa pb)
         cp-log (or (:counterparty-frozen-log event)
-                   (:peer-frozen-log event))]
+                   (:peer-frozen-log event)
+                   (get-in state [:peer-frozen-logs [epoch expected-cp]]))]
     (cond
       (and has-raw? (nil? cp-log))
       {:ok? false}
 
       (some? cp-log)
-      (let [epoch (:epoch transcript)
-            node-pub (:node-pubkey state)
-            pa (:peer-a transcript)
-            pb (:peer-b transcript)
-            expected-cp (if (= node-pub pb) pa pb)]
-        (if (and (attestation/verify-frozen-log cp-log)
-                 (= epoch (:epoch cp-log))
-                 (= expected-cp (:peer cp-log)))
-          {:ok? true :ids (set (:frozen-ids cp-log))}
-          {:ok? false}))
+      (if (and (attestation/verify-frozen-log cp-log)
+               (= epoch (:epoch cp-log))
+               (if (contains? #{pa pb} node-pub)
+                 (= expected-cp (:peer cp-log))
+                 (contains? #{pa pb} (:peer cp-log))))
+        {:ok? true :ids (set (:frozen-ids cp-log))}
+        {:ok? false})
 
       :else
-      {:ok? true :ids (get-in state [:frozen-epoch-messages (:epoch transcript)] #{})})))
+      {:ok? true :ids (or (get-in state [:frozen-epoch-messages epoch])
+                          (get-in state [:epoch-to-messages epoch])
+                          #{})})))
 
 (defn- handle-submit-transcript
   "Handles bilateral transcript submission and dispute resolution.
    Evaluates the transcript against the frozen epoch message set,
-   and records faults in :fault-strikes if a counterparty has faulted."
+   stages consensus receipt or updates standalone state and mesh weights."
   [state event]
-  (let [transcript (or (:transcript event) (:payload event) event)
-        resolved-cp (resolve-counterparty-frozen-ids event transcript state)]
-    (if-not (:ok? resolved-cp)
+  (let [raw (or (:transcript event) (:payload event) event)
+        transcript (if (instance? bitecho.economy.attestation.EpochTranscript raw)
+                     raw
+                     (try (attestation/map->EpochTranscript raw) (catch Exception _ nil)))
+        event-sender (:sender event)
+        sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
+        pa (when transcript (:peer-a transcript))
+        pb (when transcript (:peer-b transcript))]
+    (if-not (and transcript
+                 (string? pa)
+                 (string? pb)
+                 (not= pa pb)
+                 (seq (:message-roles transcript))
+                 (or (nil? sender-hex) (contains? #{pa pb} sender-hex)))
       {:state state :commands []}
-      (let [epoch (:epoch transcript)
-            local-frozen-ids (get-in state [:frozen-epoch-messages epoch] #{})
-            counterparty-frozen-ids (:ids resolved-cp)
-            local-frozen-roles-map (get-in state [:frozen-epoch-message-roles epoch] {})
-            auth-roles (derive-authoritative-roles local-frozen-ids local-frozen-roles-map)
-            frozen-log-roles (attestation/reconcile-message-roles
-                              local-frozen-ids
-                              counterparty-frozen-ids
-                              auth-roles)
-            dispute-res (attestation/evaluate-transcript-dispute transcript frozen-log-roles)
-            strike-peer (:strike dispute-res)
-            new-strikes (if strike-peer
-                          (update (or (:fault-strikes state) {}) strike-peer (fnil inc 0))
-                          (or (:fault-strikes state) {}))]
-        {:state (assoc state :fault-strikes new-strikes)
-         :commands []}))))
+      (let [resolved-cp (resolve-counterparty-frozen-ids event transcript state)]
+        (if-not (:ok? resolved-cp)
+          {:state state :commands []}
+          (let [epoch (:epoch transcript)
+                local-frozen-ids (or (get-in state [:frozen-epoch-messages epoch])
+                                     (get-in state [:epoch-to-messages epoch])
+                                     #{})
+                node-pub (:node-pubkey state)
+                local-is-party? (contains? #{pa pb} node-pub)
+                dispute-res (if (and (attestation/mutually-signed? transcript)
+                                     (or (empty? local-frozen-ids) (not local-is-party?)))
+                              {:status :settled :credit #{pa pb} :strike nil}
+                              (let [counterparty-frozen-ids (:ids resolved-cp)
+                                    local-frozen-roles-map (or (get-in state [:frozen-epoch-message-roles epoch])
+                                                               (get-in state [:epoch-to-message-roles epoch])
+                                                               {})
+                                    auth-roles (derive-authoritative-roles local-frozen-ids local-frozen-roles-map)
+                                    frozen-log-roles (attestation/reconcile-message-roles
+                                                      local-frozen-ids
+                                                      counterparty-frozen-ids
+                                                      auth-roles)]
+                                (attestation/evaluate-transcript-dispute transcript frozen-log-roles)))
+                p1 (first (sort [pa pb]))
+                p2 (second (sort [pa pb]))
+                pair-tuple [epoch p1 p2]]
+            (if (contains? (or (:settled-transcript-pairs state) #{}) pair-tuple)
+              {:state state :commands []}
+              (case (:status dispute-res)
+                (:settled :half-signed-fault)
+                (if (consensus-mode? state)
+                  (let [rid (str "transcript:" epoch ":" p1 ":" p2 ":" (:digest transcript))
+                        expected-cp (if (= node-pub pb) pa pb)
+                        cp-log (or (:counterparty-frozen-log event)
+                                   (:peer-frozen-log event)
+                                   (get-in state [:peer-frozen-logs [epoch expected-cp]]))
+                        prover-log (or (:prover-frozen-log event)
+                                       (when-let [priv (or (:node-private-key state) (get-in state [:keypair :private]))]
+                                         (when (and (= node-pub pa) (seq local-frozen-ids))
+                                           (attestation/sign-frozen-log epoch node-pub local-frozen-ids priv))))
+                        rcpt {:receipt-id rid
+                              :type :transcript
+                              :epoch epoch
+                              :peer-a pa
+                              :peer-b pb
+                              :transcript (into {} transcript)
+                              :counterparty-frozen-log cp-log
+                              :prover-frozen-log prover-log}
+                        staged (stage-receipt state rcpt)]
+                    (if (:ok? staged)
+                      {:state (:state staged) :commands []}
+                      {:state state :commands []}))
+                  (let [strike-peer (:strike dispute-res)
+                        s1 (if strike-peer
+                             (update-in state [:fault-strikes strike-peer] (fnil inc 0))
+                             state)
+                        s2 (update s1 :settled-transcript-pairs (fnil conj #{}) pair-tuple)
+                        credited (:credit dispute-res)
+                        role-cnt (count (:message-roles transcript))
+                        s3 (update-attested-mesh-weights s2 epoch credited role-cnt)]
+                    {:state s3 :commands []}))
+                {:state state :commands []}))))))))
+
+(defn- handle-receive-transcript-sig
+  "Handles incoming peer transcript signature or cosignature requests."
+  [state event]
+  (let [sender (:sender event)
+        raw-tx (:transcript event)
+        ep (long (or (:epoch event)
+                     (when (map? raw-tx) (:epoch raw-tx))
+                     0))
+        cp-log (or (:frozen-log event) (:peer-frozen-log event))
+        my-pub (:node-pubkey state)
+        my-priv (or (:node-private-key state) (get-in state [:keypair :private]))
+        known-peers (let [pm (:peers-map state)
+                          mn (or (:mesh-nodes state) (get-in state [:config :mesh-nodes]))]
+                      (set/union (when (seq pm) (set (keys pm)))
+                                 (cond
+                                   (map? mn) (set (keys mn))
+                                   (coll? mn) (set mn)
+                                   :else #{})))
+        sender-valid? (or (empty? known-peers)
+                          (contains? known-peers sender))
+        tx-valid-map? (map? raw-tx)
+        cp-log-valid? (if cp-log
+                        (boolean
+                         (and (attestation/verify-frozen-log cp-log)
+                              (= ep (:epoch cp-log))
+                              (= sender (:peer cp-log))))
+                        true)]
+    (if-not (and sender-valid? tx-valid-map? cp-log-valid?)
+      {:state state :commands []}
+      (let [state-with-log (if cp-log
+                             (assoc-in state [:peer-frozen-logs [ep sender]] cp-log)
+                             state)
+            tx (if (instance? bitecho.economy.attestation.EpochTranscript raw-tx)
+                 raw-tx
+                 (try (attestation/map->EpochTranscript raw-tx) (catch Exception _ nil)))
+            pa (when tx (:peer-a tx))
+            pb (when tx (:peer-b tx))]
+        (if-not (and tx
+                     (string? pa)
+                     (string? pb)
+                     (not= pa pb)
+                     (seq (:message-roles tx)))
+          {:state state-with-log :commands []}
+          (cond
+            ;; Case 1: Mutually-signed transcript involving my-pub and sender
+            (and (attestation/mutually-signed? tx)
+                 (contains? #{(:peer-a tx) (:peer-b tx)} my-pub)
+                 (contains? #{(:peer-a tx) (:peer-b tx)} sender))
+            (handle-submit-transcript state-with-log
+                                      {:type :submit-transcript
+                                       :transcript tx
+                                       :counterparty-frozen-log (get-in state-with-log [:peer-frozen-logs [ep sender]])})
+
+            ;; Case 2: Half-signed transcript from sender to my-pub
+            (and (attestation/half-signed? tx)
+                 (= (:peer-a tx) sender)
+                 (= (:peer-b tx) my-pub)
+                 (some? my-priv))
+            (let [local-frozen-ids (or (get-in state-with-log [:frozen-epoch-messages ep])
+                                       (get-in state-with-log [:epoch-to-messages ep])
+                                       #{})
+                  local-roles-map (or (get-in state-with-log [:frozen-epoch-message-roles ep])
+                                      (get-in state-with-log [:epoch-to-message-roles ep])
+                                      {})
+                  auth-roles (derive-authoritative-roles local-frozen-ids local-roles-map)
+                  cp-ids (if-let [l (get-in state-with-log [:peer-frozen-logs [ep sender]])]
+                           (set (:frozen-ids l))
+                           local-frozen-ids)
+                  reconciled-roles (attestation/reconcile-message-roles local-frozen-ids cp-ids auth-roles)]
+              (cond
+                (and (seq reconciled-roles)
+                     (attestation/verify-transcript-against-log tx reconciled-roles))
+                (let [cosigned (attestation/cosign-transcript tx my-priv)
+                      sub-res (handle-submit-transcript state-with-log
+                                                        {:type :submit-transcript
+                                                         :transcript cosigned
+                                                         :counterparty-frozen-log (get-in state-with-log [:peer-frozen-logs [ep sender]])})
+                      reply-cmd {:type :send-transcript-sig
+                                 :target sender
+                                 :epoch ep
+                                 :transcript (into {} cosigned)}]
+                  {:state (:state sub-res)
+                   :commands (conj (vec (:commands sub-res)) reply-cmd)})
+
+                (and (seq reconciled-roles)
+                     (not (:reconciled? event))
+                     (some? (get-in state-with-log [:peer-frozen-logs [ep sender]])))
+                (let [reconciled-half (attestation/create-transcript ep my-pub sender reconciled-roles my-priv)
+                      my-log (attestation/sign-frozen-log ep my-pub local-frozen-ids my-priv)
+                      reply-cmd {:type :send-transcript-sig
+                                 :target sender
+                                 :epoch ep
+                                 :transcript (into {} reconciled-half)
+                                 :frozen-log my-log
+                                 :reconciled? true}]
+                  {:state state-with-log
+                   :commands [reply-cmd]})
+
+                :else
+                {:state state-with-log :commands []}))
+
+            :else
+            {:state state-with-log :commands []}))))))
 
 (defn- handle-register-home-set
   "Registers a home set of nodes for Callee B for an epoch.
@@ -1582,33 +1903,38 @@
    at a different price is rejected unless targeting a new epoch."
   [state event]
   (let [callee (:callee event)
-        current-epoch (or (:epoch event) (:epoch state) 0)
-        raw-candidates (or (:candidates event) [])
-        candidates (mapv (fn [c] (if (contains? c :node-id) (assoc c :node-id (rendezvous/normalize-home-node (:node-id c))) c)) raw-candidates)
-        p-b (or (:price event) (:p-b event) 0)
-        p-b-max (or (:price-max event) (:p-b-max event) p-b)
-        tuple [callee current-epoch]
-        existing (get-in state [:home-sets tuple])]
-    (if (and existing (some? (:price existing)) (not= (:price existing) p-b))
+        event-sender (:sender event)
+        sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
+        callee-hex (when callee (if (string? callee) callee (basalt/bytes->hex callee)))]
+    (if-not (or (nil? sender-hex) (= callee-hex sender-hex))
       {:state state :commands []}
-      (let [reg-result (rendezvous/register-home-set candidates p-b p-b-max)]
-        (if (consensus-mode? state)
-          (let [rid (str "home-set:" callee ":" current-epoch)
-                staged (stage-receipt state
-                                      {:receipt-id rid
-                                       :type :register-home-set
-                                       :callee callee
-                                       :epoch current-epoch
-                                       :candidates candidates
-                                       :price p-b
-                                       :price-max p-b-max})]
-            (if (:ok? staged)
-              {:state (assoc-in (:state staged) [:home-sets tuple] reg-result)
-               :commands []}
-              {:state state
-               :commands []}))
-          {:state (assoc-in state [:home-sets tuple] reg-result)
-           :commands []})))))
+      (let [current-epoch (or (:epoch event) (:epoch state) 0)
+            raw-candidates (or (:candidates event) [])
+            candidates (mapv (fn [c] (if (contains? c :node-id) (assoc c :node-id (rendezvous/normalize-home-node (:node-id c))) c)) raw-candidates)
+            p-b (or (:price event) (:p-b event) 0)
+            p-b-max (or (:price-max event) (:p-b-max event) p-b)
+            tuple [callee current-epoch]
+            existing (get-in state [:home-sets tuple])]
+        (if (and existing (some? (:price existing)) (not= (:price existing) p-b))
+          {:state state :commands []}
+          (let [reg-result (rendezvous/register-home-set candidates p-b p-b-max)]
+            (if (consensus-mode? state)
+              (let [rid (str "home-set:" callee ":" current-epoch)
+                    staged (stage-receipt state
+                                          {:receipt-id rid
+                                           :type :register-home-set
+                                           :callee callee
+                                           :epoch current-epoch
+                                           :candidates candidates
+                                           :price p-b
+                                           :price-max p-b-max})]
+                (if (:ok? staged)
+                  {:state (assoc-in (:state staged) [:home-sets tuple] reg-result)
+                   :commands []}
+                  {:state state
+                   :commands []}))
+              {:state (assoc-in state [:home-sets tuple] reg-result)
+               :commands []})))))))
 
 (defn- pending-tuple-voucher-debit
   "Returns the maximum cumulative debit already staged in :pending-receipts for a given [callee home-node epoch] tuple."
@@ -1779,54 +2105,58 @@
   (let [payer (:payer event)
         receiver (:receiver event)
         amount (:amount event)
+        event-sender (:sender event)
+        sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
         payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
         receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))]
-    (if (consensus-mode? state)
-      (let [payer-acct (when payer-hex (get-in state [:ledger payer-hex]))]
-        (if (and payer-hex
-                 receiver-hex
-                 (integer? amount)
-                 (pos? amount)
-                 payer-acct
-                 (>= (spendable-balance state payer-hex) amount))
-          (let [rid (or (:receipt-id event)
-                        (str "intent:" payer-hex ":" receiver-hex ":" amount ":" (or (:epoch state) 0) ":" (:receipt-seq state 0)))
-                staged (stage-receipt state {:receipt-id rid
-                                             :type :settle-intent
-                                             :payer payer-hex
-                                             :receiver receiver-hex
-                                             :amount amount})]
-            (if (:ok? staged)
-              {:state (:state staged) :commands []}
-              {:state state :commands []}))
-          {:state state :commands []}))
-      (let [payer-acct (when payer-hex (get-in state [:ledger payer-hex]))
-            payer-bal (or (:balance payer-acct) 0)]
-        (if (and payer-hex
-                 receiver-hex
-                 (integer? amount)
-                 (pos? amount)
-                 payer-acct
-                 (>= payer-bal amount))
-          (let [configured-bps (or (:settlement-take-bps state)
-                                   (get-in state [:config :settlement-take-bps])
-                                   burn/default-settlement-take-bps)
-                take-bps (max 1 configured-bps)
-                take-amt (burn/calculate-settlement-take amount take-bps)
-                net-amt (- amount take-amt)
-                current-epoch (or (:epoch event) (:epoch state) 0)
-                receiver-acct (get-in state [:ledger receiver-hex]
-                                      (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                new-payer (assoc payer-acct :balance (- payer-bal amount))
-                new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
-                new-ledger (assoc (:ledger state)
-                                  payer-hex new-payer
-                                  receiver-hex new-receiver)]
-            {:state (-> state
-                        (assoc :ledger new-ledger)
-                        (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
-             :commands []})
-          {:state state :commands []})))))
+    (if-not (or (nil? sender-hex) (= payer-hex sender-hex))
+      {:state state :commands []}
+      (if (consensus-mode? state)
+        (let [payer-acct (when payer-hex (get-in state [:ledger payer-hex]))]
+          (if (and payer-hex
+                   receiver-hex
+                   (integer? amount)
+                   (pos? amount)
+                   payer-acct
+                   (>= (spendable-balance state payer-hex) amount))
+            (let [rid (or (:receipt-id event)
+                          (str "intent:" payer-hex ":" receiver-hex ":" amount ":" (or (:epoch state) 0) ":" (:receipt-seq state 0)))
+                  staged (stage-receipt state {:receipt-id rid
+                                               :type :settle-intent
+                                               :payer payer-hex
+                                               :receiver receiver-hex
+                                               :amount amount})]
+              (if (:ok? staged)
+                {:state (:state staged) :commands []}
+                {:state state :commands []}))
+            {:state state :commands []}))
+        (let [payer-acct (when payer-hex (get-in state [:ledger payer-hex]))
+              payer-bal (or (:balance payer-acct) 0)]
+          (if (and payer-hex
+                   receiver-hex
+                   (integer? amount)
+                   (pos? amount)
+                   payer-acct
+                   (>= payer-bal amount))
+            (let [configured-bps (or (:settlement-take-bps state)
+                                     (get-in state [:config :settlement-take-bps])
+                                     burn/default-settlement-take-bps)
+                  take-bps (max 1 configured-bps)
+                  take-amt (burn/calculate-settlement-take amount take-bps)
+                  net-amt (- amount take-amt)
+                  current-epoch (or (:epoch event) (:epoch state) 0)
+                  receiver-acct (get-in state [:ledger receiver-hex]
+                                        (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                  new-payer (assoc payer-acct :balance (- payer-bal amount))
+                  new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+                  new-ledger (assoc (:ledger state)
+                                    payer-hex new-payer
+                                    receiver-hex new-receiver)]
+              {:state (-> state
+                          (assoc :ledger new-ledger)
+                          (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
+               :commands []})
+            {:state state :commands []}))))))
 
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
@@ -1858,4 +2188,5 @@
                      :commands (:commands res)})
     :on-deliver (handle-on-deliver state event)
     :submit-vouchers (handle-submit-vouchers state event)
+    :receive-transcript-sig (handle-receive-transcript-sig state event)
     {:state state :commands []}))

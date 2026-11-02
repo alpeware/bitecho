@@ -3314,4 +3314,372 @@
           (let [fv (first (:failed-vouchers s-settled))]
             (is (= :unregistered-home-set (:reason fv)))))))))
 
+(deftest test-settle-intent-and-register-home-set-reject-sender-spoofing
+  (testing "handle-settle-intent and handle-register-home-set fail closed when :sender is spoofed"
+    (let [alice-kp (crypto/generate-keypair)
+          alice-pub (basalt/bytes->hex (:public alice-kp))
+          attacker-kp (crypto/generate-keypair)
+          attacker-pub (basalt/bytes->hex (:public attacker-kp))
+          bob-kp (crypto/generate-keypair)
+          bob-pub (basalt/bytes->hex (:public bob-kp))
+          peers-map {alice-pub (:public alice-kp)
+                     bob-pub (:public bob-kp)}
+          cfg (assoc config/default-config
+                     :peers-map peers-map
+                     :genesis-ledger {alice-pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      attacker-pub (account/map->AccountState {:balance 500 :seq 0 :deps []})
+                                      bob-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})})
+          consensus-state (sm/init-state [] alice-pub (assoc cfg :keypair alice-kp))
+          standalone-state (sm/init-state [] alice-pub (dissoc cfg :peers-map))]
+
+      (testing "Consensus mode: :settle-intent with sender != payer fails closed"
+        (let [res (sm/handle-event consensus-state
+                                   {:type :settle-intent
+                                    :payer alice-pub
+                                    :receiver attacker-pub
+                                    :amount 1000
+                                    :sender attacker-pub})]
+          (is (= (:state res) consensus-state))
+          (is (empty? (:commands res)))
+          (is (empty? (:pending-receipts (:state res))))))
+
+      (testing "Consensus mode: :settle-intent with sender == payer or sender nil succeeds"
+        (let [res1 (sm/handle-event consensus-state
+                                    {:type :settle-intent
+                                     :payer alice-pub
+                                     :receiver bob-pub
+                                     :amount 500
+                                     :sender alice-pub})
+              res2 (sm/handle-event consensus-state
+                                    {:type :settle-intent
+                                     :payer alice-pub
+                                     :receiver bob-pub
+                                     :amount 500})]
+          (is (= 1 (count (:pending-receipts (:state res1)))))
+          (is (= 1 (count (:pending-receipts (:state res2)))))))
+
+      (testing "Standalone mode: :settle-intent with sender != payer fails closed"
+        (let [res (sm/handle-event standalone-state
+                                   {:type :settle-intent
+                                    :payer alice-pub
+                                    :receiver attacker-pub
+                                    :amount 1000
+                                    :sender attacker-pub})]
+          (is (= (:state res) standalone-state))
+          (is (= 10000 (:balance (get-in (:state res) [:ledger alice-pub]))))
+          (is (= 500 (:balance (get-in (:state res) [:ledger attacker-pub]))))))
+
+      (testing "Standalone mode: :settle-intent with sender == payer or sender nil succeeds"
+        (let [res1 (sm/handle-event standalone-state
+                                    {:type :settle-intent
+                                     :payer alice-pub
+                                     :receiver bob-pub
+                                     :amount 1000
+                                     :sender alice-pub})]
+          (is (< (:balance (get-in (:state res1) [:ledger alice-pub])) 10000))
+          (is (pos? (:balance (get-in (:state res1) [:ledger bob-pub]))))))
+
+      (testing "Consensus mode: :register-home-set with sender != callee fails closed"
+        (let [res (sm/handle-event consensus-state
+                                   {:type :register-home-set
+                                    :callee alice-pub
+                                    :candidates [{:node-id "node-1" :price 10 :latency-ms 10}]
+                                    :price 10
+                                    :price-max 15
+                                    :sender attacker-pub})]
+          (is (= (:state res) consensus-state))
+          (is (empty? (:commands res)))
+          (is (empty? (:pending-receipts (:state res))))))
+
+      (testing "Consensus mode: :register-home-set with sender == callee or sender nil succeeds"
+        (let [res1 (sm/handle-event consensus-state
+                                    {:type :register-home-set
+                                     :callee alice-pub
+                                     :candidates [{:node-id "node-1" :price 10 :latency-ms 10}]
+                                     :price 10
+                                     :price-max 15
+                                     :sender alice-pub})
+              res2 (sm/handle-event consensus-state
+                                    {:type :register-home-set
+                                     :callee alice-pub
+                                     :candidates [{:node-id "node-1" :price 10 :latency-ms 10}]
+                                     :price 10
+                                     :price-max 15})]
+          (is (= 1 (count (:pending-receipts (:state res1)))))
+          (is (= 1 (count (:pending-receipts (:state res2)))))))
+
+      (testing "Standalone mode: :register-home-set with sender != callee fails closed"
+        (let [res (sm/handle-event standalone-state
+                                   {:type :register-home-set
+                                    :callee alice-pub
+                                    :candidates [{:node-id "node-1" :price 10 :latency-ms 10}]
+                                    :price 10
+                                    :price-max 15
+                                    :sender attacker-pub})]
+          (is (= (:state res) standalone-state))
+          (is (empty? (:home-sets (:state res))))))
+
+      (testing "Standalone mode: :register-home-set with sender == callee or sender nil succeeds"
+        (let [res1 (sm/handle-event standalone-state
+                                    {:type :register-home-set
+                                     :callee alice-pub
+                                     :candidates [{:node-id "node-1" :price 10 :latency-ms 10}]
+                                     :price 10
+                                     :price-max 15
+                                     :sender alice-pub})]
+          (is (some? (get-in (:state res1) [:home-sets [alice-pub 0]]))))))))
+
+(deftest test-transcript-adversarial-hardening-rejects-self-dealing-empty-roles-and-sender-spoofing
+  (let [kp-a (crypto/generate-keypair)
+        kp-b (crypto/generate-keypair)
+        kp-attacker (crypto/generate-keypair)
+        pub-a (basalt/bytes->hex (:public kp-a))
+        pub-b (basalt/bytes->hex (:public kp-b))
+        attacker-pub (basalt/bytes->hex (:public kp-attacker))
+        roles [["m1" :echo]]
+        valid-half (attestation/create-transcript 0 pub-a pub-b roles (:private kp-a))
+        valid-mut (attestation/cosign-transcript valid-half (:private kp-b))
+        self-tx (attestation/create-transcript 0 pub-a pub-a roles (:private kp-a))
+        self-mut (attestation/cosign-transcript self-tx (:private kp-a))
+        empty-tx (attestation/create-transcript 0 pub-a pub-b [] (:private kp-a))
+        empty-mut (attestation/cosign-transcript empty-tx (:private kp-b))
+        st-standalone (assoc (sm/init-state [] pub-a)
+                             :frozen-epoch-messages {0 #{"m1"}}
+                             :frozen-epoch-message-roles {0 {"m1" :echo}})
+        st-consensus (sm/init-state [] pub-a (assoc config/devnet-config
+                                                    :peers-map {pub-a (:public kp-a) pub-b (:public kp-b)}
+                                                    :validators [pub-a pub-b]
+                                                    :mesh-nodes [pub-a pub-b]
+                                                    :keypair kp-a))]
+    (testing "1. Self-dealing transcripts (peer-a == peer-b) are strictly rejected"
+      ;; Standalone mode handle-submit-transcript
+      (let [res (sm/handle-event st-standalone {:type :submit-transcript :transcript self-mut})]
+        (is (= (:state res) st-standalone))
+        (is (empty? (:settled-transcript-pairs (:state res))))
+        (is (empty? (:epoch-participation (:state res)))))
+      ;; Consensus mode handle-submit-transcript
+      (let [res (sm/handle-event st-consensus {:type :submit-transcript :transcript self-mut})]
+        (is (= (:state res) st-consensus))
+        (is (empty? (:pending-receipts (:state res)))))
+      ;; handle-receive-transcript-sig
+      (let [res (sm/handle-event st-consensus {:type :receive-transcript-sig
+                                               :sender pub-a
+                                               :transcript self-mut})]
+        (is (empty? (:commands res)))
+        (is (empty? (:pending-receipts (:state res)))))
+      ;; execute-finalized-blocks with self-dealing receipt
+      (let [bad-receipt {:receipt-id "rcpt-self"
+                         :type :transcript
+                         :epoch 0
+                         :peer-a pub-a
+                         :peer-b pub-a
+                         :transcript (into {} self-mut)}
+            b1 {:hash "b1" :parent-hash "genesis" :epoch 1 :payload [bad-receipt]}
+            st-with-block (assoc st-consensus
+                                 :blocks {"b1" b1}
+                                 :finalized-blocks #{"b1"}
+                                 :latest-finalized-block-hash "b1")
+            executed (sm/execute-finalized-blocks st-with-block)]
+        (is (= 1 (:failed-receipts-count executed)))
+        (is (empty? (:settled-transcript-pairs executed)))))
+
+    (testing "2. Empty-role transcripts are strictly rejected"
+      ;; Standalone mode handle-submit-transcript
+      (let [res (sm/handle-event st-standalone {:type :submit-transcript :transcript empty-mut})]
+        (is (= (:state res) st-standalone))
+        (is (empty? (:settled-transcript-pairs (:state res)))))
+      ;; Consensus mode handle-submit-transcript
+      (let [res (sm/handle-event st-consensus {:type :submit-transcript :transcript empty-mut})]
+        (is (= (:state res) st-consensus))
+        (is (empty? (:pending-receipts (:state res)))))
+      ;; handle-receive-transcript-sig
+      (let [res (sm/handle-event st-consensus {:type :receive-transcript-sig
+                                               :sender pub-a
+                                               :transcript empty-mut})]
+        (is (empty? (:commands res))))
+      ;; execute-finalized-blocks with empty-roles receipt
+      (let [bad-receipt {:receipt-id "rcpt-empty"
+                         :type :transcript
+                         :epoch 0
+                         :peer-a pub-a
+                         :peer-b pub-b
+                         :transcript (into {} empty-mut)}
+            b1 {:hash "b1" :parent-hash "genesis" :epoch 1 :payload [bad-receipt]}
+            st-with-block (assoc st-consensus
+                                 :blocks {"b1" b1}
+                                 :finalized-blocks #{"b1"}
+                                 :latest-finalized-block-hash "b1")
+            executed (sm/execute-finalized-blocks st-with-block)]
+        (is (= 1 (:failed-receipts-count executed)))
+        (is (empty? (:settled-transcript-pairs executed)))))
+
+    (testing "3. :submit-transcript rejects spoofed :sender from unrelated third parties"
+      ;; Spoofed sender attacker-pub (neither peer-a nor peer-b)
+      (let [res-spoofed (sm/handle-event st-consensus {:type :submit-transcript
+                                                       :transcript valid-mut
+                                                       :sender attacker-pub})]
+        (is (= (:state res-spoofed) st-consensus))
+        (is (empty? (:pending-receipts (:state res-spoofed)))))
+      ;; Legitimate sender pub-a succeeds
+      (let [res-legit-a (sm/handle-event st-consensus {:type :submit-transcript
+                                                       :transcript valid-mut
+                                                       :sender pub-a})]
+        (is (= 1 (count (:pending-receipts (:state res-legit-a))))))
+      ;; Legitimate sender pub-b succeeds
+      (let [res-legit-b (sm/handle-event st-consensus {:type :submit-transcript
+                                                       :transcript valid-mut
+                                                       :sender pub-b})]
+        (is (= 1 (count (:pending-receipts (:state res-legit-b))))))
+      ;; Sender nil succeeds (local invocation)
+      (let [res-nil (sm/handle-event st-consensus {:type :submit-transcript
+                                                   :transcript valid-mut
+                                                   :sender nil})]
+        (is (= 1 (count (:pending-receipts (:state res-nil)))))))))
+
+(defspec ^{:doc "Property: Simulates 3-node Streamlet cluster with bilateral transcript exchange (:send-transcript-sig / :receive-transcript-sig), partial-overlap reconciliation, half-signed dispute against signed frozen logs, and finalized-block receipt execution; asserts convergence on identical settled pairs, weights, balances, supply, and withholding strikes."}
+  prop-bilateral-transcript-mesh-reward-convergence 50
+  (prop/for-all [burn-amt (gen/choose 5000 50000)
+                 msg-count (gen/choose 2 4)]
+                (let [kp0 (crypto/generate-keypair)
+                      kp1 (crypto/generate-keypair)
+                      kp2 (crypto/generate-keypair)
+                      kps [kp0 kp1 kp2]
+                      pubs (mapv #(basalt/bytes->hex (:public %)) kps)
+                      sorted-indices (sort-by #(nth pubs %) (range 3))
+                      sorted-kps (mapv #(nth kps %) sorted-indices)
+                      sorted-pubs (mapv #(nth pubs %) sorted-indices)
+                      pub0 (nth sorted-pubs 0)
+                      pub1 (nth sorted-pubs 1)
+                      pub2 (nth sorted-pubs 2)
+                      peers-map {pub0 (:public (nth sorted-kps 0))
+                                 pub1 (:public (nth sorted-kps 1))
+                                 pub2 (:public (nth sorted-kps 2))}
+                      t-kp (crypto/generate-keypair)
+                      t-pub (basalt/bytes->hex (:public t-kp))
+                      t-priv (basalt/bytes->hex (:private t-kp))
+                      client-kp (crypto/generate-keypair)
+                      client-pub (basalt/bytes->hex (:public client-kp))
+                      faulty-kp (crypto/generate-keypair)
+                      faulty-pub (basalt/bytes->hex (:public faulty-kp))
+                      genesis-ledger {pub0 (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      pub1 (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      pub2 (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      client-pub (account/map->AccountState {:balance 1000000 :seq 0 :deps []})}
+                      cfg (assoc config/devnet-config
+                                 :genesis-ledger genesis-ledger
+                                 :peers-map peers-map
+                                 :validators sorted-pubs
+                                 :mesh-nodes sorted-pubs
+                                 :treasury-pubkey t-pub
+                                 :treasury-privkey t-priv
+                                 :min-stake 1000)
+                      s0 (sm/init-state [] pub0 (assoc cfg :keypair (nth sorted-kps 0)))
+                      s1 (sm/init-state [] pub1 (assoc cfg :keypair (nth sorted-kps 1)))
+                      s2 (sm/init-state [] pub2 (assoc cfg :keypair (nth sorted-kps 2)))
+                      mids (mapv #(str "msg-ep0-" %) (range msg-count))
+                      inject-msgs (fn [st ms]
+                                    (reduce (fn [acc mid]
+                                              (-> acc
+                                                  (update :contagion-known-ids conj mid)
+                                                  (assoc-in [:messages mid] {:payload (.getBytes (str mid) "UTF-8")})
+                                                  (update-in [:epoch-to-messages 0] (fnil conj #{}) mid)
+                                                  (assoc-in [:epoch-to-message-roles 0 mid] :gossip)))
+                                            st
+                                            ms))
+                      s0-burned (:state (sm/handle-event s0 {:type :signaling-burn :sender client-pub :burn burn-amt}))
+                      s0-msgs (inject-msgs s0-burned mids)
+                      s1-msgs (inject-msgs s1 mids)
+                      s2-msgs (inject-msgs s2 (subvec mids 0 (max 1 (dec msg-count))))
+                      ;; 1. Tick epoch 0 -> epoch 1 on all nodes
+                      tick-res0 (sm/handle-event s0-msgs {:type :tick :rng (java.util.Random. 0)})
+                      tick-res1 (sm/handle-event s1-msgs {:type :tick :rng (java.util.Random. 1)})
+                      tick-res2 (sm/handle-event s2-msgs {:type :tick :rng (java.util.Random. 2)})
+                      states-after-tick [(:state tick-res0) (:state tick-res1) (:state tick-res2)]
+                      sig-cmds0 (filterv #(= :send-transcript-sig (:type %)) (:commands tick-res0))
+                      cmd0-to-1 (first (filter #(= pub1 (:target %)) sig-cmds0))
+                      cmd0-to-2 (first (filter #(= pub2 (:target %)) sig-cmds0))
+                      ;; 2. Deliver node0 -> node1 (exact match: node1 cosigns and replies)
+                      r1 (sm/handle-event (nth states-after-tick 1)
+                                          {:type :receive-transcript-sig
+                                           :sender pub0
+                                           :target pub1
+                                           :epoch (:epoch cmd0-to-1)
+                                           :transcript (:transcript cmd0-to-1)
+                                           :frozen-log (:frozen-log cmd0-to-1)})
+                      reply1 (first (filter #(= :send-transcript-sig (:type %)) (:commands r1)))
+                      ;; Deliver node1's cosigned reply back to node0
+                      r0 (sm/handle-event (nth states-after-tick 0)
+                                          {:type :receive-transcript-sig
+                                           :sender pub1
+                                           :target pub0
+                                           :epoch (:epoch reply1)
+                                           :transcript (:transcript reply1)})
+                      ;; 3. Deliver node0 -> node2 (partial overlap: node2 responds with reconciled half-tx)
+                      r2 (sm/handle-event (nth states-after-tick 2)
+                                          {:type :receive-transcript-sig
+                                           :sender pub0
+                                           :target pub2
+                                           :epoch (:epoch cmd0-to-2)
+                                           :transcript (:transcript cmd0-to-2)
+                                           :frozen-log (:frozen-log cmd0-to-2)})
+                      reply2 (first (filter #(= :send-transcript-sig (:type %)) (:commands r2)))
+                      ;; Node0 receives reconciled half-tx, cosigns and replies
+                      r0-reconciled (sm/handle-event (:state r0)
+                                                     {:type :receive-transcript-sig
+                                                      :sender pub2
+                                                      :target pub0
+                                                      :epoch (:epoch reply2)
+                                                      :transcript (:transcript reply2)
+                                                      :frozen-log (:frozen-log reply2)
+                                                      :reconciled? true})
+                      reply0-cosigned (first (filter #(= :send-transcript-sig (:type %)) (:commands r0-reconciled)))
+                      ;; Node2 receives cosigned transcript and stages it
+                      r2-final (sm/handle-event (:state r2)
+                                                {:type :receive-transcript-sig
+                                                 :sender pub0
+                                                 :target pub2
+                                                 :epoch (:epoch reply0-cosigned)
+                                                 :transcript (:transcript reply0-cosigned)})
+                      ;; 4. Case B: Node1 submits half-signed dispute against withholding peer faulty-pub with signed frozen logs
+                      frozen-log-faulty (attestation/sign-frozen-log 0 faulty-pub mids (:private faulty-kp))
+                      half-tx-faulty (attestation/create-transcript 0 pub1 faulty-pub (mapv #(vector % :gossip) mids) (:private (nth sorted-kps 1)))
+                      s1-dispute (:state (sm/handle-event (:state r1)
+                                                          {:type :submit-transcript
+                                                           :transcript half-tx-faulty
+                                                           :counterparty-frozen-log frozen-log-faulty}))
+                      ;; 5. Progress Streamlet rounds to finalize blocks 2 & 3
+                      st0 (:state r0-reconciled)
+                      st1 s1-dispute
+                      st2 (:state r2-final)
+                      states-ep2 (exchange-block-and-votes [st0 st1 st2] sorted-pubs 2)
+                      states-ep3 (exchange-block-and-votes states-ep2 sorted-pubs 3)
+                      states-ep4 (exchange-block-and-votes states-ep3 sorted-pubs 4)
+                      states-ep5 (exchange-block-and-votes states-ep4 sorted-pubs 5)
+                      states-ep6 (exchange-block-and-votes states-ep5 sorted-pubs 6)
+                      final-s0 (nth states-ep6 0)
+                      final-s1 (nth states-ep6 1)
+                      final-s2 (nth states-ep6 2)]
+                  (and (= (:settled-transcript-pairs final-s0)
+                          (:settled-transcript-pairs final-s1)
+                          (:settled-transcript-pairs final-s2))
+                       (= (:attested-participation final-s0)
+                          (:attested-participation final-s1)
+                          (:attested-participation final-s2))
+                       (= (:mesh-nodes final-s0)
+                          (:mesh-nodes final-s1)
+                          (:mesh-nodes final-s2))
+                       (pos? (double (get-in final-s0 [:mesh-nodes pub0] 0.0)))
+                       (pos? (double (get-in final-s0 [:mesh-nodes pub1] 0.0)))
+                       (pos? (double (get-in final-s0 [:mesh-nodes pub2] 0.0)))
+                       (= (:ledger final-s0)
+                          (:ledger final-s1)
+                          (:ledger final-s2))
+                       (= (:total-minted final-s0)
+                          (:total-minted final-s1)
+                          (:total-minted final-s2))
+                       (pos? (:total-minted final-s0))
+                       (= 1 (get-in final-s0 [:fault-strikes faulty-pub]))
+                       (= 1 (get-in final-s1 [:fault-strikes faulty-pub]))
+                       (= 1 (get-in final-s2 [:fault-strikes faulty-pub]))))))
+
 
