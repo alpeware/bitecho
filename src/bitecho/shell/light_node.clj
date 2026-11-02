@@ -129,6 +129,11 @@
                    "petname-resolve" {"cmd" "petname-resolve"
                                       "petname" (extract-flag-value args "--petname" nil)
                                       "pubkey" (extract-flag-value args "--pubkey" nil)}
+                   "dac-attach" {"cmd" "dac-attach"}
+                   "dac-revoke" {"cmd" "dac-revoke"}
+                   "directory-verify" (let [pk (extract-flag-value args "--pubkey" nil)]
+                                        (cond-> {"cmd" "directory-verify"}
+                                          pk (assoc "directory_pubkey" pk)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})

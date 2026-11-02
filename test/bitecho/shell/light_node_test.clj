@@ -1235,7 +1235,8 @@
           verbs ["serve" "identity" "status" "discover" "register-home-set"
                  "offer" "accept" "send" "inbox" "close" "transfer"
                  "account" "sync-account" "settle-intent" "submit-vouchers"
-                 "petname-set" "petname-list" "petname-remove" "petname-resolve"]
+                 "petname-set" "petname-list" "petname-remove" "petname-resolve"
+                 "dac-attach" "dac-revoke" "directory-verify"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
@@ -1267,6 +1268,9 @@
       (is (= "petname-list" (get-in (light-shell/parse-light-node-args ["petname-list"]) [:cmd-map "cmd"])))
       (is (= "petname-remove" (get-in (light-shell/parse-light-node-args ["petname-remove" "--petname" "alice"]) [:cmd-map "cmd"])))
       (is (= "petname-resolve" (get-in (light-shell/parse-light-node-args ["petname-resolve" "--petname" "alice"]) [:cmd-map "cmd"])))
+      (is (= "dac-attach" (get-in (light-shell/parse-light-node-args ["dac-attach"]) [:cmd-map "cmd"])))
+      (is (= "dac-revoke" (get-in (light-shell/parse-light-node-args ["dac-revoke"]) [:cmd-map "cmd"])))
+      (is (= "directory-verify" (get-in (light-shell/parse-light-node-args ["directory-verify"]) [:cmd-map "cmd"])))
       ;; Flags (all 25 flags tested end-to-end)
       (is (= "alice" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "petname"])))
       (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "pubkey"])))

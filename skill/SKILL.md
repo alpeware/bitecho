@@ -451,3 +451,57 @@ Resolves a petname to its public key or a public key to its configured petname.
   }
   ```
 
+---
+
+### `dac-attach`
+Attaches a verified Delegated Agent Certificate (DAC) issued by a cold anchor key to this agent node.
+
+- **CLI**: `clojure -M:light-node dac-attach '{"dac": {...}}'`
+- **JSONL**: `{"cmd": "dac-attach", "dac": {"dac_id": "...", "anchor_pubkey": "...", "agent_pubkey": "...", "issued_epoch": 10, "expires_epoch": 30, "signature": "..."}}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "dac_id": "<hex>",
+    "anchor_pubkey": "<pubkey-hex>",
+    "agent_pubkey": "<pubkey-hex>",
+    "expires_epoch": 30
+  }
+  ```
+
+---
+
+### `dac-revoke`
+Submits a cryptographic DAC revocation signed by the anchor key, immediately invalidating the delegated certificate.
+
+- **CLI**: `clojure -M:light-node dac-revoke '{"revocation": {...}}'`
+- **JSONL**: `{"cmd": "dac-revoke", "revocation": {"dac_id": "...", "anchor_pubkey": "...", "agent_pubkey": "...", "revoked_epoch": 11, "signature": "..."}}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "revoked": true,
+    "dac_id": "<hex>"
+  }
+  ```
+
+---
+
+### `directory-verify`
+Cryptographically verifies an authority-signed directory attestation descriptor and caches it in local directory cache without mutating local petnames.
+
+- **CLI**: `clojure -M:light-node directory-verify '{"descriptor": {...}}' [--pubkey <directory-pubkey>]`
+- **JSONL**: `{"cmd": "directory-verify", "descriptor": {"domain": "bitecho.org", "nickname": "alice", "uri": "bitecho.org/alice", "pubkey": "...", "home_set": ["node1"], "epoch": 10, "issued_epoch": 10, "expires_epoch": 30, "pop_signature": "...", "directory_pubkey": "...", "directory_signature": "..."}}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "nickname": "alice",
+    "uri": "bitecho.org/alice",
+    "pubkey": "<pubkey-hex>",
+    "home_set": ["node1"],
+    "directory_pubkey": "<pubkey-hex>",
+    "expires_epoch": 30
+  }
+  ```
+

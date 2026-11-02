@@ -113,15 +113,29 @@
     (.getBytes (pr-str [agent-pubkey-hex (canonicalize-for-signing clean)]) StandardCharsets/UTF_8)))
 
 (defn wrap-agent-event
-  "Wraps an agent event into an envelope signed with agent-privkey-bytes."
-  [event agent-pubkey-hex ^bytes agent-privkey-bytes]
-  (let [clean-event (dissoc event :sender :sender-pubkey-bytes :rng)
-        sb (agent-event-signing-bytes agent-pubkey-hex clean-event)
-        sig (crypto/sign agent-privkey-bytes sb)
-        sig-hex (if (string? sig) sig (basalt/bytes->hex sig))]
-    {:agent-pubkey agent-pubkey-hex
-     :event clean-event
-     :signature sig-hex}))
+  "Wraps an agent event into an envelope signed with agent-privkey-bytes.
+   Optionally attaches a DAC to the envelope if provided."
+  ([event agent-pubkey-hex ^bytes agent-privkey-bytes]
+   (wrap-agent-event event agent-pubkey-hex agent-privkey-bytes nil))
+  ([event agent-pubkey-hex ^bytes agent-privkey-bytes dac]
+   (let [clean-event (dissoc event :sender :sender-pubkey-bytes :rng)
+         sb (agent-event-signing-bytes agent-pubkey-hex clean-event)
+         sig (crypto/sign agent-privkey-bytes sb)
+         sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
+         effective-dac (or dac (:dac event))]
+     (cond-> {:agent-pubkey agent-pubkey-hex
+              :event clean-event
+              :signature sig-hex}
+       effective-dac (assoc :dac effective-dac)))))
+
+(defn- verify-mesh-agent-dac
+  "Pure helper. Verifies DAC on incoming agent envelope if present."
+  [dac agent-pub-hex epoch]
+  (if-let [v-fn (try (requiring-resolve 'bitecho.light-node.core/verify-dac) (catch Exception _ nil))]
+    (let [res (v-fn dac {:expected-agent-pubkey agent-pub-hex
+                         :current-epoch epoch})]
+      (:ok? res))
+    false))
 
 (defn unwrap-authenticated-agent-event
   "Unwraps and verifies an authenticated agent envelope.
@@ -142,22 +156,27 @@
                           (:signature msg)
                           (basalt/hex->bytes (:signature msg)))
               event (:event msg)
-              sb (agent-event-signing-bytes agent-pub-hex event)]
+              sb (agent-event-signing-bytes agent-pub-hex event)
+              envelope-dac (or (:dac msg) (:dac event))]
           (when (and (some? agent-pub-bytes)
                      (some? sig-bytes)
-                     (crypto/verify agent-pub-bytes sb sig-bytes))
-            (let [ev-type (:type event)]
+                     (crypto/verify agent-pub-bytes sb sig-bytes)
+                     (or (nil? envelope-dac)
+                         (verify-mesh-agent-dac envelope-dac agent-pub-hex (:epoch event))))
+            (let [ev-type (:type event)
+                  base-event (cond-> event
+                               envelope-dac (assoc :dac envelope-dac))]
               (case ev-type
                 :settle-intent
-                (let [payer (:payer event)
-                      receiver (:receiver event)
-                      amount (:amount event)]
+                (let [payer (:payer base-event)
+                      receiver (:receiver base-event)
+                      amount (:amount base-event)]
                   (when (and (or (nil? payer) (= payer agent-pub-hex))
                              (string? receiver)
                              (not (str/blank? receiver))
                              (integer? amount)
                              (pos? amount))
-                    (-> event
+                    (-> base-event
                         (dissoc :sender :sender-pubkey-bytes :rng)
                         (assoc :sender agent-pub-hex
                                :payer agent-pub-hex
@@ -165,15 +184,15 @@
                                :rng (java.util.Random.)))))
 
                 :register-home-set
-                (let [callee (:callee event)
-                      raw-candidates (or (:candidates event) [])
+                (let [callee (:callee base-event)
+                      raw-candidates (or (:candidates base-event) [])
                       candidates (mapv (fn [c]
                                          (if (contains? c :node-id)
                                            (assoc c :node-id (rendezvous/normalize-home-node (:node-id c)))
                                            c))
                                        raw-candidates)]
                   (when (or (nil? callee) (= callee agent-pub-hex))
-                    (-> event
+                    (-> base-event
                         (dissoc :sender :sender-pubkey-bytes :rng)
                         (assoc :sender agent-pub-hex
                                :callee agent-pub-hex
@@ -182,7 +201,7 @@
                                :rng (java.util.Random.)))))
 
                 :on-deliver
-                (let [p (:payload event)
+                (let [p (:payload base-event)
                       p-bytes (cond
                                 (bytes? p) p
                                 (sequential? p) (byte-array (map byte p))
@@ -219,7 +238,7 @@
                                  (some? tx-sig-bytes)
                                  (some? tx-payload-bytes)
                                  (crypto/verify agent-pub-bytes tx-payload-bytes tx-sig-bytes))
-                        (-> event
+                        (-> base-event
                             (dissoc :sender :sender-pubkey-bytes :rng)
                             (assoc :sender agent-pub-hex
                                    :payload p-bytes
@@ -227,7 +246,7 @@
                                    :rng (java.util.Random.)))))))
 
                 :submit-vouchers
-                (let [vouchers (:vouchers event)
+                (let [vouchers (:vouchers base-event)
                       norm-vouchers (when (and (sequential? vouchers) (seq vouchers))
                                       (mapv (fn [v]
                                               (let [hn (rendezvous/normalize-home-node (:home-node v))]
@@ -243,7 +262,7 @@
                                                    (try (rendezvous/map->DeliveryAck v) (catch Exception _ nil)))]
                                          (and ack (rendezvous/verify-delivery-ack ack))))
                                      norm-vouchers))
-                    (-> event
+                    (-> base-event
                         (dissoc :sender :sender-pubkey-bytes :rng)
                         (assoc :sender agent-pub-hex
                                :vouchers norm-vouchers
@@ -251,23 +270,23 @@
                                :rng (java.util.Random.)))))
 
                 :receive-offer-header
-                (if (contains? event :home-node)
-                  (let [hn (rendezvous/normalize-home-node (:home-node event))]
+                (if (contains? base-event :home-node)
+                  (let [hn (rendezvous/normalize-home-node (:home-node base-event))]
                     (when (and (string? hn) (not (str/blank? hn)))
-                      (-> event
+                      (-> base-event
                           (dissoc :sender :sender-pubkey-bytes :rng)
                           (assoc :sender agent-pub-hex
                                  :home-node hn
                                  :sender-pubkey-bytes agent-pub-bytes
                                  :rng (java.util.Random.)))))
-                  (-> event
+                  (-> base-event
                       (dissoc :sender :sender-pubkey-bytes :rng)
                       (assoc :sender agent-pub-hex
                              :sender-pubkey-bytes agent-pub-bytes
                              :rng (java.util.Random.))))
 
                 ;; Default for other allowed events: :receive-gossip, :receive-summary, :receive-pull-request
-                (-> event
+                (-> base-event
                     (dissoc :sender :sender-pubkey-bytes :rng)
                     (assoc :sender agent-pub-hex
                            :sender-pubkey-bytes agent-pub-bytes

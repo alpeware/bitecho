@@ -31,6 +31,9 @@
    :bootstrap (:bootstrap opts)
    :home-set []
    :petnames {}
+   :dac nil
+   :revoked-dacs #{}
+   :directory-cache {}
    :sessions {}
    :pending-offers {}
    :inbox []
@@ -123,6 +126,328 @@
             {:ok? true :pubkey norm-pub :petname (pubkey->petname state norm-pub)})
           {:ok? false :error "unknown-petname"})))))
 
+;; -----------------------------------------------------------------------------
+;; Directory Attestation & Proof-of-Possession (PoP) (Axiom Amendment 2)
+;; -----------------------------------------------------------------------------
+
+(defn create-directory-pop
+  "Creates an agent Proof-of-Possession (PoP) map signed by agent-privkey-bytes.
+   Optionally signs with prev-privkey-bytes to prove key rotation continuity."
+  [agent-privkey-bytes {:keys [domain nickname pubkey home-set epoch prev-pubkey prev-privkey-bytes]}]
+  (when (and (valid-petname? nickname)
+             (valid-pubkey-hex? pubkey)
+             (or (nil? prev-pubkey)
+                 (and (valid-pubkey-hex? prev-pubkey)
+                      (not= (normalize-pubkey-hex prev-pubkey) (normalize-pubkey-hex pubkey))
+                      (some? prev-privkey-bytes))))
+    (let [norm-nick (normalize-petname nickname)
+          norm-pub (normalize-pubkey-hex pubkey)
+          norm-domain (if (or (nil? domain) (str/blank? domain)) "bitecho.org" (str/lower-case (str/trim domain)))
+          sorted-hs (vec (sort (distinct (keep (fn [hn]
+                                                 (let [n (rendezvous/normalize-home-node hn)]
+                                                   (when (and (string? n) (not (str/blank? n))) n)))
+                                               home-set))))
+          ep (long (or epoch 0))
+          norm-prev (when prev-pubkey (normalize-pubkey-hex prev-pubkey))
+          canonical-str (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
+                             (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
+          sig-bytes (crypto/sign agent-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
+          rot-sig-bytes (when norm-prev
+                          (crypto/sign prev-privkey-bytes (.getBytes canonical-str "UTF-8")))
+          rot-sig-hex (when rot-sig-bytes
+                        (if (string? rot-sig-bytes) rot-sig-bytes (basalt/bytes->hex rot-sig-bytes)))]
+      (cond-> {:domain norm-domain
+               :nickname norm-nick
+               :pubkey norm-pub
+               :home-set sorted-hs
+               :epoch ep
+               :pop-signature sig-hex}
+        norm-prev (assoc :prev-pubkey norm-prev
+                         :rotation-signature rot-sig-hex)))))
+
+(defn verify-directory-pop
+  "Verifies an agent Proof-of-Possession (PoP) map.
+   Returns true iff the agent signature verifies under pubkey and (if key rotation)
+   the rotation signature verifies under prev-pubkey."
+  [pop-map]
+  (boolean
+   (when (and (map? pop-map)
+              (valid-petname? (:nickname pop-map))
+              (valid-pubkey-hex? (:pubkey pop-map))
+              (string? (:domain pop-map))
+              (not (str/blank? (:domain pop-map)))
+              (string? (:pop-signature pop-map))
+              (not (str/blank? (:pop-signature pop-map))))
+     (let [norm-domain (str/lower-case (str/trim (:domain pop-map)))
+           norm-nick (normalize-petname (:nickname pop-map))
+           norm-pub (normalize-pubkey-hex (:pubkey pop-map))
+           sorted-hs (vec (sort (distinct (keep (fn [hn]
+                                                  (let [n (rendezvous/normalize-home-node hn)]
+                                                    (when (and (string? n) (not (str/blank? n))) n)))
+                                                (:home-set pop-map)))))
+           ep (long (or (:epoch pop-map) 0))
+           prev-pk (:prev-pubkey pop-map)
+           rot-sig (:rotation-signature pop-map)
+           has-rot? (or (some? prev-pk) (some? rot-sig))
+           norm-prev (when prev-pk (normalize-pubkey-hex prev-pk))
+           canonical-str (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
+                              (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
+           pub-bytes (try (basalt/hex->bytes norm-pub) (catch Exception _ nil))
+           sig-bytes (try (basalt/hex->bytes (:pop-signature pop-map)) (catch Exception _ nil))
+           pop-valid? (boolean (and pub-bytes sig-bytes
+                                    (crypto/verify pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes)))]
+       (if-not pop-valid?
+         false
+         (if has-rot?
+           (let [rot-keys-valid? (and (valid-pubkey-hex? prev-pk)
+                                      (not= norm-prev norm-pub)
+                                      (string? rot-sig)
+                                      (not (str/blank? rot-sig)))
+                 prev-pub-bytes (when rot-keys-valid? (try (basalt/hex->bytes norm-prev) (catch Exception _ nil)))
+                 rot-sig-bytes (when rot-keys-valid? (try (basalt/hex->bytes rot-sig) (catch Exception _ nil)))]
+             (boolean (and prev-pub-bytes rot-sig-bytes
+                           (crypto/verify prev-pub-bytes (.getBytes canonical-str "UTF-8") rot-sig-bytes))))
+           true))))))
+
+(defn sign-directory-descriptor
+  "Signs a directory attestation descriptor under a directory authority key after verifying PoP.
+   Agent self-signature proves continuity only; directory signature attests the entry."
+  [directory-privkey-bytes directory-pubkey-hex pop-map {:keys [mailbox issued-epoch expires-epoch]}]
+  (when (and (valid-pubkey-hex? directory-pubkey-hex)
+             (verify-directory-pop pop-map)
+             (integer? issued-epoch)
+             (integer? expires-epoch)
+             (>= (long expires-epoch) (long issued-epoch)))
+    (let [domain (str/lower-case (str/trim (or (:domain pop-map) "bitecho.org")))
+          norm-nick (normalize-petname (:nickname pop-map))
+          norm-pub (normalize-pubkey-hex (:pubkey pop-map))
+          sorted-hs (vec (sort (distinct (keep (fn [hn]
+                                                 (let [n (rendezvous/normalize-home-node hn)]
+                                                   (when (and (string? n) (not (str/blank? n))) n)))
+                                               (:home-set pop-map)))))
+          norm-prev (when-let [p (:prev-pubkey pop-map)] (normalize-pubkey-hex p))
+          pop-sig (:pop-signature pop-map)
+          rot-sig (or (:rotation-signature pop-map) "")
+          mbox (or mailbox "")
+          iss-ep (long issued-epoch)
+          exp-ep (long expires-epoch)
+          canonical-str (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
+                             (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
+                             (or norm-prev "") "|" pop-sig "|" rot-sig)
+          dir-sig-bytes (crypto/sign directory-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          dir-sig-hex (if (string? dir-sig-bytes) dir-sig-bytes (basalt/bytes->hex dir-sig-bytes))]
+      (cond-> {:bitecho/type :directory-descriptor
+               :domain domain
+               :nickname norm-nick
+               :uri (str domain "/" norm-nick)
+               :pubkey norm-pub
+               :home-set sorted-hs
+               :epoch (long (or (:epoch pop-map) iss-ep))
+               :issued-epoch iss-ep
+               :expires-epoch exp-ep
+               :pop-signature pop-sig
+               :directory-pubkey (normalize-pubkey-hex directory-pubkey-hex)
+               :directory-signature dir-sig-hex}
+        (seq mbox) (assoc :mailbox mbox)
+        norm-prev (assoc :prev-pubkey norm-prev)
+        (:rotation-signature pop-map) (assoc :rotation-signature (:rotation-signature pop-map))))))
+
+(defn verify-directory-descriptor
+  "Verifies a directory descriptor against a trusted directory authority public key and current epoch.
+   Strictly fails closed returning {:ok? false :error <reason>} on any validation failure."
+  [descriptor trusted-directory-pubkey current-epoch]
+  (let [desc (if (map? descriptor)
+               (into {} (for [[k v] descriptor]
+                          [(if (keyword? k) k (keyword (str/replace (name k) #"_" "-"))) v]))
+               descriptor)]
+    (cond
+      (or (not (map? desc))
+          (str/blank? (str (or (:domain desc) "")))
+          (str/blank? (str (or (:nickname desc) "")))
+          (str/blank? (str (or (:pubkey desc) "")))
+          (str/blank? (str (or (:directory-pubkey desc) "")))
+          (str/blank? (str (or (:directory-signature desc) "")))
+          (str/blank? (str (or (:pop-signature desc) "")))
+          (nil? (:issued-epoch desc))
+          (nil? (:expires-epoch desc)))
+      {:ok? false :error "malformed-descriptor"}
+
+      (or (not (valid-pubkey-hex? trusted-directory-pubkey))
+          (not= (normalize-pubkey-hex (:directory-pubkey desc))
+                (normalize-pubkey-hex trusted-directory-pubkey)))
+      {:ok? false :error "untrusted-directory-authority"}
+
+      (or (< (long (or (:expires-epoch desc) -1)) (long (or (:issued-epoch desc) 0)))
+          (and (some? current-epoch) (< (long (:expires-epoch desc)) (long current-epoch))))
+      {:ok? false :error "descriptor-expired"}
+
+      (and (some? current-epoch) (> (long (:issued-epoch desc)) (+ (long current-epoch) 2)))
+      {:ok? false :error "descriptor-future-epoch"}
+
+      (not (verify-directory-pop desc))
+      {:ok? false :error "invalid-pop-signature"}
+
+      :else
+      (let [domain (str/lower-case (str/trim (or (:domain desc) "bitecho.org")))
+            norm-nick (normalize-petname (:nickname desc))
+            norm-pub (normalize-pubkey-hex (:pubkey desc))
+            sorted-hs (vec (sort (distinct (keep (fn [hn]
+                                                   (let [n (rendezvous/normalize-home-node hn)]
+                                                     (when (and (string? n) (not (str/blank? n))) n)))
+                                                 (:home-set desc)))))
+            mbox (or (:mailbox desc) "")
+            iss-ep (long (:issued-epoch desc))
+            exp-ep (long (:expires-epoch desc))
+            norm-prev (when-let [p (:prev-pubkey desc)] (normalize-pubkey-hex p))
+            pop-sig (:pop-signature desc)
+            rot-sig (or (:rotation-signature desc) "")
+            canonical-str (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
+                               (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
+                               (or norm-prev "") "|" pop-sig "|" rot-sig)
+            dir-pub-bytes (try (basalt/hex->bytes (normalize-pubkey-hex trusted-directory-pubkey)) (catch Exception _ nil))
+            dir-sig-bytes (try (basalt/hex->bytes (:directory-signature desc)) (catch Exception _ nil))]
+        (if-not (and dir-pub-bytes dir-sig-bytes
+                     (crypto/verify dir-pub-bytes (.getBytes canonical-str "UTF-8") dir-sig-bytes))
+          {:ok? false :error "invalid-directory-signature"}
+          {:ok? true :descriptor descriptor})))))
+
+;; -----------------------------------------------------------------------------
+;; Delegated Agent Certificates (DACs: Anchor Key -> Hot Agent Key)
+;; -----------------------------------------------------------------------------
+
+(defn create-dac
+  "Creates a Delegated Agent Certificate (DAC) signed by an anchor cold key."
+  [anchor-privkey-bytes {:keys [anchor-pubkey agent-pubkey issued-epoch expires-epoch max-spend-per-epoch scopes]}]
+  (when (and (valid-pubkey-hex? anchor-pubkey)
+             (valid-pubkey-hex? agent-pubkey)
+             (not= (normalize-pubkey-hex anchor-pubkey) (normalize-pubkey-hex agent-pubkey))
+             (>= (long (or issued-epoch 0)) 0)
+             (>= (long (or expires-epoch 0)) (long (or issued-epoch 0)))
+             (>= (long (or max-spend-per-epoch 0)) 0))
+    (let [norm-anchor (normalize-pubkey-hex anchor-pubkey)
+          norm-agent (normalize-pubkey-hex agent-pubkey)
+          iss-ep (long (or issued-epoch 0))
+          exp-ep (long (or expires-epoch 0))
+          max-spend (long (or max-spend-per-epoch 0))
+          sorted-scopes (vec (sort (distinct (map str/lower-case (map name (or scopes ["gossip" "offer" "settle-intent" "transfer"]))))))
+          canonical-str (str "bitecho-dac-v1|" norm-anchor "|" norm-agent "|" iss-ep "|" exp-ep "|" max-spend "|" (str/join "," sorted-scopes))
+          dac-id (basalt/bytes->hex (crypto/sha256 (.getBytes canonical-str "UTF-8")))
+          sig-bytes (crypto/sign anchor-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))]
+      {:bitecho/type :dac
+       :dac-id dac-id
+       :anchor-pubkey norm-anchor
+       :agent-pubkey norm-agent
+       :issued-epoch iss-ep
+       :expires-epoch exp-ep
+       :max-spend-per-epoch max-spend
+       :scopes sorted-scopes
+       :signature sig-hex})))
+
+(defn create-dac-revocation
+  "Creates a DAC revocation map signed by an anchor cold key."
+  [anchor-privkey-bytes {:keys [anchor-pubkey agent-pubkey dac-id revoked-epoch]}]
+  (when (and (valid-pubkey-hex? anchor-pubkey)
+             (valid-pubkey-hex? agent-pubkey)
+             (string? dac-id)
+             (not (str/blank? dac-id)))
+    (let [norm-anchor (normalize-pubkey-hex anchor-pubkey)
+          norm-agent (normalize-pubkey-hex agent-pubkey)
+          rev-ep (long (or revoked-epoch 0))
+          canonical-str (str "bitecho-dac-revoke-v1|" norm-anchor "|" norm-agent "|" dac-id "|" rev-ep)
+          sig-bytes (crypto/sign anchor-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))]
+      {:bitecho/type :dac-revocation
+       :dac-id dac-id
+       :anchor-pubkey norm-anchor
+       :agent-pubkey norm-agent
+       :revoked-epoch rev-ep
+       :signature sig-hex})))
+
+(defn verify-dac-revocation
+  "Verifies a DAC revocation map under its anchor public key."
+  [revocation]
+  (let [rev (if (map? revocation)
+              (into {} (for [[k v] revocation]
+                         [(if (keyword? k) k (keyword (str/replace (name k) #"_" "-"))) v]))
+              revocation)]
+    (boolean
+     (when (and (map? rev)
+                (valid-pubkey-hex? (:anchor-pubkey rev))
+                (valid-pubkey-hex? (:agent-pubkey rev))
+                (string? (:dac-id rev))
+                (not (str/blank? (:dac-id rev)))
+                (string? (:signature rev))
+                (not (str/blank? (:signature rev))))
+       (let [norm-anchor (normalize-pubkey-hex (:anchor-pubkey rev))
+             norm-agent (normalize-pubkey-hex (:agent-pubkey rev))
+             dac-id (:dac-id rev)
+             rev-ep (long (or (:revoked-epoch rev) 0))
+             canonical-str (str "bitecho-dac-revoke-v1|" norm-anchor "|" norm-agent "|" dac-id "|" rev-ep)
+             pub-bytes (try (basalt/hex->bytes norm-anchor) (catch Exception _ nil))
+             sig-bytes (try (basalt/hex->bytes (:signature rev)) (catch Exception _ nil))]
+         (and pub-bytes sig-bytes
+              (crypto/verify pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes)))))))
+
+(defn verify-dac
+  "Verifies a Delegated Agent Certificate (DAC) against expected agent key, epoch, revocations, and scope.
+   Strictly fails closed returning {:ok? false :error <reason>} on any validation failure."
+  [dac {:keys [expected-agent-pubkey current-epoch revoked-dac-ids required-scope]}]
+  (let [d (if (map? dac)
+            (into {} (for [[k v] dac]
+                       [(if (keyword? k) k (keyword (str/replace (name k) #"_" "-"))) v]))
+            dac)]
+    (cond
+      (not (map? d))
+      {:ok? false :error "malformed-dac"}
+
+      (or (not (valid-pubkey-hex? (:anchor-pubkey d)))
+          (not (valid-pubkey-hex? (:agent-pubkey d)))
+          (= (normalize-pubkey-hex (:anchor-pubkey d)) (normalize-pubkey-hex (:agent-pubkey d))))
+      {:ok? false :error "invalid-dac-keys"}
+
+      (and expected-agent-pubkey
+           (not= (normalize-pubkey-hex expected-agent-pubkey)
+                 (normalize-pubkey-hex (:agent-pubkey d))))
+      {:ok? false :error "dac-agent-mismatch"}
+
+      (or (< (long (or (:expires-epoch d) -1)) (long (or (:issued-epoch d) 0)))
+          (and (some? current-epoch) (< (long (:expires-epoch d)) (long current-epoch))))
+      {:ok? false :error "dac-expired"}
+
+      (and (some? current-epoch) (> (long (:issued-epoch d)) (+ (long current-epoch) 2)))
+      {:ok? false :error "dac-future-epoch"}
+
+      (contains? (set (or revoked-dac-ids [])) (:dac-id d))
+      {:ok? false :error "dac-revoked"}
+
+      (and required-scope
+           (not (contains? (set (map str/lower-case (map name (or (:scopes d) []))))
+                           (str/lower-case (name required-scope)))))
+      {:ok? false :error "dac-scope-not-permitted"}
+
+      :else
+      (let [norm-anchor (normalize-pubkey-hex (:anchor-pubkey d))
+            norm-agent (normalize-pubkey-hex (:agent-pubkey d))
+            iss-ep (long (or (:issued-epoch d) 0))
+            exp-ep (long (or (:expires-epoch d) 0))
+            max-spend (long (or (:max-spend-per-epoch d) 0))
+            sorted-scopes (vec (sort (distinct (map str/lower-case (map name (or (:scopes d) []))))))
+            canonical-str (str "bitecho-dac-v1|" norm-anchor "|" norm-agent "|" iss-ep "|" exp-ep "|" max-spend "|" (str/join "," sorted-scopes))
+            expected-id (basalt/bytes->hex (crypto/sha256 (.getBytes canonical-str "UTF-8")))
+            anchor-pub-bytes (try (basalt/hex->bytes norm-anchor) (catch Exception _ nil))
+            sig-bytes (try (basalt/hex->bytes (str (or (:signature d) ""))) (catch Exception _ nil))]
+        (if-not (and (= (:dac-id d) expected-id)
+                     anchor-pub-bytes sig-bytes
+                     (crypto/verify anchor-pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes))
+          {:ok? false :error "invalid-dac-signature"}
+          {:ok? true
+           :dac dac
+           :dac-id (:dac-id d)
+           :anchor-pubkey norm-anchor
+           :agent-pubkey norm-agent})))))
+
 (defn- resolve-session-id
   "Resolves a session id from cmd-map or counterparty identifier (petname/pubkey).
    Supports :open (prefers open sessions) or :active (prefers non-closed sessions).
@@ -177,13 +502,22 @@
 ;; Command Handlers (Pure Helpers)
 ;; -----------------------------------------------------------------------------
 
+(defn- dac-summary [dac]
+  (when (map? dac)
+    (let [d (into {} (for [[k v] dac]
+                       [(if (keyword? k) k (keyword (str/replace (name k) #"_" "-"))) v]))]
+      {"dac_id" (:dac-id d)
+       "anchor_pubkey" (:anchor-pubkey d)
+       "expires_epoch" (:expires-epoch d)})))
+
 (defn- exec-identity [state]
   {:state state
-   :response {"ok" true
-              "pubkey" (:pubkey state)
-              "fingerprint" (:fingerprint state)
-              "ice_ufrag" (get-in state [:ice-creds :ufrag])
-              "ice_pwd" (get-in state [:ice-creds :pwd])}
+   :response (cond-> {"ok" true
+                      "pubkey" (:pubkey state)
+                      "fingerprint" (:fingerprint state)
+                      "ice_ufrag" (get-in state [:ice-creds :ufrag])
+                      "ice_pwd" (get-in state [:ice-creds :pwd])}
+               (:dac state) (assoc "dac" (dac-summary (:dac state))))
    :net-envelopes []
    :stdout-events []})
 
@@ -287,17 +621,24 @@
                                             :price price
                                             :home-node home-node})
             sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
-            offer-payload {:bitecho/type :channel-offer
-                           :session-id session-id
-                           :caller caller
-                           :callee callee
-                           :caller-ephemeral-pub eph-pub-hex
-                           :epoch epoch
-                           :price price
-                           :home-node home-node
-                           :offer-hash offer-hash
-                           :burn burn-amt
-                           :signature sig-hex}
+            active-dac (when-let [d (:dac state)]
+                         (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
+                                                    :current-epoch epoch
+                                                    :revoked-dac-ids (:revoked-dacs state)
+                                                    :required-scope "offer"}))
+                           d))
+            offer-payload (cond-> {:bitecho/type :channel-offer
+                                   :session-id session-id
+                                   :caller caller
+                                   :callee callee
+                                   :caller-ephemeral-pub eph-pub-hex
+                                   :epoch epoch
+                                   :price price
+                                   :home-node home-node
+                                   :offer-hash offer-hash
+                                   :burn burn-amt
+                                   :signature sig-hex}
+                            active-dac (assoc :dac active-dac))
             gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze offer-payload) burn-amt)
             header-event {:type :receive-offer-header
                           :caller caller
@@ -850,6 +1191,92 @@
        :net-envelopes []
        :stdout-events []})))
 
+(defn- exec-dac-attach [state cmd-map]
+  (let [raw-dac (or (get cmd-map "dac") (:dac cmd-map) cmd-map)
+        cur-ep (when (:epoch-initialized? state) (:epoch state))
+        res (verify-dac raw-dac {:expected-agent-pubkey (:pubkey state)
+                                 :current-epoch cur-ep
+                                 :revoked-dac-ids (:revoked-dacs state)})]
+    (if-not (:ok? res)
+      {:state state
+       :response {"ok" false "error" (:error res)}
+       :net-envelopes []
+       :stdout-events []}
+      (let [dac (:dac res)]
+        {:state (assoc state :dac dac)
+         :response {"ok" true
+                    "dac_id" (:dac-id res)
+                    "anchor_pubkey" (:anchor-pubkey res)
+                    "agent_pubkey" (:agent-pubkey res)
+                    "expires_epoch" (long (or (:expires-epoch dac) (get dac "expires_epoch") 0))}
+         :net-envelopes []
+         :stdout-events []}))))
+
+(defn- exec-dac-revoke [state cmd-map]
+  (let [raw-rev (or (get cmd-map "revocation") (:revocation cmd-map) cmd-map)]
+    (if-not (verify-dac-revocation raw-rev)
+      {:state state
+       :response {"ok" false "error" "invalid-dac-revocation"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [rev-map (if (map? raw-rev)
+                      (into {} (for [[k v] raw-rev]
+                                 [(if (keyword? k) k (keyword (str/replace (name k) #"_" "-"))) v]))
+                      {})
+            dac-id (:dac-id rev-map)
+            new-revoked (conj (set (or (:revoked-dacs state) #{})) dac-id)
+            attached-dac (:dac state)
+            attached-id (or (:dac-id attached-dac) (get attached-dac "dac_id"))
+            cleared-dac? (= attached-id dac-id)
+            new-state (cond-> (assoc state :revoked-dacs new-revoked)
+                        cleared-dac? (assoc :dac nil))]
+        {:state new-state
+         :response {"ok" true "revoked" true "dac_id" dac-id}
+         :net-envelopes []
+         :stdout-events []}))))
+
+(defn- exec-directory-verify [state cmd-map]
+  (let [raw-desc (or (get cmd-map "descriptor") (:descriptor cmd-map) cmd-map)
+        dir-pub (or (get cmd-map "directory_pubkey") (get cmd-map "directory-pubkey")
+                    (get cmd-map "pubkey") (:directory-pubkey cmd-map) (:pubkey cmd-map)
+                    (get-in state [:bootstrap :custody-pubkey])
+                    (get-in state [:bootstrap :treasury-pubkey]))
+        cur-ep (when (:epoch-initialized? state) (:epoch state))
+        res (verify-directory-descriptor raw-desc dir-pub cur-ep)]
+    (if-not (:ok? res)
+      {:state state
+       :response {"ok" false "error" (:error res)}
+       :net-envelopes []
+       :stdout-events []}
+      (let [desc (:descriptor res)
+            desc-map (if (map? desc)
+                       (into {} (for [[k v] desc]
+                                  [(if (keyword? k) k (keyword (str/replace (name k) #"_" "-"))) v]))
+                       {})
+            nick (:nickname desc-map)
+            pub (:pubkey desc-map)
+            prev-pub (:prev-pubkey desc-map)
+            existing (get-in state [:directory-cache nick])]
+        (if (and existing
+                 (not= (normalize-pubkey-hex (:pubkey existing)) (normalize-pubkey-hex pub))
+                 (or (nil? prev-pub)
+                     (not= (normalize-pubkey-hex (:pubkey existing)) (normalize-pubkey-hex prev-pub))))
+          {:state state
+           :response {"ok" false "error" "broken-key-continuity"}
+           :net-envelopes []
+           :stdout-events []}
+          (let [new-state (assoc-in state [:directory-cache nick] desc)]
+            {:state new-state
+             :response {"ok" true
+                        "nickname" nick
+                        "uri" (or (:uri desc-map) (str "bitecho.org/" nick))
+                        "pubkey" pub
+                        "home_set" (or (:home-set desc-map) [])
+                        "directory_pubkey" (:directory-pubkey desc-map)
+                        "expires_epoch" (:expires-epoch desc-map)}
+             :net-envelopes []
+             :stdout-events []}))))))
+
 (defn- exec-status [state]
   (let [sessions-summary (vec (for [[_ s] (:sessions state)
                                     :let [pname (pubkey->petname state (:peer s))]]
@@ -869,6 +1296,9 @@
                         "account" (:account state)
                         "petnames" (into (sorted-map) (:petnames state {}))
                         "petnames_count" (count (:petnames state {}))
+                        "dac" (dac-summary (:dac state))
+                        "revoked_dacs_count" (count (:revoked-dacs state #{}))
+                        "directory_cache_count" (count (:directory-cache state {}))
                         "accounting" {"scope" "local-non-consensus"
                                       "note" "Locally computed devnet totals; never consensus finalized"
                                       "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
@@ -902,6 +1332,9 @@
       "petname-list" (exec-petname-list state)
       "petname-remove" (exec-petname-remove state effective-map)
       "petname-resolve" (exec-petname-resolve state effective-map)
+      "dac-attach" (exec-dac-attach state effective-map)
+      "dac-revoke" (exec-dac-revoke state effective-map)
+      "directory-verify" (exec-directory-verify state effective-map)
       "status" (exec-status state)
       {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})))
 
@@ -941,11 +1374,19 @@
                              (= (:offer-hash msg) expected-hash))
           valid-sig? (and valid-hashes?
                           caller-pub sig-bytes
-                          (crypto/verify caller-pub (.getBytes ^String (:offer-hash msg) "UTF-8") sig-bytes))]
-      (if-not valid-sig?
+                          (crypto/verify caller-pub (.getBytes ^String (:offer-hash msg) "UTF-8") sig-bytes))
+          ref-epoch (:epoch state)
+          dac-check (when-let [d (:dac msg)]
+                      (verify-dac d {:expected-agent-pubkey (:caller msg)
+                                     :current-epoch ref-epoch
+                                     :revoked-dac-ids (:revoked-dacs state)
+                                     :required-scope "offer"}))]
+      (if (or (not valid-sig?)
+              (and (:dac msg) (not (:ok? dac-check))))
         {:state state :net-envelopes [] :stdout-events []}
         (let [sid (:session-id msg)
-              clean-offer (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature])]
+              clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature])
+                            (and (:dac msg) (:ok? dac-check)) (assoc :dac (:dac msg)))]
           (cond
             (contains? (:sessions state) sid)
             (let [new-state (update-in state [:sessions sid :replays-deduped] (fnil inc 0))]
@@ -964,11 +1405,16 @@
 
             :else
             (let [caller-pname (pubkey->petname state (:caller clean-offer))
+                  offer-dac (:dac clean-offer)
+                  dac-anchor (when offer-dac (or (:anchor-pubkey offer-dac) (get offer-dac "anchor_pubkey")))
+                  dac-id (when offer-dac (or (:dac-id offer-dac) (get offer-dac "dac_id")))
                   event (cond-> {"event" "offer-received"
                                  "session_id" sid
                                  "caller" (:caller clean-offer)
                                  "price" (:price clean-offer)}
-                          caller-pname (assoc "caller_petname" caller-pname))]
+                          caller-pname (assoc "caller_petname" caller-pname)
+                          dac-anchor (assoc "anchor_pubkey" dac-anchor)
+                          dac-id (assoc "dac_id" dac-id))]
               {:state (assoc-in state [:pending-offers sid] clean-offer)
                :net-envelopes []
                :stdout-events [event]})))))))

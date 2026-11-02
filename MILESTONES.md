@@ -109,9 +109,31 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
    - `test-petname-bidirectional-counterparty-resolution-and-events`: end-to-end multi-agent session lifecycle with petname resolution and wire-injection immunity.
    - `prop-petname-bijection-and-bidirectional-resolution`: 50-run generative property test asserting state bijection preservation and bidirectional resolution across arbitrary command sequences.
 
-#### Step 2B — Directory-Signed Attestation & DAC Anchor Delegation *(Axiom Amendment 2)*
-- Implement signed directory descriptors (`bitecho.org/<nickname>` resolving to pubkey + home-set) where the **directory authority** signs the attestation after proof-of-possession, and the agent's self-signature proves key continuity/rotation only.
-- Implement **Delegated Agent Certificates (DACs)** (`Parent Anchor Cold Key -> Agent Node Hot Key`) creation, verification, expiry/revocation checks, and attachment to agent envelopes.
+#### Step 2B — Directory-Signed Attestation & DAC Anchor Delegation *(Axiom Amendment 2)* — **COMPLETED**
+1. **Directory-Signed Attestation with Proof-of-Possession (`bitecho.light-node.core`)**:
+   - Enforced Axiom Amendment 2: global directory attestation must be signed by the directory authority after proof-of-possession; agent self-signature proves key continuity only.
+   - Pure cryptographic functions:
+     - `create-directory-pop` & `verify-directory-pop`: canonical string `bitecho-directory-pop-v1|<domain>|<nickname>|<pubkey>|<sorted-home-set>|<epoch>|<prev-pubkey>`. Signs with current agent private key (`:pop-signature`) and optionally previous private key (`:rotation-signature`) to prove key rotation continuity without central key custody.
+     - `sign-directory-descriptor` & `verify-directory-descriptor`: canonical string `bitecho-directory-attestation-v1|<domain>|<nickname>|<pubkey>|<sorted-home-set>|<mailbox>|<issued-epoch>|<expires-epoch>|<prev-pubkey>|<pop-signature>|<rotation-signature>`. Signed exclusively by the trusted directory authority key.
+     - Fail-closed verification enforces trusted directory authority pubkey, active epoch validity window, future-epoch guards ($issued \le current + 2$), PoP verification, and authority signature verification. Self-signed descriptors without directory authority signature fail closed (`untrusted-directory-authority` or `invalid-directory-signature`).
+2. **Delegated Agent Certificates (DACs: Anchor Key -> Agent Key)**:
+   - Pure functions for parent cold anchor key delegation to ephemeral hot agent nodes:
+     - `create-dac` & `verify-dac`: canonical string `bitecho-dac-v1|<anchor-pubkey>|<agent-pubkey>|<issued-epoch>|<expires-epoch>|<max-spend-per-epoch>|<sorted-scopes>`. Signs with anchor cold key; deterministic SHA-256 `dac-id`.
+     - `create-dac-revocation` & `verify-dac-revocation`: canonical string `bitecho-dac-revoke-v1|<anchor-pubkey>|<agent-pubkey>|<dac-id>|<revoked-epoch>`.
+     - Verification enforces key disjointness, agent pubkey matching, epoch validity, revocation list checks, permitted scope enforcement, and anchor signature integrity.
+3. **Integration into Light-Node State, Commands, Wire Envelopes & Mesh Boundary**:
+   - Light-node state maintains `:dac`, `:revoked-dacs`, and `:directory-cache`.
+   - Protocol verbs: `dac-attach`, `dac-revoke`, `directory-verify`.
+   - `directory-verify` caches verified descriptors in `:directory-cache` and enforces key rotation continuity against previously cached keys (`broken-key-continuity`), while strictly never mutating local `:petnames`.
+   - `status` and `identity` surface attached DAC summaries, revoked DAC counts, and directory cache counts.
+   - Channel offers (`offer`) attach active DACs; inbound wire offer handler (`handle-wire-offer`) validates DAC, rejecting invalid/revoked/expired DACs fail-closed and surfacing verified anchor key and DAC ID on `"offer-received"` events.
+   - Mesh ingress boundary (`wrap-agent-event` & `unwrap-authenticated-agent-event`) supports optional DAC attachment and verifies DAC validity against agent identity and epoch, failing closed on signature or validity failure.
+4. **CLI, Documentation & Generative Properties (Rules 1, 3, 6)**:
+   - CLI verbs in `bitecho.shell.light-node`: `dac-attach`, `dac-revoke`, `directory-verify`.
+   - Full documentation and usage examples added to `skill/SKILL.md` with 100% bidirectional parity against `test-cli-and-skill-flag-inventory` (22 verbs and 25 flags).
+   - `test-directory-signed-attestation-and-pop`: PoP creation, verification, key rotation continuity, and directory descriptor validation.
+   - `test-dac-creation-revocation-and-commands`: DAC creation, verification, revocation, command handlers, wire offer DAC attachment, and mesh envelope verification.
+   - `prop-directory-attestation-and-dac-security-invariants`: 50-run generative property test verifying directory attestation PoP & authority security, key rotation continuity, and DAC delegation invariants.
 
 #### Step 2C — Two-Phase Callee-Pays Rendezvous $\rightarrow$ Sealed-Channel Key-Exchange Handoff *(Axiom Priority)*
 - Wire `bitecho.rendezvous.core` (`OfferHeader` + signaling burn $\rightarrow$ policy-gated `DeliveryAck` voucher $\rightarrow$ payload reveal) directly into the X25519 `:channel-offer` / `:channel-accept` handshake so a callee-pays rendezvous introduction seamlessly transitions into an E2E encrypted sealed conversation.

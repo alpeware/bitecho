@@ -237,3 +237,31 @@ Full-node WebRTC DataChannel mesh connections (peer-to-peer full-mesh and agent 
    - Inbound wire events (`handle-wire-offer`, `handle-wire-accept`, `handle-wire-sealed-msg`, `handle-wire-close`) enrich emitted stdout events and inbox items using the local address book only.
    - Wire payloads claiming `:petname`, `:nickname`, or `"petname"` are strictly ignored and NEVER imported into or allowed to overwrite local state, preserving the Zooko's Triangle security model where local naming remains sovereign and self-assigned.
 
+### J. Directory-Signed Attestation & Delegated Agent Certificates (Milestone 2 — Step 2B)
+Per Axiom Amendment 2, global directory attestation must be signed by the directory authority after agent proof-of-possession, while the agent's self-signature proves key continuity only:
+
+1. **Proof-of-Possession & Continuity (`create-directory-pop` & `verify-directory-pop`)**:
+   - Canonical PoP string: `bitecho-directory-pop-v1|<domain>|<nickname>|<pubkey>|<sorted-home-set>|<epoch>|<prev-pubkey>`.
+   - Agent signs PoP with current private key (`:pop-signature`).
+   - When rotating keys, agent signs the canonical PoP string with previous private key (`:rotation-signature`), establishing cryptographic key continuity without central key custody.
+   - Fail-closed verification enforces nickname validity, pubkey format, domain presence, and dual signature verification on key rotation.
+
+2. **Directory Authority Attestation (`sign-directory-descriptor` & `verify-directory-descriptor`)**:
+   - Canonical attestation string: `bitecho-directory-attestation-v1|<domain>|<nickname>|<pubkey>|<sorted-home-set>|<mailbox>|<issued-epoch>|<expires-epoch>|<prev-pubkey>|<pop-signature>|<rotation-signature>`.
+   - Signed exclusively by the trusted directory authority private key.
+   - Verification strictly requires matching the trusted directory authority public key, active validity window, future-epoch guards ($issued \le current + 2$), valid PoP, and verified authority signature.
+   - Self-signed descriptors without directory authority signature fail closed (`untrusted-directory-authority` or `invalid-directory-signature`).
+
+3. **Delegated Agent Certificates (DACs: Anchor Key -> Agent Key)**:
+   - Cold anchor keys delegate operational authority to ephemeral hot agent keys via DACs (`bitecho.light-node.core`).
+   - Canonical DAC string: `bitecho-dac-v1|<anchor-pubkey>|<agent-pubkey>|<issued-epoch>|<expires-epoch>|<max-spend-per-epoch>|<sorted-scopes>`.
+   - Deterministic `dac-id` computed via SHA-256 of canonical string; signed by anchor cold key.
+   - Strict verification enforcing non-identical keys, agent pubkey matching, epoch validity window, revocation lists, permitted scopes, and anchor signature integrity.
+   - Anchor revocation mechanism (`create-dac-revocation` and `verify-dac-revocation`) invalidates delegated certificates deterministically.
+
+4. **Wire Handshake & Mesh Ingress Enforcement**:
+   - Channel offers (`offer`) attach active DACs; callee verifies DAC on incoming `:channel-offer`, rejecting invalid/expired/revoked certificates fail-closed and surfacing verified anchor key on `"offer-received"` events.
+   - Mesh ingress boundary (`unwrap-authenticated-agent-event`) validates attached envelope DACs against agent identity and epoch, failing closed on signature or validity failure.
+   - Verified directory descriptors are cached in `:directory-cache` without mutating local `:petnames`, maintaining sovereign separation between global directory namespaces and local petnames.
+
+

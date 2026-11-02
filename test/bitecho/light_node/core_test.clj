@@ -1061,4 +1061,411 @@
                                       (= pk (light-core/petname->pubkey final-st pn))))
                                pnames)))))
 
+;; -----------------------------------------------------------------------------
+;; Directory-Signed Attestation & DAC Delegation Tests (Milestone 2 - Step 2B)
+;; -----------------------------------------------------------------------------
+
+(deftest test-directory-signed-attestation-and-pop
+  (let [agent-id (test-identity)
+        agent-pub (:pubkey-hex agent-id)
+        agent-priv (:privkey-bytes agent-id)
+        dir-id (test-identity)
+        dir-pub (:pubkey-hex dir-id)
+        dir-priv (:privkey-bytes dir-id)
+        prev-id (test-identity)
+        prev-pub (:pubkey-hex prev-id)
+        prev-priv (:privkey-bytes prev-id)]
+
+    (testing "1. Proof-of-Possession creation and verification"
+      (let [pop-data {:domain "bitecho.org"
+                      :nickname "agent-smith"
+                      :pubkey agent-pub
+                      :home-set ["node1" "node2"]
+                      :epoch 5}
+            pop (light-core/create-directory-pop agent-priv pop-data)]
+        (is (= true (light-core/verify-directory-pop pop)))
+        (is (= "agent-smith" (:nickname pop)))
+        (is (= agent-pub (:pubkey pop)))
+        (is (= ["node1" "node2"] (:home-set pop)))
+        (is (= 5 (:epoch pop)))
+        (is (string? (:pop-signature pop)))
+
+        ;; Tampered signature fails
+        (let [tampered (assoc pop :pop-signature (apply str (repeat 128 "0")))]
+          (is (= false (light-core/verify-directory-pop tampered))))
+
+        ;; Tampered pubkey fails
+        (let [tampered (assoc pop :pubkey prev-pub)]
+          (is (= false (light-core/verify-directory-pop tampered))))
+
+        ;; Invalid nickname fails
+        (let [tampered (assoc pop :nickname "invalid name with spaces")]
+          (is (= false (light-core/verify-directory-pop tampered))))))
+
+    (testing "2. Proof-of-Possession with key rotation continuity"
+      (let [pop-rot-data {:domain "bitecho.org"
+                          :nickname "agent-smith"
+                          :pubkey agent-pub
+                          :home-set ["node1"]
+                          :epoch 10
+                          :prev-pubkey prev-pub
+                          :prev-privkey-bytes prev-priv}
+            pop-rot (light-core/create-directory-pop agent-priv pop-rot-data)]
+        (is (= true (light-core/verify-directory-pop pop-rot)))
+        (is (= prev-pub (:prev-pubkey pop-rot)))
+        (is (string? (:rotation-signature pop-rot)))
+
+        ;; Corrupted rotation signature fails
+        (let [tampered (assoc pop-rot :rotation-signature (apply str (repeat 128 "1")))]
+          (is (= false (light-core/verify-directory-pop tampered))))
+
+        ;; Missing rotation signature when prev-pubkey is set fails
+        (let [tampered (dissoc pop-rot :rotation-signature)]
+          (is (= false (light-core/verify-directory-pop tampered))))
+
+        ;; Rotation to identical pubkey is rejected
+        (is (nil? (light-core/create-directory-pop agent-priv (assoc pop-rot-data :prev-pubkey agent-pub))))))
+
+    (testing "3. Directory descriptor signing and verification"
+      (let [pop (light-core/create-directory-pop agent-priv {:domain "bitecho.org"
+                                                             :nickname "agent-smith"
+                                                             :pubkey agent-pub
+                                                             :home-set ["node1" "node2"]
+                                                             :epoch 5})
+            desc (light-core/sign-directory-descriptor dir-priv dir-pub pop {:mailbox "agent-smith@bitecho.org"
+                                                                             :issued-epoch 5
+                                                                             :expires-epoch 15})]
+        (is (some? desc))
+        (is (= :directory-descriptor (:bitecho/type desc)))
+        (is (= "bitecho.org/agent-smith" (:uri desc)))
+        (is (= dir-pub (:directory-pubkey desc)))
+
+        ;; Successful verification
+        (let [res (light-core/verify-directory-descriptor desc dir-pub 10)]
+          (is (= true (:ok? res)))
+          (is (= desc (:descriptor res))))
+
+        ;; Agent self-signed descriptor (without directory authority signature) is strictly rejected
+        (let [self-signed (light-core/sign-directory-descriptor agent-priv agent-pub pop {:issued-epoch 5 :expires-epoch 15})
+              res-self (light-core/verify-directory-descriptor self-signed dir-pub 10)]
+          (is (= false (:ok? res-self)))
+          (is (= "untrusted-directory-authority" (:error res-self))))
+
+        ;; Forged directory signature rejected
+        (let [tampered (assoc desc :directory-signature (apply str (repeat 128 "a")))
+              res-tamp (light-core/verify-directory-descriptor tampered dir-pub 10)]
+          (is (= false (:ok? res-tamp)))
+          (is (= "invalid-directory-signature" (:error res-tamp))))
+
+        ;; Forged PoP signature rejected
+        (let [tampered (assoc desc :pop-signature (apply str (repeat 128 "b")))
+              res-pop (light-core/verify-directory-descriptor tampered dir-pub 10)]
+          (is (= false (:ok? res-pop)))
+          (is (= "invalid-pop-signature" (:error res-pop))))
+
+        ;; Expired descriptor rejected
+        (let [res-exp (light-core/verify-directory-descriptor desc dir-pub 20)]
+          (is (= false (:ok? res-exp)))
+          (is (= "descriptor-expired" (:error res-exp))))
+
+        ;; Future issued epoch (> current + 2) rejected
+        (let [res-fut (light-core/verify-directory-descriptor desc dir-pub 2)]
+          (is (= false (:ok? res-fut)))
+          (is (= "descriptor-future-epoch" (:error res-fut))))))))
+
+(deftest test-dac-creation-revocation-and-commands
+  (let [anchor-id (test-identity)
+        anchor-pub (:pubkey-hex anchor-id)
+        anchor-priv (:privkey-bytes anchor-id)
+        agent-id (test-identity)
+        agent-pub (:pubkey-hex agent-id)
+        agent-priv (:privkey-bytes agent-id)
+        callee-id (test-identity)
+        callee-pub (:pubkey-hex callee-id)
+        callee-priv (:privkey-bytes callee-id)
+        dir-id (test-identity)
+        dir-pub (:pubkey-hex dir-id)
+        dir-priv (:privkey-bytes dir-id)
+        init-st (light-core/init-light-state (:identity agent-id) {:epoch 10 :bootstrap {:custody-pubkey dir-pub}})]
+
+    (testing "1. DAC creation, verification, and revocation"
+      (let [dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                    :agent-pubkey agent-pub
+                                                    :issued-epoch 10
+                                                    :expires-epoch 20
+                                                    :max-spend-per-epoch 100000
+                                                    :scopes ["gossip" "offer" "settle-intent" "transfer"]})]
+        (is (= :dac (:bitecho/type dac)))
+        (is (string? (:dac-id dac)))
+        (is (= anchor-pub (:anchor-pubkey dac)))
+        (is (= agent-pub (:agent-pubkey dac)))
+
+        ;; Valid DAC
+        (let [v (light-core/verify-dac dac {:expected-agent-pubkey agent-pub
+                                            :current-epoch 15})]
+          (is (= true (:ok? v)))
+          (is (= (:dac-id dac) (:dac-id v)))
+          (is (= anchor-pub (:anchor-pubkey v))))
+
+        ;; Agent mismatch
+        (let [v (light-core/verify-dac dac {:expected-agent-pubkey callee-pub
+                                            :current-epoch 15})]
+          (is (= false (:ok? v)))
+          (is (= "dac-agent-mismatch" (:error v))))
+
+        ;; Scope enforcement
+        (let [v-ok (light-core/verify-dac dac {:required-scope "offer" :current-epoch 15})
+              v-no (light-core/verify-dac dac {:required-scope "admin" :current-epoch 15})]
+          (is (= true (:ok? v-ok)))
+          (is (= false (:ok? v-no)))
+          (is (= "dac-scope-not-permitted" (:error v-no))))
+
+        ;; Expiry enforcement
+        (let [v-exp (light-core/verify-dac dac {:current-epoch 25})]
+          (is (= false (:ok? v-exp)))
+          (is (= "dac-expired" (:error v-exp))))
+
+        ;; Future epoch enforcement
+        (let [v-fut (light-core/verify-dac dac {:current-epoch 5})]
+          (is (= false (:ok? v-fut)))
+          (is (= "dac-future-epoch" (:error v-fut))))
+
+        ;; Signature tampering
+        (let [tampered (assoc dac :signature (apply str (repeat 128 "0")))
+              v (light-core/verify-dac tampered {:current-epoch 15})]
+          (is (= false (:ok? v)))
+          (is (= "invalid-dac-signature" (:error v))))
+
+        ;; Revocation
+        (let [rev (light-core/create-dac-revocation anchor-priv {:anchor-pubkey anchor-pub
+                                                                 :agent-pubkey agent-pub
+                                                                 :dac-id (:dac-id dac)
+                                                                 :revoked-epoch 12})]
+          (is (= true (light-core/verify-dac-revocation rev)))
+          (let [tampered-rev (assoc rev :signature (apply str (repeat 128 "0")))]
+            (is (= false (light-core/verify-dac-revocation tampered-rev))))
+          (let [v-rev (light-core/verify-dac dac {:revoked-dac-ids #{(:dac-id dac)} :current-epoch 15})]
+            (is (= false (:ok? v-rev)))
+            (is (= "dac-revoked" (:error v-rev)))))))
+
+    (testing "2. Light-node commands: dac-attach, dac-revoke, directory-verify"
+      (let [dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                    :agent-pubkey agent-pub
+                                                    :issued-epoch 10
+                                                    :expires-epoch 30
+                                                    :max-spend-per-epoch 50000})
+            ;; dac-attach
+            attach-res (light-core/handle-command init-st {"cmd" "dac-attach" "dac" dac} agent-priv)
+            st-attached (:state attach-res)]
+        (is (= true (get-in attach-res [:response "ok"])))
+        (is (= (:dac-id dac) (get-in attach-res [:response "dac_id"])))
+        (is (= anchor-pub (get-in attach-res [:response "anchor_pubkey"])))
+
+        ;; status shows attached DAC
+        (let [stat-res (light-core/handle-command st-attached {"cmd" "status"} agent-priv)
+              resp (:response stat-res)]
+          (is (= (:dac-id dac) (get-in resp ["dac" "dac_id"])))
+          (is (= anchor-pub (get-in resp ["dac" "anchor_pubkey"])))
+          (is (= 0 (get resp "revoked_dacs_count"))))
+
+        ;; identity shows attached DAC
+        (let [id-res (light-core/handle-command st-attached {"cmd" "identity"} agent-priv)
+              resp (:response id-res)]
+          (is (= (:dac-id dac) (get-in resp ["dac" "dac_id"])))
+          (is (= anchor-pub (get-in resp ["dac" "anchor_pubkey"]))))
+
+        ;; dac-revoke
+        (let [rev (light-core/create-dac-revocation anchor-priv {:anchor-pubkey anchor-pub
+                                                                 :agent-pubkey agent-pub
+                                                                 :dac-id (:dac-id dac)
+                                                                 :revoked-epoch 11})
+              rev-res (light-core/handle-command st-attached {"cmd" "dac-revoke" "revocation" rev} agent-priv)
+              st-revoked (:state rev-res)]
+          (is (= true (get-in rev-res [:response "ok"])))
+          (is (= true (get-in rev-res [:response "revoked"])))
+          (is (nil? (:dac st-revoked)))
+          (is (= 1 (count (:revoked-dacs st-revoked))))
+
+          ;; Attaching a revoked DAC fails closed
+          (let [re-attach (light-core/handle-command st-revoked {"cmd" "dac-attach" "dac" dac} agent-priv)]
+            (is (= false (get-in re-attach [:response "ok"])))
+            (is (= "dac-revoked" (get-in re-attach [:response "error"])))))))
+
+    (testing "3. directory-verify command and key continuity"
+      (let [pop1 (light-core/create-directory-pop agent-priv {:domain "bitecho.org"
+                                                              :nickname "smith"
+                                                              :pubkey agent-pub
+                                                              :home-set ["node1"]
+                                                              :epoch 10})
+            desc1 (light-core/sign-directory-descriptor dir-priv dir-pub pop1 {:issued-epoch 10 :expires-epoch 30})
+            ver-res (light-core/handle-command init-st {"cmd" "directory-verify"
+                                                        "descriptor" desc1
+                                                        "directory_pubkey" dir-pub}
+                                               agent-priv)
+            st-dir (:state ver-res)]
+        (is (= true (get-in ver-res [:response "ok"])))
+        (is (= "smith" (get-in ver-res [:response "nickname"])))
+        (is (= agent-pub (get-in ver-res [:response "pubkey"])))
+        (is (= 1 (count (:directory-cache st-dir))))
+        (is (empty? (:petnames st-dir)) "directory-verify must NEVER mutate :petnames")
+
+        ;; Key rotation continuity:
+        (let [new-agent (test-identity)
+              new-pub (:pubkey-hex new-agent)
+              new-priv (:privkey-bytes new-agent)
+              ;; 3a. Valid rotation with prev-pubkey
+              pop-rot (light-core/create-directory-pop new-priv {:domain "bitecho.org"
+                                                                 :nickname "smith"
+                                                                 :pubkey new-pub
+                                                                 :home-set ["node1"]
+                                                                 :epoch 11
+                                                                 :prev-pubkey agent-pub
+                                                                 :prev-privkey-bytes agent-priv})
+              desc-rot (light-core/sign-directory-descriptor dir-priv dir-pub pop-rot {:issued-epoch 11 :expires-epoch 40})
+              res-rot (light-core/handle-command st-dir {"cmd" "directory-verify"
+                                                         "descriptor" desc-rot
+                                                         "directory_pubkey" dir-pub}
+                                                 agent-priv)]
+          (is (= true (get-in res-rot [:response "ok"])))
+          (is (= new-pub (get-in res-rot [:response "pubkey"])))
+
+          ;; 3b. Broken key continuity: attempted takeover without matching prev-pubkey fails closed
+          (let [third-agent (test-identity)
+                third-pub (:pubkey-hex third-agent)
+                third-priv (:privkey-bytes third-agent)
+                pop-hijack (light-core/create-directory-pop third-priv {:domain "bitecho.org"
+                                                                        :nickname "smith"
+                                                                        :pubkey third-pub
+                                                                        :home-set ["node1"]
+                                                                        :epoch 11
+                                                                        :prev-pubkey callee-pub
+                                                                        :prev-privkey-bytes callee-priv})
+                desc-hijack (light-core/sign-directory-descriptor dir-priv dir-pub pop-hijack {:issued-epoch 11 :expires-epoch 40})
+                res-hijack (light-core/handle-command st-dir {"cmd" "directory-verify"
+                                                              "descriptor" desc-hijack
+                                                              "directory_pubkey" dir-pub}
+                                                      agent-priv)]
+            (is (= false (get-in res-hijack [:response "ok"])))
+            (is (= "broken-key-continuity" (get-in res-hijack [:response "error"])))))))
+
+    (testing "4. Wire Offer & Mesh Envelope DAC Attachment and Verification"
+      (let [dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                    :agent-pubkey agent-pub
+                                                    :issued-epoch 10
+                                                    :expires-epoch 30
+                                                    :max-spend-per-epoch 50000})
+            st-with-dac (assoc init-st :dac dac)
+            ;; Caller sends offer
+            offer-res (light-core/handle-command st-with-dac {"cmd" "offer" "callee" callee-pub "price" 10 "burn" 500} agent-priv)
+            gossip-env (second (:net-envelopes offer-res))
+            wire-payload (nippy/thaw (get-in gossip-env [:event :message :payload]))]
+        (is (= :channel-offer (:bitecho/type wire-payload)))
+        (is (some? (:dac wire-payload)) "Offer must attach active DAC")
+        (is (= (:dac-id dac) (:dac-id (:dac wire-payload))))
+
+        ;; Callee receives valid wire offer
+        (let [callee-st (light-core/init-light-state (:identity callee-id) {:epoch 10})
+              recv-res (light-core/handle-wire-payload callee-st wire-payload callee-priv)
+              ev (first (:stdout-events recv-res))]
+          (is (= "offer-received" (get ev "event")))
+          (is (= anchor-pub (get ev "anchor_pubkey")))
+          (is (= (:dac-id dac) (get ev "dac_id")))
+          (is (some? (:dac (get-in recv-res [:state :pending-offers (:session-id wire-payload)])))))
+
+        ;; Callee drops wire offer if DAC is forged or revoked
+        (let [tampered-payload (assoc-in wire-payload [:dac :signature] (apply str (repeat 128 "0")))
+              callee-st (light-core/init-light-state (:identity callee-id) {:epoch 10})
+              recv-bad (light-core/handle-wire-payload callee-st tampered-payload callee-priv)]
+          (is (empty? (:stdout-events recv-bad)))
+          (is (empty? (get-in recv-bad [:state :pending-offers]))))
+
+        ;; Mesh agent event envelope with DAC
+        (let [event {:type :settle-intent :payer agent-pub :receiver callee-pub :amount 100 :epoch 10}
+              wrapped (mesh/wrap-agent-event event agent-pub agent-priv dac)
+              unwrapped (mesh/unwrap-authenticated-agent-event wrapped)]
+          (is (some? unwrapped))
+          (is (= agent-pub (:sender unwrapped)))
+          (is (= (:dac-id dac) (get-in unwrapped [:dac :dac-id]))))
+
+        ;; Mesh drops envelope if DAC is expired or invalid
+        (let [bad-event {:type :settle-intent :payer agent-pub :receiver callee-pub :amount 100 :epoch 10}
+              bad-wrapped (assoc (mesh/wrap-agent-event bad-event agent-pub agent-priv dac)
+                                 :dac (assoc dac :signature (apply str (repeat 128 "0"))))
+              unwrapped-bad (mesh/unwrap-authenticated-agent-event bad-wrapped)]
+          (is (nil? unwrapped-bad)))))))
+
+(defspec ^{:doc "Property: Directory attestation PoP & authority security, key rotation continuity, and DAC delegation invariants"}
+  prop-directory-attestation-and-dac-security-invariants 50
+  (prop/for-all [nick-suffix (gen/elements ["alpha" "bravo" "charlie" "delta" "echo" "foxtrot"])
+                 epoch (gen/choose 1 100)
+                 validity-span (gen/choose 5 50)
+                 max-spend (gen/choose 100 100000)]
+                (let [agent-id (test-identity)
+                      agent-pub (:pubkey-hex agent-id)
+                      agent-priv (:privkey-bytes agent-id)
+                      dir-id (test-identity)
+                      dir-pub (:pubkey-hex dir-id)
+                      dir-priv (:privkey-bytes dir-id)
+                      anchor-id (test-identity)
+                      anchor-pub (:pubkey-hex anchor-id)
+                      anchor-priv (:privkey-bytes anchor-id)
+                      prev-id (test-identity)
+                      prev-pub (:pubkey-hex prev-id)
+                      prev-priv (:privkey-bytes prev-id)
+                      nick (str "agent-" nick-suffix)
+                      issued-ep (long epoch)
+                      expires-ep (+ issued-ep (long validity-span))
+                      pop (light-core/create-directory-pop agent-priv {:domain "bitecho.org"
+                                                                       :nickname nick
+                                                                       :pubkey agent-pub
+                                                                       :home-set ["node1"]
+                                                                       :epoch issued-ep})
+                      desc (light-core/sign-directory-descriptor dir-priv dir-pub pop {:issued-epoch issued-ep
+                                                                                       :expires-epoch expires-ep})
+                      dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                              :agent-pubkey agent-pub
+                                                              :issued-epoch issued-ep
+                                                              :expires-epoch expires-ep
+                                                              :max-spend-per-epoch max-spend
+                                                              :scopes ["gossip" "offer" "settle-intent" "transfer"]})]
+                  (and
+        ;; Invariant 1: Valid directory descriptor verifies cleanly under trusted authority
+                   (= true (:ok? (light-core/verify-directory-descriptor desc dir-pub issued-ep)))
+
+        ;; Invariant 2: Self-signed descriptor without directory authority signature fails closed
+                   (let [self-desc (light-core/sign-directory-descriptor agent-priv agent-pub pop {:issued-epoch issued-ep :expires-epoch expires-ep})
+                         v (light-core/verify-directory-descriptor self-desc dir-pub issued-ep)]
+                     (and (= false (:ok? v))
+                          (or (= "untrusted-directory-authority" (:error v))
+                              (= "invalid-directory-signature" (:error v)))))
+
+        ;; Invariant 3: Descriptor with tampered PoP fails closed
+                   (let [bad-pop-desc (assoc desc :pop-signature (apply str (repeat 128 "0")))
+                         v (light-core/verify-directory-descriptor bad-pop-desc dir-pub issued-ep)]
+                     (and (= false (:ok? v))
+                          (= "invalid-pop-signature" (:error v))))
+
+        ;; Invariant 4: Key rotation continuity
+                   (let [rot-pop (light-core/create-directory-pop agent-priv {:domain "bitecho.org"
+                                                                              :nickname nick
+                                                                              :pubkey agent-pub
+                                                                              :home-set ["node1"]
+                                                                              :epoch issued-ep
+                                                                              :prev-pubkey prev-pub
+                                                                              :prev-privkey-bytes prev-priv})
+                         rot-desc (light-core/sign-directory-descriptor dir-priv dir-pub rot-pop {:issued-epoch issued-ep :expires-epoch expires-ep})
+                         v-rot (light-core/verify-directory-descriptor rot-desc dir-pub issued-ep)]
+                     (and (= true (:ok? v-rot))
+                          (let [tampered-rot (assoc rot-desc :rotation-signature (apply str (repeat 128 "0")))
+                                v-bad-rot (light-core/verify-directory-descriptor tampered-rot dir-pub issued-ep)]
+                            (and (= false (:ok? v-bad-rot))
+                                 (= "invalid-pop-signature" (:error v-bad-rot))))))
+
+        ;; Invariant 5: DAC validity, expiry, and revocation
+                   (= true (:ok? (light-core/verify-dac dac {:expected-agent-pubkey agent-pub :current-epoch issued-ep})))
+                   (= false (:ok? (light-core/verify-dac dac {:current-epoch (+ expires-ep 1)})))
+                   (= "dac-expired" (:error (light-core/verify-dac dac {:current-epoch (+ expires-ep 1)})))
+                   (= false (:ok? (light-core/verify-dac dac {:revoked-dac-ids #{(:dac-id dac)} :current-epoch issued-ep})))
+                   (= "dac-revoked" (:error (light-core/verify-dac dac {:revoked-dac-ids #{(:dac-id dac)} :current-epoch issued-ep})))))))
+
 
