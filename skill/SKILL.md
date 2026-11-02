@@ -564,3 +564,83 @@ Accepts a pending Phase 1 rendezvous offer header, generates callee ephemeral X2
   }
   ```
 
+---
+
+### `lock-intent`
+Locks single-currency `$ECHO` funds into a deterministic verified-outcome escrow with deliverable commitment hash and expiration epoch.
+
+- **CLI**: `clojure -M:light-node lock-intent --receiver <pubkey-or-petname> --amount 1000 --deliverable-hash <64-hex> --expires-epoch 20 [--escrow-id <id>]`
+- **JSONL**: `{"cmd": "lock-intent", "receiver": "bob", "amount": 1000, "deliverable_hash": "<64-hex>", "expires_epoch": 20}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "escrow_id": "escrow-f7a3...",
+    "payer": "<pubkey-hex>",
+    "receiver": "<receiver-pubkey-hex>",
+    "amount": 1000,
+    "deliverable_hash": "<64-hex>",
+    "expires_epoch": 20,
+    "status": "locked"
+  }
+  ```
+
+---
+
+### `release-intent`
+Submits a release request for locked escrow funds via deliverable preimage verification or payer outcome attestation signature. Deducts mandatory 0.5% protocol settlement take.
+
+- **CLI**: `clojure -M:light-node release-intent --escrow-id <id> [--preimage <secret>]`
+- **JSONL**: `{"cmd": "release-intent", "escrow_id": "<id>", "preimage": "secret-deliverable"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "escrow_id": "escrow-f7a3...",
+    "status": "release-submitted"
+  }
+  ```
+
+---
+
+### `refund-intent`
+Submits a timeout refund request for expired escrowed funds (or early receiver voluntary refund) returning 100% of escrowed funds back to the payer.
+
+- **CLI**: `clojure -M:light-node refund-intent --escrow-id <id>`
+- **JSONL**: `{"cmd": "refund-intent", "escrow_id": "<id>"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "escrow_id": "escrow-f7a3...",
+    "status": "refund-submitted"
+  }
+  ```
+
+---
+
+### `escrows`
+Lists all locally tracked escrows enriched with counterparty petnames and status.
+
+- **CLI**: `clojure -M:light-node escrows`
+- **JSONL**: `{"cmd": "escrows"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "escrows": [
+      {
+        "escrow-id": "escrow-f7a3...",
+        "payer": "<pubkey-hex>",
+        "receiver": "<receiver-hex>",
+        "amount": 1000,
+        "deliverable-hash": "<64-hex>",
+        "created-epoch": 5,
+        "expires-epoch": 20,
+        "status": "locked",
+        "receiver_petname": "bob"
+      }
+    ]
+  }
+  ```
+

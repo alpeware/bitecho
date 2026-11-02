@@ -292,5 +292,41 @@ Connects `bitecho.rendezvous.core` Callee-Pays introduction directly into the Ch
    - Callee transitions session state to `"open"`.
    - Inbound queued `:sealed-message` payloads are immediately decrypted and surfaced in Callee's `:inbox`.
 
+### L. Verified-Outcome `$ECHO` Escrow Settlement Primitive (Milestone 3)
+Bitecho is strictly single-currency (`$ECHO`). Milestone 3 implements a pure, deterministic escrow / hash-lock settlement primitive (`bitecho.economy.escrow` + `bitecho.state-machine` + `bitecho.shell.mesh` + `bitecho.light-node.core` + `bitecho.shell.light-node`) enabling agents to lock `$ECHO` against verified deliverables and settle atomically on finalized blocks with protocol settlement take:
+
+1. **Deterministic Escrow Commitment & Identification (`compute-escrow-id`)**:
+   - Canonical escrow string: `bitecho-escrow-v1|<payer>|<receiver>|<amount>|<deliverable-hash>|<created-epoch>|<expires-epoch>|<nonce>`.
+   - Deterministic 64-character SHA-256 hex `escrow-id`.
+   - Deliverable commitment: 64-character hex hash commitment of deliverable/outcome/recipe/code artifact (`valid-deliverable-hash?`).
+
+2. **Escrow Lifecycle & Invariants**:
+   - **`:lock-intent`**:
+     - Locks `$ECHO` amount from payer's balance into `[:escrows escrow-id]`.
+     - Fails closed on self-dealing (`payer == receiver`), non-positive amounts, invalid deliverable hashes, expired epochs (`expires-epoch <= created-epoch`), insufficient payer balance, or duplicate escrow IDs.
+     - In consensus mode, pending `:lock-intent` receipts staged in `:pending-receipts` immediately deduct from payer's `spendable-balance`, preventing unfinalized double-locking.
+   - **`:release-intent`**:
+     - Verified release operates in two supported modes:
+       1. **Payer-Authorized Release**: Payer submits release or receiver supplies Ed25519 `:payer-signature` signed over `bitecho-escrow-release-v1|<escrow-id>|<deliverable-hash>` (`sign-escrow-release` / `verify-escrow-release-sig`).
+       2. **Cryptographic Preimage / Hash-Lock Release**: Receiver submits non-blank `:preimage` whose SHA-256 equals `:deliverable-hash` (`verify-deliverable-preimage`), guarded by `epoch <= expires-epoch`.
+     - Burns mandatory protocol settlement take $\tau = 0.5\%$ (`take-bps = (max 1 configured-bps)`, minimum 1 unit burned for positive amounts via `calculate-escrow-settlement-take`).
+     - Net amount is credited to receiver ledger balance; take is recorded into `[:epoch-settlement-takes closing-epoch]`, feeding trailing revenue $R_{\text{trailing}}$ and demand-gated minting.
+     - Escrow status transitions to `:released`.
+   - **`:refund-intent`**:
+     - Timeout refund after `expires-epoch` (`epoch > expires-epoch`), callable by payer or receiver.
+     - Voluntary early cancellation/refund callable by receiver (`:sender == receiver`).
+     - Refunds 100% of escrow amount back to payer with zero take burned.
+     - Escrow status transitions to `:refunded`.
+   - **Mutual Exclusion & Supply Conservation**:
+     - Escrows settle at most once: once `:released` or `:refunded`, subsequent competing receipts fail closed and never double-credit.
+     - Supply conservation identity holds across all states: $\text{initial\_supply} - \sum \text{released\_takes} = \sum \text{balances} + \sum_{\text{locked}} \text{amount}$.
+
+3. **Light-Node State, DAC Spend Authorization & CLI**:
+   - Commands: `lock-intent`, `release-intent`, `refund-intent`, `escrows`.
+   - `lock-intent` enforces attached DAC spend limits (`check-dac-spend-authorization` with scopes `["lock-intent" "settle" "settle-intent"]` and `:max-spend-per-epoch`).
+   - Counterparty addresses support local petname resolution (`pubkey->petname` and `resolve-counterparty`).
+   - 100% bidirectional CLI and skill parity across all verbs and flags (`--escrow-id`, `--deliverable-hash`, `--expires-epoch`, `--preimage`).
+
+
 
 

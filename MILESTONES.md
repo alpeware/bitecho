@@ -160,7 +160,25 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ---
 
-### Milestone 3: Verified-Outcome `$ECHO` Escrow Settlement Primitive (`lock-intent` / `release-intent` / `refund-intent`) (`master-plan-vision-roadmap.md` (workspace draft) Principles 2 & 3 / M4–M6 Bridge)
+### Milestone 3: Verified-Outcome `$ECHO` Escrow Settlement Primitive (`lock-intent` / `release-intent` / `refund-intent`) (`master-plan-vision-roadmap.md` Principles 2 & 3 / M4–M6 Bridge) — COMPLETED
 
 - Bitecho is strictly single-currency (`$ECHO`) per Simon's architectural decision; multi-currency and cross-currency swap locks are omitted.
-- Implement a pure, deterministic escrow/hash-lock settlement primitive (`lock-intent` / `release-intent` / `refund-intent`) in `bitecho.economy` and `bitecho.state-machine` with the mandatory $\tau = 0.5\%$ settlement take burned upon verified outcome release and deterministic timeout refund, enabling two agents (e.g., Antigravity and Axiom) to lock `$ECHO` against a verified deliverable (commit/recipe/proof hash) and settle atomically on finalized blocks.
+- Implemented a pure, deterministic escrow/hash-lock settlement primitive (`lock-intent` / `release-intent` / `refund-intent`) across `bitecho.economy.escrow`, `bitecho.state-machine`, `bitecho.shell.mesh`, `bitecho.light-node.core`, and `bitecho.shell.light-node` with mandatory $\tau = 0.5\%$ (`50 bps`) settlement take burned upon verified outcome release and deterministic timeout refund:
+1. **Deterministic Escrow Identification (`compute-escrow-id`)**:
+   - Canonical string `bitecho-escrow-v1|<payer>|<receiver>|<amount>|<deliverable-hash>|<created-epoch>|<expires-epoch>|<nonce>` hashed via SHA-256 to 64-character hex ID.
+   - Deliverable commitments verified via `valid-deliverable-hash?` and `verify-deliverable-preimage`.
+2. **Deterministic Lifecycle & Supply Conservation Invariants**:
+   - `:lock-intent` deducts amount from payer balance and creates locked escrow. In consensus mode, staged lock intents immediately deduct from payer's `spendable-balance` to prevent unfinalized double-locking.
+   - `:release-intent` verifies outcome via cryptographic preimage match or Ed25519 outcome attestation signature (`verify-escrow-release-sig`), burns 0.5% protocol take (minimum 1 unit burned for positive amounts), and credits net amount to receiver ledger balance.
+   - `:refund-intent` executes timeout refund (or receiver voluntary refund) returning 100% of escrowed funds back to payer with zero take burned.
+   - Idempotent execution: no escrow can be settled twice or both released and refunded; competing duplicate receipts fail closed.
+   - Supply conservation invariant verified: $\text{initial\_supply} - \sum \text{released\_takes} = \sum \text{balances} + \sum_{\text{locked}} \text{amount}$.
+3. **Light-Node Commands, DAC Spend Authorization & CLI Parity**:
+   - Light-node commands: `lock-intent`, `release-intent`, `refund-intent`, `escrows`.
+   - Attached DACs enforce `:max-spend-per-epoch` limits under scope `"lock-intent"`.
+   - 100% bidirectional CLI verbs and flags inventory parity in `test-cli-and-skill-flag-inventory` (29 verbs, 37 flags including `--escrow-id`, `--deliverable-hash`, `--expires-epoch`, `--preimage`).
+4. **Generative Property & Quality Verification (Rules 1, 3, 6)**:
+   - `test/bitecho/economy/escrow_test.clj`: unit tests and `prop-escrow-release-signature-roundtrip`.
+   - `test/bitecho/state_machine_test.clj`: 50-run generative property `prop-escrow-conservation-and-no-double-settlement`, fail-closed guards, and consensus block finalization tests.
+   - `test/bitecho/light_node/core_test.clj`: `test-light-node-escrow-commands-and-dac-enforcement`.
+

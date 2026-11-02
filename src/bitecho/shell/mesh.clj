@@ -7,6 +7,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.economy.escrow :as escrow]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.core :as core]
             [bitecho.shell.identity :as identity]
@@ -83,7 +84,10 @@
     :receive-offer-header
     :on-deliver
     :submit-vouchers
-    :settle-intent})
+    :settle-intent
+    :lock-intent
+    :release-intent
+    :refund-intent})
 
 (defn canonicalize-for-signing
   "Recursively converts a data structure into a content-deterministic
@@ -187,6 +191,56 @@
                          (dissoc :sender :sender-pubkey-bytes :rng)
                          (assoc :sender agent-pub-hex
                                 :payer agent-pub-hex
+                                :sender-pubkey-bytes agent-pub-bytes
+                                :rng (java.util.Random.)))))
+
+                 :lock-intent
+                 (let [payer (:payer base-event)
+                       receiver (:receiver base-event)
+                       amount (:amount base-event)
+                       deliverable-hash (:deliverable-hash base-event)
+                       expires-epoch (:expires-epoch base-event)
+                       created-epoch (or (:created-epoch base-event) (:epoch base-event) 0)]
+                   (when (and (or (nil? payer) (= payer agent-pub-hex))
+                              (string? receiver)
+                              (not (str/blank? receiver))
+                              (not= agent-pub-hex receiver)
+                              (integer? amount)
+                              (pos? amount)
+                              (string? deliverable-hash)
+                              (escrow/valid-deliverable-hash? deliverable-hash)
+                              (integer? expires-epoch)
+                              (integer? created-epoch)
+                              (> expires-epoch created-epoch))
+                     (-> base-event
+                         (dissoc :sender :sender-pubkey-bytes :rng)
+                         (assoc :sender agent-pub-hex
+                                :payer agent-pub-hex
+                                :created-epoch created-epoch
+                                :sender-pubkey-bytes agent-pub-bytes
+                                :rng (java.util.Random.)))))
+
+                 :release-intent
+                 (let [escrow-id (:escrow-id base-event)
+                       preimage (:preimage base-event)
+                       payer-sig (:payer-signature base-event)]
+                   (when (and (string? escrow-id)
+                              (not (str/blank? escrow-id))
+                              (or (nil? preimage) (string? preimage))
+                              (or (nil? payer-sig) (string? payer-sig)))
+                     (-> base-event
+                         (dissoc :sender :sender-pubkey-bytes :rng)
+                         (assoc :sender agent-pub-hex
+                                :sender-pubkey-bytes agent-pub-bytes
+                                :rng (java.util.Random.)))))
+
+                 :refund-intent
+                 (let [escrow-id (:escrow-id base-event)]
+                   (when (and (string? escrow-id)
+                              (not (str/blank? escrow-id)))
+                     (-> base-event
+                         (dissoc :sender :sender-pubkey-bytes :rng)
+                         (assoc :sender agent-pub-hex
                                 :sender-pubkey-bytes agent-pub-bytes
                                 :rng (java.util.Random.)))))
 

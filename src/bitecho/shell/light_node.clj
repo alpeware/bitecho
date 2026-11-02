@@ -155,6 +155,31 @@
                                     "recipient" (or (extract-flag-value args "--receiver" nil)
                                                     (extract-flag-value args "--recipient" nil))
                                     "amount" (extract-long-flag args "--amount" 0)}
+                   "lock-intent" (let [recv (or (extract-flag-value args "--receiver" nil)
+                                                (extract-flag-value args "--recipient" nil)
+                                                (extract-flag-value args "--to" nil))
+                                       amt (extract-long-flag args "--amount" nil)
+                                       dh (extract-flag-value args "--deliverable-hash" nil)
+                                       ep (extract-long-flag args "--expires-epoch" nil)
+                                       eid (extract-flag-value args "--escrow-id" nil)
+                                       m {"cmd" "lock-intent"}]
+                                   (cond-> m
+                                     recv (assoc "receiver" recv "recipient" recv)
+                                     amt (assoc "amount" amt)
+                                     dh (assoc "deliverable_hash" dh)
+                                     ep (assoc "expires_epoch" ep)
+                                     eid (assoc "escrow_id" eid)))
+                   "release-intent" (let [eid (extract-flag-value args "--escrow-id" nil)
+                                          pre (extract-flag-value args "--preimage" nil)
+                                          m {"cmd" "release-intent"}]
+                                      (cond-> m
+                                        eid (assoc "escrow_id" eid)
+                                        pre (assoc "preimage" pre)))
+                   "refund-intent" (let [eid (extract-flag-value args "--escrow-id" nil)
+                                         m {"cmd" "refund-intent"}]
+                                     (cond-> m
+                                       eid (assoc "escrow_id" eid)))
+                   "escrows" {"cmd" "escrows"}
                    "submit-vouchers" {"cmd" "submit-vouchers"}
                    "petname-set" {"cmd" "petname-set"
                                   "petname" (extract-flag-value args "--petname" nil)

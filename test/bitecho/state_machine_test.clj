@@ -6,6 +6,7 @@
             [bitecho.economy.account :as account]
             [bitecho.economy.attestation :as attestation]
             [bitecho.economy.burn :as burn]
+            [bitecho.economy.escrow :as escrow]
             [bitecho.economy.treasury :as treasury]
             [bitecho.rendezvous.core :as rdv]
             [bitecho.sieve.core :as sieve]
@@ -3681,5 +3682,254 @@
                        (= 1 (get-in final-s0 [:fault-strikes faulty-pub]))
                        (= 1 (get-in final-s1 [:fault-strikes faulty-pub]))
                        (= 1 (get-in final-s2 [:fault-strikes faulty-pub]))))))
+
+(defspec ^{:doc "Property: Escrow operations strictly conserve supply (initial_supply - released_takes = balances + locked_escrows) and prevent double-settlement across both standalone and Streamlet consensus."}
+  prop-escrow-conservation-and-no-double-settlement 50
+  (prop/for-all [initial-alice-bal (gen/choose 10000 50000)
+                 escrow-amt-1 (gen/choose 100 2000)
+                 escrow-amt-2 (gen/choose 100 2000)
+                 take-bps (gen/choose 10 100)
+                 secret-1 gen/string-alphanumeric
+                 secret-2 gen/string-alphanumeric]
+                (let [alice-kp (crypto/generate-keypair)
+                      alice-pub (basalt/bytes->hex (:public alice-kp))
+                      bob-kp (crypto/generate-keypair)
+                      bob-pub (basalt/bytes->hex (:public bob-kp))
+                      d-hash-1 (basalt/bytes->hex (crypto/sha256 (.getBytes (str secret-1) "UTF-8")))
+                      d-hash-2 (basalt/bytes->hex (crypto/sha256 (.getBytes (str secret-2) "UTF-8")))
+                      cfg (assoc config/default-config
+                                 :settlement-take-bps take-bps
+                                 :genesis-ledger {alice-pub (account/map->AccountState {:balance initial-alice-bal :seq 0 :deps []})
+                                                  bob-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})})
+          ;; Standalone test:
+                      s0 (assoc (sm/init-state [] alice-pub cfg) :epoch 0)
+          ;; Lock 1
+                      eid1 (escrow/compute-escrow-id alice-pub bob-pub escrow-amt-1 d-hash-1 0 10 "1")
+                      res-l1 (sm/handle-event s0 {:type :lock-intent
+                                                  :escrow-id eid1
+                                                  :payer alice-pub
+                                                  :receiver bob-pub
+                                                  :amount escrow-amt-1
+                                                  :deliverable-hash d-hash-1
+                                                  :created-epoch 0
+                                                  :expires-epoch 10
+                                                  :sender alice-pub})
+                      s1 (:state res-l1)
+          ;; Lock 2
+                      eid2 (escrow/compute-escrow-id alice-pub bob-pub escrow-amt-2 d-hash-2 0 5 "2")
+                      res-l2 (sm/handle-event s1 {:type :lock-intent
+                                                  :escrow-id eid2
+                                                  :payer alice-pub
+                                                  :receiver bob-pub
+                                                  :amount escrow-amt-2
+                                                  :deliverable-hash d-hash-2
+                                                  :created-epoch 0
+                                                  :expires-epoch 5
+                                                  :sender alice-pub})
+                      s2 (:state res-l2)
+          ;; Release 1 with preimage
+                      res-r1 (sm/handle-event s2 {:type :release-intent
+                                                  :escrow-id eid1
+                                                  :preimage (str secret-1)
+                                                  :sender bob-pub
+                                                  :epoch 2})
+                      s3 (:state res-r1)
+                      take-1 (escrow/calculate-escrow-settlement-take escrow-amt-1 take-bps)
+                      net-1 (- escrow-amt-1 take-1)
+          ;; Try invalid preimage release on eid2 -> fails closed
+                      res-bad-pre (sm/handle-event s3 {:type :release-intent
+                                                       :escrow-id eid2
+                                                       :preimage "wrong"
+                                                       :sender bob-pub
+                                                       :epoch 2})
+          ;; Try premature refund on eid2 -> fails closed (epoch 2 <= expires-epoch 5, sender is alice)
+                      res-bad-ref (sm/handle-event (:state res-bad-pre) {:type :refund-intent
+                                                                         :escrow-id eid2
+                                                                         :sender alice-pub
+                                                                         :epoch 2})
+          ;; Valid timeout refund on eid2 at epoch 6
+                      res-ref (sm/handle-event (:state res-bad-ref) {:type :refund-intent
+                                                                     :escrow-id eid2
+                                                                     :sender alice-pub
+                                                                     :epoch 6})
+                      s4 (:state res-ref)
+          ;; Try duplicate release on eid1 -> fails closed
+                      res-dup-rel (sm/handle-event s4 {:type :release-intent
+                                                       :escrow-id eid1
+                                                       :preimage (str secret-1)
+                                                       :sender bob-pub
+                                                       :epoch 7})
+          ;; Try refund on released eid1 -> fails closed
+                      res-dup-ref (sm/handle-event (:state res-dup-rel) {:type :refund-intent
+                                                                         :escrow-id eid1
+                                                                         :sender alice-pub
+                                                                         :epoch 15})
+                      final-st (:state res-dup-ref)
+                      final-alice (or (:balance (get-in final-st [:ledger alice-pub])) 0)
+                      final-bob (or (:balance (get-in final-st [:ledger bob-pub])) 0)
+                      final-takes (reduce + 0 (vals (:epoch-settlement-takes final-st)))]
+                  (and
+        ;; Invariant 1: Total supply conservation
+        ;; initial_alice = final_alice + final_bob + final_takes
+                   (= initial-alice-bal (+ final-alice final-bob final-takes))
+                   (= take-1 final-takes)
+                   (= net-1 final-bob)
+                   (= (- initial-alice-bal escrow-amt-1) final-alice)
+        ;; Invariant 2: Escrow 1 is released, Escrow 2 is refunded
+                   (= :released (:status (get-in final-st [:escrows eid1])))
+                   (= :refunded (:status (get-in final-st [:escrows eid2])))
+                   (contains? (:settled-escrow-ids final-st) eid1)
+                   (contains? (:settled-escrow-ids final-st) eid2)))))
+
+(deftest test-escrow-unit-fail-closed-guards
+  (testing "Escrow fail-closed guards on sender spoofing, self-dealing, invalid hashes, amounts, and dates"
+    (let [alice-kp (crypto/generate-keypair)
+          alice-pub (basalt/bytes->hex (:public alice-kp))
+          bob-kp (crypto/generate-keypair)
+          bob-pub (basalt/bytes->hex (:public bob-kp))
+          d-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          cfg (assoc config/default-config
+                     :genesis-ledger {alice-pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                                      bob-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})})
+          st (assoc (sm/init-state [] alice-pub cfg) :epoch 1)]
+
+      ;; 1. Sender spoofing on lock-intent fails closed
+      (let [res (sm/handle-event st {:type :lock-intent
+                                     :payer alice-pub
+                                     :receiver bob-pub
+                                     :amount 500
+                                     :deliverable-hash d-hash
+                                     :expires-epoch 10
+                                     :sender bob-pub})]
+        (is (= st (:state res))))
+
+      ;; 2. Self-dealing (payer == receiver) fails closed
+      (let [res (sm/handle-event st {:type :lock-intent
+                                     :payer alice-pub
+                                     :receiver alice-pub
+                                     :amount 500
+                                     :deliverable-hash d-hash
+                                     :expires-epoch 10
+                                     :sender alice-pub})]
+        (is (= st (:state res))))
+
+      ;; 3. Invalid deliverable-hash fails closed
+      (let [res (sm/handle-event st {:type :lock-intent
+                                     :payer alice-pub
+                                     :receiver bob-pub
+                                     :amount 500
+                                     :deliverable-hash "not-hex-64"
+                                     :expires-epoch 10
+                                     :sender alice-pub})]
+        (is (= st (:state res))))
+
+      ;; 4. Non-positive or non-integer amount fails closed
+      (let [res-zero (sm/handle-event st {:type :lock-intent :payer alice-pub :receiver bob-pub :amount 0 :deliverable-hash d-hash :expires-epoch 10})
+            res-neg (sm/handle-event st {:type :lock-intent :payer alice-pub :receiver bob-pub :amount -100 :deliverable-hash d-hash :expires-epoch 10})
+            res-float (sm/handle-event st {:type :lock-intent :payer alice-pub :receiver bob-pub :amount 50.5 :deliverable-hash d-hash :expires-epoch 10})]
+        (is (= st (:state res-zero)))
+        (is (= st (:state res-neg)))
+        (is (= st (:state res-float))))
+
+      ;; 5. Insufficient balance fails closed
+      (let [res (sm/handle-event st {:type :lock-intent :payer alice-pub :receiver bob-pub :amount 5000 :deliverable-hash d-hash :expires-epoch 10})]
+        (is (= st (:state res))))
+
+      ;; 6. Voluntary receiver early refund succeeds before timeout
+      (let [eid (escrow/compute-escrow-id alice-pub bob-pub 500 d-hash 1 10 "1")
+            locked-st (:state (sm/handle-event st {:type :lock-intent
+                                                   :escrow-id eid
+                                                   :payer alice-pub
+                                                   :receiver bob-pub
+                                                   :amount 500
+                                                   :deliverable-hash d-hash
+                                                   :expires-epoch 10
+                                                   :sender alice-pub}))
+            refund-res (sm/handle-event locked-st {:type :refund-intent
+                                                   :escrow-id eid
+                                                   :sender bob-pub
+                                                   :epoch 2})]
+        (is (= :refunded (get-in (:state refund-res) [:escrows eid :status])))
+        (is (= 1000 (:balance (get-in (:state refund-res) [:ledger alice-pub])))))
+
+      ;; 7. Payer outcome signature release succeeds
+      (let [eid (escrow/compute-escrow-id alice-pub bob-pub 500 d-hash 1 10 "2")
+            locked-st (:state (sm/handle-event st {:type :lock-intent
+                                                   :escrow-id eid
+                                                   :payer alice-pub
+                                                   :receiver bob-pub
+                                                   :amount 500
+                                                   :deliverable-hash d-hash
+                                                   :expires-epoch 10
+                                                   :sender alice-pub}))
+            payer-sig (escrow/sign-escrow-release (:private alice-kp) eid d-hash)
+            release-res (sm/handle-event locked-st {:type :release-intent
+                                                    :escrow-id eid
+                                                    :payer-signature payer-sig
+                                                    :sender bob-pub
+                                                    :epoch 2})]
+        (is (= :released (get-in (:state release-res) [:escrows eid :status])))
+        (is (pos? (:balance (get-in (:state release-res) [:ledger bob-pub]))))))))
+
+(deftest test-consensus-escrow-streamlet-finalization-and-spendable-balance
+  (testing "Consensus mode: spendable-balance is deducted by pending lock-intent, and finalized blocks apply escrows"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          bob-kp (crypto/generate-keypair)
+          bob-pub (basalt/bytes->hex (:public bob-kp))
+          d-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub (account/map->AccountState {:balance 1000 :seq 0 :deps []})
+                                      bob-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                     :peers-map {pub (:public kp)})
+          s0 (assoc (sm/init-state [] pub (assoc cfg :keypair kp)) :epoch 1)
+          eid (escrow/compute-escrow-id pub bob-pub 400 d-hash 1 10 "c1")
+          lock-res (sm/handle-event s0 {:type :lock-intent
+                                        :escrow-id eid
+                                        :payer pub
+                                        :receiver bob-pub
+                                        :amount 400
+                                        :deliverable-hash d-hash
+                                        :expires-epoch 10
+                                        :sender pub})
+          s1 (:state lock-res)]
+      ;; 1. Pending receipt stages cleanly and spendable-balance is reduced
+      (is (= 1 (count (:pending-receipts s1))))
+      (is (= 600 (sm/spendable-balance s1 pub)))
+      ;; 2. Attempting to lock another 700 fails closed because spendable is only 600
+      (let [bad-lock (sm/handle-event s1 {:type :lock-intent
+                                          :payer pub
+                                          :receiver bob-pub
+                                          :amount 700
+                                          :deliverable-hash d-hash
+                                          :expires-epoch 10
+                                          :sender pub})]
+        (is (= 1 (count (:pending-receipts (:state bad-lock))))))
+      ;; 3. Execute block with lock receipt
+      (let [lock-receipt (first (:pending-receipts s1))
+            block {:epoch 2 :parent-hash "genesis" :payload [lock-receipt]}
+            s-after-block (sm/execute-finalized-blocks (assoc s1 :finalized-blocks #{(streamlet/hash-block block)}
+                                                              :blocks {(streamlet/hash-block block) block}
+                                                              :head-hash (streamlet/hash-block block)))]
+        (is (= 600 (:balance (get-in s-after-block [:ledger pub]))))
+        (is (= :locked (get-in s-after-block [:escrows eid :status])))
+        ;; 4. Execute block with release receipt
+        (let [payer-sig (escrow/sign-escrow-release (:private kp) eid d-hash)
+              release-receipt {:receipt-id (str "release:" eid)
+                               :type :release-intent
+                               :escrow-id eid
+                               :payer-signature payer-sig
+                               :sender bob-pub}
+              block2 {:epoch 3 :parent-hash (streamlet/hash-block block) :payload [release-receipt]}
+              s-after-rel (sm/execute-finalized-blocks (assoc s-after-block
+                                                              :finalized-blocks #{(streamlet/hash-block block)
+                                                                                  (streamlet/hash-block block2)}
+                                                              :blocks {(streamlet/hash-block block) block
+                                                                       (streamlet/hash-block block2) block2}
+                                                              :head-hash (streamlet/hash-block block2)))]
+          (is (= :released (get-in s-after-rel [:escrows eid :status])))
+          (is (= 398 (:balance (get-in s-after-rel [:ledger bob-pub])))) ;; 400 - 2 (50 bps take) = 398
+          (is (= 2 (get-in s-after-rel [:epoch-settlement-takes 2]))))))))
+
 
 

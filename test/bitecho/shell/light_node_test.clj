@@ -1237,14 +1237,16 @@
                  "account" "sync-account" "settle-intent" "submit-vouchers"
                  "petname-set" "petname-list" "petname-remove" "petname-resolve"
                  "dac-attach" "dac-revoke" "directory-verify"
-                 "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"]
+                 "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"
+                 "lock-intent" "release-intent" "refund-intent" "escrows"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
                   "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"
                   "--petname" "--pubkey" "--overwrite" "--directory-pubkey"
                   "--min-burn" "--allowlist" "--auto-accept" "--topic" "--to"
-                  "--offer-hash" "--from"}]
+                  "--offer-hash" "--from"
+                  "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1277,7 +1279,15 @@
       (is (= "dac-attach" (get-in (light-shell/parse-light-node-args ["dac-attach"]) [:cmd-map "cmd"])))
       (is (= "dac-revoke" (get-in (light-shell/parse-light-node-args ["dac-revoke"]) [:cmd-map "cmd"])))
       (is (= "directory-verify" (get-in (light-shell/parse-light-node-args ["directory-verify"]) [:cmd-map "cmd"])))
-      ;; Flags (all 33 flags tested end-to-end)
+      (is (= "lock-intent" (get-in (light-shell/parse-light-node-args ["lock-intent" "--receiver" "bob" "--amount" "100" "--deliverable-hash" "beef" "--expires-epoch" "20" "--escrow-id" "e1"]) [:cmd-map "cmd"])))
+      (is (= "release-intent" (get-in (light-shell/parse-light-node-args ["release-intent" "--escrow-id" "e1" "--preimage" "secret"]) [:cmd-map "cmd"])))
+      (is (= "refund-intent" (get-in (light-shell/parse-light-node-args ["refund-intent" "--escrow-id" "e1"]) [:cmd-map "cmd"])))
+      (is (= "escrows" (get-in (light-shell/parse-light-node-args ["escrows"]) [:cmd-map "cmd"])))
+      ;; Flags (all 37 flags tested end-to-end)
+      (is (= "e1" (get-in (light-shell/parse-light-node-args ["lock-intent" "--escrow-id" "e1"]) [:cmd-map "escrow_id"])))
+      (is (= "beef" (get-in (light-shell/parse-light-node-args ["lock-intent" "--deliverable-hash" "beef"]) [:cmd-map "deliverable_hash"])))
+      (is (= 20 (get-in (light-shell/parse-light-node-args ["lock-intent" "--expires-epoch" "20"]) [:cmd-map "expires_epoch"])))
+      (is (= "secret" (get-in (light-shell/parse-light-node-args ["release-intent" "--preimage" "secret"]) [:cmd-map "preimage"])))
       (is (= 100 (get-in (light-shell/parse-light-node-args ["rendezvous-policy" "--min-burn" "100"]) [:cmd-map "min_burn"])))
       (is (= ["alice" "bob"] (get-in (light-shell/parse-light-node-args ["rendezvous-policy" "--allowlist" "alice,bob"]) [:cmd-map "allowlist"])))
       (is (true? (get-in (light-shell/parse-light-node-args ["rendezvous-policy" "--auto-accept"]) [:cmd-map "auto_accept"])))

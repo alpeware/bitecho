@@ -6,6 +6,7 @@
             [bitecho.crypto.sealed :as sealed]
             [bitecho.economy.account :as account]
             [bitecho.economy.burn :as burn]
+            [bitecho.economy.escrow :as escrow]
             [bitecho.light-node.core :as light-core]
             [bitecho.rendezvous.core :as rdv]
             [bitecho.shell.mesh :as mesh]
@@ -2405,5 +2406,121 @@
         (is (= "invalid-numeric-parameter" (get-in res-offer-bad [:response "error"])))
         (is (= false (get-in res-offer-neg [:response "ok"])))
         (is (= "invalid-numeric-parameter" (get-in res-offer-neg [:response "error"])))))))
+
+(deftest test-light-node-escrow-commands-and-dac-enforcement
+  (testing "Light-node escrow commands: lock-intent, release-intent, refund-intent, escrows, and DAC enforcement"
+    (let [agent-id (test-identity)
+          agent-pub (:pubkey-hex agent-id)
+          agent-priv (:privkey-bytes agent-id)
+          peer-id (test-identity)
+          peer-pub (:pubkey-hex peer-id)
+          d-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          s0 (-> (light-core/init-light-state (:identity agent-id) {:epoch 10})
+                 (assoc :petnames {"bob" peer-pub})
+                 (assoc :account {:balance 5000 :spendable 5000 :seq 0}))]
+
+      ;; 1. lock-intent by petname succeeds and creates local escrow
+      (let [res1 (light-core/handle-command s0 {"cmd" "lock-intent"
+                                                "receiver" "bob"
+                                                "amount" "1000"
+                                                "deliverable_hash" d-hash
+                                                "expires_epoch" "20"}
+                                            agent-priv)
+            eid (get-in res1 [:response "escrow_id"])
+            s1 (:state res1)]
+        (is (= true (get-in res1 [:response "ok"])))
+        (is (string? eid))
+        (is (= "locked" (get-in res1 [:response "status"])))
+        (is (= "bob" (get-in res1 [:response "receiver_petname"])))
+        (is (= 4000 (get-in s1 [:account :spendable])))
+        (is (= 1 (count (:net-envelopes res1))))
+        (let [unwrapped (mesh/unwrap-authenticated-agent-event (first (:net-envelopes res1)))]
+          (is (= :lock-intent (:type unwrapped)))
+          (is (= agent-pub (:payer unwrapped)))
+          (is (= peer-pub (:receiver unwrapped))))
+
+        ;; 2. escrows lists the active escrow enriched with petname
+        (let [res-list (light-core/handle-command s1 {"cmd" "escrows"} agent-priv)
+              escrow-list (get-in res-list [:response "escrows"])]
+          (is (= true (get-in res-list [:response "ok"])))
+          (is (= 1 (count escrow-list)))
+          (is (= "bob" (:receiver_petname (first escrow-list)))))
+
+        ;; 3. release-intent auto-signs when local node is payer
+        (let [res-rel (light-core/handle-command s1 {"cmd" "release-intent" "escrow_id" eid} agent-priv)]
+          (is (= true (get-in res-rel [:response "ok"])))
+          (is (= "release-submitted" (get-in res-rel [:response "status"])))
+          (let [unwrapped (mesh/unwrap-authenticated-agent-event (first (:net-envelopes res-rel)))]
+            (is (= :release-intent (:type unwrapped)))
+            (is (string? (:payer-signature unwrapped)))
+            (is (escrow/verify-escrow-release-sig agent-pub eid d-hash (:payer-signature unwrapped)))))
+
+        ;; 4. release-intent with preimage
+        (let [secret "my-deliverable-secret"
+              secret-hash (basalt/bytes->hex (crypto/sha256 (.getBytes secret "UTF-8")))
+              res-pre-lock (light-core/handle-command s0 {"cmd" "lock-intent"
+                                                          "receiver" peer-pub
+                                                          "amount" 500
+                                                          "deliverable_hash" secret-hash
+                                                          "expires_epoch" 25}
+                                                      agent-priv)
+              eid-pre (get-in res-pre-lock [:response "escrow_id"])
+              res-pre-rel (light-core/handle-command (:state res-pre-lock)
+                                                     {"cmd" "release-intent"
+                                                      "escrow_id" eid-pre
+                                                      "preimage" secret}
+                                                     agent-priv)]
+          (is (= true (get-in res-pre-rel [:response "ok"])))
+          (let [unwrapped (mesh/unwrap-authenticated-agent-event (first (:net-envelopes res-pre-rel)))]
+            (is (= secret (:preimage unwrapped)))))
+
+        ;; 5. refund-intent emits refund envelope
+        (let [res-ref (light-core/handle-command s1 {"cmd" "refund-intent" "escrow_id" eid} agent-priv)]
+          (is (= true (get-in res-ref [:response "ok"])))
+          (is (= "refund-submitted" (get-in res-ref [:response "status"])))
+          (let [unwrapped (mesh/unwrap-authenticated-agent-event (first (:net-envelopes res-ref)))]
+            (is (= :refund-intent (:type unwrapped)))
+            (is (= eid (:escrow-id unwrapped))))))
+
+      ;; 6. DAC spend authorization enforcement on lock-intent
+      (let [anchor-id (test-identity)
+            anchor-pub (:pubkey-hex anchor-id)
+            anchor-priv (:privkey-bytes anchor-id)
+            dac (light-core/create-dac anchor-priv {:anchor-pubkey anchor-pub
+                                                    :agent-pubkey agent-pub
+                                                    :issued-epoch 5
+                                                    :expires-epoch 50
+                                                    :max-spend-per-epoch 500
+                                                    :scopes ["lock-intent"]})
+            s-dac (assoc s0 :dac dac)
+            ;; First lock with amount 400 succeeds (spent = 400 <= 500)
+            res-dac-ok (light-core/handle-command s-dac {"cmd" "lock-intent"
+                                                         "receiver" peer-pub
+                                                         "amount" "400"
+                                                         "deliverable_hash" d-hash
+                                                         "expires_epoch" "20"}
+                                                  agent-priv)
+            ;; Second lock with amount 200 exceeds max-spend (400 + 200 = 600 > 500)
+            res-dac-exceeded (light-core/handle-command (:state res-dac-ok)
+                                                        {"cmd" "lock-intent"
+                                                         "receiver" peer-pub
+                                                         "amount" "200"
+                                                         "deliverable_hash" d-hash
+                                                         "expires_epoch" "20"}
+                                                        agent-priv)]
+        (is (= true (get-in res-dac-ok [:response "ok"])))
+        (is (= false (get-in res-dac-exceeded [:response "ok"])))
+        (is (= "dac-max-spend-exceeded" (get-in res-dac-exceeded [:response "error"]))))
+
+      ;; 7. Validation: invalid amount, expires-epoch <= current-epoch, invalid deliverable-hash fail closed
+      (let [res-bad-amt (light-core/handle-command s0 {"cmd" "lock-intent" "receiver" peer-pub "amount" "not-a-number" "deliverable_hash" d-hash "expires_epoch" 20} agent-priv)
+            res-neg-amt (light-core/handle-command s0 {"cmd" "lock-intent" "receiver" peer-pub "amount" -10 "deliverable_hash" d-hash "expires_epoch" 20} agent-priv)
+            res-bad-ep (light-core/handle-command s0 {"cmd" "lock-intent" "receiver" peer-pub "amount" 100 "deliverable_hash" d-hash "expires_epoch" 5} agent-priv)
+            res-bad-dh (light-core/handle-command s0 {"cmd" "lock-intent" "receiver" peer-pub "amount" 100 "deliverable_hash" "bad-hash" "expires_epoch" 20} agent-priv)]
+        (is (= "invalid-amount" (get-in res-bad-amt [:response "error"])))
+        (is (= "invalid-amount" (get-in res-neg-amt [:response "error"])))
+        (is (= "invalid-expires-epoch" (get-in res-bad-ep [:response "error"])))
+        (is (= "invalid-deliverable-hash" (get-in res-bad-dh [:response "error"])))))))
+
 
 

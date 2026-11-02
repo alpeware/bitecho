@@ -7,12 +7,14 @@
             [bitecho.crypto.sealed :as sealed]
             [bitecho.economy.bundle :as bundle]
             [bitecho.economy.burn :as burn]
+            [bitecho.economy.escrow :as escrow]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.mesh :as mesh]
             [clojure.data.json :as json]
             [clojure.string :as str]
-            [taoensso.nippy :as nippy]))
+            [taoensso.nippy :as nippy])
+  (:import (java.nio.charset StandardCharsets)))
 
 ;; -----------------------------------------------------------------------------
 ;; State Initialization
@@ -44,6 +46,7 @@
    :intent-seq 0
    :transfer-seq 0
    :last-transfer-hash nil
+   :escrows {}
    :rendezvous-policy (merge {:auto-accept? false
                               :min-burn 0
                               :price 10
@@ -1518,6 +1521,163 @@
                      :net-envelopes [intent-env]
                      :stdout-events []}))))))))))
 
+(defn- exec-lock-intent [state cmd-map privkey-bytes]
+  (let [raw-receiver (or (get cmd-map "receiver") (get cmd-map "recipient") (get cmd-map "to")
+                         (:receiver cmd-map) (:recipient cmd-map) (:to cmd-map))
+        raw-amount (or (get cmd-map "amount") (:amount cmd-map))
+        amount (when (some? raw-amount) (parse-long-safe raw-amount :invalid))
+        raw-dh (or (get cmd-map "deliverable_hash") (get cmd-map "deliverable-hash")
+                   (:deliverable_hash cmd-map) (:deliverable-hash cmd-map))
+        raw-deliv (or (get cmd-map "deliverable") (:deliverable cmd-map)
+                      (get cmd-map "preimage") (:preimage cmd-map))
+        deliverable-hash (cond
+                           (and (string? raw-dh) (escrow/valid-deliverable-hash? raw-dh)) (escrow/normalize-hex raw-dh)
+                           (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (.getBytes ^String raw-deliv StandardCharsets/UTF_8)))
+                           :else nil)
+        curr-ep (long (or (:epoch state) 0))
+        raw-expires (or (get cmd-map "expires_epoch") (get cmd-map "expires-epoch")
+                        (:expires_epoch cmd-map) (:expires-epoch cmd-map))
+        expires-epoch (if (some? raw-expires) (parse-long-safe raw-expires :invalid) (+ curr-ep 10))]
+    (cond
+      (or (nil? raw-receiver) (and (string? raw-receiver) (str/blank? raw-receiver)))
+      {:state state :response {"ok" false "error" "missing-receiver"} :net-envelopes [] :stdout-events []}
+
+      (or (nil? amount) (= amount :invalid) (<= amount 0))
+      {:state state :response {"ok" false "error" "invalid-amount"} :net-envelopes [] :stdout-events []}
+
+      (nil? deliverable-hash)
+      {:state state :response {"ok" false "error" (if raw-dh "invalid-deliverable-hash" "missing-deliverable-hash")} :net-envelopes [] :stdout-events []}
+
+      (or (= expires-epoch :invalid) (<= expires-epoch curr-ep))
+      {:state state :response {"ok" false "error" "invalid-expires-epoch"} :net-envelopes [] :stdout-events []}
+
+      :else
+      (let [resolved (resolve-counterparty state raw-receiver)]
+        (if-not (:ok? resolved)
+          {:state state :response {"ok" false "error" (:error resolved)} :net-envelopes [] :stdout-events []}
+          (let [receiver-pub (:pubkey resolved)
+                pname (:petname resolved)]
+            (if (= (:pubkey state) receiver-pub)
+              {:state state :response {"ok" false "error" "cannot-escrow-self"} :net-envelopes [] :stdout-events []}
+              (let [dac-auth (check-dac-spend-authorization state amount ["lock-intent" "settle" "settle-intent"])]
+                (if-not (:ok? dac-auth)
+                  {:state state :response {"ok" false "error" (:error dac-auth)} :net-envelopes [] :stdout-events []}
+                  (let [acct (:account state)
+                        spendable (when acct (parse-long-safe (or (:spendable acct) (:balance acct)) 0))]
+                    (if (and acct (< spendable amount))
+                      {:state state :response {"ok" false "error" "insufficient-balance"} :net-envelopes [] :stdout-events []}
+                      (let [raw-eid (or (get cmd-map "escrow_id") (get cmd-map "escrow-id")
+                                        (:escrow_id cmd-map) (:escrow-id cmd-map))
+                            nonce (str (inc (long (count (:escrows state {})))))
+                            escrow-id (or (when (and (string? raw-eid) (not (str/blank? raw-eid))) raw-eid)
+                                          (escrow/compute-escrow-id (:pubkey state) receiver-pub amount deliverable-hash curr-ep expires-epoch nonce))
+                            intent-payload {:type :lock-intent
+                                            :escrow-id escrow-id
+                                            :payer (:pubkey state)
+                                            :receiver receiver-pub
+                                            :amount amount
+                                            :deliverable-hash deliverable-hash
+                                            :created-epoch curr-ep
+                                            :expires-epoch expires-epoch
+                                            :epoch curr-ep
+                                            :receipt-id (str "lock:" escrow-id)}
+                            active-dac (when-let [d (:dac state)]
+                                         (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
+                                                                    :current-epoch curr-ep
+                                                                    :revoked-dac-ids (:revoked-dacs state)}))
+                                           d))
+                            envelope (mesh/wrap-agent-event intent-payload (:pubkey state) privkey-bytes active-dac)
+                            local-escrow {:escrow-id escrow-id
+                                          :payer (:pubkey state)
+                                          :receiver receiver-pub
+                                          :amount amount
+                                          :deliverable-hash deliverable-hash
+                                          :created-epoch curr-ep
+                                          :expires-epoch expires-epoch
+                                          :status :locked}
+                            new-state (cond-> (-> state
+                                                  (assoc-in [:escrows escrow-id] local-escrow)
+                                                  (assoc :dac-spend (:new-dac-spend dac-auth)))
+                                        acct (update-in [:account :spendable] - amount))]
+                        {:state new-state
+                         :response (cond-> {"ok" true
+                                            "escrow_id" escrow-id
+                                            "payer" (:pubkey state)
+                                            "receiver" receiver-pub
+                                            "amount" amount
+                                            "deliverable_hash" deliverable-hash
+                                            "expires_epoch" expires-epoch
+                                            "status" "locked"}
+                                     pname (assoc "receiver_petname" pname))
+                         :net-envelopes [envelope]
+                         :stdout-events []}))))))))))))
+
+(defn- exec-release-intent [state cmd-map privkey-bytes]
+  (let [escrow-id (or (get cmd-map "escrow_id") (get cmd-map "escrow-id")
+                      (:escrow_id cmd-map) (:escrow-id cmd-map))]
+    (if (or (nil? escrow-id) (and (string? escrow-id) (str/blank? escrow-id)))
+      {:state state :response {"ok" false "error" "missing-escrow-id"} :net-envelopes [] :stdout-events []}
+      (let [preimage (or (get cmd-map "preimage") (:preimage cmd-map)
+                         (get cmd-map "deliverable") (:deliverable cmd-map))
+            payer-sig (or (get cmd-map "payer_signature") (get cmd-map "payer-signature")
+                          (:payer_signature cmd-map) (:payer-signature cmd-map))
+            local-escrow (get-in state [:escrows escrow-id])
+            d-hash (or (when local-escrow (:deliverable-hash local-escrow))
+                       (get cmd-map "deliverable_hash") (get cmd-map "deliverable-hash")
+                       (:deliverable_hash cmd-map) (:deliverable-hash cmd-map))
+            final-sig (or payer-sig
+                          (when (and (= (:pubkey state) (when local-escrow (:payer local-escrow)))
+                                     (string? d-hash))
+                            (escrow/sign-escrow-release privkey-bytes escrow-id d-hash)))
+            release-payload (cond-> {:type :release-intent
+                                     :escrow-id escrow-id
+                                     :epoch (:epoch state 0)
+                                     :receipt-id (str "release:" escrow-id)}
+                              preimage (assoc :preimage preimage)
+                              final-sig (assoc :payer-signature final-sig))
+            envelope (mesh/wrap-agent-event release-payload (:pubkey state) privkey-bytes)
+            new-state (if local-escrow
+                        (assoc-in state [:escrows escrow-id :status] :release-submitted)
+                        state)]
+        {:state new-state
+         :response {"ok" true "escrow_id" escrow-id "status" "release-submitted"}
+         :net-envelopes [envelope]
+         :stdout-events []}))))
+
+(defn- exec-refund-intent [state cmd-map privkey-bytes]
+  (let [escrow-id (or (get cmd-map "escrow_id") (get cmd-map "escrow-id")
+                      (:escrow_id cmd-map) (:escrow-id cmd-map))]
+    (if (or (nil? escrow-id) (and (string? escrow-id) (str/blank? escrow-id)))
+      {:state state :response {"ok" false "error" "missing-escrow-id"} :net-envelopes [] :stdout-events []}
+      (let [refund-payload {:type :refund-intent
+                            :escrow-id escrow-id
+                            :epoch (:epoch state 0)
+                            :receipt-id (str "refund:" escrow-id)}
+            envelope (mesh/wrap-agent-event refund-payload (:pubkey state) privkey-bytes)
+            local-escrow (get-in state [:escrows escrow-id])
+            new-state (if local-escrow
+                        (assoc-in state [:escrows escrow-id :status] :refund-submitted)
+                        state)]
+        {:state new-state
+         :response {"ok" true "escrow_id" escrow-id "status" "refund-submitted"}
+         :net-envelopes [envelope]
+         :stdout-events []}))))
+
+(defn- exec-escrows [state]
+  (let [enriched (mapv (fn [[eid esc]]
+                         (let [payer (:payer esc)
+                               receiver (:receiver esc)
+                               payer-pname (when payer (pubkey->petname state payer))
+                               recv-pname (when receiver (pubkey->petname state receiver))]
+                           (cond-> (assoc esc :escrow-id eid)
+                             payer-pname (assoc :payer_petname payer-pname)
+                             recv-pname (assoc :receiver_petname recv-pname))))
+                       (vec (:escrows state {})))]
+    {:state state
+     :response {"ok" true "escrows" enriched}
+     :net-envelopes []
+     :stdout-events []}))
+
 (defn- exec-submit-vouchers [state cmd-map privkey-bytes]
   (let [raw-vouchers (or (get cmd-map "vouchers")
                          (:vouchers cmd-map)
@@ -1775,6 +1935,7 @@
                         "dac" (dac-summary (:dac state))
                         "revoked_dacs_count" (count (:revoked-dacs state #{}))
                         "directory_cache_count" (count (:directory-cache state {}))
+                        "escrows_count" (count (:escrows state {}))
                         "accounting" {"scope" "local-non-consensus"
                                       "note" "Locally computed devnet totals; never consensus finalized"
                                       "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
@@ -1806,6 +1967,10 @@
       "account" (exec-sync-account state effective-map)
       "sync-account" (exec-sync-account state effective-map)
       "settle-intent" (exec-settle-intent state effective-map privkey-bytes)
+      "lock-intent" (exec-lock-intent state effective-map privkey-bytes)
+      "release-intent" (exec-release-intent state effective-map privkey-bytes)
+      "refund-intent" (exec-refund-intent state effective-map privkey-bytes)
+      "escrows" (exec-escrows state)
       "submit-vouchers" (exec-submit-vouchers state effective-map privkey-bytes)
       "petname-set" (exec-petname-set state effective-map)
       "petname-list" (exec-petname-list state)

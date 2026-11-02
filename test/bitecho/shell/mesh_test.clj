@@ -456,6 +456,11 @@
       (doseq [t mesh/allowed-agent-events]
         (let [evt (case t
                     :settle-intent {:type t :payer pub :receiver "302a300506032b6570032100" :amount 100}
+                    :lock-intent {:type t :payer pub :receiver "302a300506032b6570032100" :amount 100
+                                  :deliverable-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                                  :expires-epoch 10 :created-epoch 0}
+                    :release-intent {:type t :escrow-id "escrow-123"}
+                    :refund-intent {:type t :escrow-id "escrow-123"}
                     :on-deliver (let [tf (account/create-transfer priv {:sender pub :receiver "302a300506032b6570032100" :amount 50 :seq 1 :deps []})
                                       p (vec (.getBytes ^String (pr-str {:transfer (into {} tf)}) "UTF-8"))]
                                   {:type t :payload p :message-id "msg-1"})

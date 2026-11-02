@@ -9,6 +9,7 @@
             [bitecho.economy.attestation-test]
             [bitecho.economy.bundle-test]
             [bitecho.economy.burn-test]
+            [bitecho.economy.escrow-test]
             [bitecho.economy.treasury-test]
             [bitecho.light-node.core-test]
             [bitecho.murmur.core-test]
