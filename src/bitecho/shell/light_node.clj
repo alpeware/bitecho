@@ -862,8 +862,13 @@
         needs-net? (seq (:net-envelopes res))]
     (if needs-net?
       (let [currently-live? (connection-live? @conn-atom @state-atom)
+            replay-envs (when (= verb "register-home-set")
+                          (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
+            live-envs (if (seq replay-envs)
+                        (into (vec replay-envs) (:net-envelopes res))
+                        (:net-envelopes res))
             sent? (when currently-live?
-                    (send-all-envelopes! (:send-fn @conn-atom) (:net-envelopes res)))]
+                    (send-all-envelopes! (:send-fn @conn-atom) live-envs))]
         (if sent?
           (do
             (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
