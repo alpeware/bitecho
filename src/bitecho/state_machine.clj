@@ -726,18 +726,45 @@
     {:state state
      :commands commands}))
 
+(defn- peer-pubkey-hex
+  "Normalizes a Peer record, map, hex string, or byte array into a hex pubkey string."
+  [peer]
+  (let [pk (if (map? peer) (:pubkey peer) peer)]
+    (cond
+      (string? pk) pk
+      (bytes? pk) (basalt/bytes->hex pk)
+      :else nil)))
+
+(defn- exclude-self-peers
+  "Filters out any peer entry matching the state's :node-pubkey."
+  [state peers]
+  (if-let [self-hex (peer-pubkey-hex (:node-pubkey state))]
+    (filterv #(not= (peer-pubkey-hex %) self-hex) peers)
+    (vec peers)))
+
+(defn- sanitize-basalt-view
+  "Strips any slot whose :peer matches (:node-pubkey state) by setting :peer to nil."
+  [state view]
+  (if-let [self-hex (peer-pubkey-hex (:node-pubkey state))]
+    (mapv (fn [slot]
+            (if (= (peer-pubkey-hex (:peer slot)) self-hex)
+              (assoc slot :peer nil)
+              slot))
+          view)
+    view))
+
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
   (let [cfg (:config state)
         new-epoch (inc (or (:epoch state) 0))
         epoch-entropy (derive-epoch-entropy state cfg)
-        view (:basalt-view state)
+        view (sanitize-basalt-view state (:basalt-view state))
         rng (:rng event)
         reset-result (basalt/reset-slots-deterministic view epoch-entropy (:node-pubkey state) (:basalt-index state) 1)
-        new-view (:view reset-result)
+        new-view (sanitize-basalt-view state (:view reset-result))
         new-index (:next-r reset-result)
-        extracted-peers (basalt/extract-peers new-view)
+        extracted-peers (exclude-self-peers state (basalt/extract-peers new-view))
         push-targets (basalt/select-peers-deterministic (str epoch-entropy ":push:" new-epoch) (:node-pubkey state) new-view 1)
         push-command (when (seq push-targets)
                        {:type :send-push-view
@@ -855,7 +882,7 @@
               murmur-max-cache-size (:murmur-max-cache-size cfg)
               payload (:payload event)
               rng (:rng event)
-              extracted-peers (basalt/extract-peers (:basalt-view state))
+              extracted-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
               sieve-message (if (and (:private-key event) (:public-key event))
                               (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
                               {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
@@ -908,7 +935,7 @@
               murmur-max-cache-size (:murmur-max-cache-size cfg)
               payload (:payload event)
               rng (:rng event)
-              extracted-peers (basalt/extract-peers (:basalt-view state))
+              extracted-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
               sieve-message (if (and (:private-key event) (:public-key event))
                               (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
                               {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
@@ -966,8 +993,9 @@
 (defn- handle-receive-push-view
   "Handles an incoming Basalt view exchange."
   [state event]
-  (let [received-peers (:view event)
-        new-view (basalt/update-view (:basalt-view state) received-peers)]
+  (let [clean-view (sanitize-basalt-view state (:basalt-view state))
+        received-peers (exclude-self-peers state (:view event))
+        new-view (sanitize-basalt-view state (basalt/update-view clean-view received-peers))]
     {:state (assoc state :basalt-view new-view)
      :commands []}))
 
@@ -1088,7 +1116,12 @@
         valid-burn? (and (number? burn-amt) (>= burn-amt burn/min-signaling-burn))
         valid-signature? (when (and valid-burn? message) (sieve/validate-message message))]
     (if (and (some? msg-id) valid-burn? valid-signature?)
-      (let [extracted-peers (basalt/extract-peers (:basalt-view state))
+      (let [non-self-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
+            hop-sender-hex (peer-pubkey-hex (:sender event))
+            non-sender-peers (if hop-sender-hex
+                               (filterv #(not= (peer-pubkey-hex %) hop-sender-hex) non-self-peers)
+                               non-self-peers)
+            extracted-peers (if (seq non-sender-peers) non-sender-peers non-self-peers)
             gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
             new-message? (some? (:message gossip-result))
             sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
@@ -2327,8 +2360,12 @@
           receiver (:receiver event)
           amount (:amount event)
           deliverable-hash (:deliverable-hash event)
-          current-epoch (long (or (:epoch event) (:epoch state) 0))
-          created-epoch (long (or (:created-epoch event) current-epoch))
+          current-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
+                                (:epoch state)
+                                (or (:epoch event) (:epoch state) 0)))
+          created-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
+                                (max (long (or (:created-epoch event) current-epoch)) (- current-epoch 168))
+                                (or (:created-epoch event) current-epoch)))
           expires-epoch (long (:expires-epoch event))
           nonce (str (or (:nonce event) "0"))
           event-sender (:sender event)
@@ -2399,7 +2436,9 @@
           payer-sig (:payer-signature event)
           event-sender (:sender event)
           sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
-          current-epoch (long (or (:epoch event) (:epoch state) 0))]
+          current-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
+                                (:epoch state)
+                                (or (:epoch event) (:epoch state) 0)))]
       (if-not (and escrow (= :locked (:status escrow)))
         {:state state :commands []}
         (let [payer (:payer escrow)
@@ -2463,7 +2502,9 @@
           escrow (get-in state [:escrows escrow-id])
           event-sender (:sender event)
           sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
-          current-epoch (long (or (:epoch event) (:epoch state) 0))]
+          current-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
+                                (:epoch state)
+                                (or (:epoch event) (:epoch state) 0)))]
       (if-not (and escrow (= :locked (:status escrow)))
         {:state state :commands []}
         (let [payer (:payer escrow)

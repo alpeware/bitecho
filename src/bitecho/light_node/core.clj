@@ -1315,17 +1315,14 @@
                            (get acct "finalized_epoch")
                            (:epoch state)
                            0))
-          new-state (cond-> (assoc state
-                                   :account {:balance bal
-                                             :spendable spendable
-                                             :seq seq-num
-                                             :deps deps
-                                             :finalized-epoch fin-ep}
-                                   :transfer-seq seq-num
-                                   :last-transfer-hash (last deps))
-                      (pos? fin-ep)
-                      (assoc :epoch (max (long (:epoch state 0)) fin-ep)
-                             :epoch-initialized? true))]
+          new-state (assoc state
+                           :account {:balance bal
+                                     :spendable spendable
+                                     :seq seq-num
+                                     :deps deps
+                                     :finalized-epoch fin-ep}
+                           :transfer-seq seq-num
+                           :last-transfer-hash (last deps))]
       {:state new-state
        :response {"ok" true
                   "pubkey" (:pubkey state)
@@ -1355,6 +1352,12 @@
        :net-envelopes []
        :stdout-events []})))
 
+(defn- effective-chain-epoch
+  "Returns the best-known on-chain epoch from :epoch and [:account :finalized-epoch]."
+  [state]
+  (max (long (or (:epoch state) 0))
+       (long (or (get-in state [:account :finalized-epoch]) 0))))
+
 (defn- check-dac-spend-authorization
   "Checks whether the current state's DAC permits spending `amount` in `required-scopes`.
    Returns {:ok? true :new-dac-spend ...} on success or when no DAC is attached.
@@ -1363,7 +1366,7 @@
    Tracks cumulative spend per DAC ID under :dac-spend {dac-id {:epoch current-epoch :spent new-spent}}."
   [state amount required-scopes]
   (if-let [dac (:dac state)]
-    (let [curr-epoch (or (:epoch state) 0)
+    (let [curr-epoch (effective-chain-epoch state)
           dac-res (verify-dac dac {:expected-agent-pubkey (:pubkey state)
                                    :current-epoch curr-epoch
                                    :revoked-dac-ids (:revoked-dacs state)
@@ -1492,9 +1495,10 @@
                    :net-envelopes []
                    :stdout-events []}
                   (let [next-intent-seq (inc (long (:intent-seq state 0)))
+                        curr-ep (effective-chain-epoch state)
                         rid (or (get cmd-map "receipt_id")
                                 (:receipt_id cmd-map)
-                                (str "intent:" (:pubkey state) ":" receiver ":" amount ":" (:epoch state 0) ":" next-intent-seq))
+                                (str "intent:" (:pubkey state) ":" receiver ":" amount ":" curr-ep ":" next-intent-seq))
                         take-amt (burn/calculate-settlement-take amount burn/default-settlement-take-bps)
                         net-amt (- amount take-amt)
                         intent-env (mesh/wrap-agent-event
@@ -1502,7 +1506,7 @@
                                      :payer (:pubkey state)
                                      :receiver receiver
                                      :amount amount
-                                     :epoch (:epoch state 0)
+                                     :epoch curr-ep
                                      :receipt-id rid}
                                     (:pubkey state)
                                     privkey-bytes)
@@ -1534,7 +1538,7 @@
                            (and (string? raw-dh) (escrow/valid-deliverable-hash? raw-dh)) (escrow/normalize-hex raw-dh)
                            (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (.getBytes ^String raw-deliv StandardCharsets/UTF_8)))
                            :else nil)
-        curr-ep (long (or (:epoch state) 0))
+        curr-ep (effective-chain-epoch state)
         raw-expires (or (get cmd-map "expires_epoch") (get cmd-map "expires-epoch")
                         (:expires_epoch cmd-map) (:expires-epoch cmd-map))
         expires-epoch (if (some? raw-expires) (parse-long-safe raw-expires :invalid) (+ curr-ep 10))]
@@ -1631,7 +1635,7 @@
                             (escrow/sign-escrow-release privkey-bytes escrow-id d-hash)))
             release-payload (cond-> {:type :release-intent
                                      :escrow-id escrow-id
-                                     :epoch (:epoch state 0)
+                                     :epoch (effective-chain-epoch state)
                                      :receipt-id (str "release:" escrow-id)}
                               preimage (assoc :preimage preimage)
                               final-sig (assoc :payer-signature final-sig))
@@ -1651,7 +1655,7 @@
       {:state state :response {"ok" false "error" "missing-escrow-id"} :net-envelopes [] :stdout-events []}
       (let [refund-payload {:type :refund-intent
                             :escrow-id escrow-id
-                            :epoch (:epoch state 0)
+                            :epoch (effective-chain-epoch state)
                             :receipt-id (str "refund:" escrow-id)}
             envelope (mesh/wrap-agent-event refund-payload (:pubkey state) privkey-bytes)
             local-escrow (get-in state [:escrows escrow-id])
@@ -1706,7 +1710,7 @@
       (let [voucher-env (mesh/wrap-agent-event
                          {:type :submit-vouchers
                           :vouchers (mapv #(into {} %) compacted)
-                          :epoch (:epoch state 0)}
+                          :epoch (effective-chain-epoch state)}
                          (:pubkey state)
                          privkey-bytes)
             new-state (assoc state :vouchers [])]
@@ -2644,14 +2648,16 @@
       {:state state :net-envelopes [] :stdout-events []}
       (let [msg-type (or (:bitecho/type msg) (:type msg))
             msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
+            sess-epoch (when-let [sid (:session-id msg)]
+                         (get-in state [:sessions sid :epoch]))
             ref-epoch (if (or (:epoch-initialized? state)
                               (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
                         (:epoch state)
-                        (or (when-let [sid (:session-id msg)]
-                              (get-in state [:sessions sid :epoch]))
-                            msg-epoch))
+                        (or sess-epoch msg-epoch))
             skew-exceeded? (and msg-epoch ref-epoch
-                                (> (Math/abs (- msg-epoch ref-epoch)) 2))]
+                                (> (Math/abs (- msg-epoch (long ref-epoch))) 2)
+                                (or (nil? sess-epoch)
+                                    (> (Math/abs (- msg-epoch (long sess-epoch))) 2)))]
         (if skew-exceeded?
           {:state state :net-envelopes [] :stdout-events []}
           (let [res (case msg-type

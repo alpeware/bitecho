@@ -4120,3 +4120,45 @@
       ;; Client: 1000000 - 400 (eid1) - 600 (eid2) + 600 (refund) = 999600
       (is (= 999600 (:balance (get-in s0-final [:ledger client-pub])))))))
 
+(defspec ^{:doc "Property: Basalt view exchange and Murmur gossip fanout never include local node pubkey or gossip sender when remote peers exist"}
+  prop-basalt-push-view-and-murmur-exclude-self-and-sender 25
+  (prop/for-all [seed (gen/choose 1 10000)
+                 payload-str (gen/not-empty gen/string-alphanumeric)]
+                (let [kp1 (crypto/generate-keypair)
+                      kp2 (crypto/generate-keypair)
+                      kp3 (crypto/generate-keypair)
+                      pub1 (basalt/bytes->hex (:public kp1))
+                      pub2 (basalt/bytes->hex (:public kp2))
+                      pub3 (basalt/bytes->hex (:public kp3))
+                      peer1 (basalt/make-peer "10.0.0.1" 5000 (:public kp1))
+                      peer2 (basalt/make-peer "10.0.0.2" 5000 (:public kp2))
+                      peer3 (basalt/make-peer "10.0.0.3" 5000 (:public kp3))
+                      cfg (assoc config/devnet-config
+                                 :murmur-k 2
+                                 :genesis-ledger {pub1 (account/map->AccountState {:balance 100000 :seq 0 :deps []})
+                                                  pub2 (account/map->AccountState {:balance 100000 :seq 0 :deps []})
+                                                  pub3 (account/map->AccountState {:balance 100000 :seq 0 :deps []})}
+                                 :peers-map {pub1 (:public kp1) pub2 (:public kp2) pub3 (:public kp3)}
+                                 :validators [pub1 pub2 pub3]
+                                 :mesh-nodes [pub1 pub2 pub3])
+                      s0 (sm/init-state [peer2 peer3] pub1 (assoc cfg :keypair kp1))
+                      ;; Peer 2 pushes its Basalt view (which includes peer1 = self!) to node 1
+                      s1 (:state (sm/handle-event s0 {:type :receive-push-view
+                                                      :sender pub2
+                                                      :view [peer1 peer3]}))
+                      view-pubs (set (map #(let [pk (:pubkey %)] (if (string? pk) pk (basalt/bytes->hex pk)))
+                                          (basalt/extract-peers (:basalt-view s1))))
+                      ;; Peer 2 sends a gossip message to node 1; with murmur-k=2 and only peer3 remaining, node 1 must forward to peer3 (never peer1 or peer2)
+                      gossip-msg (sieve/wrap-message (.getBytes payload-str "UTF-8") (:private kp2) (:public kp2) 500)
+                      res-gossip (sm/handle-event s1 {:type :receive-gossip
+                                                      :sender pub2
+                                                      :message gossip-msg
+                                                      :rng (java.util.Random. (long seed))})
+                      gossip-cmd (first (filter #(= :send-gossip (:type %)) (:commands res-gossip)))
+                      target-pubs (set (map #(let [pk (:pubkey %)] (if (string? pk) pk (basalt/bytes->hex pk)))
+                                            (:targets gossip-cmd)))]
+                  (and (not (contains? view-pubs pub1))
+                       (= #{pub2 pub3} view-pubs)
+                       (= #{pub3} target-pubs)))))
+
+

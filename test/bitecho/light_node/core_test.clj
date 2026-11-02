@@ -2522,5 +2522,71 @@
         (is (= "invalid-expires-epoch" (get-in res-bad-ep [:response "error"])))
         (is (= "invalid-deliverable-hash" (get-in res-bad-dh [:response "error"])))))))
 
+(defspec ^{:doc "Property: sync-account updates on-chain finalized_epoch for economic/escrow commands without breaking peer-to-peer wire epoch skew tolerance"}
+  prop-sync-account-preserves-wire-epoch-and-session-delivery 25
+  (prop/for-all [fin-epoch (gen/choose 10 500)
+                 msg-a->b (gen/not-empty gen/string-alphanumeric)
+                 msg-b->a (gen/not-empty gen/string-alphanumeric)]
+                (let [alice (test-identity)
+                      bob (test-identity)
+                      priv-a (:privkey-bytes alice)
+                      pub-b (:pubkey-hex bob)
+                      priv-b (:privkey-bytes bob)
+                      d-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                      ;; Both Alice and Bob initialize at wire epoch 0 and open a sealed session
+                      st-a0 (light-core/init-light-state (:identity alice) {})
+                      st-b0 (light-core/init-light-state (:identity bob) {:autonomous? true})
+                      offer-res (light-core/handle-command st-a0 {"cmd" "offer" "callee" pub-b "price" 10 "burn" 500} priv-a)
+                      sid (get-in offer-res [:response "session_id"])
+                      offer-env (first (filter gossip-env? (:net-envelopes offer-res)))
+                      b-after-offer (light-core/handle-wire-payload st-b0 offer-env priv-b)
+                      accept-env (first (filter gossip-env? (:net-envelopes b-after-offer)))
+                      a-after-accept (light-core/handle-wire-payload (:state offer-res) accept-env priv-a)
+                      ;; Now Alice runs sync-account with on-chain finalized_epoch = fin-epoch (>= 10), while Bob stays unsynced at epoch 0
+                      sync-res (light-core/handle-command (:state a-after-accept)
+                                                          {"cmd" "sync-account"
+                                                           "balance" 100000
+                                                           "spendable" 100000
+                                                           "seq" 0
+                                                           "deps" []
+                                                           "finalized_epoch" fin-epoch}
+                                                          priv-a)
+                      st-a-synced (:state sync-res)
+                      ;; 1. Alice sends a sealed message to Bob; Bob (still at wire epoch 0) must accept it
+                      send-ab (light-core/handle-command st-a-synced {"cmd" "send" "session_id" sid "text" msg-a->b} priv-a)
+                      ab-env (first (:net-envelopes send-ab))
+                      b-after-rx (light-core/handle-wire-payload (:state b-after-offer) ab-env priv-b)
+                      ack-env (first (:net-envelopes b-after-rx))
+                      ;; 2. Alice must accept Bob's session-ack and purge her outbox
+                      a-after-ack (light-core/handle-wire-payload (:state send-ab) ack-env priv-a)
+                      ;; 3. Bob (at wire epoch 0) sends a sealed message to Alice; Alice must accept it
+                      send-ba (light-core/handle-command (:state b-after-rx) {"cmd" "send" "session_id" sid "text" msg-b->a} priv-b)
+                      ba-env (first (:net-envelopes send-ba))
+                      a-after-rx (light-core/handle-wire-payload (:state a-after-ack) ba-env priv-a)
+                      ;; 4. Alice's lock-intent must enforce expires_epoch > fin-epoch using synced finalized_epoch
+                      bad-lock (light-core/handle-command (:state a-after-rx)
+                                                          {"cmd" "lock-intent"
+                                                           "receiver" pub-b
+                                                           "amount" 1000
+                                                           "deliverable_hash" d-hash
+                                                           "expires_epoch" (dec fin-epoch)}
+                                                          priv-a)
+                      good-lock (light-core/handle-command (:state a-after-rx)
+                                                           {"cmd" "lock-intent"
+                                                            "receiver" pub-b
+                                                            "amount" 1000
+                                                            "deliverable_hash" d-hash
+                                                            "expires_epoch" (+ fin-epoch 20)}
+                                                           priv-a)]
+                  (and (= 1 (count (:inbox (:state b-after-rx))))
+                       (= msg-a->b (:text (first (:inbox (:state b-after-rx)))))
+                       (empty? (get-in (:state a-after-ack) [:sessions sid :outbox]))
+                       (= 1 (count (:inbox (:state a-after-rx))))
+                       (= msg-b->a (:text (first (:inbox (:state a-after-rx)))))
+                       (false? (get-in bad-lock [:response "ok"]))
+                       (= "invalid-expires-epoch" (get-in bad-lock [:response "error"]))
+                       (true? (get-in good-lock [:response "ok"]))))))
+
+
 
 
