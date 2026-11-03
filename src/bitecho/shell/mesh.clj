@@ -87,7 +87,8 @@
     :settle-intent
     :lock-intent
     :release-intent
-    :refund-intent})
+    :refund-intent
+    :query-chain-state})
 
 (defn canonicalize-for-signing
   "Recursively converts a data structure into a content-deterministic
@@ -243,6 +244,15 @@
                          (assoc :sender agent-pub-hex
                                 :sender-pubkey-bytes agent-pub-bytes
                                 :rng (java.util.Random.)))))
+
+                 :query-chain-state
+                 (when (or (nil? (:pubkey base-event)) (= (:pubkey base-event) agent-pub-hex))
+                   (-> base-event
+                       (dissoc :sender :sender-pubkey-bytes :rng)
+                       (assoc :sender agent-pub-hex
+                              :pubkey agent-pub-hex
+                              :sender-pubkey-bytes agent-pub-bytes
+                              :rng (java.util.Random.))))
 
                  :register-home-set
                  (let [callee (:callee base-event)
@@ -1435,11 +1445,17 @@
               local-port (+ base-local-port (int (get node-idx pid 0)))
               setup (if (neg? (compare (name node-id) (name pid))) "active" "passive")
               local-fp (:fingerprint identity)
-              local-ice (identity/deterministic-ice-creds node-id local-fp)
+              local-ice (or (:ice-creds identity)
+                            (when (and (:ice-ufrag identity) (:ice-pwd identity))
+                              {:ufrag (:ice-ufrag identity) :pwd (:ice-pwd identity)})
+                            (identity/deterministic-ice-creds node-id local-fp))
               node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp)
               _ (apply-mesh-conn-event! peer-conns peer-hex
                                         {:type :dial-started :generation next-gen :node node :peer pid})
-              remote-ice (identity/deterministic-ice-creds pid peer-fp)
+              remote-ice (or (when (and (:ice-ufrag peer-cfg) (:ice-pwd peer-cfg))
+                               {:ufrag (:ice-ufrag peer-cfg) :pwd (:ice-pwd peer-cfg)})
+                             (:ice-creds peer-cfg)
+                             (identity/deterministic-ice-creds pid peer-fp))
               remote-sdp {:ip peer-ip
                           :port peer-port
                           :fingerprint peer-fp
@@ -1516,12 +1532,53 @@
                                                 {:type :send-failed :error (or (.getMessage e) "send-failed")}))
                       nil)))))))))))
 
+(defn build-validator-chain-state-snapshot
+  "Pure helper. Builds and signs a :chain-state-snapshot from validator state."
+  [st validator-identity pubkey nonce]
+  (let [acc (get (:ledger st) pubkey)
+        balance (long (or (:balance acc) 0))
+        spendable (long (or (:spendable acc) (sm/spendable-balance st pubkey) balance))
+        seq-num (long (or (:seq acc) 0))
+        deps (vec (or (:deps acc) []))
+        fin-epoch (long (or (:last-executed-finalized-epoch st) 0))
+        matching-escrows (vec (sort-by :escrow-id
+                                       (filter (fn [esc]
+                                                 (or (= (:payer esc) pubkey)
+                                                     (= (:receiver esc) pubkey)))
+                                               (vals (or (:escrows st) {})))))
+        val-pub (or (:node-pubkey st)
+                    (:pubkey-hex validator-identity)
+                    (when-let [pk (get-in st [:keypair :public])]
+                      (basalt/bytes->hex pk)))
+        val-priv (or (:node-private-key st)
+                     (get-in st [:keypair :private])
+                     (get-in validator-identity [:keypair :private])
+                     (when-let [pk-hex (:privkey-hex validator-identity)]
+                       (basalt/hex->bytes pk-hex)))
+        base-snap {:bitecho/type :chain-state-snapshot
+                   :type :chain-state-snapshot
+                   :validator-pubkey val-pub
+                   :pubkey pubkey
+                   :finalized-epoch fin-epoch
+                   :balance balance
+                   :spendable spendable
+                   :seq seq-num
+                   :deps deps
+                   :escrows matching-escrows
+                   :nonce (or nonce "")}
+        sign-fn (try (requiring-resolve 'bitecho.light-node.core/sign-chain-state-snapshot) (catch Exception _ nil))]
+    (if (and sign-fn val-priv)
+      (sign-fn base-snap val-priv)
+      base-snap)))
+
 (defn make-agent-connection-handler
   "Returns a connection handler function for an incoming agent node.
    Works identically for UDP and TCP agent connections using single-authority lifecycle state."
   ([shell-node agent-conns]
-   (make-agent-connection-handler shell-node agent-conns nil))
+   (make-agent-connection-handler shell-node agent-conns nil nil))
   ([shell-node agent-conns peer-ice-pwds]
+   (make-agent-connection-handler shell-node agent-conns peer-ice-pwds nil))
+  ([shell-node agent-conns peer-ice-pwds validator-identity]
    (fn [agent-node]
      (let [conn-key (atom [:anon (System/identityHashCode agent-node)])
            init-gen (inc (long (reduce max 0 (map #(long (or (:generation %) 0)) (vals (or (when agent-conns (deref agent-conns)) {}))))))
@@ -1560,16 +1617,31 @@
                      (apply-mesh-conn-event! agent-conns @conn-key
                                              {:type :invalid-frame :generation @node-gen :node agent-node :error "invalid-agent-envelope"}))
                    (do
-                     (when (and (:ice-ufrag unwrapped) (:ice-pwd unwrapped))
-                       (when (instance? clojure.lang.Atom peer-ice-pwds)
-                         (swap! peer-ice-pwds assoc (:ice-ufrag unwrapped) (:ice-pwd unwrapped)))
-                       (try
-                         (api/set-remote-ice-credentials! agent-node (:ice-ufrag unwrapped) (:ice-pwd unwrapped))
-                         (catch Exception _
-                           (when-let [st-atom (:state-atom agent-node)]
-                             (swap! st-atom assoc
-                                    :remote-ice-ufrag (:ice-ufrag unwrapped)
-                                    :remote-ice-pwd (:ice-pwd unwrapped))))))
+                     (when (and (= :register-home-set (:type unwrapped))
+                                (:ice-ufrag unwrapped)
+                                (:ice-pwd unwrapped))
+                       (let [ufrag (:ice-ufrag unwrapped)
+                             pwd (:ice-pwd unwrapped)
+                             sender (:sender unwrapped)
+                             node-ufrag (when-let [sa (:state-atom agent-node)] (:remote-ice-ufrag @sa))
+                             can-set? (and (or (nil? node-ufrag) (= node-ufrag ufrag))
+                                           (or (nil? peer-ice-pwds)
+                                               (not (instance? clojure.lang.Atom peer-ice-pwds))
+                                               (let [curr-pwds @peer-ice-pwds
+                                                     owner (get curr-pwds [:owner ufrag])]
+                                                 (or (nil? owner) (= owner sender)))))]
+                         (when can-set?
+                           (when (instance? clojure.lang.Atom peer-ice-pwds)
+                             (swap! peer-ice-pwds (fn [m]
+                                                    (-> (assoc m ufrag pwd)
+                                                        (assoc [:owner ufrag] sender)))))
+                           (try
+                             (api/set-remote-ice-credentials! agent-node ufrag pwd)
+                             (catch Exception _
+                               (when-let [st-atom (:state-atom agent-node)]
+                                 (swap! st-atom assoc
+                                        :remote-ice-ufrag ufrag
+                                        :remote-ice-pwd pwd)))))))
                      (let [sender (:sender unwrapped)]
                        (when (and sender (not= sender @conn-key))
                          (let [old-key @conn-key]
@@ -1584,36 +1656,22 @@
                                        (apply-mesh-conn-event! agent-conns @conn-key
                                                                {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
                          (when (or (nil? agent-conns) (= agent-node (:node updated)))
-                           (async/put! (:network-in shell-node) unwrapped)
-                           (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
-                             (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped))))))))))))
+                           (if (= (:type unwrapped) :query-chain-state)
+                             (let [st (or (when shell-node (query-node-state shell-node 500)) {})
+                                   v-id (or validator-identity (:identity shell-node))
+                                   snapshot (build-validator-chain-state-snapshot st v-id (:pubkey unwrapped) (:nonce unwrapped))]
+                               (try
+                                 (api/send! agent-node (nippy/freeze snapshot) cid)
+                                 (catch Exception e
+                                   (log-mesh-error "Failed to send chain-state-snapshot to agent" e))))
+                             (do
+                               (async/put! (:network-in shell-node) unwrapped)
+                               (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
+                                 (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped))))))))))))))
          :on-close (fn [_]
                      (when agent-conns
                        (apply-mesh-conn-event! agent-conns @conn-key
                                                {:type :on-close :generation @node-gen :node agent-node})))})))))
-
-(defn init-mesh-listener!
-  "Starts validator-to-validator listener with :peer-ice-pwds map constructed from configured peers (ufrag -> pwd)."
-  [config identity callbacks]
-  (let [port (int (or (get-in config [:cluster :port])
-                      (get-in config [:node :port])
-                      5000))
-        peers (or (get-in config [:cluster :peers])
-                  (get-in config [:peers])
-                  (vals (get-in config [:cluster :nodes]))
-                  [])
-        peer-pwds (into {}
-                        (keep (fn [p]
-                                (let [ufrag (or (:ice-ufrag p) (get-in p [:ice-creds :ufrag]))
-                                      pwd (or (:ice-pwd p) (get-in p [:ice-creds :pwd]))]
-                                  (when (and ufrag pwd)
-                                    [ufrag pwd])))
-                              peers))
-        listen-opts {:port port
-                     :cert-data (:cert-data identity)
-                     :ice-creds (:ice-creds identity)
-                     :peer-ice-pwds peer-pwds}]
-    (api/listen! listen-opts callbacks)))
 
 (defn- init-agent-listener!
   "Starts agent ingress listener when enabled.
@@ -1628,7 +1686,7 @@
                        :ice-creds (:ice-creds identity)
                        :peer-ice-pwds peer-ice-pwds}]
       (api/listen! listen-opts
-                   {:on-connection (make-agent-connection-handler shell-node agent-conns peer-ice-pwds)}))))
+                   {:on-connection (make-agent-connection-handler shell-node agent-conns peer-ice-pwds identity)}))))
 
 (defn- init-agent-tcp-listener!
   "Starts TCP agent ingress listener when enabled (RFC 4571 framing)."
@@ -1644,7 +1702,7 @@
                        :ice-creds (:ice-creds identity)
                        :peer-ice-pwds peer-ice-pwds}]
       (api/listen-tcp! listen-opts
-                       {:on-connection (make-agent-connection-handler shell-node agent-conns peer-ice-pwds)}))))
+                       {:on-connection (make-agent-connection-handler shell-node agent-conns peer-ice-pwds identity)}))))
 
 (defn stop-mesh-node!
   "Stops all running resources of a mesh node cleanly."

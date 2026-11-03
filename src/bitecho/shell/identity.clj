@@ -12,7 +12,7 @@
            [java.nio.charset StandardCharsets]
            [java.nio.file Files StandardCopyOption]
            [java.nio.file.attribute PosixFilePermissions]
-           [java.security KeyFactory MessageDigest PrivateKey]
+           [java.security KeyFactory MessageDigest PrivateKey SecureRandom]
            [java.security.cert CertificateFactory X509Certificate]
            [java.security.spec PKCS8EncodedKeySpec]
            [java.util Base64]))
@@ -62,9 +62,28 @@
       (catch Exception _
         false))))
 
+(defn generate-random-ice-creds
+  "Generates cryptographically random ICE credentials via SecureRandom.
+   Returns {:ufrag <8-hex-chars> :pwd <24-hex-chars>}.
+   Accepts optional node-id and fingerprint for interface parity."
+  ([]
+   (generate-random-ice-creds nil nil))
+  ([_node-id]
+   (generate-random-ice-creds nil nil))
+  ([_node-id _fingerprint]
+   (let [sr (SecureRandom.)
+         ufrag-bytes (byte-array 4)
+         pwd-bytes (byte-array 12)
+         _ (.nextBytes sr ufrag-bytes)
+         _ (.nextBytes sr pwd-bytes)]
+     {:ufrag (basalt/bytes->hex ufrag-bytes)
+      :pwd (basalt/bytes->hex pwd-bytes)})))
+
 (defn deterministic-ice-creds
   "Derives deterministic ICE ufrag (8 chars) and pwd (24 chars) credentials
-   from node-id and optional peer/cert fingerprint."
+   from node-id and optional peer/cert fingerprint.
+   NOTE: For deterministic unit/simulator test fixtures only.
+   Production identities use generate-random-ice-creds."
   ([node-id]
    (deterministic-ice-creds node-id nil))
   ([node-id fingerprint]
@@ -153,34 +172,6 @@
                     (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
     true))
 
-(defn- read-persisted-identity
-  "Reads and validates an existing node-identity.edn file."
-  [node-id identity-file]
-  (let [edn-data (edn/read-string (slurp identity-file))]
-    (when-not (and (map? edn-data)
-                   (:pubkey-hex edn-data)
-                   (:privkey-hex edn-data)
-                   (:cert-pem edn-data)
-                   (:key-pem edn-data)
-                   (:fingerprint edn-data)
-                   (:ice-creds edn-data))
-      (throw (ex-info "Corrupt node-identity.edn file: missing required fields"
-                      {:file (.getAbsolutePath identity-file)})))
-    (let [cert (parse-cert-pem (:cert-pem edn-data))
-          key (parse-private-key-pem (:key-pem edn-data))
-          pub-bytes (basalt/hex->bytes (:pubkey-hex edn-data))
-          priv-bytes (basalt/hex->bytes (:privkey-hex edn-data))]
-      (when (or (nil? cert) (nil? key))
-        (throw (ex-info "Corrupt node-identity.edn file: invalid certificate or key"
-                        {:file (.getAbsolutePath identity-file)})))
-      {:node-id node-id
-       :pubkey-hex (:pubkey-hex edn-data)
-       :privkey-hex (:privkey-hex edn-data)
-       :keypair {:public pub-bytes :private priv-bytes}
-       :fingerprint (:fingerprint edn-data)
-       :ice-creds (:ice-creds edn-data)
-       :cert-data {:cert cert :key key :fingerprint (:fingerprint edn-data)}})))
-
 (defn- write-atomic-identity!
   "Writes node identity map to disk atomically using temporary file and atomic rename."
   [identity-dir identity-file identity-map]
@@ -196,6 +187,48 @@
       (catch Exception _
         (Files/move (.toPath tmp-file) (.toPath identity-file)
                     (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))))
+
+(defn- read-persisted-identity
+  "Reads and validates an existing node-identity.edn file.
+   Automatically rotates legacy deterministic ICE passwords to random SecureRandom credentials."
+  [node-id identity-file]
+  (let [edn-data (edn/read-string (slurp identity-file))]
+    (when-not (and (map? edn-data)
+                   (:pubkey-hex edn-data)
+                   (:privkey-hex edn-data)
+                   (:cert-pem edn-data)
+                   (:key-pem edn-data)
+                   (:fingerprint edn-data)
+                   (:ice-creds edn-data))
+      (throw (ex-info "Corrupt node-identity.edn file: missing required fields"
+                      {:file (.getAbsolutePath identity-file)})))
+    (let [cert (parse-cert-pem (:cert-pem edn-data))
+          key (parse-private-key-pem (:key-pem edn-data))
+          pub-bytes (basalt/hex->bytes (:pubkey-hex edn-data))
+          priv-bytes (basalt/hex->bytes (:privkey-hex edn-data))
+          fp (:fingerprint edn-data)
+          persisted-ice (:ice-creds edn-data)
+          legacy-ice (deterministic-ice-creds node-id fp)
+          ice-creds (if (or (= (:pwd persisted-ice) (:pwd legacy-ice))
+                            (not= 24 (count (or (:pwd persisted-ice) ""))))
+                      (let [new-ice (generate-random-ice-creds node-id fp)
+                            parent (.getParentFile (io/file identity-file))]
+                        (write-atomic-identity! parent identity-file
+                                                (cond-> (assoc edn-data :ice-creds new-ice)
+                                                  (:ice-ufrag edn-data) (assoc :ice-ufrag (:ufrag new-ice))
+                                                  (:ice-pwd edn-data) (assoc :ice-pwd (:pwd new-ice))))
+                        new-ice)
+                      persisted-ice)]
+      (when (or (nil? cert) (nil? key))
+        (throw (ex-info "Corrupt node-identity.edn file: invalid certificate or key"
+                        {:file (.getAbsolutePath identity-file)})))
+      {:node-id node-id
+       :pubkey-hex (:pubkey-hex edn-data)
+       :privkey-hex (:privkey-hex edn-data)
+       :keypair {:public pub-bytes :private priv-bytes}
+       :fingerprint fp
+       :ice-creds ice-creds
+       :cert-data {:cert cert :key key :fingerprint fp}})))
 
 (defn load-or-create-node-identity!
   "Loads or creates node identity containing Ed25519 keypair, DTLS certificate/key,
@@ -220,7 +253,7 @@
             fp (normalize-fingerprint (:fingerprint cert-data))
             cert-pem (encode-cert-pem cert)
             key-pem (encode-private-key-pem key)
-            ice-creds (deterministic-ice-creds node-id fp)
+            ice-creds (generate-random-ice-creds node-id fp)
             kp (crypto/generate-keypair)
             pub-hex (basalt/bytes->hex (:public kp))
             priv-hex (basalt/bytes->hex (:private kp))

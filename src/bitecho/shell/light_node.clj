@@ -180,7 +180,9 @@
                                          m {"cmd" "refund-intent"}]
                                      (cond-> m
                                        eid (assoc "escrow_id" eid)))
-                   "escrows" {"cmd" "escrows"}
+                   "escrows" (let [sync? (boolean (some #{"--sync"} args))]
+                               (cond-> {"cmd" "escrows"}
+                                 sync? (assoc "sync" true)))
                    "submit-vouchers" {"cmd" "submit-vouchers"}
                    "petname-set" {"cmd" "petname-set"
                                   "petname" (extract-flag-value args "--petname" nil)
@@ -253,24 +255,25 @@
 (defn save-light-state!
   "Persists sanitized light-node state via Nippy with atomic move and 0600 permissions."
   [state-file state]
-  (let [f (io/file state-file)
-        dir (.getParentFile f)
-        _ (when dir (.mkdirs dir))
-        tmp-file (io/file (str state-file ".tmp"))
-        clean-state (strip-sensitive-keys state)
-        frozen (nippy/freeze clean-state)]
-    (Files/write (.toPath tmp-file) ^bytes frozen (into-array java.nio.file.OpenOption []))
-    (try
-      (Files/setPosixFilePermissions (.toPath tmp-file) (PosixFilePermissions/fromString "rw-------"))
-      (catch UnsupportedOperationException _ nil))
-    (try
-      (Files/move (.toPath tmp-file) (.toPath f)
-                  (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
-                                                        StandardCopyOption/REPLACE_EXISTING]))
-      (catch Exception _
+  (when (and (some? state-file) (not (str/blank? (str state-file))))
+    (let [f (io/file state-file)
+          dir (.getParentFile f)
+          _ (when dir (.mkdirs dir))
+          tmp-file (io/file (str state-file ".tmp"))
+          clean-state (strip-sensitive-keys state)
+          frozen (nippy/freeze clean-state)]
+      (Files/write (.toPath tmp-file) ^bytes frozen (into-array java.nio.file.OpenOption []))
+      (try
+        (Files/setPosixFilePermissions (.toPath tmp-file) (PosixFilePermissions/fromString "rw-------"))
+        (catch UnsupportedOperationException _ nil))
+      (try
         (Files/move (.toPath tmp-file) (.toPath f)
-                    (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
-    true))
+                    (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                                          StandardCopyOption/REPLACE_EXISTING]))
+        (catch Exception _
+          (Files/move (.toPath tmp-file) (.toPath f)
+                      (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+      true)))
 
 (defn load-light-state!
   "Loads persisted light-node state via Nippy, or nil if file does not exist."
@@ -350,21 +353,130 @@
                   (catch Exception _ nil))))
             candidates))))
 
+(defn query-validator-chain-state!
+  "Dials a single validator node over Port 5010/DTLS, sends :query-chain-state,
+   awaits and returns the signed :chain-state-snapshot map (or nil on timeout/error)."
+  [identity node pubkey privkey-bytes opts]
+  (let [client-node (api/create-node {:port 0
+                                      :cert-data (:cert-data identity)
+                                      :ice-creds (:ice-creds identity)
+                                      :setup "active"})
+        snapshot-promise (promise)
+        nonce (or (:nonce opts) (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID)))
+        transport (or (:transport opts) :datachannel)
+        target-host (if (= transport :connect)
+                      (or (:ingress-host node) (:ip node) "127.0.0.1")
+                      (or (:ip node) "127.0.0.1"))
+        target-port (case transport
+                      :connect (int (or (:ingress-port node) (:agent-tcp-port node) (:agent-port node) 443))
+                      :tcp (int (or (:agent-tcp-port node) (:agent-port node) (:port node) 5010))
+                      (int (or (:agent-port node) (:port node) 5010)))
+        remote-sdp (cond-> {:ip target-host
+                            :port target-port
+                            :fingerprint (identity/normalize-fingerprint (:fingerprint node))
+                            :remote-ice-ufrag (or (:ice-ufrag node) "ufrag")
+                            :remote-ice-pwd (or (:ice-pwd node) "pwd")}
+                     (= transport :connect)
+                     (assoc :proxy (or (:proxy opts) (resolve-proxy-url nil))))
+        callbacks {:on-open
+                   (fn [evt]
+                     (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                           query-env (light-core/build-chain-state-query-envelope pubkey privkey-bytes {:nonce nonce})
+                           frozen (nippy/freeze query-env)]
+                       (try
+                         (api/send! client-node frozen cid)
+                         (catch Exception _
+                           (deliver snapshot-promise nil)))))
+                   :on-message
+                   (fn [evt]
+                     (try
+                       (let [payload (:payload evt)
+                             msg (if (bytes? payload) (nippy/thaw payload) payload)]
+                         (when (and (map? msg) (= :chain-state-snapshot (or (:bitecho/type msg) (:type msg))))
+                           (deliver snapshot-promise msg)))
+                       (catch Exception _ nil)))
+                   :on-error
+                   (fn [_] (deliver snapshot-promise nil))
+                   :on-close
+                   (fn [_] (deliver snapshot-promise nil))}]
+    (try
+      (if (or (= transport :tcp) (= transport :connect))
+        (api/start-tcp! client-node remote-sdp callbacks)
+        (api/start! client-node remote-sdp callbacks))
+      (let [timeout-ms (long (or (:timeout-ms opts) 2500))]
+        (deref snapshot-promise timeout-ms nil))
+      (catch Exception _ nil)
+      (finally
+        (try (api/close! client-node) (catch Exception _ nil))))))
+
+(defn fetch-inband-chain-state-quorum!
+  "Fetches chain state snapshots from validators in parallel, cross-checking via verify-chain-state-quorum.
+   Supports injectable (:inband-snapshot-fetcher opts) for deterministic testing.
+   Returns {:ok? true :snapshot agreed-snap :quorum-count n :validators [...]} or {:ok? false :error <reason>}."
+  [identity bootstrap pubkey privkey-bytes opts]
+  (if-let [fetcher (:inband-snapshot-fetcher opts)]
+    (let [snaps (fetcher pubkey)
+          trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+          q-opts (assoc opts
+                        :expected-pubkey pubkey
+                        :trusted-validators trusted
+                        :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0)))]
+      (light-core/verify-chain-state-quorum snaps q-opts))
+    (let [nodes (vals (:nodes bootstrap))]
+      (if (empty? nodes)
+        {:ok? false :error "empty-bootstrap-nodes"}
+        (let [timeout-ms (long (or (:timeout-ms opts) 2500))
+              nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
+              q-opts (assoc opts :timeout-ms timeout-ms :nonce nonce)
+              snaps (->> nodes
+                         (pmap (fn [node]
+                                 (try
+                                   (query-validator-chain-state! identity node pubkey privkey-bytes q-opts)
+                                   (catch Exception _ nil))))
+                         (filterv some?))
+              trusted (set (keep :pubkey nodes))
+              verify-opts (assoc opts
+                                 :expected-pubkey pubkey
+                                 :expected-nonce nonce
+                                 :trusted-validators trusted
+                                 :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0)))]
+          (if (empty? snaps)
+            {:ok? false :error "no-inband-snapshots-returned"}
+            (light-core/verify-chain-state-quorum snaps verify-opts)))))))
+
 (defn maybe-sync-account-state!
-  "Attempts to fetch account state from validators via fetch-validator-accountz!
-   and applies sync-account command to state-atom if successful."
+  "Attempts in-band validator quorum sync over Port 5010/DTLS via fetch-inband-chain-state-quorum!.
+   If in-band returns snapshots and verifies quorum, updates state-atom and returns {:ok? true :state @state-atom :quorum-result q-res}.
+   If in-band quorum verification fails, fails closed immediately and returns {:ok? false :error (:error inband-res)}.
+   If zero in-band snapshots were reachable (and no inband fetcher provided), falls back to legacy HTTP fetch-validator-accountz!."
   [state-atom bootstrap pubkey privkey-bytes opts]
-  (when-let [resp (fetch-validator-accountz! bootstrap pubkey opts)]
-    (when (:account resp)
-      (let [cmd {"cmd" "sync-account"
-                 "balance" (get-in resp [:account :balance] 0)
-                 "spendable" (:spendable resp)
-                 "seq" (get-in resp [:account :seq] 0)
-                 "deps" (vec (get-in resp [:account :deps] []))
-                 "finalized_epoch" (:finalized-epoch resp 0)}
-            res (light-core/handle-command @state-atom cmd privkey-bytes)]
-        (reset! state-atom (:state res))
-        (:state res)))))
+  (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})
+        inband-res (fetch-inband-chain-state-quorum! id bootstrap pubkey privkey-bytes opts)]
+    (cond
+      (:ok? inband-res)
+      (let [snap (:snapshot inband-res)]
+        (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
+        {:ok? true :state @state-atom :quorum-result inband-res})
+
+      (or (:inband-snapshot-fetcher opts)
+          (and (not= (:error inband-res) "no-inband-snapshots-returned")
+               (not= (:error inband-res) "empty-bootstrap-nodes")))
+      {:ok? false :error (:error inband-res)}
+
+      :else
+      (if-let [resp (fetch-validator-accountz! bootstrap pubkey opts)]
+        (if (:account resp)
+          (let [cmd {"cmd" "sync-account"
+                     "balance" (get-in resp [:account :balance] 0)
+                     "spendable" (:spendable resp)
+                     "seq" (get-in resp [:account :seq] 0)
+                     "deps" (vec (get-in resp [:account :deps] []))
+                     "finalized_epoch" (:finalized-epoch resp 0)}
+                res (light-core/handle-command @state-atom cmd privkey-bytes)]
+            (reset! state-atom (:state res))
+            {:ok? true :state @state-atom :accountz resp})
+          {:ok? false :error "no-account-in-accountz"})
+        {:ok? false :error (or (:error inband-res) "all-sync-methods-failed")}))))
 
 (defn init-conn-state
   "Initializes the pure single-authority connection lifecycle state map."
@@ -754,20 +866,24 @@
                      (do
                        (apply-conn-event! conn-atom {:type :on-close :generation generation} cb-opts)
                        (sync-conn-diagnostics! state-atom conn-atom))
-                     (let [was-open? (= :open (:phase @conn-atom))]
+                     (let [curr-conn @conn-atom
+                           already-closed-this-gen? (and (or (nil? generation)
+                                                             (= (long generation) (long (:generation curr-conn 0))))
+                                                         (contains? #{:failed :down} (:phase curr-conn)))]
                        (when (instance? clojure.lang.Atom channel-id)
                          (reset! channel-id nil))
-                       (apply-conn-event! conn-atom
-                                          (cond-> {:type :on-close}
-                                            (some? generation) (assoc :generation generation))
-                                          cb-opts)
-                       (when state-atom
-                         (swap! state-atom assoc :connected? false :connection-error "connection-closed"))
-                       (sync-conn-diagnostics! state-atom conn-atom)
-                       (when (and was-open? reconnect-fn (not= :down (:phase @conn-atom)))
-                         (if (:async-reconnect? ctx)
-                           (future (attempt-proactive-reconnect! reconnect-fn ctx))
-                           (attempt-proactive-reconnect! reconnect-fn ctx)))))
+                       (when-not already-closed-this-gen?
+                         (apply-conn-event! conn-atom
+                                            (cond-> {:type :on-close}
+                                              (some? generation) (assoc :generation generation))
+                                            cb-opts)
+                         (when state-atom
+                           (swap! state-atom assoc :connected? false :connection-error "connection-closed"))
+                         (sync-conn-diagnostics! state-atom conn-atom)
+                         (when (and reconnect-fn (not= :down (:phase @conn-atom)))
+                           (if (:async-reconnect? ctx)
+                             (future (attempt-proactive-reconnect! reconnect-fn ctx))
+                             (attempt-proactive-reconnect! reconnect-fn ctx))))))
                    (do
                      (when (instance? clojure.lang.Atom channel-id)
                        (reset! channel-id nil))
@@ -895,71 +1011,78 @@
   (let [{:keys [state-atom conn-atom out-writer state-file identity bootstrap conn-opts]} ctx
         cmd-map (try (json/read-str line) (catch Exception _ nil))
         verb (when (map? cmd-map) (get cmd-map "cmd"))
-        _ (when (or (and (= verb "sync-account") (nil? (get cmd-map "balance")))
-                    (and (= verb "account") (or (get cmd-map "sync") (:sync? cmd-map))))
-            (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) conn-opts))
-        res (light-core/process-jsonl-line @state-atom line (:privkey-bytes identity))
-        needs-net? (seq (:net-envelopes res))]
-    (if needs-net?
-      (let [currently-live? (connection-live? @conn-atom @state-atom)
-            replay-envs (when (= verb "register-home-set")
-                          (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
-            live-envs (if (seq replay-envs)
-                        (into (vec replay-envs) (:net-envelopes res))
-                        (:net-envelopes res))
-            sent? (when currently-live?
-                    (send-all-envelopes! (:send-fn @conn-atom) live-envs))]
-        (if sent?
+        sync-wanted? (or (and (= verb "sync-account") (nil? (get cmd-map "balance")) (nil? (get cmd-map "snapshots")) (nil? (get cmd-map "snapshot")))
+                         (and (= verb "account") (or (get cmd-map "sync") (:sync? cmd-map)))
+                         (and (= verb "escrows") (or (get cmd-map "sync") (:sync? cmd-map))))
+        sync-opts (assoc (or conn-opts {}) :identity identity)
+        sync-res (when sync-wanted?
+                   (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts))]
+    (if (and sync-res (false? (:ok? sync-res)))
+      (let [err-resp {"ok" false "error" (:error sync-res)}]
+        (emit-json-line! out-writer err-resp)
+        err-resp)
+      (let [res (light-core/process-jsonl-line @state-atom line (:privkey-bytes identity))
+            needs-net? (seq (:net-envelopes res))]
+        (if needs-net?
+          (let [currently-live? (connection-live? @conn-atom @state-atom)
+                replay-envs (when (= verb "register-home-set")
+                              (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
+                live-envs (if (seq replay-envs)
+                            (into (vec replay-envs) (:net-envelopes res))
+                            (:net-envelopes res))
+                sent? (when currently-live?
+                        (send-all-envelopes! (:send-fn @conn-atom) live-envs))]
+            (if sent?
+              (do
+                (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                (sync-conn-diagnostics! state-atom conn-atom)
+                (save-light-state! state-file @state-atom)
+                (when-let [resp (:response res)]
+                  (emit-json-line! out-writer resp)))
+              (do
+                (when conn-atom
+                  (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
+                (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
+                      cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
+                      home-set (if state-atom (:home-set @state-atom) [])
+                      opts-with-gen (assoc (or conn-opts {})
+                                           :generation target-gen
+                                           :validator-cursor cursor
+                                           :home-set home-set)
+                      reconn (connect-validators! identity bootstrap opts-with-gen)]
+                  (if (:ok? reconn)
+                    (do
+                      (when conn-atom
+                        (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
+                      (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
+                            all-envs (into (vec replay-envs) (:net-envelopes res))]
+                        (if (send-all-envelopes! (:send-fn reconn) all-envs)
+                          (do
+                            (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                            (sync-conn-diagnostics! state-atom conn-atom)
+                            (save-light-state! state-file @state-atom)
+                            (when-let [resp (:response res)]
+                              (emit-json-line! out-writer resp)))
+                          (let [err "send-failed"]
+                            (when conn-atom
+                              (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
+                            (when state-atom
+                              (swap! state-atom assoc :connected? false :connection-error err))
+                            (sync-conn-diagnostics! state-atom conn-atom)
+                            (emit-json-line! out-writer {"ok" false "error" err})))))
+                    (let [err (or (:error reconn) "listener-disabled")]
+                      (when conn-atom
+                        (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
+                      (when state-atom
+                        (swap! state-atom assoc :connected? false :connection-error err))
+                      (sync-conn-diagnostics! state-atom conn-atom)
+                      (emit-json-line! out-writer {"ok" false "error" err})))))))
           (do
-            (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+            (reset! state-atom (:state res))
             (sync-conn-diagnostics! state-atom conn-atom)
             (save-light-state! state-file @state-atom)
             (when-let [resp (:response res)]
-              (emit-json-line! out-writer resp)))
-          (do
-            (when conn-atom
-              (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
-            (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
-                  cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
-                  home-set (if state-atom (:home-set @state-atom) [])
-                  opts-with-gen (assoc (or conn-opts {})
-                                       :generation target-gen
-                                       :validator-cursor cursor
-                                       :home-set home-set)
-                  reconn (connect-validators! identity bootstrap opts-with-gen)]
-              (if (:ok? reconn)
-                (do
-                  (when conn-atom
-                    (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
-                  (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
-                        all-envs (into (vec replay-envs) (:net-envelopes res))]
-                    (if (send-all-envelopes! (:send-fn reconn) all-envs)
-                      (do
-                        (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
-                        (sync-conn-diagnostics! state-atom conn-atom)
-                        (save-light-state! state-file @state-atom)
-                        (when-let [resp (:response res)]
-                          (emit-json-line! out-writer resp)))
-                      (let [err "send-failed"]
-                        (when conn-atom
-                          (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
-                        (when state-atom
-                          (swap! state-atom assoc :connected? false :connection-error err))
-                        (sync-conn-diagnostics! state-atom conn-atom)
-                        (emit-json-line! out-writer {"ok" false "error" err})))))
-                (let [err (or (:error reconn) "listener-disabled")]
-                  (when conn-atom
-                    (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
-                  (when state-atom
-                    (swap! state-atom assoc :connected? false :connection-error err))
-                  (sync-conn-diagnostics! state-atom conn-atom)
-                  (emit-json-line! out-writer {"ok" false "error" err})))))))
-      (do
-        (reset! state-atom (:state res))
-        (sync-conn-diagnostics! state-atom conn-atom)
-        (save-light-state! state-file @state-atom)
-        (when-let [resp (:response res)]
-          (emit-json-line! out-writer resp))))))
+              (emit-json-line! out-writer resp))))))))
 
 (defn run-serve!
   "Runs the light node in continuous JSONL serve mode reading STDIN and writing STDOUT."
@@ -1057,35 +1180,42 @@
         state-atom (atom initial-state)
         cmd-map (:cmd-map opts)
         verb (when (map? cmd-map) (get cmd-map "cmd"))
-        _ (when (or (and (= verb "sync-account") (nil? (get cmd-map "balance")))
-                    (and (= verb "account") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map))))
-            (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) opts))
+        sync-wanted? (or (and (= verb "sync-account") (nil? (get cmd-map "balance")) (nil? (get cmd-map "snapshots")) (nil? (get cmd-map "snapshot")))
+                         (and (= verb "account") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map)))
+                         (and (= verb "escrows") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map))))
+        sync-opts (assoc opts :identity identity)
+        sync-res (when sync-wanted?
+                   (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts))
         out-writer (PrintWriter. System/out true)]
-    (binding [*out* *err*]
-      (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
-            new-state (:state res)
-            needs-network? (and (seq (:net-envelopes res)) (:connect? opts true))]
-        (if needs-network?
-          (let [conn-res (connect-validators! identity bootstrap opts)]
-            (if-not (:ok? conn-res)
-              (let [err-resp {"ok" false "error" (or (:error conn-res) "listener-disabled")}]
-                (emit-json-line! out-writer err-resp)
-                err-resp)
-              (let [sent? (send-all-envelopes! (:send-fn conn-res) (:net-envelopes res))]
-                (when-let [n (:node conn-res)]
-                  (try (api/close! n) (catch Exception _ nil)))
-                (if sent?
-                  (do
-                    (save-light-state! state-file new-state)
-                    (emit-json-line! out-writer (:response res))
-                    (:response res))
-                  (let [err-resp {"ok" false "error" "connection-closed"}]
-                    (emit-json-line! out-writer err-resp)
-                    err-resp)))))
-          (do
-            (save-light-state! state-file new-state)
-            (emit-json-line! out-writer (:response res))
-            (:response res)))))))
+    (if (and sync-res (false? (:ok? sync-res)))
+      (let [err-resp {"ok" false "error" (:error sync-res)}]
+        (emit-json-line! out-writer err-resp)
+        err-resp)
+      (binding [*out* *err*]
+        (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
+              new-state (:state res)
+              needs-network? (and (seq (:net-envelopes res)) (:connect? opts true))]
+          (if needs-network?
+            (let [conn-res (connect-validators! identity bootstrap opts)]
+              (if-not (:ok? conn-res)
+                (let [err-resp {"ok" false "error" (or (:error conn-res) "listener-disabled")}]
+                  (emit-json-line! out-writer err-resp)
+                  err-resp)
+                (let [sent? (send-all-envelopes! (:send-fn conn-res) (:net-envelopes res))]
+                  (when-let [n (:node conn-res)]
+                    (try (api/close! n) (catch Exception _ nil)))
+                  (if sent?
+                    (do
+                      (save-light-state! state-file new-state)
+                      (emit-json-line! out-writer (:response res))
+                      (:response res))
+                    (let [err-resp {"ok" false "error" "connection-closed"}]
+                      (emit-json-line! out-writer err-resp)
+                      err-resp)))))
+            (do
+              (save-light-state! state-file new-state)
+              (emit-json-line! out-writer (:response res))
+              (:response res))))))))
 
 (defn run-light-node-cli!
   "Dispatches light-node CLI invocation based on parsed arguments."

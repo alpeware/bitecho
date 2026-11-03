@@ -2500,7 +2500,7 @@
         (is (> (:epoch st-pruned) 2))
         (is (not (contains? (:messages st-pruned) msg-id)))
         (is (not (contains? (:contagion-known-ids st-pruned) msg-id)))
-        (is (contains? (get-in st-pruned [:murmur-cache :set]) msg-id))
+        (is (not (contains? (get-in st-pruned [:murmur-cache :set]) msg-id)))
         (let [res-summary (sm/handle-event st-pruned {:type :receive-summary :sender "peer-remote" :summary #{msg-id}})]
           (is (empty? (filter (fn [cmd]
                                 (and (= :send-pull-request (:type cmd))
@@ -2540,7 +2540,7 @@
                   (and (= (- initial-balance burn-amt) bal-after-1)
                        (not (contains? (:messages st-pruned) msg-id))
                        (not (contains? (:contagion-known-ids st-pruned) msg-id))
-                       (contains? (get-in st-pruned [:murmur-cache :set]) msg-id)
+                       (not (contains? (get-in st-pruned [:murmur-cache :set]) msg-id))
                        (empty? pull-commands)
                        (= bal-after-1 bal-after-2)))))
 

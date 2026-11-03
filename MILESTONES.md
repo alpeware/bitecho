@@ -227,9 +227,9 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ### Milestone 4 (Pillar A): Transport Durability, STUN/Reaper Fix & Light-Node Reconnect Liveness
 
-#### Step 4A — `clj-datachannel` Transport & Reaper Fix (`8057c16`) — **`[BUILT & VERIFIED]`**
+#### Step 4A — `clj-datachannel` Transport & Reaper Fix (`2abeab8`) — **`[BUILT & VERIFIED]`**
 1. **Parse STUN `USERNAME` (`0x0006`) & Bidirectional Validator Keepalive**:
-   - `datachannel.stun/handle-packet` rewinds and parses `ATTR_USERNAME` on Binding Requests after message-integrity validation. Splits `local-ufrag:remote-ufrag`, asserts target ufrag matches local `ice-ufrag` (or rejects), and populates `:remote-ice-ufrag` and `:remote-ice-pwd` in `datachannel.core/handle-receive` for symmetric keepalive routing.
+   - `datachannel.stun/handle-packet` rewinds and parses `ATTR_USERNAME` (`0x0006`) on Binding Requests after message-integrity validation. Splits `local-ufrag:remote-ufrag`, asserts target ufrag matches local `ice-ufrag` (or rejects), and `datachannel.core/handle-receive` populates `:remote-ice-ufrag` from the STUN request and resolves `:remote-ice-pwd` via `:peer-ice-pwds` (populated on validators via authenticated `:register-home-set` envelopes and `api/set-remote-ice-credentials!`) for symmetric keepalive routing.
    - `create-connection` retains `:peer-ice-pwds` from options, and `handle-receive` resolves peer passwords across both static maps and dynamic `IDeref` atoms. Added pure `:set-remote-ice-credentials` event and `api/set-remote-ice-credentials!` helper.
    - Isolated network packet transmissions in `api/apply-action!` with `try/catch` so transport socket exceptions never abort application lifecycle callbacks (`:on-close`, `:on-error`).
 2. **Traffic-Aware Idleness Tracking (`last-any-traffic` / SCTP State)**:
@@ -244,11 +244,11 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 #### Step 4B — `bitecho.shell.light-node` Proactive Reconnect & Non-Double-Burn Replay — **`[BUILT & VERIFIED]`**
 1. **Proactive Reconnect on `:on-close` (Rule 4 & Rule 5)**:
    - When `:on-close` fires in `make-client-callbacks`, transitions `conn-atom` through `transition-conn` and drives bounded exponential-backoff reconnect via `attempt-proactive-reconnect!` (up to 3 attempts, configurable backoff).
-   - In `make-client-callbacks` (`:on-close`), inspects `was-open? (= :open (:phase @conn-atom))` before state transition, guaranteeing duplicate same-generation `:on-close` callbacks on an already-failed/closed generation never invoke `attempt-proactive-reconnect!` a second time.
+   - In `make-client-callbacks` (`:on-close`), deduplicates by generation (`already-closed-this-gen?` when `@conn-atom` is already `:failed` or `:down` for the same generation), guaranteeing both pre-open (`:dialing`) and post-open (`:open`) `:on-close` events trigger `attempt-proactive-reconnect!` while duplicate same-generation `:on-close` callbacks never invoke `attempt-proactive-reconnect!` a second time.
    - Upon reconnect, `reconnect-fn` calls `(build-reconnect-recovery-envelopes @state-atom privkey)`, automatically re-registering `:home-set` candidates (carrying `:ice-ufrag` and `:ice-pwd` at current epoch and nil epoch) and replaying unacknowledged session outbox envelopes.
-2. **Preserve `:autonomous? false` Default & Ingress Credential Population**:
+2. **Preserve `:autonomous? false` Default & Scoped Ingress Credential Population**:
    - `run-serve!`, `run-one-shot!`, and reconnect recovery strictly preserve `:autonomous? false` by default, preventing unexpected auto-acceptance unless `--autonomous` was explicitly specified by the operator.
-   - In `src/bitecho/shell/mesh.clj`, `init-agent-listener!` and `init-agent-tcp-listener!` pass a shared `:peer-ice-pwds` atom, and `make-agent-connection-handler` updates credentials on incoming authenticated agent `:register-home-set` envelopes, enabling validator-to-agent bidirectional keepalive emission. Added `init-mesh-listener!` with static peer password maps.
+   - In `src/bitecho/shell/mesh.clj`, `init-agent-listener!` and `init-agent-tcp-listener!` pass a shared `:peer-ice-pwds` atom, and `make-agent-connection-handler` updates credentials strictly on incoming authenticated agent `:register-home-set` envelopes with ufrag ownership verification (`[:owner ufrag] -> sender`), enabling validator-to-agent bidirectional keepalive emission while preventing cross-agent ufrag poisoning.
 3. **Idempotent Non-Double-Burn Outbox Replay & LOW 6 Resolution**:
    - Replay strictly reuses cached `:gossip-env` entries from `:outbox` to preserve exact original `:message-id`s (`sha256(payload-bytes)`), eliminating duplicate burns and preventing validator double-spend rejections.
    - Closed **LOW 6**: Updated envelope path assertions in `test/bitecho/light_node/core_test.clj` and `test/bitecho/shell/light_node_test.clj` to inspect `(get-in env [:event :message :message-id])` and `(get-in env [:event :message :payload])` and assert non-nil `orig-msg-id`, ensuring envelope assertions are strictly non-vacuous.
@@ -258,14 +258,25 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ### Milestone 5 (Pillar B): In-Band Validator $\rightarrow$ Light-Node Authenticated Chain State Sync (Over Port 5010/DTLS)
 
-#### Step 5A — Signed/Authenticated Chain State Snapshot & Multi-Validator Cross-Check
+#### Step 5A — Signed/Authenticated Chain State Snapshot & Multi-Validator Cross-Check — **`[BUILT & VERIFIED]`**
 1. **In-Band `:query-chain-state` / `:chain-state-snapshot` Protocol**:
-   - Extend the port `5010` / DTLS agent channel with an authenticated in-band chain-state query/response protocol (complementing out-of-band HTTP `fetch-validator-accountz`).
-   - Validator responses carry a validator-signed snapshot covering the querying agent's finalized `balance`, `spendable`, `seq`, `deps`, `finalized_epoch`, and the statuses (`:locked` / `:released` / `:refunded`, `:settled-epoch`, `:net-amount`, `:refund-reason`) of escrows involving the agent.
+   - Extended the Port `5010` / DTLS agent channel with an authenticated in-band chain-state query/response protocol (complementing out-of-band HTTP `fetch-validator-accountz`).
+   - Query envelopes carry authenticated `{:type :query-chain-state :pubkey <hex> :nonce <str>}` signed by agent Ed25519 identity.
+   - Validator responses carry a validator-signed `:chain-state-snapshot` covering the querying agent's finalized `balance`, `spendable`, `seq`, `deps`, `finalized_epoch`, and the statuses (`:locked` / `:released` / `:refunded`, `:settled-epoch`, `:net-amount`, `:refund-reason`) of escrows involving the agent.
 2. **Multi-Validator Quorum Cross-Check & Fail-Closed Verification**:
-   - Cross-check signed snapshots across the bootstrap validator set (`node1`, `node2`, `node3`), verifying validator Ed25519 signatures and failing closed on stale or disagreeing responses.
+   - Implemented pure `canonical-chain-state-snapshot-str`, `sign-chain-state-snapshot`, `verify-chain-state-snapshot`, and `verify-chain-state-quorum`.
+   - Cross-checks signed snapshots across the bootstrap validator set, verifying validator Ed25519 signatures, verifying epoch freshness, and failing closed on stale epochs, untrusted validators, tampered signatures, or state disagreement across quorum.
+   - Wire payload processing (`handle-wire-payload`) explicitly bypasses the 2-epoch skew drop for incoming `:chain-state-snapshot`, enabling light nodes to fast-forward from genesis/epoch 1 to finalized chain epoch without false drop.
 3. **Light-Node `sync-account` & `escrows` Integration**:
-   - Wire in-band snapshot verification directly into `sync-account` / `account` and `escrows` so any client-only light-node daemon can independently verify finalized chain state and escrow settlement without out-of-band validator access.
+   - Wired in-band snapshot verification directly into `maybe-sync-account-state!` with primary in-band DTLS/DataChannel parallel querying and fallback to HTTP.
+   - Wired `sync-account`, `account --sync`, and `escrows --sync` in `run-serve!` and `run-one-shot!`, immediately failing closed on quorum error or state divergence.
+4. **Milestone 4 Follow-Ups & Generative Verification**:
+   - Remediated **HIGH 1** with secure random ICE credentials (`generate-random-ice-creds`), persistence in `node-identity.edn`, and automatic rotation of legacy deterministic passwords on read.
+   - Remediated **MEDIUM 2** with generation-deduplicated `:on-close` reconnect triggers covering both pre-open dialing and open phases.
+   - Remediated **LOW 4** with strict `:register-home-set` scoping and anti-poisoning ownership checks for peer ICE credentials.
+   - Remediated **LOW 5** removing dead code and updating documentation.
+   - Remediated **Cross-Validator Unacked Replay Fix** by pruning `:murmur-cache` on TTL eviction and preventing redundant gossip re-burns.
+   - Verified via generative property test `prop-inband-chain-state-snapshot-quorum-and-fail-closed` (50 runs), unit/integration tests `test-ice-random-credentials-generation-and-rotation` and `test-inband-chain-state-sync-and-escrows-quorum`. All 348 tests pass; 0 lint warnings.
 
 ---
 

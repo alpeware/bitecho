@@ -2257,7 +2257,7 @@
   (prop/for-all [epoch (gen/choose 1 50)
                  burn (gen/choose 200 800)
                  topic (gen/elements ["greeting" "file-transfer" "query" "attest"])
-                 text (gen/not-empty gen/string-ascii)]
+                 text gen-text-message]
                 (let [caller-id (test-identity)
                       _caller-pub (:pubkey-hex caller-id)
                       caller-priv (:privkey-bytes caller-id)
@@ -2635,6 +2635,125 @@
             b-rx-new (light-core/handle-wire-payload st-b-open new-env priv-b)]
         (is (= 1 (count (:inbox (:state b-rx-new)))))
         (is (= "message while alice is at 971" (:text (first (:inbox (:state b-rx-new))))))))))
+
+;; -----------------------------------------------------------------------------
+;; Milestone 5 (Pillar B): Generative Quorum & Wire Skew Bypass Tests
+;; -----------------------------------------------------------------------------
+
+(defspec ^{:doc "Property: inband chain-state snapshot quorum, wire bypass, and fail-closed invariants across validator state disagreement, untrusted nodes, and tampered signatures"}
+  prop-inband-chain-state-snapshot-quorum-and-fail-closed 50
+  (prop/for-all [bal (gen/choose 1000 50000)
+                 spd-offset (gen/choose 0 500)
+                 seq-num (gen/choose 1 100)
+                 fin-ep (gen/choose 10 500)
+                 num-escrows (gen/choose 0 3)]
+                (let [user-kp (crypto/generate-keypair)
+                      user-pub (basalt/bytes->hex (:public user-kp))
+                      user-priv (:private user-kp)
+                      spd (max 0 (- bal spd-offset))
+                      val-kps [(crypto/generate-keypair) (crypto/generate-keypair) (crypto/generate-keypair)]
+                      val-pubs (mapv #(basalt/bytes->hex (:public %)) val-kps)
+                      trusted (set val-pubs)
+                      bootstrap {:nodes {"v1" {:pubkey (nth val-pubs 0) :ip "127.0.0.1" :port 5001 :fingerprint "FP1"}
+                                         "v2" {:pubkey (nth val-pubs 1) :ip "127.0.0.1" :port 5002 :fingerprint "FP2"}
+                                         "v3" {:pubkey (nth val-pubs 2) :ip "127.0.0.1" :port 5003 :fingerprint "FP3"}}}
+                      init-st (assoc (light-core/init-light-state {:identity {:pubkey-hex user-pub}} {:bootstrap bootstrap})
+                                     :epoch 1)
+                      statuses [:locked :released :refunded]
+                      escrows (vec (for [i (range num-escrows)]
+                                     (let [st-val (nth statuses (mod i 3))]
+                                       (cond-> {:escrow-id (str "esc-" i)
+                                                :payer user-pub
+                                                :receiver (sample-pubkey-hex)
+                                                :amount (+ 100 (* i 50))
+                                                :deliverable-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (str "deliv-" i) "UTF-8")))
+                                                :created-epoch (max 0 (- fin-ep 5))
+                                                :expires-epoch (+ fin-ep 10)
+                                                :status st-val}
+                                         (= st-val :released) (assoc :settled-epoch fin-ep :net-amount (+ 95 (* i 50)))
+                                         (= st-val :refunded) (assoc :settled-epoch fin-ep :refund-reason "timeout")))))
+                      deps [(str "dep-" seq-num)]
+                      base-snap {:pubkey user-pub
+                                 :finalized-epoch fin-ep
+                                 :balance bal
+                                 :spendable spd
+                                 :seq seq-num
+                                 :deps deps
+                                 :escrows escrows
+                                 :nonce "test-nonce"}
+                      signed-snaps (mapv (fn [i]
+                                           (light-core/sign-chain-state-snapshot
+                                            (assoc base-snap :validator-pubkey (nth val-pubs i))
+                                            (:private (nth val-kps i))))
+                                         (range 3))
+                      opts {:expected-pubkey user-pub
+                            :trusted-validators trusted
+                            :min-finalized-epoch 5}
+          ;; 1. Valid 3/3 quorum succeeds and updates state correctly
+                      q-res (light-core/verify-chain-state-quorum signed-snaps opts)
+                      applied (when (:ok? q-res) (light-core/apply-verified-chain-state-snapshot init-st (:snapshot q-res)))]
+                  (and (:ok? q-res)
+                       (= 3 (:quorum-count q-res))
+                       (= bal (get-in applied [:account :balance]))
+                       (= spd (get-in applied [:account :spendable]))
+                       (= seq-num (get-in applied [:account :seq]))
+                       (= (max 1 fin-ep) (:epoch applied))
+                       (= (count escrows) (count (:escrows applied)))
+
+           ;; 2. Valid 2/3 agreement succeeds
+                       (let [q2-res (light-core/verify-chain-state-quorum [(nth signed-snaps 0) (nth signed-snaps 1)] opts)]
+                         (and (:ok? q2-res) (= 2 (:quorum-count q2-res))))
+
+             ;; 3. Tampered balance or signature fails closed ("invalid-snapshot-signature")
+                       (let [tampered (assoc (nth signed-snaps 0) :balance (inc bal))
+                             t-res (light-core/verify-chain-state-quorum [tampered (nth signed-snaps 1) (nth signed-snaps 2)] opts)]
+                         (and (false? (:ok? t-res))
+                              (= "invalid-snapshot-signature" (:error t-res))))
+
+             ;; 4. Untrusted validator fails closed ("untrusted-validator")
+                       (let [rogue-kp (crypto/generate-keypair)
+                             rogue-pub (basalt/bytes->hex (:public rogue-kp))
+                             rogue-snap (light-core/sign-chain-state-snapshot
+                                         (assoc base-snap :validator-pubkey rogue-pub)
+                                         (:private rogue-kp))
+                             u-res (light-core/verify-chain-state-quorum [rogue-snap (nth signed-snaps 1) (nth signed-snaps 2)] opts)]
+                         (and (false? (:ok? u-res))
+                              (= "untrusted-validator" (:error u-res))))
+
+             ;; 5. Stale finalized epoch fails closed ("stale-finalized-epoch")
+                       (let [stale-opts (assoc opts :min-finalized-epoch (+ fin-ep 100))
+                             stale-res (light-core/verify-chain-state-quorum signed-snaps stale-opts)]
+                         (and (false? (:ok? stale-res))
+                              (= "stale-finalized-epoch" (:error stale-res))))
+
+             ;; 6. Disagreement among validators (different balances at same epoch) fails closed ("validator-state-disagreement")
+                       (let [disagree-snap (light-core/sign-chain-state-snapshot
+                                            (assoc base-snap :validator-pubkey (nth val-pubs 2) :balance (+ bal 1000))
+                                            (:private (nth val-kps 2)))
+                             d-res (light-core/verify-chain-state-quorum [(nth signed-snaps 0) (nth signed-snaps 1) disagree-snap] opts)]
+                         (and (false? (:ok? d-res))
+                              (= "validator-state-disagreement" (:error d-res))))
+
+             ;; 7. Excessive epoch skew (> 2) fails closed ("validator-epoch-skew-exceeded")
+                       (let [skewed-snap (light-core/sign-chain-state-snapshot
+                                          (assoc base-snap :validator-pubkey (nth val-pubs 2) :finalized-epoch (+ fin-ep 5))
+                                          (:private (nth val-kps 2)))
+                             sk-res (light-core/verify-chain-state-quorum [(nth signed-snaps 0) (nth signed-snaps 1) skewed-snap] opts)]
+                         (and (false? (:ok? sk-res))
+                              (= "validator-epoch-skew-exceeded" (:error sk-res))))
+
+             ;; 8. Inbound :chain-state-snapshot via handle-wire-payload advances light node at epoch 1 to 6600 without skew drop
+                       (let [advance-snap (light-core/sign-chain-state-snapshot
+                                           (assoc base-snap :validator-pubkey (nth val-pubs 0) :finalized-epoch 6600)
+                                           (:private (nth val-kps 0)))
+                             wire-res (light-core/handle-wire-payload init-st advance-snap user-priv)
+                             post-st (:state wire-res)
+                             stdout (first (:stdout-events wire-res))]
+                         (and (= 6600 (get-in post-st [:account :finalized-epoch]))
+                              (= 6600 (:epoch post-st))
+                              (some? stdout)
+                              (= "chain-state-synced" (get stdout "event"))
+                              (= 6600 (get stdout "finalized_epoch"))))))))
 
 
 

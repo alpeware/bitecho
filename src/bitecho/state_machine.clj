@@ -635,7 +635,13 @@
                   evicted (subvec ord 0 overflow)
                   kept (subvec ord overflow)]
               [(reduce disj s evicted) kept])
-            [s ord]))]
+            [s ord]))
+        pruned-murmur-cache (if (and (:murmur-cache state) (seq expired-ids))
+                              {:set (set/difference (or (get-in state [:murmur-cache :set]) #{}) expired-ids)
+                               :queue (into clojure.lang.PersistentQueue/EMPTY
+                                            (remove #(contains? expired-ids %)
+                                                    (or (get-in state [:murmur-cache :queue]) [])))}
+                              (:murmur-cache state))]
     (-> (assoc state
                :epoch-to-messages pruned-epoch-to-messages
                :epoch-to-message-roles pruned-epoch-to-roles
@@ -664,7 +670,8 @@
                :executed-finalized-blocks-order pruned-exec-blocks-ord
                :escrows pruned-escrows
                :settled-escrow-ids pruned-tracked-settled-escrows
-               :settled-escrow-order pruned-settled-escrows-ord)
+               :settled-escrow-order pruned-settled-escrows-ord
+               :murmur-cache pruned-murmur-cache)
         (prune-rendezvous-retention-state rdv-cutoff))))
 
 (defn- collect-ancestor-receipt-ids
@@ -1003,7 +1010,15 @@
   "Handles an incoming Contagion anti-entropy summary."
   [state event]
   (let [remote-summary (:summary event)
-        known-ids (set/union (:contagion-known-ids state) (get-in state [:murmur-cache :set] #{}))
+        known-burn-mids (into #{}
+                              (keep (fn [rid]
+                                      (when (string/starts-with? rid "gossip-burn:")
+                                        (subs rid (count "gossip-burn:")))))
+                              (set/union (or (:known-receipt-ids state) #{})
+                                         (or (:executed-receipt-ids state) #{})))
+        known-ids (set/union (:contagion-known-ids state)
+                             (get-in state [:murmur-cache :set] #{})
+                             known-burn-mids)
         missing-ids (contagion/lazy-pull known-ids remote-summary)
         commands (if (seq missing-ids)
                    [{:type :send-pull-request
@@ -1129,34 +1144,48 @@
             current-epoch (or (:epoch state) 0)]
         (if (consensus-mode? state)
           (if new-message?
-            (if (and (not= sender node-pk) sender)
-              (if (and (get-in state [:ledger sender])
-                       (>= (spendable-balance state sender) burn-amt))
-                (let [staged (stage-receipt state {:receipt-id (str "gossip-burn:" msg-id)
-                                                   :type :burn
-                                                   :sender sender
-                                                   :amount burn-amt})]
-                  (if (:ok? staged)
-                    (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
-                    {:state state :commands []}))
-                {:state state :commands []})
-              (let [staged (stage-receipt state {:receipt-id (str "gossip-burn:" msg-id)
-                                                 :type :burn
-                                                 :sender sender
-                                                 :amount burn-amt})]
-                (if (:ok? staged)
-                  (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
-                  {:state state :commands []})))
+            (let [burn-rid (str "gossip-burn:" msg-id)
+                  already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
+                                      (contains? (or (:executed-receipt-ids state) #{}) burn-rid))]
+              (if already-burned?
+                (record-accepted-gossip state message gossip-result new-message? current-epoch)
+                (if (and (not= sender node-pk) sender)
+                  (if (and (get-in state [:ledger sender])
+                           (>= (spendable-balance state sender) burn-amt))
+                    (let [staged (stage-receipt state {:receipt-id burn-rid
+                                                       :type :burn
+                                                       :sender sender
+                                                       :amount burn-amt})]
+                      (if (:ok? staged)
+                        (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
+                        {:state state :commands []}))
+                    {:state state :commands []})
+                  (let [staged (stage-receipt state {:receipt-id burn-rid
+                                                     :type :burn
+                                                     :sender sender
+                                                     :amount burn-amt})]
+                    (if (:ok? staged)
+                      (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
+                      {:state state :commands []})))))
             (record-accepted-gossip state message gossip-result new-message? current-epoch))
           ;; Standalone non-consensus mode
-          (let [burn-deduction (when (and new-message? (not= sender node-pk) sender)
+          (let [burn-rid (str "gossip-burn:" msg-id)
+                already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
+                                    (contains? (or (:executed-receipt-ids state) #{}) burn-rid))
+                burn-deduction (when (and new-message? (not already-burned?) (not= sender node-pk) sender)
                                  (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
-            (if (and new-message? (not= sender node-pk) (nil? burn-deduction))
+            (if (and new-message? (not already-burned?) (not= sender node-pk) (nil? burn-deduction))
               {:state state :commands []}
-              (let [state-with-burn (if burn-deduction
-                                      (-> state
-                                          (assoc :ledger (:ledger burn-deduction))
-                                          (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt))
+              (let [state-with-burn (if (and burn-deduction (not already-burned?))
+                                      (let [[next-known next-known-ord] (fifo-track (:known-receipt-ids state)
+                                                                                    (:known-receipt-order state)
+                                                                                    burn-rid
+                                                                                    (long (or (get-in state [:config :max-tracked-receipts]) 10000)))]
+                                        (-> state
+                                            (assoc :ledger (:ledger burn-deduction))
+                                            (assoc :known-receipt-ids next-known
+                                                   :known-receipt-order next-known-ord)
+                                            (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt)))
                                       state)]
                 (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch))))))
       {:state state :commands []})))

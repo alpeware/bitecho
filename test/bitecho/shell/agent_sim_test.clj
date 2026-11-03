@@ -207,9 +207,28 @@
           (let [on-msg (:on-message @child-callbacks)]
             (is (fn? on-msg))
             (on-msg {:payload frozen :channel-id 0})
-            (is (= {ufrag pwd} @peer-ice-pwds) "peer-ice-pwds atom must be updated with agent credentials")
+            (is (= pwd (get @peer-ice-pwds ufrag)) "peer-ice-pwds atom must be updated with agent credentials")
+            (is (= agent-pub-hex (get @peer-ice-pwds [:owner ufrag])) "peer-ice-pwds must record owner sender pubkey")
             (is (= ufrag (:remote-ice-ufrag @child-state)) "child node state must have remote-ice-ufrag")
-            (is (= pwd (:remote-ice-pwd @child-state)) "child node state must have remote-ice-pwd")))))))
+            (is (= pwd (:remote-ice-pwd @child-state)) "child node state must have remote-ice-pwd")
+
+            ;; 1. Non-:register-home-set event (e.g. :settle-intent with spoofed credentials) does NOT ingest
+            (let [spoofed-ufrag "spoofed-ufrag"
+                  spoofed-pwd "spoofed-pwd"
+                  settle-payload {:type :settle-intent :payer agent-pub-hex :receiver "rec-pubkey" :amount 10
+                                  :ice-ufrag spoofed-ufrag :ice-pwd spoofed-pwd}
+                  settle-env (mesh/wrap-agent-event settle-payload agent-pub-hex agent-priv-bytes)]
+              (on-msg {:payload (nippy/freeze settle-env) :channel-id 0})
+              (is (nil? (get @peer-ice-pwds spoofed-ufrag)) "Non-:register-home-set event must NOT ingest credentials into peer-ice-pwds"))
+
+            ;; 2. A second agent cannot overwrite/poison an existing ufrag owned by the first agent
+            (let [agent2-kp (crypto/generate-keypair)
+                  agent2-pub (basalt/bytes->hex (:public agent2-kp))
+                  agent2-priv (:private agent2-kp)
+                  malicious-env (sim/build-home-set-envelope agent2-pub agent2-priv candidates price epoch ufrag "poisoned-pwd")]
+              (on-msg {:payload (nippy/freeze malicious-env) :channel-id 0})
+              (is (= pwd (get @peer-ice-pwds ufrag)) "Second agent must NOT overwrite existing ufrag credentials")
+              (is (= agent-pub-hex (get @peer-ice-pwds [:owner ufrag])) "Ownership must remain with first agent"))))))))
 
 (deftest test-parse-sim-args
   (testing "parse-sim-args applies defaults when flags omitted"

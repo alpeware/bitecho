@@ -1651,7 +1651,7 @@
                                         (range 1 (inc outbox-count))))))))))
 
 (deftest test-duplicate-same-generation-on-close-invokes-reconnect-only-once
-  (testing "Duplicate same-generation :on-close callback invokes reconnect-fn only once"
+  (testing "Post-open (:open) duplicate same-generation :on-close callback invokes reconnect-fn only once"
     (let [kp (crypto/generate-keypair)
           pub (basalt/bytes->hex (:public kp))
           priv (:private kp)
@@ -1672,7 +1672,181 @@
       (on-close nil)
       (is (= 1 @reconn-count) "First :on-close must trigger reconnect-fn")
 
-      ;; Duplicate same-generation :on-close invocation (when :phase is no longer :open)
+      ;; Duplicate same-generation :on-close invocation (when :phase is already :failed or :down)
       (on-close nil)
-      (is (= 1 @reconn-count) "Duplicate same-generation :on-close must NOT trigger reconnect-fn a second time"))))
+      (is (= 1 @reconn-count) "Duplicate same-generation :on-close must NOT trigger reconnect-fn a second time")))
+
+  (testing "Pre-open (:dialing) :on-close callback ALSO invokes reconnect-fn once, and duplicate ignores"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          priv (:private kp)
+          st-atom (atom {:pubkey pub :epoch 1 :home-set [] :autonomous? false :connected? false :connection-error nil})
+          conn-atom (atom (assoc (light-shell/init-conn-state) :phase :dialing :generation 2))
+          reconn-count (atom 0)
+          mock-reconnect (fn []
+                           (swap! reconn-count inc)
+                           {:ok? true :phase :dialing})
+          ctx {:identity {:pubkey-hex pub :privkey-bytes priv}
+               :state-atom st-atom
+               :conn-atom conn-atom
+               :reconnect-fn mock-reconnect
+               :generation 2}
+          callbacks (light-shell/make-client-callbacks nil (atom "cid") (promise) (atom nil) ctx)
+          on-close (:on-close callbacks)]
+      ;; First :on-close invocation during :dialing
+      (on-close nil)
+      (is (= 1 @reconn-count) "Pre-open (:dialing) :on-close must trigger reconnect-fn")
+
+      ;; Duplicate same-generation :on-close invocation
+      (on-close nil)
+      (is (= 1 @reconn-count) "Duplicate pre-open same-generation :on-close must NOT trigger reconnect-fn a second time"))))
+
+(deftest test-inband-chain-state-sync-and-escrows-quorum
+  (testing "Milestone 5 (Pillar B): In-band validator quorum sync, fail-closed on tampered snapshots, and CLI verb/flag integration"
+    (let [val-kps [(crypto/generate-keypair) (crypto/generate-keypair) (crypto/generate-keypair)]
+          val-pubs (mapv #(basalt/bytes->hex (:public %)) val-kps)
+          trusted-set (set val-pubs)
+          bootstrap {:nodes {"v1" {:pubkey (nth val-pubs 0) :ip "127.0.0.1" :port 5001 :fingerprint "FP1"}
+                             "v2" {:pubkey (nth val-pubs 1) :ip "127.0.0.1" :port 5002 :fingerprint "FP2"}
+                             "v3" {:pubkey (nth val-pubs 2) :ip "127.0.0.1" :port 5003 :fingerprint "FP3"}}}
+          user-kp (crypto/generate-keypair)
+          user-pub (basalt/bytes->hex (:public user-kp))
+          user-priv (:private user-kp)
+          peer-pub (sample-pubkey-hex)
+          deliv-hash (basalt/bytes->hex (crypto/sha256 (.getBytes "deliverable-1" "UTF-8")))
+          escrows [{:escrow-id "e1"
+                    :payer user-pub
+                    :receiver peer-pub
+                    :amount 500
+                    :deliverable-hash deliv-hash
+                    :created-epoch 90
+                    :expires-epoch 150
+                    :status :locked}]
+          base-snap {:pubkey user-pub
+                     :finalized-epoch 100
+                     :balance 5000
+                     :spendable 4500
+                     :seq 3
+                     :deps ["dep-3"]
+                     :escrows escrows
+                     :nonce "test-nonce"}
+          valid-snaps (mapv (fn [i]
+                              (light-core/sign-chain-state-snapshot
+                               (assoc base-snap :validator-pubkey (nth val-pubs i))
+                               (:private (nth val-kps i))))
+                            (range 3))
+          init-st (assoc (light-core/init-light-state {:identity {:pubkey-hex user-pub}} {:bootstrap bootstrap})
+                         :epoch 1)
+          st-atom (atom init-st)
+          identity {:pubkey-hex user-pub :privkey-bytes user-priv}
+          fetcher-ok (fn [_pk] valid-snaps)
+          conn-opts {:inband-snapshot-fetcher fetcher-ok}]
+
+      ;; 1. maybe-sync-account-state! with valid quorum updates account state and returns {:ok? true}
+      (let [res (light-shell/maybe-sync-account-state! st-atom bootstrap user-pub user-priv conn-opts)]
+        (is (true? (:ok? res)))
+        (is (= 100 (:epoch @st-atom)))
+        (is (= 5000 (get-in @st-atom [:account :balance])))
+        (is (= 4500 (get-in @st-atom [:account :spendable])))
+        (is (= 3 (get-in @st-atom [:account :seq])))
+        (is (= ["dep-3"] (get-in @st-atom [:account :deps])))
+        (is (= 1 (count (:escrows @st-atom))))
+        (is (= 500 (get-in @st-atom [:escrows "e1" :amount]))))
+
+      ;; 2. maybe-sync-account-state! fails closed on invalid snapshot signature or quorum disagreement
+      (let [tampered-snaps (assoc-in valid-snaps [0 :signature] "0000000000000000")
+            fetcher-bad (fn [_pk] tampered-snaps)
+            bad-opts {:inband-snapshot-fetcher fetcher-bad}
+            pre-st @st-atom
+            bad-res (light-shell/maybe-sync-account-state! st-atom bootstrap user-pub user-priv bad-opts)]
+        (is (false? (:ok? bad-res)))
+        (is (= "invalid-snapshot-signature" (:error bad-res)))
+        (is (= pre-st @st-atom) "State must not mutate on failed quorum verification"))
+
+      ;; 3. handle-serve-line! with sync-account, account --sync, and escrows --sync
+      (let [temp-dir (Files/createTempDirectory "bitecho-test-sync-serve" (into-array FileAttribute []))
+            state-file (str (io/file (str temp-dir) "state.nippy"))
+            sw (StringWriter.)
+            out-w (PrintWriter. sw)
+            ctx {:state-atom st-atom
+                 :conn-atom (atom (light-shell/init-conn-state))
+                 :out-writer out-w
+                 :state-file state-file
+                 :identity identity
+                 :bootstrap bootstrap
+                 :conn-opts conn-opts}]
+        ;; (a) account --sync
+        (light-shell/handle-serve-line! (json/write-str {"cmd" "account" "sync" true}) ctx)
+        (let [line (last (str/split-lines (.toString sw)))
+              parsed (json/read-str line)]
+          (is (= true (get parsed "ok")))
+          (is (= 5000 (get parsed "balance")))
+          (is (= 4500 (get parsed "spendable"))))
+
+        ;; (b) escrows --sync
+        (light-shell/handle-serve-line! (json/write-str {"cmd" "escrows" "sync" true}) ctx)
+        (let [line (last (str/split-lines (.toString sw)))
+              parsed (json/read-str line)
+              esc-list (get parsed "escrows")
+              first-esc (first esc-list)]
+          (is (= true (get parsed "ok")))
+          (is (seq esc-list))
+          (is (= "e1" (get first-esc "escrow_id")))
+          (is (= 500 (get first-esc "amount"))))
+
+        ;; (c) sync-account
+        (light-shell/handle-serve-line! (json/write-str {"cmd" "sync-account"}) ctx)
+        (let [line (last (str/split-lines (.toString sw)))
+              parsed (json/read-str line)]
+          (is (= true (get parsed "ok")))
+          (is (= 5000 (get parsed "balance")))
+          (is (= 4500 (get parsed "spendable"))))
+
+        ;; (d) Fail-closed on bad sync in handle-serve-line!
+        (let [disagree-snap (light-core/sign-chain-state-snapshot
+                             (assoc base-snap :validator-pubkey (nth val-pubs 1) :balance 999999)
+                             (:private (nth val-kps 1)))
+              disagree-snaps [(nth valid-snaps 0) disagree-snap (nth valid-snaps 2)]
+              bad-ctx (assoc ctx :conn-opts {:inband-snapshot-fetcher (fn [_pk] disagree-snaps)})]
+          (light-shell/handle-serve-line! (json/write-str {"cmd" "account" "sync" true}) bad-ctx)
+          (let [line (last (str/split-lines (.toString sw)))
+                parsed (json/read-str line)]
+            (is (= false (get parsed "ok")))
+            (is (= "validator-state-disagreement" (get parsed "error"))))))
+
+      ;; 4. Authenticated :query-chain-state envelope wrap/unwrap and validator snapshot building
+      (let [query-env (light-core/build-chain-state-query-envelope user-pub user-priv "nonce-abc")
+            unwrapped (mesh/unwrap-authenticated-agent-event query-env)]
+        (is (some? unwrapped))
+        (is (= :query-chain-state (:type unwrapped)))
+        (is (= user-pub (:pubkey unwrapped)))
+        (is (= "nonce-abc" (:nonce unwrapped)))
+
+        (let [val-kp (first val-kps)
+              val-pub (first val-pubs)
+              val-identity {:pubkey-hex val-pub :keypair {:public (:public val-kp) :private (:private val-kp)}}
+              val-node-state {:identity val-identity
+                              :epoch 120
+                              :last-executed-finalized-epoch 120
+                              :ledger {user-pub {:balance 7000 :spendable 6800 :seq 5 :deps ["d5"]}}
+                              :escrows {"e-v" {:escrow-id "e-v"
+                                               :payer user-pub
+                                               :receiver peer-pub
+                                               :amount 200
+                                               :deliverable-hash deliv-hash
+                                               :created-epoch 110
+                                               :expires-epoch 160
+                                               :status :locked}}}
+              val-snap (mesh/build-validator-chain-state-snapshot val-node-state val-identity user-pub "nonce-abc")]
+          (is (some? val-snap))
+          (is (= user-pub (:pubkey val-snap)))
+          (is (= val-pub (:validator-pubkey val-snap)))
+          (is (= 120 (:finalized-epoch val-snap)))
+          (is (= 7000 (:balance val-snap)))
+          (is (= 6800 (:spendable val-snap)))
+          (is (= 5 (:seq val-snap)))
+          (is (= "nonce-abc" (:nonce val-snap)))
+          (is (= 1 (count (:escrows val-snap))))
+          (let [v-res (light-core/verify-chain-state-snapshot val-snap {:expected-pubkey user-pub :trusted-validators trusted-set})]
+            (is (true? (:ok? v-res)))))))))
 

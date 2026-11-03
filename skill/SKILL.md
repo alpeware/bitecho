@@ -620,10 +620,10 @@ Submits a timeout refund request for expired escrowed funds (or early receiver v
 ---
 
 ### `escrows`
-Lists all locally tracked escrows enriched with counterparty petnames and status.
+Lists all locally tracked escrows enriched with counterparty petnames and status. When invoked with `--sync`, synchronizes finalized account and escrow state directly from the validator mesh via authenticated in-band DTLS/DataChannel quorum verification.
 
-- **CLI**: `clojure -M:light-node escrows`
-- **JSONL**: `{"cmd": "escrows"}`
+- **CLI**: `clojure -M:light-node escrows [--sync]`
+- **JSONL**: `{"cmd": "escrows", "sync": true}`
 - **Response**:
   ```json
   {

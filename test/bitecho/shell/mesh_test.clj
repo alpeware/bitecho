@@ -279,6 +279,68 @@
           (doseq [f (reverse (file-seq temp-dir))]
             (.delete ^File f)))))))
 
+(deftest test-ice-random-credentials-generation-and-rotation
+  (testing "HIGH 1: random ICE credential generation and automatic rotation of legacy deterministic credentials"
+    (let [rnd1 (identity/generate-random-ice-creds)
+          rnd2 (identity/generate-random-ice-creds)
+          det (identity/deterministic-ice-creds :node-1)]
+      ;; 1. Random generator shapes and entropy
+      (is (= 8 (count (:ufrag rnd1))))
+      (is (= 24 (count (:pwd rnd1))))
+      (is (re-matches #"^[0-9a-f]{8}$" (:ufrag rnd1)))
+      (is (re-matches #"^[0-9a-f]{24}$" (:pwd rnd1)))
+      (is (not= (:pwd rnd1) (:pwd rnd2)) "Consecutive random ICE creds must be distinct")
+      (is (not= (:pwd rnd1) (:pwd det)) "Random ICE creds must not equal deterministic creds")
+
+      ;; 2. New identity gets random ICE creds and persists across reload
+      (let [temp-dir1 (.toFile (Files/createTempDirectory "bitecho-test-rnd-id1-" (into-array FileAttribute [])))
+            temp-dir2 (.toFile (Files/createTempDirectory "bitecho-test-rnd-id2-" (into-array FileAttribute [])))
+            sd1 (.getAbsolutePath temp-dir1)
+            sd2 (.getAbsolutePath temp-dir2)]
+        (try
+          (let [id-fresh1 (identity/load-or-create-node-identity! sd1 :node-rnd-1)
+                id-fresh2 (identity/load-or-create-node-identity! sd2 :node-rnd-2)]
+            (is (= 24 (count (get-in id-fresh1 [:ice-creds :pwd]))))
+            (is (not= (get-in id-fresh1 [:ice-creds :pwd]) (get-in id-fresh2 [:ice-creds :pwd])))
+            ;; Reload same dir
+            (let [reloaded (identity/load-or-create-node-identity! sd1 :node-rnd-1)]
+              (is (= (:ice-creds id-fresh1) (:ice-creds reloaded)))))
+
+          ;; 3. Legacy deterministic credentials upgrade/rotate on read
+          (let [legacy-kp (identity/generate-ed25519-keypair-map)
+                cert-data (dtls/generate-cert)
+                fp (identity/normalize-fingerprint (:fingerprint cert-data))
+                legacy-creds (identity/deterministic-ice-creds :node-legacy fp)
+                cert-pem (identity/encode-cert-pem (:cert cert-data))
+                key-pem (identity/encode-private-key-pem (:key cert-data))
+                legacy-file (io/file sd1 "identity" "node-identity.edn")
+                legacy-data {:node-id :node-legacy
+                             :pubkey-hex (:pubkey-hex legacy-kp)
+                             :privkey-hex (:privkey-hex legacy-kp)
+                             :cert-pem cert-pem
+                             :key-pem key-pem
+                             :fingerprint fp
+                             :ice-creds legacy-creds
+                             :ice-ufrag (:ufrag legacy-creds)
+                             :ice-pwd (:pwd legacy-creds)}]
+            (spit legacy-file (pr-str legacy-data))
+            ;; Call load-or-create-node-identity! on state-dir containing legacy identity
+            (let [upgraded (identity/load-or-create-node-identity! sd1 :node-legacy)
+                  upgraded-creds (:ice-creds upgraded)]
+              (is (not= (:pwd legacy-creds) (:pwd upgraded-creds))
+                  "Legacy deterministic ICE password must be automatically rotated")
+              (is (= 24 (count (:pwd upgraded-creds))))
+              ;; Verify on-disk file was updated
+              (let [on-disk (edn/read-string (slurp legacy-file))]
+                (is (= (:pwd upgraded-creds) (get-in on-disk [:ice-creds :pwd])))
+                (is (= (:pwd upgraded-creds) (:ice-pwd on-disk))))
+              ;; Second read retains the newly rotated random credentials
+              (let [reloaded (identity/load-or-create-node-identity! sd1 :node-legacy)]
+                (is (= upgraded-creds (:ice-creds reloaded))))))
+          (finally
+            (doseq [f (reverse (file-seq temp-dir1))] (.delete ^File f))
+            (doseq [f (reverse (file-seq temp-dir2))] (.delete ^File f))))))))
+
 (deftest test-generate-ed25519-keypair-map
   (testing "generate-ed25519-keypair-map creates verifiable keypair"
     (let [kp-map (identity/generate-ed25519-keypair-map)
