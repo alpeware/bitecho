@@ -1121,7 +1121,7 @@
             non-sender-peers (if hop-sender-hex
                                (filterv #(not= (peer-pubkey-hex %) hop-sender-hex) non-self-peers)
                                non-self-peers)
-            extracted-peers (if (seq non-sender-peers) non-sender-peers non-self-peers)
+            extracted-peers non-sender-peers
             gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
             new-message? (some? (:message gossip-result))
             sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
@@ -2363,9 +2363,7 @@
           current-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
                                 (:epoch state)
                                 (or (:epoch event) (:epoch state) 0)))
-          created-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
-                                (max (long (or (:created-epoch event) current-epoch)) (- current-epoch 168))
-                                (or (:created-epoch event) current-epoch)))
+          created-epoch (long (or (:created-epoch event) current-epoch))
           expires-epoch (long (:expires-epoch event))
           nonce (str (or (:nonce event) "0"))
           event-sender (:sender event)

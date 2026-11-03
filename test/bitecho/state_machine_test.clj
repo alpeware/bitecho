@@ -4051,6 +4051,30 @@
           (is (some? (get-in s-pruned [:escrows eid2])))
           (is (= :locked (get-in s-pruned [:escrows eid2 :status]))))))))
 
+(deftest test-consensus-lock-intent-rejects-stale-created-epoch
+  (testing "In consensus mode (with :peers-map), lock-intent with created-epoch < current-epoch - 168 is rejected without clamping"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          bob-kp (crypto/generate-keypair)
+          bob-pub (basalt/bytes->hex (:public bob-kp))
+          d-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub (account/map->AccountState {:balance 10000 :seq 0 :deps []})
+                                      bob-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+                     :peers-map {pub (:public kp)})
+          s0 (assoc (sm/init-state [] pub (assoc cfg :keypair kp)) :epoch 200)
+          ;; created-epoch 30 is < 200 - 168 = 32 -> stale!
+          res-stale (sm/handle-event s0 {:type :lock-intent
+                                         :payer pub
+                                         :receiver bob-pub
+                                         :amount 100
+                                         :deliverable-hash d-hash
+                                         :created-epoch 30
+                                         :expires-epoch 40
+                                         :sender pub})]
+      (is (= s0 (:state res-stale)))
+      (is (empty? (:pending-receipts (:state res-stale)))))))
+
 (deftest test-three-node-streamlet-escrow-finalization-convergence
   (testing "3-node Streamlet cluster converges on lock, release, and refund finalized block execution"
     (let [kps (take 3 (repeatedly crypto/generate-keypair))
@@ -4160,5 +4184,34 @@
                   (and (not (contains? view-pubs pub1))
                        (= #{pub2 pub3} view-pubs)
                        (= #{pub3} target-pubs)))))
+
+(deftest test-murmur-two-peer-view-never-echoes-back-to-sender
+  (testing "In a 2-peer network (self + hop-sender), handle-receive-gossip accepts message into cache and receipts but emits zero :send-gossip commands back to sender"
+    (let [kp1 (crypto/generate-keypair)
+          pub1 (basalt/bytes->hex (:public kp1))
+          kp2 (crypto/generate-keypair)
+          pub2 (basalt/bytes->hex (:public kp2))
+          peer2 {:pubkey pub2 :ip "127.0.0.1" :port 5002}
+          cfg (assoc config/devnet-config
+                     :murmur-k 2
+                     :genesis-ledger {pub1 (account/map->AccountState {:balance 100000 :seq 0 :deps []})
+                                      pub2 (account/map->AccountState {:balance 100000 :seq 0 :deps []})}
+                     :peers-map {pub1 (:public kp1) pub2 (:public kp2)}
+                     :validators [pub1 pub2]
+                     :mesh-nodes [pub1 pub2])
+          s0 (sm/init-state [peer2] pub1 (assoc cfg :keypair kp1))
+          gossip-msg (sieve/wrap-message (.getBytes "two-peer test payload" "UTF-8") (:private kp2) (:public kp2) 500)
+          msg-id (basalt/bytes->hex (crypto/sha256 (:payload gossip-msg)))
+          res (sm/handle-event s0 {:type :receive-gossip
+                                   :sender pub2
+                                   :message gossip-msg
+                                   :rng (java.util.Random. 42)})]
+      ;; 1. Accepted into cache and receipts
+      (is (contains? (:contagion-known-ids (:state res)) msg-id))
+      (is (contains? (get-in (:state res) [:murmur-cache :set]) msg-id))
+      (is (= 1 (count (:pending-receipts (:state res)))))
+      (is (= (str "gossip-burn:" msg-id) (:receipt-id (first (:pending-receipts (:state res))))))
+      ;; 2. Never echoes back to sender: zero :send-gossip commands
+      (is (empty? (filter #(= :send-gossip (:type %)) (:commands res)))))))
 
 

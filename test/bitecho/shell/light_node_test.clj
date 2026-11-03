@@ -2,7 +2,9 @@
   "Unit, integration, and E2E tests for the Bitecho light-node boundary shell."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
+            [bitecho.crypto.sealed :as sealed]
             [bitecho.light-node.core :as light-core]
+            [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.light-node :as light-shell]
             [bitecho.shell.mesh :as mesh]
@@ -13,7 +15,8 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [datachannel.api :as api])
+            [datachannel.api :as api]
+            [taoensso.nippy :as nippy])
   (:import [java.io PrintWriter StringWriter]
            [java.net ServerSocket Socket]
            [java.nio.charset StandardCharsets]
@@ -1401,3 +1404,74 @@
                               (nil? (:validator_id summary2))
                               (= (inc initial-cursor) (:validator-cursor conn2))
                               (= (inc initial-cursor) (:validator_cursor summary2))))))))
+
+(deftest test-register-home-set-shell-wiring-replays-unacked-session-envelopes
+  (testing "when register-home-set is executed through handle-serve-line! with unacked outbox messages, emits both home-set and replayed envelopes with identical message-ids"
+    (let [temp-dir (Files/createTempDirectory "bitecho-test-hs-replay" (into-array FileAttribute []))
+          state-dir (str temp-dir)
+          state-file (str (io/file state-dir "state.nippy"))
+          identity (light-shell/load-or-create-light-identity! state-dir)
+          pub-hex (:pubkey-hex identity)
+          priv-bytes (:privkey-bytes identity)
+          peer-kp (crypto/generate-keypair)
+          peer-pub (basalt/bytes->hex (:public peer-kp))
+          sid "session-test-hs-replay"
+          k1 (byte-array 32 (byte 1))
+          k2 (byte-array 32 (byte 2))
+          seq-num 1
+          sealed-m (sealed/seal-message k1 seq-num (.getBytes "unacked payload" "UTF-8") (.getBytes sid "UTF-8"))
+          msg-payload {:bitecho/type :sealed-message
+                       :session-id sid
+                       :sender pub-hex
+                       :recipient peer-pub
+                       :epoch 0
+                       :seq seq-num
+                       :nonce (basalt/bytes->hex (:nonce sealed-m))
+                       :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
+          orig-env (agent-sim/build-gossip-envelope pub-hex priv-bytes (nippy/freeze msg-payload) 500)
+          orig-msg-id (:message-id (:message (:event orig-env)))
+          session {:session-id sid
+                   :peer peer-pub
+                   :state "open"
+                   :tx-seq seq-num
+                   :acked-seq 0
+                   :epoch 0
+                   :tx-key k1
+                   :rx-key k2
+                   :outbox {seq-num {:seq seq-num :msg-payload msg-payload :burn 500 :gossip-env orig-env}}
+                   :outbox-order [seq-num]}
+          descriptor {:network :devnet
+                      :nodes {:node1 {:node-id :node1 :ip "127.0.0.1" :agent-port 5010}}}
+          init-st (-> (light-core/init-light-state identity {:bootstrap descriptor :epoch 0})
+                      (assoc-in [:sessions sid] session))
+          state-atom (atom init-st)
+          sent-envelopes (atom [])
+          conn-atom (atom {:ok? true
+                           :phase :open
+                           :channel-id (atom "cid-hs-replay")
+                           :send-fn (fn [env] (swap! sent-envelopes conj env) true)})
+          sw (StringWriter.)
+          out-writer (PrintWriter. sw true)
+          ctx {:state-atom state-atom
+               :conn-atom conn-atom
+               :out-writer out-writer
+               :state-file state-file
+               :identity identity
+               :bootstrap descriptor
+               :conn-opts {}}
+          cmd-json (json/write-str {"cmd" "register-home-set" "home_nodes" ["node1"] "price" 10 "burn" 500})]
+      (swap! state-atom assoc :connected? true)
+      (light-shell/handle-serve-line! cmd-json ctx)
+      ;; 1. Sent envelopes include both replayed unacked envelope and register-home-set envelopes
+      (is (>= (count @sent-envelopes) 2))
+      (let [replayed-env (first @sent-envelopes)
+            replayed-msg-id (:message-id (:message (:event replayed-env)))
+            resp (json/read-str (first (str/split-lines (.toString sw))))]
+        ;; 2. Replayed unacked session envelope has identical message-id (no new envelope, no double-burn)
+        (is (= orig-msg-id replayed-msg-id))
+        (is (= orig-env replayed-env))
+        ;; 3. Command succeeded
+        (is (= true (get resp "ok")))
+        (is (contains? #{"ok" "degraded"} (get resp "status")))
+        (is (= ["node1"] (get resp "home_nodes")))))))
+

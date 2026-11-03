@@ -175,9 +175,10 @@ Light nodes (AI agents) and edge participants maintain zero-loss, zero-duplicati
    - On duplicate message arrival (`:replayed-seq`), receiver increments `:replays-deduped`, suppresses duplicate inbox entries and stdout events, and re-emits signed `:session-ack` to clear the sender's outbox.
    - Sender validates peer Ed25519 signature on `:session-ack`, advances contiguous `:acked-seq`, and purges selectively and cumulatively acknowledged sequences from `:outbox` and `:outbox-order`.
 
-4. **Outbox Replay Across Failover & Epoch Skew Tolerance**:
-   - Reconnection triggers `build-unacked-replay-envelopes`, replaying unacknowledged outbox messages across open sessions.
-   - Replay envelopes advance envelope `:epoch` to at least the current state epoch to prevent skew rejection if failover spans epoch ticks.
+4. **Idempotent Outbox Replay & Session-Epoch Wire Authority**:
+   - Reconnection and keepalive (`register-home-set`) trigger `build-unacked-replay-envelopes`, replaying unacknowledged outbox messages across open sessions.
+   - **Gossip Envelope Reuse**: Replay reuses the cached signed `:gossip-env` stored directly in the `:outbox` entry (`{:seq seq-num :msg-payload msg-payload :burn burn-amt :gossip-env gossip-env}`). This preserves the exact original `:message-id` (`sha256(payload-bytes)`), ensuring validator gossip deduplication suppresses duplicate burns and prevents double-spending.
+   - **Session-Epoch Wire Authority**: Sealed message payloads (`:sealed-message`) set `:epoch` to `(long (or (:epoch session) (:epoch state) 0))`, tying message epoch strictly to the open session's established epoch rather than volatile local node epoch advances. Wire receivers evaluate skew against both reference epoch and session epoch (`(or (<= (abs (- msg-epoch ref-epoch)) 2) (<= (abs (- msg-epoch sess-epoch)) 2))`), guaranteeing delivered sessions never drop replayed or in-flight messages due to validator or account sync epoch advances.
    - Consensus validators forward peer-received gossip to connected agents (`forward-gossip-to-agents!`) and replay cached epoch gossip (`replay-cached-gossip-to-agent!`) upon agent connection and DataChannel identification with connection-scoped message deduplication.
 
 ### G. Full-Node Mesh Shell Lifecycle Discipline (Rules 4 & 5)
@@ -205,8 +206,9 @@ Full-node WebRTC DataChannel mesh connections (peer-to-peer full-mesh and agent 
    - HTTP endpoint `GET /statusz` surfaces aggregate `conn_dropped` and `conn_stale` metrics alongside consensus and tokenomics telemetry.
 
 ### H. Live Signed $ECHO Transfers, DeliveryAck Voucher Settlement & Protocol Settlement Take
-1. **Light-Node Account State & Economic Commands**:
-   - `account` & `sync-account`: Synchronizes on-chain balance, sequence (`seq`), causal dependencies (`deps`), and spendable balance via `fetch-validator-accountz!` from validator `/accountz` endpoints.
+1. **Light-Node Account State, `effective-chain-epoch` Decoupling & Economic Commands**:
+   - `account` & `sync-account`: Synchronizes on-chain balance, sequence (`seq`), causal dependencies (`deps`), spendable balance, and `finalized_epoch` via `fetch-validator-accountz!` from validator `/accountz` endpoints.
+   - **`effective-chain-epoch` Decoupling**: `sync-account` stores `finalized_epoch` in `[:account :finalized-epoch]`. Economic and consensus commands (on-chain DAC expiry, escrow `created-epoch`, `lock-intent`) use `(effective-chain-epoch state)` to resolve the latest finalized consensus epoch without mutating the peer-to-peer wire `:epoch`. This completely decouples on-chain economic horizons from peer-to-peer gossip wire skew tolerance.
    - `transfer`: Validates spendable balance, generates signed transfer gossiped to peers and wrapped in an authenticated `:on-deliver` agent ingress event.
    - `settle-intent`: Dispatches payment intents with mandatory protocol take $\tau = 0.5\%$, debits payer spendable balance, and records burn window contributions upon block finalization.
    - `submit-vouchers`: Compacts valid signed `DeliveryAck` vouchers per channel tuple `[callee home-node epoch]` retaining max `:seq`, submitting to validators via authenticated `:submit-vouchers` events for on-chain settlement debit/credit execution.

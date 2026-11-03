@@ -1120,7 +1120,7 @@
             shared-sec (sealed/x25519-shared-secret (:private kp-resp) caller-eph)
             keys (sealed/derive-channel-keys shared-sec session-id :responder)
             eph-pub-hex (basalt/bytes->hex (:public kp-resp))
-            epoch (:epoch state)
+            epoch (long (or (:epoch offer) (:epoch state) 0))
             burn-val (or (:burn offer) 500)
             ack-res (rendezvous/process-offer-header
                      {:caller caller
@@ -1193,7 +1193,7 @@
                          :session-id session-id
                          :sender (:pubkey state)
                          :recipient (:peer session)
-                         :epoch (:epoch state)
+                         :epoch (long (or (:epoch session) (:epoch state) 0))
                          :seq seq-num
                          :nonce (basalt/bytes->hex (:nonce sealed))
                          :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
@@ -1202,7 +1202,7 @@
             curr-outbox (or (:outbox session) {})
             curr-order (or (:outbox-order session) [])
             next-order (conj curr-order seq-num)
-            next-outbox (assoc curr-outbox seq-num {:seq seq-num :msg-payload msg-payload :burn burn-amt})
+            next-outbox (assoc curr-outbox seq-num {:seq seq-num :msg-payload msg-payload :burn burn-amt :gossip-env gossip-env})
             [final-outbox final-order overflow] (if (> (count next-order) max-outbox)
                                                   (let [overflow (- (count next-order) max-outbox)
                                                         evicted (subvec next-order 0 overflow)
@@ -1268,7 +1268,7 @@
                            :session-id session-id
                            :sender (:pubkey state)
                            :recipient (:peer session)
-                           :epoch (:epoch state)
+                           :epoch (long (or (:epoch session) (:epoch state) 0))
                            :signature sig-hex}
             gossip-env (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze close-payload) 500)
             closed-sess (-> session
@@ -2185,7 +2185,7 @@
                         :session-id session-id
                         :sender (:pubkey state)
                         :recipient peer-pub
-                        :epoch (:epoch state)
+                        :epoch (long (or (get-in state [:sessions session-id :epoch]) (:epoch state) 0))
                         :ack-seq contiguous-ack-seq
                         :acked-seq msg-seq
                         :seen-seqs seen-vec
@@ -2312,8 +2312,9 @@
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn build-unacked-replay-envelopes
-  "Extracts unacknowledged session outbox messages, advances their epoch to the current state epoch,
-   and wraps them in signed gossip envelopes for failover/reconnect replay."
+  "Extracts unacknowledged session outbox messages and returns signed gossip envelopes
+   for failover/reconnect replay, reusing existing signed gossip envelopes to preserve
+   message-id deduplication and prevent double-burn."
   ([state privkey-bytes]
    (build-unacked-replay-envelopes state privkey-bytes nil))
   ([state privkey-bytes session-id-filter]
@@ -2330,12 +2331,12 @@
               seq-num (or (seq (:outbox-order sess)) (sort (keys (or (:outbox sess) {}))))
               :let [item (get-in sess [:outbox seq-num])]
               :when item
-              :let [msg (:msg-payload item)
-                    burn (or (:burn item) 500)
-                    curr-ep (:epoch state 0)
-                    upd-epoch (max (long (or (:epoch msg) 0)) (long curr-ep))
-                    upd-msg (assoc msg :epoch upd-epoch)]]
-          (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze upd-msg) burn)))))))
+              :let [env (:gossip-env item)]]
+          (if env
+            env
+            (let [msg (:msg-payload item)
+                  burn (or (:burn item) 500)]
+              (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze msg) burn)))))))))
 
 (defn- handle-wire-close [state msg]
   (try
@@ -2501,7 +2502,7 @@
                                              :session-id session-id
                                              :sender (:pubkey state)
                                              :recipient (:callee outbound)
-                                             :epoch (:epoch state)
+                                             :epoch (long (or (:epoch outbound) (:epoch state) 0))
                                              :seq seq-num
                                              :nonce (basalt/bytes->hex (:nonce sealed-m))
                                              :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
@@ -2516,9 +2517,9 @@
                               :contiguous-rx-seq 0
                               :replays-deduped 0
                               :outbox-evicted 0
-                              :outbox {seq-num {:seq seq-num :msg-payload msg-payload :burn 500}}
+                              :outbox {seq-num {:seq seq-num :msg-payload msg-payload :burn 500 :gossip-env msg-env}}
                               :outbox-order [seq-num]
-                              :epoch (:epoch state)
+                              :epoch (long (or (:epoch outbound) (:epoch state) 0))
                               :tx-key (:tx-key keys)
                               :rx-key (:rx-key keys)
                               :replay-window (sealed/init-replay-window)}
@@ -2535,7 +2536,7 @@
                             :outbox-evicted 0
                             :outbox {}
                             :outbox-order []
-                            :epoch (:epoch state)
+                            :epoch (long (or (:epoch outbound) (:epoch state) 0))
                             :tx-key (:tx-key keys)
                             :rx-key (:rx-key keys)
                             :replay-window (sealed/init-replay-window)}
@@ -2620,7 +2621,7 @@
                                            :outbox-evicted 0
                                            :outbox {}
                                            :outbox-order []
-                                           :epoch (:epoch state)
+                                           :epoch (long (or (:epoch header) (:epoch state) 0))
                                            :tx-key (:tx-key keys)
                                            :rx-key (:rx-key keys)
                                            :replay-window (sealed/init-replay-window)}

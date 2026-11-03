@@ -2587,6 +2587,54 @@
                        (= "invalid-expires-epoch" (get-in bad-lock [:response "error"]))
                        (true? (get-in good-lock [:response "ok"]))))))
 
+(deftest test-unacked-replay-envelope-reuse-and-session-epoch-authority
+  (testing "build-unacked-replay-envelopes reuses original gossip envelope preserving message-id and delivers across epoch skew"
+    (let [alice (test-identity)
+          bob (test-identity)
+          priv-a (:privkey-bytes alice)
+          pub-b (:pubkey-hex bob)
+          priv-b (:privkey-bytes bob)
+          ;; Alice and Bob open a session at wire epoch 0
+          st-a0 (light-core/init-light-state (:identity alice) {})
+          st-b0 (light-core/init-light-state (:identity bob) {:autonomous? true})
+          offer-res (light-core/handle-command st-a0 {"cmd" "offer" "callee" pub-b "price" 10 "burn" 500} priv-a)
+          sid (get-in offer-res [:response "session_id"])
+          offer-env (first (filter gossip-env? (:net-envelopes offer-res)))
+          b-after-offer (light-core/handle-wire-payload st-b0 offer-env priv-b)
+          accept-env (first (filter gossip-env? (:net-envelopes b-after-offer)))
+          a-after-accept (light-core/handle-wire-payload (:state offer-res) accept-env priv-a)
+          st-a-open (:state a-after-accept)
+          st-b-open (:state b-after-offer)
+          ;; Alice sends a message at epoch 0
+          send-res (light-core/handle-command st-a-open {"cmd" "send" "session_id" sid "text" "hello from epoch 0"} priv-a)
+          orig-env (first (:net-envelopes send-res))
+          orig-msg-id (:message-id orig-env)
+          orig-payload (:payload orig-env)
+          st-a-sent (:state send-res)
+          ;; Now Alice's local state epoch advances to 971 (e.g. from validator sync or time)
+          st-a-advanced (assoc st-a-sent :epoch 971)
+          replayed-envs (light-core/build-unacked-replay-envelopes st-a-advanced priv-a)
+          replayed-env (first replayed-envs)]
+      ;; (a) Exact message-id and payload bytes preserved (no epoch bump, no new message-id)
+      (is (= 1 (count replayed-envs)))
+      (is (= orig-msg-id (:message-id replayed-env)))
+      (is (= (seq orig-payload) (seq (:payload replayed-env))))
+      (is (= orig-env replayed-env))
+
+      ;; (b) Bob is at local epoch 0 with session opened at epoch 0.
+      ;; When Alice replays the unacked message from epoch 971 state, Bob must accept it!
+      (let [b-rx-replayed (light-core/handle-wire-payload st-b-open replayed-env priv-b)]
+        (is (= 1 (count (:inbox (:state b-rx-replayed)))))
+        (is (= "hello from epoch 0" (:text (first (:inbox (:state b-rx-replayed)))))))
+
+      ;; Also when Alice (now at epoch 971) sends a brand-new message on the epoch-0 session:
+      (let [send-new (light-core/handle-command st-a-advanced {"cmd" "send" "session_id" sid "text" "message while alice is at 971"} priv-a)
+            new-env (first (:net-envelopes send-new))
+            ;; Bob at epoch 0 accepts it because session-epoch is authoritative (epoch 0)
+            b-rx-new (light-core/handle-wire-payload st-b-open new-env priv-b)]
+        (is (= 1 (count (:inbox (:state b-rx-new)))))
+        (is (= "message while alice is at 971" (:text (first (:inbox (:state b-rx-new))))))))))
+
 
 
 

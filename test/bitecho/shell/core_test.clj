@@ -117,6 +117,7 @@
           receiver (apply str (repeat 64 "b"))
           peer-pub (apply str (repeat 64 "c"))
           init (-> (sm/init-state [{:pubkey peer-pub :ip "127.0.0.1" :port 5001}] sender)
+                   (assoc :peers-map {sender {:pubkey sender} peer-pub {:pubkey peer-pub}})
                    (assoc-in [:ledger sender] (account/map->AccountState {:balance 50000 :seq 0 :deps []})))
           tx (account/create-transfer (:private kp) {:sender sender :receiver receiver :amount 1000 :seq 1 :deps []})
           tx-hash (account/transfer-hash tx)
