@@ -2608,17 +2608,18 @@
           ;; Alice sends a message at epoch 0
           send-res (light-core/handle-command st-a-open {"cmd" "send" "session_id" sid "text" "hello from epoch 0"} priv-a)
           orig-env (first (:net-envelopes send-res))
-          orig-msg-id (:message-id orig-env)
-          orig-payload (:payload orig-env)
+          orig-msg-id (get-in orig-env [:event :message :message-id])
+          orig-payload (get-in orig-env [:event :message :payload])
           st-a-sent (:state send-res)
           ;; Now Alice's local state epoch advances to 971 (e.g. from validator sync or time)
           st-a-advanced (assoc st-a-sent :epoch 971)
           replayed-envs (light-core/build-unacked-replay-envelopes st-a-advanced priv-a)
           replayed-env (first replayed-envs)]
       ;; (a) Exact message-id and payload bytes preserved (no epoch bump, no new message-id)
+      (is (some? orig-msg-id))
       (is (= 1 (count replayed-envs)))
-      (is (= orig-msg-id (:message-id replayed-env)))
-      (is (= (seq orig-payload) (seq (:payload replayed-env))))
+      (is (= orig-msg-id (get-in replayed-env [:event :message :message-id])))
+      (is (= (seq orig-payload) (seq (get-in replayed-env [:event :message :payload]))))
       (is (= orig-env replayed-env))
 
       ;; (b) Bob is at local epoch 0 with session opened at epoch 0.

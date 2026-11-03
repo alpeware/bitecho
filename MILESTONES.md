@@ -227,25 +227,28 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ### Milestone 4 (Pillar A): Transport Durability, STUN/Reaper Fix & Light-Node Reconnect Liveness
 
-#### Step 4A — `clj-datachannel` Transport & Reaper Fix (`36beb20`+)
+#### Step 4A — `clj-datachannel` Transport & Reaper Fix (`3facde8`) — **`[BUILT & VERIFIED]`**
 1. **Parse STUN `USERNAME` (`0x0006`) on Validator `0x0001` Binding Requests**:
-   - Populate `:remote-ice-ufrag` and `:remote-ice-pwd` on validator child-nodes from incoming STUN Binding Requests so validators send bidirectional STUN keepalives back to connected peers.
+   - `datachannel.stun/handle-packet` rewinds and parses `ATTR_USERNAME` on Binding Requests after message-integrity validation. Splits `local-ufrag:remote-ufrag`, asserts target ufrag matches local `ice-ufrag` (or rejects), and populates `:remote-ice-ufrag` and `:remote-ice-pwd` in `datachannel.core/handle-receive` for symmetric keepalive routing.
 2. **Traffic-Aware Idleness Tracking (`last-any-traffic` / SCTP State)**:
-   - Track child-node idleness using `last-any-traffic` and active SCTP association state rather than `:last-stun-received` alone, ensuring active SCTP peers are never reaped.
+   - Initialized and updated `:last-any-traffic` across STUN, DTLS application/handshake, and valid SCTP verification tags. `handle-timeout-timer :stun/keepalive` evaluates idleness against `(max :last-any-traffic :last-stun-received)` with association-aware timeouts (`30s` unestablished / `60s` established), guaranteeing active SCTP data channels are never prematurely marked disconnected.
 3. **Explicit Reaper Notify/Close on Eviction**:
-   - When the 10s reaper evicts an expired child (`30s` non-connected / `60s` idle), emit explicit close notifications (`SCTP ABORT` / `DTLS close_notify` and `:on-close` callback) instead of silent `dissoc` from `@routing-table`.
+   - Implemented pure `(should-reap-child? [st now-ms])` and explicit eviction `(reap-expired-children! [routing-table now-ms])` (and updated `reap-tcp-connections!`). On eviction of expired children (>60s idle), cleanly sets `@(:running child)` to false, transitions state to `:closed`, fires `:on-close` (`{:type :on-close :cause :reaper-timeout}`), and sends encrypted DTLS/SCTP `ABORT` chunks to cleanly close remote peer associations without socket leaks.
 4. **Stop `0x0101` `XOR-MAPPED-ADDRESS` Self-Candidate Pollution**:
-   - Prevent `datachannel.stun/handle-packet` and `datachannel.core/handle-receive` from appending the client's own reflexive `XOR-MAPPED-ADDRESS` IP:port into `:remote-candidates`.
+   - `0x0101` Binding Responses return `{:binding-response? true :mapped-address candidate-str :candidate candidate-str}`. `datachannel.core/handle-receive` routes server-reflexive candidates to `:local-candidates` and strictly prevents pollution of `:remote-candidates`.
 5. **Deterministic Idle-Wire & Leak Repro Tests**:
-   - Add deterministic wire idle tests and leak reproduction tests in `clj-datachannel` verifying associations survive >60s idle windows and clean up deterministically on true timeout.
+   - Added `test/datachannel/reaper_keepalive_test.clj` verifying Binding Request username extraction and target ufrag matching, server-reflexive candidate non-pollution across keepalives, traffic-aware idleness at $t = 75\text{s}$, and explicit reaper eviction with encrypted DTLS/SCTP ABORT chunk emission. All 7 STUN/reaper unit tests (37 assertions) pass; 0 lint warnings.
 
-#### Step 4B — `bitecho.shell.light-node` Proactive Reconnect & Non-Double-Burn Replay
+#### Step 4B — `bitecho.shell.light-node` Proactive Reconnect & Non-Double-Burn Replay — **`[BUILT & VERIFIED]`**
 1. **Proactive Reconnect on `:on-close` (Rule 4 & Rule 5)**:
-   - When `:on-close` fires in `bitecho.shell.light-node`, drive bounded exponential-backoff reconnect through the single-authority connection lifecycle reducer (`transition-conn`), automatically re-registering the agent's home-set (`register-home-set`) and replaying unacknowledged session outbox envelopes upon reconnect without relying on external wrapper scripts.
+   - When `:on-close` fires in `make-client-callbacks`, transitions `conn-atom` through `transition-conn` and drives bounded exponential-backoff reconnect via `attempt-proactive-reconnect!` (up to 3 attempts, configurable backoff).
+   - Upon reconnect, `reconnect-fn` calls `(build-reconnect-recovery-envelopes @state-atom privkey)`, automatically re-registering `:home-set` candidates (at current epoch and nil epoch) and replaying unacknowledged session outbox envelopes.
 2. **Preserve `:autonomous? false` Default**:
-   - Ensure reconnect and state recovery strictly preserve `:autonomous? false` (manual acceptance per standing rule unless `--autonomous` is explicitly passed).
-3. **Idempotent Non-Double-Burn Outbox Replay**:
-   - Cache and reuse the original signed gossip envelope (`message-id`) for unacknowledged session messages in `:outbox` so re-forwarding across reconnects or keepalives hits validator gossip deduplication and never double-burns signaling ECH.
+   - `run-serve!`, `run-one-shot!`, and reconnect recovery strictly preserve `:autonomous? false` by default, preventing unexpected auto-acceptance unless `--autonomous` was explicitly specified by the operator.
+3. **Idempotent Non-Double-Burn Outbox Replay & LOW 6 Resolution**:
+   - Replay strictly reuses cached `:gossip-env` entries from `:outbox` to preserve exact original `:message-id`s (`sha256(payload-bytes)`), eliminating duplicate burns and preventing validator double-spend rejections.
+   - Closed **LOW 6**: Updated envelope path assertions in `test/bitecho/light_node/core_test.clj` and `test/bitecho/shell/light_node_test.clj` to inspect `(get-in env [:event :message :message-id])` and `(get-in env [:event :message :payload])` and assert non-nil `orig-msg-id`, ensuring envelope assertions are strictly non-vacuous.
+   - Added property test `prop-proactive-reconnect-and-lifecycle-invariants` (30 trials) and unit tests verifying bounded reconnect retries, recovery envelope generation, stale-generation `:on-close` isolation (`gen < current` increments `:ignored-stale` and skips reconnect), and autonomous flag preservation. All 343 tests (2,767 assertions) pass; 0 lint warnings.
 
 ---
 

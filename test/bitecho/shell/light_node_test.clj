@@ -1429,7 +1429,7 @@
                        :nonce (basalt/bytes->hex (:nonce sealed-m))
                        :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
           orig-env (agent-sim/build-gossip-envelope pub-hex priv-bytes (nippy/freeze msg-payload) 500)
-          orig-msg-id (:message-id (:message (:event orig-env)))
+          orig-msg-id (get-in orig-env [:event :message :message-id])
           session {:session-id sid
                    :peer peer-pub
                    :state "open"
@@ -1463,9 +1463,10 @@
       (swap! state-atom assoc :connected? true)
       (light-shell/handle-serve-line! cmd-json ctx)
       ;; 1. Sent envelopes include both replayed unacked envelope and register-home-set envelopes
+      (is (some? orig-msg-id))
       (is (>= (count @sent-envelopes) 2))
       (let [replayed-env (first @sent-envelopes)
-            replayed-msg-id (:message-id (:message (:event replayed-env)))
+            replayed-msg-id (get-in replayed-env [:event :message :message-id])
             resp (json/read-str (first (str/split-lines (.toString sw))))]
         ;; 2. Replayed unacked session envelope has identical message-id (no new envelope, no double-burn)
         (is (= orig-msg-id replayed-msg-id))
@@ -1474,4 +1475,178 @@
         (is (= true (get resp "ok")))
         (is (contains? #{"ok" "degraded"} (get resp "status")))
         (is (= ["node1"] (get resp "home_nodes")))))))
+
+(deftest test-attempt-proactive-reconnect-bounded-retries
+  (testing "attempt-proactive-reconnect! retries up to max-attempts and returns on success or exhaustion"
+    ;; 1. Fails 2 times then succeeds on 3rd attempt
+    (let [attempts (atom 0)
+          mock-reconnect (fn []
+                           (swap! attempts inc)
+                           (if (= @attempts 3)
+                             {:ok? true :phase :open}
+                             {:ok? false :error "listener-disabled"}))
+          res (light-shell/attempt-proactive-reconnect! mock-reconnect {:reconnect-max-attempts 4 :reconnect-backoff-ms 0})]
+      (is (= 3 @attempts))
+      (is (= true (:ok? res))))
+
+    ;; 2. Fails repeatedly, stops at max-attempts
+    (let [attempts (atom 0)
+          mock-reconnect (fn []
+                           (swap! attempts inc)
+                           {:ok? false :error "timeout"})
+          res (light-shell/attempt-proactive-reconnect! mock-reconnect {:reconnect-max-attempts 3 :reconnect-backoff-ms 0})]
+      (is (= 3 @attempts))
+      (is (= false (:ok? res)))
+      (is (= "timeout" (:error res))))))
+
+(deftest test-build-reconnect-recovery-envelopes-pure-helper
+  (testing "build-reconnect-recovery-envelopes combines register-home-set envelopes and unacked session replay envelopes preserving message-ids"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          priv (:private kp)
+          peer-kp (crypto/generate-keypair)
+          peer-pub (basalt/bytes->hex (:public peer-kp))
+          sid "test-sess-recov"
+          msg-payload {:bitecho/type :sealed-message
+                       :session-id sid
+                       :sender pub
+                       :recipient peer-pub
+                       :epoch 0
+                       :seq 1
+                       :nonce "010203"
+                       :ciphertext "aabbcc"}
+          orig-env (agent-sim/build-gossip-envelope pub priv (nippy/freeze msg-payload) 500)
+          orig-msg-id (get-in orig-env [:event :message :message-id])
+          st-base {:pubkey pub
+                   :epoch 5
+                   :home-set [:node1 :node2]
+                   :rendezvous-policy {:price 20}
+                   :sessions {sid {:session-id sid
+                                   :state "open"
+                                   :peer peer-pub
+                                   :epoch 0
+                                   :outbox {1 {:seq 1 :msg-payload msg-payload :burn 500 :gossip-env orig-env}}
+                                   :outbox-order [1]}}}]
+      (is (some? orig-msg-id))
+      ;; With home-set and outbox: returns 2 home-set envelopes + 1 replay envelope
+      (let [envs (light-shell/build-reconnect-recovery-envelopes st-base priv)]
+        (is (= 3 (count envs)))
+        (is (= :register-home-set (:type (:event (first envs)))))
+        (is (= :register-home-set (:type (:event (second envs)))))
+        (is (= orig-env (nth envs 2)))
+        (is (= orig-msg-id (get-in (nth envs 2) [:event :message :message-id]))))
+
+      ;; Without home-set: returns only the replay envelope
+      (let [envs-no-hs (light-shell/build-reconnect-recovery-envelopes (assoc st-base :home-set []) priv)]
+        (is (= 1 (count envs-no-hs)))
+        (is (= orig-env (first envs-no-hs))))
+
+      ;; With nil privkey: returns empty vector
+      (is (empty? (light-shell/build-reconnect-recovery-envelopes st-base nil))))))
+
+(deftest test-make-client-callbacks-on-close-proactive-reconnect
+  (testing "make-client-callbacks :on-close triggers proactive reconnect for active generation and ignores stale generation"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          priv (:private kp)
+          st-atom (atom {:pubkey pub :epoch 0 :connected? true :connection-error nil :autonomous? false})
+          conn-atom (atom (assoc (light-shell/init-conn-state) :phase :open :generation 2))
+          reconnected? (atom false)
+          mock-reconnect (fn []
+                           (reset! reconnected? true)
+                           {:ok? true :phase :open})
+          chan-id (atom "cid-test")
+          ctx-stale {:identity {:pubkey-hex pub :privkey-bytes priv}
+                     :state-atom st-atom
+                     :conn-atom conn-atom
+                     :reconnect-fn mock-reconnect
+                     :generation 1} ;; stale! gen 1 < gen 2
+          cbs-stale (light-shell/make-client-callbacks nil chan-id (promise) (atom nil) ctx-stale)]
+
+      ;; 1. Stale generation :on-close
+      ((:on-close cbs-stale) nil)
+      (is (false? @reconnected?) "Stale :on-close must never trigger reconnect-fn")
+      (is (= 1 (:ignored-stale @conn-atom)) "Stale :on-close must increment :ignored-stale")
+      (is (= :open (:phase @conn-atom)) "Stale :on-close must not transition phase from :open")
+      (is (= "cid-test" @chan-id) "Channel ID must not be cleared by stale :on-close")
+
+      ;; 2. Active generation :on-close
+      (let [ctx-active {:identity {:pubkey-hex pub :privkey-bytes priv}
+                        :state-atom st-atom
+                        :conn-atom conn-atom
+                        :reconnect-fn mock-reconnect
+                        :generation 2}
+            cbs-active (light-shell/make-client-callbacks nil chan-id (promise) (atom nil) ctx-active)]
+        ((:on-close cbs-active) nil)
+        (is (true? @reconnected?) "Active generation :on-close must trigger proactive reconnect")
+        (is (nil? @chan-id) "Channel ID must be cleared by active :on-close")
+        (is (= false (:autonomous? @st-atom)) "Autonomous flag must remain false across reconnect")))))
+
+(defspec ^{:doc "Property: Proactive reconnect on :on-close with bounded retries and envelope invariants"}
+  prop-proactive-reconnect-and-lifecycle-invariants 30
+  (prop/for-all [cur-gen (gen/choose 1 10)
+                 outbox-count (gen/choose 0 5)
+                 stale-offset (gen/choose 1 5)]
+                (let [kp (crypto/generate-keypair)
+                      pub (basalt/bytes->hex (:public kp))
+                      priv (:private kp)
+                      sid "prop-sess"
+                      outbox (into {} (for [i (range 1 (inc outbox-count))]
+                                        (let [msg {:bitecho/type :sealed-message
+                                                   :session-id sid
+                                                   :seq i
+                                                   :payload (str "msg-" i)}
+                                              env (agent-sim/build-gossip-envelope pub priv (nippy/freeze msg) 500)]
+                                          [i {:seq i :msg-payload msg :burn 500 :gossip-env env}])))
+                      outbox-order (vec (range 1 (inc outbox-count)))
+                      st-init {:pubkey pub
+                               :epoch 0
+                               :home-set [:node1]
+                               :rendezvous-policy {:price 10}
+                               :autonomous? false
+                               :connected? true
+                               :connection-error nil
+                               :sessions {sid {:session-id sid :state "open" :outbox outbox :outbox-order outbox-order}}}
+                      st-atom (atom st-init)
+                      conn-atom (atom (assoc (light-shell/init-conn-state) :phase :open :generation cur-gen))
+                      reconn-called (atom 0)
+                      mock-reconnect (fn []
+                                       (swap! reconn-called inc)
+                                       (swap! conn-atom assoc :phase :open)
+                                       {:ok? true :phase :open})
+                      stale-gen (- cur-gen stale-offset)
+                      ctx-stale {:identity {:pubkey-hex pub :privkey-bytes priv}
+                                 :state-atom st-atom
+                                 :conn-atom conn-atom
+                                 :reconnect-fn mock-reconnect
+                                 :generation stale-gen}
+                      cbs-stale (light-shell/make-client-callbacks nil (atom "cid") (promise) (atom nil) ctx-stale)]
+
+      ;; (a) Stale generation on-close invariant
+                  ((:on-close cbs-stale) nil)
+                  (and (= 0 @reconn-called)
+                       (= 1 (:ignored-stale @conn-atom))
+                       (= :open (:phase @conn-atom))
+           ;; (b) Active generation on-close invariant
+                       (let [ctx-active {:identity {:pubkey-hex pub :privkey-bytes priv}
+                                         :state-atom st-atom
+                                         :conn-atom conn-atom
+                                         :reconnect-fn mock-reconnect
+                                         :generation cur-gen}
+                             cbs-active (light-shell/make-client-callbacks nil (atom "cid") (promise) (atom nil) ctx-active)]
+                         ((:on-close cbs-active) nil)
+                         (let [recovery-envs (light-shell/build-reconnect-recovery-envelopes @st-atom priv)]
+                           (and (= 1 @reconn-called)
+                                (= false (:autonomous? @st-atom))
+                    ;; 2 home-set envs + outbox-count replay envs
+                                (= (+ 2 outbox-count) (count recovery-envs))
+                    ;; Replay envs must preserve original message-ids
+                                (every? (fn [i]
+                                          (let [expected-env (:gossip-env (get outbox i))
+                                                expected-mid (get-in expected-env [:event :message :message-id])
+                                                matching-recov (first (filter #(= expected-mid (get-in % [:event :message :message-id]))
+                                                                              recovery-envs))]
+                                            (and (some? matching-recov)
+                                                 (= expected-env matching-recov))))
+                                        (range 1 (inc outbox-count))))))))))
 

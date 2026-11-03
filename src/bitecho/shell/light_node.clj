@@ -4,6 +4,7 @@
    with atomic rename (0600 permissions), and WebRTC DataChannel agent connections."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.light-node.core :as light-core]
+            [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.discovery :as discovery]
             [bitecho.shell.identity :as identity]
             [clojure.data.json :as json]
@@ -662,6 +663,39 @@
           (when event-out
             (event-out {"event" "connection-failed" "connected" false "error" err})))))))
 
+(defn build-reconnect-recovery-envelopes
+  "Pure helper to build recovery envelopes upon reconnection: re-registers home-set
+   if present and replays unacknowledged session outbox gossip envelopes."
+  [state privkey-bytes]
+  (if-not privkey-bytes
+    []
+    (let [home-set (:home-set state)
+          home-set-envs (if (seq home-set)
+                          (let [price (long (or (get-in state [:rendezvous-policy :price]) 10))
+                                pub (:pubkey state)
+                                curr-epoch (:epoch state)
+                                env-curr (agent-sim/build-home-set-envelope pub privkey-bytes home-set price curr-epoch)
+                                env-nil (agent-sim/build-home-set-envelope pub privkey-bytes home-set price nil)]
+                            [env-curr env-nil])
+                          [])
+          replay-envs (light-core/build-unacked-replay-envelopes state privkey-bytes)]
+      (into (vec home-set-envs) replay-envs))))
+
+(defn attempt-proactive-reconnect!
+  "Attempts reconnect-fn up to max-attempts times with bounded exponential backoff until successful or exhausted."
+  [reconnect-fn opts]
+  (let [max-attempts (long (or (:reconnect-max-attempts opts) 3))
+        backoff-ms (long (or (:reconnect-backoff-ms opts) 0))]
+    (loop [attempt 0]
+      (let [res (reconnect-fn)]
+        (if (or (:ok? res) (>= (inc attempt) max-attempts))
+          res
+          (do
+            (when (pos? backoff-ms)
+              (let [sleep-ms (min (* backoff-ms (long (Math/pow 2 attempt))) 10000)]
+                (try (Thread/sleep sleep-ms) (catch Exception _ nil))))
+            (recur (inc attempt))))))))
+
 (defn make-client-callbacks
   "Creates callback handlers for client DataChannel connection."
   [client-node channel-id connected? send-fn-atom ctx]
@@ -727,7 +761,11 @@
                                           cb-opts)
                        (when state-atom
                          (swap! state-atom assoc :connected? false :connection-error "connection-closed"))
-                       (sync-conn-diagnostics! state-atom conn-atom)))
+                       (sync-conn-diagnostics! state-atom conn-atom)
+                       (when (and reconnect-fn (not= :down (:phase @conn-atom)))
+                         (if (:async-reconnect? ctx)
+                           (future (attempt-proactive-reconnect! reconnect-fn ctx))
+                           (attempt-proactive-reconnect! reconnect-fn ctx)))))
                    (do
                      (when (instance? clojure.lang.Atom channel-id)
                        (reset! channel-id nil))
@@ -929,10 +967,11 @@
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
-        initial-state (or (cond-> loaded-state
-                            (:autonomous? opts) (assoc :autonomous? true))
+        initial-state (or (when loaded-state
+                            (cond-> loaded-state
+                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))))
                           (light-core/init-light-state identity {:bootstrap bootstrap
-                                                                 :autonomous? (:autonomous? opts false)}))
+                                                                 :autonomous? (boolean (:autonomous? opts false))}))
         state-atom (atom initial-state)
         conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
@@ -957,9 +996,9 @@
                                     :connected? true
                                     :connection-error nil)
                              (sync-conn-diagnostics! state-atom conn-atom)
-                             (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))]
-                               (when (seq replay-envs)
-                                 (send-all-envelopes! (:send-fn reconn) replay-envs)))
+                             (let [recovery-envs (build-reconnect-recovery-envelopes @state-atom (:privkey-bytes identity))]
+                               (when (seq recovery-envs)
+                                 (send-all-envelopes! (:send-fn reconn) recovery-envs)))
                              reconn)
                            (let [err (or (:error reconn) "listener-disabled")]
                              (when conn-atom
@@ -974,7 +1013,8 @@
                          :conn-atom conn-atom
                          :event-out event-out
                          :reconnect-fn reconnect-fn
-                         :state-file state-file)
+                         :state-file state-file
+                         :async-reconnect? true)
         _ (reset! conn-opts-atom conn-opts)
         conn-res (reconnect-fn)
         ctx {:state-atom state-atom
@@ -1007,10 +1047,11 @@
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
-        initial-state (or (cond-> loaded-state
-                            (:autonomous? opts) (assoc :autonomous? true))
+        initial-state (or (when loaded-state
+                            (cond-> loaded-state
+                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))))
                           (light-core/init-light-state identity {:bootstrap bootstrap
-                                                                 :autonomous? (:autonomous? opts false)}))
+                                                                 :autonomous? (boolean (:autonomous? opts false))}))
         state-atom (atom initial-state)
         cmd-map (:cmd-map opts)
         verb (when (map? cmd-map) (get cmd-map "cmd"))
