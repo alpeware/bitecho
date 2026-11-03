@@ -535,11 +535,19 @@
                                        (:failed-receipts-count item)
                                        (:failed-receipts-count st-map)
                                        (count (:failed-receipts item))
-                                       0))]
+                                       0))
+                      node-k (or (when-let [v (or (:k_bps st-map) (:k-bps st-map))]
+                                   (try (Long/parseLong (str v)) (catch Exception _ nil)))
+                                 (when-let [v (:k-bps item)]
+                                   (try (Long/parseLong (str v)) (catch Exception _ nil)))
+                                 (when-let [v (or (get-in item [:config :treasury-k-bps])
+                                                  (get-in item [:config :k-bps]))]
+                                   (try (Long/parseLong (str v)) (catch Exception _ nil))))]
                   {:fin-epoch fin-epoch
                    :minted minted
                    :supply supply
-                   :failed failed}))
+                   :failed failed
+                   :k-bps node-k}))
               items)
         active-validators (count items)
         min-validators (long (or (:min-validators opts) 3))
@@ -556,7 +564,12 @@
         max-supply (if (seq item-stats) (apply max (map :supply item-stats)) 0)
         max-failed (if (seq item-stats) (apply max (map :failed item-stats)) 0)
 
-        k-bps (long (or (:k-bps opts) default-k-bps))
+        reported-k-vals (vec (keep :k-bps item-stats))
+        telemetry-present? (boolean (seq reported-k-vals))
+        k-bps-source (if telemetry-present? :telemetry :configured-default)
+        k-bps (long (if telemetry-present?
+                      (apply max reported-k-vals)
+                      (or (:k-bps opts) default-k-bps)))
         demand-gate-compliant? (<= k-bps max-k-bps)
         supply-cap-compliant? (and (<= max-minted max-conditional-mint-supply)
                                    (or (zero? max-supply) (<= max-supply hard-cap)))
@@ -574,6 +587,7 @@
                           mint-converged?)]
     {:demand-gate-k-bps k-bps
      :demand-gate-compliant? demand-gate-compliant?
+     :k-bps-source k-bps-source
      :supply-cap-compliant? supply-cap-compliant?
      :redundant-infra? redundant-infra?
      :quorum-met? quorum-met?

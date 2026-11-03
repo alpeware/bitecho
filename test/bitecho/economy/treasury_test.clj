@@ -827,10 +827,12 @@
                                                        :finalized_epoch ep
                                                        :minted m-val
                                                        :failed_receipts (if (zero? idx) failed-count 0)
-                                                       :supply 18900000000}
+                                                       :supply 18900000000
+                                                       :k_bps k-bps}
                                              :fin-epoch ep
                                              :minted m-val
-                                             :failed-rcpts (if (zero? idx) failed-count 0)}]))
+                                             :failed-rcpts (if (zero? idx) failed-count 0)
+                                             :k-bps k-bps}]))
                                    node-ids))
                       sla-res (treasury/evaluate-treasury-sla snaps {:k-bps k-bps :min-validators 3})
                       expected-redundant? (>= num-validators 3)
@@ -858,3 +860,35 @@
                    (= expected-finality? (:finality-healthy? sla-res))
                    (= expected-zero-failed? (:zero-failed-receipts? sla-res))
                    (= expected-healthy? (:sla-healthy? sla-res))))))
+
+(deftest test-evaluate-treasury-sla-telemetry-k-bps
+  (testing "evaluate-treasury-sla extracts k_bps from statusz telemetry and marks source :telemetry"
+    (let [snaps {:node1 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0 k_bps=3000"}
+                 :node2 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0 k_bps=3000"}
+                 :node3 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0 k_bps=3000"}}
+          res (treasury/evaluate-treasury-sla snaps)]
+      (is (= 3000 (:demand-gate-k-bps res)))
+      (is (= :telemetry (:k-bps-source res)))
+      (is (true? (:demand-gate-compliant? res)))
+      (is (true? (:sla-healthy? res)))))
+
+  (testing "evaluate-treasury-sla fails closed when telemetry k_bps exceeds 5000 bps"
+    (let [snaps {:node1 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0 k_bps=5500"}
+                 :node2 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0 k_bps=5000"}
+                 :node3 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0 k_bps=5000"}}
+          res (treasury/evaluate-treasury-sla snaps)]
+      (is (= 5500 (:demand-gate-k-bps res)))
+      (is (= :telemetry (:k-bps-source res)))
+      (is (false? (:demand-gate-compliant? res)))
+      (is (false? (:sla-healthy? res)))))
+
+  (testing "evaluate-treasury-sla falls back to configured default when k_bps telemetry absent"
+    (let [snaps {:node1 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0"}
+                 :node2 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0"}
+                 :node3 {:statusz "role=validator epoch=10 finalized_epoch=10 minted=0 supply=1000 failed_receipts=0"}}
+          res (treasury/evaluate-treasury-sla snaps)]
+      (is (= treasury/default-k-bps (:demand-gate-k-bps res)))
+      (is (= :configured-default (:k-bps-source res)))
+      (is (true? (:demand-gate-compliant? res)))
+      (is (true? (:sla-healthy? res))))))
+

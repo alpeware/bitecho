@@ -394,8 +394,8 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
    - **Cluster Convergence Audit**: Integrated into `evaluate-cluster-convergence` and `./scripts/cluster.sh audit`, asserting `/burnsz`, `/accountz`, `/connz`, Treasury SLA, and wire protocol version agreement across all nodes.
 
 3. **Testnet Launch Exit Gates Evaluator (`run-testnet-readiness-gate`)**:
-   - Deterministic four-gate readiness evaluator (`master-plan` M4):
-     1. **Third-Party Validator Finalization**: 4-node Streamlet BFT cluster (3 genesis validators + 1 third-party partner node) finalizing notarized blocks under demand gate ($k = 0.5$).
+   - Deterministic four-gate readiness evaluator (`master-plan` M4) executing an in-process 4-validator simulation (`node1..node3` genesis + `node4` simulated third-party partner validator with a fresh keypair) to deterministically gate consensus, demand-gate minting ($k = 0.5$), directory attestation, verified-outcome settlement, and rolling-upgrade wire compatibility prior to external multi-operator onboarding:
+     1. **Third-Party Validator Finalization**: In-process 4-node Streamlet BFT cluster (`node1..node3` + partner `node4`) finalizing notarized blocks under demand gate ($k = 0.5$).
      2. **Live Directory Resolution**: Directory Authority authenticates cryptographic Proof-of-Possession and resolves nicknames to public keys and home sets, rejecting forged signatures.
      3. **Verified-Outcome Real Workload**: Real tensor einsum workload paying strictly on deliverable preimage SHA-256 hash match, burning mandatory 50 bps protocol settlement take.
      4. **Rolling-Upgrade Wire Compatibility**: Continuity verified across mixed v1, legacy unversioned, and v2 payloads, with fail-closed rejection of v99.

@@ -130,6 +130,15 @@
   "Maximum supported wire protocol version for forward rolling-upgrade compatibility (N+1)."
   2)
 
+(defn rolling-upgrade-compatible?
+  "Pure helper checking whether two wire protocol versions are within the rolling-upgrade compatibility window (<= 1 step difference) and supported."
+  [v1 v2]
+  (and (integer? v1)
+       (integer? v2)
+       (<= min-supported-wire-version (long v1) max-supported-wire-version)
+       (<= min-supported-wire-version (long v2) max-supported-wire-version)
+       (<= (Math/abs (- (long v1) (long v2))) 1)))
+
 (defn valid-agent-envelope-version?
   "Pure helper verifying agent wire protocol envelope version compatibility.
    Returns true if :protocol-version is absent/nil (legacy unversioned N-1) or in [min-supported-wire-version, max-supported-wire-version]."
@@ -1019,9 +1028,10 @@
          pending-receipts (long (count (or (:pending-receipts state) [])))
          failed-receipts (long (or (:failed-receipts-count state) 0))
          conn-dropped (long (or (:conn_dropped conn-diag-summary) 0))
-         conn-stale (long (or (:conn_stale conn-diag-summary) 0))]
-     (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d conn_dropped=%d conn_stale=%d\n"
-             role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts conn-dropped conn-stale))))
+         conn-stale (long (or (:conn_stale conn-diag-summary) 0))
+         k-bps (long (min treasury/max-k-bps (max 0 (long (or (:k-bps state) (get-in state [:config :treasury-k-bps]) (get-in state [:config :k-bps]) treasury/default-k-bps)))))]
+     (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d conn_dropped=%d conn_stale=%d k_bps=%d\n"
+             role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts conn-dropped conn-stale k-bps))))
 
 (defn parse-statusz-line
   "Parses a statusz line string into a keyword map with numeric fields parsed as longs."
@@ -1030,7 +1040,7 @@
     (let [kvs (str/split (str/trim line) #"\s+")
           numeric-keys #{:epoch :notarized :finalized :supply :minted :burns
                          :finalized_epoch :pending_receipts :failed_receipts
-                         :conn_dropped :conn_stale}]
+                         :conn_dropped :conn_stale :k_bps}]
       (reduce
        (fn [m kv]
          (let [[k-str v-str] (str/split kv #"=" 2)]
@@ -1058,6 +1068,7 @@
      :minted-skew 0
      :burn-digest-converged? true
      :accountz-converged? true
+     :wire-version-status :converged
      :wire-version-converged? true
      :treasury-sla {:sla-healthy? true}
      :soak-summary {:max_failed_receipts 0
@@ -1173,11 +1184,21 @@
                                      (or (get-in snap [:connz :protocol_version])
                                          (get-in snap [:connz "protocol_version"])))
                                    parsed-snapshots))
-          wire-version-converged?
-          (if (seq wire-versions)
-            (and (every? #(and (integer? %) (<= min-supported-wire-version (long %) max-supported-wire-version)) wire-versions)
-                 (<= (- (apply max wire-versions) (apply min wire-versions)) 1))
-            true)
+          has-connz? (boolean (some (fn [[_ snap]] (some? (:connz snap))) parsed-snapshots))
+          require-wire-ver? (or has-connz? (true? (:require-wire-version? opts)))
+
+          [wire-version-status wire-version-converged?]
+          (if require-wire-ver?
+            (if (< (count wire-versions) (count parsed-snapshots))
+              [:unknown false]
+              (let [all-compatible? (every? true?
+                                            (for [v1 wire-versions
+                                                  v2 wire-versions]
+                                              (rolling-upgrade-compatible? v1 v2)))]
+                (if all-compatible?
+                  [:converged true]
+                  [:diverged false])))
+            [:unknown true])
 
           ;; Treasury SLA evaluation across validator snapshots
           min-vals (long (or (:min-validators opts) (min 3 (count parsed-snapshots))))
@@ -1203,6 +1224,7 @@
        :minted-skew minted-skew
        :burn-digest-converged? burn-digest-converged?
        :accountz-converged? accountz-converged?
+       :wire-version-status wire-version-status
        :wire-version-converged? wire-version-converged?
        :treasury-sla treasury-sla
        :soak-summary soak-summary

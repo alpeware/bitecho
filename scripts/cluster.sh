@@ -1101,6 +1101,20 @@ elif skew == 0:
     if len(set(acc_signatures)) > 1:
         accountz_mismatch = True
 
+k_bps_vals = {}
+for n in nodes:
+    st = parsed.get(n, {})
+    try:
+        k_val = int(st.get('k_bps', -1))
+    except Exception:
+        k_val = -1
+    k_bps_vals[n] = k_val
+
+unique_k_bps = set(k_bps_vals.values())
+k_bps_ok = len(unique_k_bps) == 1 and all(0 <= k <= 5000 for k in unique_k_bps)
+k_bps_val = list(unique_k_bps)[0] if unique_k_bps else -1
+k_bps_str = str(k_bps_val) if k_bps_ok else 'MISMATCH/INVALID'
+
 wire_versions = []
 for n in nodes:
     cz = data[n].get('connz', '')
@@ -1108,11 +1122,14 @@ for n in nodes:
     if vm:
         wire_versions.append(int(vm.group(1)))
 
-wire_ver_val = wire_versions[0] if wire_versions else 1
-wire_converged = (len(set(wire_versions)) <= 1) and (1 <= wire_ver_val <= 2)
-wire_ver_str = f'v{wire_ver_val}'
+if len(wire_versions) == len(nodes):
+    wire_converged = (max(wire_versions) - min(wire_versions) <= 1) and all(1 <= v <= 2 for v in wire_versions)
+    wire_ver_str = f'v{min(wire_versions)}' if len(set(wire_versions)) == 1 else f'v{min(wire_versions)}..v{max(wire_versions)}'
+else:
+    wire_converged = False
+    wire_ver_str = 'UNKNOWN'
 
-treasury_sla_ok = (skew <= 2 and max(failed_rcpts.values()) == 0 and (minted_skew == 0 if skew == 0 else True) and len(nodes) >= 3)
+treasury_sla_ok = (skew <= 2 and max(failed_rcpts.values()) == 0 and (minted_skew == 0 if skew == 0 else True) and len(nodes) >= 3 and k_bps_ok)
 
 print('\n--- Convergence & Soak Assessment ---')
 print(f'Common Finalized Epoch: {min_fin}')
@@ -1122,7 +1139,7 @@ print(f'Burn Digest Parity:     {\"PASSED\" if not digest_mismatch else \"FAILED
 print(f'Accountz Ledger Parity: {\"PASSED\" if not accountz_mismatch else \"FAILED\"}')
 print(f'Window Burns Converged: {\"PASSED\" if not mismatches else f\"FAILED (mismatches: {len(mismatches)})\"}')
 print(f'Failed Receipts Max:    {max(failed_rcpts.values())} (healthy == 0)')
-print(f'Treasury SLA Status:    {\"PASSED\" if treasury_sla_ok else \"FAILED\"} (k=0.5, redundant_validators={len(nodes)}/3)')
+print(f'Treasury SLA Status:    {\"PASSED\" if treasury_sla_ok else \"FAILED\"} (configured_k_bps={k_bps_str}/5000, redundant_validators={len(nodes)}/3)')
 print(f'Wire Protocol Version:  {wire_ver_str} ({\"CONVERGED\" if wire_converged else \"DIVERGED\"})')
 
 if skew > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch or not treasury_sla_ok or not wire_converged:

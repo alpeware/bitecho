@@ -422,6 +422,7 @@
       (is (str/includes? out "failed_receipts=0"))
       (is (str/includes? out "conn_dropped=0"))
       (is (str/includes? out "conn_stale=0"))
+      (is (str/includes? out "k_bps=5000"))
       (is (str/ends-with? out "\n"))))
 
   (testing "statusz line format accounts for pruned counts"
@@ -1375,11 +1376,12 @@
                :peers "2/2" :supply 18900000000 :minted minted :burns burns
                :finalized_epoch fin-epoch :burn_digest bdig
                :pending_receipts 0 :failed_receipts failed-rcpts
-               :conn_dropped conn-drop :conn_stale conn-stale}
+               :conn_dropped conn-drop :conn_stale conn-stale
+               :k_bps 5000}
      :burnsz {:anchor-epoch fin-epoch
               :window [[(max 0 (dec fin-epoch)) win-burns win-takes]
                        [fin-epoch win-burns win-takes]]}
-     :connz {:conn_dropped conn-drop :conn_stale conn-stale}}))
+     :connz {:conn_dropped conn-drop :conn_stale conn-stale :protocol_version 1}}))
 
 (defspec ^{:doc "Property: Pure cluster convergence evaluator invariants"}
   prop-evaluate-cluster-convergence-invariants 50
@@ -1409,7 +1411,7 @@
 
 (deftest test-parse-statusz-and-evaluate-cluster-convergence
   (testing "parse-statusz-line parses render-statusz format into typed map"
-    (let [line "role=validator epoch=100 head=b-hash notarized=95 finalized=90 peers=2/2 supply=18900000000 minted=5000 burns=250 finalized_epoch=88 burn_digest=d-abc pending_receipts=4 failed_receipts=0 conn_dropped=1 conn_stale=0\n"
+    (let [line "role=validator epoch=100 head=b-hash notarized=95 finalized=90 peers=2/2 supply=18900000000 minted=5000 burns=250 finalized_epoch=88 burn_digest=d-abc pending_receipts=4 failed_receipts=0 conn_dropped=1 conn_stale=0 k_bps=5000\n"
           parsed (mesh/parse-statusz-line line)]
       (is (= "validator" (:role parsed)))
       (is (= 100 (:epoch parsed)))
@@ -1425,25 +1427,39 @@
       (is (= 4 (:pending_receipts parsed)))
       (is (= 0 (:failed_receipts parsed)))
       (is (= 1 (:conn_dropped parsed)))
-      (is (= 0 (:conn_stale parsed)))))
+      (is (= 0 (:conn_stale parsed)))
+      (is (= 5000 (:k_bps parsed)))))
 
   (testing "evaluate-cluster-convergence on 3 100% converged nodes"
-    (let [statusz-str "role=validator epoch=10 head=genesis notarized=8 finalized=8 peers=2/2 supply=18900000000 minted=0 burns=100 finalized_epoch=8 burn_digest=digest-1 pending_receipts=0 failed_receipts=0 conn_dropped=0 conn_stale=0"
+    (let [statusz-str "role=validator epoch=10 head=genesis notarized=8 finalized=8 peers=2/2 supply=18900000000 minted=0 burns=100 finalized_epoch=8 burn_digest=digest-1 pending_receipts=0 failed_receipts=0 conn_dropped=0 conn_stale=0 k_bps=5000"
           burn-window [[6 50 0] [7 25 0] [8 25 0]]
-          snapshots {"node1" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}
-                     "node2" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}
-                     "node3" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}}
+          snapshots {"node1" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0 :protocol_version 1}}
+                     "node2" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0 :protocol_version 1}}
+                     "node3" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0 :protocol_version 1}}}
           res (mesh/evaluate-cluster-convergence snapshots)]
       (is (true? (:converged? res)))
       (is (true? (:window-burns-converged? res)))
       (is (true? (:burn-digest-converged? res)))
       (is (true? (:accountz-converged? res)))
+      (is (true? (:wire-version-converged? res)))
+      (is (= :converged (:wire-version-status res)))
       (is (= 8 (:common-finalized-epoch res)))
       (is (= 0 (:finalized-epoch-skew res)))
       (is (empty? (:epoch-mismatches res)))
       (is (= 0 (:minted-skew res)))
       (is (= 0 (get-in res [:soak-summary :max_failed_receipts])))
       (is (true? (get-in res [:soak-summary :finality_healthy?])))))
+
+  (testing "evaluate-cluster-convergence fails closed when connz is present but protocol_version is missing"
+    (let [statusz-str "role=validator epoch=10 head=genesis notarized=8 finalized=8 peers=2/2 supply=18900000000 minted=0 burns=100 finalized_epoch=8 burn_digest=digest-1 pending_receipts=0 failed_receipts=0 conn_dropped=0 conn_stale=0 k_bps=5000"
+          burn-window [[6 50 0] [7 25 0] [8 25 0]]
+          snapshots {"node1" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}
+                     "node2" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}
+                     "node3" {:statusz statusz-str :burnsz {:anchor-epoch 8 :window burn-window} :connz {:conn_dropped 0 :conn_stale 0}}}
+          res (mesh/evaluate-cluster-convergence snapshots)]
+      (is (false? (:wire-version-converged? res)))
+      (is (= :unknown (:wire-version-status res)))
+      (is (false? (:converged? res)))))
 
   (testing "evaluate-cluster-convergence detects accountz ledger mismatch at same finalized-epoch (fin-epoch-skew == 0)"
     (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 0}

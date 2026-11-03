@@ -64,7 +64,8 @@
         {:ok? true :version current-wire-version :legacy-unversioned? true}
 
         (and (integer? raw-v)
-             (<= min-supported-wire-version (long raw-v) max-supported-wire-version))
+             (<= min-supported-wire-version (long raw-v) max-supported-wire-version)
+             (rolling-upgrade-compatible? current-wire-version (long raw-v)))
         {:ok? true :version (long raw-v) :legacy-unversioned? false}
 
         :else

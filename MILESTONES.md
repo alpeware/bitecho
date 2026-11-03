@@ -367,8 +367,8 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
    - Incorporated Treasury SLA evaluation and `:wire-version-converged?` into `evaluate-cluster-convergence` in `src/bitecho/shell/mesh.clj`.
    - Updated `cmd_audit` in `scripts/cluster.sh` to evaluate and display Treasury SLA conformance and wire protocol version agreement.
 4. **Testnet Launch Exit Gates Evaluator (`run-testnet-readiness-gate`)**:
-   - Implemented `run-testnet-readiness-gate` and `run-all-angels-demos` in `src/bitecho/demo/angels.clj`:
-     - **Gate 1**: 4-validator Streamlet BFT cluster (3 genesis validators + 1 third-party partner node) notarizing and finalizing blocks under demand gate ($k = 0.5$).
+   - Implemented `run-testnet-readiness-gate` and `run-all-angels-demos` in `src/bitecho/demo/angels.clj`, executing an in-process 4-validator simulation (`node1..node3` genesis + `node4` simulated third-party partner validator with a fresh keypair) to deterministically gate consensus, demand-gate minting ($k = 0.5$), directory attestation, verified-outcome settlement, and rolling-upgrade wire compatibility prior to external multi-operator onboarding:
+     - **Gate 1**: In-process 4-validator Streamlet BFT cluster (`node1..node3` genesis + `node4` partner) notarizing and finalizing blocks under demand gate ($k = 0.5$).
      - **Gate 2**: Live Directory Authority resolving registered nicknames to keys and home sets, rejecting forged signatures.
      - **Gate 3**: Real einsum tensor workload paying strictly on verified deliverable SHA-256 preimage match with 50 bps protocol settlement take burned.
      - **Gate 4**: Rolling-upgrade wire protocol compatibility across mixed v1, legacy unversioned, and v2 payloads, with fail-closed rejection of v99.
