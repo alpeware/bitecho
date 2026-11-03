@@ -1172,7 +1172,9 @@
         loaded-state (load-light-state! state-file)
         initial-state (or (when loaded-state
                             (cond-> loaded-state
-                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))))
+                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
+                              (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
+                              (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (boolean (:autonomous? opts false))}))
         state-atom (atom initial-state)
@@ -1252,7 +1254,9 @@
         loaded-state (load-light-state! state-file)
         initial-state (or (when loaded-state
                             (cond-> loaded-state
-                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))))
+                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
+                              (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
+                              (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (boolean (:autonomous? opts false))}))
         state-atom (atom initial-state)
