@@ -27,6 +27,7 @@
             [bitecho.simulator-config-test]
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-test]
+            [bitecho.state-machine-ttl-test]
             [bitecho.streamlet.core-test]
             [bitecho.streamlet.fuzz-test]
             [bitecho.tokenomics-v2-e2e-test]

@@ -70,12 +70,17 @@
   (prop/for-all [dim-m (gen/choose 1 4)
                  dim-k1 (gen/choose 1 4)
                  dim-k2 (gen/choose 1 4)
-                 dim-n (gen/choose 1 4)]
-                (let [gen-mat (fn [rows cols]
-                                (vec (repeatedly rows #(vec (repeatedly cols (fn [] (double (- (rand-int 20) 10))))))))
-                      a (gen-mat dim-m dim-k1)
-                      b (gen-mat dim-k1 dim-k2)
-                      c (gen-mat dim-k2 dim-n)
+                 dim-n (gen/choose 1 4)
+                 vals-a (gen/vector (gen/fmap double (gen/choose -10 10)) 16)
+                 vals-b (gen/vector (gen/fmap double (gen/choose -10 10)) 16)
+                 vals-c (gen/vector (gen/fmap double (gen/choose -10 10)) 16)]
+                (let [mat-from-vals (fn [vals rows cols]
+                                      (vec (for [r (range rows)]
+                                             (vec (for [c (range cols)]
+                                                    (nth vals (+ (* r cols) c)))))))
+                      a (mat-from-vals vals-a dim-m dim-k1)
+                      b (mat-from-vals vals-b dim-k1 dim-k2)
+                      c (mat-from-vals vals-c dim-k2 dim-n)
                       ab_c (angels/einsum-2d (angels/einsum-2d a b) c)
                       a_bc (angels/einsum-2d a (angels/einsum-2d b c))]
                   (angels/verify-tensor-parity ab_c a_bc 1e-6))))
@@ -152,3 +157,22 @@
       (is (= 3 (get-in res [:simulator-framing :cluster-nodes])))
       (is (= 3 (get-in res [:simulator-framing :devices])))
       (is (= "Streamlet 3-Node Genesis BFT" (get-in res [:simulator-framing :cluster-type]))))))
+
+;; -----------------------------------------------------------------------------
+;; 5. Testnet Readiness Gate Test (Milestone 7 / Master-Plan M4)
+;; -----------------------------------------------------------------------------
+
+(deftest test-testnet-readiness-gate
+  (testing "Testnet launch exit gates verification: 4-validator BFT under demand gate, nickname directory, verified-outcome escrow, rolling wire versioning"
+    (let [res (angels/run-testnet-readiness-gate)]
+      (is (true? (:ok? res)))
+      (is (true? (get-in res [:exit-gates :third-party-validators-finalizing?])))
+      (is (true? (get-in res [:exit-gates :demand-gate-enforced?])))
+      (is (true? (get-in res [:exit-gates :treasury-sla-healthy?])))
+      (is (true? (get-in res [:exit-gates :directory-resolving?])))
+      (is (true? (get-in res [:exit-gates :verified-outcome-workload-settled?])))
+      (is (true? (get-in res [:exit-gates :rolling-upgrade-wire-compatible?])))
+      (is (= 4 (get-in res [:cluster :validator-count])))
+      (is (true? (boolean (get-in res [:cluster :partner-node4-present?]))))
+      (is (= 50 (get-in res [:workload :settlement-take-burned])))
+      (is (= 9950 (get-in res [:workload :worker-net-received]))))))

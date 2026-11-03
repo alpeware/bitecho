@@ -2978,6 +2978,70 @@
           (is (true? (:epoch-initialized? st-2)))
           (is (= 6600 (get-in st-2 [:account :finalized-epoch]))))))))
 
+;; -----------------------------------------------------------------------------
+;; 27. Wire Protocol Versioning & Rolling-Upgrade Compatibility (Milestone 7 / FLAG B)
+;; -----------------------------------------------------------------------------
+
+(defspec ^{:doc "Property: Rolling-upgrade wire protocol compatibility across N-1 (unversioned), N (v1), and N+1 (v2) payloads with fail-closed rejection and counted diagnostics for unsupported versions"}
+  prop-wire-version-rolling-upgrade-compatibility 50
+  (prop/for-all [v-unsupported (gen/elements [-5 0 3 4 99 999])
+                 supported-v (gen/elements [nil 1 2])
+                 use-string-key? gen/boolean]
+                (let [id (test-identity)
+                      user-pub (:pubkey-hex id)
+                      user-priv (:privkey-bytes id)
+                      bootstrap {:network :devnet :nodes {}}
+                      base-st (light-core/init-light-state id {:bootstrap bootstrap})
+          ;; 1. Check check-wire-version-compatibility helper
+                      unsupported-msg (if use-string-key?
+                                        {"cmd" "offer" "protocol_version" v-unsupported}
+                                        {:bitecho/type :channel-offer :protocol-version v-unsupported})
+                      unsupported-chk (light-core/check-wire-version-compatibility unsupported-msg)
+                      supported-msg (cond
+                                      (nil? supported-v) {:bitecho/type :channel-offer}
+                                      use-string-key? {"protocol_version" supported-v}
+                                      :else {:protocol-version supported-v})
+                      supported-chk (light-core/check-wire-version-compatibility supported-msg)
+
+          ;; 2. handle-wire-payload fail-closed on unsupported version
+                      bogus-wire (if use-string-key?
+                                   {"protocol_version" v-unsupported "type" "channel-offer"}
+                                   {:protocol-version v-unsupported :bitecho/type :channel-offer})
+                      rej-res (light-core/handle-wire-payload base-st bogus-wire user-priv)
+                      st-rej (:state rej-res)
+
+          ;; 3. mesh envelope helpers
+                      valid-env? (mesh/valid-agent-envelope-version? supported-msg)
+                      invalid-env? (mesh/valid-agent-envelope-version? unsupported-msg)
+                      sample-event {:type :refund-intent :escrow-id "escrow-1" :epoch 1 :seq 1}
+                      wrapped (mesh/wrap-agent-event sample-event user-pub user-priv)
+                      unwrapped (mesh/unwrap-authenticated-agent-event wrapped)]
+                  (and
+       ;; Helper invariants
+                   (false? (:ok? unsupported-chk))
+                   (= "unsupported-wire-version" (:error unsupported-chk))
+                   (= v-unsupported (:version unsupported-chk))
+                   (true? (:ok? supported-chk))
+                   (if (nil? supported-v)
+                     (true? (:legacy-unversioned? supported-chk))
+                     (false? (:legacy-unversioned? supported-chk)))
+
+       ;; handle-wire-payload invariants (Rule 5: Zero Silent Failures, counted diagnostics)
+                   (= false (get-in rej-res [:response "ok"]))
+                   (= "unsupported-wire-version" (get-in rej-res [:response "error"]))
+                   (= 1 (get-in st-rej [:wire-version-diagnostics :unsupported-dropped]))
+                   (= v-unsupported (get-in st-rej [:wire-version-diagnostics :last-unsupported-version]))
+                   (= "unsupported-wire-version" (get-in st-rej [:wire-version-diagnostics :last-error]))
+                   (= 1 (count (:stdout-events rej-res)))
+                   (= "wire-version-rejected" (get (first (:stdout-events rej-res)) "event"))
+
+       ;; mesh envelope invariants
+                   (true? valid-env?)
+                   (false? invalid-env?)
+                   (= 1 (:protocol-version wrapped))
+                   (some? unwrapped)
+                   (= 1 (:protocol-version unwrapped))))))
+
 
 
 

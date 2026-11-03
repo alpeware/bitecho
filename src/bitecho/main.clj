@@ -201,16 +201,12 @@
                 (System/exit 0)))))))))
 
 (defn- cmd-demo-angels
-  "Runs the Milestone 6 Angels Demos: Multi-Harness Neutrality Proof and Three-Device einsum Pipeline."
+  "Runs the Milestone 6 & 7 Angels Demos: Multi-Harness Neutrality Proof, Three-Device einsum Pipeline, and Testnet Readiness Gate."
   [_args]
   (try
-    (let [neutrality-res (angels/run-multi-harness-neutrality-demo)
-          einsum-res (angels/run-three-device-einsum-demo)
-          report {:multi-harness-neutrality neutrality-res
-                  :three-device-einsum einsum-res
-                  :all-verified? (and (:ok? neutrality-res) (:ok? einsum-res))}]
+    (let [report (angels/run-all-angels-demos)]
       (println (json/write-str report))
-      (if (:all-verified? report)
+      (if (:ok? report)
         (System/exit 0)
         (System/exit 1)))
     (catch Exception e

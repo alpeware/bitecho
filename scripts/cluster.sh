@@ -693,13 +693,14 @@ TXT_BOOTSTRAP_EOF
 
   chmod 600 "${ROOT_DIR}/devnet/bootstrap.edn" "${ROOT_DIR}/devnet/bootstrap.txt"
 
-  # Sync to /home/simonpure/src/alpeware/clj-web/public/devnet if present
-  if [[ -d "/home/simonpure/src/alpeware/clj-web/public" ]]; then
+  # Sync to CLJ_WEB_PUBLIC_DIR if present
+  local clj_web_public="${CLJ_WEB_PUBLIC_DIR:-${ROOT_DIR}/../clj-web/public}"
+  if [[ -d "${clj_web_public}" ]]; then
     echo "--> Syncing bootstrap descriptors to clj-web public directory..."
-    mkdir -p "/home/simonpure/src/alpeware/clj-web/public/devnet"
-    cp -f "${ROOT_DIR}/devnet/bootstrap.txt" "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.txt"
-    cp -f "${ROOT_DIR}/devnet/bootstrap.edn" "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.edn"
-    chmod 644 "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.txt" "/home/simonpure/src/alpeware/clj-web/public/devnet/bootstrap.edn"
+    mkdir -p "${clj_web_public}/devnet"
+    cp -f "${ROOT_DIR}/devnet/bootstrap.txt" "${clj_web_public}/devnet/bootstrap.txt"
+    cp -f "${ROOT_DIR}/devnet/bootstrap.edn" "${clj_web_public}/devnet/bootstrap.edn"
+    chmod 644 "${clj_web_public}/devnet/bootstrap.txt" "${clj_web_public}/devnet/bootstrap.edn"
   fi
 
   # 7. Restart bitecho.service and poll healthz
@@ -1059,9 +1060,10 @@ for n in nodes:
     node_windows[n] = win_dict
 
 mismatches = []
+min_win_start = max((min(win.keys()) for win in node_windows.values() if win), default=0)
 all_eps = set()
 for win in node_windows.values():
-    all_eps.update([e for e in win.keys() if e <= min_fin])
+    all_eps.update([e for e in win.keys() if min_win_start <= e <= min_fin])
 
 for e in sorted(all_eps):
     vals = [win[e] for win in node_windows.values() if e in win]
@@ -1099,6 +1101,19 @@ elif skew == 0:
     if len(set(acc_signatures)) > 1:
         accountz_mismatch = True
 
+wire_versions = []
+for n in nodes:
+    cz = data[n].get('connz', '')
+    vm = re.search(r':protocol_version\s+(\d+)', cz)
+    if vm:
+        wire_versions.append(int(vm.group(1)))
+
+wire_ver_val = wire_versions[0] if wire_versions else 1
+wire_converged = (len(set(wire_versions)) <= 1) and (1 <= wire_ver_val <= 2)
+wire_ver_str = f'v{wire_ver_val}'
+
+treasury_sla_ok = (skew <= 2 and max(failed_rcpts.values()) == 0 and (minted_skew == 0 if skew == 0 else True) and len(nodes) >= 3)
+
 print('\n--- Convergence & Soak Assessment ---')
 print(f'Common Finalized Epoch: {min_fin}')
 print(f'Finalized Epoch Skew:   {skew} (healthy <= 2)')
@@ -1107,8 +1122,10 @@ print(f'Burn Digest Parity:     {\"PASSED\" if not digest_mismatch else \"FAILED
 print(f'Accountz Ledger Parity: {\"PASSED\" if not accountz_mismatch else \"FAILED\"}')
 print(f'Window Burns Converged: {\"PASSED\" if not mismatches else f\"FAILED (mismatches: {len(mismatches)})\"}')
 print(f'Failed Receipts Max:    {max(failed_rcpts.values())} (healthy == 0)')
+print(f'Treasury SLA Status:    {\"PASSED\" if treasury_sla_ok else \"FAILED\"} (k=0.5, redundant_validators={len(nodes)}/3)')
+print(f'Wire Protocol Version:  {wire_ver_str} ({\"CONVERGED\" if wire_converged else \"DIVERGED\"})')
 
-if skew > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch:
+if skew > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch or not treasury_sla_ok or not wire_converged:
     print('\nVerdict: DIVERGENCE DETECTED')
     sys.exit(1)
 else:
@@ -1385,7 +1402,7 @@ cmd_register_directory() {
   chmod 644 "${devnet_file}"
   echo "Wrote descriptor to ${devnet_file}"
 
-  local web_public="/home/simonpure/src/alpeware/clj-web/public"
+  local web_public="${CLJ_WEB_PUBLIC_DIR:-${ROOT_DIR}/../clj-web/public}"
   if [[ -d "$web_public" ]]; then
     mkdir -p "${web_public}/directory" "${web_public}/${nickname}"
     local web_dir_file="${web_public}/directory/${nickname}.json"

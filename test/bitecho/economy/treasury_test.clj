@@ -808,3 +808,53 @@
                   (and (= (+ 50 unclaimed) (:unclaimed-mint res))
                        (= unclaimed (get-in res [:epoch-unclaimed-mint 1]))
                        (= amt (:total-minted res))))))
+
+(defspec ^{:doc "Property: evaluate-treasury-sla accurately evaluates demand gate, supply cap, redundant infra, quorum, finality skew, and mint convergence invariants"}
+  prop-treasury-sla-invariants 50
+  (prop/for-all [num-validators (gen/choose 1 5)
+                 base-epoch (gen/choose 10 100)
+                 epoch-skew (gen/choose 0 4)
+                 failed-count (gen/elements [0 0 0 1 5])
+                 k-bps (gen/elements [1000 3000 5000 5500 8000])
+                 minted-total (gen/elements [1000000 23100000000 24000000000])]
+                (let [node-ids (mapv #(keyword (str "node" %)) (range 1 (inc num-validators)))
+                      snaps (into {}
+                                  (map-indexed
+                                   (fn [idx nid]
+                                     (let [ep (if (zero? idx) (+ base-epoch epoch-skew) base-epoch)
+                                           m-val (if (and (pos? epoch-skew) (zero? idx)) (+ minted-total 1000) minted-total)]
+                                       [nid {:statusz {:epoch ep
+                                                       :finalized_epoch ep
+                                                       :minted m-val
+                                                       :failed_receipts (if (zero? idx) failed-count 0)
+                                                       :supply 18900000000}
+                                             :fin-epoch ep
+                                             :minted m-val
+                                             :failed-rcpts (if (zero? idx) failed-count 0)}]))
+                                   node-ids))
+                      sla-res (treasury/evaluate-treasury-sla snaps {:k-bps k-bps :min-validators 3})
+                      expected-redundant? (>= num-validators 3)
+                      expected-quorum? (>= num-validators (+ (quot (* 2 num-validators) 3) 1))
+                      actual-epoch-skew (if (> num-validators 1) epoch-skew 0)
+                      expected-finality? (<= actual-epoch-skew 2)
+                      expected-zero-failed? (zero? failed-count)
+                      expected-demand-gate? (<= k-bps treasury/max-k-bps)
+                      actual-max-minted (if (and (pos? epoch-skew) (pos? num-validators)) (+ minted-total 1000) minted-total)
+                      expected-supply-cap? (<= actual-max-minted treasury/max-conditional-mint-supply)
+                      actual-minted-skew (if (> num-validators 1) (if (pos? epoch-skew) 1000 0) 0)
+                      expected-mint-converged? (if (zero? actual-epoch-skew) (zero? actual-minted-skew) true)
+                      expected-healthy? (and expected-redundant?
+                                             expected-quorum?
+                                             expected-finality?
+                                             expected-zero-failed?
+                                             expected-demand-gate?
+                                             expected-supply-cap?
+                                             expected-mint-converged?)]
+                  (and
+                   (= expected-demand-gate? (:demand-gate-compliant? sla-res))
+                   (= expected-supply-cap? (:supply-cap-compliant? sla-res))
+                   (= expected-redundant? (:redundant-infra? sla-res))
+                   (= expected-quorum? (:quorum-met? sla-res))
+                   (= expected-finality? (:finality-healthy? sla-res))
+                   (= expected-zero-failed? (:zero-failed-receipts? sla-res))
+                   (= expected-healthy? (:sla-healthy? sla-res))))))

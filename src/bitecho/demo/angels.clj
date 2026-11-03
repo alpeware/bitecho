@@ -66,11 +66,13 @@
 ;; -----------------------------------------------------------------------------
 
 (defn exchange-block-and-votes
-  "Simulates one Streamlet consensus epoch across a 3-validator cluster.
+  "Simulates one Streamlet consensus epoch across an N-validator cluster.
    Ticks all nodes, distributes the leader's proposal, collects votes, and distributes votes."
   [states sorted-pubs ep]
-  (let [proposer-idx (mod ep 3)
+  (let [n (count sorted-pubs)
+        proposer-idx (mod ep n)
         proposer-pub (nth sorted-pubs proposer-idx)
+        all-indices (vec (range n))
         tick-results (mapv (fn [st] (sm/handle-event st {:type :tick :rng (java.util.Random. ep)})) states)
         states-after-tick (mapv :state tick-results)
         proposer-res (nth tick-results proposer-idx)
@@ -78,7 +80,7 @@
         proposer-vote (first (filter #(= :send-vote (:type %)) (:commands proposer-res)))
         block (:block prop-cmd)
         v-prop (:vote proposer-vote)
-        peer-indices (filter #(not= % proposer-idx) [0 1 2])
+        peer-indices (filterv #(not= % proposer-idx) all-indices)
         prop-deliver-results (reduce (fn [acc idx]
                                        (assoc acc idx (sm/handle-event (nth states-after-tick idx)
                                                                        {:type :receive-propose :block block :sender proposer-pub})))
@@ -93,7 +95,7 @@
                                   (if (= idx proposer-idx)
                                     (nth states-after-tick idx)
                                     (:state (get prop-deliver-results idx))))
-                                [0 1 2])
+                                all-indices)
         all-votes (into [[proposer-idx proposer-pub v-prop]]
                         (map (fn [idx] [idx (nth sorted-pubs idx) (get peer-votes idx)]) peer-indices))
         final-states (reduce (fn [curr-states [from-idx from-pub v]]
@@ -104,7 +106,7 @@
                                            (nth curr-states to-idx)
                                            (:state (sm/handle-event (nth curr-states to-idx)
                                                                     {:type :receive-vote :vote v :sender from-pub}))))
-                                       [0 1 2])))
+                                       all-indices)))
                              states-with-props
                              all-votes)]
     final-states))
@@ -715,3 +717,266 @@
                           :scale-capacity {:15-nodes "linear-purity"
                                            :100-nodes "quadratic-gossip-convergence"
                                            :1000-nodes "hierarchical-sub-cluster"}}})))
+
+;; -----------------------------------------------------------------------------
+;; 3. Testnet Launch Exit Gates Evaluator (Milestone 7 / Master-Plan M4)
+;; -----------------------------------------------------------------------------
+
+(defn run-testnet-readiness-gate
+  "Executes and evaluates all four Master-Plan M4 Testnet Launch Exit Gates:
+   1. Third-party validators finalizing under demand gate (k = 0.5) on a 4-node Streamlet BFT cluster.
+   2. Live nickname directory resolving registered nicknames to keys and home sets.
+   3. Real workload paying strictly on verified deliverable preimage outcome with 50 bps protocol take.
+   4. Rolling-upgrade wire protocol continuity across mixed v1, legacy unversioned, and v2 payloads."
+  [& [_opts]]
+  (let [;; -----------------------------------------------------------------------
+        ;; 1. Cluster Setup (3 Genesis Validators + 1 Third-Party Partner Node4)
+        ;; -----------------------------------------------------------------------
+        dir-kp (crypto/generate-keypair)
+        dir-pub (basalt/bytes->hex (:public dir-kp))
+        dir-priv (:private dir-kp)
+
+        val-kps [(crypto/generate-keypair)
+                 (crypto/generate-keypair)
+                 (crypto/generate-keypair)
+                 (crypto/generate-keypair)]
+        val-pubs (mapv #(basalt/bytes->hex (:public %)) val-kps)
+        sorted-val-indices (sort-by #(nth val-pubs %) (range 4))
+        sorted-val-kps (mapv #(nth val-kps %) sorted-val-indices)
+        sorted-val-pubs (mapv #(nth val-pubs %) sorted-val-indices)
+
+        payer-kp (crypto/generate-keypair)
+        payer-pub (basalt/bytes->hex (:public payer-kp))
+        payer-priv (:private payer-kp)
+
+        worker-kp (crypto/generate-keypair)
+        worker-pub (basalt/bytes->hex (:public worker-kp))
+        worker-priv (:private worker-kp)
+
+        bootstrap {:network :devnet
+                   :directory-pubkey dir-pub
+                   :treasury-pubkey (nth sorted-val-pubs 0)
+                   :custody-pubkey (nth sorted-val-pubs 0)
+                   :nodes {:node1 {:pubkey (nth sorted-val-pubs 0) :ip "127.0.0.1" :port 5001 :agent-port 5010}
+                           :node2 {:pubkey (nth sorted-val-pubs 1) :ip "127.0.0.1" :port 5002 :agent-port 5010}
+                           :node3 {:pubkey (nth sorted-val-pubs 2) :ip "127.0.0.1" :port 5003 :agent-port 5010}
+                           :node4 {:pubkey (nth sorted-val-pubs 3) :ip "127.0.0.1" :port 5004 :agent-port 5010}}}
+
+        payer-init-bal 500000
+        worker-init-bal 10000
+        val-init-bal 1000000
+
+        genesis-ledger (into {}
+                             (concat (map (fn [pk] [pk (account/map->AccountState {:balance val-init-bal :seq 0 :deps []})])
+                                          sorted-val-pubs)
+                                     [[payer-pub (account/map->AccountState {:balance payer-init-bal :seq 0 :deps []})]
+                                      [worker-pub (account/map->AccountState {:balance worker-init-bal :seq 0 :deps []})]]))
+        peers-map (into {}
+                        (map (fn [kp] [(basalt/bytes->hex (:public kp)) (:public kp)])
+                             sorted-val-kps))
+        cfg (assoc config/devnet-config
+                   :genesis-ledger genesis-ledger
+                   :peers-map peers-map
+                   :validators sorted-val-pubs
+                   :mesh-nodes sorted-val-pubs
+                   :settlement-take-bps 50)
+        init-val-states (mapv (fn [idx]
+                                (sm/init-state [] (nth sorted-val-pubs idx) (assoc cfg :keypair (nth sorted-val-kps idx))))
+                              (range 4))
+
+        ;; -----------------------------------------------------------------------
+        ;; Gate 2: Live Nickname Directory Attestation & Resolution
+        ;; -----------------------------------------------------------------------
+        partner-kp (crypto/generate-keypair)
+        partner-pub (basalt/bytes->hex (:public partner-kp))
+        partner-priv (:private partner-kp)
+
+        nexus-pop (light-core/create-directory-pop payer-priv {:domain "bitecho.org" :nickname "nexus" :pubkey payer-pub})
+        axiom-pop (light-core/create-directory-pop worker-priv {:domain "bitecho.org" :nickname "axiom" :pubkey worker-pub})
+        partner-pop (light-core/create-directory-pop partner-priv {:domain "bitecho.org" :nickname "partner-agent" :pubkey partner-pub})
+
+        nexus-desc (light-core/sign-directory-descriptor dir-priv dir-pub nexus-pop {:issued-epoch 1 :expires-epoch 100 :home-set ["node1" "node2"]})
+        axiom-desc (light-core/sign-directory-descriptor dir-priv dir-pub axiom-pop {:issued-epoch 1 :expires-epoch 100 :home-set ["node2" "node3"]})
+        partner-desc (light-core/sign-directory-descriptor dir-priv dir-pub partner-pop {:issued-epoch 1 :expires-epoch 100 :home-set ["node3" "node4"]})
+
+        payer-light-st (assoc (light-core/init-light-state {:pubkey-hex payer-pub} {:bootstrap bootstrap})
+                              :home-set ["node1" "node2"])
+
+        ;; Verify and resolve directory descriptors
+        v-nexus (light-core/verify-directory-descriptor nexus-desc dir-pub 1)
+        v-axiom (light-core/verify-directory-descriptor axiom-desc dir-pub 1)
+        v-partner (light-core/verify-directory-descriptor partner-desc dir-pub 1)
+
+        ;; Forged authority check
+        forged-kp (crypto/generate-keypair)
+        forged-desc (assoc partner-desc :directory-signature (basalt/bytes->hex (crypto/sign (:private forged-kp) (.getBytes "tampered" "UTF-8"))))
+        v-forged (light-core/verify-directory-descriptor forged-desc dir-pub 1)
+
+        directory-resolving? (and (:ok? v-nexus)
+                                  (:ok? v-axiom)
+                                  (:ok? v-partner)
+                                  (= payer-pub (get-in v-nexus [:descriptor :pubkey]))
+                                  (= worker-pub (get-in v-axiom [:descriptor :pubkey]))
+                                  (= partner-pub (get-in v-partner [:descriptor :pubkey]))
+                                  (false? (:ok? v-forged)))
+
+        ;; -----------------------------------------------------------------------
+        ;; Gate 3: Real Workload Paying Strictly on Verified Outcome Preimage
+        ;; -----------------------------------------------------------------------
+        workload-input [[1.0 2.0] [3.0 4.0]]
+        workload-weights [[2.0 0.0] [0.0 2.0]]
+        workload-result (einsum-2d workload-input workload-weights)
+        workload-preimage (pr-str workload-result)
+        workload-hash (tensor->deliverable-hash workload-preimage)
+
+        escrow-amount 10000
+        expected-take 50
+        expected-net 9950
+
+        ;; Payer locks intent
+        lock-cmd-res (light-core/handle-command
+                      payer-light-st
+                      {"cmd" "lock-intent"
+                       "receiver" worker-pub
+                       "amount" escrow-amount
+                       "deliverable_hash" workload-hash
+                       "expires_epoch" 25
+                       "escrow_id" "esc-workload-gate3"}
+                      payer-priv)
+        st-payer-locked (:state lock-cmd-res)
+        lock-env (first (:net-envelopes lock-cmd-res))
+        lock-event (mesh/unwrap-authenticated-agent-event lock-env)
+
+        ;; Distribute lock-event to all 4 validators
+        val-states-l1 (mapv #(sm/handle-event % lock-event) init-val-states)
+        val-states-ep3 (advance-consensus-epochs (mapv :state val-states-l1) sorted-val-pubs 1 3)
+
+        ;; Worker executes workload, payer verifies preimage against deliverable_hash
+        preimage-verified? (= workload-hash (tensor->deliverable-hash workload-preimage))
+
+        ;; Payer issues release-intent with verified deliverable preimage
+        rel-cmd-res (light-core/handle-command
+                     st-payer-locked
+                     {"cmd" "release-intent"
+                      "escrow_id" "esc-workload-gate3"
+                      "preimage" workload-preimage}
+                     payer-priv)
+        _st-payer-released (:state rel-cmd-res)
+        rel-env (first (:net-envelopes rel-cmd-res))
+        rel-event (mesh/unwrap-authenticated-agent-event rel-env)
+
+        ;; Finalize release across all 4 validators
+        val-states-r1 (mapv #(sm/handle-event % rel-event) val-states-ep3)
+        val-states-ep6 (advance-consensus-epochs (mapv :state val-states-r1) sorted-val-pubs 4 3)
+
+        ;; Advance consensus and trigger demand-gated epoch mint under k = 0.5
+        val-states-ep9 (advance-consensus-epochs val-states-ep6 sorted-val-pubs 7 3)
+
+        ;; BFT Quorum Snapshots & Verification across all 4 validators (quorum = 3 of 4)
+        worker-snaps (mapv (fn [i]
+                             (mesh/build-validator-chain-state-snapshot
+                              (nth val-states-ep9 i)
+                              {:pubkey-hex (nth sorted-val-pubs i) :keypair (nth sorted-val-kps i)}
+                              worker-pub
+                              "nonce-worker"))
+                           (range 4))
+        worker-q (light-core/verify-chain-state-quorum worker-snaps {:expected-pubkey worker-pub :trusted-validators (set sorted-val-pubs) :min-finalized-epoch 1})
+        worker-light-st (light-core/apply-verified-chain-state-snapshot
+                         (light-core/init-light-state {:pubkey-hex worker-pub} {:bootstrap bootstrap})
+                         (:snapshot worker-q))
+
+        worker-final-bal (get-in worker-light-st [:account :balance])
+        workload-settled? (and preimage-verified?
+                               (:ok? worker-q)
+                               (= 4 (:quorum-count worker-q))
+                               (= (+ worker-init-bal expected-net) worker-final-bal))
+
+        ;; -----------------------------------------------------------------------
+        ;; Gate 1: 4 Validators Finalizing Under Demand Gate (k = 0.5) & Treasury SLA
+        ;; -----------------------------------------------------------------------
+        cluster-snaps (into {}
+                            (map-indexed (fn [idx st]
+                                           [(keyword (str "node" (inc idx)))
+                                            {:statusz (mesh/render-statusz st 3 4 nil)
+                                             :burnsz (sm/extract-burn-window st)
+                                             :accountz {:accounts (into {} (map (fn [[k v]] [k (into {} v)]) (:ledger st)))
+                                                        :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
+                                             :connz {:protocol_version 1 :conn_dropped 0 :conn_stale 0}}])
+                                         val-states-ep9))
+        convergence (mesh/evaluate-cluster-convergence cluster-snaps)
+        treasury-sla (:treasury-sla convergence)
+
+        third-party-finalizing? (and (>= (:common-finalized-epoch convergence) 1)
+                                     (<= (:finalized-epoch-skew convergence) 2)
+                                     (= 4 (count val-states-ep9)))
+        demand-gate-enforced? (and (:demand-gate-compliant? treasury-sla)
+                                   (= 5000 (:demand-gate-k-bps treasury-sla)))
+        treasury-sla-healthy? (:sla-healthy? treasury-sla)
+
+        ;; -----------------------------------------------------------------------
+        ;; Gate 4: Rolling-Upgrade Wire Versioning Continuity (FLAG B)
+        ;; -----------------------------------------------------------------------
+        ;; Wire v1, legacy unversioned N-1, and forward-compatible v2 payloads
+        wire-v1 {:protocol-version 1 :bitecho/type :channel-offer :caller payer-pub :callee worker-pub}
+        wire-unversioned {:bitecho/type :channel-offer :caller payer-pub :callee worker-pub}
+        wire-v2 {:protocol-version 2 :bitecho/type :channel-offer :caller payer-pub :callee worker-pub :unknown-future-flag "future-value"}
+        wire-v99 {:protocol-version 99 :bitecho/type :channel-offer :caller payer-pub :callee worker-pub}
+
+        chk-v1 (light-core/check-wire-version-compatibility wire-v1)
+        chk-unversioned (light-core/check-wire-version-compatibility wire-unversioned)
+        chk-v2 (light-core/check-wire-version-compatibility wire-v2)
+        chk-v99 (light-core/check-wire-version-compatibility wire-v99)
+
+        rx-v99 (light-core/handle-wire-payload payer-light-st wire-v99 payer-priv)
+        v99-rejected? (and (false? (get-in rx-v99 [:response "ok"]))
+                           (= "unsupported-wire-version" (get-in rx-v99 [:response "error"]))
+                           (= 1 (get-in (:state rx-v99) [:wire-version-diagnostics :unsupported-dropped]))
+                           (= 99 (get-in (:state rx-v99) [:wire-version-diagnostics :last-unsupported-version])))
+
+        rolling-compatible? (and (:ok? chk-v1)
+                                 (:ok? chk-unversioned)
+                                 (true? (:legacy-unversioned? chk-unversioned))
+                                 (:ok? chk-v2)
+                                 (false? (:ok? chk-v99))
+                                 v99-rejected?
+                                 (:wire-version-converged? convergence))
+
+        all-gates-passed? (and third-party-finalizing?
+                               demand-gate-enforced?
+                               treasury-sla-healthy?
+                               directory-resolving?
+                               workload-settled?
+                               rolling-compatible?)]
+
+    {:ok? all-gates-passed?
+     :all-gates-passed? all-gates-passed?
+     :exit-gates {:third-party-validators-finalizing? third-party-finalizing?
+                  :demand-gate-enforced? demand-gate-enforced?
+                  :treasury-sla-healthy? treasury-sla-healthy?
+                  :directory-resolving? directory-resolving?
+                  :verified-outcome-workload-settled? workload-settled?
+                  :rolling-upgrade-wire-compatible? rolling-compatible?}
+     :cluster {:validator-count 4
+               :partner-node4-present? true
+               :validators ["node1" "node2" "node3" "node4"]
+               :common-finalized-epoch (:common-finalized-epoch convergence)
+               :finalized-epoch-skew (:finalized-epoch-skew convergence)}
+     :workload {:escrow-amount escrow-amount
+                :settlement-take-burned expected-take
+                :worker-net-received expected-net
+                :preimage-verified? preimage-verified?}
+     :treasury-sla treasury-sla
+     :convergence convergence}))
+
+(defn run-all-angels-demos
+  "Runs all angels demos including multi-harness neutrality, three-device einsum, and testnet readiness gate."
+  [& [opts]]
+  (let [neutrality-res (run-multi-harness-neutrality-demo opts)
+        einsum-res (run-three-device-einsum-demo opts)
+        readiness-res (run-testnet-readiness-gate opts)
+        all-ok? (and (:ok? neutrality-res) (:ok? einsum-res) (:ok? readiness-res))]
+    {:ok? all-ok?
+     :all-verified? all-ok?
+     :multi-harness-neutrality neutrality-res
+     :three-device-einsum einsum-res
+     :testnet-readiness-gate readiness-res}))

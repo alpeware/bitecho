@@ -15,10 +15,10 @@
   []
   (basalt/bytes->hex (:public (crypto/generate-keypair))))
 
-(defn- sample-fingerprint
+(def gen-fingerprint
   "Generates a valid 32-byte colon-separated uppercase hex fingerprint string."
-  []
-  (str/join ":" (repeatedly 32 #(format "%02X" (rand-int 256)))))
+  (gen/fmap #(str/join ":" (map (partial format "%02X") %))
+            (gen/vector (gen/choose 0 255) 32)))
 
 (def gen-node-id
   "Generates test node IDs."
@@ -37,12 +37,13 @@
             ingress-host (gen/elements [nil "node1.ingress.bitecho.org" "node2.ingress.bitecho.org"])
             ingress-port (gen/elements [nil 443 8443])
             ufrag (gen/fmap (partial apply str) (gen/vector gen/char-alphanumeric 8))
-            pwd (gen/fmap (partial apply str) (gen/vector gen/char-alphanumeric 24))]
+            pwd (gen/fmap (partial apply str) (gen/vector gen/char-alphanumeric 24))
+            fp gen-fingerprint
+            include-dir-pk? gen/boolean]
     (let [pubkey (sample-pubkey-hex)
-          fp (sample-fingerprint)
           treasury-pk (sample-pubkey-hex)
           custody-pk (sample-pubkey-hex)
-          dir-pk (when (zero? (rand-int 2)) (sample-pubkey-hex))]
+          dir-pk (when include-dir-pk? (sample-pubkey-hex))]
       (cond-> {:network :devnet
                :treasury-pubkey treasury-pk
                :custody-pubkey custody-pk

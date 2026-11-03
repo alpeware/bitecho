@@ -478,4 +478,114 @@
                 (update :unclaimed-mint (fnil + 0) unclaimed)
                 (assoc-in [:epoch-unclaimed-mint epoch] unclaimed))))))))
 
+(defn evaluate-treasury-sla
+  "Pure function evaluating Treasury SLA conformance across cluster validator snapshots or state machine states.
+   Accepts either a map of {node-id snapshot-or-state, ...} or a collection of snapshots/states.
+   Options map opts supports {:k-bps 5000 :min-validators 3 :quorum-size 3}.
+   Evaluates:
+     :demand-gate-k-bps        (<= max-k-bps 5000, i.e. k <= 0.5)
+     :demand-gate-compliant?
+     :supply-cap-compliant?    (total-minted <= max-conditional-mint-supply and supply <= hard-cap)
+     :redundant-infra?         (active-validators >= min-validators (default 3))
+     :quorum-met?              (active-validators >= quorum-size)
+     :finality-healthy?        (finalized-epoch-skew <= 2)
+     :zero-failed-receipts?    (max-failed-receipts == 0)
+     :mint-converged?          (when finalized-epoch-skew == 0, minted-skew == 0)
+     :sla-healthy?             (conjunction of the above)."
+  [snapshots-or-states & [opts]]
+  (let [items (if (map? snapshots-or-states)
+                (vals snapshots-or-states)
+                (or snapshots-or-states []))
+        item-stats
+        (mapv (fn [item]
+                (let [st (if (and (map? item) (contains? item :statusz))
+                           (:statusz item)
+                           item)
+                      st-map (if (string? st)
+                               (try
+                                 (let [pairs (string/split (string/trim st) #"\s+")]
+                                   (into {} (keep (fn [p]
+                                                    (let [[k v] (string/split p #"=" 2)]
+                                                      (when (and k v)
+                                                        [(keyword k) (try (Long/parseLong v) (catch Exception _ v))])))
+                                                  pairs)))
+                                 (catch Exception _ {}))
+                               (or st {}))
+                      fin-epoch (long (or (:fin-epoch item)
+                                          (:finalized_epoch st-map)
+                                          (:finalized-epoch st-map)
+                                          (:last-executed-finalized-epoch item)
+                                          (:last-executed-finalized-epoch st-map)
+                                          (get-in item [:burnsz :anchor-epoch])
+                                          0))
+                      minted (long (or (:minted item)
+                                       (:minted st-map)
+                                       (:total-minted item)
+                                       (:total-minted st-map)
+                                       (get-in item [:treasury :ledger :minted-total])
+                                       (get-in st-map [:treasury :ledger :minted-total])
+                                       0))
+                      supply (long (or (:supply item)
+                                       (:supply st-map)
+                                       (when-let [ledger (or (:ledger item) (:ledger st-map))]
+                                         (reduce + 0 (map (fn [v] (if (map? v) (or (:balance v) 0) (or v 0))) (vals ledger))))
+                                       0))
+                      failed (long (or (:failed-rcpts item)
+                                       (:failed_receipts st-map)
+                                       (:failed-receipts-count item)
+                                       (:failed-receipts-count st-map)
+                                       (count (:failed-receipts item))
+                                       0))]
+                  {:fin-epoch fin-epoch
+                   :minted minted
+                   :supply supply
+                   :failed failed}))
+              items)
+        active-validators (count items)
+        min-validators (long (or (:min-validators opts) 3))
+        quorum-size (long (or (:quorum-size opts) (+ (quot (* 2 active-validators) 3) 1)))
+        fin-epochs (mapv :fin-epoch item-stats)
+        fin-epoch-skew (if (seq fin-epochs)
+                         (- (apply max fin-epochs) (apply min fin-epochs))
+                         0)
+        minted-vals (mapv :minted item-stats)
+        minted-skew (if (seq minted-vals)
+                      (- (apply max minted-vals) (apply min minted-vals))
+                      0)
+        max-minted (if (seq minted-vals) (apply max minted-vals) 0)
+        max-supply (if (seq item-stats) (apply max (map :supply item-stats)) 0)
+        max-failed (if (seq item-stats) (apply max (map :failed item-stats)) 0)
+
+        k-bps (long (or (:k-bps opts) default-k-bps))
+        demand-gate-compliant? (<= k-bps max-k-bps)
+        supply-cap-compliant? (and (<= max-minted max-conditional-mint-supply)
+                                   (or (zero? max-supply) (<= max-supply hard-cap)))
+        redundant-infra? (>= active-validators min-validators)
+        quorum-met? (>= active-validators quorum-size)
+        finality-healthy? (<= fin-epoch-skew 2)
+        zero-failed-receipts? (zero? max-failed)
+        mint-converged? (if (zero? fin-epoch-skew) (zero? minted-skew) true)
+        sla-healthy? (and demand-gate-compliant?
+                          supply-cap-compliant?
+                          redundant-infra?
+                          quorum-met?
+                          finality-healthy?
+                          zero-failed-receipts?
+                          mint-converged?)]
+    {:demand-gate-k-bps k-bps
+     :demand-gate-compliant? demand-gate-compliant?
+     :supply-cap-compliant? supply-cap-compliant?
+     :redundant-infra? redundant-infra?
+     :quorum-met? quorum-met?
+     :finality-healthy? finality-healthy?
+     :zero-failed-receipts? zero-failed-receipts?
+     :mint-converged? mint-converged?
+     :active-validators active-validators
+     :finalized-epoch-skew fin-epoch-skew
+     :minted-skew minted-skew
+     :max-failed-receipts max-failed
+     :total-minted max-minted
+     :supply max-supply
+     :sla-healthy? sla-healthy?}))
+
 

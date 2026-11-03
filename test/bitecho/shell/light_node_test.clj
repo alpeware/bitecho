@@ -1308,6 +1308,8 @@
       (is (= "h123" (get-in (light-shell/parse-light-node-args ["rendezvous-accept" "--offer-hash" "h123"]) [:cmd-map "offer_hash"])))
       (is (= "alice" (get-in (light-shell/parse-light-node-args ["rendezvous-accept" "--from" "alice"]) [:cmd-map "from"])))
       (is (= "dir-key-1" (get-in (light-shell/parse-light-node-args ["directory-verify" "--directory-pubkey" "dir-key-1"]) [:cmd-map "directory_pubkey"])))
+      (is (= "nexus" (get-in (light-shell/parse-light-node-args ["directory-verify" "--nickname" "nexus"]) [:cmd-map "nickname"])))
+      (is (= "bitecho.org" (get-in (light-shell/parse-light-node-args ["directory-verify" "--domain" "bitecho.org"]) [:cmd-map "domain"])))
       (is (= "alice" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "petname"])))
       (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "pubkey"])))
       (is (true? (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "overwrite"])))
@@ -1858,4 +1860,54 @@
           (is (= 1 (count (:escrows val-snap))))
           (let [v-res (light-core/verify-chain-state-snapshot val-snap {:expected-pubkey user-pub :trusted-validators trusted-set})]
             (is (true? (:ok? v-res)))))))))
+
+(deftest test-directory-verify-auto-fetch
+  (testing "directory-verify --nickname auto-fetches descriptor via :directory-fetcher in run-one-shot! and handle-serve-line!"
+    (let [state-dir (str "/tmp/test-dir-verify-" (System/currentTimeMillis))
+          _ (.mkdirs (io/file state-dir))
+          user-identity (light-shell/load-or-create-light-identity! state-dir)
+          user-pub (or (:pubkey-hex user-identity) (:pubkey user-identity))
+          user-priv (:privkey-bytes user-identity)
+          dir-kp (crypto/generate-keypair)
+          dir-pub (basalt/bytes->hex (:public dir-kp))
+          dir-priv (:private dir-kp)
+          pop (light-core/create-directory-pop user-priv {:domain "bitecho.org" :nickname "nexus" :pubkey user-pub})
+          desc (light-core/sign-directory-descriptor dir-priv dir-pub pop {:issued-epoch 1 :expires-epoch 50})
+          fetcher (fn [dom nick]
+                    (when (and (= dom "bitecho.org") (= nick "nexus"))
+                      desc))
+          bootstrap {:network :devnet :directory-pubkey dir-pub :nodes {}}]
+      (try
+        ;; 1. Test run-one-shot!
+        (let [sw (java.io.StringWriter.)
+              pw (java.io.PrintWriter. sw true)]
+          (binding [*out* pw]
+            (let [opts {:state-dir state-dir
+                        :bootstrap bootstrap
+                        :directory-fetcher fetcher
+                        :cmd-map {"cmd" "directory-verify" "nickname" "nexus"}}
+                  one-shot-res (light-shell/run-one-shot! opts)]
+              (is (true? (get one-shot-res "ok")))
+              (is (= "nexus" (get one-shot-res "nickname"))))))
+        ;; 2. Test handle-serve-line!
+        (let [state-atom (atom (light-core/init-light-state user-identity {:bootstrap bootstrap}))
+              conn-atom (atom {:phase :down :send-fn (constantly true)})
+              sw (java.io.StringWriter.)
+              pw (java.io.PrintWriter. sw true)
+              serve-line (json/write-str {"cmd" "directory-verify" "nickname" "nexus"})
+              ctx {:state-atom state-atom
+                   :conn-atom conn-atom
+                   :out-writer pw
+                   :identity user-identity
+                   :bootstrap bootstrap
+                   :conn-opts {:directory-fetcher fetcher}}]
+          (light-shell/handle-serve-line! serve-line ctx)
+          (let [line (last (str/split-lines (.toString sw)))
+                serve-res (json/read-str line)]
+            (is (true? (get serve-res "ok")))
+            (is (= "nexus" (get serve-res "nickname")))
+            (is (contains? (:directory-cache @state-atom) "nexus"))))
+        (finally
+          (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
+                (reverse (file-seq (io/file state-dir)))))))))
 

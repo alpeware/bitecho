@@ -18,6 +18,63 @@
   (:import (java.nio.charset StandardCharsets)))
 
 ;; -----------------------------------------------------------------------------
+;; Wire Protocol Versioning & Rolling Upgrade Compatibility (FLAG B)
+;; -----------------------------------------------------------------------------
+
+(def current-wire-version
+  "Current Bitecho wire protocol envelope version."
+  1)
+
+(def min-supported-wire-version
+  "Minimum supported wire protocol version for rolling-upgrade compatibility (N-1/N)."
+  1)
+
+(def max-supported-wire-version
+  "Maximum supported wire protocol version for forward rolling-upgrade compatibility (N+1)."
+  2)
+
+(defn rolling-upgrade-compatible?
+  "Pure predicate checking whether two wire protocol versions are within the rolling-upgrade compatibility window (<= 1 step difference)."
+  [local-version remote-version]
+  (and (integer? local-version)
+       (integer? remote-version)
+       (>= (long local-version) 1)
+       (>= (long remote-version) 1)
+       (<= (Math/abs (- (long local-version) (long remote-version))) 1)))
+
+(defn check-wire-version-compatibility
+  "Pure function inspecting a wire payload or message map for protocol version compatibility.
+   Supports :protocol-version, \"protocol_version\", and :wire-version keys.
+   Returns {:ok? true :version 1 :legacy-unversioned? true} for unversioned (N-1) messages.
+   Returns {:ok? true :version v :legacy-unversioned? false} for supported version integers in [1, 2].
+   Returns {:ok? false :error \"unsupported-wire-version\" :version v :min-supported 1 :max-supported 2} otherwise."
+  [msg]
+  (if-not (map? msg)
+    {:ok? false :error "unsupported-wire-version" :version nil :min-supported min-supported-wire-version :max-supported max-supported-wire-version}
+    (let [has-v? (or (contains? msg :protocol-version)
+                     (contains? msg "protocol_version")
+                     (contains? msg :wire-version))
+          raw-v (if (contains? msg :protocol-version)
+                  (:protocol-version msg)
+                  (if (contains? msg "protocol_version")
+                    (get msg "protocol_version")
+                    (:wire-version msg)))]
+      (cond
+        (or (not has-v?) (nil? raw-v))
+        {:ok? true :version current-wire-version :legacy-unversioned? true}
+
+        (and (integer? raw-v)
+             (<= min-supported-wire-version (long raw-v) max-supported-wire-version))
+        {:ok? true :version (long raw-v) :legacy-unversioned? false}
+
+        :else
+        {:ok? false
+         :error "unsupported-wire-version"
+         :version raw-v
+         :min-supported min-supported-wire-version
+         :max-supported max-supported-wire-version}))))
+
+;; -----------------------------------------------------------------------------
 ;; State Initialization
 ;; -----------------------------------------------------------------------------
 
@@ -60,7 +117,10 @@
    :outbound-rendezvous {}
    :pending-rendezvous {}
    :pending-rendezvous-accepts {}
-   :voucher-seqs {}})
+   :voucher-seqs {}
+   :wire-version-diagnostics {:unsupported-dropped 0
+                              :last-unsupported-version nil
+                              :last-error nil}})
 
 ;; -----------------------------------------------------------------------------
 ;; Petnames Address Book & Counterparty Resolution (Pure Helpers)
@@ -669,6 +729,7 @@
   (let [canonical-str (canonical-chain-state-snapshot-str snapshot)
         sig-bytes (crypto/sign validator-privkey-bytes (.getBytes canonical-str StandardCharsets/UTF_8))]
     (assoc snapshot
+           :protocol-version current-wire-version
            :bitecho/type :chain-state-snapshot
            :type :chain-state-snapshot
            :signature (basalt/bytes->hex sig-bytes))))
@@ -1185,7 +1246,8 @@
                                                 :dac active-dac})
                 header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id)
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes header-str "UTF-8")))
-                wire-payload (cond-> {:bitecho/type :rendezvous-offer-header
+                wire-payload (cond-> {:protocol-version current-wire-version
+                                      :bitecho/type :rendezvous-offer-header
                                       :type :rendezvous-offer-header
                                       :caller caller
                                       :callee callee
@@ -1245,7 +1307,8 @@
         callee-x25519-pub (basalt/bytes->hex (:public kp-callee))
         ack-str (canonical-rendezvous-ack-str caller callee offer-hash callee-x25519-pub epoch (:signature signed-ack))
         sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes ack-str "UTF-8")))
-        ack-payload {:bitecho/type :rendezvous-ack-voucher
+        ack-payload {:protocol-version current-wire-version
+                     :bitecho/type :rendezvous-ack-voucher
                      :type :rendezvous-ack-voucher
                      :caller caller
                      :callee callee
@@ -1355,7 +1418,8 @@
                                                 :home-node home-node
                                                 :dac active-dac})
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
-                offer-payload (cond-> {:bitecho/type :channel-offer
+                offer-payload (cond-> {:protocol-version current-wire-version
+                                       :bitecho/type :channel-offer
                                        :session-id session-id
                                        :caller caller
                                        :callee callee
@@ -1442,7 +1506,8 @@
                       :min-burn 100})
             delivery-ack (into {} (:delivery-ack ack-res))
             sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes (str session-id "-" eph-pub-hex) "UTF-8")))
-            accept-payload {:bitecho/type :channel-accept
+            accept-payload {:protocol-version current-wire-version
+                            :bitecho/type :channel-accept
                             :session-id session-id
                             :caller caller
                             :callee (:pubkey state)
@@ -1493,7 +1558,8 @@
             burn-amt (long (or (get cmd-map "burn") 500))
             seq-num (inc (:tx-seq session 0))
             sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (.getBytes session-id "UTF-8"))
-            msg-payload {:bitecho/type :sealed-message
+            msg-payload {:protocol-version current-wire-version
+                         :bitecho/type :sealed-message
                          :session-id session-id
                          :sender (:pubkey state)
                          :recipient (:peer session)
@@ -1568,7 +1634,8 @@
       {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
       (let [pname (pubkey->petname state (:peer session))
             sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes (str "close-" session-id) "UTF-8")))
-            close-payload {:bitecho/type :channel-close
+            close-payload {:protocol-version current-wire-version
+                           :bitecho/type :channel-close
                            :session-id session-id
                            :sender (:pubkey state)
                            :recipient (:peer session)
@@ -2231,9 +2298,7 @@
         dir-pub (or (get cmd-map "directory_pubkey") (get cmd-map "directory-pubkey")
                     (:directory_pubkey cmd-map) (:directory-pubkey cmd-map)
                     (:trusted-directory-pubkey state)
-                    (get-in state [:bootstrap :directory-pubkey])
-                    (get-in state [:bootstrap :custody-pubkey])
-                    (get-in state [:bootstrap :treasury-pubkey]))
+                    (get-in state [:bootstrap :directory-pubkey]))
         cur-ep (when (:epoch-initialized? state) (:epoch state))
         res (verify-directory-descriptor raw-desc dir-pub cur-ep)]
     (if-not (:ok? res)
@@ -2399,7 +2464,12 @@
                         "accounting" {"scope" "local-non-consensus"
                                       "note" "Locally computed devnet totals; never consensus finalized"
                                       "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
-                                      "vouchers_count" (count (:vouchers state []))}}
+                                      "vouchers_count" (count (:vouchers state []))}
+                        "wire_protocol" {"version" current-wire-version
+                                         "min_supported" min-supported-wire-version
+                                         "max_supported" max-supported-wire-version
+                                         "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
+                                         "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])}}
                  (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state)))
      :net-envelopes []
      :stdout-events []}))
@@ -2460,21 +2530,33 @@
       (recur thawed)
       nil)
 
-    (and (map? raw-payload-or-event)
-         (contains? raw-payload-or-event :bitecho/type))
-    raw-payload-or-event
-
     (and (map? raw-payload-or-event) (map? (:event raw-payload-or-event)))
-    (recur (:event raw-payload-or-event))
+    (let [ver (or (:protocol-version raw-payload-or-event) (get raw-payload-or-event "protocol_version"))
+          unwrapped (unwrap-wire-message (:event raw-payload-or-event))]
+      (if (and (map? unwrapped) ver (not (contains? unwrapped :protocol-version)) (not (contains? unwrapped "protocol_version")))
+        (assoc unwrapped :protocol-version ver)
+        unwrapped))
 
     (and (map? raw-payload-or-event) (map? (:message raw-payload-or-event)))
-    (let [p (:payload (:message raw-payload-or-event))]
-      (if (bytes? p)
-        (recur (try (nippy/thaw p) (catch Exception _ nil)))
-        (if (map? p) (recur p) nil)))
+    (let [ver (or (:protocol-version raw-payload-or-event) (get raw-payload-or-event "protocol_version"))
+          p (:payload (:message raw-payload-or-event))
+          unwrapped (if (bytes? p)
+                      (unwrap-wire-message (try (nippy/thaw p) (catch Exception _ nil)))
+                      (if (map? p) (unwrap-wire-message p) nil))]
+      (if (and (map? unwrapped) ver (not (contains? unwrapped :protocol-version)) (not (contains? unwrapped "protocol_version")))
+        (assoc unwrapped :protocol-version ver)
+        unwrapped))
 
     (and (map? raw-payload-or-event)
-         (contains? raw-payload-or-event :type))
+         (or (contains? raw-payload-or-event :bitecho/type)
+             (contains? raw-payload-or-event :type)
+             (contains? raw-payload-or-event "type")
+             (contains? raw-payload-or-event "cmd")))
+    raw-payload-or-event
+
+    (and (map? raw-payload-or-event)
+         (or (contains? raw-payload-or-event :protocol-version)
+             (contains? raw-payload-or-event "protocol_version")))
     raw-payload-or-event
 
     :else nil))
@@ -2644,7 +2726,8 @@
            ack-sign-bytes (.getBytes (str "ack-" session-id "-" contiguous-ack-seq "-" msg-seq "-" (str/join "," seen-vec)) "UTF-8")
            sig (crypto/sign privkey-bytes ack-sign-bytes)
            sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
-           ack-payload {:bitecho/type :session-ack
+           ack-payload {:protocol-version current-wire-version
+                        :bitecho/type :session-ack
                         :session-id session-id
                         :sender (:pubkey state)
                         :recipient peer-pub
@@ -2945,7 +3028,8 @@
                   (let [reveal-str (canonical-rendezvous-reveal-str session-id (:pubkey state) (:callee outbound)
                                                                     offer-hash (:caller-x25519-pub outbound) (:epoch state))
                         reveal-sig (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes reveal-str "UTF-8")))
-                        reveal-payload {:bitecho/type :rendezvous-reveal
+                        reveal-payload {:protocol-version current-wire-version
+                                        :bitecho/type :rendezvous-reveal
                                         :type :rendezvous-reveal
                                         :session-id session-id
                                         :caller (:pubkey state)
@@ -2961,7 +3045,8 @@
                           (let [text-bytes (.getBytes ^String initial-text "UTF-8")
                                 seq-num 1
                                 sealed-m (sealed/seal-message (:tx-key keys) seq-num text-bytes (.getBytes session-id "UTF-8"))
-                                msg-payload {:bitecho/type :sealed-message
+                                msg-payload {:protocol-version current-wire-version
+                                             :bitecho/type :sealed-message
                                              :session-id session-id
                                              :sender (:pubkey state)
                                              :recipient (:callee outbound)
@@ -3147,41 +3232,58 @@
            :stdout-events []})))))
 
 (defn handle-wire-payload
-  "Processes an incoming network event or raw payload. Enforces 2-epoch skew tolerance
-   and anti-replay protections before dispatching to message-specific reducers."
+  "Processes an incoming network event or raw payload. Enforces wire protocol version compatibility,
+   2-epoch skew tolerance, and anti-replay protections before dispatching to message-specific reducers."
   [state raw-payload-or-event privkey-bytes]
   (let [msg (unwrap-wire-message raw-payload-or-event)]
     (if-not (map? msg)
       {:state state :net-envelopes [] :stdout-events []}
-      (let [msg-type (or (:bitecho/type msg) (:type msg))
-            msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
-            sess-epoch (when-let [sid (:session-id msg)]
-                         (get-in state [:sessions sid :epoch]))
-            ref-epoch (if (or (:epoch-initialized? state)
-                              (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
-                        (:epoch state)
-                        (or sess-epoch msg-epoch))
-            skew-exceeded? (and (not= msg-type :chain-state-snapshot)
-                                msg-epoch ref-epoch
-                                (> (Math/abs (- msg-epoch (long ref-epoch))) 2)
-                                (or (nil? sess-epoch)
-                                    (> (Math/abs (- msg-epoch (long sess-epoch))) 2)))]
-        (if skew-exceeded?
-          {:state state :net-envelopes [] :stdout-events []}
-          (let [res (case msg-type
-                      :channel-offer (handle-wire-offer state msg privkey-bytes)
-                      :channel-accept (handle-wire-accept state msg)
-                      :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
-                      :session-ack (handle-wire-session-ack state msg)
-                      :channel-close (handle-wire-close state msg)
-                      :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
-                      :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
-                      :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
-                      :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
-                      {:state state :net-envelopes [] :stdout-events []})]
-            (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
-              (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
-              res)))))))
+      (let [v-chk (check-wire-version-compatibility msg)]
+        (if-not (:ok? v-chk)
+          (let [unsupported-ver (:version v-chk)
+                err-msg (:error v-chk)
+                new-state (-> state
+                              (update-in [:wire-version-diagnostics :unsupported-dropped] (fnil inc 0))
+                              (assoc-in [:wire-version-diagnostics :last-unsupported-version] unsupported-ver)
+                              (assoc-in [:wire-version-diagnostics :last-error] err-msg))
+                diag-event {"event" "wire-version-rejected"
+                            "error" err-msg
+                            "version" unsupported-ver
+                            "min_supported" min-supported-wire-version
+                            "max_supported" max-supported-wire-version}]
+            {:state new-state
+             :response {"ok" false "error" err-msg "version" unsupported-ver}
+             :net-envelopes []
+             :stdout-events [diag-event]})
+          (let [msg-type (or (:bitecho/type msg) (:type msg))
+                msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
+                sess-epoch (when-let [sid (:session-id msg)]
+                             (get-in state [:sessions sid :epoch]))
+                ref-epoch (if (or (:epoch-initialized? state)
+                                  (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
+                            (:epoch state)
+                            (or sess-epoch msg-epoch))
+                skew-exceeded? (and (not= msg-type :chain-state-snapshot)
+                                    msg-epoch ref-epoch
+                                    (> (Math/abs (- msg-epoch (long ref-epoch))) 2)
+                                    (or (nil? sess-epoch)
+                                        (> (Math/abs (- msg-epoch (long sess-epoch))) 2)))]
+            (if skew-exceeded?
+              {:state state :net-envelopes [] :stdout-events []}
+              (let [res (case msg-type
+                          :channel-offer (handle-wire-offer state msg privkey-bytes)
+                          :channel-accept (handle-wire-accept state msg)
+                          :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
+                          :session-ack (handle-wire-session-ack state msg)
+                          :channel-close (handle-wire-close state msg)
+                          :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
+                          :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
+                          :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
+                          :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
+                          {:state state :net-envelopes [] :stdout-events []})]
+                (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
+                  (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
+                  res)))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; JSONL Line Processor

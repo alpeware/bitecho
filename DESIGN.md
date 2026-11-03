@@ -375,6 +375,32 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
    - Settles both escrows on-chain with 50 bps burn take per stage, validated by 3-of-3 BFT quorum snapshots.
    - Employs honest simulation framing (3 cluster nodes + 3 edge devices), with documented scaling projections to 15, 100, and 1000 nodes.
 
+### O. Wire Protocol Versioning Policy, Treasury SLA Monitoring & Testnet Launch Gates (Milestone 7 / Step 7A)
+
+1. **Wire Protocol Versioning & Rolling-Upgrade Policy (Closing FLAG B)**:
+   - **Explicit Version Envelope**: Wire envelopes and light-node message maps include `:protocol-version` (`current-wire-version = 1`, `min-supported-wire-version = 1`, `max-supported-wire-version = 2`).
+   - **Rolling-Upgrade Window**: Pure compatibility check `rolling-upgrade-compatible?` enforces that validator and light node software versions within a 1-step window ($|v_1 - v_2| \le 1$) seamlessly interoperate. Legacy unversioned envelopes ($N-1$) are normalized and accepted as version 1 (`:legacy-unversioned? true`).
+   - **Fail-Closed Rejection with Counted Diagnostics (Rule 5)**: Unsupported or future versions exceeding the window strictly fail closed without dropping envelopes silently. Rejections increment `:unsupported-dropped`, record `:last-unsupported-version` and `:last-error`, emit structured `{"event": "wire-version-rejected"}` events, and surface under `"wire_protocol"` in `exec-status` and `/connz` diagnostics.
+   - **Mesh Ingress Validation**: `valid-agent-envelope-version?` and `wrap-agent-event` / `unwrap-authenticated-agent-event` ensure external agent connections over port 5010 authenticate wire versioning before event dispatch.
+
+2. **Treasury SLA Monitoring & Cluster Convergence Telemetry**:
+   - **Pure Conformance Evaluator (`evaluate-treasury-sla`)**: Monitors cluster telemetry against economic and consensus SLAs:
+     - Demand gate compliance ($k \le 0.5$, $k\text{-bps} \le 5000$).
+     - Supply cap compliance ($\text{total-minted} \le 23.1\text{B}$, $\text{supply} \le 42\text{B}$).
+     - Redundant validator infrastructure ($\text{active-validators} \ge 3$, BFT quorum met).
+     - Finality health ($\text{finalized-epoch-skew} \le 2$).
+     - Zero failed receipts ($\text{max-failed-receipts} = 0$).
+     - Mint convergence ($\text{minted-skew} = 0$ when $\text{finalized-epoch-skew} = 0$).
+   - **Cluster Convergence Audit**: Integrated into `evaluate-cluster-convergence` and `./scripts/cluster.sh audit`, asserting `/burnsz`, `/accountz`, `/connz`, Treasury SLA, and wire protocol version agreement across all nodes.
+
+3. **Testnet Launch Exit Gates Evaluator (`run-testnet-readiness-gate`)**:
+   - Deterministic four-gate readiness evaluator (`master-plan` M4):
+     1. **Third-Party Validator Finalization**: 4-node Streamlet BFT cluster (3 genesis validators + 1 third-party partner node) finalizing notarized blocks under demand gate ($k = 0.5$).
+     2. **Live Directory Resolution**: Directory Authority authenticates cryptographic Proof-of-Possession and resolves nicknames to public keys and home sets, rejecting forged signatures.
+     3. **Verified-Outcome Real Workload**: Real tensor einsum workload paying strictly on deliverable preimage SHA-256 hash match, burning mandatory 50 bps protocol settlement take.
+     4. **Rolling-Upgrade Wire Compatibility**: Continuity verified across mixed v1, legacy unversioned, and v2 payloads, with fail-closed rejection of v99.
+
+
 
 
 

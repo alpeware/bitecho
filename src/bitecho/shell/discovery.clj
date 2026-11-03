@@ -161,20 +161,22 @@
   "Loads and parses a bootstrap descriptor from a file path or HTTP/HTTPS URL.
    Defaults to 'https://bitecho.org/devnet/bootstrap.txt', falling back to local file when offline."
   ([] (load-bootstrap-descriptor! "https://bitecho.org/devnet/bootstrap.txt"))
-  ([^String source-or-url]
-   (let [content (if (re-matches #"^https?://.*" (or source-or-url ""))
-                   (try
-                     (slurp (.toURL (URI/create source-or-url)))
-                     (catch Exception e
-                       (let [fallback-file (io/file "devnet/bootstrap.txt")]
-                         (if (.exists fallback-file)
-                           (slurp fallback-file)
-                           (throw (ex-info (str "Failed to load remote bootstrap descriptor: " (ex-message e))
-                                           {:error :descriptor-load-failed :url source-or-url}
-                                           e))))))
-                   (let [f (io/file source-or-url)]
-                     (if (.exists f)
-                       (slurp f)
-                       (throw (ex-info (str "Bootstrap descriptor file not found: " source-or-url)
-                                       {:error :descriptor-file-not-found :file source-or-url})))))]
-     (parse-bootstrap-descriptor content))))
+  ([source-or-url]
+   (if (map? source-or-url)
+     source-or-url
+     (let [content (if (and (string? source-or-url) (re-matches #"^https?://.*" (or source-or-url "")))
+                     (try
+                       (slurp (.toURL (URI/create source-or-url)))
+                       (catch Exception e
+                         (let [fallback-file (io/file "devnet/bootstrap.txt")]
+                           (if (.exists fallback-file)
+                             (slurp fallback-file)
+                             (throw (ex-info (str "Failed to load remote bootstrap descriptor: " (ex-message e))
+                                             {:error :descriptor-load-failed :url source-or-url}
+                                             e))))))
+                     (let [f (io/file source-or-url)]
+                       (if (.exists f)
+                         (slurp f)
+                         (throw (ex-info (str "Bootstrap descriptor file not found: " source-or-url)
+                                         {:error :descriptor-file-not-found :file source-or-url})))))]
+       (parse-bootstrap-descriptor content)))))

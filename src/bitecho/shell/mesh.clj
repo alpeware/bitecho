@@ -8,6 +8,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
+            [bitecho.economy.treasury :as treasury]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.core :as core]
             [bitecho.shell.identity :as identity]
@@ -117,9 +118,36 @@
   (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)]
     (.getBytes (pr-str [agent-pubkey-hex (canonicalize-for-signing clean)]) StandardCharsets/UTF_8)))
 
+(def current-wire-version
+  "Current Bitecho mesh wire protocol envelope version."
+  1)
+
+(def min-supported-wire-version
+  "Minimum supported wire protocol version for rolling-upgrade compatibility (N-1/N)."
+  1)
+
+(def max-supported-wire-version
+  "Maximum supported wire protocol version for forward rolling-upgrade compatibility (N+1)."
+  2)
+
+(defn valid-agent-envelope-version?
+  "Pure helper verifying agent wire protocol envelope version compatibility.
+   Returns true if :protocol-version is absent/nil (legacy unversioned N-1) or in [min-supported-wire-version, max-supported-wire-version]."
+  [msg]
+  (if-not (map? msg)
+    false
+    (let [v (if (contains? msg :protocol-version)
+              (:protocol-version msg)
+              (when (contains? msg "protocol_version")
+                (get msg "protocol_version")))]
+      (or (nil? v)
+          (and (integer? v)
+               (<= min-supported-wire-version (long v) max-supported-wire-version))))))
+
 (defn wrap-agent-event
   "Wraps an agent event into an envelope signed with agent-privkey-bytes.
-   Optionally attaches a DAC to the envelope if provided."
+   Optionally attaches a DAC to the envelope if provided.
+   Includes :protocol-version current-wire-version for rolling upgrade compatibility."
   ([event agent-pubkey-hex ^bytes agent-privkey-bytes]
    (wrap-agent-event event agent-pubkey-hex agent-privkey-bytes nil))
   ([event agent-pubkey-hex ^bytes agent-privkey-bytes dac]
@@ -128,7 +156,8 @@
          sig (crypto/sign agent-privkey-bytes sb)
          sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
          effective-dac (or dac (:dac event))]
-     (cond-> {:agent-pubkey agent-pubkey-hex
+     (cond-> {:protocol-version current-wire-version
+              :agent-pubkey agent-pubkey-hex
               :event clean-event
               :signature sig-hex}
        effective-dac (assoc :dac effective-dac)))))
@@ -156,6 +185,7 @@
                  (try (nippy/thaw raw-msg) (catch Exception _ nil))
                  raw-msg)]
        (when (and (map? msg)
+                  (valid-agent-envelope-version? msg)
                   (string? (:agent-pubkey msg))
                   (map? (:event msg))
                   (contains? allowed-agent-events (:type (:event msg)))
@@ -176,8 +206,12 @@
                           (and (integer? effective-epoch)
                                (verify-mesh-agent-dac envelope-dac agent-pub-hex effective-epoch opts))))
              (let [ev-type (:type event)
+                   protocol-ver (long (or (:protocol-version msg)
+                                          (get msg "protocol_version")
+                                          current-wire-version))
                    base-event (cond-> event
-                                envelope-dac (assoc :dac envelope-dac))]
+                                envelope-dac (assoc :dac envelope-dac)
+                                true (assoc :protocol-version protocol-ver))]
                (case ev-type
                  :settle-intent
                  (let [payer (:payer base-event)
@@ -956,7 +990,8 @@
                          (:last-diagnostic conn) (assoc :last_diagnostic (:last-diagnostic conn)))))
          peers-summary (into {} (map (fn [[k c]] [k (summarize c)]) peers))
          agents-summary (into {} (map (fn [[k c]] [(if (keyword? k) (name k) (str k)) (summarize c)]) agents))]
-     {:conn_dropped total-dropped
+     {:protocol_version current-wire-version
+      :conn_dropped total-dropped
       :conn_stale total-stale
       :peers peers-summary
       :agents agents-summary})))
@@ -1012,8 +1047,8 @@
 (defn evaluate-cluster-convergence
   "Pure function evaluating consensus, burn window, and soak convergence across cluster node snapshots.
    Takes {node-id {:statusz <map-or-str> :burnsz {:anchor-epoch ... :window [[ep burn take] ...]} ...}}
-   and returns structured convergence telemetry."
-  [node-snapshots]
+   and optional opts map {:min-validators N :k-bps N :quorum-size N}, returning structured convergence telemetry."
+  [node-snapshots & [opts]]
   (if (empty? node-snapshots)
     {:common-finalized-epoch 0
      :finalized-epoch-skew 0
@@ -1023,6 +1058,8 @@
      :minted-skew 0
      :burn-digest-converged? true
      :accountz-converged? true
+     :wire-version-converged? true
+     :treasury-sla {:sla-healthy? true}
      :soak-summary {:max_failed_receipts 0
                     :total_conn_dropped 0
                     :total_conn_stale 0
@@ -1131,6 +1168,21 @@
           total-stale (reduce + 0 (map :conn-stale (vals parsed-snapshots)))
           finality-healthy? (<= fin-epoch-skew 2)
 
+          ;; Wire protocol version convergence check (rolling upgrade window <= 1)
+          wire-versions (vec (keep (fn [[_ snap]]
+                                     (or (get-in snap [:connz :protocol_version])
+                                         (get-in snap [:connz "protocol_version"])))
+                                   parsed-snapshots))
+          wire-version-converged?
+          (if (seq wire-versions)
+            (and (every? #(and (integer? %) (<= min-supported-wire-version (long %) max-supported-wire-version)) wire-versions)
+                 (<= (- (apply max wire-versions) (apply min wire-versions)) 1))
+            true)
+
+          ;; Treasury SLA evaluation across validator snapshots
+          min-vals (long (or (:min-validators opts) (min 3 (count parsed-snapshots))))
+          treasury-sla (treasury/evaluate-treasury-sla parsed-snapshots (assoc (or opts {}) :min-validators min-vals))
+
           soak-summary {:max_failed_receipts max-failed
                         :total_conn_dropped total-dropped
                         :total_conn_stale total-stale
@@ -1140,7 +1192,9 @@
                           burn-digest-converged?
                           finality-healthy?
                           (zero? max-failed)
-                          accountz-converged?)]
+                          accountz-converged?
+                          wire-version-converged?
+                          (:sla-healthy? treasury-sla))]
       {:common-finalized-epoch common-fin-epoch
        :finalized-epoch-skew fin-epoch-skew
        :epoch-mismatches epoch-mismatches
@@ -1149,6 +1203,8 @@
        :minted-skew minted-skew
        :burn-digest-converged? burn-digest-converged?
        :accountz-converged? accountz-converged?
+       :wire-version-converged? wire-version-converged?
+       :treasury-sla treasury-sla
        :soak-summary soak-summary
        :converged? converged?})))
 

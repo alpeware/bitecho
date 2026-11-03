@@ -123,6 +123,11 @@ Bitecho distinguishes between real-time peer communication and finalized economi
 - Selective Acknowledgments (SACK) detect lost or out-of-order packets. Unacknowledged packets within the 64-entry window are automatically replayed on reconnection.
 - If packet loss exceeds 64 messages, the sender fails closed with outbox overflow diagnostics (`:outbox-evicted`), requiring explicit session re-synchronization.
 
+### Wire Protocol Versioning & Rolling-Upgrade Policy
+- Envelopes carry explicit protocol versions (`:protocol-version 1`).
+- Rolling upgrades seamlessly support adjacent version steps ($N-1$ unversioned, $N$ v1, $N+1$ v2).
+- Unsupported versions fail closed with counted diagnostics (`:unsupported-dropped`), preventing silent drops or broken sessions during staggered cluster upgrades.
+
 ---
 
 ## 5. Architectural Invariants Summary
@@ -135,3 +140,4 @@ Bitecho distinguishes between real-time peer communication and finalized economi
 | **Consensus** | Streamlet BFT (3 Nodes) | 3-chain notarization finality, 2-of-3 quorum |
 | **Directory** | Dual-signed PoP + Attestation | Decentralized key continuity, zero authority custody |
 | **Channels** | X25519 Sealed Sessions | ChaCha20-Poly1305, SACK anti-replay, 64-entry window |
+| **Wire Protocol** | Rolling-Upgrade Policy | Versioned envelopes, 1-step rolling window, fail-closed diagnostics |

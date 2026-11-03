@@ -197,8 +197,12 @@
                                       "pubkey" (extract-flag-value args "--pubkey" nil)}
                    "dac-attach" {"cmd" "dac-attach"}
                    "dac-revoke" {"cmd" "dac-revoke"}
-                   "directory-verify" (let [pk (extract-flag-value args "--directory-pubkey" nil)]
+                   "directory-verify" (let [nick (extract-flag-value args "--nickname" nil)
+                                            dom (extract-flag-value args "--domain" nil)
+                                            pk (extract-flag-value args "--directory-pubkey" nil)]
                                         (cond-> {"cmd" "directory-verify"}
+                                          nick (assoc "nickname" nick)
+                                          dom (assoc "domain" dom)
                                           pk (assoc "directory_pubkey" pk)))
                    "directory-register" (let [nick (extract-flag-value args "--nickname" nil)
                                               dom (extract-flag-value args "--domain" nil)
@@ -451,7 +455,6 @@
            url1 (str "https://" dom "/directory/" nickname ".json")
            url2 (str "https://" dom "/" nickname)
            local-f1 (io/file "devnet/directory" (str nickname ".json"))
-           local-f2 (io/file "/home/simonpure/src/alpeware/clj-web/public/directory" (str nickname ".json"))
            client (HttpClient/newHttpClient)
            fetch-url (fn [^String u]
                        (try
@@ -464,14 +467,12 @@
                            (when (= 200 (.statusCode resp))
                              (.body resp)))
                          (catch Exception _ nil)))]
-       (or (when (.exists local-f1)
-             (light-core/parse-directory-descriptor-text (slurp local-f1)))
-           (when (.exists local-f2)
-             (light-core/parse-directory-descriptor-text (slurp local-f2)))
-           (if-let [body1 (fetch-url url1)]
+       (or (if-let [body1 (fetch-url url1)]
              (light-core/parse-directory-descriptor-text body1)
              (when-let [body2 (fetch-url url2)]
-               (light-core/parse-directory-descriptor-text body2))))))))
+               (light-core/parse-directory-descriptor-text body2)))
+           (when (.exists local-f1)
+             (light-core/parse-directory-descriptor-text (slurp local-f1))))))))
 
 (defn fetch-inband-chain-state-quorum!
   "Fetches chain state snapshots from validators in parallel, cross-checking via verify-chain-state-quorum.
@@ -1088,7 +1089,7 @@
       (let [err-resp {"ok" false "error" (:error sync-res)}]
         (emit-json-line! out-writer err-resp)
         err-resp)
-      (let [effective-line (if (and (= verb "directory-lookup")
+      (let [effective-line (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
                                     (not (contains? cmd-map "descriptor"))
                                     (not (contains? cmd-map :descriptor)))
                              (let [nick (or (get cmd-map "nickname") (:nickname cmd-map))
@@ -1262,7 +1263,7 @@
         state-atom (atom initial-state)
         raw-cmd-map (:cmd-map opts)
         verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
-        cmd-map (if (and (= verb "directory-lookup")
+        cmd-map (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
                          (not (contains? raw-cmd-map "descriptor"))
                          (not (contains? raw-cmd-map :descriptor)))
                   (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map))
