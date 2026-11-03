@@ -46,16 +46,21 @@
      :transfer-hash thash}))
 
 (defn build-home-set-envelope
-  "Builds a signed agent envelope registering Rendezvous home-set candidates for callee."
-  [agent-pub-hex agent-priv-bytes candidates price epoch]
-  (let [candidate-maps (mapv (fn [c] (if (map? c) (assoc c :price (or (:price c) price)) {:node-id c :price price})) candidates)
-        event {:type :register-home-set
-               :callee agent-pub-hex
-               :candidates candidate-maps
-               :price price
-               :price-max price
-               :epoch epoch}]
-    (mesh/wrap-agent-event event agent-pub-hex agent-priv-bytes)))
+  "Builds a signed agent envelope registering Rendezvous home-set candidates for callee,
+   optionally including ICE credentials for bidirectional keepalive."
+  ([agent-pub-hex agent-priv-bytes candidates price epoch]
+   (build-home-set-envelope agent-pub-hex agent-priv-bytes candidates price epoch nil nil))
+  ([agent-pub-hex agent-priv-bytes candidates price epoch ice-ufrag ice-pwd]
+   (let [candidate-maps (mapv (fn [c] (if (map? c) (assoc c :price (or (:price c) price)) {:node-id c :price price})) candidates)
+         event (cond-> {:type :register-home-set
+                        :callee agent-pub-hex
+                        :candidates candidate-maps
+                        :price price
+                        :price-max price
+                        :epoch epoch}
+                 ice-ufrag (assoc :ice-ufrag ice-ufrag)
+                 ice-pwd (assoc :ice-pwd ice-pwd))]
+     (mesh/wrap-agent-event event agent-pub-hex agent-priv-bytes))))
 
 (defn parse-sim-args
   "Parses CLI arguments for simulate-agents:

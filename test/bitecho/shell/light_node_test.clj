@@ -1650,3 +1650,29 @@
                                                  (= expected-env matching-recov))))
                                         (range 1 (inc outbox-count))))))))))
 
+(deftest test-duplicate-same-generation-on-close-invokes-reconnect-only-once
+  (testing "Duplicate same-generation :on-close callback invokes reconnect-fn only once"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          priv (:private kp)
+          st-atom (atom {:pubkey pub :epoch 1 :home-set [] :autonomous? false :connected? true :connection-error nil})
+          conn-atom (atom (assoc (light-shell/init-conn-state) :phase :open :generation 1))
+          reconn-count (atom 0)
+          mock-reconnect (fn []
+                           (swap! reconn-count inc)
+                           {:ok? true :phase :open})
+          ctx {:identity {:pubkey-hex pub :privkey-bytes priv}
+               :state-atom st-atom
+               :conn-atom conn-atom
+               :reconnect-fn mock-reconnect
+               :generation 1}
+          callbacks (light-shell/make-client-callbacks nil (atom "cid") (promise) (atom nil) ctx)
+          on-close (:on-close callbacks)]
+      ;; First :on-close invocation (when :phase is :open)
+      (on-close nil)
+      (is (= 1 @reconn-count) "First :on-close must trigger reconnect-fn")
+
+      ;; Duplicate same-generation :on-close invocation (when :phase is no longer :open)
+      (on-close nil)
+      (is (= 1 @reconn-count) "Duplicate same-generation :on-close must NOT trigger reconnect-fn a second time"))))
+

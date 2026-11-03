@@ -682,8 +682,10 @@
                 hs (rendezvous/register-home-set candidate-maps p-b p-b-max)
                 my-pub (:pubkey state)
                 curr-epoch (:epoch state)
-                env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b curr-epoch)
-                env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b nil)]
+                ice-ufrag (get-in state [:ice-creds :ufrag])
+                ice-pwd (get-in state [:ice-creds :pwd])
+                env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b curr-epoch ice-ufrag ice-pwd)
+                env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b nil ice-ufrag ice-pwd)]
             {:state (assoc state :home-set (:home-nodes hs))
              :response {"ok" true
                         "status" (name (:status hs :ok))
@@ -696,8 +698,10 @@
             hs (rendezvous/register-home-set candidate-maps p-b p-b-max)
             my-pub (:pubkey state)
             curr-epoch (:epoch state)
-            env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b curr-epoch)
-            env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b nil)]
+            ice-ufrag (get-in state [:ice-creds :ufrag])
+            ice-pwd (get-in state [:ice-creds :pwd])
+            env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b curr-epoch ice-ufrag ice-pwd)
+            env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b nil ice-ufrag ice-pwd)]
         {:state (assoc state :home-set (:home-nodes hs))
          :response {"ok" true
                     "status" (name (:status hs :ok))

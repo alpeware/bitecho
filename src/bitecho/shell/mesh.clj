@@ -1516,68 +1516,104 @@
                                                 {:type :send-failed :error (or (.getMessage e) "send-failed")}))
                       nil)))))))))))
 
-(defn- make-agent-connection-handler
+(defn make-agent-connection-handler
   "Returns a connection handler function for an incoming agent node.
    Works identically for UDP and TCP agent connections using single-authority lifecycle state."
-  [shell-node agent-conns]
-  (fn [agent-node]
-    (let [conn-key (atom [:anon (System/identityHashCode agent-node)])
-          init-gen (inc (long (reduce max 0 (map #(long (or (:generation %) 0)) (vals (or (when agent-conns (deref agent-conns)) {}))))))
-          node-gen (atom init-gen)]
-      (when agent-conns
-        (apply-mesh-conn-event! agent-conns @conn-key
-                                {:type :accept-started :generation @node-gen :node agent-node :channel-id 0}))
-      (api/set-callbacks!
-       agent-node
-       {:on-open (fn [evt]
-                   (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
-                         updated (when agent-conns
-                                   (apply-mesh-conn-event! agent-conns @conn-key
-                                                           {:type :on-open :generation @node-gen :node agent-node :channel-id cid}))]
-                     (when (or (nil? agent-conns) (= agent-node (:node updated)))
-                       (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
-        :on-data-channel (fn [evt]
-                           (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
-                                 updated (when agent-conns
-                                           (apply-mesh-conn-event! agent-conns @conn-key
-                                                                   {:type :on-data-channel :generation @node-gen :node agent-node :channel-id cid}))]
-                             (when (or (nil? agent-conns) (= agent-node (:node updated)))
-                               (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
-        :on-message
-        (fn [evt]
-          (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
-                active? (or (nil? agent-conns)
-                            (= agent-node (:node (get @agent-conns @conn-key))))]
-            (if-not active?
-              (when agent-conns
-                (apply-mesh-conn-event! agent-conns @conn-key
-                                        {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))
-              (let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
-                (if-not unwrapped
-                  (when agent-conns
-                    (apply-mesh-conn-event! agent-conns @conn-key
-                                            {:type :invalid-frame :generation @node-gen :node agent-node :error "invalid-agent-envelope"}))
-                  (let [sender (:sender unwrapped)]
-                    (when (and sender (not= sender @conn-key))
-                      (let [old-key @conn-key]
-                        (if agent-conns
-                          (let [rebound (apply-agent-sender-rebind! agent-conns old-key sender cid (System/currentTimeMillis))]
-                            (when (= agent-node (:node rebound))
-                              (reset! conn-key sender)
-                              (reset! node-gen (long (or (:generation rebound) @node-gen)))
-                              (replay-cached-gossip-to-agent! shell-node agent-conns sender)))
-                          (reset! conn-key sender))))
-                    (let [updated (when agent-conns
+  ([shell-node agent-conns]
+   (make-agent-connection-handler shell-node agent-conns nil))
+  ([shell-node agent-conns peer-ice-pwds]
+   (fn [agent-node]
+     (let [conn-key (atom [:anon (System/identityHashCode agent-node)])
+           init-gen (inc (long (reduce max 0 (map #(long (or (:generation %) 0)) (vals (or (when agent-conns (deref agent-conns)) {}))))))
+           node-gen (atom init-gen)]
+       (when agent-conns
+         (apply-mesh-conn-event! agent-conns @conn-key
+                                 {:type :accept-started :generation @node-gen :node agent-node :channel-id 0}))
+       (api/set-callbacks!
+        agent-node
+        {:on-open (fn [evt]
+                    (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                          updated (when agent-conns
                                     (apply-mesh-conn-event! agent-conns @conn-key
-                                                            {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
+                                                            {:type :on-open :generation @node-gen :node agent-node :channel-id cid}))]
                       (when (or (nil? agent-conns) (= agent-node (:node updated)))
-                        (async/put! (:network-in shell-node) unwrapped)
-                        (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
-                          (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped)))))))))))
-        :on-close (fn [_]
-                    (when agent-conns
-                      (apply-mesh-conn-event! agent-conns @conn-key
-                                              {:type :on-close :generation @node-gen :node agent-node})))}))))
+                        (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
+         :on-data-channel (fn [evt]
+                            (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                                  updated (when agent-conns
+                                            (apply-mesh-conn-event! agent-conns @conn-key
+                                                                    {:type :on-data-channel :generation @node-gen :node agent-node :channel-id cid}))]
+                              (when (or (nil? agent-conns) (= agent-node (:node updated)))
+                                (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
+         :on-message
+         (fn [evt]
+           (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                 active? (or (nil? agent-conns)
+                             (= agent-node (:node (get @agent-conns @conn-key))))]
+             (if-not active?
+               (when agent-conns
+                 (apply-mesh-conn-event! agent-conns @conn-key
+                                         {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))
+               (let [unwrapped (unwrap-authenticated-agent-event (:payload evt))]
+                 (if-not unwrapped
+                   (when agent-conns
+                     (apply-mesh-conn-event! agent-conns @conn-key
+                                             {:type :invalid-frame :generation @node-gen :node agent-node :error "invalid-agent-envelope"}))
+                   (do
+                     (when (and (:ice-ufrag unwrapped) (:ice-pwd unwrapped))
+                       (when (instance? clojure.lang.Atom peer-ice-pwds)
+                         (swap! peer-ice-pwds assoc (:ice-ufrag unwrapped) (:ice-pwd unwrapped)))
+                       (try
+                         (api/set-remote-ice-credentials! agent-node (:ice-ufrag unwrapped) (:ice-pwd unwrapped))
+                         (catch Exception _
+                           (when-let [st-atom (:state-atom agent-node)]
+                             (swap! st-atom assoc
+                                    :remote-ice-ufrag (:ice-ufrag unwrapped)
+                                    :remote-ice-pwd (:ice-pwd unwrapped))))))
+                     (let [sender (:sender unwrapped)]
+                       (when (and sender (not= sender @conn-key))
+                         (let [old-key @conn-key]
+                           (if agent-conns
+                             (let [rebound (apply-agent-sender-rebind! agent-conns old-key sender cid (System/currentTimeMillis))]
+                               (when (= agent-node (:node rebound))
+                                 (reset! conn-key sender)
+                                 (reset! node-gen (long (or (:generation rebound) @node-gen)))
+                                 (replay-cached-gossip-to-agent! shell-node agent-conns sender)))
+                             (reset! conn-key sender))))
+                       (let [updated (when agent-conns
+                                       (apply-mesh-conn-event! agent-conns @conn-key
+                                                               {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
+                         (when (or (nil? agent-conns) (= agent-node (:node updated)))
+                           (async/put! (:network-in shell-node) unwrapped)
+                           (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
+                             (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped))))))))))))
+         :on-close (fn [_]
+                     (when agent-conns
+                       (apply-mesh-conn-event! agent-conns @conn-key
+                                               {:type :on-close :generation @node-gen :node agent-node})))})))))
+
+(defn init-mesh-listener!
+  "Starts validator-to-validator listener with :peer-ice-pwds map constructed from configured peers (ufrag -> pwd)."
+  [config identity callbacks]
+  (let [port (int (or (get-in config [:cluster :port])
+                      (get-in config [:node :port])
+                      5000))
+        peers (or (get-in config [:cluster :peers])
+                  (get-in config [:peers])
+                  (vals (get-in config [:cluster :nodes]))
+                  [])
+        peer-pwds (into {}
+                        (keep (fn [p]
+                                (let [ufrag (or (:ice-ufrag p) (get-in p [:ice-creds :ufrag]))
+                                      pwd (or (:ice-pwd p) (get-in p [:ice-creds :pwd]))]
+                                  (when (and ufrag pwd)
+                                    [ufrag pwd])))
+                              peers))
+        listen-opts {:port port
+                     :cert-data (:cert-data identity)
+                     :ice-creds (:ice-creds identity)
+                     :peer-ice-pwds peer-pwds}]
+    (api/listen! listen-opts callbacks)))
 
 (defn- init-agent-listener!
   "Starts agent ingress listener when enabled.
@@ -1586,11 +1622,13 @@
   (when (and (= transport :datachannel)
              (get-in config [:cluster :listen-agents?] false))
     (let [port (int (get-in config [:cluster :agent-port] 5010))
+          peer-ice-pwds (atom {})
           listen-opts {:port port
                        :cert-data (:cert-data identity)
-                       :ice-creds (:ice-creds identity)}]
+                       :ice-creds (:ice-creds identity)
+                       :peer-ice-pwds peer-ice-pwds}]
       (api/listen! listen-opts
-                   {:on-connection (make-agent-connection-handler shell-node agent-conns)}))))
+                   {:on-connection (make-agent-connection-handler shell-node agent-conns peer-ice-pwds)}))))
 
 (defn- init-agent-tcp-listener!
   "Starts TCP agent ingress listener when enabled (RFC 4571 framing)."
@@ -1600,11 +1638,13 @@
     (let [port (int (or (get-in config [:cluster :agent-tcp-port])
                         (get-in config [:cluster :agent-port])
                         5010))
+          peer-ice-pwds (atom {})
           listen-opts {:port port
                        :cert-data (:cert-data identity)
-                       :ice-creds (:ice-creds identity)}]
+                       :ice-creds (:ice-creds identity)
+                       :peer-ice-pwds peer-ice-pwds}]
       (api/listen-tcp! listen-opts
-                       {:on-connection (make-agent-connection-handler shell-node agent-conns)}))))
+                       {:on-connection (make-agent-connection-handler shell-node agent-conns peer-ice-pwds)}))))
 
 (defn stop-mesh-node!
   "Stops all running resources of a mesh node cleanly."

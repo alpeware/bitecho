@@ -674,8 +674,10 @@
                           (let [price (long (or (get-in state [:rendezvous-policy :price]) 10))
                                 pub (:pubkey state)
                                 curr-epoch (:epoch state)
-                                env-curr (agent-sim/build-home-set-envelope pub privkey-bytes home-set price curr-epoch)
-                                env-nil (agent-sim/build-home-set-envelope pub privkey-bytes home-set price nil)]
+                                ice-ufrag (get-in state [:ice-creds :ufrag])
+                                ice-pwd (get-in state [:ice-creds :pwd])
+                                env-curr (agent-sim/build-home-set-envelope pub privkey-bytes home-set price curr-epoch ice-ufrag ice-pwd)
+                                env-nil (agent-sim/build-home-set-envelope pub privkey-bytes home-set price nil ice-ufrag ice-pwd)]
                             [env-curr env-nil])
                           [])
           replay-envs (light-core/build-unacked-replay-envelopes state privkey-bytes)]
@@ -752,7 +754,7 @@
                      (do
                        (apply-conn-event! conn-atom {:type :on-close :generation generation} cb-opts)
                        (sync-conn-diagnostics! state-atom conn-atom))
-                     (do
+                     (let [was-open? (= :open (:phase @conn-atom))]
                        (when (instance? clojure.lang.Atom channel-id)
                          (reset! channel-id nil))
                        (apply-conn-event! conn-atom
@@ -762,7 +764,7 @@
                        (when state-atom
                          (swap! state-atom assoc :connected? false :connection-error "connection-closed"))
                        (sync-conn-diagnostics! state-atom conn-atom)
-                       (when (and reconnect-fn (not= :down (:phase @conn-atom)))
+                       (when (and was-open? reconnect-fn (not= :down (:phase @conn-atom)))
                          (if (:async-reconnect? ctx)
                            (future (attempt-proactive-reconnect! reconnect-fn ctx))
                            (attempt-proactive-reconnect! reconnect-fn ctx)))))

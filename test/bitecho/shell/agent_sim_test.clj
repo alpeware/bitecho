@@ -7,11 +7,13 @@
             [bitecho.shell.agent-sim :as sim]
             [bitecho.shell.mesh :as mesh]
             [bitecho.state-machine :as sm]
+            [clojure.core.async :as async]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [datachannel.api :as api]
             [taoensso.nippy :as nippy]))
 
 (defn- setup-test-state
@@ -168,6 +170,46 @@
       (is (= candidates (:candidates unwrapped)))
       (is (= price (:price unwrapped)))
       (is (contains? (:home-sets st1) [agent-pub-hex epoch])))))
+
+(deftest test-home-set-envelope-carries-ice-credentials-and-populates-handler
+  (testing "build-home-set-envelope carries :ice-ufrag and :ice-pwd, verified by unwrap-authenticated-agent-event and populated on agent connection handler"
+    (let [agent-kp (crypto/generate-keypair)
+          agent-pub-hex (basalt/bytes->hex (:public agent-kp))
+          agent-priv-bytes (:private agent-kp)
+          candidates [{:node-id "node-cand-1" :price 200}]
+          price 200
+          epoch 1
+          ufrag "agent-ice-ufrag"
+          pwd "agent-ice-pwd"
+          envelope (sim/build-home-set-envelope agent-pub-hex agent-priv-bytes candidates price epoch ufrag pwd)
+          frozen (nippy/freeze envelope)
+          unwrapped (mesh/unwrap-authenticated-agent-event frozen)]
+      (is (some? unwrapped))
+      (is (= :register-home-set (:type unwrapped)))
+      (is (= ufrag (:ice-ufrag unwrapped)))
+      (is (= pwd (:ice-pwd unwrapped)))
+      ;; Test agent connection handler updates peer-ice-pwds atom and sets credentials on child node
+      (let [shell-in (async/chan 10)
+            shell-node {:network-in shell-in
+                        :state-atom (atom {})}
+            agent-conns (atom {})
+            peer-ice-pwds (atom {})
+            handler (mesh/make-agent-connection-handler shell-node agent-conns peer-ice-pwds)
+            child-state (atom {:remote-ice-ufrag nil :remote-ice-pwd nil})
+            child-callbacks (atom nil)
+            mock-agent-node {:state-atom child-state
+                             :callbacks child-callbacks
+                             :running (atom true)}]
+        (with-redefs [api/set-callbacks! (fn [_ cbs] (reset! child-callbacks cbs))
+                      api/set-remote-ice-credentials! (fn [node u p]
+                                                        (swap! (:state-atom node) assoc :remote-ice-ufrag u :remote-ice-pwd p))]
+          (handler mock-agent-node)
+          (let [on-msg (:on-message @child-callbacks)]
+            (is (fn? on-msg))
+            (on-msg {:payload frozen :channel-id 0})
+            (is (= {ufrag pwd} @peer-ice-pwds) "peer-ice-pwds atom must be updated with agent credentials")
+            (is (= ufrag (:remote-ice-ufrag @child-state)) "child node state must have remote-ice-ufrag")
+            (is (= pwd (:remote-ice-pwd @child-state)) "child node state must have remote-ice-pwd")))))))
 
 (deftest test-parse-sim-args
   (testing "parse-sim-args applies defaults when flags omitted"
