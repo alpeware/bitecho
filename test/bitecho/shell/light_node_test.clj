@@ -1240,6 +1240,7 @@
                  "account" "sync-account" "settle-intent" "submit-vouchers"
                  "petname-set" "petname-list" "petname-remove" "petname-resolve"
                  "dac-attach" "dac-revoke" "directory-verify"
+                 "directory-register" "directory-lookup"
                  "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"
                  "lock-intent" "release-intent" "refund-intent" "escrows"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
@@ -1249,7 +1250,8 @@
                   "--petname" "--pubkey" "--overwrite" "--directory-pubkey"
                   "--min-burn" "--allowlist" "--auto-accept" "--topic" "--to"
                   "--offer-hash" "--from"
-                  "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"}]
+                  "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"
+                  "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1286,7 +1288,14 @@
       (is (= "release-intent" (get-in (light-shell/parse-light-node-args ["release-intent" "--escrow-id" "e1" "--preimage" "secret"]) [:cmd-map "cmd"])))
       (is (= "refund-intent" (get-in (light-shell/parse-light-node-args ["refund-intent" "--escrow-id" "e1"]) [:cmd-map "cmd"])))
       (is (= "escrows" (get-in (light-shell/parse-light-node-args ["escrows"]) [:cmd-map "cmd"])))
-      ;; Flags (all 37 flags tested end-to-end)
+      (is (= "directory-register" (get-in (light-shell/parse-light-node-args ["directory-register"]) [:cmd-map "cmd"])))
+      (is (= "directory-lookup" (get-in (light-shell/parse-light-node-args ["directory-lookup"]) [:cmd-map "cmd"])))
+      ;; Flags (all 42 flags tested end-to-end)
+      (is (= "alice" (get-in (light-shell/parse-light-node-args ["directory-register" "--nickname" "alice"]) [:cmd-map "nickname"])))
+      (is (= "bitecho.org" (get-in (light-shell/parse-light-node-args ["directory-register" "--domain" "bitecho.org"]) [:cmd-map "domain"])))
+      (is (= "https://bitecho.org/inbox" (get-in (light-shell/parse-light-node-args ["directory-register" "--mailbox" "https://bitecho.org/inbox"]) [:cmd-map "mailbox"])))
+      (is (= "pk1" (get-in (light-shell/parse-light-node-args ["directory-register" "--prev-pubkey" "pk1"]) [:cmd-map "prev_pubkey"])))
+      (is (= "sk1" (get-in (light-shell/parse-light-node-args ["directory-register" "--prev-privkey" "sk1"]) [:cmd-map "prev_privkey"])))
       (is (= "e1" (get-in (light-shell/parse-light-node-args ["lock-intent" "--escrow-id" "e1"]) [:cmd-map "escrow_id"])))
       (is (= "beef" (get-in (light-shell/parse-light-node-args ["lock-intent" "--deliverable-hash" "beef"]) [:cmd-map "deliverable_hash"])))
       (is (= 20 (get-in (light-shell/parse-light-node-args ["lock-intent" "--expires-epoch" "20"]) [:cmd-map "expires_epoch"])))

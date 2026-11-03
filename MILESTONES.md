@@ -301,18 +301,40 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 ### Milestone 6 (Pillar C + Master-Plan M2/M3): Live Directory Service, Multi-Harness Skill v1 & Angels Demo
 
 #### Step 6A — Live Nickname Directory Authority & Zero-Faucet Onboarding Readiness
-1. **Live Directory Authority Service (`bitecho.org/<nickname>`)**:
-   - Deploy live registration and lookup endpoints where an agent submits a Proof-of-Possession (`create-directory-pop`, with optional `:rotation-signature` for key continuity) and home-set, and the directory authority verifies PoP and issues a directory-signed attestation (`sign-directory-descriptor`).
-   - Document the directory authority key-custody architecture and rotation procedures.
-2. **One-Line Light-Node Launch, `SKILL.md` & Onboarding Guide**:
-   - Provide a one-line light-node launch workflow, finalized `skill/SKILL.md`, and step-by-step onboarding guide reflecting the earn-first + manual operator transfer model (zero faucet).
-   - Explicitly document live-only delivery semantics vs. store-and-forward spooling for offline peers.
+1. **Directory Authority Core & Shell Architecture (`bitecho.light-node.core`, `bitecho.shell.light-node`)**:
+   - Updated `parse-bootstrap-txt` and `parse-bootstrap-edn` to parse and propagate `:directory-pubkey`.
+   - Updated `init-light-state` to configure `:trusted-directory-pubkey`.
+   - Added pure helper `parse-directory-descriptor-text` supporting raw JSON, EDN, or Markdown documents containing fenced ```` ```json ```` codeblocks (`https://bitecho.org/<nickname>`).
+   - Implemented `directory-register` (`create-directory-pop` supporting optional `:rotation-signature` for continuous key continuity) and `directory-lookup` (resolving nicknames, auto-fetching descriptors, verifying directory authority signatures, and caching in `:directory-cache` without mutating local petnames).
+   - Wired injectable `(:directory-fetcher opts)` in `fetch-directory-descriptor!` in `light_node.clj`, auto-fetching missing descriptors during `directory-lookup` and `directory-verify`.
+   - Added CLI subcommand `sign-directory-pop` in `src/bitecho/main.clj` to sign descriptors under cold authority identities.
+2. **Cluster Tooling, Web Publishing & Onboarding Guide**:
+   - Updated `scripts/cluster.sh` Step 2/7 to ensure Directory Authority identity at `${CLUSTER_KEY_DIR}/directory` and export `DIRECTORY_PUB`.
+   - Updated `scripts/cluster.sh` Step 6/7 to include `:directory-pubkey "${DIRECTORY_PUB}"` in `devnet/bootstrap.edn` and `Directory Authority Public Key: ${DIRECTORY_PUB}` in `devnet/bootstrap.txt`.
+   - Added `register-directory` CLI command to `scripts/cluster.sh`, generating signed descriptors and publishing them to `/home/simonpure/src/alpeware/clj-web/public/` (`directory/<nickname>.json`, `<nickname>/index.json`, and human-readable Markdown with embedded JSON block `<nickname>/index.md`).
+   - Created `scripts/light-node.sh` (`chmod +x`) with default `--bootstrap https://bitecho.org/devnet/bootstrap.txt`.
+   - Created `ONBOARDING.md` documenting one-line launch, earn-first zero-faucet participation, Directory Authority cold key custody & PoP registration/lookup, and explicit live-only delivery semantics vs. 10-epoch validator cache and 64-entry session outbox SACK replay.
+   - Updated `skill/SKILL.md` and `test-cli-and-skill-flag-inventory` with 100% bidirectional parity (31 verbs, 42 flags).
+3. **Axiom `seq: 112` Snapshot Escrow Pruning**:
+   - Updated `apply-verified-chain-state-snapshot` so that when a snapshot with `:escrows` is synced, any unconfirmed non-terminal local escrow absent from incoming escrows older than $fin\_epoch - 5$ is pruned, while recent in-flight and terminal escrows are preserved. Verified in `test-chain-state-snapshot-wire-bft-quorum-and-invariants`.
 
 #### Step 6B — Multi-Harness Skill v1 & Angels Demo (`master-plan-vision-roadmap.md` M2 & M3)
 1. **Multi-Harness Neutrality Proof (`master-plan` M2)**:
-   - Connect two distinct agent harnesses over the live devnet using the shared JSONL/envelope skill protocol, completing a signed, sealed, and settled exchange with burn accounting and on-chain finality asserted.
+   - Implemented `run-multi-harness-neutrality-demo` in `src/bitecho/demo/angels.clj`:
+     - Connects two distinct agent harness models across the 3-node Streamlet BFT cluster: Harness A (JSONL external bridge driving `process-jsonl-line`) and Harness B (JVM-native compiled Clojure maps driving `handle-command`).
+     - Demonstrates full cryptographic lifecycle: PoP generation, Directory Authority signing, discovery via `directory-lookup`, petname assignment, callee-pays rendezvous introduction, E2E X25519 sealed channel key derivation, verified-outcome hash-locked escrow, sealed preimage delivery, and release with $\tau = 0.5\%$ (50 bps) protocol settlement take burned on 3-chain block finality.
+     - Performs 3-of-3 BFT quorum snapshot verification across all validators (`verify-chain-state-quorum`), asserts supply conservation ($\text{initial\_supply} - \text{take\_burned} = \sum \text{final\_balances}$), and verifies both harnesses synchronizing finalized account balances.
 2. **Three-Device / `clj-einsum` Angels Demo (`master-plan` M3)**:
-   - Wire `clj-einsum` as the application example with a two-device laptop pipeline split plus a phone third device (light node, no local inference first) backed by the 3-node BFT genesis cluster, using strictly honest simulator framing (`15` / `100` / `1000` nodes).
+   - Implemented `run-three-device-einsum-demo` in `src/bitecho/demo/angels.clj`:
+     - Models a 2-stage split pipeline inference workflow across 3 device archetypes backed by the 3-node genesis BFT cluster:
+       1) **Phone Light Node (`device-1`)**: Edge device with zero local inference; locks $10,000$ `$ECHO` escrow committed to golden deliverable hash and transmits prompt tensor $X$.
+       2) **Laptop Stage 1 Shard (`device-2`)**: Computes Stage 1 contraction $Y_{\text{mid}} = \text{einsum}(\text{"ij,jk->ik"}, X, W_1)$ via pure deterministic Clojure tensor algebra, locks Stage 2 escrow ($4,000$ `$ECHO`), and forwards intermediate activations to Device 3 over sealed channel.
+       3) **Laptop Stage 2 Shard (`device-3`)**: Computes Stage 2 contraction $Y_{\text{out}} = \text{einsum}(\text{"ik,kl->il"}, Y_{\text{mid}}, W_2)$, mechanically verifies tensor parity against golden reference (`verify-tensor-parity`), and transmits verified deliverable preimage back to Device 1.
+     - Releases both escrows on-chain with 50 bps protocol take burned per stage (70 ECH total), validated across all 3 validators by BFT quorum snapshots.
+     - Uses strictly honest simulator framing (3 cluster nodes + 3 edge devices), documenting linear purity scaling to 15 nodes, quadratic gossip convergence to 100 nodes, and hierarchical sub-clusters to 1000 nodes.
+3. **CLI Runner & Test Coverage**:
+   - Added `demo-angels` CLI subcommand in `src/bitecho/main.clj` and `./scripts/demo-angels.sh` (`chmod +x`), outputting complete structured JSON verification report.
+   - Implemented unit tests and generative property test `prop-einsum-associativity` in `test/bitecho/demo/angels_test.clj`, and registered `[bitecho.demo.angels-test]` in `test/bitecho/test_runner.clj`. All 366 tests (3003 assertions) pass green.
 
 ---
 

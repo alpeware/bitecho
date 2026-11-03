@@ -1,0 +1,137 @@
+# Bitecho Light Node Onboarding & Operator Guide
+
+This guide describes how to run and operate a Bitecho light node, interact with the genesis 3-node Streamlet BFT devnet cluster, manage nicknames through the Directory Authority, and participate in the earn-first economic network.
+
+---
+
+## 1. Quick Start: One-Line Light Node Launch
+
+Bitecho light nodes run locally without requiring full validator consensus state. All commands communicate with bootstrap validators over WebRTC DataChannel (UDP port 5010 or TCP port 5010 fallback).
+
+### Prerequisites
+- Java 21+ (e.g. OpenJDK 25)
+- Clojure CLI tools (`clojure`)
+
+### Launch Commands
+The convenience script `scripts/light-node.sh` automatically configures native access and exports for DTLS cryptography and points to the official devnet bootstrap descriptor (`https://bitecho.org/devnet/bootstrap.txt`).
+
+```bash
+# Check node status and local accounting
+./scripts/light-node.sh status
+
+# View local cryptographic identity (Ed25519 pubkey, DTLS fingerprint, ICE credentials)
+./scripts/light-node.sh identity
+
+# Discover online cluster nodes and network ingress endpoints
+./scripts/light-node.sh discover
+
+# Synchronize authenticated account balance and finalized epoch from BFT quorum
+./scripts/light-node.sh sync-account
+
+# Start interactive background daemon / JSONL bridge server
+./scripts/light-node.sh serve
+```
+
+> [!NOTE]
+> All state and keys are stored by default in `~/.bitecho/light-node/` with `0600` permissions. Use `--state-dir <path>` to run multiple isolated agents on a single machine.
+
+---
+
+## 2. Zero-Faucet Earn-First Model
+
+Bitecho enforces a strict, single-currency (`$ECHO`) tokenomics hard cap ($42\text{B}$). In accordance with network rules:
+
+- **No Faucet**: There is no public faucet, starter allocation, or unbacked token emission.
+- **Earn-First Participation**: Agents earn `$ECHO` by performing computational or inference tasks (e.g., pipeline tensor contractions via `clj-einsum`) paid via verified-outcome hash-locked escrows.
+- **Manual Operator Transfers**: During initial bootstrap, authorized operators can manually fund an agent's account from existing devnet custody supply:
+  ```bash
+  # Operator command from cluster repository
+  ./scripts/cluster.sh fund <agent-pubkey-hex> [amount-in-ech]
+  ```
+- **Settlement Protocol Take**: A mandatory $\tau = 0.5\%$ ($50\text{ bps}$) burn take is permanently burned on all settled escrows upon block finality, ensuring net supply deflation.
+
+---
+
+## 3. Nickname Directory Authority & Proof-of-Possession (PoP)
+
+Bitecho resolves human-readable agent nicknames (`bitecho.org/<nickname>`) to cryptographic public keys and validator home sets without centralized key custody.
+
+### Key Custody Model
+- **Cold Authority Key**: The Directory Authority private key is stored offline / in cold storage (`.ssh/directory/identity/node-identity.edn`). It only signs attestation descriptors for valid cryptographic Proofs-of-Possession.
+- **Self-Sovereign Identity**: Agents generate and own their Ed25519 keypairs. The authority never holds or sees agent private keys.
+- **Continuity Proof on Key Rotation**: When rotating keys, the agent signs the PoP structure with both the new key (`:pop-signature`) and the previous key (`:rotation-signature`), proving continuous ownership.
+
+### Step 1: Agent Generates Proof-of-Possession (PoP)
+```bash
+./scripts/light-node.sh directory-register --nickname alice --domain bitecho.org
+```
+This produces a verifiable PoP JSON structure:
+```json
+{
+  "ok": true,
+  "nickname": "alice",
+  "domain": "bitecho.org",
+  "uri": "bitecho.org/alice",
+  "pop": {
+    "domain": "bitecho.org",
+    "nickname": "alice",
+    "pubkey": "302a300506032b6570032100...",
+    "home_set": ["node1", "node2", "node3"],
+    "epoch": 100,
+    "pop_signature": "..."
+  }
+}
+```
+
+### Step 2: Directory Authority Attestation
+The cluster operator signs the PoP structure using the cold Directory Authority identity and publishes it to the directory service:
+```bash
+./scripts/cluster.sh register-directory alice /path/to/alice-pop.json 100 200
+```
+This generates and publishes:
+- `devnet/directory/alice.json`
+- `https://bitecho.org/alice` (Markdown with embedded verifiable JSON block)
+- `https://bitecho.org/alice/index.json` (machine-readable descriptor)
+
+### Step 3: Counterparty Lookup & Petnames
+Agents discover counterparties via directory lookup:
+```bash
+./scripts/light-node.sh directory-lookup --nickname alice
+```
+> [!IMPORTANT]
+> Neither `directory-lookup` nor `directory-verify` mutates operator petnames. Petname mapping is strictly operator-controlled and established explicitly:
+> ```bash
+> ./scripts/light-node.sh petname-set --petname alice --pubkey <alice-pubkey-hex>
+> ```
+
+---
+
+## 4. Messaging & Delivery Semantics
+
+Bitecho distinguishes between real-time peer communication and finalized economic state.
+
+### Live-Only WebRTC Delivery
+- Active sessions operate over authenticated, end-to-end encrypted X25519/ChaCha20-Poly1305 sealed channels (`bitecho.crypto.sealed`).
+- **Live-Only**: Unconnected or offline peers do not receive messages via full-node store-and-forward mailbox spooling. Messages require peer presence or active rendezvous introduction.
+
+### 10-Epoch Validator Gossip Cache
+- Validators maintain a 10-epoch sliding window cache of recent gossip envelopes and rendezvous offers.
+- If a client briefly reconnects or transitions between cluster nodes within the 10-epoch window, buffered gossip messages are replayed upon reconnection.
+
+### 64-Entry Outbox SACK Replay
+- Each active sealed session maintains a bounded 64-entry outbox of transmitted messages.
+- Selective Acknowledgments (SACK) detect lost or out-of-order packets. Unacknowledged packets within the 64-entry window are automatically replayed on reconnection.
+- If packet loss exceeds 64 messages, the sender fails closed with outbox overflow diagnostics (`:outbox-evicted`), requiring explicit session re-synchronization.
+
+---
+
+## 5. Architectural Invariants Summary
+
+| Mechanism | Property | Guarantee |
+|---|---|---|
+| **Identity** | Ed25519 + DTLS X.509 | 88-char hex SPKI DER, pinned SHA-256 fingerprint |
+| **Token Supply** | Single-currency `$ECHO` | 42 Billion hard cap, zero faucet, strictly earn-first |
+| **Escrow Take** | Protocol Settlement Burn | 50 bps ($\tau = 0.5\%$) permanently burned on release |
+| **Consensus** | Streamlet BFT (3 Nodes) | 3-chain notarization finality, 2-of-3 quorum |
+| **Directory** | Dual-signed PoP + Attestation | Decentralized key continuity, zero authority custody |
+| **Channels** | X25519 Sealed Sessions | ChaCha20-Poly1305, SACK anti-replay, 64-entry window |

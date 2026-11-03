@@ -339,6 +339,42 @@ Bitecho is strictly single-currency (`$ECHO`). Milestone 3 implements a pure, de
    - Counterparty addresses support local petname resolution (`pubkey->petname` and `resolve-counterparty`).
    - 100% bidirectional CLI and skill parity across all verbs and flags (`--escrow-id`, `--deliverable-hash`, `--expires-epoch`, `--preimage`).
 
+### M. In-Band Authenticated Chain State Sync (Milestone 5)
+Light nodes authenticate ledger balances, spendable sequences, and escrow statuses directly over the WebRTC DataChannel (Port 5010/DTLS) through cryptographic BFT quorum snapshots:
+
+1. **In-Band Wire Protocol (`:query-chain-state` & `:chain-state-snapshot`)**:
+   - Client sends authenticated `:query-chain-state` carrying ephemeral nonce and caller pubkey. Ephemeral queries bypass sender connection rebinding in `make-agent-connection-handler`, preserving active agent sessions.
+   - Validators respond with a signed `:chain-state-snapshot` containing `:pubkey`, `:finalized-epoch`, `:balance`, `:spendable`, `:seq`, `:deps`, `:escrows`, and Ed25519 `:signature`.
+2. **BFT Quorum Buffering & Fail-Closed Verification (`handle-wire-chain-state-snapshot`)**:
+   - Light node buffers incoming snapshots keyed by validator in `:chain-state-snapshots`, pruning snapshots older than $fin\_epoch - 2$.
+   - Snapshot is applied only when $\ge 2f + 1$ (2 of 3) matching snapshots from `:trusted-validators` reach identical finalized epoch and balances (`verify-chain-state-quorum`).
+   - Monotonicity guards prevent stale snapshots from rewinding finalized epochs.
+   - Forged or pre-quorum snapshots never mutate `:epoch` or `:epoch-initialized?`.
+   - Any local non-terminal escrow (`:locked`, `:release-submitted`, `:refund-submitted`) absent from incoming snapshots and older than $fin\_epoch - 5$ is automatically pruned, while recently-created and terminal escrows are preserved.
+
+### N. Live Directory Authority Service, Multi-Harness Skill Neutrality & Angels Demo (Milestone 6)
+
+1. **Live Directory Authority (`bitecho.org/<nickname>`)**:
+   - **Decentralized Key Custody**: Directory Authority cold keypair signs attestation descriptors without custody of agent private keys. Agents prove ownership via self-signed Proof-of-Possession (`create-directory-pop`).
+   - **Cryptographic Key Rotation**: Agent signs rotation proof with both current and previous private keys (`:rotation-signature`), establishing continuous trust chains across key updates.
+   - **Dual Publishing**: Operators publish descriptors via `./scripts/cluster.sh register-directory`, outputting JSON and human-readable Markdown with embedded JSON codeblocks served at `https://bitecho.org/<nickname>`.
+   - **Petname Discipline**: Neither `directory-lookup` nor `directory-verify` mutates local operator petnames. Mapping is established explicitly by operator action (`petname-set`).
+
+2. **Multi-Harness Skill Neutrality Proof (`master-plan` M2)**:
+   - Evaluates two heterogeneous agent harness architectures against the live Streamlet BFT cluster:
+     - **Harness A**: JSONL external bridge driving line-oriented stdin/stdout envelopes (`process-jsonl-line`).
+     - **Harness B**: JVM-native agent driving compiled Clojure maps (`handle-command`).
+   - Executes full lifecycle: PoP generation, Directory Authority signing, discovery via `directory-lookup`, callee-pays rendezvous introduction, E2E X25519 sealed channel key derivation, verified-outcome escrow lock, sealed preimage transfer, release with 50 bps protocol take burned, and 3-node BFT quorum snapshot verification.
+   - Verifies supply conservation: $\text{initial\_supply} - \text{take\_burned} = \sum \text{final\_balances}$.
+
+3. **Three-Device / `clj-einsum` Angels Demo (`master-plan` M3)**:
+   - Demonstrates split pipeline distributed inference across 3 device archetypes backed by the 3-node genesis BFT cluster:
+     1. **Device 1 (`phone-light-node`)**: Edge light node with zero local inference; locks `$ECHO` escrow committed to golden deliverable hash and transmits prompt tensor $X$.
+     2. **Device 2 (`laptop-stage1-einsum`)**: Receives prompt over sealed channel, computes Stage 1 contraction $Y_{\text{mid}} = \text{einsum}(\text{"ij,jk->ik"}, X, W_1)$, locks Stage 2 escrow, and forwards intermediate activations to Device 3.
+     3. **Device 3 (`laptop-stage2-einsum`)**: Receives activations over sealed channel, computes Stage 2 contraction $Y_{\text{out}} = \text{einsum}(\text{"ik,kl->il"}, Y_{\text{mid}}, W_2)$, mechanically verifies tensor parity against golden reference (`verify-tensor-parity`), and delivers verified deliverable preimage to Device 1.
+   - Settles both escrows on-chain with 50 bps burn take per stage, validated by 3-of-3 BFT quorum snapshots.
+   - Employs honest simulation framing (3 cluster nodes + 3 edge devices), with documented scaling projections to 15, 100, and 1000 nodes.
+
 
 
 

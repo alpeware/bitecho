@@ -200,6 +200,26 @@
                    "directory-verify" (let [pk (extract-flag-value args "--directory-pubkey" nil)]
                                         (cond-> {"cmd" "directory-verify"}
                                           pk (assoc "directory_pubkey" pk)))
+                   "directory-register" (let [nick (extract-flag-value args "--nickname" nil)
+                                              dom (extract-flag-value args "--domain" nil)
+                                              mb (extract-flag-value args "--mailbox" nil)
+                                              prev-pk (extract-flag-value args "--prev-pubkey" nil)
+                                              prev-sk (extract-flag-value args "--prev-privkey" nil)
+                                              m {"cmd" "directory-register"}]
+                                          (cond-> m
+                                            nick (assoc "nickname" nick)
+                                            dom (assoc "domain" dom)
+                                            mb (assoc "mailbox" mb)
+                                            prev-pk (assoc "prev_pubkey" prev-pk)
+                                            prev-sk (assoc "prev_privkey" prev-sk)))
+                   "directory-lookup" (let [nick (extract-flag-value args "--nickname" nil)
+                                            dom (extract-flag-value args "--domain" nil)
+                                            dir-pk (extract-flag-value args "--directory-pubkey" nil)
+                                            m {"cmd" "directory-lookup"}]
+                                        (cond-> m
+                                          nick (assoc "nickname" nick)
+                                          dom (assoc "domain" dom)
+                                          dir-pk (assoc "directory_pubkey" dir-pk)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -357,9 +377,10 @@
   "Dials a single validator node over Port 5010/DTLS, sends :query-chain-state,
    awaits and returns the signed :chain-state-snapshot map (or nil on timeout/error)."
   [identity node pubkey privkey-bytes opts]
-  (let [client-node (api/create-node {:port 0
+  (let [query-ice-creds (identity/generate-random-ice-creds)
+        client-node (api/create-node {:port 0
                                       :cert-data (:cert-data identity)
-                                      :ice-creds (:ice-creds identity)
+                                      :ice-creds query-ice-creds
                                       :setup "active"})
         snapshot-promise (promise)
         nonce (or (:nonce opts) (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID)))
@@ -403,11 +424,54 @@
       (if (or (= transport :tcp) (= transport :connect))
         (api/start-tcp! client-node remote-sdp callbacks)
         (api/start! client-node remote-sdp callbacks))
-      (let [timeout-ms (long (or (:timeout-ms opts) 2500))]
-        (deref snapshot-promise timeout-ms nil))
+      (let [timeout-ms (long (or (:timeout-ms opts) 4000))]
+        (try
+          (deref snapshot-promise timeout-ms nil)
+          (catch InterruptedException _ nil)))
       (catch Exception _ nil)
       (finally
         (try (api/close! client-node) (catch Exception _ nil))))))
+
+(defn fetch-directory-descriptor!
+  "Fetches and parses a directory descriptor for nickname under domain.
+   Supports injectable (:directory-fetcher opts) (fn [domain nickname] ...) for deterministic testing.
+   Over HTTP/HTTPS, fetches https://<domain>/directory/<nickname>.json (falling back to https://<domain>/<nickname>),
+   and parses via light-core/parse-directory-descriptor-text."
+  ([domain nickname] (fetch-directory-descriptor! domain nickname nil))
+  ([domain nickname opts]
+   (if-let [custom-fetcher (:directory-fetcher opts)]
+     (try
+       (let [res (custom-fetcher domain nickname)]
+         (cond
+           (map? res) res
+           (string? res) (light-core/parse-directory-descriptor-text res)
+           :else nil))
+       (catch Exception _ nil))
+     (let [dom (if (or (nil? domain) (str/blank? domain)) "bitecho.org" (str/trim domain))
+           url1 (str "https://" dom "/directory/" nickname ".json")
+           url2 (str "https://" dom "/" nickname)
+           local-f1 (io/file "devnet/directory" (str nickname ".json"))
+           local-f2 (io/file "/home/simonpure/src/alpeware/clj-web/public/directory" (str nickname ".json"))
+           client (HttpClient/newHttpClient)
+           fetch-url (fn [^String u]
+                       (try
+                         (let [req (-> (HttpRequest/newBuilder)
+                                       (.uri (URI/create u))
+                                       (.timeout (Duration/ofMillis 4000))
+                                       (.GET)
+                                       (.build))
+                               resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+                           (when (= 200 (.statusCode resp))
+                             (.body resp)))
+                         (catch Exception _ nil)))]
+       (or (when (.exists local-f1)
+             (light-core/parse-directory-descriptor-text (slurp local-f1)))
+           (when (.exists local-f2)
+             (light-core/parse-directory-descriptor-text (slurp local-f2)))
+           (if-let [body1 (fetch-url url1)]
+             (light-core/parse-directory-descriptor-text body1)
+             (when-let [body2 (fetch-url url2)]
+               (light-core/parse-directory-descriptor-text body2))))))))
 
 (defn fetch-inband-chain-state-quorum!
   "Fetches chain state snapshots from validators in parallel, cross-checking via verify-chain-state-quorum.
@@ -931,8 +995,11 @@
         (catch Exception _
           (deliver connected? :connect-failed)))
       (api/start! client-node remote-sdp callbacks))
+    (Thread/interrupted)
     (let [timeout-ms (long (or (:timeout-ms opts) 8000))
-          res (deref connected? timeout-ms :timeout)]
+          res (try
+                (deref connected? timeout-ms :timeout)
+                (catch InterruptedException _ :connect-failed))]
       (cond
         (= res :bad-fingerprint)
         (do (try (api/close! client-node) (catch Exception _ nil))
@@ -1021,7 +1088,18 @@
       (let [err-resp {"ok" false "error" (:error sync-res)}]
         (emit-json-line! out-writer err-resp)
         err-resp)
-      (let [res (light-core/process-jsonl-line @state-atom line (:privkey-bytes identity))
+      (let [effective-line (if (and (= verb "directory-lookup")
+                                    (not (contains? cmd-map "descriptor"))
+                                    (not (contains? cmd-map :descriptor)))
+                             (let [nick (or (get cmd-map "nickname") (:nickname cmd-map))
+                                   dom (or (get cmd-map "domain") (:domain cmd-map) "bitecho.org")
+                                   desc (when (and (string? nick) (not (str/blank? nick)))
+                                          (fetch-directory-descriptor! dom nick conn-opts))]
+                               (if desc
+                                 (json/write-str (assoc cmd-map "descriptor" desc))
+                                 line))
+                             line)
+            res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
             needs-net? (seq (:net-envelopes res))]
         (if needs-net?
           (let [currently-live? (connection-live? @conn-atom @state-atom)
@@ -1178,8 +1256,18 @@
                           (light-core/init-light-state identity {:bootstrap bootstrap
                                                                  :autonomous? (boolean (:autonomous? opts false))}))
         state-atom (atom initial-state)
-        cmd-map (:cmd-map opts)
-        verb (when (map? cmd-map) (get cmd-map "cmd"))
+        raw-cmd-map (:cmd-map opts)
+        verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
+        cmd-map (if (and (= verb "directory-lookup")
+                         (not (contains? raw-cmd-map "descriptor"))
+                         (not (contains? raw-cmd-map :descriptor)))
+                  (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map))
+                        dom (or (get raw-cmd-map "domain") (:domain raw-cmd-map) "bitecho.org")
+                        desc (when (and (string? nick) (not (str/blank? nick)))
+                               (fetch-directory-descriptor! dom nick opts))]
+                    (cond-> raw-cmd-map
+                      desc (assoc "descriptor" desc)))
+                  raw-cmd-map)
         sync-wanted? (or (and (= verb "sync-account") (nil? (get cmd-map "balance")) (nil? (get cmd-map "snapshots")) (nil? (get cmd-map "snapshot")))
                          (and (= verb "account") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map)))
                          (and (= verb "escrows") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map))))

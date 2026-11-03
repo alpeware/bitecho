@@ -12,6 +12,7 @@
             [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.mesh :as mesh]
             [clojure.data.json :as json]
+            [clojure.edn :as edn]
             [clojure.string :as str]
             [taoensso.nippy :as nippy])
   (:import (java.nio.charset StandardCharsets)))
@@ -31,6 +32,9 @@
    :epoch (long (:epoch opts 0))
    :epoch-initialized? (contains? opts :epoch)
    :bootstrap (:bootstrap opts)
+   :trusted-directory-pubkey (or (:directory-pubkey opts)
+                                 (get-in opts [:bootstrap :directory-pubkey])
+                                 (:trusted-directory-pubkey opts))
    :home-set []
    :petnames {}
    :dac nil
@@ -388,6 +392,27 @@
                                    (seq rot-sig) (assoc :rotation-signature rot-sig))]
               {:ok? true :valid? true :descriptor canonical-desc})))))
     (catch Exception _ {:ok? false :valid? false :error "malformed-descriptor"})))
+
+(defn parse-directory-descriptor-text
+  "Extracts and parses a directory descriptor map from raw JSON, raw EDN,
+   or a Markdown document containing a fenced ```json ... ``` block.
+   Returns nil on malformed input."
+  [text]
+  (when (and (string? text) (not (str/blank? text)))
+    (let [fenced-match (re-find #"(?s)```(?:json)?\s*([\s\S]*?)\s*```" text)
+          candidate (if fenced-match (str/trim (second fenced-match)) (str/trim text))]
+      (or (try
+            (let [parsed (json/read-str candidate :key-fn keyword)]
+              (when (and (map? parsed)
+                         (or (:nickname parsed) (:pubkey parsed) (= (:bitecho/type parsed) "directory-descriptor")))
+                parsed))
+            (catch Exception _ nil))
+          (try
+            (let [parsed (edn/read-string candidate)]
+              (when (and (map? parsed)
+                         (or (:nickname parsed) (:pubkey parsed) (= (:bitecho/type parsed) :directory-descriptor)))
+                parsed))
+            (catch Exception _ nil))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Delegated Agent Certificates (DACs: Anchor Key -> Hot Agent Key)
@@ -802,7 +827,8 @@
 
 (defn apply-verified-chain-state-snapshot
   "Applies a verified chain state snapshot to local light-node state.
-   Guards against stale finalized epochs (monotonicity) and clears stale
+   Guards against stale finalized epochs (monotonicity), prunes expired
+   unconfirmed non-terminal escrows absent from snapshot, and clears stale
    status-dependent escrow fields on merge."
   [state snapshot]
   (let [curr-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
@@ -814,15 +840,27 @@
                          :seq (long (or (:seq snapshot) 0))
                          :deps (vec (or (:deps snapshot) []))
                          :finalized-epoch fin-epoch}
-            incoming-escrows (or (:escrows snapshot) [])
+            has-escrows? (or (contains? snapshot :escrows) (contains? snapshot "escrows"))
+            incoming-escrows (or (:escrows snapshot) (get snapshot "escrows") [])
+            incoming-ids (set (map #(or (:escrow-id %) (get % "escrow_id")) incoming-escrows))
             existing-escrows (or (:escrows state) {})
+            non-terminal-statuses #{:locked :release-submitted :refund-submitted
+                                    "locked" "release-submitted" "refund-submitted"}
+            base-escrows (if has-escrows?
+                           (into {} (remove (fn [[eid existing]]
+                                              (and (not (contains? incoming-ids eid))
+                                                   (contains? non-terminal-statuses (:status existing))
+                                                   (< (long (or (:created-epoch existing) (:created_epoch existing) 0))
+                                                      (- fin-epoch 5))))
+                                            existing-escrows))
+                           existing-escrows)
             merged-escrows (reduce (fn [acc esc]
-                                     (let [eid (:escrow-id esc)
+                                     (let [eid (or (:escrow-id esc) (get esc "escrow_id"))
                                            existing (dissoc (get acc eid {})
                                                             :settled-epoch :net-amount :take-burned :refund-reason
                                                             "settled_epoch" "net_amount" "take_burned" "refund_reason")]
                                        (assoc acc eid (merge existing esc))))
-                                   existing-escrows
+                                   base-escrows
                                    incoming-escrows)]
         (-> state
             (assoc :account new-account
@@ -1446,8 +1484,9 @@
     (if-not (and session (= "open" (:state session)))
       {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
       (let [pname (pubkey->petname state (:peer session))
-            text (get cmd-map "text")
-            payload-hex (get cmd-map "payload_hex")
+            text (or (get cmd-map "text") (:text cmd-map))
+            payload-hex (or (get cmd-map "payload_hex") (get cmd-map "payload-hex")
+                            (:payload_hex cmd-map) (:payload-hex cmd-map))
             payload-bytes (cond (some? text) (.getBytes ^String text "UTF-8")
                                 (some? payload-hex) (basalt/hex->bytes payload-hex)
                                 :else (byte-array 0))
@@ -2191,6 +2230,8 @@
   (let [raw-desc (or (get cmd-map "descriptor") (:descriptor cmd-map) cmd-map)
         dir-pub (or (get cmd-map "directory_pubkey") (get cmd-map "directory-pubkey")
                     (:directory_pubkey cmd-map) (:directory-pubkey cmd-map)
+                    (:trusted-directory-pubkey state)
+                    (get-in state [:bootstrap :directory-pubkey])
                     (get-in state [:bootstrap :custody-pubkey])
                     (get-in state [:bootstrap :treasury-pubkey]))
         cur-ep (when (:epoch-initialized? state) (:epoch state))
@@ -2228,6 +2269,107 @@
                         "expires_epoch" (:expires-epoch desc-map)}
              :net-envelopes []
              :stdout-events []}))))))
+
+(defn- exec-directory-register [state cmd-map ^bytes privkey-bytes]
+  (let [nick (or (get cmd-map "nickname") (:nickname cmd-map))
+        domain (or (get cmd-map "domain") (:domain cmd-map) "bitecho.org")
+        prev-pk (or (get cmd-map "prev_pubkey") (get cmd-map "prev-pubkey")
+                    (:prev_pubkey cmd-map) (:prev-pubkey cmd-map))
+        prev-sk-raw (or (get cmd-map "prev_privkey") (get cmd-map "prev-privkey")
+                        (:prev_privkey cmd-map) (:prev-privkey cmd-map))
+        prev-sk-bytes (when prev-sk-raw
+                        (try
+                          (if (bytes? prev-sk-raw)
+                            prev-sk-raw
+                            (basalt/hex->bytes prev-sk-raw))
+                          (catch Exception _ nil)))]
+    (if-not (valid-petname? nick)
+      {:state state
+       :response {"ok" false "error" "invalid-nickname"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [norm-nick (normalize-petname nick)
+            norm-domain (if (or (nil? domain) (str/blank? domain)) "bitecho.org" (str/lower-case (str/trim domain)))
+            hs (if (seq (:home-set state))
+                 (vec (for [hn (:home-set state)]
+                        (if (map? hn) (name (or (:node-id hn) (:node hn) "node1")) (name hn))))
+                 ["node1" "node2" "node3"])
+            ep (effective-chain-epoch state)
+            pop-opts (cond-> {:domain norm-domain
+                              :nickname norm-nick
+                              :pubkey (:pubkey state)
+                              :home-set hs
+                              :epoch ep}
+                       prev-pk (assoc :prev-pubkey prev-pk
+                                      :prev-privkey-bytes prev-sk-bytes))
+            pop (create-directory-pop privkey-bytes pop-opts)]
+        (if-not pop
+          {:state state
+           :response {"ok" false "error" "invalid-pop-parameters"}
+           :net-envelopes []
+           :stdout-events []}
+          (let [pop-str-map (cond-> {"domain" (:domain pop)
+                                     "nickname" (:nickname pop)
+                                     "pubkey" (:pubkey pop)
+                                     "home_set" (:home-set pop)
+                                     "epoch" (:epoch pop)
+                                     "pop_signature" (:pop-signature pop)}
+                              (:prev-pubkey pop)
+                              (assoc "prev_pubkey" (:prev-pubkey pop)
+                                     "rotation_signature" (:rotation-signature pop)))]
+            {:state state
+             :response {"ok" true
+                        "nickname" norm-nick
+                        "domain" norm-domain
+                        "uri" (str norm-domain "/" norm-nick)
+                        "pop" pop-str-map}
+             :net-envelopes []
+             :stdout-events []}))))))
+
+(defn- exec-directory-lookup [state cmd-map]
+  (let [nick (or (get cmd-map "nickname") (:nickname cmd-map))
+        raw-desc (or (get cmd-map "descriptor") (:descriptor cmd-map))]
+    (if-not (valid-petname? nick)
+      {:state state
+       :response {"ok" false "error" "invalid-nickname"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [norm-nick (normalize-petname nick)
+            trusted-pub (or (get cmd-map "directory_pubkey") (get cmd-map "directory-pubkey")
+                            (:directory_pubkey cmd-map) (:directory-pubkey cmd-map)
+                            (:trusted-directory-pubkey state)
+                            (get-in state [:bootstrap :directory-pubkey]))]
+        (if (some? raw-desc)
+          (let [verify-map (assoc cmd-map "directory_pubkey" trusted-pub)
+                v-res (exec-directory-verify state verify-map)]
+            (if-not (get-in v-res [:response "ok"])
+              v-res
+              (let [desc (get-in (:state v-res) [:directory-cache norm-nick])]
+                {:state (:state v-res)
+                 :response {"ok" true "descriptor" desc}
+                 :net-envelopes []
+                 :stdout-events []})))
+          (let [cached (get-in state [:directory-cache norm-nick])]
+            (if-not cached
+              {:state state
+               :response {"ok" false "error" "directory-entry-not-found"}
+               :net-envelopes []
+               :stdout-events []}
+              (if trusted-pub
+                (let [v-res (verify-directory-descriptor cached trusted-pub (effective-chain-epoch state))]
+                  (if (:ok? v-res)
+                    {:state state
+                     :response {"ok" true "descriptor" cached}
+                     :net-envelopes []
+                     :stdout-events []}
+                    {:state state
+                     :response {"ok" false "error" "directory-entry-not-found"}
+                     :net-envelopes []
+                     :stdout-events []}))
+                {:state state
+                 :response {"ok" true "descriptor" cached}
+                 :net-envelopes []
+                 :stdout-events []}))))))))
 
 (defn- exec-status [state]
   (let [sessions-summary (vec (for [[_ s] (:sessions state)
@@ -2302,6 +2444,8 @@
       "dac-attach" (exec-dac-attach state effective-map)
       "dac-revoke" (exec-dac-revoke state effective-map)
       "directory-verify" (exec-directory-verify state effective-map)
+      "directory-register" (exec-directory-register state effective-map privkey-bytes)
+      "directory-lookup" (exec-directory-lookup state effective-map)
       "status" (exec-status state)
       {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})))
 
@@ -3035,7 +3179,7 @@
                       :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
                       :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
                       {:state state :net-envelopes [] :stdout-events []})]
-            (if (and msg-epoch (not (:epoch-initialized? (:state res))))
+            (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
               (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
               res)))))))
 

@@ -1661,8 +1661,9 @@
                                  (swap! st-atom assoc
                                         :remote-ice-ufrag ufrag
                                         :remote-ice-pwd pwd)))))))
-                     (let [sender (:sender unwrapped)]
-                       (when (and sender (not= sender @conn-key))
+                     (let [sender (:sender unwrapped)
+                           query-only? (= (:type unwrapped) :query-chain-state)]
+                       (when (and sender (not query-only?) (not= sender @conn-key))
                          (let [old-key @conn-key]
                            (if agent-conns
                              (let [rebound (apply-agent-sender-rebind! agent-conns old-key sender cid (System/currentTimeMillis))]
@@ -1671,11 +1672,11 @@
                                  (reset! node-gen (long (or (:generation rebound) @node-gen)))
                                  (replay-cached-gossip-to-agent! shell-node agent-conns sender)))
                              (reset! conn-key sender))))
-                       (let [updated (when agent-conns
+                       (let [updated (when (and agent-conns (not query-only?))
                                        (apply-mesh-conn-event! agent-conns @conn-key
                                                                {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
-                         (when (or (nil? agent-conns) (= agent-node (:node updated)))
-                           (if (= (:type unwrapped) :query-chain-state)
+                         (when (or (nil? agent-conns) query-only? (= agent-node (:node updated)))
+                           (if query-only?
                              (let [st (or (when shell-node (query-node-state shell-node 500)) {})
                                    v-id (or validator-identity (:identity shell-node))
                                    snapshot (build-validator-chain-state-snapshot st v-id (:pubkey unwrapped) (:nonce unwrapped))]

@@ -32,6 +32,7 @@ fi
 BILLING_ACCOUNT="${BILLING_ACCOUNT:-00A760-ADD23B-93C934}"
 SSH_USER="${SSH_USER:-bitecho}"
 SSH_KEY_DIR="${ROOT_DIR}/.ssh"
+CLUSTER_KEY_DIR="${CLUSTER_KEY_DIR:-${SSH_KEY_DIR}}"
 SSH_KEY="${SSH_KEY_DIR}/bitecho_cluster_ed25519"
 TREASURY_KEY_FILE="${SSH_KEY_DIR}/devnet_treasury_keypair.edn"
 CUSTODY_KEY_FILE="${SSH_KEY_DIR}/devnet_custody_keypair.edn"
@@ -413,9 +414,10 @@ cmd_deploy() {
     return 1
   fi
 
-  # 2. Ensure Devnet Treasury & Custody keypairs exist locally
-  echo "--> Step 2/7: Ensuring Treasury and Custody Ed25519 keypairs..."
+  # 2. Ensure Devnet Treasury, Custody & Directory identities exist locally
+  echo "--> Step 2/7: Ensuring Treasury, Custody, and Directory Ed25519 identities..."
   mkdir -p "${SSH_KEY_DIR}"
+  mkdir -p "${CLUSTER_KEY_DIR}/directory"
   local local_java
   local_java="$(resolve_local_java)"
   if [[ ! -f "${TREASURY_KEY_FILE}" ]]; then
@@ -432,14 +434,31 @@ cmd_deploy() {
          --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
          -jar "${ROOT_DIR}/target/bitecho.jar" gen-keypair "${CUSTODY_KEY_FILE}" >/dev/null
   fi
+  local DIRECTORY_KEY_FILE="${CLUSTER_KEY_DIR}/directory/identity/node-identity.edn"
+  if [[ ! -f "${DIRECTORY_KEY_FILE}" && ! -f "${CLUSTER_KEY_DIR}/directory/node-identity.edn" ]]; then
+    echo "Generating Devnet Directory Authority identity at ${CLUSTER_KEY_DIR}/directory..."
+    "$local_java" --enable-native-access=ALL-UNNAMED \
+         --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+         --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+         -cp "${ROOT_DIR}/target/bitecho.jar:$(clojure -Spath 2>/dev/null || true)" clojure.main -e \
+         "(require '[bitecho.shell.identity :as id]) (id/load-or-create-node-identity! \"${CLUSTER_KEY_DIR}/directory\" :directory)" >/dev/null
+  fi
 
   chmod 600 "${TREASURY_KEY_FILE}" "${CUSTODY_KEY_FILE}"
+  if [[ -f "${DIRECTORY_KEY_FILE}" ]]; then
+    chmod 600 "${DIRECTORY_KEY_FILE}"
+  fi
 
-  local TREASURY_PUB TREASURY_PRIV CUSTODY_PUB CUSTODY_PRIV
+  local TREASURY_PUB TREASURY_PRIV CUSTODY_PUB CUSTODY_PRIV DIRECTORY_PUB
   TREASURY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${TREASURY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
   TREASURY_PRIV="$(grep -o ':privkey-hex "[^"]*"' "${TREASURY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
   CUSTODY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${CUSTODY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
   CUSTODY_PRIV="$(grep -o ':privkey-hex "[^"]*"' "${CUSTODY_KEY_FILE}" | head -n1 | cut -d'"' -f2)"
+  local dir_file="${DIRECTORY_KEY_FILE}"
+  if [[ ! -f "${dir_file}" && -f "${CLUSTER_KEY_DIR}/directory/node-identity.edn" ]]; then
+    dir_file="${CLUSTER_KEY_DIR}/directory/node-identity.edn"
+  fi
+  DIRECTORY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${dir_file}" | head -n1 | cut -d'"' -f2)"
 
   if [[ -z "${TREASURY_PUB:-}" || ! "${TREASURY_PUB}" =~ ^[0-9a-fA-F]{88}$ ]]; then
     echo "Error: Invalid or missing Treasury public key in ${TREASURY_KEY_FILE} (must be 88-char hex)." >&2
@@ -457,9 +476,15 @@ cmd_deploy() {
     echo "Error: Invalid or missing Custody private key in ${CUSTODY_KEY_FILE} (must be 96-char hex)." >&2
     return 1
   fi
+  if [[ -z "${DIRECTORY_PUB:-}" || ! "${DIRECTORY_PUB}" =~ ^[0-9a-fA-F]{88}$ ]]; then
+    echo "Error: Invalid or missing Directory Authority public key in ${dir_file} (must be 88-char hex)." >&2
+    return 1
+  fi
 
-  echo "Treasury Pubkey: ${TREASURY_PUB}"
-  echo "Custody Pubkey:  ${CUSTODY_PUB}"
+  echo "Treasury Pubkey:  ${TREASURY_PUB}"
+  echo "Custody Pubkey:   ${CUSTODY_PUB}"
+  echo "Directory Pubkey: ${DIRECTORY_PUB}"
+  export DIRECTORY_PUB
 
   # 3. Upload uberjar to all 3 VMs
   echo "--> Step 3/7: Uploading uberjar to all nodes via rsync..."
@@ -609,6 +634,7 @@ REMOTE_CFG
 {:network :devnet
  :treasury-pubkey "${TREASURY_PUB}"
  :custody-pubkey "${CUSTODY_PUB}"
+ :directory-pubkey "${DIRECTORY_PUB}"
  :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node1.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
          :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node2.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
          :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}}}
@@ -623,6 +649,7 @@ Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 Network: devnet (3-node Streamlet BFT validator quorum, N=3, quorum=2 of 3)
 Treasury Public Key: ${TREASURY_PUB}
 Custody Public Key:  ${CUSTODY_PUB}
+Directory Authority Public Key: ${DIRECTORY_PUB}
 
 Bootstrap Validators:
 --------------------------------------------------------------------------------
@@ -676,13 +703,42 @@ TXT_BOOTSTRAP_EOF
   fi
 
   # 7. Restart bitecho.service and poll healthz
-  echo "--> Step 7/7: Restarting bitecho.service and verifying healthz..."
+  echo "--> Step 7/7: Writing bitecho.service, restarting service, and verifying healthz..."
   local deploy_failed=false
   for node in "${NODES[@]}"; do
     local ip
     ip="$(get_ip "$node")"
-    echo "Restarting service on ${node} (${ip})..."
-    ssh_cmd "$node" sudo systemctl restart bitecho.service
+    echo "Updating bitecho.service and restarting on ${node} (${ip})..."
+    ssh_cmd "$node" bash -s << 'SERVICE_UNIT'
+set -euo pipefail
+cat << 'UNIT' | sudo tee /etc/systemd/system/bitecho.service > /dev/null
+[Unit]
+Description=Bitecho Full Node & Streamlet Validator
+After=network.target
+
+[Service]
+Type=simple
+User=bitecho
+LimitNOFILE=65536
+Restart=always
+RestartSec=3
+ExecStart=/opt/jdk-25/bin/java \
+  -Xms128m -Xmx320m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m \
+  -XX:+UseCompactObjectHeaders -XX:+UseG1GC \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho/bitecho.jar run /etc/bitecho/config.edn
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bitecho
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl restart bitecho.service
+SERVICE_UNIT
 
     echo "Polling healthz on ${node}..."
     local ok=false
@@ -1285,6 +1341,75 @@ print(f'{seq} {deps}')
   fi
 }
 
+cmd_register_directory() {
+  local nickname="${1:-}"
+  local pop_arg="${2:-}"
+  local issued_epoch="${3:-}"
+  local expires_epoch="${4:-}"
+  local mailbox="${5:-}"
+
+  if [[ -z "$nickname" || -z "$pop_arg" ]]; then
+    echo "Usage: $0 register-directory <nickname> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]" >&2
+    return 1
+  fi
+
+  local dir_ident="${CLUSTER_KEY_DIR}/directory"
+  if [[ ! -d "$dir_ident" && ! -f "$dir_ident" && -d "${SSH_KEY_DIR}/directory" ]]; then
+    dir_ident="${SSH_KEY_DIR}/directory"
+  fi
+  if [[ ! -d "$dir_ident" && ! -f "$dir_ident" ]]; then
+    echo "Error: Directory identity not found at ${dir_ident}. Run 'deploy' first." >&2
+    return 1
+  fi
+
+  local local_java
+  local_java="$(resolve_local_java)"
+
+  echo "Signing directory descriptor for nickname: ${nickname}..."
+  local descriptor_json
+  descriptor_json="$("$local_java" --enable-native-access=ALL-UNNAMED \
+       --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+       --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+       -cp "${ROOT_DIR}/target/bitecho.jar:$(clojure -Spath 2>/dev/null || true)" \
+       clojure.main -m bitecho.main sign-directory-pop \
+       "${dir_ident}" "${pop_arg}" "${issued_epoch}" "${expires_epoch}" "${mailbox}")"
+
+  if [[ -z "$descriptor_json" || ! "$descriptor_json" =~ ^\{.*\}$ ]]; then
+    echo "Error: Failed to obtain valid signed descriptor JSON." >&2
+    return 1
+  fi
+
+  mkdir -p "${ROOT_DIR}/devnet/directory"
+  local devnet_file="${ROOT_DIR}/devnet/directory/${nickname}.json"
+  echo "$descriptor_json" > "${devnet_file}"
+  chmod 644 "${devnet_file}"
+  echo "Wrote descriptor to ${devnet_file}"
+
+  local web_public="/home/simonpure/src/alpeware/clj-web/public"
+  if [[ -d "$web_public" ]]; then
+    mkdir -p "${web_public}/directory" "${web_public}/${nickname}"
+    local web_dir_file="${web_public}/directory/${nickname}.json"
+    local web_nick_json="${web_public}/${nickname}/index.json"
+    local web_nick_md="${web_public}/${nickname}/index.md"
+
+    echo "$descriptor_json" > "${web_dir_file}"
+    echo "$descriptor_json" > "${web_nick_json}"
+
+    cat > "${web_nick_md}" << MD_EOF
+# Bitecho Directory Attestation: ${nickname}
+
+Verified directory descriptor signed by the Bitecho Directory Authority.
+
+\`\`\`json
+${descriptor_json}
+\`\`\`
+MD_EOF
+
+    chmod 644 "${web_dir_file}" "${web_nick_json}" "${web_nick_md}"
+    echo "Published to clj-web: ${web_dir_file}, ${web_nick_json}, ${web_nick_md}"
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # CLI Dispatcher & Usage
 # ------------------------------------------------------------------------------
@@ -1303,6 +1428,8 @@ Commands:
   audit                               Audit /statusz, /burnsz, /accountz, /connz, and memory convergence across all 3 nodes
   simulate [--agents N] [--messages M] [--burn B] Run light agent swarm simulator against Devnet
   fund <recipient> [amount]           Send ECH from Devnet custody to an agent public key (default: 1000000)
+  register-directory <nickname> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]
+                                      Sign agent PoP and publish directory attestation descriptor
   chaos [--rounds N] [--interval SEC] Run chaos monkey restarting random nodes and checking convergence
   logs [node1|node2|node3]            Stream systemd journal logs from a cluster node
   bootstrap-sdp                       Display WebRTC DataChannel bootstrap connection parameters for agents
@@ -1343,6 +1470,9 @@ main() {
       ;;
     fund)
       cmd_fund "$@"
+      ;;
+    register-directory|register_directory)
+      cmd_register_directory "$@"
       ;;
     chaos)
       cmd_chaos "$@"

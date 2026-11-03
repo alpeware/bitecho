@@ -1,12 +1,17 @@
 (ns bitecho.main
   "CLI entrypoint for Bitecho node."
   (:gen-class)
-  (:require [bitecho.shell.agent-sim :as agent-sim]
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.demo.angels :as angels]
+            [bitecho.light-node.core :as light-core]
+            [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
+            [clojure.data.json :as json]
             [clojure.edn :as edn]
-            [clojure.java.io :as io]))
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 (defn- print-usage
   "Prints CLI usage guide."
@@ -19,7 +24,9 @@
   (println "  bitecho validate-config <config.edn>")
   (println "  bitecho simulate-agents <bootstrap.edn> <keypair.edn> [--agents N] [--messages M] [--burn B]")
   (println "  bitecho fund-agent <bootstrap.edn> <keypair.edn> <recipient-pubkey-hex> <amount> [--seq S] [--deps D] [--burn B]")
-  (println "  bitecho light-node <serve|verb> [options]"))
+  (println "  bitecho light-node <serve|verb> [options]")
+  (println "  bitecho sign-directory-pop <dir-identity-dir-or-file> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]")
+  (println "  bitecho demo-angels"))
 
 (defn- cmd-run
   "Runs a Bitecho mesh node given a config EDN file."
@@ -127,6 +134,90 @@
         (println (str "Error: " (.getMessage e))))
       (System/exit 1))))
 
+(defn- cmd-sign-directory-pop
+  "Signs a directory attestation descriptor from a PoP JSON string or file under a cold Directory Authority key."
+  [args]
+  (let [[dir-identity-path pop-json-str issued-epoch-str expires-epoch-str mailbox] args]
+    (if-not (and dir-identity-path pop-json-str)
+      (do
+        (binding [*out* *err*]
+          (println "Usage: bitecho sign-directory-pop <dir-identity-dir-or-file> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]"))
+        (System/exit 1))
+      (let [f (io/file dir-identity-path)]
+        (when-not (.exists f)
+          (binding [*out* *err*]
+            (println (str "Error: Directory identity path not found: " dir-identity-path)))
+          (System/exit 1))
+        (let [id-file (cond
+                        (.isFile f) f
+                        (.exists (io/file f "identity" "node-identity.edn")) (io/file f "identity" "node-identity.edn")
+                        (.exists (io/file f "node-identity.edn")) (io/file f "node-identity.edn")
+                        :else nil)
+              ident (if id-file
+                      (let [edn-data (edn/read-string (slurp id-file))
+                            pub-hex (:pubkey-hex edn-data)
+                            priv-hex (:privkey-hex edn-data)
+                            pub-bytes (basalt/hex->bytes pub-hex)
+                            priv-bytes (basalt/hex->bytes priv-hex)]
+                        {:pubkey-hex pub-hex
+                         :keypair {:public pub-bytes :private priv-bytes}})
+                      (identity/load-or-create-node-identity! dir-identity-path :directory))
+              priv-bytes (get-in ident [:keypair :private])
+              pub-hex (:pubkey-hex ident)
+              pop-file (io/file pop-json-str)
+              pop-raw (if (.exists pop-file) (slurp pop-file) pop-json-str)
+              pop-map (try (json/read-str pop-raw) (catch Exception e
+                                                     (binding [*out* *err*]
+                                                       (println (str "Error: Failed to parse PoP JSON: " (.getMessage e))))
+                                                     (System/exit 1)))]
+          (when-not (and (map? pop-map) (light-core/verify-directory-pop pop-map))
+            (binding [*out* *err*]
+              (println "Error: Invalid Proof-of-Possession (PoP) structure or signature"))
+            (System/exit 1))
+          (let [issued-ep (when (and issued-epoch-str (not (str/blank? issued-epoch-str)))
+                            (Long/parseLong (str issued-epoch-str)))
+                expires-ep (when (and expires-epoch-str (not (str/blank? expires-epoch-str)))
+                             (Long/parseLong (str expires-epoch-str)))
+                opts (cond-> {}
+                       issued-ep (assoc :issued-epoch issued-ep)
+                       expires-ep (assoc :expires-epoch expires-ep)
+                       mailbox (assoc :mailbox mailbox))
+                desc (light-core/sign-directory-descriptor priv-bytes pub-hex pop-map opts)
+                v-res (light-core/verify-directory-descriptor desc pub-hex (or issued-ep 0))]
+            (if-not (:ok? v-res)
+              (do
+                (binding [*out* *err*]
+                  (println (str "Error: Failed to verify signed descriptor: " (:error v-res))))
+                (System/exit 1))
+              (let [stringified (into {}
+                                      (for [[k v] desc]
+                                        [(if (keyword? k)
+                                           (if-let [ns (namespace k)]
+                                             (str ns "/" (name k))
+                                             (name k))
+                                           (str k))
+                                         v]))]
+                (println (json/write-str stringified))
+                (System/exit 0)))))))))
+
+(defn- cmd-demo-angels
+  "Runs the Milestone 6 Angels Demos: Multi-Harness Neutrality Proof and Three-Device einsum Pipeline."
+  [_args]
+  (try
+    (let [neutrality-res (angels/run-multi-harness-neutrality-demo)
+          einsum-res (angels/run-three-device-einsum-demo)
+          report {:multi-harness-neutrality neutrality-res
+                  :three-device-einsum einsum-res
+                  :all-verified? (and (:ok? neutrality-res) (:ok? einsum-res))}]
+      (println (json/write-str report))
+      (if (:all-verified? report)
+        (System/exit 0)
+        (System/exit 1)))
+    (catch Exception e
+      (binding [*out* *err*]
+        (println (str "Error running demo-angels: " (.getMessage e))))
+      (System/exit 1))))
+
 (defn -main
   "Main CLI entrypoint."
   [& args]
@@ -158,6 +249,12 @@
 
       "light-node"
       (light-node/run-light-node-cli! rest-args)
+
+      "sign-directory-pop"
+      (cmd-sign-directory-pop rest-args)
+
+      "demo-angels"
+      (cmd-demo-angels rest-args)
 
       (do
         (print-usage)

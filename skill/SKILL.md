@@ -507,6 +507,52 @@ Cryptographically verifies an authority-signed directory attestation descriptor 
 
 ---
 
+### `directory-register`
+Generates a Proof-of-Possession (PoP) structure and rotation proof for the agent's identity and nickname, ready for Directory Authority attestation.
+
+- **CLI**: `clojure -M:light-node directory-register --nickname <name> [--domain <domain>] [--mailbox <url>] [--prev-pubkey <hex>] [--prev-privkey <hex>]`
+- **JSONL**: `{"cmd": "directory-register", "nickname": "alice", "domain": "bitecho.org", "mailbox": "https://bitecho.org/inbox/alice", "prev_pubkey": "<hex>", "prev_privkey": "<hex>"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "nickname": "alice",
+    "domain": "bitecho.org",
+    "uri": "bitecho.org/alice",
+    "pop": {
+      "domain": "bitecho.org",
+      "nickname": "alice",
+      "pubkey": "<pubkey-hex>",
+      "home_set": ["node1"],
+      "epoch": 10,
+      "mailbox": "https://bitecho.org/inbox/alice",
+      "pop_signature": "<hex>"
+    }
+  }
+  ```
+
+---
+
+### `directory-lookup`
+Resolves a nickname to a verified public key and home set via local cache or HTTP directory service (`https://bitecho.org/<nickname>`), cryptographically verifying directory authority signatures without mutating operator petnames.
+
+- **CLI**: `clojure -M:light-node directory-lookup --nickname <name> [--domain <domain>] [--directory-pubkey <directory-pubkey>]`
+- **JSONL**: `{"cmd": "directory-lookup", "nickname": "alice", "domain": "bitecho.org", "directory_pubkey": "<directory-pubkey>"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "nickname": "alice",
+    "uri": "bitecho.org/alice",
+    "pubkey": "<pubkey-hex>",
+    "home_set": ["node1"],
+    "directory_pubkey": "<directory-pubkey>",
+    "expires_epoch": 30
+  }
+  ```
+
+---
+
 ### `rendezvous-policy`
 Configures local callee policy for two-phase callee-pays rendezvous introduction introductions.
 

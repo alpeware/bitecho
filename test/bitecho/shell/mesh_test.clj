@@ -1221,6 +1221,56 @@
         (is (= 2 (get-in @agent-conns [agent-pub :ignored-stale])))
         (is (nil? (async/poll! network-in)))))))
 
+(deftest test-query-chain-state-does-not-evict-persistent-agent-connection
+  (testing "Incoming :query-chain-state serves snapshot without evicting or closing persistent agent connection"
+    (let [kp (crypto/generate-keypair)
+          agent-pub (basalt/bytes->hex (:public kp))
+          agent-priv (:private kp)
+          val-kp (crypto/generate-keypair)
+          val-pub (basalt/bytes->hex (:public val-kp))
+          val-ident {:pubkey-hex val-pub
+                     :keypair val-kp}
+          network-in (async/chan 10)
+          shell-node {:network-in network-in
+                      :identity val-ident
+                      :state-atom (atom {:messages {}
+                                         :message-epochs {}
+                                         :last-executed-finalized-epoch 100
+                                         :ledger {agent-pub {:balance 50000 :spendable 45000 :seq 10}}
+                                         :escrows {}})}
+          agent-conns (atom {})
+          cbs-map (atom {})
+          closed-nodes (atom [])
+          sent-messages (atom [])
+          handler (mesh/make-agent-connection-handler shell-node agent-conns nil val-ident)
+          persistent-node {:id :persistent-agent-node}
+          query-node {:id :ephemeral-query-node}
+          persistent-env (nippy/freeze (mesh/wrap-agent-event {:type :receive-summary :epoch 1 :summary "s1"} agent-pub agent-priv))
+          query-env (nippy/freeze (mesh/wrap-agent-event {:type :query-chain-state :pubkey agent-pub :nonce "test-nonce"} agent-pub agent-priv))]
+      (with-redefs [api/set-callbacks! (fn [n cbs] (swap! cbs-map assoc n cbs))
+                    api/close! (fn [n] (swap! closed-nodes conj n))
+                    api/send! (fn [node payload cid] (swap! sent-messages conj {:node node :payload payload :channel-id cid}))]
+        ;; 1. Persistent connection opens and authenticates
+        (handler persistent-node)
+        ((:on-message (get @cbs-map persistent-node)) {:channel-id 1 :payload persistent-env})
+        (is (= persistent-node (get-in @agent-conns [agent-pub :node])))
+        (is (empty? @closed-nodes))
+
+        ;; 2. Ephemeral query connection opens and sends :query-chain-state
+        (handler query-node)
+        ((:on-message (get @cbs-map query-node)) {:channel-id 2 :payload query-env})
+
+        ;; 3. Snapshot sent back to query-node
+        (is (= 1 (count @sent-messages)))
+        (is (= query-node (:node (first @sent-messages))))
+        (let [resp-snapshot (nippy/thaw (:payload (first @sent-messages)))]
+          (is (= :chain-state-snapshot (:type resp-snapshot)))
+          (is (= 50000 (:balance resp-snapshot))))
+
+        ;; 4. Persistent connection is NOT evicted or closed!
+        (is (= persistent-node (get-in @agent-conns [agent-pub :node])))
+        (is (empty? @closed-nodes))))))
+
 (deftest test-record-sent-msg-fifo-eviction-at-1024-cap
   (testing "inserting the 1025th message ID evicts only the 1st message ID while retaining 2..1025"
     (let [initial-conn (mesh/init-mesh-conn-state)

@@ -2888,7 +2888,95 @@
         (is (= 100 (:settled-epoch merged-refunded)))
         (is (= "timeout" (:refund-reason merged-refunded)))
         (is (nil? (:net-amount merged-refunded)))
-        (is (nil? (:take-burned merged-refunded)))))))
+        (is (nil? (:take-burned merged-refunded)))))
+
+    ;; Axiom seq: 112: Pruning of expired non-terminal escrows absent from snapshot with escrows
+    (let [esc-old-locked {:escrow-id "esc-old"
+                          :status :locked
+                          :created-epoch 80}
+          esc-recent-locked {:escrow-id "esc-recent"
+                             :status :locked
+                             :created-epoch 96}
+          esc-old-released {:escrow-id "esc-released"
+                            :status :released
+                            :created-epoch 80}
+          st-with-escrows (-> init-st
+                              (assoc-in [:account :finalized-epoch] 90)
+                              (assoc :escrows {"esc-old" esc-old-locked
+                                               "esc-recent" esc-recent-locked
+                                               "esc-released" esc-old-released}))
+          snap-at-100 {:pubkey user-pub
+                       :finalized-epoch 100
+                       :balance 50000
+                       :spendable 45000
+                       :seq 42
+                       :escrows [{:escrow-id "esc-new"
+                                  :status :locked
+                                  :created-epoch 98}]}
+          applied (light-core/apply-verified-chain-state-snapshot st-with-escrows snap-at-100)]
+      ;; "esc-old" is (< 80 (- 100 5)), non-terminal, and absent -> pruned!
+      (is (nil? (get-in applied [:escrows "esc-old"])))
+      ;; "esc-recent" is (>= 96 (- 100 5)) -> preserved!
+      (is (some? (get-in applied [:escrows "esc-recent"])))
+      ;; "esc-released" is terminal -> preserved!
+      (is (some? (get-in applied [:escrows "esc-released"])))
+      ;; "esc-new" from snapshot -> added!
+      (is (some? (get-in applied [:escrows "esc-new"]))))))
+
+(deftest test-fresh-node-raw-epoch-side-channel-guard
+  (testing "Axiom seq: 102 LOW 1: forged or pre-quorum :chain-state-snapshot never pins epoch on a fresh node"
+    (let [user-kp (crypto/generate-keypair)
+          user-pub (basalt/bytes->hex (:public user-kp))
+          user-priv (:private user-kp)
+          val-kps [(crypto/generate-keypair) (crypto/generate-keypair) (crypto/generate-keypair)]
+          val-pubs (mapv #(basalt/bytes->hex (:public %)) val-kps)
+          bootstrap {:nodes {"v1" {:pubkey (nth val-pubs 0) :ip "127.0.0.1" :port 5001}
+                             "v2" {:pubkey (nth val-pubs 1) :ip "127.0.0.1" :port 5002}
+                             "v3" {:pubkey (nth val-pubs 2) :ip "127.0.0.1" :port 5003}}}
+          fresh-st (light-core/init-light-state {:identity {:pubkey-hex user-pub}} {:bootstrap bootstrap})
+          base-snap {:pubkey user-pub
+                     :finalized-epoch 6600
+                     :balance 50000
+                     :spendable 45000
+                     :seq 42
+                     :deps []
+                     :escrows []
+                     :nonce "test-nonce"}]
+      ;; Fresh node starts uninitialized
+      (is (= 0 (:epoch fresh-st)))
+      (is (false? (:epoch-initialized? fresh-st)))
+
+      ;; 1. Forged snapshot with epoch 99999
+      (let [forged-snap (assoc base-snap
+                               :type :chain-state-snapshot
+                               :validator-pubkey (nth val-pubs 0)
+                               :epoch 99999
+                               :finalized-epoch 99999
+                               :signature "deadbeef")
+            res-forged (light-core/handle-wire-payload fresh-st forged-snap user-priv)
+            st-forged (:state res-forged)]
+        (is (= 0 (:epoch st-forged)))
+        (is (false? (:epoch-initialized? st-forged))))
+
+      ;; 2. Single 1-of-3 pre-quorum signed snapshot with epoch 6600
+      (let [snap-0 (light-core/sign-chain-state-snapshot
+                    (assoc base-snap :validator-pubkey (nth val-pubs 0))
+                    (:private (nth val-kps 0)))
+            res-1 (light-core/handle-wire-payload fresh-st snap-0 user-priv)
+            st-1 (:state res-1)]
+        (is (= 0 (:epoch st-1)))
+        (is (false? (:epoch-initialized? st-1)))
+        (is (= 1 (count (:chain-state-snapshots st-1))))
+
+        ;; 3. Second matching snapshot reaches 2/3 BFT quorum -> now epoch advances
+        (let [snap-1 (light-core/sign-chain-state-snapshot
+                      (assoc base-snap :validator-pubkey (nth val-pubs 1))
+                      (:private (nth val-kps 1)))
+              res-2 (light-core/handle-wire-payload st-1 snap-1 user-priv)
+              st-2 (:state res-2)]
+          (is (= 6600 (:epoch st-2)))
+          (is (true? (:epoch-initialized? st-2)))
+          (is (= 6600 (get-in st-2 [:account :finalized-epoch]))))))))
 
 
 

@@ -41,20 +41,22 @@
     (let [pubkey (sample-pubkey-hex)
           fp (sample-fingerprint)
           treasury-pk (sample-pubkey-hex)
-          custody-pk (sample-pubkey-hex)]
-      {:network :devnet
-       :treasury-pubkey treasury-pk
-       :custody-pubkey custody-pk
-       :nodes {node-id (cond-> {:node-id node-id
-                                :ip ip
-                                :port port
-                                :agent-port agent-port
-                                :pubkey pubkey
-                                :fingerprint fp
-                                :ice-ufrag ufrag
-                                :ice-pwd pwd}
-                         ingress-host (assoc :ingress-host ingress-host
-                                             :ingress-port (or ingress-port 443)))}})))
+          custody-pk (sample-pubkey-hex)
+          dir-pk (when (zero? (rand-int 2)) (sample-pubkey-hex))]
+      (cond-> {:network :devnet
+               :treasury-pubkey treasury-pk
+               :custody-pubkey custody-pk
+               :nodes {node-id (cond-> {:node-id node-id
+                                        :ip ip
+                                        :port port
+                                        :agent-port agent-port
+                                        :pubkey pubkey
+                                        :fingerprint fp
+                                        :ice-ufrag ufrag
+                                        :ice-pwd pwd}
+                                 ingress-host (assoc :ingress-host ingress-host
+                                                     :ingress-port (or ingress-port 443)))}}
+        dir-pk (assoc :directory-pubkey dir-pk)))))
 
 (defn- descriptor->txt
   "Renders a descriptor map into bootstrap.txt format."
@@ -63,8 +65,10 @@
         node-id (name (:node-id node))]
     (str "Network: " (name (:network desc)) "\n"
          "Treasury Public Key: " (:treasury-pubkey desc) "\n"
-         "Custody Public Key:  " (:custody-pubkey desc) "\n\n"
-         "Bootstrap Validators:\n"
+         "Custody Public Key:  " (:custody-pubkey desc) "\n"
+         (when-let [dp (:directory-pubkey desc)]
+           (str "Directory Authority Public Key: " dp "\n"))
+         "\nBootstrap Validators:\n"
          "--------------------------------------------------------------------------------\n"
          "Node: " node-id " (zone-a)\n"
          "  Cluster Address:   " (:ip node) ":" (:port node) " (UDP DataChannel)\n"

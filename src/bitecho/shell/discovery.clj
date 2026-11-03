@@ -71,16 +71,18 @@
         network (keyword (:network data :devnet))
         treasury-pk (validate-pubkey! (:treasury-pubkey data) "treasury")
         custody-pk (validate-pubkey! (:custody-pubkey data) "custody")
+        dir-pk (when-let [dp (:directory-pubkey data)] (validate-pubkey! dp "directory"))
         nodes-map (or (:nodes data) {})
         _ (when (empty? nodes-map)
             (throw (ex-info "Bootstrap descriptor contains no validator nodes"
                             {:error :invalid-descriptor :data data})))
         normalized-nodes (into {} (for [[k v] nodes-map]
                                     [(keyword k) (normalize-node-entry k v)]))]
-    {:network network
-     :treasury-pubkey treasury-pk
-     :custody-pubkey custody-pk
-     :nodes normalized-nodes}))
+    (cond-> {:network network
+             :treasury-pubkey treasury-pk
+             :custody-pubkey custody-pk
+             :nodes normalized-nodes}
+      dir-pk (assoc :directory-pubkey dir-pk))))
 
 (defn- parse-single-node-txt-block
   "Extracts a validator node map from a text block starting with 'Node: <id>'."
@@ -117,19 +119,22 @@
   (let [net-match (re-find #"(?im)^Network:\s*([a-zA-Z0-9_\-]+)" txt-str)
         treasury-match (re-find #"(?im)^Treasury Public Key:\s*([0-9a-fA-F]+)" txt-str)
         custody-match (re-find #"(?im)^Custody Public Key:\s*([0-9a-fA-F]+)" txt-str)
+        dir-match (re-find #"(?im)^Directory Authority Public Key:\s*([0-9a-fA-F]+)" txt-str)
         network (keyword (str/lower-case (or (second net-match) "devnet")))
         treasury-pk (validate-pubkey! (second treasury-match) "treasury")
         custody-pk (validate-pubkey! (second custody-match) "custody")
+        dir-pk (when (second dir-match) (validate-pubkey! (second dir-match) "directory"))
         node-blocks (rest (str/split txt-str #"(?im)(?=^Node:\s*)"))
         nodes-entries (keep parse-single-node-txt-block node-blocks)
         nodes-map (into {} nodes-entries)]
     (when (empty? nodes-map)
       (throw (ex-info "No validator node blocks found in bootstrap.txt"
                       {:error :invalid-descriptor :raw-text txt-str})))
-    {:network network
-     :treasury-pubkey treasury-pk
-     :custody-pubkey custody-pk
-     :nodes nodes-map}))
+    (cond-> {:network network
+             :treasury-pubkey treasury-pk
+             :custody-pubkey custody-pk
+             :nodes nodes-map}
+      dir-pk (assoc :directory-pubkey dir-pk))))
 
 (defn parse-bootstrap-descriptor
   "Auto-detects EDN or text format and parses into a validated descriptor map."

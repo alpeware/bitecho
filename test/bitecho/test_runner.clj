@@ -4,6 +4,7 @@
             [bitecho.contagion.core-test]
             [bitecho.crypto-test]
             [bitecho.crypto.sealed-test]
+            [bitecho.demo.angels-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]
             [bitecho.economy.attestation-test]
