@@ -905,13 +905,15 @@
         ctx {:node-id :node-local
              :identity {:pubkey-hex (apply str (repeat 88 "a"))
                         :fingerprint "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
-                        :cert-data {}}
+                        :cert-data {}
+                        :ice-creds {:ufrag "ufragloc" :pwd "pwdlocal12345678901234"}}
              :node-idx {:node-local 0 :node-remote 1}
              :nodes-cfg {:node-local {:port 5000}
                          :node-remote {:ip "127.0.0.1"
                                        :port 5001
                                        :pubkey (apply str (repeat 88 "b"))
-                                       :fingerprint "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"}}
+                                       :fingerprint "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+                                       :ice-creds {:ufrag "ufragrem" :pwd "pwdremote12345678901234"}}}
              :shell-node shell-node
              :peer-conns peer-conns}]
     (with-redefs [api/start! (fn [_ _ cbs] (reset! captured-callbacks cbs))

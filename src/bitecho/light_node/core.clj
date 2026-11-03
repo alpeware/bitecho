@@ -576,6 +576,16 @@
 ;; Milestone 5 (Pillar B): In-Band Authenticated Chain State Snapshot Protocol
 ;; -----------------------------------------------------------------------------
 
+(defn- parse-long-safe
+  "Parses a number or string into a long safely. Returns default-val (default nil) on failure or nil."
+  ([v] (parse-long-safe v nil))
+  ([v default-val]
+   (cond
+     (integer? v) (long v)
+     (number? v) (long v)
+     (string? v) (try (Long/parseLong (str/trim v)) (catch Exception _ default-val))
+     :else default-val)))
+
 (defn- canonical-escrow-entry-str
   "Formats a single escrow map into canonical colon-separated representation:
    <escrow-id>:<payer>:<receiver>:<amount>:<deliverable-hash>:<created-epoch>:<expires-epoch>:<status-name>:<settled-epoch-or-empty>:<net-amount-or-empty>:<refund-reason-or-empty>"
@@ -653,7 +663,8 @@
 
     (let [trusted (:trusted-validators opts)
           val-pub (or (:validator-pubkey snapshot) (get snapshot "validator_pubkey"))]
-      (and (seq trusted) (not (contains? (set trusted) val-pub))))
+      (or (empty? trusted)
+          (not (contains? (set (map normalize-pubkey-hex trusted)) (normalize-pubkey-hex val-pub)))))
     {:ok? false :error "untrusted-validator"}
 
     (let [exp-nonce (:expected-nonce opts)
@@ -790,29 +801,36 @@
                              :validators (vec (sort (map :validator-pubkey agreeing-snaps)))}))))))))))))))
 
 (defn apply-verified-chain-state-snapshot
-  "Applies a verified chain state snapshot to local light-node state."
+  "Applies a verified chain state snapshot to local light-node state.
+   Guards against stale finalized epochs (monotonicity) and clears stale
+   status-dependent escrow fields on merge."
   [state snapshot]
-  (let [fin-epoch (long (or (:finalized-epoch snapshot) 0))
-        new-account {:balance (long (or (:balance snapshot) 0))
-                     :spendable (long (or (:spendable snapshot) 0))
-                     :seq (long (or (:seq snapshot) 0))
-                     :deps (vec (or (:deps snapshot) []))
-                     :finalized-epoch fin-epoch}
-        incoming-escrows (or (:escrows snapshot) [])
-        existing-escrows (or (:escrows state) {})
-        merged-escrows (reduce (fn [acc esc]
-                                 (let [eid (:escrow-id esc)
-                                       existing (get acc eid {})]
-                                   (assoc acc eid (merge existing esc))))
-                               existing-escrows
-                               incoming-escrows)]
-    (-> state
-        (assoc :account new-account
-               :transfer-seq (:seq new-account)
-               :last-transfer-hash (last (:deps new-account))
-               :epoch (max (long (or (:epoch state) 0)) fin-epoch)
-               :epoch-initialized? true
-               :escrows merged-escrows))))
+  (let [curr-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
+        fin-epoch (parse-long-safe (or (:finalized-epoch snapshot) (get snapshot "finalized_epoch")) 0)]
+    (if (< fin-epoch curr-fin-ep)
+      state
+      (let [new-account {:balance (long (or (:balance snapshot) 0))
+                         :spendable (long (or (:spendable snapshot) 0))
+                         :seq (long (or (:seq snapshot) 0))
+                         :deps (vec (or (:deps snapshot) []))
+                         :finalized-epoch fin-epoch}
+            incoming-escrows (or (:escrows snapshot) [])
+            existing-escrows (or (:escrows state) {})
+            merged-escrows (reduce (fn [acc esc]
+                                     (let [eid (:escrow-id esc)
+                                           existing (dissoc (get acc eid {})
+                                                            :settled-epoch :net-amount :take-burned :refund-reason
+                                                            "settled_epoch" "net_amount" "take_burned" "refund_reason")]
+                                       (assoc acc eid (merge existing esc))))
+                                   existing-escrows
+                                   incoming-escrows)]
+        (-> state
+            (assoc :account new-account
+                   :transfer-seq (:seq new-account)
+                   :last-transfer-hash (last (:deps new-account))
+                   :epoch (max (long (or (:epoch state) 0)) fin-epoch)
+                   :epoch-initialized? true
+                   :escrows merged-escrows))))))
 
 (defn build-chain-state-query-envelope
   "Builds and wraps an authenticated :query-chain-state agent envelope.
@@ -962,16 +980,6 @@
                     "home_nodes" (vec (for [n (:home-nodes hs)] (name (or (:node-id n) n))))}
          :net-envelopes [env-curr env-nil]
          :stdout-events []}))))
-
-(defn- parse-long-safe
-  "Parses a number or string into a long safely. Returns default-val (default nil) on failure or nil."
-  ([v] (parse-long-safe v nil))
-  ([v default-val]
-   (cond
-     (integer? v) (long v)
-     (number? v) (long v)
-     (string? v) (try (Long/parseLong (str/trim v)) (catch Exception _ default-val))
-     :else default-val)))
 
 (defn compute-session-id
   "Computes deterministic session-id from caller, callee, and caller-ephemeral-pub."
@@ -2952,30 +2960,47 @@
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn handle-wire-chain-state-snapshot
-  "Handles incoming validator :chain-state-snapshot.
+  "Handles incoming validator :chain-state-snapshot over wire.
    Verifies against trusted bootstrap validators and min finalized epoch.
-   Applies verified snapshot to light-node state and emits chain-state-synced stdout event."
+   Buffers snapshot in :chain-state-snapshots, prunes stale snapshots, and applies
+   ONLY when verified BFT quorum is reached across trusted validators."
   [state msg]
-  (let [trusted-validators (set (keep :pubkey (vals (get-in state [:bootstrap :nodes]))))
+  (let [trusted (set (keep (comp normalize-pubkey-hex :pubkey) (vals (get-in state [:bootstrap :nodes]))))
+        min-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
         opts {:expected-pubkey (:pubkey state)
-              :trusted-validators trusted-validators
-              :min-finalized-epoch (get-in state [:account :finalized-epoch] 0)}
+              :trusted-validators trusted
+              :min-finalized-epoch min-fin-ep}
         v-res (verify-chain-state-snapshot msg opts)]
-    (if (:ok? v-res)
+    (if-not (:ok? v-res)
+      {:state state :net-envelopes [] :stdout-events []}
       (let [snap (:snapshot v-res)
-            st-applied (apply-verified-chain-state-snapshot state snap)
-            new-state (assoc-in st-applied [:chain-state-snapshots (:validator-pubkey snap)] snap)
-            stdout-evt {"event" "chain-state-synced"
-                        "pubkey" (:pubkey state)
-                        "balance" (:balance snap)
-                        "spendable" (:spendable snap)
-                        "seq" (:seq snap)
-                        "finalized_epoch" (:finalized-epoch snap)
-                        "validator" (:validator-pubkey snap)}]
-        {:state new-state
-         :net-envelopes []
-         :stdout-events [stdout-evt]})
-      {:state state :net-envelopes [] :stdout-events []})))
+            val-pk (:validator-pubkey snap)
+            fin-ep (long (or (:finalized-epoch snap) 0))
+            existing-snaps (:chain-state-snapshots state {})
+            ;; Prune stale snapshots older than (fin-ep - 2)
+            fresh-snaps (into {} (filter (fn [[_ s]]
+                                           (>= (long (or (:finalized-epoch s) 0)) (- fin-ep 2)))
+                                         existing-snaps))
+            buffered-snaps (assoc fresh-snaps val-pk snap)
+            buffered-state (assoc state :chain-state-snapshots buffered-snaps)
+            q-res (verify-chain-state-quorum (vals buffered-snaps) opts)]
+        (if (:ok? q-res)
+          (let [agreed-snap (:snapshot q-res)
+                st-applied (apply-verified-chain-state-snapshot buffered-state agreed-snap)
+                stdout-evt {"event" "chain-state-synced"
+                            "pubkey" (:pubkey state)
+                            "balance" (:balance agreed-snap)
+                            "spendable" (:spendable agreed-snap)
+                            "seq" (:seq agreed-snap)
+                            "finalized_epoch" (:finalized-epoch agreed-snap)
+                            "quorum_count" (:quorum-count q-res)
+                            "validator" (:validator-pubkey agreed-snap)}]
+            {:state st-applied
+             :net-envelopes []
+             :stdout-events [stdout-evt]})
+          {:state buffered-state
+           :net-envelopes []
+           :stdout-events []})))))
 
 (defn handle-wire-payload
   "Processes an incoming network event or raw payload. Enforces 2-epoch skew tolerance

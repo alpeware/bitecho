@@ -43,6 +43,7 @@
   (is (#'core/valid-network-event? {:type :lock-intent}))
   (is (#'core/valid-network-event? {:type :release-intent}))
   (is (#'core/valid-network-event? {:type :refund-intent}))
+  (is (#'core/valid-network-event? {:type :query-chain-state}))
   (is (#'core/valid-network-event? {:type :submit-transcript}))
   (is (set/subset? mesh/allowed-agent-events @#'core/allowed-network-events))
   (is (not (#'core/valid-network-event? {:type :tick})))

@@ -2742,18 +2742,153 @@
                          (and (false? (:ok? sk-res))
                               (= "validator-epoch-skew-exceeded" (:error sk-res))))
 
-             ;; 8. Inbound :chain-state-snapshot via handle-wire-payload advances light node at epoch 1 to 6600 without skew drop
-                       (let [advance-snap (light-core/sign-chain-state-snapshot
-                                           (assoc base-snap :validator-pubkey (nth val-pubs 0) :finalized-epoch 6600)
-                                           (:private (nth val-kps 0)))
-                             wire-res (light-core/handle-wire-payload init-st advance-snap user-priv)
-                             post-st (:state wire-res)
-                             stdout (first (:stdout-events wire-res))]
-                         (and (= 6600 (get-in post-st [:account :finalized-epoch]))
-                              (= 6600 (:epoch post-st))
+             ;; 8. Inbound :chain-state-snapshot via handle-wire-payload buffers and applies on 2/3 BFT quorum
+                       (let [advance-snap-0 (light-core/sign-chain-state-snapshot
+                                             (assoc base-snap :validator-pubkey (nth val-pubs 0) :finalized-epoch 6600)
+                                             (:private (nth val-kps 0)))
+                             advance-snap-1 (light-core/sign-chain-state-snapshot
+                                             (assoc base-snap :validator-pubkey (nth val-pubs 1) :finalized-epoch 6600)
+                                             (:private (nth val-kps 1)))
+                             wire-res1 (light-core/handle-wire-payload init-st advance-snap-0 user-priv)
+                             st1 (:state wire-res1)
+                             wire-res2 (light-core/handle-wire-payload st1 advance-snap-1 user-priv)
+                             st2 (:state wire-res2)
+                             stdout (first (:stdout-events wire-res2))]
+                         (and (= 1 (count (:chain-state-snapshots st1)))
+                              (= 1 (:epoch st1))
+                              (nil? (get-in st1 [:account :finalized-epoch]))
+                              (empty? (:stdout-events wire-res1))
+                              (= 6600 (get-in st2 [:account :finalized-epoch]))
+                              (= 6600 (:epoch st2))
                               (some? stdout)
                               (= "chain-state-synced" (get stdout "event"))
                               (= 6600 (get stdout "finalized_epoch"))))))))
+
+(deftest test-chain-state-snapshot-wire-bft-quorum-and-invariants
+  (let [user-kp (crypto/generate-keypair)
+        user-pub (basalt/bytes->hex (:public user-kp))
+        user-priv (:private user-kp)
+        val-kps [(crypto/generate-keypair) (crypto/generate-keypair) (crypto/generate-keypair)]
+        val-pubs (mapv #(basalt/bytes->hex (:public %)) val-kps)
+        bootstrap {:nodes {"v1" {:pubkey (nth val-pubs 0) :ip "127.0.0.1" :port 5001}
+                           "v2" {:pubkey (nth val-pubs 1) :ip "127.0.0.1" :port 5002}
+                           "v3" {:pubkey (nth val-pubs 2) :ip "127.0.0.1" :port 5003}}}
+        init-st (assoc (light-core/init-light-state {:identity {:pubkey-hex user-pub}} {:bootstrap bootstrap})
+                       :epoch 1)
+        base-snap {:pubkey user-pub
+                   :finalized-epoch 100
+                   :balance 50000
+                   :spendable 45000
+                   :seq 42
+                   :deps []
+                   :escrows [{:escrow-id "esc-1"
+                              :payer user-pub
+                              :receiver (nth val-pubs 0)
+                              :amount 5000
+                              :deliverable-hash "abc123"
+                              :created-epoch 90
+                              :expires-epoch 110
+                              :status :locked}]
+                   :nonce "test-nonce"}]
+
+    ;; MEDIUM 1: verify-chain-state-snapshot fails closed when trusted-validators is nil or empty
+    (let [signed-snap (light-core/sign-chain-state-snapshot
+                       (assoc base-snap :validator-pubkey (nth val-pubs 0))
+                       (:private (nth val-kps 0)))
+          opts-nil {:expected-pubkey user-pub :trusted-validators nil :min-finalized-epoch 0}
+          opts-empty {:expected-pubkey user-pub :trusted-validators #{} :min-finalized-epoch 0}]
+      (is (= {:ok? false :error "untrusted-validator"} (light-core/verify-chain-state-snapshot signed-snap opts-nil)))
+      (is (= {:ok? false :error "untrusted-validator"} (light-core/verify-chain-state-snapshot signed-snap opts-empty))))
+
+    ;; HIGH 1: handle-wire-payload buffers snapshot until 2/3 BFT quorum reached
+    (let [snap-0 (light-core/sign-chain-state-snapshot
+                  (assoc base-snap :validator-pubkey (nth val-pubs 0))
+                  (:private (nth val-kps 0)))
+          snap-1 (light-core/sign-chain-state-snapshot
+                  (assoc base-snap :validator-pubkey (nth val-pubs 1))
+                  (:private (nth val-kps 1)))
+          res-1 (light-core/handle-wire-payload init-st snap-0 user-priv)
+          st-1 (:state res-1)]
+      ;; First snapshot buffered, no state mutation
+      (is (= 1 (count (:chain-state-snapshots st-1))))
+      (is (= 1 (:epoch st-1)))
+      (is (nil? (get-in st-1 [:account :finalized-epoch])))
+      (is (empty? (:stdout-events res-1)))
+
+      ;; Second matching snapshot from different validator completes 2/3 quorum
+      (let [res-2 (light-core/handle-wire-payload st-1 snap-1 user-priv)
+            st-2 (:state res-2)
+            sync-event (first (:stdout-events res-2))]
+        (is (= 100 (get-in st-2 [:account :finalized-epoch])))
+        (is (= 100 (:epoch st-2)))
+        (is (= 50000 (get-in st-2 [:account :balance])))
+        (is (= 45000 (get-in st-2 [:account :spendable])))
+        (is (= 42 (get-in st-2 [:account :seq])))
+        (is (= "chain-state-synced" (get sync-event "event")))
+        (is (= 100 (get sync-event "finalized_epoch")))
+        (is (= 2 (get sync-event "quorum_count")))))
+
+    ;; LOW 1: Monotonicity guard in apply-verified-chain-state-snapshot
+    (let [current-st (assoc-in init-st [:account :finalized-epoch] 200)
+          stale-snap {:pubkey user-pub :finalized-epoch 150 :balance 99999}
+          applied (light-core/apply-verified-chain-state-snapshot current-st stale-snap)]
+      (is (= current-st applied) "Must return unchanged state when incoming finalized-epoch < current finalized-epoch"))
+
+    ;; LOW 2: Stale status-dependent fields cleared when merging escrows
+    (let [existing-escrow {:escrow-id "esc-1"
+                           :payer user-pub
+                           :receiver (nth val-pubs 0)
+                           :amount 5000
+                           :deliverable-hash "abc123"
+                           :created-epoch 90
+                           :expires-epoch 110
+                           :status :released
+                           :settled-epoch 95
+                           :net-amount 4975
+                           :take-burned 25}
+          state-with-escrow (-> init-st
+                                (assoc-in [:account :finalized-epoch] 95)
+                                (assoc :escrows {"esc-1" existing-escrow}))
+          ;; Incoming snapshot updates escrow back to locked or to refunded
+          locked-snap {:pubkey user-pub
+                       :finalized-epoch 100
+                       :balance 50000
+                       :spendable 45000
+                       :seq 42
+                       :escrows [{:escrow-id "esc-1"
+                                  :payer user-pub
+                                  :receiver (nth val-pubs 0)
+                                  :amount 5000
+                                  :deliverable-hash "abc123"
+                                  :created-epoch 90
+                                  :expires-epoch 110
+                                  :status :locked}]}
+          applied-locked (light-core/apply-verified-chain-state-snapshot state-with-escrow locked-snap)
+          merged-locked (get-in applied-locked [:escrows "esc-1"])]
+      (is (= :locked (:status merged-locked)))
+      (is (nil? (:settled-epoch merged-locked)))
+      (is (nil? (:net-amount merged-locked)))
+      (is (nil? (:take-burned merged-locked)))
+      (is (nil? (:refund-reason merged-locked)))
+
+      ;; Now verify refunded escrow clears net-amount and take-burned
+      (let [refunded-snap (assoc locked-snap :escrows [{:escrow-id "esc-1"
+                                                        :payer user-pub
+                                                        :receiver (nth val-pubs 0)
+                                                        :amount 5000
+                                                        :deliverable-hash "abc123"
+                                                        :created-epoch 90
+                                                        :expires-epoch 110
+                                                        :status :refunded
+                                                        :settled-epoch 100
+                                                        :refund-reason "timeout"}])
+            applied-refunded (light-core/apply-verified-chain-state-snapshot state-with-escrow refunded-snap)
+            merged-refunded (get-in applied-refunded [:escrows "esc-1"])]
+        (is (= :refunded (:status merged-refunded)))
+        (is (= 100 (:settled-epoch merged-refunded)))
+        (is (= "timeout" (:refund-reason merged-refunded)))
+        (is (nil? (:net-amount merged-refunded)))
+        (is (nil? (:take-burned merged-refunded)))))))
 
 
 

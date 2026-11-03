@@ -278,6 +278,24 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
    - Remediated **Cross-Validator Unacked Replay Fix** by pruning `:murmur-cache` on TTL eviction and preventing redundant gossip re-burns.
    - Verified via generative property test `prop-inband-chain-state-snapshot-quorum-and-fail-closed` (50 runs), unit/integration tests `test-ice-random-credentials-generation-and-rotation` and `test-inband-chain-state-sync-and-escrows-quorum`. All 348 tests pass; 0 lint warnings.
 
+#### Step 5B — Axiom `seq: 100` BFT Quorum Wire Buffering & Fail-Closed Hardening — **`[BUILT & VERIFIED]`**
+1. **Wire Snapshot Buffering & Multi-Validator BFT Quorum (`HIGH 1`)**:
+   - Updated `handle-wire-chain-state-snapshot` in `src/bitecho/light_node/core.clj` to buffer incoming validator snapshots keyed by validator pubkey into `:chain-state-snapshots` rather than applying single-validator wire messages immediately.
+   - Evaluates `verify-chain-state-quorum` across buffered snapshots; only advances light-node finalized epoch, balances, and escrow statuses upon $\ge 2f+1$ (2/3) quorum agreement among trusted validators.
+   - Prunes stale snapshots older than $fin\_epoch - 2$ on receipt.
+2. **Untrusted Validator Set Fail-Closed (`MEDIUM 1`)**:
+   - `verify-chain-state-snapshot` explicitly fails closed with `{:ok? false :error "untrusted-validator"}` when `:trusted-validators` is nil or empty `#{}`.
+3. **Monotonicity & Escrow Field Clearing Guard (`LOW 1` & `LOW 2`)**:
+   - Added monotonicity check to `apply-verified-chain-state-snapshot` (`(< fin-epoch curr-fin-ep)` returns unmodified state), preventing regressive snapshots from reverting finalized epochs.
+   - Clears stale status-dependent fields (`:settled-epoch`, `:net-amount`, `:take-burned`, `:refund-reason`) when merging incoming escrows, ensuring transitions back to `:locked` or to `:refunded` never retain conflicting keys.
+4. **Mesh Dial Credential Enforcement & Unsigned Snapshot Refusal (`LOW 3` & `LOW 4`)**:
+   - Removed legacy `deterministic-ice-creds` fallback from `init-datachannel-peer!` in `src/bitecho/shell/mesh.clj`. Dials strictly fail closed with `{:type :dial-failed :peer pid :error "missing-ice-credentials"}` if either local or remote ICE credentials lack `:ufrag` or `:pwd`.
+   - `build-validator-chain-state-snapshot` and `make-agent-connection-handler` strictly refuse to serve unsigned or unverified snapshots over the wire.
+5. **Allowed Network Events & Test Runner Coverage (`LOW 5`)**:
+   - Added `:query-chain-state` to `allowed-network-events` in `src/bitecho/shell/core.clj`.
+   - Registered `bitecho.shell.core-test` and `bitecho.shell.persistence-test` in `test/bitecho/test_runner.clj`.
+   - Verified via property test `prop-inband-chain-state-snapshot-quorum-and-fail-closed` and unit test `test-chain-state-snapshot-wire-bft-quorum-and-invariants`. All 358 tests (2921 assertions) pass; 0 lint warnings; format clean.
+
 ---
 
 ### Milestone 6 (Pillar C + Master-Plan M2/M3): Live Directory Service, Multi-Harness Skill v1 & Angels Demo

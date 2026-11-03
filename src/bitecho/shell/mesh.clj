@@ -1428,34 +1428,44 @@
     (let [peer-hex (:pubkey peer-cfg)
           raw-fp (:fingerprint peer-cfg)
           peer-fp (when (identity/verify-peer-fingerprint? raw-fp raw-fp)
-                    (identity/normalize-fingerprint raw-fp))]
-      (if-not peer-fp
+                    (identity/normalize-fingerprint raw-fp))
+          {:keys [node-id identity node-idx nodes-cfg shell-node peer-conns agent-conns]} ctx
+          local-fp (:fingerprint identity)
+          local-ice (or (:ice-creds identity)
+                        (when (and (:ice-ufrag identity) (:ice-pwd identity))
+                          {:ufrag (:ice-ufrag identity) :pwd (:ice-pwd identity)}))
+          remote-ice (or (:ice-creds peer-cfg)
+                         (when (and (:ice-ufrag peer-cfg) (:ice-pwd peer-cfg))
+                           {:ufrag (:ice-ufrag peer-cfg) :pwd (:ice-pwd peer-cfg)}))]
+      (cond
+        (not peer-fp)
         (do
           (when peer-hex
             (apply-mesh-conn-event! (:peer-conns ctx) peer-hex
                                     {:type :dial-failed :peer pid :error "invalid-peer-fingerprint"}))
           (log-mesh-error (format "Invalid peer fingerprint for %s" pid)
                           (ex-info "Invalid peer fingerprint" {:peer pid :fingerprint raw-fp})))
-        (let [{:keys [node-id identity node-idx nodes-cfg shell-node peer-conns agent-conns]} ctx
-              next-gen (inc (long (get-in @peer-conns [peer-hex :generation] 0)))
+
+        (or (nil? (:ufrag local-ice)) (nil? (:pwd local-ice))
+            (nil? (:ufrag remote-ice)) (nil? (:pwd remote-ice)))
+        (do
+          (when peer-hex
+            (apply-mesh-conn-event! (:peer-conns ctx) peer-hex
+                                    {:type :dial-failed :peer pid :error "missing-ice-credentials"}))
+          (log-mesh-error (format "Missing ICE credentials for peer %s" pid)
+                          (ex-info "Missing ICE credentials" {:peer pid :local-ice local-ice :remote-ice remote-ice})))
+
+        :else
+        (let [next-gen (inc (long (get-in @peer-conns [peer-hex :generation] 0)))
               peer-ip (or (:ip peer-cfg) "127.0.0.1")
               base-peer-port (int (or (:port peer-cfg) 5000))
               peer-port (+ base-peer-port (int (get node-idx node-id 0)))
               base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))
               local-port (+ base-local-port (int (get node-idx pid 0)))
               setup (if (neg? (compare (name node-id) (name pid))) "active" "passive")
-              local-fp (:fingerprint identity)
-              local-ice (or (:ice-creds identity)
-                            (when (and (:ice-ufrag identity) (:ice-pwd identity))
-                              {:ufrag (:ice-ufrag identity) :pwd (:ice-pwd identity)})
-                            (identity/deterministic-ice-creds node-id local-fp))
               node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp)
               _ (apply-mesh-conn-event! peer-conns peer-hex
                                         {:type :dial-started :generation next-gen :node node :peer pid})
-              remote-ice (or (when (and (:ice-ufrag peer-cfg) (:ice-pwd peer-cfg))
-                               {:ufrag (:ice-ufrag peer-cfg) :pwd (:ice-pwd peer-cfg)})
-                             (:ice-creds peer-cfg)
-                             (identity/deterministic-ice-creds pid peer-fp))
               remote-sdp {:ip peer-ip
                           :port peer-port
                           :fingerprint peer-fp
@@ -1568,8 +1578,17 @@
                    :nonce (or nonce "")}
         sign-fn (try (requiring-resolve 'bitecho.light-node.core/sign-chain-state-snapshot) (catch Exception _ nil))]
     (if (and sign-fn val-priv)
-      (sign-fn base-snap val-priv)
-      base-snap)))
+      (let [signed (sign-fn base-snap val-priv)]
+        (if (and (map? signed) (string? (:signature signed)) (not (str/blank? (:signature signed))))
+          signed
+          (do
+            (log-mesh-error "build-validator-chain-state-snapshot: invalid signature produced"
+                            (ex-info "Invalid signature" {:signed signed}))
+            nil)))
+      (do
+        (log-mesh-error "build-validator-chain-state-snapshot: missing sign-fn or val-priv"
+                        (ex-info "Cannot sign snapshot" {:has-sign-fn? (boolean sign-fn) :has-priv? (boolean val-priv)}))
+        nil))))
 
 (defn make-agent-connection-handler
   "Returns a connection handler function for an incoming agent node.
@@ -1660,10 +1679,11 @@
                              (let [st (or (when shell-node (query-node-state shell-node 500)) {})
                                    v-id (or validator-identity (:identity shell-node))
                                    snapshot (build-validator-chain-state-snapshot st v-id (:pubkey unwrapped) (:nonce unwrapped))]
-                               (try
-                                 (api/send! agent-node (nippy/freeze snapshot) cid)
-                                 (catch Exception e
-                                   (log-mesh-error "Failed to send chain-state-snapshot to agent" e))))
+                               (when (and (map? snapshot) (string? (:signature snapshot)) (not (str/blank? (:signature snapshot))))
+                                 (try
+                                   (api/send! agent-node (nippy/freeze snapshot) cid)
+                                   (catch Exception e
+                                     (log-mesh-error "Failed to send chain-state-snapshot to agent" e)))))
                              (do
                                (async/put! (:network-in shell-node) unwrapped)
                                (when (and (= (:type unwrapped) :receive-gossip) agent-conns)

@@ -30,6 +30,7 @@
     :lock-intent
     :release-intent
     :refund-intent
+    :query-chain-state
     :submit-transcript
     :receive-transcript-sig})
 
