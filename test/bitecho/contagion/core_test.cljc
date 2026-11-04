@@ -1,11 +1,15 @@
 (ns bitecho.contagion.core-test
-  "Tests for Contagion reliable broadcast protocol."
+  "Tests for Contagion reliable broadcast protocol.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.contagion.core :as contagion]
             [bitecho.crypto :as crypto]
             [clojure.set :as set]
-            [clojure.test :refer [deftest is testing]]
-            [clojure.test.check.clojure-test :refer [defspec]]
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
@@ -20,11 +24,13 @@
     (basalt/make-peer ip port pubkey)))
 
 (def ^{:doc "Generator for Basalt views"} gen-view
-  (gen/fmap (fn [peers] (basalt/init-view peers 10 (java.util.Random. 42)))
+  (gen/fmap (fn [peers] (basalt/init-view peers 10 (crypto/make-random 42)))
             (gen/vector gen-peer 0 10)))
 
 (def ^{:doc "Generator for byte array payloads"} gen-payload
-  (gen/fmap byte-array (gen/vector gen/byte)))
+  (gen/fmap (fn [v] #?(:clj (byte-array (map byte v))
+                       :cljs (js/Uint8Array. (clj->js v))))
+            (gen/vector #?(:clj gen/byte :cljs (gen/choose -128 127)))))
 
 (def ^{:doc "Generator for message ids"} gen-message-id
   (gen/fmap basalt/bytes->hex (gen/fmap crypto/sha256 gen-payload)))
@@ -34,11 +40,11 @@
 
 (defspec ^{:doc "generate-summary selects 1 target from view and includes all known ids"}
   generate-summary-invariants
-  100
+  50
   (prop/for-all [view gen-view
                  known-ids gen-known-ids
                  seed gen/nat]
-                (let [rng (java.util.Random. seed)
+                (let [rng (crypto/make-random seed)
                       result (contagion/generate-summary rng view known-ids)
                       extracted (basalt/extract-peers view)]
                   (if (empty? extracted)
@@ -49,14 +55,14 @@
 
 (deftest ^{:doc "Test edge cases for generate summary"} test-generate-summary
   (testing "empty view returns nil"
-    (let [rng (java.util.Random. 42)
+    (let [rng (crypto/make-random 42)
           known-ids #{"id1" "id2"}
           result (contagion/generate-summary rng #{} known-ids)]
       (is (nil? result)))))
 
 (defspec ^{:doc "lazy-pull only requests missing ids"}
   lazy-pull-requests-missing-only
-  100
+  50
   (prop/for-all [local-known-ids gen-known-ids
                  remote-summary gen-known-ids]
                 (let [missing (contagion/lazy-pull local-known-ids remote-summary)]

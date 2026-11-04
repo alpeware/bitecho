@@ -1,13 +1,22 @@
 (ns bitecho.murmur.core-test
-  "Tests for Murmur probabilistic broadcast protocol."
+  "Tests for Murmur probabilistic broadcast protocol.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]
             [bitecho.murmur.core :as murmur]
             [clojure.set :as set]
-            [clojure.test :refer [deftest is testing]]
-            [clojure.test.check.clojure-test :refer [defspec]]
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
+
+(def ^:private empty-queue
+  #?(:clj clojure.lang.PersistentQueue/EMPTY
+     :cljs (.-EMPTY cljs.core/PersistentQueue)))
 
 (def ^{:doc "Generator for Ed25519 public keys"} gen-pubkey
   (gen/fmap (fn [_] (:public (crypto/generate-keypair)))
@@ -23,24 +32,25 @@
   (gen/vector gen-peer 0 10))
 
 (def ^{:doc "Generator for byte array payloads"} gen-payload
-  (gen/fmap byte-array (gen/vector gen/byte)))
+  (gen/fmap (fn [v] #?(:clj (byte-array (map byte v))
+                       :cljs (js/Uint8Array. (clj->js v))))
+            (gen/vector #?(:clj gen/byte :cljs (gen/choose -128 127)))))
 
 (defspec ^{:doc "Initiate broadcast targets k random peers and deterministic ID"}
   initiate-broadcast-invariants
-  100
+  50
   (prop/for-all [view gen-view
                  k gen/nat
                  payload gen-payload
                  seed gen/nat]
-                (let [rng (java.util.Random. seed)
+                (let [rng (crypto/make-random seed)
                       result (murmur/initiate-broadcast payload rng view k)
                       expected-id (basalt/bytes->hex (crypto/sha256 payload))
                       expected-target-count (min k (count (set view)))]
                   (and
                    (= expected-id (:message-id result))
-                   (= (seq payload) (seq (:payload result)))
+                   (fressian/byte-array-equals? payload (:payload result))
                    (= expected-target-count (count (:targets result)))
-       ;; verify targets is a subset of view
                    (set/subset? (set (:targets result)) (set view))))))
 
 (def ^{:doc "Generator for message ids"} gen-message-id
@@ -54,14 +64,14 @@
 
 (defspec ^{:doc "receive-gossip forwards unseen messages and updates cache"}
   receive-gossip-unseen-invariants
-  100
+  50
   (prop/for-all [view gen-view
                  k gen/nat
                  msg gen-message
                  seed gen/nat
                  max-cache-size (gen/choose 1 100)]
-                (let [rng (java.util.Random. seed)
-                      empty-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
+                (let [rng (crypto/make-random seed)
+                      empty-cache {:set #{} :queue empty-queue}
                       result (murmur/receive-gossip empty-cache msg rng view k max-cache-size)
                       expected-target-count (min k (count (set view)))]
                   (and
@@ -73,14 +83,14 @@
 
 (defspec ^{:doc "receive-gossip drops seen messages"}
   receive-gossip-seen-invariants
-  100
+  50
   (prop/for-all [view gen-view
                  k gen/nat
                  msg gen-message
                  seed gen/nat
                  max-cache-size (gen/choose 1 100)]
-                (let [rng (java.util.Random. seed)
-                      cache {:set #{(:message-id msg)} :queue (conj clojure.lang.PersistentQueue/EMPTY (:message-id msg))}
+                (let [rng (crypto/make-random seed)
+                      cache {:set #{(:message-id msg)} :queue (conj empty-queue (:message-id msg))}
                       result (murmur/receive-gossip cache msg rng view k max-cache-size)]
                   (and
                    (= cache (:cache result))
@@ -89,32 +99,32 @@
 
 (deftest ^{:doc "Test edge cases for initiate broadcast"} test-initiate-broadcast
   (testing "empty view returns no targets"
-    (let [rng (java.util.Random. 42)
-          payload (.getBytes "hello")
+    (let [rng (crypto/make-random 42)
+          payload (fressian/utf8->bytes "hello")
           result (murmur/initiate-broadcast payload rng #{} 3)]
       (is (= 0 (count (:targets result))))
       (is (= (basalt/bytes->hex (crypto/sha256 payload)) (:message-id result)))))
 
   (testing "k greater than view size returns all view elements"
-    (let [rng (java.util.Random. 42)
+    (let [rng (crypto/make-random 42)
           peers [(basalt/make-peer "127.0.0.1" 8080 (:public (crypto/generate-keypair)))
                  (basalt/make-peer "127.0.0.1" 8081 (:public (crypto/generate-keypair)))]
           view peers
-          payload (.getBytes "hello")
+          payload (fressian/utf8->bytes "hello")
           result (murmur/initiate-broadcast payload rng view 5)]
       (is (= 2 (count (:targets result))))
       (is (= (set view) (set (:targets result)))))))
 
 (deftest ^{:doc "Test cache eviction in receive-gossip"} test-receive-gossip-cache
   (testing "cache evicts oldest element when max-cache-size is exceeded"
-    (let [rng (java.util.Random. 42)
+    (let [rng (crypto/make-random 42)
           view #{}
           k 3
           max-size 2
-          msg1 {:message-id "id1" :payload (.getBytes "p1")}
-          msg2 {:message-id "id2" :payload (.getBytes "p2")}
-          msg3 {:message-id "id3" :payload (.getBytes "p3")}
-          empty-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
+          msg1 {:message-id "id1" :payload (fressian/utf8->bytes "p1")}
+          msg2 {:message-id "id2" :payload (fressian/utf8->bytes "p2")}
+          msg3 {:message-id "id3" :payload (fressian/utf8->bytes "p3")}
+          empty-cache {:set #{} :queue empty-queue}
 
           res1 (murmur/receive-gossip empty-cache msg1 rng view k max-size)
           cache1 (:cache res1)

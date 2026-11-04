@@ -7,7 +7,7 @@
   "Initiates a broadcast by generating a deterministic message ID from the payload,
    and selecting up to k random peers from the provided view.
    Returns a map with :message-id, :payload, and :targets."
-  [^bytes payload ^java.util.Random rng view k]
+  [payload rng view k]
   (let [message-id (basalt/bytes->hex (crypto/sha256 payload))
         targets (basalt/select-peers rng view k)]
     {:message-id message-id
@@ -34,7 +34,7 @@
    If the message ID is in the cache, drops it and returns the unmodified cache.
    If unseen, updates the cache, returns the message, and selects k random forward targets.
    Returns a map with :cache, :forward-targets, and :message."
-  [seen-cache message ^java.util.Random rng view k max-cache-size]
+  [seen-cache message rng view k max-cache-size]
   (let [message-id (:message-id message)]
     (if (contains? (:set seen-cache) message-id)
       {:cache seen-cache

@@ -7,7 +7,7 @@
   "Generates an anti-entropy summary by targeting a random peer from the Basalt view.
    Takes an RNG instance, the local Basalt view, and a set of known message IDs.
    Returns a map with :target and :summary, or nil if the view is empty."
-  [^java.util.Random rng view known-ids]
+  [rng view known-ids]
   (let [targets (basalt/select-peers rng view 1)
         target (first targets)]
     (if target

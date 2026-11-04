@@ -1,9 +1,13 @@
 (ns bitecho.economy.account-test
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
-            [clojure.test :refer [deftest is testing]]
-            [clojure.test.check.clojure-test :refer [defspec]]
+            [bitecho.fressian :as fressian]
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
@@ -43,7 +47,7 @@
                              :amount 50
                              :seq 6
                              :deps ["hash1" "hash2"]}
-          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
+          payload-bytes (fressian/utf8->bytes (pr-str (into (sorted-map) unsigned-transfer)))
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature)))]
       (is (true? (account/validate-transfer state transfer)))))
@@ -60,7 +64,7 @@
                              :amount 50
                              :seq 7
                              :deps ["hash1" "hash2"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -77,7 +81,7 @@
                              :amount 50
                              :seq 5
                              :deps ["hash1" "hash2"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -94,7 +98,7 @@
                              :amount 50
                              :seq 6
                              :deps ["hash1" "hash3"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -111,7 +115,7 @@
                              :amount 150
                              :seq 6
                              :deps ["hash1" "hash2"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -128,7 +132,7 @@
                              :amount 50
                              :seq 6
                              :deps ["hash1" "hash2"]}
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
           signature (crypto/sign privkey payload-bytes)
           tampered-transfer (account/map->Transfer (assoc unsigned-transfer :amount 60 :signature signature))]
       (is (false? (account/validate-transfer state tampered-transfer)))))
@@ -144,7 +148,7 @@
                                            :amount 50
                                            :seq 6
                                            :deps ["hash1" "hash2"]
-                                           :signature (byte-array 64)})]
+                                           :signature #?(:clj (byte-array 64) :cljs (js/Uint8Array. 64))})]
       (is (false? (account/validate-transfer state transfer))))))
 
 (deftest apply-transfer-test
@@ -160,12 +164,9 @@
                              :amount 40
                              :seq 6
                              :deps ["hash1"]}
-          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
-          signature (crypto/sign sender-privkey payload-bytes)
-          transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature)))
+          transfer (account/create-transfer sender-privkey unsigned-transfer)
           updated-ledger (account/apply-transfer ledger transfer)
-          safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))
-          transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))]
+          transfer-hash (account/transfer-hash transfer)]
       (is (= 60 (:balance (get updated-ledger sender-pubkey))))
       (is (= 6 (:seq (get updated-ledger sender-pubkey))))
       (is (= [transfer-hash] (:deps (get updated-ledger sender-pubkey))))
@@ -184,7 +185,7 @@
                              :amount 40
                              :seq 6
                              :deps ["hash1"]}
-          transfer (account/map->Transfer (assoc unsigned-transfer :signature (byte-array 64)))
+          transfer (account/map->Transfer (assoc unsigned-transfer :signature #?(:clj (byte-array 64) :cljs (js/Uint8Array. 64))))
           updated-ledger (account/apply-transfer ledger transfer)]
       (is (= ledger updated-ledger))))
 
@@ -202,9 +203,7 @@
                              :amount 40
                              :seq 6
                              :deps ["hash1"]}
-          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
-          signature (crypto/sign sender-privkey payload-bytes)
-          transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature)))
+          transfer (account/create-transfer sender-privkey unsigned-transfer)
           updated-ledger (account/apply-transfer ledger transfer)]
       (is (= 60 (:balance (get updated-ledger sender-pubkey))))
       (is (= 90 (:balance (get updated-ledger receiver-pubkey))))
@@ -222,12 +221,9 @@
                              :amount 40
                              :seq 6
                              :deps ["hash1"]}
-          payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
-          signature (crypto/sign (:private keys1) payload-bytes)
-          transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))
+          transfer (account/create-transfer (:private keys1) unsigned-transfer)
           updated-ledger (account/apply-transfer ledger transfer)
-          safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex signature))
-          transfer-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))]
+          transfer-hash (account/transfer-hash transfer)]
       ;; The balance should be (100 - 40) + 40 = 100
       (is (= 100 (:balance (get updated-ledger sender-pubkey))))
       ;; Seq and deps should update
@@ -268,7 +264,7 @@
           (is (= ledger (account/apply-transfer ledger tampered)))))
 
       (testing "validate-transfer rejects invalid signature bytes"
-        (let [tampered (assoc tx :signature (vec (byte-array 64)))]
+        (let [tampered (assoc tx :signature (vec #?(:clj (byte-array 64) :cljs (js/Uint8Array. 64))))]
           (is (false? (account/validate-transfer initial-sender tampered)))
           (is (= ledger (account/apply-transfer ledger tampered))))))))
 
@@ -281,7 +277,7 @@
                       receiver-kp (crypto/generate-keypair)
                       sender-pubhex (basalt/bytes->hex (:public sender-kp))
                       receiver-pubhex (basalt/bytes->hex (:public receiver-kp))
-                      initial-deps (vec (repeatedly deps-count #(str "dep-" (java.util.UUID/randomUUID))))
+                      initial-deps (vec (repeatedly deps-count #(str "dep-" #?(:clj (java.util.UUID/randomUUID) :cljs (random-uuid)))))
                       sender-state (account/map->AccountState {:balance initial-balance
                                                                :seq initial-seq
                                                                :deps initial-deps})
@@ -315,7 +311,7 @@
                       (= [expected-hash] (:deps updated-sender))))
 
        ;; Invariant 3: Tampered signature fails validation and apply-transfer rejects it
-                   (let [bad-sig (byte-array 64)
+                   (let [bad-sig #?(:clj (byte-array 64) :cljs (js/Uint8Array. 64))
                          tampered-sig-tx (assoc tx :signature (vec bad-sig))]
                      (and (false? (account/validate-transfer sender-state tampered-sig-tx))
                           (= ledger (account/apply-transfer ledger tampered-sig-tx))))

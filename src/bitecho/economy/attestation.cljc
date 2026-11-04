@@ -1,7 +1,10 @@
 (ns bitecho.economy.attestation
-  "Bilateral epoch transcript attestations and deterministic node weight calculation."
+  "Bilateral epoch transcript attestations and deterministic node weight calculation.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]
             [clojure.set :as set]
             [clojure.string :as str]))
 
@@ -13,27 +16,29 @@
   "Default minimum baseline stake (S_min) for weight calculation (250,000 ECHO testnet floor)."
   250000)
 
-(defrecord EpochTranscript [epoch peer-a peer-b message-roles digest sig-a sig-b])
+(defrecord ^{:doc "Bilateral epoch transcript attestation record."} EpochTranscript [epoch peer-a peer-b message-roles digest sig-a sig-b])
 
 (defn- to-hex
   "Normalizes a public key or digest representation to a hex string."
   [x]
   (cond
     (string? x) x
-    (bytes? x) (basalt/bytes->hex x)
-    (sequential? x) (basalt/bytes->hex (byte-array (map byte x)))
+    (fressian/bytes? x) (basalt/bytes->hex x)
+    (sequential? x) (basalt/bytes->hex #?(:clj (byte-array (map byte x))
+                                          :cljs (js/Uint8Array. (clj->js x))))
     :else (str x)))
 
 (defn- to-bytes
-  "Normalizes a byte array, vector of numbers, or hex string into a byte-array."
+  "Normalizes a byte array, vector of numbers, or hex string into a byte-array / Uint8Array."
   [x]
   (cond
-    (bytes? x) x
-    (sequential? x) (byte-array (map byte x))
+    (fressian/bytes? x) x
+    (sequential? x) #?(:clj (byte-array (map byte x))
+                       :cljs (js/Uint8Array. (clj->js x)))
     (string? x) (if (re-matches #"^[0-9a-fA-F]+$" x)
                   (basalt/hex->bytes x)
-                  (.getBytes ^String x "UTF-8"))
-    :else (byte-array 0)))
+                  (fressian/utf8->bytes x))
+    :else (fressian/hex->bytes "")))
 
 (defn canonicalize-message-roles
   "Sorts message-role entries deterministically into a vector of [message-id role]."
@@ -64,12 +69,12 @@
   [epoch peer-a peer-b message-roles]
   (let [[p1 p2] (sort [(to-hex peer-a) (to-hex peer-b)])
         roles-vec (canonicalize-message-roles message-roles)
-        baos (java.io.ByteArrayOutputStream.)]
-    (.write baos (.getBytes (str (int epoch)) "UTF-8"))
-    (.write baos (.getBytes ^String p1 "UTF-8"))
-    (.write baos (.getBytes ^String p2 "UTF-8"))
-    (.write baos (.getBytes (pr-str roles-vec) "UTF-8"))
-    (basalt/bytes->hex (crypto/sha256 (.toByteArray baos)))))
+        combined (fressian/concat-bytes
+                  (fressian/utf8->bytes (str (int epoch)))
+                  (fressian/utf8->bytes (str p1))
+                  (fressian/utf8->bytes (str p2))
+                  (fressian/utf8->bytes (pr-str roles-vec)))]
+    (basalt/bytes->hex (crypto/sha256 combined))))
 
 (defn create-transcript
   "Creates an EpochTranscript.
@@ -91,7 +96,7 @@
          p-b (to-hex peer-b)
          roles (canonicalize-message-roles message-roles)
          digest (compute-exchange-digest epoch p-a p-b roles)
-         digest-bytes (.getBytes ^String digest "UTF-8")
+         digest-bytes (fressian/utf8->bytes digest)
          [priv-a priv-b] (cond
                            (sequential? priv-spec) [(first priv-spec) (second priv-spec)]
                            (map? priv-spec) [(:priv-a priv-spec) (:priv-b priv-spec)]
@@ -109,13 +114,14 @@
 (defn cosign-transcript
   "Appends peer B's signature to a transcript, returning an updated EpochTranscript."
   [transcript priv-b]
-  (let [digest-bytes (.getBytes ^String (:digest transcript) "UTF-8")
+  (let [digest-bytes (fressian/utf8->bytes (:digest transcript))
         sig-b (vec (crypto/sign (to-bytes priv-b) digest-bytes))]
     (assoc transcript :sig-b sig-b)))
 
 (defn verify-transcript
   "Verifies that the transcript's digest matches the canonical exchange data,
-   sig-a is valid for peer-a, and sig-b (if present) is valid for peer-b."
+   sig-a is valid for peer-a, and sig-b (if present) is valid for peer-b.
+   Supports shell-boundary pre-verification (:crypto/verified? or :crypto/verified-a?)."
   [transcript]
   (try
     (if (and (map? transcript)
@@ -129,19 +135,23 @@
                                                      (:peer-b transcript)
                                                      (:message-roles transcript))]
         (if (= expected-digest (:digest transcript))
-          (let [digest-bytes (.getBytes ^String (:digest transcript) "UTF-8")
-                valid-a? (crypto/verify (to-bytes (:peer-a transcript))
-                                        digest-bytes
-                                        (to-bytes (:sig-a transcript)))
+          (let [digest-bytes (fressian/utf8->bytes (:digest transcript))
+                valid-a? (or (:crypto/verified-a? transcript)
+                             (:crypto/verified? transcript)
+                             (crypto/verify (to-bytes (:peer-a transcript))
+                                            digest-bytes
+                                            (to-bytes (:sig-a transcript))))
                 valid-b? (if-let [sig-b (:sig-b transcript)]
-                           (crypto/verify (to-bytes (:peer-b transcript))
-                                          digest-bytes
-                                          (to-bytes sig-b))
+                           (or (:crypto/verified-b? transcript)
+                               (:crypto/verified? transcript)
+                               (crypto/verify (to-bytes (:peer-b transcript))
+                                              digest-bytes
+                                              (to-bytes sig-b)))
                            true)]
             (boolean (and valid-a? valid-b?)))
           false))
       false)
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       false)))
 
 (defn mutually-signed?
@@ -194,7 +204,7 @@
                                                      frozen-log-roles)]
         (= expected-digest (:digest transcript)))
       false)
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       false)))
 
 (defn evaluate-transcript-dispute
@@ -219,13 +229,13 @@
 
 (defn sign-frozen-log
   "Signs a counterparty frozen message log for an epoch using privkey.
-   Canonical payload: (pr-str [epoch peer-hex sorted-ids]).
+   Canonical payload: [epoch peer-hex sorted-ids].
    Returns {:epoch epoch :peer peer-hex :frozen-ids sorted-ids :signature sig-hex}."
   [epoch peer-pubkey frozen-ids privkey]
   (let [peer-hex (to-hex peer-pubkey)
         sorted-ids (vec (sort (map str (or frozen-ids []))))
-        payload (.getBytes (pr-str [epoch peer-hex sorted-ids]) "UTF-8")
-        sig (crypto/sign (to-bytes privkey) payload)]
+        payload [epoch peer-hex sorted-ids]
+        sig (crypto/sign-canonical (to-bytes privkey) payload)]
     {:epoch epoch
      :peer peer-hex
      :frozen-ids sorted-ids
@@ -234,7 +244,9 @@
 (defn verify-frozen-log
   "Verifies a cryptographically signed counterparty frozen log map.
    Validates map shape, integer epoch, non-blank peer and signature,
-   and verifies that the signature matches the canonical payload under peer's public key."
+   and verifies that the signature matches the canonical payload under peer's public key.
+   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)
+   and shell-boundary pre-verification (:crypto/verified? true)."
   [signed-log]
   (try
     (if (and (map? signed-log)
@@ -247,10 +259,11 @@
              (not (str/blank? (:signature signed-log))))
       (let [peer-hex (to-hex (:peer signed-log))
             sorted-ids (vec (sort (map str (or (:frozen-ids signed-log) []))))
-            payload (.getBytes (pr-str [(:epoch signed-log) peer-hex sorted-ids]) "UTF-8")
+            payload [(:epoch signed-log) peer-hex sorted-ids]
             pub-bytes (to-bytes peer-hex)
             sig-bytes (to-bytes (:signature signed-log))]
-        (boolean (crypto/verify pub-bytes payload sig-bytes)))
+        (boolean (or (:crypto/verified? signed-log)
+                     (crypto/verify-with-fallback pub-bytes payload sig-bytes))))
       false)
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       false)))

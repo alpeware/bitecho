@@ -1,9 +1,13 @@
 (ns bitecho.streamlet.core
-  "Streamlet core data structures and pure functions."
-  (:require [bitecho.crypto :as crypto]
+  "Streamlet core data structures and pure functions.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]
             [clojure.set :as set]))
 
-(defrecord Block [epoch parent-hash payload proposer signature])
+(defrecord ^{:doc "Streamlet consensus block record."} Block [epoch parent-hash payload proposer signature])
 
 #_{:clj-kondo/ignore [:redefined-var]}
 (defn ->Block
@@ -14,30 +18,15 @@
   ([epoch parent-hash payload proposer signature]
    (Block. epoch parent-hash payload proposer signature)))
 
-(defrecord Vote [block-hash epoch voter-signature])
+(defrecord ^{:doc "Streamlet vote record."} Vote [block-hash epoch voter-signature])
 
 (def max-epoch-catchup-delta
   "Maximum allowed forward epoch jump from a single message or ancestor step."
   64)
 
-(defn hex->bytes
-  "Converts a hex string to a byte array."
-  [^String s]
-  (let [len (.length s)
-        data (byte-array (/ len 2))]
-    (loop [i 0]
-      (when (< i len)
-        (aset data (/ i 2)
-              (unchecked-byte
-               (+ (bit-shift-left (Character/digit (.charAt s i) 16) 4)
-                  (Character/digit (.charAt s (inc i)) 16))))
-        (recur (+ i 2))))
-    data))
-
-(defn bytes->hex
-  "Converts a byte array to a hex string."
-  [^bytes ba]
-  (apply str (map #(format "%02x" %) ba)))
+(def ^{:doc "Portable byte array predicate."} bytes? fressian/bytes?)
+(def ^{:doc "Converts hex string to byte array."} hex->bytes basalt/hex->bytes)
+(def ^{:doc "Converts byte array to hex string."} bytes->hex basalt/bytes->hex)
 
 (defn valid-hex-string?
   "Returns true if s is a non-empty, even-length hex string."
@@ -50,46 +39,56 @@
 (defn block-signing-bytes
   "Serializes block contents excluding signature for Ed25519 signing."
   [block]
-  (.getBytes (pr-str [(:epoch block) (:parent-hash block) (:payload block) (:proposer block)]) "UTF-8"))
+  (crypto/canonical-signing-bytes [(:epoch block) (:parent-hash block) (:payload block) (:proposer block)]))
 
 (defn sign-block
   "Signs a block with proposer's private key bytes, attaching the hex signature."
-  [block ^bytes private-key]
-  (let [sig-bytes (crypto/sign private-key (block-signing-bytes block))]
+  [block private-key]
+  (let [sig-bytes (crypto/sign-canonical private-key [(:epoch block) (:parent-hash block) (:payload block) (:proposer block)])]
     (assoc block :signature (bytes->hex sig-bytes))))
 
 (defn verify-block-signature
-  "Verifies the Ed25519 signature of a block against the proposer's public key bytes."
-  [block ^bytes proposer-pubkey-bytes]
-  (boolean
-   (when (and (map? block)
-              (valid-hex-string? (:signature block))
-              (bytes? proposer-pubkey-bytes))
-     (try
-       (crypto/verify proposer-pubkey-bytes
-                      (block-signing-bytes block)
-                      (hex->bytes (:signature block)))
-       (catch Exception _ false)))))
+  "Verifies the Ed25519 signature of a block against the proposer's public key bytes.
+   Supports N/N-1 rolling verification and shell-boundary pre-verification."
+  [block proposer-pubkey-bytes]
+  (if (:crypto/verified? block)
+    true
+    (boolean
+     (when (and (map? block)
+                (valid-hex-string? (:signature block))
+                (bytes? proposer-pubkey-bytes))
+       (try
+         (crypto/verify-with-fallback proposer-pubkey-bytes
+                                      [(:epoch block) (:parent-hash block) (:payload block) (:proposer block)]
+                                      (hex->bytes (:signature block)))
+         (catch #?(:clj Exception :cljs :default) _ false))))))
 
 (defn verify-vote-signature
   "Verifies the Ed25519 signature of a vote against voter-pubkey-bytes.
+   Supports N/N-1 rolling verification and shell-boundary pre-verification.
    Returns false on any non-string field, malformed hex, or verification error."
-  [vote ^bytes voter-pubkey-bytes]
-  (boolean
-   (when (and (map? vote)
-              (string? (:block-hash vote))
-              (valid-hex-string? (:voter-signature vote))
-              (bytes? voter-pubkey-bytes))
-     (try
-       (crypto/verify voter-pubkey-bytes
-                      (.getBytes ^String (:block-hash vote) "UTF-8")
-                      (hex->bytes (:voter-signature vote)))
-       (catch Exception _ false)))))
+  [vote voter-pubkey-bytes]
+  (if (:crypto/verified? vote)
+    true
+    (boolean
+     (when (and (map? vote)
+                (string? (:block-hash vote))
+                (valid-hex-string? (:voter-signature vote)))
+       (let [pk-bytes (if (string? voter-pubkey-bytes)
+                        (hex->bytes voter-pubkey-bytes)
+                        voter-pubkey-bytes)]
+         (when (bytes? pk-bytes)
+           (try
+             (let [sig-bytes (hex->bytes (:voter-signature vote))
+                   msg-bytes (fressian/utf8->bytes (:block-hash vote))]
+               (or (crypto/verify pk-bytes msg-bytes sig-bytes)
+                   (crypto/verify-with-fallback pk-bytes (:block-hash vote) sig-bytes)))
+             (catch #?(:clj Exception :cljs :default) _ false))))))))
 
 (defn hash-block
-  "Serializes a block to a string, hashes it via SHA-256, and returns a hex string."
+  "Serializes a block to canonical bytes, hashes via SHA-256, and returns a hex string."
   [block]
-  (bytes->hex (crypto/sha256 (.getBytes (pr-str block) "UTF-8"))))
+  (bytes->hex (crypto/sha256 (fressian/encode-canonical (into {} block)))))
 
 (defn propose-block
   "Proposes a block for a given epoch.
@@ -218,13 +217,13 @@
                (longest-notarized-parent? state parent-hash epoch))
       (let [b-hash (hash-block block)
             private-key (get-in state [:keypair :private])
-            sig-bytes (crypto/sign private-key (.getBytes ^String b-hash "UTF-8"))]
+            sig-bytes (crypto/sign private-key (fressian/utf8->bytes b-hash))]
         (->Vote b-hash epoch (bytes->hex sig-bytes))))))
 
 (defn quorum-threshold
   "Calculates the 2n/3 quorum threshold for a network of size n."
   [n]
-  (int (Math/ceil (/ (* 2.0 n) 3))))
+  (int #?(:clj (Math/ceil (/ (* 2.0 n) 3)) :cljs (js/Math.ceil (/ (* 2.0 n) 3)))))
 
 (defn accumulate-vote
   "Validates a vote and accumulates it into the block's vote set.
@@ -399,7 +398,7 @@
     (let [entry (get-in state [:peers-map peer-hex])]
       (cond
         (bytes? entry) entry
-        (string? entry) (try (hex->bytes entry) (catch Exception _ nil))
+        (string? entry) (try (hex->bytes entry) (catch #?(:clj Exception :cljs :default) _ nil))
         :else nil))))
 
 (defn valid-block-proposal?
@@ -452,7 +451,7 @@
   (or (get-in state [:keypair :public])
       (get-in state [:keys :public])
       (when-let [hex (:node-pubkey state)]
-        (try (hex->bytes hex) (catch Exception _ nil)))))
+        (try (hex->bytes hex) (catch #?(:clj Exception :cljs :default) _ nil)))))
 
 (defn- extract-sender-pubkey-bytes
   "Resolves the sender's public key bytes strictly from :peers-map in state.

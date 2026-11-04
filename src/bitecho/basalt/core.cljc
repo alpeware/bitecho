@@ -1,70 +1,63 @@
 (ns bitecho.basalt.core
-  "Core logic for Basalt peer sampling protocol."
-  (:require [bitecho.crypto :as crypto]))
+  "Core logic for Basalt peer sampling protocol.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
+  (:require [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]))
 
-(defrecord Peer [ip port pubkey hash])
+(defrecord ^{:doc "Represents a sampled network peer."} Peer [ip port pubkey hash])
 
 (declare extract-peers)
 
-(defn bytes->hex
-  "Converts a byte array to a hex string."
-  [^bytes ba]
-  (apply str (map #(format "%02x" %) ba)))
+;; Re-export portable byte helpers for backward compatibility
+(def ^{:doc "Returns true if x is a raw byte array (byte[] on JVM, Uint8Array on JS)."} bytes? fressian/bytes?)
+(def ^{:doc "Returns the length in bytes of x."} count-bytes fressian/count-bytes)
+(def ^{:doc "Encodes a string to UTF-8 bytes."} utf8->bytes fressian/utf8->bytes)
+(def ^{:doc "Decodes UTF-8 bytes to a string."} bytes->utf8 fressian/bytes->utf8)
+(def ^{:doc "Converts a byte array / Uint8Array to a lowercase hex string."} bytes->hex fressian/bytes->hex)
+(def ^{:doc "Converts a hex string to a byte array / Uint8Array."} hex->bytes fressian/hex->bytes)
+(def ^{:doc "Checks byte equality between two byte arrays."} byte-array-equals? fressian/byte-array-equals?)
+(def ^{:doc "Lexicographical unsigned comparison of two byte arrays."} byte-array-compare fressian/byte-array-compare)
 
-(defn hex->bytes
-  "Converts a hex string to a byte array. Throws IllegalArgumentException on invalid input."
-  [^String s]
-  (let [len (.length s)]
-    (if (odd? len)
-      (throw (IllegalArgumentException. "Hex string must have an even length"))
-      (let [data (byte-array (quot len 2))]
-        (loop [i 0]
-          (if (< i len)
-            (let [high (Character/digit (.charAt s i) 16)
-                  low  (Character/digit (.charAt s (inc i)) 16)]
-              (if (or (= high -1) (= low -1))
-                (throw (IllegalArgumentException. "Invalid hex character"))
-                (do
-                  (aset data (quot i 2)
-                        (unchecked-byte (+ (bit-shift-left high 4) low)))
-                  (recur (+ i 2)))))
-            data))))))
+(defn concat-bytes
+  "Concatenates two byte arrays."
+  [a b]
+  (let [len-a (count-bytes a)
+        len-b (count-bytes b)
+        total-len (+ len-a len-b)]
+    #?(:clj
+       (let [res (byte-array total-len)]
+         (System/arraycopy ^bytes a 0 res 0 len-a)
+         (System/arraycopy ^bytes b 0 res len-a len-b)
+         res)
+       :cljs
+       (let [res (js/Uint8Array. total-len)]
+         (.set res a 0)
+         (.set res b len-a)
+         res))))
 
 (defn make-peer
   "Creates a Peer record given IP, port, and a public key byte array.
    Calculates the deterministic SHA-256 hash of IP:PORT:PUBKEY to uniquely identify the peer.
    Age defaults to 0."
-  [^String ip ^long port ^bytes pubkey]
-  (let [ip-bytes (.getBytes ip)
-        port-str (str port)
-        port-bytes (.getBytes port-str)
-        hash-input (byte-array (+ (count ip-bytes)
-                                  1
-                                  (count port-bytes)
-                                  1
-                                  (count pubkey)))
-        bb (java.nio.ByteBuffer/wrap hash-input)]
-    (.put bb ip-bytes)
-    (.put bb (byte 124))
-    (.put bb port-bytes)
-    (.put bb (byte 124))
-    (.put bb pubkey)
-    (->Peer ip port (bytes->hex pubkey) (bytes->hex (crypto/sha256 hash-input)))))
+  [ip port pubkey]
+  (let [ip-bytes (utf8->bytes (str ip))
+        port-bytes (utf8->bytes (str port))
+        pub-bytes (if (string? pubkey) (hex->bytes pubkey) pubkey)
+        sep (utf8->bytes "|")
+        hash-input (concat-bytes (concat-bytes (concat-bytes (concat-bytes ip-bytes sep) port-bytes) sep) pub-bytes)]
+    (->Peer ip port (bytes->hex pub-bytes) (bytes->hex (crypto/sha256 hash-input)))))
 
 (defn derive-slot-seed
   "Deterministically computes SHA-256(epoch-entropy || node-pubkey || slot-idx).
    Returns the 64-character lowercase hex string representation.
    Supports epoch-entropy and node-pubkey as either string or byte array."
   [epoch-entropy node-pubkey slot-idx]
-  (let [e-bytes (if (bytes? epoch-entropy) epoch-entropy (.getBytes ^String (str epoch-entropy) "UTF-8"))
-        p-bytes (if (bytes? node-pubkey) node-pubkey (.getBytes ^String (str node-pubkey) "UTF-8"))
-        s-bytes (.getBytes ^String (str slot-idx) "UTF-8")
-        total-len (+ (count e-bytes) (count p-bytes) (count s-bytes))
-        bb (java.nio.ByteBuffer/wrap (byte-array total-len))]
-    (.put bb ^bytes e-bytes)
-    (.put bb ^bytes p-bytes)
-    (.put bb ^bytes s-bytes)
-    (bytes->hex (crypto/sha256 (.array bb)))))
+  (let [e-bytes (if (bytes? epoch-entropy) epoch-entropy (utf8->bytes (str epoch-entropy)))
+        p-bytes (if (bytes? node-pubkey) node-pubkey (utf8->bytes (str node-pubkey)))
+        s-bytes (utf8->bytes (str slot-idx))
+        input (concat-bytes (concat-bytes e-bytes p-bytes) s-bytes)]
+    (bytes->hex (crypto/sha256 input))))
 
 (defn rank
   "Calculates the cryptographic rank of a peer for a given slot seed.
@@ -72,12 +65,9 @@
    and returns the hex string representation.
    Supports slot seed and peer-hash as either string or byte array."
   [seed peer-hash]
-  (let [seed-bytes (if (bytes? seed) seed (.getBytes ^String (str seed) "UTF-8"))
-        hash-bytes (if (bytes? peer-hash) peer-hash (.getBytes ^String (str peer-hash) "UTF-8"))
-        input (byte-array (+ (count seed-bytes) (count hash-bytes)))
-        bb (java.nio.ByteBuffer/wrap input)]
-    (.put bb ^bytes seed-bytes)
-    (.put bb ^bytes hash-bytes)
+  (let [seed-bytes (if (bytes? seed) seed (utf8->bytes (str seed)))
+        hash-bytes (if (bytes? peer-hash) peer-hash (utf8->bytes (str peer-hash)))
+        input (concat-bytes seed-bytes hash-bytes)]
     (bytes->hex (crypto/sha256 input))))
 
 (defn update-view
@@ -113,14 +103,14 @@
 
 (defn init-view
   "Initializes a new Basalt view (a vector of view-size slots) from initial peers.
-   Accepts an explicit java.util.Random instance:
-     (init-view initial-peers view-size ^java.util.Random rng)
+   Accepts an explicit RNG / crypto.IRandom instance:
+     (init-view initial-peers view-size rng)
    Or deterministic epoch-entropy and node-pubkey:
      (init-view initial-peers view-size epoch-entropy node-pubkey)"
-  ([initial-peers view-size ^java.util.Random rng]
+  ([initial-peers view-size rng]
    (let [slots (vec (repeatedly view-size
-                                #(let [seed-bytes (byte-array 32)]
-                                   (.nextBytes rng seed-bytes)
+                                #(let [seed-bytes #?(:clj (byte-array 32) :cljs (js/Uint8Array. 32))]
+                                   (crypto/next-bytes rng seed-bytes)
                                    {:seed (bytes->hex seed-bytes) :peer nil})))]
      (if (empty? initial-peers)
        slots
@@ -148,17 +138,17 @@
         result))))
 
 (defn reset-slots-rng
-  "Resets k slots starting at index r (with wrap-around) using explicit java.util.Random.
+  "Resets k slots starting at index r (with wrap-around) using explicit IRandom/RNG.
    Yields previous peers, generates new random 32-byte seeds via rng,
    and repopulates slots using remaining and sampled peers.
    Returns {:view updated-view :samples samples :next-r new-r}."
-  [view ^java.util.Random rng r k]
+  [view rng r k]
   (let [size (count view)
         indices (map #(mod (+ r %) size) (range k))
         samples (keep :peer (map #(get view %) indices))
         cleared-view (reduce (fn [v idx]
-                               (let [seed-bytes (byte-array 32)]
-                                 (.nextBytes rng seed-bytes)
+                               (let [seed-bytes #?(:clj (byte-array 32) :cljs (js/Uint8Array. 32))]
+                                 (crypto/next-bytes rng seed-bytes)
                                  (assoc v idx {:seed (bytes->hex seed-bytes) :peer nil})))
                              view
                              indices)
@@ -202,12 +192,12 @@
 
 (defn reset-slots
   "Resets k slots starting at index r (with wrap-around).
-   Delegates to reset-slots-rng when passed an explicit java.util.Random instance:
+   Delegates to reset-slots-rng when passed an explicit IRandom/Random instance:
      (reset-slots view rng r k)
    Delegates to reset-slots-deterministic when passed epoch-entropy and node-pubkey:
      (reset-slots view epoch-entropy node-pubkey r k)
    Returns {:view updated-view :samples samples :next-r new-r}."
-  ([view ^java.util.Random rng r k]
+  ([view rng r k]
    (reset-slots-rng view rng r k))
   ([view epoch-entropy node-pubkey r k]
    (reset-slots-deterministic view epoch-entropy node-pubkey r k)))
@@ -223,25 +213,36 @@
         seed (derive-slot-seed epoch-entropy node-pubkey "select")]
     (take k (sort-by #(rank seed (:hash %)) peers))))
 
+(defn- shuffle-with-rng
+  [coll rng]
+  (let [v (vec coll)
+        n (count v)]
+    (loop [i (dec n)
+           res (transient v)]
+      (if (pos? i)
+        (let [j (crypto/next-int rng (inc i))
+              tmp (get res i)
+              res' (-> res (assoc! i (get res j)) (assoc! j tmp))]
+          (recur (dec i) res'))
+        (persistent! res)))))
+
 (defn select-peers
   "Selects up to k peers from the view for exchange.
-   Supports explicit RNG-based shuffling when passed a java.util.Random instance:
-     (select-peers ^java.util.Random rng view k)
+   Supports explicit RNG-based shuffling when passed an IRandom / java.util.Random instance:
+     (select-peers rng view k)
    Supports deterministic rank-based selection when passed epoch-entropy and node-pubkey:
      (select-peers epoch-entropy node-pubkey view k)
    Or when passed a string/bytes seed as the first argument:
      (select-peers seed view k)"
-  ([^java.util.Random rng view k]
-   (if (instance? java.util.Random rng)
+  ([rng-or-entropy view k]
+   (if (satisfies? crypto/IRandom rng-or-entropy)
      (let [peers (if (and (vector? view) (some #(contains? % :seed) view))
                    (extract-peers view)
-                   (seq view))
+                   (distinct (remove nil? view)))
            size (count peers)]
        (if (zero? size)
          ()
-         (let [shuffled (java.util.ArrayList. peers)]
-           (java.util.Collections/shuffle shuffled rng)
-           (take k shuffled))))
-     (select-peers-deterministic rng "select" view k)))
+         (take k (shuffle-with-rng peers rng-or-entropy))))
+     (select-peers-deterministic rng-or-entropy "select" view k)))
   ([epoch-entropy node-pubkey view k]
    (select-peers-deterministic epoch-entropy node-pubkey view k)))

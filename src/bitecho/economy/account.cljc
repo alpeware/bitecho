@@ -1,32 +1,38 @@
 (ns bitecho.economy.account
+  "Account ledger state and transfer transactions.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]))
+            [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]))
 
-(defrecord AccountState [balance seq deps])
+(defrecord ^{:doc "Account ledger state record holding balance, seq, and transaction dependency hashes."} AccountState [balance seq deps])
 
-(defrecord Transfer [sender receiver amount seq deps signature])
+(defrecord ^{:doc "Transfer transaction record with signature and dependencies."} Transfer [sender receiver amount seq deps signature])
 
 (defn create-transfer
-  "Creates and signs a transfer, ensuring byte-level consistency with validate-transfer."
+  "Creates and signs a transfer using canonical Fressian signing bytes."
   [privkey unsigned-transfer]
-  (let [payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-transfer)) "UTF-8")
-        signature-bytes (crypto/sign privkey payload-bytes)]
+  (let [signature-bytes (crypto/sign-canonical privkey (into {} unsigned-transfer))]
     (map->Transfer (assoc unsigned-transfer :signature (vec signature-bytes)))))
 
 (defn transfer-hash
-  "Calculates the SHA-256 hash of a transfer, ensuring consistent signature stringification."
+  "Calculates the SHA-256 hash of a transfer using canonical Fressian encoding."
   [transfer]
-  (let [safe-transfer (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex (byte-array (map byte (:signature transfer)))))]
-    (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-transfer) "UTF-8")))))
+  (let [sig-hex (if (string? (:signature transfer))
+                  (:signature transfer)
+                  (let [sig-col (:signature transfer)]
+                    (basalt/bytes->hex (if (fressian/bytes? sig-col)
+                                         sig-col
+                                         #?(:clj (byte-array (map byte sig-col))
+                                            :cljs (js/Uint8Array. (clj->js sig-col)))))))
+        safe-transfer (assoc (dissoc (into {} transfer) :crypto/verified?) :signature sig-hex)]
+    (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical safe-transfer)))))
 
 (defn validate-transfer
   "Validates a transfer against a current account state.
-   Returns true if valid, false otherwise.
-   Validation rules:
-   1. The transfer's sequence number must be exactly 1 greater than the current state's sequence number.
-   2. The transfer's causal dependencies must exactly match the current state's causal dependencies.
-   3. The current state's balance must be >= the transfer's amount.
-   4. The transfer's signature must be valid."
+   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)
+   and shell-boundary pre-verification (:crypto/verified? true)."
   [current-state transfer]
   (try
     (let [sender (:sender transfer)
@@ -37,15 +43,16 @@
           valid-deps? (= (:deps transfer) (:deps current-state))
           valid-balance? (>= (:balance current-state) (:amount transfer))
 
-          unsigned-transfer (into (sorted-map) (dissoc transfer :signature))
-          payload-bytes (.getBytes (pr-str unsigned-transfer) "UTF-8")
+          unsigned-transfer (into (sorted-map) (dissoc transfer :signature :crypto/verified?))
           sig-bytes (if (coll? (:signature transfer))
-                      (byte-array (map byte (:signature transfer)))
+                      #?(:clj (byte-array (map byte (:signature transfer)))
+                         :cljs (js/Uint8Array. (clj->js (:signature transfer))))
                       (:signature transfer))
-          valid-signature? (crypto/verify sender-bytes payload-bytes sig-bytes)]
+          valid-signature? (or (:crypto/verified? transfer)
+                               (crypto/verify-with-fallback sender-bytes unsigned-transfer sig-bytes))]
 
-      (and valid-seq? valid-deps? valid-balance? valid-signature?))
-    (catch Exception _
+      (and valid-seq? valid-deps? valid-balance? (boolean valid-signature?)))
+    (catch #?(:clj Exception :cljs :default) _
       false)))
 
 (defn apply-transfer
@@ -60,11 +67,11 @@
         sender-state (get ledger sender)
         amount (:amount transfer)]
     (if (and sender-state (validate-transfer sender-state transfer))
-      (let [transfer-hash (transfer-hash transfer)
+      (let [t-hash (transfer-hash transfer)
             new-sender-state (map->AccountState
                               {:balance (- (:balance sender-state) amount)
                                :seq (:seq transfer)
-                               :deps [transfer-hash]})
+                               :deps [t-hash]})
             ledger-after-send (assoc ledger sender new-sender-state)
             receiver-state (get ledger-after-send receiver (map->AccountState {:balance 0 :seq 0 :deps []}))
             new-receiver-state (assoc receiver-state :balance (+ (:balance receiver-state) amount))]
@@ -96,4 +103,3 @@
           l))
       ledger
       allocations))))
-

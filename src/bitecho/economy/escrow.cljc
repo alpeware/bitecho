@@ -1,13 +1,15 @@
 (ns bitecho.economy.escrow
   "Pure Sans-IO Escrow & Hash-Lock Settlement Primitives for Bitecho.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser).
    Enforces single-currency ($ECHO) verified-outcome escrow lifecycle:
    :lock-intent -> :release-intent (preimage or payer signature) or :refund-intent (timeout).
    Guarantees mandatory tau = 0.5% protocol settlement take burned on verified release."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.economy.burn :as burn]
-            [clojure.string :as str])
-  (:import (java.nio.charset StandardCharsets)))
+            [bitecho.fressian :as fressian]
+            [clojure.string :as str]))
 
 (defn valid-deliverable-hash?
   "Returns true if s is a valid 64-character hex string representing a SHA-256 commitment."
@@ -21,7 +23,7 @@
   [s]
   (cond
     (string? s) (str/lower-case (str/trim s))
-    (bytes? s) (str/lower-case (basalt/bytes->hex s))
+    (fressian/bytes? s) (str/lower-case (basalt/bytes->hex s))
     :else nil))
 
 (defn normalize-party
@@ -29,7 +31,7 @@
   [p]
   (cond
     (string? p) (str/lower-case (str/trim p))
-    (bytes? p) (str/lower-case (basalt/bytes->hex p))
+    (fressian/bytes? p) (str/lower-case (basalt/bytes->hex p))
     :else nil))
 
 (defn canonical-escrow-id-str
@@ -56,7 +58,7 @@
                       (or (:nonce m) (get m "nonce") "0")))
   ([payer receiver amount deliverable-hash created-epoch expires-epoch nonce]
    (let [s (canonical-escrow-id-str payer receiver amount deliverable-hash created-epoch expires-epoch nonce)
-         b (.getBytes ^String s StandardCharsets/UTF_8)]
+         b (fressian/utf8->bytes s)]
      (basalt/bytes->hex (crypto/sha256 b)))))
 
 (defn canonical-escrow-release-str
@@ -68,30 +70,31 @@
 
 (defn sign-escrow-release
   "Signs canonical outcome release string using payer's private key bytes. Returns hex string."
-  [^bytes privkey-bytes escrow-id deliverable-hash]
+  [privkey-bytes escrow-id deliverable-hash]
   (let [s (canonical-escrow-release-str escrow-id deliverable-hash)
-        b (.getBytes ^String s StandardCharsets/UTF_8)
-        sig (crypto/sign privkey-bytes b)]
+        b (fressian/utf8->bytes s)
+        sig (crypto/sign (if (string? privkey-bytes) (basalt/hex->bytes privkey-bytes) privkey-bytes) b)]
     (if (string? sig) sig (basalt/bytes->hex sig))))
 
 (defn verify-escrow-release-sig
-  "Verifies payer's Ed25519 signature over canonical outcome release string."
+  "Verifies payer's Ed25519 signature over canonical outcome release string.
+   Supports shell-boundary pre-verification."
   [payer-pubkey escrow-id deliverable-hash sig-bytes-or-hex]
   (try
     (let [pub-bytes (cond
-                      (bytes? payer-pubkey) payer-pubkey
+                      (fressian/bytes? payer-pubkey) payer-pubkey
                       (string? payer-pubkey) (basalt/hex->bytes payer-pubkey)
                       :else nil)
           sig-bytes (cond
-                      (bytes? sig-bytes-or-hex) sig-bytes-or-hex
+                      (fressian/bytes? sig-bytes-or-hex) sig-bytes-or-hex
                       (string? sig-bytes-or-hex) (basalt/hex->bytes sig-bytes-or-hex)
                       :else nil)
           s (canonical-escrow-release-str escrow-id deliverable-hash)
-          msg-bytes (.getBytes ^String s StandardCharsets/UTF_8)]
+          msg-bytes (fressian/utf8->bytes s)]
       (boolean
        (and pub-bytes sig-bytes
             (crypto/verify pub-bytes msg-bytes sig-bytes))))
-    (catch Exception _ false)))
+    (catch #?(:clj Exception :cljs :default) _ false)))
 
 (defn verify-deliverable-preimage
   "Verifies whether SHA-256(preimage) equals deliverable-hash."
@@ -99,10 +102,10 @@
   (try
     (and (string? preimage)
          (valid-deliverable-hash? deliverable-hash)
-         (let [b (.getBytes ^String preimage StandardCharsets/UTF_8)
+         (let [b (fressian/utf8->bytes preimage)
                h (basalt/bytes->hex (crypto/sha256 b))]
            (= (normalize-hex h) (normalize-hex deliverable-hash))))
-    (catch Exception _ false)))
+    (catch #?(:clj Exception :cljs :default) _ false)))
 
 (defn calculate-escrow-settlement-take
   "Computes mandatory tau = 0.5% protocol settlement take via (burn/calculate-settlement-take amount take-bps)

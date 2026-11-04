@@ -1,6 +1,8 @@
 (ns bitecho.state-machine
   "The pure root reducer that integrates Basalt, Murmur, Sieve, and Contagion.
-   Accepts `state` and `event` inputs and emits a map of `{:state new-state :commands [...]}`."
+   Accepts `state` and `event` inputs and emits a map of `{:state new-state :commands [...]}`.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
@@ -11,14 +13,34 @@
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
             [bitecho.economy.treasury :as treasury]
+            [bitecho.fressian :as fressian]
             [bitecho.murmur.core :as murmur]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.sieve.core :as sieve]
             [bitecho.streamlet.core :as streamlet]
             [clojure.edn :as edn]
             [clojure.set :as set]
-            [clojure.string :as string])
-  (:import [java.nio.charset StandardCharsets]))
+            [clojure.string :as string]))
+
+(def ^:private bytes? fressian/bytes?)
+
+(def ^:private empty-queue
+  #?(:clj clojure.lang.PersistentQueue/EMPTY
+     :cljs (.-EMPTY cljs.core/PersistentQueue)))
+
+(def ^:private empty-bytes
+  #?(:clj (byte-array 0)
+     :cljs (js/Uint8Array. 0)))
+
+(defn- to-byte-array
+  "Converts a coll of numbers, byte array, or nil into a byte-array / Uint8Array."
+  [x]
+  (cond
+    (nil? x) empty-bytes
+    (fressian/bytes? x) x
+    (sequential? x) #?(:clj (byte-array (map byte x))
+                       :cljs (js/Uint8Array. (clj->js x)))
+    :else empty-bytes))
 
 (declare apply-payload-to-ledger execute-finalized-blocks derive-authoritative-roles)
 
@@ -29,16 +51,31 @@
     (if (string? pk) pk (basalt/bytes->hex pk))))
 
 (defn- attach-control-frame-signature
-  "If node private key is present in state, signs the control frame and attaches :sender and :signature."
+  "If node private key is present in state, signs the control frame and attaches :sender and :signature.
+   When :defer-crypto? is true (Decision A(i)), attaches a :sign-and-emit :crypto-effect descriptor."
   [state cmd frame-type message-id]
-  (if-let [priv (or (:node-private-key state)
-                    (get-in state [:config :node-private-key])
-                    (get-in state [:keypair :private])
-                    (get-in state [:keys :private]))]
-    (let [pub (:node-pubkey state)
-          signed (sieve/sign-control-frame frame-type message-id priv pub)]
-      (assoc cmd :sender pub :signature (:signature signed)))
-    cmd))
+  (let [pub (:node-pubkey state)
+        priv (or (:node-private-key state)
+                 (get-in state [:config :node-private-key])
+                 (get-in state [:keypair :private])
+                 (get-in state [:keys :private]))
+        defer? (or (:defer-crypto? state)
+                   (get-in state [:config :defer-crypto?]))]
+    (cond
+      priv
+      (let [signed (sieve/sign-control-frame frame-type message-id priv pub)]
+        (assoc cmd :sender pub :signature (:signature signed)))
+
+      defer?
+      (assoc cmd
+             :sender pub
+             :crypto-effect {:effect :sign-and-emit
+                             :sender pub
+                             :signing-payload {:type frame-type :message-id message-id}
+                             :signature-field :signature})
+
+      :else
+      cmd)))
 
 (defn init-state
   "Initializes the pure Bitecho state map.
@@ -48,7 +85,7 @@
    (init-state initial-peers node-pubkey config/default-config))
   ([initial-peers node-pubkey cfg]
    (let [genesis-ledger (when-let [gl (:genesis-ledger cfg)]
-                          (into {} (map (fn [[k v]] [k (if (instance? bitecho.economy.account.AccountState v)
+                          (into {} (map (fn [[k v]] [k (if (record? v)
                                                          v
                                                          (account/map->AccountState v))]))
                                 gl))
@@ -62,7 +99,7 @@
       :epoch-settlement-takes {}
       :basalt-index 0
       :basalt-view (basalt/init-view initial-peers view-size epoch-entropy node-pubkey)
-      :murmur-cache {:set #{} :queue clojure.lang.PersistentQueue/EMPTY}
+      :murmur-cache {:set #{} :queue empty-queue}
       :contagion-known-ids #{}
       :messages {} :message-epochs {}
       :epoch-to-messages {} :epoch-to-message-roles {}
@@ -209,7 +246,7 @@
   [state]
   (let [w (extract-burn-window state)
         s (pr-str w)
-        b (.getBytes ^String s StandardCharsets/UTF_8)
+        b (fressian/utf8->bytes s)
         h (basalt/bytes->hex (crypto/sha256 b))]
     (subs h 0 16)))
 
@@ -638,7 +675,7 @@
             [s ord]))
         pruned-murmur-cache (if (and (:murmur-cache state) (seq expired-ids))
                               {:set (set/difference (or (get-in state [:murmur-cache :set]) #{}) expired-ids)
-                               :queue (into clojure.lang.PersistentQueue/EMPTY
+                               :queue (into empty-queue
                                             (remove #(contains? expired-ids %)
                                                     (or (get-in state [:murmur-cache :queue]) [])))}
                               (:murmur-cache state))]
@@ -892,7 +929,7 @@
               extracted-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
               sieve-message (if (and (:private-key event) (:public-key event))
                               (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
-                              {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
+                              {:payload payload :sender "local" :signature empty-bytes :burn-amount burn-amt})
               broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
               message-id (:message-id broadcast-result)
               message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
@@ -945,7 +982,7 @@
               extracted-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
               sieve-message (if (and (:private-key event) (:public-key event))
                               (sieve/wrap-message payload (:private-key event) (:public-key event) burn-amt)
-                              {:payload payload :sender "local" :signature (byte-array 0) :burn-amount burn-amt})
+                              {:payload payload :sender "local" :signature empty-bytes :burn-amount burn-amt})
               broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
               message-id (:message-id broadcast-result)
               message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
@@ -1241,29 +1278,48 @@
               {:state state-with-echo :commands []}))
           {:state state :commands []})))))
 
+(defn- thaw-payload-data
+  "Deserializes a payload map, trying canonical Fressian first.
+   If decoding fails or does not yield a map/record, falls back to legacy EDN string parsing."
+  [payload-bytes]
+  (let [pb (to-byte-array payload-bytes)]
+    (or (try
+          (let [v (fressian/decode pb)]
+            (when (or (map? v) (record? v))
+              v))
+          (catch #?(:clj Exception :cljs :default) _ nil))
+        (try
+          (let [payload-str (fressian/bytes->utf8 pb)]
+            (edn/read-string {:default tagged-literal
+                              :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                        'bitecho.economy.account.AccountState account/map->AccountState}}
+                             payload-str))
+          (catch #?(:clj Exception :cljs :default) _ nil)))))
+
 (defn- apply-transfer-payload-to-ledger
   "Deserializes a transfer from payload-bytes and applies it to ledger if valid.
+   Supports canonical Fressian payload bytes as well as legacy EDN UTF-8 strings.
    Returns the updated ledger map, or nil if invalid/failed."
   [ledger payload-bytes]
   (try
-    (let [payload-str (String. ^bytes payload-bytes "UTF-8")
-          payload-edn (edn/read-string {:default tagged-literal
-                                        :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                  'bitecho.economy.account.AccountState account/map->AccountState}} payload-str)
+    (let [pb (to-byte-array payload-bytes)
+          payload-data (thaw-payload-data pb)
           transfer-map (cond
-                         (and (map? payload-edn) (:transfer payload-edn)) (:transfer payload-edn)
-                         (instance? bitecho.economy.account.Transfer payload-edn) payload-edn
+                         (and (map? payload-data) (:transfer payload-data)) (:transfer payload-data)
+                         (record? payload-data) payload-data
                          :else nil)]
       (if transfer-map
-        (let [transfer-map (if (instance? clojure.lang.TaggedLiteral transfer-map)
+        (let [transfer-map (if (tagged-literal? transfer-map)
                              (:form transfer-map)
                              (into {} transfer-map))
               sig (cond
-                    (vector? (:signature transfer-map)) (byte-array (map byte (:signature transfer-map)))
-                    (string? (:signature transfer-map)) (.getBytes ^String (:signature transfer-map) "UTF-8")
-                    (and (seqable? (:signature transfer-map)) (every? number? (:signature transfer-map))) (byte-array (map byte (:signature transfer-map)))
-                    (bytes? (:signature transfer-map)) (:signature transfer-map)
-                    :else (byte-array 0))
+                    (fressian/bytes? (:signature transfer-map)) (:signature transfer-map)
+                    (vector? (:signature transfer-map)) (to-byte-array (:signature transfer-map))
+                    (string? (:signature transfer-map)) (if (re-matches #"^[0-9a-fA-F]+$" (:signature transfer-map))
+                                                          (fressian/hex->bytes (:signature transfer-map))
+                                                          (fressian/utf8->bytes (:signature transfer-map)))
+                    (and (seqable? (:signature transfer-map)) (every? number? (:signature transfer-map))) (to-byte-array (:signature transfer-map))
+                    :else empty-bytes)
               transfer-map (assoc transfer-map :signature sig)
               transfer (account/map->Transfer transfer-map)
               sender (:sender transfer)
@@ -1275,7 +1331,7 @@
               (account/apply-transfer ledger-with-receiver transfer))
             nil))
         nil))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       nil)))
 
 (defn- apply-payload-to-ledger
@@ -1326,7 +1382,7 @@
 
          :transfer
          (if-let [pb (:payload-bytes r)]
-           (if-let [new-ledger (apply-transfer-payload-to-ledger ledger (byte-array (map byte pb)))]
+           (if-let [new-ledger (apply-transfer-payload-to-ledger ledger (to-byte-array pb))]
              new-ledger
              ledger)
            ledger)
@@ -1419,7 +1475,7 @@
 
                                        :transfer
                                        (if-let [pb (:payload-bytes r)]
-                                         (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger s) (byte-array (map byte pb)))]
+                                         (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger s) (to-byte-array pb))]
                                            (assoc s :ledger new-ledger)
                                            (update s :failed-receipts-count (fnil inc 0)))
                                          (update s :failed-receipts-count (fnil inc 0)))
@@ -1583,10 +1639,10 @@
                                              tuple [(:callee r) home-node (:epoch r)]
                                              raw (:ack r)
                                              raw-ack (when raw
-                                                       (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
+                                                       (if (record? raw)
                                                          raw
                                                          (try (rendezvous/map->DeliveryAck raw)
-                                                              (catch Exception _ nil))))
+                                                              (catch #?(:clj Exception :cljs :default) _ nil))))
                                              ack (when raw-ack
                                                    (if (contains? raw-ack :home-node)
                                                      (assoc raw-ack :home-node (rendezvous/normalize-home-node (:home-node raw-ack)))
@@ -1612,9 +1668,9 @@
 
                                        :transcript
                                        (let [raw-tx (:transcript r)
-                                             tx (if (instance? bitecho.economy.attestation.EpochTranscript raw-tx)
+                                             tx (if (record? raw-tx)
                                                   raw-tx
-                                                  (try (attestation/map->EpochTranscript raw-tx) (catch Exception _ nil)))
+                                                  (try (attestation/map->EpochTranscript raw-tx) (catch #?(:clj Exception :cljs :default) _ nil)))
                                              ep (long (or (when tx (:epoch tx)) (:epoch r) 0))
                                              pa (when tx (:peer-a tx))
                                              pb (when tx (:peer-b tx))
@@ -1772,32 +1828,26 @@
 (defn- handle-on-deliver
   "Handles the internal delivery event, updating the ledger with the payload and emitting an app-event."
   [state event]
-  (let [p (:payload event)
-        payload-bytes (cond
-                        (bytes? p) p
-                        (sequential? p) (byte-array (map byte p))
-                        :else (byte-array 0))
+  (let [p (or (:payload event) (when (:transfer event) (fressian/encode-canonical {:transfer (into {} (:transfer event))})))
+        payload-bytes (to-byte-array p)
         message-id (:message-id event)
         event-sender (:sender event)]
     (if (consensus-mode? state)
-      (let [payload-str (try (String. ^bytes payload-bytes StandardCharsets/UTF_8) (catch Exception _ nil))
-            payload-edn (try (when payload-str
-                               (edn/read-string {:default tagged-literal
-                                                 :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                           'bitecho.economy.account.AccountState account/map->AccountState}} payload-str))
-                             (catch Exception _ nil))
-            raw-transfer (when (and (map? payload-edn) (:transfer payload-edn))
-                           (:transfer payload-edn))
+      (let [payload-data (thaw-payload-data payload-bytes)
+            raw-transfer (when (and (map? payload-data) (:transfer payload-data))
+                           (:transfer payload-data))
             transfer-map (when raw-transfer
-                           (let [m (if (instance? clojure.lang.TaggedLiteral raw-transfer)
+                           (let [m (if (tagged-literal? raw-transfer)
                                      (:form raw-transfer)
                                      (into {} raw-transfer))
                                  sig (cond
-                                       (vector? (:signature m)) (byte-array (map byte (:signature m)))
-                                       (string? (:signature m)) (.getBytes ^String (:signature m) "UTF-8")
-                                       (and (seqable? (:signature m)) (every? number? (:signature m))) (byte-array (map byte (:signature m)))
-                                       (bytes? (:signature m)) (:signature m)
-                                       :else (byte-array 0))]
+                                       (fressian/bytes? (:signature m)) (:signature m)
+                                       (vector? (:signature m)) (to-byte-array (:signature m))
+                                       (string? (:signature m)) (if (re-matches #"^[0-9a-fA-F]+$" (:signature m))
+                                                                  (fressian/hex->bytes (:signature m))
+                                                                  (fressian/utf8->bytes (:signature m)))
+                                       (and (seqable? (:signature m)) (every? number? (:signature m))) (to-byte-array (:signature m))
+                                       :else empty-bytes)]
                              (assoc m :signature sig)))
             transfer (when transfer-map (account/map->Transfer transfer-map))
             sender (when transfer (:sender transfer))
@@ -1825,16 +1875,11 @@
          :commands [{:type :app-event :event-name :on-deliver
                      :payload (:payload event) :message-id message-id}]})
       (let [sender-authorized? (or (nil? event-sender)
-                                   (let [payload-str (try (String. ^bytes payload-bytes StandardCharsets/UTF_8) (catch Exception _ nil))
-                                         payload-edn (try (when payload-str
-                                                            (edn/read-string {:default tagged-literal
-                                                                              :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                                                        'bitecho.economy.account.AccountState account/map->AccountState}} payload-str))
-                                                          (catch Exception _ nil))
-                                         raw-transfer (when (and (map? payload-edn) (:transfer payload-edn))
-                                                        (:transfer payload-edn))
+                                   (let [payload-data (thaw-payload-data payload-bytes)
+                                         raw-transfer (when (and (map? payload-data) (:transfer payload-data))
+                                                        (:transfer payload-data))
                                          transfer-map (when raw-transfer
-                                                        (if (instance? clojure.lang.TaggedLiteral raw-transfer)
+                                                        (if (tagged-literal? raw-transfer)
                                                           (:form raw-transfer)
                                                           (into {} raw-transfer)))]
                                      (= (:sender transfer-map) event-sender)))
@@ -1935,9 +1980,9 @@
    stages consensus receipt or updates standalone state and mesh weights."
   [state event]
   (let [raw (or (:transcript event) (:payload event) event)
-        transcript (if (instance? bitecho.economy.attestation.EpochTranscript raw)
+        transcript (if (record? raw)
                      raw
-                     (try (attestation/map->EpochTranscript raw) (catch Exception _ nil)))
+                     (try (attestation/map->EpochTranscript raw) (catch #?(:clj Exception :cljs :default) _ nil)))
         event-sender (:sender event)
         sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
         pa (when transcript (:peer-a transcript))
@@ -2043,9 +2088,9 @@
       (let [state-with-log (if cp-log
                              (assoc-in state [:peer-frozen-logs [ep sender]] cp-log)
                              state)
-            tx (if (instance? bitecho.economy.attestation.EpochTranscript raw-tx)
+            tx (if (record? raw-tx)
                  raw-tx
-                 (try (attestation/map->EpochTranscript raw-tx) (catch Exception _ nil)))
+                 (try (attestation/map->EpochTranscript raw-tx) (catch #?(:clj Exception :cljs :default) _ nil)))
             pa (when tx (:peer-a tx))
             pb (when tx (:peer-b tx))]
         (if-not (and tx
@@ -2245,10 +2290,10 @@
   (let [raw-vouchers (or (:vouchers event) [])
         compacted (->> raw-vouchers
                        (keep (fn [raw]
-                               (let [ack (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
+                               (let [ack (if (record? raw)
                                            raw
                                            (try (rendezvous/map->DeliveryAck raw)
-                                                (catch Exception _ nil)))]
+                                                (catch #?(:clj Exception :cljs :default) _ nil)))]
                                  (when (and ack (rendezvous/verify-delivery-ack ack))
                                    (assoc ack :home-node (rendezvous/normalize-home-node (:home-node ack)))))))
                        (group-by (fn [ack] [(:callee ack) (rendezvous/normalize-home-node (:home-node ack)) (long (or (:epoch ack) 0))]))

@@ -1,10 +1,14 @@
 (ns bitecho.rendezvous.core-test
-  "Tests for pure multi-homed Callee registration, home node selection, and DeliveryAck vouchers."
+  "Tests for pure multi-homed Callee registration, home node selection, and DeliveryAck vouchers.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.rendezvous.core :as rdv]
-            [clojure.test :refer [deftest is testing]]
-            [clojure.test.check.clojure-test :refer [defspec]]
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
@@ -215,7 +219,7 @@
         (is (= :invalid-debit (:error res)))))
 
     (testing "Rejects corrupted / invalid signature"
-      (let [corrupted-ack (assoc valid-ack :signature (basalt/bytes->hex (byte-array 64)))
+      (let [corrupted-ack (assoc valid-ack :signature (basalt/bytes->hex #?(:clj (byte-array 64) :cljs (js/Uint8Array. 64))))
             res (rdv/verify-ack-for-settlement corrupted-ack settlement-ctx)]
         (is (false? (:valid? res)))
         (is (= :invalid-signature (:error res)))))))

@@ -1,25 +1,23 @@
 (ns bitecho.sieve.core
-  "Core logic for Sieve consistent broadcast validation."
+  "Core logic for Sieve consistent broadcast validation.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser).
+   Supports canonical Fressian signing with N/N-1 verification fallback and
+   shell-boundary pre-verification (Decision A(i))."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]))
+            [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]))
 
 (defn- to-bytes
   "Normalizes a byte array, vector of numbers, or hex string into a byte-array."
   [x]
   (cond
-    (bytes? x) x
-    (sequential? x) (byte-array (map byte x))
+    (fressian/bytes? x) x
+    (sequential? x) #?(:clj (byte-array (map byte x)) :cljs (js/Uint8Array. (clj->js x)))
     (string? x) (if (re-matches #"^[0-9a-fA-F]+$" x)
                   (basalt/hex->bytes x)
-                  (.getBytes ^String x "UTF-8"))
-    :else (byte-array 0)))
-
-(defn- concat-bytes
-  [^bytes a ^bytes b]
-  (let [result (byte-array (+ (alength a) (alength b)))]
-    (System/arraycopy a 0 result 0 (alength a))
-    (System/arraycopy b 0 result (alength a) (alength b))
-    result))
+                  (fressian/utf8->bytes x))
+    :else #?(:clj (byte-array 0) :cljs (js/Uint8Array. 0))))
 
 (defn- signing-bytes
   "Returns payload when burn-amount is nil, or payload concatenated with
@@ -28,7 +26,7 @@
   (let [p-bytes (to-bytes payload)]
     (if (nil? burn-amount)
       p-bytes
-      (concat-bytes p-bytes (.getBytes (str ":burn:" burn-amount) "UTF-8")))))
+      (basalt/concat-bytes p-bytes (fressian/utf8->bytes (str ":burn:" burn-amount))))))
 
 (defn wrap-message
   "Wraps a payload with an Ed25519 signature and the sender's public key hex.
@@ -51,28 +49,31 @@
   "Validates a signed message.
    Takes a message containing :payload, :sender (hex), and :signature.
    When :burn-amount is present, verifies signature against payload bound with :burn-amount.
+   Supports shell-boundary pre-verification (:crypto/verified? true).
    Returns the message if the signature is valid, nil otherwise."
   [message]
-  (try
-    (let [payload (:payload message)
-          burn-amount (:burn-amount message)
-          sign-payload (signing-bytes payload burn-amount)
-          sender-pub-key (basalt/hex->bytes ^String (:sender message))
-          signature (:signature message)]
-      (if (crypto/verify sender-pub-key sign-payload signature)
-        message
-        nil))
-    (catch Exception _
-      nil)))
+  (if (:crypto/verified? message)
+    message
+    (try
+      (let [payload (:payload message)
+            burn-amount (:burn-amount message)
+            sign-payload (signing-bytes payload burn-amount)
+            sender-pub-key (basalt/hex->bytes ^String (:sender message))
+            signature (:signature message)]
+        (if (crypto/verify sender-pub-key sign-payload signature)
+          message
+          nil))
+      (catch #?(:clj Exception :cljs :default) _
+        nil))))
 
 (defn sign-control-frame
   "Signs a canonical control payload for frame-type and message-id.
    Returns a map containing :sender (hex), :message-id, :frame-type, and :signature."
   [frame-type message-id private-key public-key]
-  (let [payload (.getBytes (pr-str {:type frame-type :message-id message-id}) "UTF-8")
+  (let [frame-payload {:type frame-type :message-id message-id}
         priv-bytes (to-bytes private-key)
         pub-hex (if (string? public-key) public-key (basalt/bytes->hex public-key))
-        sig (crypto/sign priv-bytes payload)]
+        sig (crypto/sign-canonical priv-bytes frame-payload)]
     {:sender pub-hex
      :message-id message-id
      :frame-type frame-type
@@ -81,31 +82,31 @@
 (defn validate-control-frame
   "Validates the sender's Ed25519 signature on an incoming control frame event against expected-type.
    If :signature is present, it MUST be cryptographically valid for (:sender event).
+   Supports N/N-1 canonical Fressian with legacy pr-str fallback and shell-boundary pre-verification.
    If require-signed? is true, missing signatures are rejected."
   ([event expected-type]
    (validate-control-frame event expected-type false))
   ([event expected-type require-signed?]
-   (try
-     (let [sender (:sender event)
-           sig (:signature event)
-           mid (:message-id event)
-           payload (:payload event)]
-       (cond
-         (some? sig)
-         (and (some? sender)
-              (or (some? mid) (some? payload))
-              (let [sender-bytes (to-bytes sender)
-                    sig-bytes (to-bytes sig)
-                    payload-bytes (if payload
-                                    (to-bytes payload)
-                                    (.getBytes (pr-str {:type expected-type :message-id mid}) "UTF-8"))]
-                (boolean (crypto/verify sender-bytes payload-bytes sig-bytes))))
+   (if (:crypto/verified? event)
+     true
+     (try
+       (let [sender (:sender event)
+             sig (:signature event)
+             mid (:message-id event)
+             payload (:payload event)]
+         (cond
+           (some? sig)
+           (and (some? sender)
+                (or (some? mid) (some? payload))
+                (let [sender-bytes (to-bytes sender)
+                      sig-bytes (to-bytes sig)
+                      target-payload (or payload {:type expected-type :message-id mid})]
+                  (boolean (crypto/verify-with-fallback sender-bytes target-payload sig-bytes))))
 
-         require-signed?
-         false
+           require-signed?
+           false
 
-         :else
-         true))
-     (catch Exception _
-       false))))
-
+           :else
+           true))
+       (catch #?(:clj Exception :cljs :default) _
+         false)))))

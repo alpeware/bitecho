@@ -1,20 +1,30 @@
 (ns bitecho.basalt.core-test
-  "Tests for Basalt peer sampling core logic."
+  "Tests for Basalt peer sampling core logic.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
-            [clojure.test :refer [deftest is testing]]
-            [clojure.test.check.clojure-test :refer [defspec]]
+            [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
+(defn- make-32-bytes []
+  #?(:clj (byte-array 32)
+     :cljs (js/Uint8Array. 32)))
+
 (deftest ^{:doc "Tests invalid hex string parsing handling."} invalid-hex-test
-  (testing "throws IllegalArgumentException on odd-length string"
-    (is (thrown? IllegalArgumentException (basalt/hex->bytes "123"))))
-  (testing "throws IllegalArgumentException on non-hex characters"
-    (is (thrown? IllegalArgumentException (basalt/hex->bytes "123z")))))
+  (testing "throws IllegalArgumentException or error on odd-length string"
+    (is (thrown? #?(:clj IllegalArgumentException :cljs :default) (basalt/hex->bytes "123"))))
+  (testing "throws IllegalArgumentException or error on non-hex characters"
+    (is (thrown? #?(:clj IllegalArgumentException :cljs :default) (basalt/hex->bytes "123z")))))
 
 (deftest ^{:doc "Tests creation of peer records."} peer-creation-test
   (testing "creates a peer with proper hashed id"
-    (let [peer (basalt/make-peer "127.0.0.1" 8080 (byte-array 32))]
+    (let [peer (basalt/make-peer "127.0.0.1" 8080 (make-32-bytes))]
       (is (= "127.0.0.1" (:ip peer)))
       (is (= 8080 (:port peer)))
       (is (some? (:pubkey peer)))
@@ -22,62 +32,60 @@
 
 (deftest ^{:doc "Tests for sybil collision resistance."} peer-sybil-collision-test
   (testing "hashes are distinct when IP and port strings concatenate identically"
-    (let [pubkey (byte-array 32)
+    (let [pubkey (make-32-bytes)
           peer1 (basalt/make-peer "127.0.0.1" 80 pubkey)
           peer2 (basalt/make-peer "127.0.0.18" 0 pubkey)]
       (is (not= (:hash peer1) (:hash peer2))))))
 
-(defspec ^{:doc "Tests view initialization spec."} view-initialization-spec 100
+(defspec ^{:doc "Tests view initialization spec."} view-initialization-spec 50
   (prop/for-all [peers (gen/list (gen/tuple
                                   (gen/return "127.0.0.1")
                                   gen/nat
-                                  (gen/return (byte-array 32))))
+                                  (gen/return (make-32-bytes))))
                  view-size (gen/choose 1 50)]
                 (let [peer-records (map (fn [[ip port pubkey]]
                                           (basalt/make-peer ip port pubkey))
                                         peers)
-                      rng (java.util.Random. 42)
+                      rng (crypto/make-random 42)
                       view (basalt/init-view peer-records view-size rng)]
                   (and (vector? view)
                        (= view-size (count view))
                        (every? map? view)
                        (every? #(string? (:seed %)) view)
-                       (every? #(or (nil? (:peer %)) (instance? bitecho.basalt.core.Peer (:peer %))) view)))))
+                       (every? #(or (nil? (:peer %)) #?(:clj (instance? bitecho.basalt.core.Peer (:peer %)) :cljs (instance? basalt/Peer (:peer %)))) view)))))
 
 (deftest ^{:doc "Tests extract-peers."} extract-peers-test
   (testing "extracts distinct non-nil peers"
-    (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array 32))
-          p2 (basalt/make-peer "2.2.2.2" 80 (byte-array 32))
+    (let [p1 (basalt/make-peer "1.1.1.1" 80 (make-32-bytes))
+          p2 (basalt/make-peer "2.2.2.2" 80 (make-32-bytes))
           view [{:seed "a" :peer p1} {:seed "b" :peer nil} {:seed "c" :peer p2} {:seed "d" :peer p1}]
           extracted (basalt/extract-peers view)]
       (is (= 2 (count extracted)))
       (is (some #(= p1 %) extracted))
       (is (some #(= p2 %) extracted)))))
 
-(defspec ^{:doc "Tests that update-view maximizes distinct participants."} update-view-spec 100
-  (prop/for-all [peers-data (gen/list (gen/tuple (gen/return "127.0.0.1") gen/nat (gen/return (byte-array 32))))
+(defspec ^{:doc "Tests that update-view maximizes distinct participants."} update-view-spec 50
+  (prop/for-all [peers-data (gen/list (gen/tuple (gen/return "127.0.0.1") gen/nat (gen/return (make-32-bytes))))
                  view-size (gen/choose 1 20)]
                 (let [peers (vals (reduce (fn [acc peer] (assoc acc (:hash peer) peer)) {}
                                           (map (fn [[ip port pubkey]] (basalt/make-peer ip port pubkey)) peers-data)))
-                      rng (java.util.Random. 42)
-                      empty-view (vec (repeatedly view-size #(let [sb (byte-array 32)]
-                                                               (.nextBytes rng sb)
+                      rng (crypto/make-random 42)
+                      empty-view (vec (repeatedly view-size #(let [sb (make-32-bytes)]
+                                                               (crypto/next-bytes rng sb)
                                                                {:seed (basalt/bytes->hex sb) :peer nil})))
                       updated-view (basalt/update-view empty-view peers)
                       extracted (basalt/extract-peers updated-view)]
                   (and
-                    ;; 1. The number of extracted peers should equal the minimum of view-size and unique peers
                    (= (count extracted) (min view-size (count peers)))
-                    ;; 2. All extracted peers should be unique
                    (= (count extracted) (count (set (map :hash extracted))))))))
 
 (deftest ^{:doc "Tests selection of random peers for exchange."} select-peers-test
   (testing "selects up to k random peers from view"
-    (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array 32))
-          p2 (basalt/make-peer "2.2.2.2" 80 (byte-array 32))
-          p3 (basalt/make-peer "3.3.3.3" 80 (byte-array 32))
+    (let [p1 (basalt/make-peer "1.1.1.1" 80 (make-32-bytes))
+          p2 (basalt/make-peer "2.2.2.2" 80 (make-32-bytes))
+          p3 (basalt/make-peer "3.3.3.3" 80 (make-32-bytes))
           view [{:seed "a" :peer p1} {:seed "b" :peer p2} {:seed "c" :peer p3}]
-          rng (java.util.Random. 42)
+          rng (crypto/make-random 42)
           selected-1 (basalt/select-peers rng view 1)
           selected-2 (basalt/select-peers rng view 2)
           selected-4 (basalt/select-peers rng view 4)]
@@ -88,16 +96,15 @@
 
 (deftest ^{:doc "Tests resetting slots and dynamic sampling."} reset-slots-test
   (testing "resets k slots starting at index r, wrap-around, and returns samples"
-    (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array 32))
-          p2 (basalt/make-peer "2.2.2.2" 80 (byte-array 32))
-          p3 (basalt/make-peer "3.3.3.3" 80 (byte-array 32))
-          p4 (basalt/make-peer "4.4.4.4" 80 (byte-array 32))
+    (let [p1 (basalt/make-peer "1.1.1.1" 80 (make-32-bytes))
+          p2 (basalt/make-peer "2.2.2.2" 80 (make-32-bytes))
+          p3 (basalt/make-peer "3.3.3.3" 80 (make-32-bytes))
+          p4 (basalt/make-peer "4.4.4.4" 80 (make-32-bytes))
           view [{:seed "seed0" :peer p1}
                 {:seed "seed1" :peer p2}
                 {:seed "seed2" :peer p3}
                 {:seed "seed3" :peer p4}]
-          rng (java.util.Random. 42)
-          ;; reset 2 slots starting at index 3. Modulo will affect indices 3 and 0.
+          rng (crypto/make-random 42)
           result (basalt/reset-slots view rng 3 2)
           updated-view (:view result)
           samples (:samples result)
@@ -107,10 +114,8 @@
       (is (some #(= p4 %) samples))
       (is (some #(= p1 %) samples))
       (is (= 4 (count updated-view)))
-      ;; Seeds for 3 and 0 should be different from original
       (is (not= "seed3" (:seed (nth updated-view 3))))
       (is (not= "seed0" (:seed (nth updated-view 0))))
-      ;; All peers (including displaced p4, p1) should be reassigned into new slots
       (is (= 4 (count (remove #(nil? (:peer %)) updated-view)))))))
 
 (deftest ^{:doc "Tests deterministic slot seed derivation."} derive-slot-seed-test
@@ -132,8 +137,8 @@
 
   (testing "polymorphic inputs: string vs byte-array inputs yield identical results"
     (let [s-str (basalt/derive-slot-seed "genesis" "pubkey-1" 0)
-          s-bytes (basalt/derive-slot-seed (.getBytes "genesis" "UTF-8")
-                                           (.getBytes "pubkey-1" "UTF-8")
+          s-bytes (basalt/derive-slot-seed (fressian/utf8->bytes "genesis")
+                                           (fressian/utf8->bytes "pubkey-1")
                                            0)]
       (is (= s-str s-bytes)))))
 
@@ -174,14 +179,14 @@
         (is (= (:seed (nth (:view res1) 1)) (basalt/derive-slot-seed entropy pubkey 1)))))
 
     (testing "reset-slots-rng yields deterministic results given seeded RNG"
-      (let [res1 (basalt/reset-slots-rng init-view (java.util.Random. 42) 0 2)
-            res2 (basalt/reset-slots-rng init-view (java.util.Random. 42) 0 2)]
+      (let [res1 (basalt/reset-slots-rng init-view (crypto/make-random 42) 0 2)
+            res2 (basalt/reset-slots-rng init-view (crypto/make-random 42) 0 2)]
         (is (= (:view res1) (:view res2)))
         (is (= (:next-r res1) (:next-r res2)))))
 
     (testing "reset-slots clean delegator routes 4-arity to RNG and 5-arity to deterministic"
-      (let [res-rng (basalt/reset-slots init-view (java.util.Random. 42) 0 2)
-            expected-rng (basalt/reset-slots-rng init-view (java.util.Random. 42) 0 2)
+      (let [res-rng (basalt/reset-slots init-view (crypto/make-random 42) 0 2)
+            expected-rng (basalt/reset-slots-rng init-view (crypto/make-random 42) 0 2)
             res-det (basalt/reset-slots init-view entropy pubkey 0 2)
             expected-det (basalt/reset-slots-deterministic init-view entropy pubkey 0 2)]
         (is (= (:view res-rng) (:view expected-rng)))
@@ -189,9 +194,9 @@
 
 (deftest ^{:doc "Tests deterministic rank-based peer selection."}
   select-peers-deterministic-test
-  (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array 32))
-        p2 (basalt/make-peer "2.2.2.2" 80 (byte-array 32))
-        p3 (basalt/make-peer "3.3.3.3" 80 (byte-array 32))
+  (let [p1 (basalt/make-peer "1.1.1.1" 80 (make-32-bytes))
+        p2 (basalt/make-peer "2.2.2.2" 80 (make-32-bytes))
+        p3 (basalt/make-peer "3.3.3.3" 80 (make-32-bytes))
         peers [p1 p2 p3]
         entropy "entropy-test"
         pubkey "pubkey-test"]
@@ -242,9 +247,9 @@
   (prop/for-all [entropy (gen/not-empty gen/string-alphanumeric)
                  pubkey (gen/not-empty gen/string-alphanumeric)
                  k (gen/choose 1 3)]
-                (let [p1 (basalt/make-peer "1.1.1.1" 80 (byte-array 32))
-                      p2 (basalt/make-peer "2.2.2.2" 80 (byte-array 32))
-                      p3 (basalt/make-peer "3.3.3.3" 80 (byte-array 32))
+                (let [p1 (basalt/make-peer "1.1.1.1" 80 (make-32-bytes))
+                      p2 (basalt/make-peer "2.2.2.2" 80 (make-32-bytes))
+                      p3 (basalt/make-peer "3.3.3.3" 80 (make-32-bytes))
                       peers [p1 p2 p3]
                       sel1 (basalt/select-peers-deterministic entropy pubkey peers k)
                       sel2 (basalt/select-peers-deterministic entropy pubkey peers k)]

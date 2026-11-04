@@ -9,6 +9,7 @@
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
             [bitecho.economy.treasury :as treasury]
+            [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.core :as core]
             [bitecho.shell.identity :as identity]
@@ -321,15 +322,17 @@
                                  (sequential? p) (byte-array (map byte p))
                                  :else nil)]
                    (when p-bytes
-                     (let [p-str (try (String. ^bytes p-bytes StandardCharsets/UTF_8) (catch Exception _ nil))
-                           p-edn (try (when p-str
-                                        (edn/read-string {:default tagged-literal
-                                                          :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                                    'bitecho.economy.account.AccountState account/map->AccountState}}
-                                                         p-str))
-                                      (catch Exception _ nil))
-                           raw-transfer (when (and (map? p-edn) (:transfer p-edn))
-                                          (:transfer p-edn))
+                     (let [p-data (or (try (let [v (fressian/decode p-bytes)]
+                                             (when (or (map? v) (record? v)) v))
+                                           (catch Exception _ nil))
+                                      (try (when-let [p-str (try (String. ^bytes p-bytes StandardCharsets/UTF_8) (catch Exception _ nil))]
+                                             (edn/read-string {:default tagged-literal
+                                                               :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                                         'bitecho.economy.account.AccountState account/map->AccountState}}
+                                                              p-str))
+                                           (catch Exception _ nil)))
+                           raw-transfer (when (and (map? p-data) (:transfer p-data))
+                                          (:transfer p-data))
                            transfer-map (when raw-transfer
                                           (if (instance? clojure.lang.TaggedLiteral raw-transfer)
                                             (:form raw-transfer)
@@ -344,14 +347,12 @@
                                             (.getBytes ^String sig StandardCharsets/UTF_8))
                                           :else nil)
                            unsigned-tx (when (map? transfer-map)
-                                         (into (sorted-map) (dissoc transfer-map :signature)))
-                           tx-payload-bytes (when unsigned-tx
-                                              (.getBytes (pr-str unsigned-tx) StandardCharsets/UTF_8))]
+                                         (into (sorted-map) (dissoc transfer-map :signature)))]
                        (when (and (map? transfer-map)
                                   (= (:sender transfer-map) agent-pub-hex)
                                   (some? tx-sig-bytes)
-                                  (some? tx-payload-bytes)
-                                  (crypto/verify agent-pub-bytes tx-payload-bytes tx-sig-bytes))
+                                  (some? unsigned-tx)
+                                  (crypto/verify-with-fallback agent-pub-bytes unsigned-tx tx-sig-bytes))
                          (-> base-event
                              (dissoc :sender :sender-pubkey-bytes :rng)
                              (assoc :sender agent-pub-hex

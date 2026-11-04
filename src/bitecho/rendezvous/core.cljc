@@ -1,9 +1,12 @@
 (ns bitecho.rendezvous.core
-  "Multi-homed Callee registration, home node selection, and DeliveryAck vouchers."
+  "Multi-homed Callee registration, home node selection, and DeliveryAck vouchers.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]))
+            [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]))
 
-(defrecord DeliveryAck [callee home-node epoch offer-hash seq cumulative-debit signature])
+(defrecord ^{:doc "Delivery acknowledgment voucher record."} DeliveryAck [callee home-node epoch offer-hash seq cumulative-debit signature])
 
 (defn normalize-home-node
   "Normalizes a home-node identifier to a string (converting keywords/symbols via name, or non-nil values via str)."
@@ -18,23 +21,27 @@
   "Normalizes a byte array, vector of numbers, or hex string into a byte-array."
   [x]
   (cond
-    (bytes? x) x
-    (sequential? x) (byte-array (map byte x))
+    (fressian/bytes? x) x
+    (sequential? x) #?(:clj (byte-array (map byte x)) :cljs (js/Uint8Array. (clj->js x)))
     (string? x) (if (re-matches #"^[0-9a-fA-F]+$" x)
                   (basalt/hex->bytes x)
-                  (.getBytes ^String x "UTF-8"))
-    :else (byte-array 0)))
+                  (fressian/utf8->bytes x))
+    :else #?(:clj (byte-array 0) :cljs (js/Uint8Array. 0))))
+
+(defn ack-payload-data
+  "Extracts canonical payload tuple for DeliveryAck signature."
+  [ack]
+  [(:callee ack)
+   (:home-node ack)
+   (:epoch ack)
+   (:offer-hash ack)
+   (:seq ack)
+   (:cumulative-debit ack)])
 
 (defn- ack-payload-bytes
   "Extracts canonical payload bytes for DeliveryAck signature."
   [ack]
-  (let [canonical-data [(:callee ack)
-                        (:home-node ack)
-                        (:epoch ack)
-                        (:offer-hash ack)
-                        (:seq ack)
-                        (:cumulative-debit ack)]]
-    (.getBytes (pr-str canonical-data) "UTF-8")))
+  (crypto/canonical-signing-bytes (ack-payload-data ack)))
 
 (defn register-home-set
   "Registers a home set of nodes for Callee B.
@@ -134,32 +141,35 @@
                        :seq seq-num
                        :cumulative-debit cumulative-debit
                        :signature nil})
-        payload (ack-payload-bytes unsigned-ack)
-        sig (basalt/bytes->hex (crypto/sign (to-bytes privkey) payload))]
+        data (ack-payload-data unsigned-ack)
+        sig (basalt/bytes->hex (crypto/sign-canonical (to-bytes privkey) data))]
     (assoc unsigned-ack :signature sig)))
 
 (defn verify-delivery-ack
   "Verifies the cryptographic signature of a DeliveryAck.
+   Supports N/N-1 canonical Fressian with legacy pr-str fallback and shell-boundary pre-verification.
    Accepts [ack] (using (:callee ack) as public key) or [ack callee-pubkey]."
   ([ack]
    (verify-delivery-ack ack (:callee ack)))
   ([ack callee-pubkey]
-   (try
-     (let [pub-bytes (to-bytes (or callee-pubkey (:callee ack)))
-           sig-bytes (to-bytes (:signature ack))
-           verify-payload (fn [payload]
-                            (try
-                              (boolean (crypto/verify pub-bytes payload sig-bytes))
-                              (catch Exception _ false)))]
-       (boolean
-        (or (verify-payload (ack-payload-bytes ack))
-            (when (and (:home-node ack) (or (string? (:home-node ack)) (keyword? (:home-node ack))))
-              (let [norm (normalize-home-node (:home-node ack))
-                    kw (keyword norm)]
-                (or (verify-payload (ack-payload-bytes (assoc ack :home-node kw)))
-                    (verify-payload (ack-payload-bytes (assoc ack :home-node norm)))))))))
-     (catch Exception _
-       false))))
+   (if (:crypto/verified? ack)
+     true
+     (try
+       (let [pub-bytes (to-bytes (or callee-pubkey (:callee ack)))
+             sig-bytes (to-bytes (:signature ack))
+             verify-data (fn [data]
+                           (try
+                             (boolean (crypto/verify-with-fallback pub-bytes data sig-bytes))
+                             (catch #?(:clj Exception :cljs :default) _ false)))]
+         (boolean
+          (or (verify-data (ack-payload-data ack))
+              (when (and (:home-node ack) (or (string? (:home-node ack)) (keyword? (:home-node ack))))
+                (let [norm (normalize-home-node (:home-node ack))
+                      kw (keyword norm)]
+                  (or (verify-data (ack-payload-data (assoc ack :home-node kw)))
+                      (verify-data (ack-payload-data (assoc ack :home-node norm)))))))))
+       (catch #?(:clj Exception :cljs :default) _
+         false)))))
 
 (defn verify-ack-for-settlement
   "Verifies a DeliveryAck voucher for epoch boundary settlement.

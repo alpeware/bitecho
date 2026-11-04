@@ -2,6 +2,7 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}
         org.clojure/core.async {:mvn/version "1.9.829-alpha2"}
         org.clojure/data.json {:mvn/version "2.5.1"}
+        org.clojure/data.fressian {:mvn/version "1.1.0"}
         com.taoensso/nippy {:mvn/version "3.6.0"}
         alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
                                   :git/sha "2abeab82cfaa39fc2df4b9dfa047915794fa496b"}}
@@ -26,6 +27,10 @@
                              "--enable-native-access=ALL-UNNAMED"
                              "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                              "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]}
+           :test-cljs {:extra-paths ["test"]
+                       :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
+                                    org.clojure/test.check {:mvn/version "1.1.1"}}
+                       :main-opts ["-m" "bitecho.cljs-runner"]}
            :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.01.19"}
                                  org.clojure/test.check {:mvn/version "1.1.1"}}
                   :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "dev/bitecho/simulator"]}

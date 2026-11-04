@@ -1,21 +1,76 @@
 (ns bitecho.light-node.core
   "Pure Sans-IO protocol state reducer for the Bitecho light node.
    Handles command processing, sealed channel establishment, anti-replay,
-   epoch skew tolerance, and Wire/JSONL conversions without side effects."
+   epoch skew tolerance, and Wire/JSONL conversions without side effects.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.economy.bundle :as bundle]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
+            [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
-            [bitecho.shell.agent-sim :as agent-sim]
-            [bitecho.shell.mesh :as mesh]
-            [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.string :as str]
-            [taoensso.nippy :as nippy])
-  (:import (java.nio.charset StandardCharsets)))
+            #?(:cljs [bitecho.economy.account :as account])
+            #?(:cljs [bitecho.sieve.core :as sieve])
+            #?(:clj [bitecho.shell.agent-sim :as agent-sim])
+            #?(:clj [bitecho.shell.mesh :as mesh])
+            #?(:clj [clojure.data.json :as json])
+            #?(:clj [taoensso.nippy :as nippy])))
+
+(def ^:private bytes? fressian/bytes?)
+
+(def ^:private empty-bytes
+  #?(:clj (byte-array 0)
+     :cljs (js/Uint8Array. 0)))
+
+(defn- math-abs [n]
+  #?(:clj (Math/abs (long n))
+     :cljs (js/Math.abs n)))
+
+(defn- math-ceil [n]
+  #?(:clj (long (Math/ceil (double n)))
+     :cljs (long (js/Math.ceil (double n)))))
+
+(defn- parse-json-str
+  ([s] (parse-json-str s false))
+  ([s keywordize?]
+   (try
+     #?(:clj (json/read-str s :key-fn (if keywordize? keyword identity))
+        :cljs (let [obj (js/JSON.parse s)]
+                (js->clj obj :keywordize-keys keywordize?)))
+     (catch #?(:clj Exception :cljs :default) _ nil))))
+
+(defn- nippy-payload? [b]
+  #?(:clj (and (bytes? b)
+               (>= (alength ^bytes b) 3)
+               (= (aget ^bytes b 0) (byte 0x4E))
+               (= (aget ^bytes b 1) (byte 0x50))
+               (= (aget ^bytes b 2) (byte 0x59)))
+     :cljs (boolean (and b false))))
+
+(defn- freeze-payload
+  "Encodes a wire payload using Nippy on JVM for backwards compatibility, and Canonical Fressian on CLJS."
+  [payload]
+  #?(:clj (nippy/freeze payload)
+     :cljs (fressian/encode-canonical payload)))
+
+(defn- thaw-payload
+  "Decodes a wire payload, checking for Nippy on JVM first, falling back to Canonical Fressian."
+  [payload-bytes]
+  (if (nippy-payload? payload-bytes)
+    #?(:clj (try (nippy/thaw payload-bytes)
+                 (catch Exception _ nil))
+       :cljs nil)
+    (or (try (let [v (fressian/decode payload-bytes)]
+               (when (or (map? v) (record? v)) v))
+             (catch #?(:clj Exception :cljs :default) _ nil))
+        #?(:clj (try (nippy/thaw payload-bytes)
+                     (catch Exception _ nil))
+           :cljs nil))))
 
 ;; -----------------------------------------------------------------------------
 ;; Wire Protocol Versioning & Rolling Upgrade Compatibility (FLAG B)
@@ -40,7 +95,73 @@
        (integer? remote-version)
        (<= min-supported-wire-version (long local-version) max-supported-wire-version)
        (<= min-supported-wire-version (long remote-version) max-supported-wire-version)
-       (<= (Math/abs (- (long local-version) (long remote-version))) 1)))
+       (<= (math-abs (- (long local-version) (long remote-version))) 1)))
+
+(defn- wrap-agent-event
+  ([event pubkey privkey]
+   (wrap-agent-event event pubkey privkey nil))
+  ([event pubkey privkey dac]
+   (if (or (nil? privkey) (= :defer-crypto privkey))
+     (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
+           effective-dac (or dac (:dac event))
+           base (cond-> {:protocol-version current-wire-version
+                         :agent-pubkey pubkey
+                         :event clean}
+                  effective-dac (assoc :dac effective-dac))]
+       (assoc base :crypto-effect {:effect :sign-and-emit
+                                   :sender pubkey
+                                   :signing-payload [pubkey clean]
+                                   :signature-field :signature
+                                   :envelope base}))
+     #?(:clj (mesh/wrap-agent-event event pubkey privkey dac)
+        :cljs (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
+                    sb (crypto/canonical-signing-bytes [pubkey clean])
+                    sig (crypto/sign privkey sb)
+                    sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
+                    effective-dac (or dac (:dac event))]
+                (cond-> {:protocol-version current-wire-version
+                         :agent-pubkey pubkey
+                         :event clean
+                         :signature sig-hex}
+                  effective-dac (assoc :dac effective-dac)))))))
+
+(defn- build-gossip-envelope
+  [sender-pub-hex sender-priv-bytes payload-bytes burn-amount]
+  #?(:clj (agent-sim/build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount)
+     :cljs (let [pub-bytes (if (fressian/bytes? sender-pub-hex) sender-pub-hex (basalt/hex->bytes sender-pub-hex))
+                 pub-hex (if (string? sender-pub-hex) sender-pub-hex (basalt/bytes->hex sender-pub-hex))
+                 sieve-msg (sieve/wrap-message payload-bytes sender-priv-bytes pub-bytes burn-amount)
+                 message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))
+                 agent-event {:type :receive-gossip :message (assoc sieve-msg :message-id message-id)}]
+             (wrap-agent-event agent-event pub-hex sender-priv-bytes))))
+
+(defn- build-home-set-envelope
+  ([agent-pub-hex agent-priv-bytes candidates price epoch]
+   (build-home-set-envelope agent-pub-hex agent-priv-bytes candidates price epoch nil nil))
+  ([agent-pub-hex agent-priv-bytes candidates price epoch ice-ufrag ice-pwd]
+   #?(:clj (agent-sim/build-home-set-envelope agent-pub-hex agent-priv-bytes candidates price epoch ice-ufrag ice-pwd)
+      :cljs (let [candidate-maps (mapv (fn [c] (if (map? c) (assoc c :price (or (:price c) price)) {:node-id c :price price})) candidates)
+                  event (cond-> {:type :register-home-set
+                                 :callee agent-pub-hex
+                                 :candidates candidate-maps
+                                 :price price
+                                 :price-max price
+                                 :epoch epoch}
+                          (and ice-ufrag ice-pwd) (assoc :ice-ufrag ice-ufrag :ice-pwd ice-pwd))]
+              (wrap-agent-event event agent-pub-hex agent-priv-bytes)))))
+
+(defn- build-transfer-gossip-envelope
+  [sender-pub-hex sender-priv-bytes transfer-opts burn-amount]
+  #?(:clj (agent-sim/build-transfer-gossip-envelope sender-pub-hex sender-priv-bytes transfer-opts burn-amount)
+     :cljs (let [unsigned (assoc transfer-opts :sender sender-pub-hex)
+                 signed-transfer (account/create-transfer sender-priv-bytes unsigned)
+                 transfer-map (into {} signed-transfer)
+                 payload-bytes (fressian/encode-canonical {:transfer transfer-map})
+                 envelope (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount)
+                 thash (account/transfer-hash signed-transfer)]
+             {:envelope envelope
+              :transfer signed-transfer
+              :transfer-hash thash})))
 
 (defn check-wire-version-compatibility
   "Pure function inspecting a wire payload or message map for protocol version compatibility.
@@ -142,8 +263,8 @@
                   (str/starts-with? (str/lower-case t) "302a300506032b6570032100"))
          (try
            (let [b (basalt/hex->bytes t)]
-             (and (some? b) (= 44 (alength ^bytes b))))
-           (catch Exception _ false)))))))
+             (and (some? b) (= 44 (fressian/count-bytes b))))
+           (catch #?(:clj Exception :cljs :default) _ false)))))))
 
 (defn normalize-pubkey-hex
   "Returns lower-case trimmed pubkey hex string when valid-pubkey-hex?, else nil."
@@ -305,8 +426,8 @@
                            (normalize-pubkey-hex prev-pk))
                canonical-str (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
                                   (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
-               pub-bytes (try (basalt/hex->bytes norm-pub) (catch Exception _ nil))
-               sig-bytes (try (basalt/hex->bytes (:pop-signature pop-m)) (catch Exception _ nil))
+               pub-bytes (try (basalt/hex->bytes norm-pub) (catch #?(:clj Exception :cljs :default) _ nil))
+               sig-bytes (try (basalt/hex->bytes (:pop-signature pop-m)) (catch #?(:clj Exception :cljs :default) _ nil))
                pop-valid? (boolean (and pub-bytes sig-bytes
                                         (crypto/verify pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes)))]
            (if-not pop-valid?
@@ -318,12 +439,12 @@
                                           (not (str/blank? rot-sig))
                                           norm-prev
                                           (not= norm-prev norm-pub))
-                     prev-pub-bytes (when rot-keys-valid? (try (basalt/hex->bytes norm-prev) (catch Exception _ nil)))
-                     rot-sig-bytes (when rot-keys-valid? (try (basalt/hex->bytes rot-sig) (catch Exception _ nil)))]
+                     prev-pub-bytes (when rot-keys-valid? (try (basalt/hex->bytes norm-prev) (catch #?(:clj Exception :cljs :default) _ nil)))
+                     rot-sig-bytes (when rot-keys-valid? (try (basalt/hex->bytes rot-sig) (catch #?(:clj Exception :cljs :default) _ nil)))]
                  (boolean (and prev-pub-bytes rot-sig-bytes
                                (crypto/verify prev-pub-bytes (.getBytes canonical-str "UTF-8") rot-sig-bytes))))
                true))))))
-    (catch Exception _ false)))
+    (catch #?(:clj Exception :cljs :default) _ false)))
 
 (defn sign-directory-descriptor
   "Signs a directory attestation descriptor under a directory authority key after verifying PoP.
@@ -431,8 +552,8 @@
               canonical-str (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
                                  (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
                                  (or norm-prev "") "|" pop-sig "|" rot-sig)
-              dir-pub-bytes (try (basalt/hex->bytes (normalize-pubkey-hex trusted-directory-pubkey)) (catch Exception _ nil))
-              dir-sig-bytes (try (basalt/hex->bytes (:directory-signature desc)) (catch Exception _ nil))]
+              dir-pub-bytes (try (basalt/hex->bytes (normalize-pubkey-hex trusted-directory-pubkey)) (catch #?(:clj Exception :cljs :default) _ nil))
+              dir-sig-bytes (try (basalt/hex->bytes (:directory-signature desc)) (catch #?(:clj Exception :cljs :default) _ nil))]
           (if-not (and dir-pub-bytes dir-sig-bytes
                        (crypto/verify dir-pub-bytes (.getBytes canonical-str "UTF-8") dir-sig-bytes))
             {:ok? false :valid? false :error "invalid-directory-signature"}
@@ -452,7 +573,7 @@
                                    norm-prev (assoc :prev-pubkey norm-prev)
                                    (seq rot-sig) (assoc :rotation-signature rot-sig))]
               {:ok? true :valid? true :descriptor canonical-desc})))))
-    (catch Exception _ {:ok? false :valid? false :error "malformed-descriptor"})))
+    (catch #?(:clj Exception :cljs :default) _ {:ok? false :valid? false :error "malformed-descriptor"})))
 
 (defn parse-directory-descriptor-text
   "Extracts and parses a directory descriptor map from raw JSON, raw EDN,
@@ -463,17 +584,17 @@
     (let [fenced-match (re-find #"(?s)```(?:json)?\s*([\s\S]*?)\s*```" text)
           candidate (if fenced-match (str/trim (second fenced-match)) (str/trim text))]
       (or (try
-            (let [parsed (json/read-str candidate :key-fn keyword)]
+            (let [parsed (parse-json-str candidate true)]
               (when (and (map? parsed)
                          (or (:nickname parsed) (:pubkey parsed) (= (:bitecho/type parsed) "directory-descriptor")))
                 parsed))
-            (catch Exception _ nil))
+            (catch #?(:clj Exception :cljs :default) _ nil))
           (try
             (let [parsed (edn/read-string candidate)]
               (when (and (map? parsed)
                          (or (:nickname parsed) (:pubkey parsed) (= (:bitecho/type parsed) :directory-descriptor)))
                 parsed))
-            (catch Exception _ nil))))))
+            (catch #?(:clj Exception :cljs :default) _ nil))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Delegated Agent Certificates (DACs: Anchor Key -> Hot Agent Key)
@@ -564,11 +685,11 @@
                dac-id (:dac-id rev)
                rev-ep (long (or (:revoked-epoch rev) 0))
                canonical-str (str "bitecho-dac-revoke-v1|" norm-anchor "|" norm-agent "|" dac-id "|" rev-ep)
-               pub-bytes (try (basalt/hex->bytes norm-anchor) (catch Exception _ nil))
-               sig-bytes (try (basalt/hex->bytes (:signature rev)) (catch Exception _ nil))]
+               pub-bytes (try (basalt/hex->bytes norm-anchor) (catch #?(:clj Exception :cljs :default) _ nil))
+               sig-bytes (try (basalt/hex->bytes (:signature rev)) (catch #?(:clj Exception :cljs :default) _ nil))]
            (and pub-bytes sig-bytes
                 (crypto/verify pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes))))))
-    (catch Exception _ false)))
+    (catch #?(:clj Exception :cljs :default) _ false)))
 
 (defn verify-dac
   "Verifies a Delegated Agent Certificate (DAC) against expected agent key, epoch, revocations, and scope.
@@ -631,8 +752,8 @@
             {:ok? false :valid? false :error "dac-scope-not-permitted"}
             (let [canonical-str (str "bitecho-dac-v1|" norm-anchor "|" norm-agent "|" iss-ep "|" exp-ep "|" max-spend "|" (str/join "," sorted-scopes))
                   expected-id (basalt/bytes->hex (crypto/sha256 (.getBytes canonical-str "UTF-8")))
-                  anchor-pub-bytes (try (basalt/hex->bytes norm-anchor) (catch Exception _ nil))
-                  sig-bytes (try (basalt/hex->bytes (:signature d)) (catch Exception _ nil))]
+                  anchor-pub-bytes (try (basalt/hex->bytes norm-anchor) (catch #?(:clj Exception :cljs :default) _ nil))
+                  sig-bytes (try (basalt/hex->bytes (:signature d)) (catch #?(:clj Exception :cljs :default) _ nil))]
               (if-not (and (= (:dac-id d) expected-id)
                            anchor-pub-bytes sig-bytes
                            (crypto/verify anchor-pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes))
@@ -656,7 +777,7 @@
                    :expires-epoch exp-ep
                    :max-spend-per-epoch max-spend
                    :scopes sorted-scopes})))))))
-    (catch Exception _ {:ok? false :valid? false :error "malformed-dac"})))
+    (catch #?(:clj Exception :cljs :default) _ {:ok? false :valid? false :error "malformed-dac"})))
 
 ;; -----------------------------------------------------------------------------
 ;; Milestone 5 (Pillar B): In-Band Authenticated Chain State Snapshot Protocol
@@ -669,7 +790,11 @@
    (cond
      (integer? v) (long v)
      (number? v) (long v)
-     (string? v) (try (Long/parseLong (str/trim v)) (catch Exception _ default-val))
+     (string? v) (try
+                   #?(:clj (Long/parseLong (str/trim v))
+                      :cljs (let [n (js/parseInt (str/trim v) 10)]
+                              (if (js/isNaN n) default-val n)))
+                   (catch #?(:clj Exception :cljs :default) _ default-val))
      :else default-val)))
 
 (defn- canonical-escrow-entry-str
@@ -728,7 +853,7 @@
    Returns snapshot with :bitecho/type :chain-state-snapshot, :type :chain-state-snapshot, and :signature hex."
   [snapshot ^bytes validator-privkey-bytes]
   (let [canonical-str (canonical-chain-state-snapshot-str snapshot)
-        sig-bytes (crypto/sign validator-privkey-bytes (.getBytes canonical-str StandardCharsets/UTF_8))]
+        sig-bytes (crypto/sign validator-privkey-bytes (.getBytes canonical-str "UTF-8"))]
     (assoc snapshot
            :protocol-version current-wire-version
            :bitecho/type :chain-state-snapshot
@@ -775,11 +900,11 @@
     (let [val-pub (or (:validator-pubkey snapshot) (get snapshot "validator_pubkey"))
           sig (or (:signature snapshot) (get snapshot "signature"))
           canonical-str (canonical-chain-state-snapshot-str snapshot)
-          val-pub-bytes (try (basalt/hex->bytes val-pub) (catch Exception _ nil))
-          sig-bytes (try (basalt/hex->bytes sig) (catch Exception _ nil))
+          val-pub-bytes (try (basalt/hex->bytes val-pub) (catch #?(:clj Exception :cljs :default) _ nil))
+          sig-bytes (try (basalt/hex->bytes sig) (catch #?(:clj Exception :cljs :default) _ nil))
           valid? (and val-pub-bytes sig-bytes
-                      (try (crypto/verify val-pub-bytes (.getBytes canonical-str StandardCharsets/UTF_8) sig-bytes)
-                           (catch Exception _ false)))]
+                      (try (crypto/verify val-pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes)
+                           (catch #?(:clj Exception :cljs :default) _ false)))]
       (if valid?
         (let [raw-escrows (or (:escrows snapshot) (get snapshot "escrows") [])
               escrows-vec (if (map? raw-escrows) (vals raw-escrows) (vec raw-escrows))
@@ -847,7 +972,7 @@
         total-n (if (seq trusted) (count trusted) (count unique-snaps))
         quorum-size (long (or (:quorum-size opts)
                               (if (pos? total-n)
-                                (long (Math/ceil (/ (* 2.0 total-n) 3.0)))
+                                (math-ceil (/ (* 2.0 total-n) 3.0))
                                 1)))]
     (if (empty? unique-snaps)
       {:ok? false :error "empty-snapshots"}
@@ -937,11 +1062,13 @@
    opts can be a map (e.g. {:nonce ... :epoch ...}) or a string nonce."
   [pubkey-hex ^bytes privkey-bytes opts]
   (let [opts-map (if (map? opts) opts {:nonce (str opts)})
+        epoch-val (long (or (:epoch opts-map) 0))
+        default-nonce (str "qcs-" epoch-val "-" (subs (str pubkey-hex) 0 (min 16 (count (str pubkey-hex)))))
         payload {:type :query-chain-state
                  :pubkey pubkey-hex
-                 :epoch (long (or (:epoch opts-map) 0))
-                 :nonce (or (:nonce opts-map) (str (System/currentTimeMillis)))}]
-    (mesh/wrap-agent-event payload pubkey-hex privkey-bytes)))
+                 :epoch epoch-val
+                 :nonce (or (:nonce opts-map) default-nonce)}]
+    (wrap-agent-event payload pubkey-hex privkey-bytes)))
 
 (defn- resolve-session-id
   "Resolves a session id from cmd-map or counterparty identifier (petname/pubkey).
@@ -1055,8 +1182,8 @@
                 curr-epoch (:epoch state)
                 ice-ufrag (get-in state [:ice-creds :ufrag])
                 ice-pwd (get-in state [:ice-creds :pwd])
-                env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b curr-epoch ice-ufrag ice-pwd)
-                env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes requested-nodes p-b nil ice-ufrag ice-pwd)]
+                env-curr (build-home-set-envelope my-pub privkey-bytes requested-nodes p-b curr-epoch ice-ufrag ice-pwd)
+                env-nil (build-home-set-envelope my-pub privkey-bytes requested-nodes p-b nil ice-ufrag ice-pwd)]
             {:state (assoc state :home-set (:home-nodes hs))
              :response {"ok" true
                         "status" (name (:status hs :ok))
@@ -1071,8 +1198,8 @@
             curr-epoch (:epoch state)
             ice-ufrag (get-in state [:ice-creds :ufrag])
             ice-pwd (get-in state [:ice-creds :pwd])
-            env-curr (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b curr-epoch ice-ufrag ice-pwd)
-            env-nil (agent-sim/build-home-set-envelope my-pub privkey-bytes candidates p-b nil ice-ufrag ice-pwd)]
+            env-curr (build-home-set-envelope my-pub privkey-bytes candidates p-b curr-epoch ice-ufrag ice-pwd)
+            env-nil (build-home-set-envelope my-pub privkey-bytes candidates p-b nil ice-ufrag ice-pwd)]
         {:state (assoc state :home-set (:home-nodes hs))
          :response {"ok" true
                     "status" (name (:status hs :ok))
@@ -1259,7 +1386,7 @@
                                       :home-node home-node
                                       :signature sig-hex}
                                active-dac (assoc :dac active-dac))
-                gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze wire-payload) burn-amt)
+                gossip-env (build-gossip-envelope caller privkey-bytes (freeze-payload wire-payload) burn-amt)
                 outbound-entry {:offer-hash offer-hash
                                 :session-id session-id
                                 :caller caller
@@ -1318,7 +1445,7 @@
                      :epoch epoch
                      :delivery-ack (into {} signed-ack)
                      :signature sig-hex}
-        gossip-env (agent-sim/build-gossip-envelope callee privkey-bytes (nippy/freeze ack-payload) 500)
+        gossip-env (build-gossip-envelope callee privkey-bytes (freeze-payload ack-payload) 500)
         accept-entry {:callee-x25519-priv (:private kp-callee)
                       :callee-x25519-pub callee-x25519-pub
                       :caller caller
@@ -1432,7 +1559,7 @@
                                        :burn burn-amt
                                        :signature sig-hex}
                                 active-dac (assoc :dac active-dac))
-                gossip-env (agent-sim/build-gossip-envelope caller privkey-bytes (nippy/freeze offer-payload) burn-amt)
+                gossip-env (build-gossip-envelope caller privkey-bytes (freeze-payload offer-payload) burn-amt)
                 header-event {:type :receive-offer-header
                               :caller caller
                               :callee callee
@@ -1441,7 +1568,7 @@
                               :price price
                               :offer-hash offer-hash
                               :session-id session-id}
-                header-env (mesh/wrap-agent-event header-event caller privkey-bytes)
+                header-env (wrap-agent-event header-event caller privkey-bytes)
                 session-entry {:session-id session-id
                                :peer callee
                                :role :initiator
@@ -1516,7 +1643,7 @@
                             :epoch epoch
                             :delivery-ack delivery-ack
                             :signature sig-hex}
-            gossip-env (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze accept-payload) 500)
+            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload accept-payload) 500)
             session-entry {:session-id session-id
                            :peer caller
                            :role :responder
@@ -1555,7 +1682,7 @@
                             (:payload_hex cmd-map) (:payload-hex cmd-map))
             payload-bytes (cond (some? text) (.getBytes ^String text "UTF-8")
                                 (some? payload-hex) (basalt/hex->bytes payload-hex)
-                                :else (byte-array 0))
+                                :else empty-bytes)
             burn-amt (long (or (get cmd-map "burn") 500))
             seq-num (inc (:tx-seq session 0))
             sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (.getBytes session-id "UTF-8"))
@@ -1568,7 +1695,7 @@
                          :seq seq-num
                          :nonce (basalt/bytes->hex (:nonce sealed))
                          :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
-            gossip-env (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze msg-payload) burn-amt)
+            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt)
             max-outbox (long (or (:max-outbox-size state) 64))
             curr-outbox (or (:outbox session) {})
             curr-order (or (:outbox-order session) [])
@@ -1591,7 +1718,7 @@
          :response (cond-> {"ok" true
                             "session_id" session-id
                             "seq" seq-num
-                            "bytes_sent" (alength payload-bytes)
+                            "bytes_sent" (fressian/count-bytes payload-bytes)
                             "burn" burn-amt}
                      pname (assoc "peer_petname" pname))
          :net-envelopes [gossip-env]
@@ -1642,7 +1769,7 @@
                            :recipient (:peer session)
                            :epoch (long (or (:epoch session) (:epoch state) 0))
                            :signature sig-hex}
-            gossip-env (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze close-payload) 500)
+            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload close-payload) 500)
             closed-sess (-> session
                             (assoc :state "closed")
                             (dissoc :tx-key :rx-key :ephemeral-priv))
@@ -1835,13 +1962,13 @@
                                       (when (and acct (seq (:deps acct))) (:deps acct))
                                       (when-let [prev (:last-transfer-hash state)] [prev])
                                       []))
-                        res (agent-sim/build-transfer-gossip-envelope
+                        res (build-transfer-gossip-envelope
                              (:pubkey state)
                              privkey-bytes
                              {:receiver receiver :amount amount :seq seq-num :deps deps}
                              burn-amt)
                         deliver-payload (vec (.getBytes ^String (pr-str {:transfer (into {} (:transfer res))}) "UTF-8"))
-                        deliver-env (mesh/wrap-agent-event
+                        deliver-env (wrap-agent-event
                                      {:type :on-deliver
                                       :payload deliver-payload
                                       :message-id (:transfer-hash res)}
@@ -1904,7 +2031,7 @@
                                 (str "intent:" (:pubkey state) ":" receiver ":" amount ":" curr-ep ":" next-intent-seq))
                         take-amt (burn/calculate-settlement-take amount burn/default-settlement-take-bps)
                         net-amt (- amount take-amt)
-                        intent-env (mesh/wrap-agent-event
+                        intent-env (wrap-agent-event
                                     {:type :settle-intent
                                      :payer (:pubkey state)
                                      :receiver receiver
@@ -1939,7 +2066,7 @@
                       (get cmd-map "preimage") (:preimage cmd-map))
         deliverable-hash (cond
                            (and (string? raw-dh) (escrow/valid-deliverable-hash? raw-dh)) (escrow/normalize-hex raw-dh)
-                           (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (.getBytes ^String raw-deliv StandardCharsets/UTF_8)))
+                           (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (.getBytes ^String raw-deliv "UTF-8")))
                            :else nil)
         curr-ep (effective-chain-epoch state)
         raw-expires (or (get cmd-map "expires_epoch") (get cmd-map "expires-epoch")
@@ -1993,7 +2120,7 @@
                                                                     :current-epoch curr-ep
                                                                     :revoked-dac-ids (:revoked-dacs state)}))
                                            d))
-                            envelope (mesh/wrap-agent-event intent-payload (:pubkey state) privkey-bytes active-dac)
+                            envelope (wrap-agent-event intent-payload (:pubkey state) privkey-bytes active-dac)
                             local-escrow {:escrow-id escrow-id
                                           :payer (:pubkey state)
                                           :receiver receiver-pub
@@ -2042,7 +2169,7 @@
                                      :receipt-id (str "release:" escrow-id)}
                               preimage (assoc :preimage preimage)
                               final-sig (assoc :payer-signature final-sig))
-            envelope (mesh/wrap-agent-event release-payload (:pubkey state) privkey-bytes)
+            envelope (wrap-agent-event release-payload (:pubkey state) privkey-bytes)
             new-state (if local-escrow
                         (assoc-in state [:escrows escrow-id :status] :release-submitted)
                         state)]
@@ -2060,7 +2187,7 @@
                             :escrow-id escrow-id
                             :epoch (effective-chain-epoch state)
                             :receipt-id (str "refund:" escrow-id)}
-            envelope (mesh/wrap-agent-event refund-payload (:pubkey state) privkey-bytes)
+            envelope (wrap-agent-event refund-payload (:pubkey state) privkey-bytes)
             local-escrow (get-in state [:escrows escrow-id])
             new-state (if local-escrow
                         (assoc-in state [:escrows escrow-id :status] :refund-submitted)
@@ -2110,7 +2237,7 @@
                          [])
         compacted (->> raw-vouchers
                        (keep (fn [raw]
-                               (let [ack-map (if (instance? bitecho.rendezvous.core.DeliveryAck raw)
+                               (let [ack-map (if (record? raw)
                                                (into {} raw)
                                                {:callee (or (get raw "callee") (:callee raw))
                                                 :home-node (or (get raw "home_node") (get raw "home-node") (:home-node raw))
@@ -2119,7 +2246,7 @@
                                                 :seq (long (or (get raw "seq") (:seq raw) 0))
                                                 :cumulative-debit (long (or (get raw "cumulative_debit") (get raw "cumulative-debit") (:cumulative-debit raw) 0))
                                                 :signature (or (get raw "signature") (:signature raw))})
-                                     ack (try (rendezvous/map->DeliveryAck ack-map) (catch Exception _ nil))]
+                                     ack (try (rendezvous/map->DeliveryAck ack-map) (catch #?(:clj Exception :cljs :default) _ nil))]
                                  (when (and ack (rendezvous/verify-delivery-ack ack))
                                    ack))))
                        bundle/compact-vouchers)]
@@ -2128,7 +2255,7 @@
        :response {"ok" false "error" "no-valid-vouchers"}
        :net-envelopes []
        :stdout-events []}
-      (let [voucher-env (mesh/wrap-agent-event
+      (let [voucher-env (wrap-agent-event
                          {:type :submit-vouchers
                           :vouchers (mapv #(into {} %) compacted)
                           :epoch (effective-chain-epoch state)}
@@ -2348,7 +2475,7 @@
                           (if (bytes? prev-sk-raw)
                             prev-sk-raw
                             (basalt/hex->bytes prev-sk-raw))
-                          (catch Exception _ nil)))]
+                          (catch #?(:clj Exception :cljs :default) _ nil)))]
     (if-not (valid-petname? nick)
       {:state state
        :response {"ok" false "error" "invalid-nickname"}
@@ -2527,7 +2654,7 @@
 (defn- unwrap-wire-message [raw-payload-or-event]
   (cond
     (bytes? raw-payload-or-event)
-    (if-let [thawed (try (nippy/thaw raw-payload-or-event) (catch Exception _ nil))]
+    (if-let [thawed (try (thaw-payload raw-payload-or-event) (catch #?(:clj Exception :cljs :default) _ nil))]
       (recur thawed)
       nil)
 
@@ -2542,7 +2669,7 @@
     (let [ver (or (:protocol-version raw-payload-or-event) (get raw-payload-or-event "protocol_version"))
           p (:payload (:message raw-payload-or-event))
           unwrapped (if (bytes? p)
-                      (unwrap-wire-message (try (nippy/thaw p) (catch Exception _ nil)))
+                      (unwrap-wire-message (try (thaw-payload p) (catch #?(:clj Exception :cljs :default) _ nil)))
                       (if (map? p) (unwrap-wire-message p) nil))]
       (if (and (map? unwrapped) ver (not (contains? unwrapped :protocol-version)) (not (contains? unwrapped "protocol_version")))
         (assoc unwrapped :protocol-version ver)
@@ -2576,8 +2703,8 @@
                  (or (nil? (:price msg)) (integer? (:price msg)))
                  (= (normalize-pubkey-hex (:callee msg)) (normalize-pubkey-hex (:pubkey state))))
       {:state state :net-envelopes [] :stdout-events []}
-      (let [caller-pub (try (basalt/hex->bytes (:caller msg)) (catch Exception _ nil))
-            sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+      (let [caller-pub (try (basalt/hex->bytes (:caller msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+            sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
             expected-sid (compute-session-id (:caller msg) (:callee msg) (:caller-ephemeral-pub msg))
             expected-hash-legacy (compute-offer-hash msg)
             expected-hash-sealed (sealed/offer-hash msg)
@@ -2638,7 +2765,7 @@
                 {:state (assoc-in state [:pending-offers sid] clean-offer)
                  :net-envelopes []
                  :stdout-events [event]}))))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn- handle-wire-accept [state msg]
@@ -2664,8 +2791,8 @@
           {:state state :net-envelopes [] :stdout-events []}
 
           :else
-          (let [callee-pub (try (basalt/hex->bytes (:callee msg)) (catch Exception _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+          (let [callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 valid-ack? (rendezvous/verify-delivery-ack (:delivery-ack msg) (:callee msg))
                 valid-sig? (and callee-pub sig-bytes
                                 (crypto/verify callee-pub
@@ -2673,7 +2800,7 @@
                                                sig-bytes))]
             (if-not (and valid-ack? valid-sig?)
               {:state state :net-envelopes [] :stdout-events []}
-              (let [callee-eph (try (basalt/hex->bytes (:callee-ephemeral-pub msg)) (catch Exception _ nil))
+              (let [callee-eph (try (basalt/hex->bytes (:callee-ephemeral-pub msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                     shared-sec (when callee-eph (sealed/x25519-shared-secret (:ephemeral-priv session) callee-eph))]
                 (if-not shared-sec
                   {:state state :net-envelopes [] :stdout-events []}
@@ -2701,7 +2828,7 @@
                     {:state new-state
                      :net-envelopes []
                      :stdout-events [event]}))))))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn- advance-contiguous-rx-seq
@@ -2737,7 +2864,7 @@
                         :acked-seq msg-seq
                         :seen-seqs seen-vec
                         :signature sig-hex}]
-       (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze ack-payload) 100)))))
+       (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload ack-payload) 100)))))
 
 (defn- handle-wire-sealed-msg [state msg privkey-bytes]
   (try
@@ -2755,7 +2882,7 @@
           (let [chk (sealed/check-and-advance-replay-window (:replay-window session) (:seq msg))]
             (cond
               (:accepted? chk)
-              (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch Exception _ nil))
+              (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                     decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (.getBytes session-id "UTF-8")))]
                 (if-not decrypted
                   {:state state :net-envelopes [] :stdout-events []}
@@ -2765,7 +2892,7 @@
                                                                   (:highest-seq (:window chk) 0))
                         seen-seqs (vec (sort (:seen (:window chk))))
                         ack-env (build-session-ack-envelope state session-id (:sender msg) new-contiguous (:seq msg) seen-seqs privkey-bytes)
-                        text (try (String. ^bytes decrypted "UTF-8") (catch Exception _ nil))
+                        text (try (fressian/bytes->utf8 decrypted) (catch #?(:clj Exception :cljs :default) _ nil))
                         sender-pname (pubkey->petname state (:sender msg))
                         inbox-item {:session-id session-id
                                     :session_id session-id
@@ -2792,7 +2919,7 @@
                      :stdout-events [event]})))
 
               (= :replayed-seq (:error chk))
-              (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch Exception _ nil))
+              (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                     decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (.getBytes session-id "UTF-8")))]
                 (if-not decrypted
                   {:state state :net-envelopes [] :stdout-events []}
@@ -2806,7 +2933,7 @@
 
               :else
               {:state state :net-envelopes [] :stdout-events []})))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn- handle-wire-session-ack [state msg]
@@ -2825,8 +2952,8 @@
                      (= "open" (:state session))
                      (= (:sender msg) (:peer session)))
           {:state state :net-envelopes [] :stdout-events []}
-          (let [peer-pub (try (basalt/hex->bytes (:peer session)) (catch Exception _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+          (let [peer-pub (try (basalt/hex->bytes (:peer session)) (catch #?(:clj Exception :cljs :default) _ nil))
+                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 ack-seq (long (or (:ack-seq msg) 0))
                 acked-seq (long (or (:acked-seq msg) 0))
                 seen-vec (vec (sort (or (:seen-seqs msg) [])))
@@ -2855,7 +2982,7 @@
                 {:state new-state
                  :net-envelopes []
                  :stdout-events []}))))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn build-unacked-replay-envelopes
@@ -2883,7 +3010,7 @@
             env
             (let [msg (:msg-payload item)
                   burn (or (:burn item) 500)]
-              (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze msg) burn)))))))))
+              (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg) burn)))))))))
 
 (defn- handle-wire-close [state msg]
   (try
@@ -2896,8 +3023,8 @@
             session (get-in state [:sessions session-id])]
         (if-not (and session (not= "closed" (:state session)))
           {:state state :net-envelopes [] :stdout-events []}
-          (let [sender-pub (try (basalt/hex->bytes (:sender msg)) (catch Exception _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+          (let [sender-pub (try (basalt/hex->bytes (:sender msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 valid-sig? (and sender-pub sig-bytes
                                 (crypto/verify sender-pub (.getBytes (str "close-" session-id) "UTF-8") sig-bytes))]
             (if-not valid-sig?
@@ -2912,7 +3039,7 @@
                 {:state new-state
                  :net-envelopes []
                  :stdout-events [event]}))))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn- handle-wire-rendezvous-header
@@ -2949,8 +3076,8 @@
           (let [dac-id (when (and wire-dac (:ok? dac-check))
                          (or (:dac-id (:dac dac-check)) (get (:dac dac-check) "dac_id")))
                 header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn topic home-node dac-id)
-                caller-pub (try (basalt/hex->bytes caller) (catch Exception _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+                caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
+                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 valid-sig? (and caller-pub sig-bytes
                                 (crypto/verify caller-pub (.getBytes header-str "UTF-8") sig-bytes))]
             (if-not valid-sig?
@@ -2980,7 +3107,7 @@
                       {:state (assoc-in state [:pending-rendezvous offer-hash] clean-header)
                        :net-envelopes []
                        :stdout-events [header-evt]})))))))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn- handle-wire-rendezvous-ack
@@ -3012,14 +3139,14 @@
                 callee-x25519 (:callee-x25519 msg)
                 epoch (long (:epoch msg))
                 ack-str (canonical-rendezvous-ack-str (:caller msg) (:callee msg) offer-hash callee-x25519 epoch ack-sig)
-                callee-pub (try (basalt/hex->bytes (:callee msg)) (catch Exception _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+                callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-valid? (and callee-pub sig-bytes
                                 (crypto/verify callee-pub (.getBytes ack-str "UTF-8") sig-bytes))]
             (if-not (and ack-valid? sig-valid?)
               {:state state :net-envelopes [] :stdout-events []}
               (let [session-id (:session-id outbound)
-                    callee-eph (try (basalt/hex->bytes callee-x25519) (catch Exception _ nil))
+                    callee-eph (try (basalt/hex->bytes callee-x25519) (catch #?(:clj Exception :cljs :default) _ nil))
                     keys (when callee-eph
                            (sealed/derive-session-keys (:caller-x25519-priv outbound) callee-eph
                                                        (:caller outbound) (:callee outbound)
@@ -3039,7 +3166,7 @@
                                         :caller-x25519 (:caller-x25519-pub outbound)
                                         :epoch (:epoch state)
                                         :signature reveal-sig}
-                        reveal-env (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze reveal-payload) 500)
+                        reveal-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload reveal-payload) 500)
                         initial-text (:initial-text outbound)
                         [session-with-tx net-envs]
                         (if (and initial-text (not (str/blank? initial-text)))
@@ -3055,7 +3182,7 @@
                                              :seq seq-num
                                              :nonce (basalt/bytes->hex (:nonce sealed-m))
                                              :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
-                                msg-env (agent-sim/build-gossip-envelope (:pubkey state) privkey-bytes (nippy/freeze msg-payload) 500)]
+                                msg-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) 500)]
                             [{:session-id session-id
                               :peer (:callee outbound)
                               :role :initiator
@@ -3103,7 +3230,7 @@
                     {:state new-state
                      :net-envelopes net-envs
                      :stdout-events [est-evt]}))))))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn- handle-wire-rendezvous-reveal
@@ -3146,13 +3273,13 @@
             (if-not commitment-valid?
               {:state state :net-envelopes [] :stdout-events []}
               (let [reveal-str (canonical-rendezvous-reveal-str sid caller callee offer-hash caller-x25519 (long (:epoch msg)))
-                    caller-pub (try (basalt/hex->bytes caller) (catch Exception _ nil))
-                    sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch Exception _ nil))
+                    caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
+                    sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                     sig-valid? (and caller-pub sig-bytes
                                     (crypto/verify caller-pub (.getBytes reveal-str "UTF-8") sig-bytes))]
                 (if-not sig-valid?
                   {:state state :net-envelopes [] :stdout-events []}
-                  (let [caller-eph (try (basalt/hex->bytes caller-x25519) (catch Exception _ nil))
+                  (let [caller-eph (try (basalt/hex->bytes caller-x25519) (catch #?(:clj Exception :cljs :default) _ nil))
                         keys (when caller-eph
                                (sealed/derive-session-keys (:callee-x25519-priv pending) caller-eph
                                                            caller callee offer-hash :responder))]
@@ -3186,7 +3313,7 @@
                         {:state new-state
                          :net-envelopes []
                          :stdout-events [est-evt]}))))))))))
-    (catch Exception _
+    (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
 (defn handle-wire-chain-state-snapshot
@@ -3266,9 +3393,9 @@
                             (or sess-epoch msg-epoch))
                 skew-exceeded? (and (not= msg-type :chain-state-snapshot)
                                     msg-epoch ref-epoch
-                                    (> (Math/abs (- msg-epoch (long ref-epoch))) 2)
+                                    (> (math-abs (- msg-epoch (long ref-epoch))) 2)
                                     (or (nil? sess-epoch)
-                                        (> (Math/abs (- msg-epoch (long sess-epoch))) 2)))]
+                                        (> (math-abs (- msg-epoch (long sess-epoch))) 2)))]
             (if skew-exceeded?
               {:state state :net-envelopes [] :stdout-events []}
               (let [res (case msg-type
@@ -3297,9 +3424,9 @@
     (if (or (nil? trimmed) (str/blank? trimmed))
       {:state state :response {"ok" false "error" "empty-line"} :net-envelopes [] :stdout-events []}
       (try
-        (let [cmd-map (json/read-str trimmed)]
+        (let [cmd-map (parse-json-str trimmed)]
           (if (and (map? cmd-map) (contains? cmd-map "cmd"))
             (handle-command state cmd-map privkey-bytes)
             {:state state :response {"ok" false "error" "malformed-request"} :net-envelopes [] :stdout-events []}))
-        (catch Exception _
+        (catch #?(:clj Exception :cljs :default) _
           {:state state :response {"ok" false "error" "malformed-request"} :net-envelopes [] :stdout-events []})))))

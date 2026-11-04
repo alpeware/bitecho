@@ -1,9 +1,12 @@
 (ns bitecho.streamlet.core-test
   (:require [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]
             [bitecho.streamlet.core :as core]
             [clojure.set :as set]
-            [clojure.test :refer [deftest is testing]]
-            [clojure.test.check.clojure-test :refer [defspec]]
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
@@ -81,7 +84,7 @@
       ;; Verify signature
       (is (true? (crypto/verify
                   (:public keypair)
-                  (.getBytes ^String (:block-hash vote) "UTF-8")
+                  (fressian/utf8->bytes (:block-hash vote))
                   (core/hex->bytes (:voter-signature vote))))))))
 
 (deftest test-longest-notarized-parent-vote
@@ -168,16 +171,16 @@
         block-hash "test-block-hash"
 
         ;; valid vote from pub1
-        sig1 (crypto/sign priv1 (.getBytes block-hash "UTF-8"))
-        vote1 (core/->Vote block-hash 1 (#'core/bytes->hex sig1))
+        sig1 (crypto/sign priv1 (fressian/utf8->bytes block-hash))
+        vote1 (core/->Vote block-hash 1 (core/bytes->hex sig1))
 
         ;; valid vote from pub2
-        sig2 (crypto/sign priv2 (.getBytes block-hash "UTF-8"))
-        vote2 (core/->Vote block-hash 1 (#'core/bytes->hex sig2))
+        sig2 (crypto/sign priv2 (fressian/utf8->bytes block-hash))
+        vote2 (core/->Vote block-hash 1 (core/bytes->hex sig2))
 
         ;; invalid vote (wrong signature)
-        invalid-sig (crypto/sign priv2 (.getBytes "wrong-hash" "UTF-8"))
-        invalid-vote (core/->Vote block-hash 1 (#'core/bytes->hex invalid-sig))]
+        invalid-sig (crypto/sign priv2 (fressian/utf8->bytes "wrong-hash"))
+        invalid-vote (core/->Vote block-hash 1 (core/bytes->hex invalid-sig))]
 
     (testing "accumulate-vote rejects invalid signatures"
       (let [state {:block-votes {} :notarized-blocks #{}}
@@ -187,15 +190,15 @@
     (testing "accumulate-vote accepts valid signature but no notarization below threshold"
       (let [state {:block-votes {} :notarized-blocks #{}}
             new-state (core/accumulate-vote state vote1 pub1 3)]
-        (is (= #{(#'core/bytes->hex pub1)} (get-in new-state [:block-votes block-hash])))
+        (is (= #{(core/bytes->hex pub1)} (get-in new-state [:block-votes block-hash])))
         (is (= #{} (:notarized-blocks new-state)))))
 
     (testing "accumulate-vote notarizes block when threshold is reached"
-      (let [state {:block-votes {block-hash #{(#'core/bytes->hex pub1)}}
+      (let [state {:block-votes {block-hash #{(core/bytes->hex pub1)}}
                    :notarized-blocks #{}}
             ;; threshold for n=3 is 2
             new-state (core/accumulate-vote state vote2 pub2 3)]
-        (is (= #{(#'core/bytes->hex pub1) (#'core/bytes->hex pub2)} (get-in new-state [:block-votes block-hash])))
+        (is (= #{(core/bytes->hex pub1) (core/bytes->hex pub2)} (get-in new-state [:block-votes block-hash])))
         (is (= #{block-hash} (:notarized-blocks new-state)))))))
 
 (defn- build-test-chain
@@ -296,8 +299,8 @@
                        (nil? stale-genesis-vote)
                        shorter-ancestor-ok?))))
 
-(defn- test-bytes->hex [^bytes ba]
-  (apply str (map #(format "%02x" %) ba)))
+(defn- test-bytes->hex [ba]
+  (fressian/bytes->hex ba))
 
 (defn- setup-test-nodes [n]
   (let [pairs (repeatedly n crypto/generate-keypair)
@@ -348,7 +351,7 @@
               vote (:vote vote-cmd)]
           (is (= 1 (:epoch vote)))
           (is (true? (crypto/verify (:public proposer-kp)
-                                    (.getBytes ^String (:block-hash vote) "UTF-8")
+                                    (fressian/utf8->bytes (:block-hash vote))
                                     (core/hex->bytes (:voter-signature vote))))))))))
 
 (deftest test-handle-streamlet-event-tick-non-proposer
@@ -406,7 +409,7 @@
           (is (= :send-vote (:type cmd)))
           (is (= b-hash (:block-hash (:vote cmd))))
           (is (true? (crypto/verify (:public kp0)
-                                    (.getBytes ^String b-hash "UTF-8")
+                                    (fressian/utf8->bytes b-hash)
                                     (core/hex->bytes (:voter-signature (:vote cmd)))))))))
 
     (testing "proposal with unknown parent buffers into future-blocks"
@@ -434,7 +437,7 @@
         (is (empty? (:commands result)))))
 
     (testing "proposal with corrupted signature is rejected fail-closed"
-      (let [corrupted (assoc block :signature (core/bytes->hex (byte-array 64)))
+      (let [corrupted (assoc block :signature (core/bytes->hex #?(:clj (byte-array 64) :cljs (js/Uint8Array. 64))))
             event {:type :receive-propose :block corrupted :sender hex1}
             result (core/handle-streamlet-event state event)]
         (is (= state (:state result)))
@@ -485,7 +488,7 @@
                :voted-epochs #{1}}]
 
     (testing "receiving valid vote accumulates and notarizes at quorum (2 of 3)"
-      (let [sig1 (core/bytes->hex (crypto/sign (:private kp1) (.getBytes ^String b-hash "UTF-8")))
+      (let [sig1 (core/bytes->hex (crypto/sign (:private kp1) (fressian/utf8->bytes b-hash)))
             vote1 (core/->Vote b-hash 1 sig1)
             event {:type :receive-vote :vote vote1 :sender hex1}
             result (core/handle-streamlet-event state event)
@@ -495,7 +498,7 @@
 
     (testing "receiving vote for unknown block buffers into future-votes"
       (let [unknown-hash "some-unseen-block-hash"
-            sig2 (core/bytes->hex (crypto/sign (:private kp2) (.getBytes ^String unknown-hash "UTF-8")))
+            sig2 (core/bytes->hex (crypto/sign (:private kp2) (fressian/utf8->bytes unknown-hash)))
             vote2 (core/->Vote unknown-hash 1 sig2)
             event {:type :receive-vote :vote vote2 :sender hex2}
             result (core/handle-streamlet-event state event)
@@ -506,7 +509,7 @@
     (testing "receiving Sybil vote for known block is rejected fail-closed without modifying state"
       (let [sybil-kp (crypto/generate-keypair)
             sybil-hex (core/bytes->hex (:public sybil-kp))
-            sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (.getBytes ^String b-hash "UTF-8")))
+            sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (fressian/utf8->bytes b-hash)))
             sybil-vote (core/->Vote b-hash 1 sybil-sig)
             event {:type :receive-vote
                    :vote sybil-vote
@@ -520,7 +523,7 @@
       (let [sybil-kp (crypto/generate-keypair)
             sybil-hex (core/bytes->hex (:public sybil-kp))
             unknown-hash "unknown-hash-xyz"
-            sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (.getBytes ^String unknown-hash "UTF-8")))
+            sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (fressian/utf8->bytes unknown-hash)))
             sybil-vote (core/->Vote unknown-hash 1 sybil-sig)
             event {:type :receive-vote :vote sybil-vote :sender sybil-hex}
             result (core/handle-streamlet-event state event)]
@@ -596,7 +599,7 @@
                                    (let [final-st (reduce (fn [s v]
                                                             (let [sender-pk (first (filter (fn [hex]
                                                                                              (crypto/verify (get peers-map hex)
-                                                                                                            (.getBytes ^String b-hash "UTF-8")
+                                                                                                            (fressian/utf8->bytes b-hash)
                                                                                                             (core/hex->bytes (:voter-signature v))))
                                                                                            peer-hexes))]
                                                               (:state (core/handle-streamlet-event s {:type :receive-vote :vote v :sender sender-pk}))))
@@ -687,10 +690,10 @@
                                   :block-votes (if unknown-block? {} {b-hash #{(first peer-hexes)}})
                                   :notarized-blocks #{}
                                   :voted-epochs #{epoch}}
-                      honest-sig (core/bytes->hex (crypto/sign (:private honest-kp) (.getBytes ^String b-hash "UTF-8")))
+                      honest-sig (core/bytes->hex (crypto/sign (:private honest-kp) (fressian/utf8->bytes b-hash)))
                       honest-vote (core/->Vote b-hash epoch honest-sig)
                       honest-res (core/handle-streamlet-event base-state {:type :receive-vote :vote honest-vote :sender honest-hex})
-                      sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (.getBytes ^String b-hash "UTF-8")))
+                      sybil-sig (core/bytes->hex (crypto/sign (:private sybil-kp) (fressian/utf8->bytes b-hash)))
                       sybil-vote (core/->Vote b-hash epoch sybil-sig)
                       sybil-res (core/handle-streamlet-event base-state {:type :receive-vote :vote sybil-vote :sender sybil-hex})]
                   (and (not= base-state (:state honest-res))
@@ -795,7 +798,7 @@
               sig (gen/elements ["112233" "aabbcc" 123 :sig nil])]
       {:block-hash b-hash :epoch 1 :voter-signature sig})
     (gen/let [b-hash (gen/elements ["known-block-hash" "unknown-block-hash"])
-              sig (gen/elements [123 :sig-kw ["not" "hex"] (byte-array [1 2 3]) "abc" "zzzzzzzz" "xyz123" "1" "" nil])]
+              sig (gen/elements [123 :sig-kw ["not" "hex"] #?(:clj (byte-array [1 2 3]) :cljs (js/Uint8Array. #js [1 2 3])) "abc" "zzzzzzzz" "xyz123" "1" "" nil])]
       {:block-hash b-hash :epoch 1 :voter-signature sig})]))
 
 (defspec ^{:doc "Property: Streamlet reducer drops all malformed vote events fail-closed without throwing or altering state"}
@@ -828,7 +831,7 @@
                                   :voted-epochs #{epoch}}
                       event {:type :receive-vote :vote vote :sender sender-hex}
                       res (try (core/handle-streamlet-event base-state event)
-                               (catch Throwable e {:error e}))]
+                               (catch #?(:clj Throwable :cljs :default) e {:error e}))]
                   (and (not (contains? res :error))
                        (= base-state (:state res))
                        (= [] (:commands res))))))
@@ -908,7 +911,7 @@
                                                                                (let [pk (get-in s [:peers-map h])]
                                                                                  (and pk
                                                                                       (crypto/verify pk
-                                                                                                     (.getBytes ^String (:block-hash v) "UTF-8")
+                                                                                                     (fressian/utf8->bytes (:block-hash v))
                                                                                                      (core/hex->bytes (:voter-signature v))))))
                                                                              peer-hexes))]
                                                 (:state (core/handle-streamlet-event s {:type :receive-vote :vote v :sender voter-hex}))))
@@ -941,7 +944,7 @@
         voters (take threshold (map vector pairs peer-hexes))
         votes (into {}
                     (map (fn [[kp hex]]
-                           (let [sig-bytes (crypto/sign (:private kp) (.getBytes ^String b-hash "UTF-8"))
+                           (let [sig-bytes (crypto/sign (:private kp) (fressian/utf8->bytes b-hash))
                                  vote (core/->Vote b-hash epoch (core/bytes->hex sig-bytes))]
                              [hex vote]))
                          voters))]
@@ -1133,7 +1136,7 @@
                       voter-hex (nth peer-hexes voter-idx)
                       voter-kp (nth pairs voter-idx)
                       b-hash "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                      sig-bytes (crypto/sign (:private voter-kp) (.getBytes ^String b-hash "UTF-8"))
+                      sig-bytes (crypto/sign (:private voter-kp) (fressian/utf8->bytes b-hash))
                       vote (core/->Vote b-hash future-epoch (core/bytes->hex sig-bytes))
                       state {:epoch curr-epoch
                              :node-pubkey (first peer-hexes)
@@ -1154,7 +1157,7 @@
           b-hash (core/hash-block b)
           voter-kp (second pairs)
           voter-hex (second peer-hexes)
-          sig (crypto/sign (:private voter-kp) (.getBytes ^String b-hash "UTF-8"))
+          sig (crypto/sign (:private voter-kp) (fressian/utf8->bytes b-hash))
           vote (core/->Vote b-hash 1 (core/bytes->hex sig))
           init-state {:epoch 1
                       :node-pubkey (first peer-hexes)
@@ -1230,7 +1233,7 @@
     (testing "ancestor with quorum count but Sybil voter outside peers-map is rejected fail-closed"
       (let [sybil-kp (crypto/generate-keypair)
             sybil-hex (core/bytes->hex (:public sybil-kp))
-            sybil-sig (crypto/sign (:private sybil-kp) (.getBytes ^String h1 "UTF-8"))
+            sybil-sig (crypto/sign (:private sybil-kp) (fressian/utf8->bytes h1))
             sybil-vote (core/->Vote h1 1 (core/bytes->hex sybil-sig))
             sybil-votes {hex1 (get (:vote-proofs q-votes1) hex1)
                          sybil-hex sybil-vote}

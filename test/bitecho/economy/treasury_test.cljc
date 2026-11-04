@@ -1,12 +1,15 @@
 (ns bitecho.economy.treasury-test
   "Tests for demand-gated treasury minting, 20/80 split, and Genesis Bootstrap custody."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
             [bitecho.economy.attestation :as attestation]
             [bitecho.economy.treasury :as treasury]
-            [clojure.test :refer [deftest is testing]]
-            [clojure.test.check.clojure-test :refer [defspec]]
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
@@ -249,7 +252,7 @@
       (is (= 4200000000 (:balance (get ledger "custody-partners-pub"))))
       (is (= 4200000000 (:balance (get ledger "custody-ecosystem-pub"))))
       (is (= 18900000000 (reduce + (map :balance (vals ledger)))))
-      (is (every? #(instance? bitecho.economy.account.AccountState %) (vals ledger)))
+      (is (every? record? (vals ledger)))
       (is (every? #(= 0 (:seq %)) (vals ledger)))
       (is (every? #(= [] (:deps %)) (vals ledger)))))
 

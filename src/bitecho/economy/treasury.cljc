@@ -1,8 +1,11 @@
 (ns bitecho.economy.treasury
-  "Demand-gated minting (k = 0.5), 20/80 Streamlet-Mesh split, and Genesis Bootstrap custody."
+  "Demand-gated minting (k = 0.5), 20/80 Streamlet-Mesh split, and Genesis Bootstrap custody.
+   Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.fressian :as fressian]
             [clojure.string :as string]))
 
 (def default-k-bps
@@ -110,7 +113,8 @@
           (into {}
                 (keep (fn [[node weight]]
                         (let [w (max 0.0 (double (or weight 0.0)))
-                              share (long (Math/floor (/ (* (double safe-amt) w) total-weight)))]
+                              share (long #?(:clj (Math/floor (/ (* (double safe-amt) w) total-weight))
+                                             :cljs (js/Math.floor (/ (* (double safe-amt) w) total-weight))))]
                           (when (pos? share)
                             [node share])))
                       recipients))))
@@ -160,11 +164,9 @@
                                :amount req-amt
                                :seq next-seq
                                :deps deps}
-                  payload-bytes (.getBytes (pr-str (into (sorted-map) unsigned-tx)) "UTF-8")
-                  signature (crypto/sign custody-priv payload-bytes)
+                  signature (crypto/sign-canonical custody-priv unsigned-tx)
                   transfer (account/map->Transfer (assoc unsigned-tx :signature (vec signature)))
-                  safe-tx (assoc (into (sorted-map) transfer) :signature (basalt/bytes->hex signature))
-                  tx-hash (basalt/bytes->hex (crypto/sha256 (.getBytes (pr-str safe-tx) "UTF-8")))]
+                  tx-hash (account/transfer-hash transfer)]
               (recur (rest rem-allocs)
                      (- rem-balance req-amt)
                      next-seq
@@ -331,15 +333,13 @@
    Supports 3-arity (epoch and allocations) and 4-arity (binding mint-dust)."
   ([treasury-priv epoch allocations]
    (let [sorted-allocs (into (sorted-map) allocations)
-         payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")
          priv-bytes (if (string? treasury-priv) (basalt/hex->bytes treasury-priv) treasury-priv)
-         sig-bytes (crypto/sign priv-bytes payload-bytes)]
+         sig-bytes (crypto/sign-canonical priv-bytes [epoch sorted-allocs])]
      (basalt/bytes->hex sig-bytes)))
   ([treasury-priv epoch allocations mint-dust]
    (let [sorted-allocs (into (sorted-map) allocations)
-         payload-bytes (.getBytes (pr-str [epoch sorted-allocs mint-dust]) "UTF-8")
          priv-bytes (if (string? treasury-priv) (basalt/hex->bytes treasury-priv) treasury-priv)
-         sig-bytes (crypto/sign priv-bytes payload-bytes)]
+         sig-bytes (crypto/sign-canonical priv-bytes [epoch sorted-allocs mint-dust])]
      (basalt/bytes->hex sig-bytes))))
 
 (defn- normalize-key-hex
@@ -347,8 +347,9 @@
   [k]
   (cond
     (string? k) k
-    (bytes? k) (basalt/bytes->hex k)
-    (and (seqable? k) (seq k)) (basalt/bytes->hex (byte-array (map byte k)))
+    (fressian/bytes? k) (basalt/bytes->hex k)
+    (and (seqable? k) (seq k)) (basalt/bytes->hex #?(:clj (byte-array (map byte k))
+                                                     :cljs (js/Uint8Array. (clj->js k))))
     :else nil))
 
 (defn- blank-key-or-sig?
@@ -357,41 +358,43 @@
   (cond
     (nil? x) true
     (string? x) (string/blank? x)
-    (bytes? x) (zero? (alength ^bytes x))
+    (fressian/bytes? x) (zero? (fressian/count-bytes x))
     (seqable? x) (empty? x)
     :else false))
 
 (defn verify-mint-signature
   "Cryptographically verifies the treasury signature on epoch mint allocations,
-   optionally binding mint-dust into the signed payload."
+   optionally binding mint-dust into the signed payload.
+   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)."
   ([expected-pub sig epoch allocations]
    (try
      (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
            sig-bytes (cond
                        (string? sig) (basalt/hex->bytes sig)
-                       (bytes? sig) sig
-                       :else (byte-array (map byte sig)))
-           sorted-allocs (into (sorted-map) allocations)
-           payload-bytes (.getBytes (pr-str [epoch sorted-allocs]) "UTF-8")]
-       (boolean (crypto/verify pub-bytes payload-bytes sig-bytes)))
-     (catch Exception _
+                       (fressian/bytes? sig) sig
+                       :else #?(:clj (byte-array (map byte sig))
+                                :cljs (js/Uint8Array. (clj->js sig))))
+           sorted-allocs (into (sorted-map) allocations)]
+       (boolean (crypto/verify-with-fallback pub-bytes [epoch sorted-allocs] sig-bytes)))
+     (catch #?(:clj Exception :cljs :default) _
        false)))
   ([expected-pub sig epoch allocations mint-dust]
    (try
      (let [pub-bytes (if (string? expected-pub) (basalt/hex->bytes expected-pub) expected-pub)
            sig-bytes (cond
                        (string? sig) (basalt/hex->bytes sig)
-                       (bytes? sig) sig
-                       :else (byte-array (map byte sig)))
-           sorted-allocs (into (sorted-map) allocations)
-           payload-bytes (.getBytes (pr-str [epoch sorted-allocs mint-dust]) "UTF-8")]
-       (boolean (crypto/verify pub-bytes payload-bytes sig-bytes)))
-     (catch Exception _
+                       (fressian/bytes? sig) sig
+                       :else #?(:clj (byte-array (map byte sig))
+                                :cljs (js/Uint8Array. (clj->js sig))))
+           sorted-allocs (into (sorted-map) allocations)]
+       (boolean (crypto/verify-with-fallback pub-bytes [epoch sorted-allocs mint-dust] sig-bytes)))
+     (catch #?(:clj Exception :cljs :default) _
        false))))
 
 (defn apply-epoch-mint
   "Applies an authorized, capped epoch demand-gated mint to state.
    Requires cryptographic verification against the authoritative treasury public key.
+   Supports shell-boundary pre-verification (:crypto/verified? true).
    Rejects in full (leaving :ledger, :total-minted, and :minted-epochs unchanged) if:
      - epoch is missing or already in :minted-epochs (double-mint rejected);
      - treasury pubkey or signature is missing, empty, mismatched, or invalid;
@@ -437,9 +440,10 @@
       state
 
       ;; 5. Cryptographic signature verification against allocations, binding mint-dust if present
-      (not (if has-dust?
-             (verify-mint-signature state-pub sig epoch allocations raw-dust)
-             (verify-mint-signature state-pub sig epoch allocations)))
+      (not (or (:crypto/verified? mint-ctx)
+               (if has-dust?
+                 (verify-mint-signature state-pub sig epoch allocations raw-dust)
+                 (verify-mint-signature state-pub sig epoch allocations))))
       state
 
       :else
@@ -478,6 +482,15 @@
                 (update :unclaimed-mint (fnil + 0) unclaimed)
                 (assoc-in [:epoch-unclaimed-mint epoch] unclaimed))))))))
 
+(defn- parse-long-safe
+  "Safely parses an integer/long from a string representation across JVM and CLJS."
+  [v]
+  (try
+    #?(:clj (Long/parseLong (str v))
+       :cljs (let [n (js/parseInt (str v) 10)]
+               (if (js/isNaN n) nil n)))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
 (defn evaluate-treasury-sla
   "Pure function evaluating Treasury SLA conformance across cluster validator snapshots or state machine states.
    Accepts either a map of {node-id snapshot-or-state, ...} or a collection of snapshots/states.
@@ -507,9 +520,9 @@
                                    (into {} (keep (fn [p]
                                                     (let [[k v] (string/split p #"=" 2)]
                                                       (when (and k v)
-                                                        [(keyword k) (try (Long/parseLong v) (catch Exception _ v))])))
+                                                        [(keyword k) (or (parse-long-safe v) v)])))
                                                   pairs)))
-                                 (catch Exception _ {}))
+                                 (catch #?(:clj Exception :cljs :default) _ {}))
                                (or st {}))
                       fin-epoch (long (or (:fin-epoch item)
                                           (:finalized_epoch st-map)
@@ -537,12 +550,12 @@
                                        (count (:failed-receipts item))
                                        0))
                       node-k (or (when-let [v (or (:k_bps st-map) (:k-bps st-map))]
-                                   (try (Long/parseLong (str v)) (catch Exception _ nil)))
+                                   (parse-long-safe v))
                                  (when-let [v (:k-bps item)]
-                                   (try (Long/parseLong (str v)) (catch Exception _ nil)))
+                                   (parse-long-safe v))
                                  (when-let [v (or (get-in item [:config :treasury-k-bps])
                                                   (get-in item [:config :k-bps]))]
-                                   (try (Long/parseLong (str v)) (catch Exception _ nil))))]
+                                   (parse-long-safe v)))]
                   {:fin-epoch fin-epoch
                    :minted minted
                    :supply supply
@@ -601,5 +614,3 @@
      :total-minted max-minted
      :supply max-supply
      :sla-healthy? sla-healthy?}))
-
-
