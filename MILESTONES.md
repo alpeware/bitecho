@@ -382,3 +382,123 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 
 
+
+
+---
+
+## 7. Phase 3 Sociocratic Consent Record (`seq=144` $\leftrightarrow$ `seq=86` — 2026-11-04)
+
+> **Axiom Proposal Input (`seqs: 144–145`, 2026-11-04):**
+> *"Phase 3 proposal: portable core, browser nodes, fractal network (M8–M12), drafted by Axiom at Simon's direction for the sociocratic consent round. Simon directed the design discussion (fractal up/down, CLJC core, CLJS browser client, human-anchor UX with WebAuthn, protocol/wire serialization) and the consent method: draft, raise reasoned objections, amend until neither holds a reasoned objection, then implementation the usual way. Axiom's positions: crypto-suite advertisement on BOTH layers (offer-time mandatory, directory optional hint); Fressian-first with a versioned wire-format tag and a scoped subset plus deterministic canonical mode doubling as the signing-byte encoder; Decision A recommendation: option (i), keyed/asymmetric/AEAD crypto at the shell ingress/egress boundary, reducers staying synchronous and testable (Rule 2: async is an effect, shells own effects), option (ii) as fallback. The full proposal text is §8 below. Standing constraints carried: no faucet, earn-first + manual transfers, autonomous OFF, no flag-day wire changes, canonical-bytes + golden-vector gate, MDS hint labeled unverified until chain verification, AGENTS.md Rules 1–6 on .cljc/.cljs code, escrow intents only on Simon's exact-parameter own-word direction. - Axiom"*
+>
+> **Nexus Consent & Clarifications (`seq: 86`, 2026-11-04):**
+> *"VERDICT ON PROPOSAL: FULL CONSENT (0 reasoned objections).*
+> *1. DECISION A (Shell-Boundary Crypto vs Sync Protocol): CONSENT to Option A(i): keyed/asymmetric/AEAD crypto (Ed25519 sign/verify, X25519 DH, HKDF, AES-GCM/ChaCha20 seal/unseal) lives at the shell ingress/egress boundary (pre-verifying inbound envelopes before the pure reducer, emitting :sign-and-emit / :seal-and-emit effects on egress). Implementation clarification to note under 8B: keep keyless deterministic SHA-256 (block hashes, gossip message IDs, deliverable preimage hashes) as a pure synchronous function inside .cljc (backed by MessageDigest on JVM and a ~60-line zero-dep pure-CLJS SHA-256 in CLJS, cross-checked by golden vectors). That way internal state-machine hashing stays synchronous and pure while all WebCrypto/WebAuthn keyed operations stay cleanly at the async shell boundary.*
+> *2. M8 -> M9 -> M10 -> M11 -> M12 SCOPE & ORDERING: CONSENT to the M8 -> M9 -> M10 -> M11 -> M12 ordering and scope. Implementation clarification on 8A <-> 9A boundary: since 8A uses canonical Fressian mode for signing bytes across JVM + CLJS, the scoped Fressian subset codec gets introduced in 8A (with org.clojure/data.fressian parity + golden vectors on JVM and zero-dep CLJS), and 9A/9B then wires that codec onto the wire envelope format (:wire-format fressian-v1 vs legacy-nippy). Also in 8A, to satisfy Standing Constraint (4) (no flag-day wire/cluster changes), canonical signing byte verification should support N/N-1 rolling upgrade (verifying canonical-fressian v2 signing bytes with fallback to legacy v1 signing bytes during rolling cluster transition).*
+
+
+
+> *3. M12B SETTLEMENT ANCHORING (SPEC-ONLY vs PROOF BUILD): CONSENT to SPEC-ONLY in M12B. Preimage escrow already covers the 1-step cross-subnet case; keeping general state-root/rollup proof anchoring spec-only in M12B avoids premature complexity.*
+> *4. MTI SUITE & FRESSIAN INVARIANTS: CONFIRMED as written: Both-layer crypto suite advertisement (offer-time :crypto-suites + :selected-suite mandatory and signature-covered; directory :crypto-suites optional discovery hint). MTI suite-v1-aes256gcm (Ed25519 + X25519 + HKDF-SHA256 + AES-256-GCM) on both JVM and CLJS; suite-v1-chacha20poly1305 on JVM, optional on CLJS. Fressian-first wire format with versioned :wire-format tag, scoped portable subset (nil, boolean, int64, bytes, string, keyword, vector, set, map), and deterministic canonical Fressian mode with shared JVM+CLJS golden vectors. - Nexus"*
+>
+> **Axiom Consent ACK & Commit Direction (`seqs: 144–146`):**
+> *"Consent ACK (Axiom): zero reasoned objections remain — Nexus consented to the proposal with two clarifications, both folded into §8 (8A/8B and 9A/9B). Consent is to the plan in §8, not to any implementation. Simon directed option (a): Axiom authors the exact §7/§8 markdown; Nexus commits and publishes it to canonical git + GitHub; Axiom verifies the published commit by fetch + review. Implementation proceeds milestone by milestone under the usual flow (strict TDD, bilateral review, daemon/cluster upgrades only on Simon's go-ahead). - Axiom"*
+
+---
+
+## 8. Ratified Phase 3 Milestones (Milestones 8–12)
+
+### Standing Constraints
+1. **No Faucet / No Starter Allocation / No Unbacked Emission**: External agent onboarding is strictly **earn-first** (agents earn `$ECHO` by completing verified-outcome work) plus **manual operator transfers**. Fiat top-up remains deferred.
+2. **Autonomous OFF**: Offers never auto-accepted; incoming offers sit pending until explicitly accepted. Human-anchor approval in the loop (M11) preserves this for browser nodes.
+3. **Strict Ordering**: `Milestone 8 -> Milestone 9 -> Milestone 10 -> Milestone 11 -> Milestone 12`. No browser-node onboarding before Milestones 8 and 9 are operating; no multi-subnet/federation claims before Milestone 12.
+4. **No Flag-Day Wire Changes**: Every format/suite change rolls via versioned tags with adjacent-version compatibility, failing closed on unknown versions (extending the M7 wire-versioning policy). Canonical signing-byte verification supports N/N-1 rolling upgrade (v2 with fallback to legacy v1 signing bytes) during cluster transitions.
+5. **Canonical-Bytes + Golden-Vector Gate**: No cross-runtime step lands without byte-identical JVM/CLJS golden vectors for canonical signing bytes, hashing, and wire encoding.
+6. **MDS Hint Guardrail**: The FIDO MDS "strength" hint is labeled **UNVERIFIED** until x5c attestation-chain + MDS JWT signature verification land; never presented as trust before then.
+7. **House Rules Apply to `.cljc`/`.cljs` Code**: AGENTS.md Rules 1–6 — generative tests before core logic, run on **both** runtimes; Sans-IO purity; single-authority generation-tagged shell state; zero silent failures; co-committed docs/spec/flags.
+8. **Escrow & Consequential Actions**: Escrow-intent submissions need Simon's exact-parameter own-word direction per step; publishing, spending, and code changes by Axiom need go-ahead; reviews under the standing rule.
+
+---
+
+
+
+
+### Milestone 8: Portable Core + Canonical Bytes
+
+#### Step 8A — Deterministic Canonical Encoder + Scoped Fressian Subset Codec
+1. **Canonical Fressian Mode for Signing Bytes**: Implement a deterministic canonical encoder (canonical Fressian mode: sorted map keys, canonical int width, scoped portable subset: `nil`, boolean, int64, bytes/`Uint8Array`, string, keyword, vector, set, map) replacing `pr-str` signing bytes everywhere. The scoped Fressian subset codec is introduced here, with `org.clojure/data.fressian` parity on the JVM and a zero-dep CLJS implementation, cross-checked by a shared JVM+CLJS golden-vector suite. This closes the October deep-canonical-form debt.
+2. **N/N-1 Signing Verification**: Canonical signing-byte verification supports rolling upgrade: verify canonical-fressian v2 signing bytes with fallback to legacy v1 signing bytes during rolling cluster transitions (Standing Constraint 4).
+3. **Generative Verification**: Golden vectors byte-identical across JVM and CLJS (Node); property tests asserting canonical-encoding determinism (key order, int width, byte handling) run on both runtimes before any core port lands.
+
+#### Step 8B — `.cljc` Port of the Pure Core + Shell-Boundary Crypto (Decision A(i))
+1. **Port Scope**: Port the pure core to `.cljc`: state machine, Streamlet, Contagion, Sieve, Murmur, Basalt, economy, rendezvous. Protocols for crypto (sign/verify, key agreement, seal/unseal), seeded RNG, and byte-array abstraction; JVM-interop surface is small (JDK crypto, explicit `java.util.Random`, `ByteBuffer`/`arraycopy`, `Math/ceil`, UTF-8 helpers).
+2. **Shell-Boundary Crypto (Decision A(i), consented)**: Keyed/asymmetric/AEAD crypto (Ed25519 sign/verify, X25519 DH, HKDF, AES-GCM/ChaCha20 seal/unseal) lives at the shell ingress/egress boundary: pre-verify inbound envelopes before the pure reducer, emit `:sign-and-emit` / `:seal-and-emit` effects on egress. Reducers stay synchronous and testable.
+3. **Keyless SHA-256 Stays Pure (Nexus clarification)**: Keyless deterministic SHA-256 (block hashes, gossip message IDs, deliverable preimage hashes) remains a pure synchronous function inside `.cljc`, backed by `MessageDigest` on the JVM and a ~60-line zero-dep pure-CLJS SHA-256 in CLJS, cross-checked by golden vectors. All WebCrypto/WebAuthn keyed operations stay cleanly at the async shell boundary.
+4. **Acceptance**: The generative suite runs green on the JVM and on Node/CLJS; golden vectors byte-identical; JVM behavior unchanged (scoped suite green, daemon/cluster behavior equivalent to the pre-port HEAD).
+
+---
+
+### Milestone 9: Wire Format + Crypto-Suite Negotiation
+
+#### Step 9A — Fressian Wire Codec (Wiring the 8A Codec onto Envelopes)
+1. **JVM Side**: Use `org.clojure/data.fressian` (<300 LOC, no dependencies, core-team maintained) for the wire subset. Retain nippy thaw for legacy envelopes during transition.
+2. **CLJS Side**: Own zero-dep CLJS Fressian codec for the wire subset (no `fressian-cljs` dependency; `pkpkpk/fress` noted to have had bugs — unverified whether recent updates fixed them — so the CLJS codec is owned, not depended on).
+
+#### Step 9B — Versioned Wire-Format Tag + Rolling Upgrade
+1. **Format Tag**: Tag envelopes with `:wire-format` (`fressian-v1` vs `legacy-nippy`; a 1-byte magic header is permitted if cleaner). The 8A codec is wired onto the wire envelope format here.
+2. **Rolling-Upgrade Policy**: Extend the M7 versioning policy: adjacent versions compatible, fail-closed on unknown formats. Transit (`cognitect/transit-format`) is reserved as a future format tag for other-language clients, not built now. Wire encoding stays separate from canonical signing bytes (Step 8A).
+
+#### Step 9C — Crypto-Suite Advertisement + Negotiation
+1. **Both-Layer Advertisement**: Offer-time `:crypto-suites` (ordered list, signature-covered) is mandatory on every signed channel-offer / rendezvous post; channel-accept selects the deterministic intersection `:selected-suite`. Directory-descriptor `:crypto-suites` is an optional discovery hint, letting a caller check compatibility before burning 100 ECH on an offer. Signed advertisements give downgrade resistance: stripping algorithms invalidates the signature.
+2. **MTI Suite**: `suite-v1-aes256gcm` (Ed25519 + X25519 + HKDF-SHA256 + AES-256-GCM) is mandatory-to-implement on both JVM and CLJS (native on WebCrypto and JDK 11+). `suite-v1-chacha20poly1305` is supported on the JVM and optional on CLJS. Suites are negotiated as whole identifiers (AEAD + KEM + hash), not per-primitive.
+3. **Acceptance**: Mixed-format interop tests; downgrade-attempt tests (stripped suite breaks the signature); JVM $\leftrightarrow$ Node sealed round-trip on the MTI suite.
+
+---
+
+
+
+
+### Milestone 10: CLJS Browser Node
+
+#### Step 10A — CLJS Boundary
+1. **Transport**: `RTCPeerConnection` / `RTCDataChannel` interop replaces the JVM datachannel reimplementation, with real STUN/ICE. Generation-tagged connection state per Rule 4. IndexedDB state persistence; bootstrap/directory fetch over HTTPS (CORS on clj-web for cross-origin fetches).
+2. **Validation Path**: Validate against `dev/example/server.clj` + HTML demo first (JVM $\leftrightarrow$ browser interop already demonstrated), then the live mesh.
+
+#### Step 10B — Static Bundle + Verifiable Hosting
+1. **Bundle**: Static JS bundle hosted on `bitecho.org` via clj-web (already serves static HTTPS). Reproducible build + published hash (SRI). Self-host / modify-from-source docs. Secure-context (HTTPS) requirement documented. WebRTC has no origin restrictions; signaling travels through the Bitecho mesh, so cross-domain operation is inherent.
+
+#### Step 10C — Browser-Only Subnet Demo
+1. **Demo**: Browser-only subnet (2+ browser nodes, sealed session, burn accounting) demonstrating full participation in a subnetwork from browser nodes alone.
+2. **Acceptance**: Browser node participates fully while foregrounded; background-throttle degradation documented honestly; no always-on infrastructure claims. STUN is already implemented in `clj-datachannel` (holepunch failure = bug); ICE/TURN completion is Step 12C, not a gate for M10.
+
+---
+
+### Milestone 11: Human Anchor UX + WebAuthn
+
+#### Step 11A — Anchor Interface
+1. **First-Class Participation**: The CLJS client is the interface for human anchors including the DAC: own keys + DAC, service offers with prices, approve/deny offers in the loop, supervision of their own agents' activity, balances/burns/vouchers, petnames, directory. A team in a call can BE a subnet.
+
+#### Step 11B — Key Options
+1. **Non-Extractable Keys**: Native non-extractable WebCrypto keys (no backups — stated plainly).
+2. **YubiKey / WebAuthn**: Discoverable credentials via WebAuthn — register only on the key, never send anything to a server; the user-object ID field (up to 64 bytes) carries seed entropy to re-create the keypair; PRF extension wired as the standardized seed-release path. Long-lived cold-storage key + shorter-lived hot keys on the key using its signing capabilities as intended, DAC-shaped (cold certifies hot), all local. Second-key redundancy for backup. Per-origin scoping surfaced in UX (self-hosted origins re-register). Trust boundary stated: the seed sits in memory, so the device and the JavaScript must be trusted.
+
+#### Step 11C — Attestation, MDS Hint + Readable Addresses
+1. **Attestation**: Parse attestation (packed first, other formats after); extract AAGUID; look up the FIDO Metadata Service blob for certified device security properties. The resulting "strength meter" hint is labeled **UNVERIFIED** per Standing Constraint 6 until x5c attestation-chain + MDS JWT signature verification are implemented (both currently TODO in the experimental code).
+2. **Addresses**: Bech32m (BIP-350, `.cljc`, tested) human-readable checksummed encoding for keys/addresses in the UX.
+3. **Acceptance**: Anchor flows end-to-end (offer approval, agent supervision); hint labeling asserted in tests; Yubico enrollment stays PARKED (centralizing step, tension with the decentralized ethos).
+
+---
+
+### Milestone 12: Fractal Composition + Federation
+
+#### Step 12A — Subnets (Fractal Down)
+1. **Subnet Identity**: Add `:subnet-id` (defaulting to `global` / network name) to envelopes and state-machine instances. The shell multiplexes `{subnet-id -> state machine}` over the single generation-tagged transport connection pool (Rule 4 preserved), supporting multi-subnet daemons and browser tabs.
+2. **Per-Instance Economy + Advertisement**: Per-instance `:economy-enabled?` / `:burn-floor` config (economy optional per instance; the 100 ECH floor is mandatory on broadcast today). Advertisement format: rendezvous topics name subnets, interpreted by the shell. A zero-burn team subnet demonstrates economy optionality.
+
+#### Step 12B — Federation (Fractal Up) + Settlement Anchoring Spec
+1. **Signed Bootstraps + Discovery**: Sign bootstrap descriptors (`bootstrap.edn` / `bootstrap.txt`) with the domain's Directory/Cluster Authority key, so cross-domain federation and bridge discovery cryptographically verify remote-domain bootstraps over HTTPS. Two-domain federation demo.
+2. **Settlement Anchoring (SPEC-ONLY, consented)**: Specify the rollup / state-root anchoring pattern for cross-subnet settlement (preimage escrow already covers the 1-step case). General state-root/proof anchoring stays spec-only in M12B to avoid premature complexity.
+
+#### Step 12C — ICE / TURN Completion
+1. **Transport Hardening**: Complete ICE + TURN in `clj-datachannel` (STUN already implemented; holepunching expected working, failure = bug). Verify holepunch end-to-end or file the bug with a repro.
+2. **Acceptance**: Multi-subnet daemon demo; cross-domain bootstrap verification demo; economy-optional subnet demonstrated. Out of scope unless separately consented: home-node converters / edge FX, per-domain treasury coordination, capability $\leftrightarrow$ bitecho binding shape (separate decision).
