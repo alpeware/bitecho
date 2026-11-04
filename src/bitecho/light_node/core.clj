@@ -34,12 +34,12 @@
   2)
 
 (defn rolling-upgrade-compatible?
-  "Pure predicate checking whether two wire protocol versions are within the rolling-upgrade compatibility window (<= 1 step difference)."
+  "Pure predicate checking whether two wire protocol versions are within the rolling-upgrade compatibility window (<= 1 step difference) and supported."
   [local-version remote-version]
   (and (integer? local-version)
        (integer? remote-version)
-       (>= (long local-version) 1)
-       (>= (long remote-version) 1)
+       (<= min-supported-wire-version (long local-version) max-supported-wire-version)
+       (<= min-supported-wire-version (long remote-version) max-supported-wire-version)
        (<= (Math/abs (- (long local-version) (long remote-version))) 1)))
 
 (defn check-wire-version-compatibility

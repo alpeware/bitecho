@@ -723,10 +723,10 @@
 ;; -----------------------------------------------------------------------------
 
 (defn run-testnet-readiness-gate
-  "Executes and evaluates all four Master-Plan M4 Testnet Launch Exit Gates:
-   1. Third-party validators finalizing under demand gate (k = 0.5) on a 4-node Streamlet BFT cluster.
-   2. Live nickname directory resolving registered nicknames to keys and home sets.
-   3. Real workload paying strictly on verified deliverable preimage outcome with 50 bps protocol take.
+  "Executes and evaluates all four Master-Plan M4 Testnet Launch Exit Gates in a deterministic in-process simulation:
+   1. Simulated 4-validator Streamlet BFT cluster (node1..node3 genesis + node4 simulated third-party partner validator with a fresh keypair) finalizing blocks under demand gate (k = 0.5).
+   2. Simulated Directory Authority resolving registered nicknames to keys and home sets and rejecting forged signatures.
+   3. Simulated einsum workload paying strictly on verified deliverable preimage outcome with 50 bps protocol take.
    4. Rolling-upgrade wire protocol continuity across mixed v1, legacy unversioned, and v2 payloads."
   [& [_opts]]
   (let [;; -----------------------------------------------------------------------

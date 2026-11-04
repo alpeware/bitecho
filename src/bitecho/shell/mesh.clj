@@ -1029,7 +1029,7 @@
          failed-receipts (long (or (:failed-receipts-count state) 0))
          conn-dropped (long (or (:conn_dropped conn-diag-summary) 0))
          conn-stale (long (or (:conn_stale conn-diag-summary) 0))
-         k-bps (long (min treasury/max-k-bps (max 0 (long (or (:k-bps state) (get-in state [:config :treasury-k-bps]) (get-in state [:config :k-bps]) treasury/default-k-bps)))))]
+         k-bps (long (or (:k-bps state) (get-in state [:config :treasury-k-bps]) (get-in state [:config :k-bps]) treasury/default-k-bps))]
      (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d conn_dropped=%d conn_stale=%d k_bps=%d\n"
              role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts conn-dropped conn-stale k-bps))))
 
