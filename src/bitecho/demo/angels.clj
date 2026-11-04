@@ -730,7 +730,7 @@
    4. Rolling-upgrade wire protocol continuity across mixed v1, legacy unversioned, and v2 payloads."
   [& [_opts]]
   (let [;; -----------------------------------------------------------------------
-        ;; 1. Cluster Setup (3 Genesis Validators + 1 Third-Party Partner Node4)
+        ;; 1. Simulated Cluster Setup (3 Genesis Validators + 1 Simulated Third-Party Partner Node4)
         ;; -----------------------------------------------------------------------
         dir-kp (crypto/generate-keypair)
         dir-pub (basalt/bytes->hex (:public dir-kp))
@@ -785,7 +785,7 @@
                               (range 4))
 
         ;; -----------------------------------------------------------------------
-        ;; Gate 2: Live Nickname Directory Attestation & Resolution
+        ;; Gate 2: Simulated Nickname Directory Attestation & Resolution
         ;; -----------------------------------------------------------------------
         partner-kp (crypto/generate-keypair)
         partner-pub (basalt/bytes->hex (:public partner-kp))
@@ -821,7 +821,7 @@
                                   (false? (:ok? v-forged)))
 
         ;; -----------------------------------------------------------------------
-        ;; Gate 3: Real Workload Paying Strictly on Verified Outcome Preimage
+        ;; Gate 3: Simulated Workload Paying Strictly on Verified Outcome Preimage
         ;; -----------------------------------------------------------------------
         workload-input [[1.0 2.0] [3.0 4.0]]
         workload-weights [[2.0 0.0] [0.0 2.0]]
@@ -892,7 +892,7 @@
                                (= (+ worker-init-bal expected-net) worker-final-bal))
 
         ;; -----------------------------------------------------------------------
-        ;; Gate 1: 4 Validators Finalizing Under Demand Gate (k = 0.5) & Treasury SLA
+        ;; Gate 1: Simulated 4 Validators Finalizing Under Demand Gate (k = 0.5) & Treasury SLA
         ;; -----------------------------------------------------------------------
         cluster-snaps (into {}
                             (map-indexed (fn [idx st]
