@@ -12,7 +12,46 @@
                    [java.security KeyFactory KeyPairGenerator]
                    [java.security.spec PKCS8EncodedKeySpec X509EncodedKeySpec]
                    [javax.crypto Cipher KeyAgreement Mac]
-                   [javax.crypto.spec IvParameterSpec SecretKeySpec])))
+                   [javax.crypto.spec GCMParameterSpec IvParameterSpec SecretKeySpec])))
+
+;; -----------------------------------------------------------------------------
+;; Crypto-Suite Negotiation & Constants (Step 9C)
+;; -----------------------------------------------------------------------------
+
+(def ^{:doc "Mandatory-to-implement AES-256-GCM AEAD crypto suite identifier."}
+  suite-v1-aes256gcm "suite-v1-aes256gcm")
+
+(def ^{:doc "ChaCha20-Poly1305 AEAD crypto suite identifier."}
+  suite-v1-chacha20poly1305 "suite-v1-chacha20poly1305")
+
+(def ^{:doc "Default list of advertised crypto-suites in priority order."}
+  default-crypto-suites [suite-v1-aes256gcm suite-v1-chacha20poly1305])
+
+(def ^{:doc "Set of supported crypto-suite identifiers."}
+  supported-crypto-suites #{suite-v1-aes256gcm suite-v1-chacha20poly1305})
+
+(defn negotiate-crypto-suite
+  "Negotiates a mutual crypto-suite between caller and callee.
+   Caller suites are ordered by preference (highest to lowest).
+   Selects caller's highest-priority mutually supported suite.
+   Returns {:ok? true :selected-suite suite-str} on success,
+   or {:ok? false :error \"no-mutually-supported-crypto-suite\" ...} on failure."
+  [caller-suites callee-suites]
+  (let [callee-set (set (map #(if (keyword? %) (name %) (str %)) (or callee-suites [])))
+        caller-list (map #(if (keyword? %) (name %) (str %)) (or caller-suites []))
+        mutually-supported (filterv (fn [s]
+                                      (and (contains? supported-crypto-suites s)
+                                           (contains? callee-set s)))
+                                    caller-list)]
+    (if-let [selected (first mutually-supported)]
+      {:ok? true
+       :selected-suite selected
+       :mutual-suites mutually-supported}
+      {:ok? false
+       :error "no-mutually-supported-crypto-suite"
+       :caller-suites (vec caller-list)
+       :callee-suites (vec callee-set)
+       :supported-suites (vec supported-crypto-suites)})))
 
 ;; -----------------------------------------------------------------------------
 ;; X25519 Key Exchange
@@ -156,65 +195,165 @@
              buf)))
 
 ;; -----------------------------------------------------------------------------
-;; ChaCha20-Poly1305 AEAD
+;; AEAD Implementations (AES-256-GCM & ChaCha20-Poly1305)
 ;; -----------------------------------------------------------------------------
 
-(defn seal-message
-  "Encrypts and authenticates plaintext using ChaCha20-Poly1305 AEAD.
-   Returns a map with :seq, :nonce (12 bytes), and :ciphertext (including 16-byte Poly1305 tag)."
-  [tx-key seq-num plaintext aad]
-  (let [nonce (seq->nonce seq-num)]
+(defn- chacha-poly-seal
+  [tx-key nonce plaintext aad]
+  #?(:clj (let [cipher (Cipher/getInstance "ChaCha20-Poly1305")
+                key-spec (SecretKeySpec. tx-key "ChaCha20")
+                iv-spec (IvParameterSpec. nonce)]
+            (.init cipher Cipher/ENCRYPT_MODE key-spec iv-spec)
+            (when (and aad (pos? (alength ^bytes aad)))
+              (.updateAAD cipher ^bytes aad))
+            (let [input (or plaintext (byte-array 0))]
+              (.doFinal cipher input)))
+     :cljs (let [node-crypto (js/require "node:crypto")
+                 cipher (.createCipheriv node-crypto "chacha20-poly1305" (js/Buffer.from tx-key) (js/Buffer.from nonce) #js {:authTagLength 16})]
+             (when (and aad (pos? (fressian/count-bytes aad)))
+               (.setAAD cipher (js/Buffer.from aad)))
+             (let [input (or plaintext (js/Uint8Array. 0))
+                   part1 (.update cipher (js/Buffer.from input))
+                   _part2 (.final cipher)
+                   tag (.getAuthTag cipher)
+                   total (js/Buffer.concat #js [part1 tag])]
+               (js/Uint8Array. total)))))
+
+(defn- chacha-poly-open
+  [rx-key nonce ciphertext aad]
+  (try
     #?(:clj (let [cipher (Cipher/getInstance "ChaCha20-Poly1305")
-                  key-spec (SecretKeySpec. tx-key "ChaCha20")
+                  key-spec (SecretKeySpec. rx-key "ChaCha20")
                   iv-spec (IvParameterSpec. nonce)]
-              (.init cipher Cipher/ENCRYPT_MODE key-spec iv-spec)
+              (.init cipher Cipher/DECRYPT_MODE key-spec iv-spec)
               (when (and aad (pos? (alength ^bytes aad)))
                 (.updateAAD cipher ^bytes aad))
-              (let [input (or plaintext (byte-array 0))
-                    ct (.doFinal cipher input)]
-                {:seq seq-num
-                 :nonce nonce
-                 :ciphertext ct}))
+              (.doFinal cipher ^bytes ciphertext))
        :cljs (let [node-crypto (js/require "node:crypto")
-                   cipher (.createCipheriv node-crypto "chacha20-poly1305" (js/Buffer.from tx-key) (js/Buffer.from nonce) #js {:authTagLength 16})]
-               (when (and aad (pos? (fressian/count-bytes aad)))
-                 (.setAAD cipher (js/Buffer.from aad)))
-               (let [input (or plaintext (js/Uint8Array. 0))
-                     part1 (.update cipher (js/Buffer.from input))
-                     _part2 (.final cipher)
-                     tag (.getAuthTag cipher)
-                     total (js/Buffer.concat #js [part1 tag])]
-                 {:seq seq-num
-                  :nonce nonce
-                  :ciphertext (js/Uint8Array. total)})))))
+                   ct-buf (js/Buffer.from ciphertext)
+                   tag-len 16
+                   payload-len (- (.-length ct-buf) tag-len)]
+               (when (>= payload-len 0)
+                 (let [payload (.subarray ct-buf 0 payload-len)
+                       tag (.subarray ct-buf payload-len)
+                       decipher (.createDecipheriv node-crypto "chacha20-poly1305" (js/Buffer.from rx-key) (js/Buffer.from nonce) #js {:authTagLength 16})]
+                   (when (and aad (pos? (fressian/count-bytes aad)))
+                     (.setAAD decipher (js/Buffer.from aad)))
+                   (.setAuthTag decipher tag)
+                   (let [part1 (.update decipher payload)
+                         part2 (.final decipher)]
+                     (js/Uint8Array. (js/Buffer.concat #js [part1 part2])))))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn aes-gcm-seal
+  "Encrypts and authenticates plaintext using AES-256-GCM AEAD.
+   Appends 16-byte authentication tag to ciphertext."
+  [tx-key nonce plaintext aad]
+  #?(:clj (let [cipher (Cipher/getInstance "AES/GCM/NoPadding")
+                key-spec (SecretKeySpec. tx-key "AES")
+                gcm-spec (GCMParameterSpec. 128 nonce)]
+            (.init cipher Cipher/ENCRYPT_MODE key-spec gcm-spec)
+            (when (and aad (pos? (alength ^bytes aad)))
+              (.updateAAD cipher ^bytes aad))
+            (let [input (or plaintext (byte-array 0))]
+              (.doFinal cipher input)))
+     :cljs (let [node-crypto (js/require "node:crypto")
+                 cipher (.createCipheriv node-crypto "aes-256-gcm" (js/Buffer.from tx-key) (js/Buffer.from nonce) #js {:authTagLength 16})]
+             (when (and aad (pos? (fressian/count-bytes aad)))
+               (.setAAD cipher (js/Buffer.from aad)))
+             (let [input (or plaintext (js/Uint8Array. 0))
+                   part1 (.update cipher (js/Buffer.from input))
+                   part2 (.final cipher)
+                   tag (.getAuthTag cipher)
+                   total (js/Buffer.concat #js [part1 part2 tag])]
+               (js/Uint8Array. total)))))
+
+(defn aes-gcm-open
+  "Decrypts and verifies ciphertext (including 16-byte tag) using AES-256-GCM AEAD.
+   Returns plaintext bytes on success, nil on tampering or verification failure."
+  [rx-key nonce ciphertext aad]
+  (try
+    #?(:clj (let [cipher (Cipher/getInstance "AES/GCM/NoPadding")
+                  key-spec (SecretKeySpec. rx-key "AES")
+                  gcm-spec (GCMParameterSpec. 128 nonce)]
+              (.init cipher Cipher/DECRYPT_MODE key-spec gcm-spec)
+              (when (and aad (pos? (alength ^bytes aad)))
+                (.updateAAD cipher ^bytes aad))
+              (.doFinal cipher ^bytes ciphertext))
+       :cljs (let [node-crypto (js/require "node:crypto")
+                   ct-buf (js/Buffer.from ciphertext)
+                   tag-len 16
+                   payload-len (- (.-length ct-buf) tag-len)]
+               (when (>= payload-len 0)
+                 (let [payload (.subarray ct-buf 0 payload-len)
+                       tag (.subarray ct-buf payload-len)
+                       decipher (.createDecipheriv node-crypto "aes-256-gcm" (js/Buffer.from rx-key) (js/Buffer.from nonce) #js {:authTagLength 16})]
+                   (when (and aad (pos? (fressian/count-bytes aad)))
+                     (.setAAD decipher (js/Buffer.from aad)))
+                   (.setAuthTag decipher tag)
+                   (let [part1 (.update decipher payload)
+                         part2 (.final decipher)]
+                     (js/Uint8Array. (js/Buffer.concat #js [part1 part2])))))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn seal-message
+  "Encrypts and authenticates plaintext using AEAD.
+   Accepts [tx-key seq-num plaintext aad] (defaults to suite-v1-aes256gcm)
+   or [tx-key seq-num plaintext aad suite].
+   Returns a map with :seq, :nonce (12 bytes), :ciphertext (including 16-byte tag), and :suite."
+  ([tx-key seq-num plaintext aad suite]
+   (let [suite-norm (if (keyword? suite) (name suite) (or suite suite-v1-aes256gcm))
+         nonce (seq->nonce seq-num)
+         ct (case suite-norm
+              "suite-v1-aes256gcm" (aes-gcm-seal tx-key nonce plaintext aad)
+              "suite-v1-chacha20poly1305" (chacha-poly-seal tx-key nonce plaintext aad)
+              (throw (ex-info (str "Unsupported crypto-suite for sealing: " suite-norm) {:suite suite-norm})))]
+     {:seq seq-num
+      :nonce nonce
+      :ciphertext ct
+      :suite suite-norm}))
+  ([tx-key seq-num plaintext aad]
+   (seal-message tx-key seq-num plaintext aad suite-v1-aes256gcm)))
 
 (defn open-message
-  "Decrypts and verifies ciphertext using ChaCha20-Poly1305 AEAD.
+  "Decrypts and verifies ciphertext using AEAD.
+   Supports 4-arity [rx-key seq-num ciphertext aad],
+   5-arity [rx-key seq-num ciphertext aad suite-or-opts],
+   and 6-arity [rx-key seq-num ciphertext aad session-suite frame-suite].
+   Rejects frame if session-suite and frame-suite mismatch (anti-downgrade).
    Returns the decrypted plaintext byte array on success, or nil on failure/tampering."
-  [rx-key seq-num ciphertext aad]
-  (try
-    (let [nonce (seq->nonce seq-num)]
-      #?(:clj (let [cipher (Cipher/getInstance "ChaCha20-Poly1305")
-                    key-spec (SecretKeySpec. rx-key "ChaCha20")
-                    iv-spec (IvParameterSpec. nonce)]
-                (.init cipher Cipher/DECRYPT_MODE key-spec iv-spec)
-                (when (and aad (pos? (alength ^bytes aad)))
-                  (.updateAAD cipher ^bytes aad))
-                (.doFinal cipher ^bytes ciphertext))
-         :cljs (let [node-crypto (js/require "node:crypto")
-                     ct-buf (js/Buffer.from ciphertext)
-                     tag-len 16
-                     payload-len (- (.-length ct-buf) tag-len)
-                     payload (.subarray ct-buf 0 payload-len)
-                     tag (.subarray ct-buf payload-len)
-                     decipher (.createDecipheriv node-crypto "chacha20-poly1305" (js/Buffer.from rx-key) (js/Buffer.from nonce) #js {:authTagLength 16})]
-                 (when (and aad (pos? (fressian/count-bytes aad)))
-                   (.setAAD decipher (js/Buffer.from aad)))
-                 (.setAuthTag decipher tag)
-                 (let [part1 (.update decipher payload)
-                       part2 (.final decipher)]
-                   (js/Uint8Array. (js/Buffer.concat #js [part1 part2]))))))
-    (catch #?(:clj Exception :cljs :default) _ nil)))
+  ([rx-key seq-num ciphertext aad session-suite frame-suite]
+   (let [s-norm (when session-suite (if (keyword? session-suite) (name session-suite) (str session-suite)))
+         f-norm (when frame-suite (if (keyword? frame-suite) (name frame-suite) (str frame-suite)))]
+     (cond
+       ;; Mid-session downgrade / suite mismatch rejection
+       (and s-norm f-norm (not= s-norm f-norm))
+       nil
+
+       :else
+       (let [target-suite (or f-norm s-norm)
+             nonce (seq->nonce seq-num)]
+         (case target-suite
+           "suite-v1-aes256gcm"
+           (aes-gcm-open rx-key nonce ciphertext aad)
+
+           "suite-v1-chacha20poly1305"
+           (chacha-poly-open rx-key nonce ciphertext aad)
+
+           nil
+           ;; No suite specified: try suite-v1-aes256gcm first, fallback to suite-v1-chacha20poly1305
+           (or (aes-gcm-open rx-key nonce ciphertext aad)
+               (chacha-poly-open rx-key nonce ciphertext aad))
+
+           nil)))))
+  ([rx-key seq-num ciphertext aad suite-or-opts]
+   (if (map? suite-or-opts)
+     (open-message rx-key seq-num ciphertext aad
+                   (or (:session-suite suite-or-opts) (:expected-suite suite-or-opts))
+                   (or (:frame-suite suite-or-opts) (:suite suite-or-opts)))
+     (open-message rx-key seq-num ciphertext aad suite-or-opts suite-or-opts)))
+  ([rx-key seq-num ciphertext aad]
+   (open-message rx-key seq-num ciphertext aad nil nil)))
 
 ;; -----------------------------------------------------------------------------
 ;; Offer Hash Binding & DAC Integrity (SPEC §4)
@@ -232,9 +371,9 @@
     :else default-val))
 
 (defn offer-hash
-  "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, and home-node.
-   When :dac is absent, uses canonical format bitecho-sealed-offer-v1|...
-   When :dac is present, appends |<dac-id> to cryptographically bind the offer signature to the specific DAC."
+  "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, home-node,
+   optional :crypto-suites, and optional :dac.
+   When :crypto-suites is present, appends |<suites-csv> to bind the negotiated suite preference to the signature."
   [offer-map]
   (let [sid (str (or (:session-id offer-map) (get offer-map "session_id") (get offer-map "session-id") ""))
         caller (str (or (:caller offer-map) (get offer-map "caller") ""))
@@ -246,10 +385,16 @@
         hn-str (if (keyword? home-node) (name home-node) (str home-node))
         dac (or (:dac offer-map) (get offer-map "dac"))
         dac-id (when dac (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id") (:dac_id dac)))
+        suites (or (:crypto-suites offer-map) (get offer-map "crypto_suites") (get offer-map "crypto-suites"))
+        suites-str (when (seq suites)
+                     (str/join "," (map #(if (keyword? %) (name %) (str %)) suites)))
         base-str (str "bitecho-sealed-offer-v1|" sid "|" caller "|" callee "|" eph "|" epoch "|" price "|" hn-str)
+        with-suites (if (seq suites-str)
+                      (str base-str "|" suites-str)
+                      base-str)
         canonical-str (if (and dac (seq (str dac-id)))
-                        (str base-str "|" dac-id)
-                        base-str)]
+                        (str with-suites "|" dac-id)
+                        with-suites)]
     (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes canonical-str)))))
 
 ;; -----------------------------------------------------------------------------

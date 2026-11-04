@@ -18,8 +18,7 @@
             #?(:cljs [bitecho.sieve.core :as sieve])
             #?(:clj [bitecho.shell.agent-sim :as agent-sim])
             #?(:clj [bitecho.shell.mesh :as mesh])
-            #?(:clj [clojure.data.json :as json])
-            #?(:clj [taoensso.nippy :as nippy])))
+            #?(:clj [clojure.data.json :as json])))
 
 (def ^:private bytes? fressian/bytes?)
 
@@ -44,39 +43,20 @@
                 (js->clj obj :keywordize-keys keywordize?)))
      (catch #?(:clj Exception :cljs :default) _ nil))))
 
-(defn- nippy-payload? [b]
-  #?(:clj (and (bytes? b)
-               (>= (alength ^bytes b) 3)
-               (= (aget ^bytes b 0) (byte 0x4E))
-               (= (aget ^bytes b 1) (byte 0x50))
-               (= (aget ^bytes b 2) (byte 0x59)))
-     :cljs (boolean (and b false))))
-
-(defn- freeze-payload
-  "Encodes a wire payload using Nippy on JVM for backwards compatibility, and Canonical Fressian on CLJS."
+(defn freeze-payload
+  "Encodes a wire payload using Fressian wire codec (encode-wire)."
   [payload]
-  #?(:clj (nippy/freeze payload)
-     :cljs (fressian/encode-canonical payload)))
+  (fressian/encode-wire payload))
 
-(defn- thaw-payload
-  "Decodes a wire payload, checking for Nippy on JVM first, falling back to Canonical Fressian.
+(defn thaw-payload
+  "Decodes a wire payload using Fressian wire codec (decode-wire),
+   supporting Fressian and legacy Nippy payloads.
    Always strips untrusted shell-boundary crypto tags from the result."
   [payload-bytes]
-  (let [res (if (nippy-payload? payload-bytes)
-              #?(:clj (try (nippy/thaw payload-bytes)
-                           (catch Exception _ nil))
-                 :cljs nil)
-              (or (try (let [v (fressian/decode payload-bytes)]
-                         (when (or (map? v) (record? v)) v))
-                       (catch #?(:clj Exception :cljs :default) _ nil))
-                  #?(:clj (try (nippy/thaw payload-bytes)
-                               (catch Exception _ nil))
-                     :cljs nil)))]
-    (when res
-      (fressian/strip-untrusted-crypto-tags res))))
+  (fressian/decode-wire payload-bytes))
 
 ;; -----------------------------------------------------------------------------
-;; Wire Protocol Versioning & Rolling Upgrade Compatibility (FLAG B)
+;; Wire Protocol Versioning & Rolling Upgrade Compatibility (FLAG B & Step 9B)
 ;; -----------------------------------------------------------------------------
 
 (def current-wire-version
@@ -91,6 +71,18 @@
   "Maximum supported wire protocol version for forward rolling-upgrade compatibility (N+1)."
   2)
 
+(def current-wire-format
+  "Current default wire encoding format."
+  "fressian-v1")
+
+(def supported-wire-formats
+  "Set of supported wire encoding formats (strings and keywords)."
+  #{"fressian-v1" "legacy-nippy" :fressian-v1 :legacy-nippy})
+
+(def reserved-wire-formats
+  "Set of reserved wire encoding formats for future milestones (fail-closed if encountered)."
+  #{"transit-json" "transit-msgpack" :transit-json :transit-msgpack})
+
 (defn rolling-upgrade-compatible?
   "Pure predicate checking whether two wire protocol versions are within the rolling-upgrade compatibility window (<= 1 step difference) and supported."
   [local-version remote-version]
@@ -100,6 +92,38 @@
        (<= min-supported-wire-version (long remote-version) max-supported-wire-version)
        (<= (math-abs (- (long local-version) (long remote-version))) 1)))
 
+(defn check-wire-format-compatibility
+  "Pure function inspecting a wire payload or message map for wire format compatibility.
+   Supports :wire-format, \"wire_format\", and \"wire-format\" keys.
+   Returns {:ok? true :wire-format \"fressian-v1\" :legacy-unversioned? true} when wire-format is absent.
+   Returns {:ok? true :wire-format fmt-str :legacy-unversioned? false} when format is supported.
+   Returns {:ok? false :error \"unsupported-wire-format\" :wire-format fmt :supported-formats [\"fressian-v1\" \"legacy-nippy\"]}
+   for reserved or unknown wire formats."
+  [msg]
+  (if-not (map? msg)
+    {:ok? false :error "unsupported-wire-format" :wire-format nil :supported-formats ["fressian-v1" "legacy-nippy"]}
+    (let [has-fmt? (or (contains? msg :wire-format)
+                       (contains? msg "wire_format")
+                       (contains? msg "wire-format"))
+          raw-fmt (cond
+                    (contains? msg :wire-format) (:wire-format msg)
+                    (contains? msg "wire_format") (get msg "wire_format")
+                    (contains? msg "wire-format") (get msg "wire-format")
+                    :else nil)]
+      (cond
+        (or (not has-fmt?) (nil? raw-fmt))
+        {:ok? true :wire-format current-wire-format :legacy-unversioned? true}
+
+        (contains? supported-wire-formats raw-fmt)
+        (let [norm-str (if (keyword? raw-fmt) (name raw-fmt) (str raw-fmt))]
+          {:ok? true :wire-format norm-str :legacy-unversioned? false})
+
+        :else
+        {:ok? false
+         :error "unsupported-wire-format"
+         :wire-format raw-fmt
+         :supported-formats ["fressian-v1" "legacy-nippy"]}))))
+
 (defn- wrap-agent-event
   ([event pubkey privkey]
    (wrap-agent-event event pubkey privkey nil))
@@ -108,6 +132,7 @@
      (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
            effective-dac (or dac (:dac event))
            base (cond-> {:protocol-version current-wire-version
+                         :wire-format current-wire-format
                          :agent-pubkey pubkey
                          :event clean}
                   effective-dac (assoc :dac effective-dac))]
@@ -123,6 +148,7 @@
                     sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
                     effective-dac (or dac (:dac event))]
                 (cond-> {:protocol-version current-wire-version
+                         :wire-format current-wire-format
                          :agent-pubkey pubkey
                          :event clean
                          :signature sig-hex}
@@ -245,7 +271,10 @@
    :voucher-seqs {}
    :wire-version-diagnostics {:unsupported-dropped 0
                               :last-unsupported-version nil
-                              :last-error nil}})
+                              :unsupported-format-dropped 0
+                              :last-unsupported-format nil
+                              :last-error nil}
+   :crypto-suites (or (:crypto-suites opts) sealed/default-crypto-suites)})
 
 ;; -----------------------------------------------------------------------------
 ;; Petnames Address Book & Counterparty Resolution (Pure Helpers)
@@ -335,8 +364,9 @@
 
 (defn create-directory-pop
   "Creates an agent Proof-of-Possession (PoP) map signed by agent-privkey-bytes.
-   Optionally signs with prev-privkey-bytes to prove key rotation continuity."
-  [agent-privkey-bytes {:keys [domain nickname pubkey home-set epoch prev-pubkey prev-privkey-bytes]}]
+   Optionally signs with prev-privkey-bytes to prove key rotation continuity.
+   Optionally binds advertised :crypto-suites."
+  [agent-privkey-bytes {:keys [domain nickname pubkey home-set epoch prev-pubkey prev-privkey-bytes crypto-suites]}]
   (when (and (valid-petname? nickname)
              (valid-pubkey-hex? pubkey)
              (or (nil? epoch) (integer? epoch))
@@ -353,8 +383,13 @@
                                                home-set))))
           ep (long (or epoch 0))
           norm-prev (when prev-pubkey (normalize-pubkey-hex prev-pubkey))
-          canonical-str (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
-                             (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
+          suites-str (when (seq crypto-suites)
+                       (str/join "," (map #(if (keyword? %) (name %) (str %)) crypto-suites)))
+          base-canonical (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
+                              (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
+          canonical-str (if (seq suites-str)
+                          (str base-canonical "|" suites-str)
+                          base-canonical)
           sig-bytes (crypto/sign agent-privkey-bytes (fressian/utf8->bytes canonical-str))
           sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
           rot-sig-bytes (when norm-prev
@@ -367,6 +402,7 @@
                :home-set sorted-hs
                :epoch ep
                :pop-signature sig-hex}
+        (seq crypto-suites) (assoc :crypto-suites (vec (map #(if (keyword? %) (name %) (str %)) crypto-suites)))
         norm-prev (assoc :prev-pubkey norm-prev
                          :rotation-signature rot-sig-hex)))))
 
@@ -427,8 +463,14 @@
                has-rot? (or (some? prev-pk) (some? rot-sig))
                norm-prev (when (and (string? prev-pk) (valid-pubkey-hex? prev-pk))
                            (normalize-pubkey-hex prev-pk))
-               canonical-str (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
-                                  (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
+               suites (or (:crypto-suites pop-m) (get pop-m "crypto_suites") (get pop-m "crypto-suites"))
+               suites-str (when (seq suites)
+                            (str/join "," (map #(if (keyword? %) (name %) (str %)) suites)))
+               base-canonical (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
+                                   (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
+               canonical-str (if (seq suites-str)
+                               (str base-canonical "|" suites-str)
+                               base-canonical)
                pub-bytes (try (basalt/hex->bytes norm-pub) (catch #?(:clj Exception :cljs :default) _ nil))
                sig-bytes (try (basalt/hex->bytes (:pop-signature pop-m)) (catch #?(:clj Exception :cljs :default) _ nil))
                pop-valid? (boolean (and pub-bytes sig-bytes
@@ -473,9 +515,15 @@
           mbox (or mailbox "")
           iss-ep (long issued-epoch)
           exp-ep (long expires-epoch)
-          canonical-str (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
-                             (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
-                             (or norm-prev "") "|" pop-sig "|" rot-sig)
+          suites (or (:crypto-suites pop-m) (get pop-m "crypto_suites") (get pop-m "crypto-suites"))
+          suites-str (when (seq suites)
+                       (str/join "," (map #(if (keyword? %) (name %) (str %)) suites)))
+          base-canonical (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
+                              (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
+                              (or norm-prev "") "|" pop-sig "|" rot-sig)
+          canonical-str (if (seq suites-str)
+                          (str base-canonical "|" suites-str)
+                          base-canonical)
           dir-sig-bytes (crypto/sign directory-privkey-bytes (fressian/utf8->bytes canonical-str))
           dir-sig-hex (if (string? dir-sig-bytes) dir-sig-bytes (basalt/bytes->hex dir-sig-bytes))]
       (cond-> {:bitecho/type :directory-descriptor
@@ -490,6 +538,7 @@
                :pop-signature pop-sig
                :directory-pubkey (normalize-pubkey-hex directory-pubkey-hex)
                :directory-signature dir-sig-hex}
+        (seq suites) (assoc :crypto-suites (vec (map #(if (keyword? %) (name %) (str %)) suites)))
         (seq mbox) (assoc :mailbox mbox)
         norm-prev (assoc :prev-pubkey norm-prev)
         (:rotation-signature pop-m) (assoc :rotation-signature (:rotation-signature pop-m))))))
@@ -552,9 +601,15 @@
               norm-prev (when-let [p (:prev-pubkey desc)] (normalize-pubkey-hex p))
               pop-sig (:pop-signature desc)
               rot-sig (or (:rotation-signature desc) "")
-              canonical-str (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
-                                 (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
-                                 (or norm-prev "") "|" pop-sig "|" rot-sig)
+              suites (or (:crypto-suites desc) (get desc "crypto_suites") (get desc "crypto-suites"))
+              suites-str (when (seq suites)
+                           (str/join "," (map #(if (keyword? %) (name %) (str %)) suites)))
+              base-canonical (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
+                                  (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
+                                  (or norm-prev "") "|" pop-sig "|" rot-sig)
+              canonical-str (if (seq suites-str)
+                              (str base-canonical "|" suites-str)
+                              base-canonical)
               dir-pub-bytes (try (basalt/hex->bytes (normalize-pubkey-hex trusted-directory-pubkey)) (catch #?(:clj Exception :cljs :default) _ nil))
               dir-sig-bytes (try (basalt/hex->bytes (:directory-signature desc)) (catch #?(:clj Exception :cljs :default) _ nil))]
           (if-not (and dir-pub-bytes dir-sig-bytes
@@ -572,11 +627,33 @@
                                           :pop-signature pop-sig
                                           :directory-pubkey (normalize-pubkey-hex trusted-directory-pubkey)
                                           :directory-signature (:directory-signature desc)}
+                                   (seq suites) (assoc :crypto-suites (vec (map #(if (keyword? %) (name %) (str %)) suites)))
                                    (seq mbox) (assoc :mailbox mbox)
                                    norm-prev (assoc :prev-pubkey norm-prev)
                                    (seq rot-sig) (assoc :rotation-signature rot-sig))]
               {:ok? true :valid? true :descriptor canonical-desc})))))
     (catch #?(:clj Exception :cljs :default) _ {:ok? false :valid? false :error "malformed-descriptor"})))
+
+(defn check-directory-suite-compatibility
+  "Inspects a directory descriptor and validates compatibility with local crypto-suites.
+   Returns {:ok? true :compatible? true :selected-suite suite ...} on match,
+   or {:ok? false :compatible? false :error reason} on incompatibility."
+  ([descriptor]
+   (check-directory-suite-compatibility descriptor sealed/default-crypto-suites))
+  ([descriptor local-suites]
+   (let [desc (normalize-wire-map descriptor)
+         desc-suites (:crypto-suites desc)]
+     (if (seq desc-suites)
+       (let [neg (sealed/negotiate-crypto-suite desc-suites local-suites)]
+         (if (:ok? neg)
+           {:ok? true :compatible? true :selected-suite (:selected-suite neg) :descriptor-suites desc-suites}
+           {:ok? false :compatible? false :error "incompatible-directory-crypto-suites" :descriptor-suites desc-suites :local-suites (vec local-suites)}))
+       ;; Legacy descriptor without suite advertisement defaults to chacha20-poly1305
+       (let [legacy-supported? (contains? (set (map #(if (keyword? %) (name %) (str %)) local-suites))
+                                          sealed/suite-v1-chacha20poly1305)]
+         (if legacy-supported?
+           {:ok? true :compatible? true :selected-suite sealed/suite-v1-chacha20poly1305 :legacy? true}
+           {:ok? false :compatible? false :error "legacy-descriptor-incompatible"}))))))
 
 (defn parse-directory-descriptor-text
   "Extracts and parses a directory descriptor map from raw JSON, raw EDN,
@@ -1218,9 +1295,9 @@
     (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes sid-input)))))
 
 (defn compute-offer-hash
-  "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, home-node, and optional DAC.
-   Recreates the exact 2d21308 base format (session-id-caller-callee-eph-epoch-price-homenode)
-   with optional |<dac-id> appended when DAC is present."
+  "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, home-node,
+   optional :crypto-suites, and optional DAC.
+   Recreates the exact base format with optional |<suites-csv> and optional |<dac-id> appended."
   [offer-map]
   (let [caller (str (or (:caller offer-map) (get offer-map "caller") ""))
         callee (str (or (:callee offer-map) (get offer-map "callee") ""))
@@ -1238,28 +1315,49 @@
                  (string? home-node) home-node
                  (or (keyword? home-node) (symbol? home-node)) (name home-node)
                  :else (str (or home-node "")))
+        suites (or (:crypto-suites offer-map) (get offer-map "crypto_suites") (get offer-map "crypto-suites"))
+        suites-str (when (seq suites)
+                     (str/join "," (map #(if (keyword? %) (name %) (str %)) suites)))
         dac (or (:dac offer-map) (get offer-map "dac"))
         dac-id (or (:dac-id offer-map) (get offer-map "dac_id") (get offer-map "dac-id")
                    (when dac (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id") (:dac_id dac))))
-        hash-input (str sid "-" caller "-" callee "-" eph-pub "-" epoch "-" price-or-burn "-" hn-str
-                        (when (and (string? dac-id) (not (str/blank? dac-id)))
-                          (str "|" dac-id)))]
+        base-input (str sid "-" caller "-" callee "-" eph-pub "-" epoch "-" price-or-burn "-" hn-str)
+        with-suites (if (seq suites-str)
+                      (str base-input "|" suites-str)
+                      base-input)
+        hash-input (if (and (string? dac-id) (not (str/blank? dac-id)))
+                     (str with-suites "|" dac-id)
+                     with-suites)]
     (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes hash-input)))))
 
 (defn canonical-rendezvous-header-str
-  "Computes canonical string for Phase 1 :rendezvous-offer-header caller signature."
-  [caller callee offer-hash epoch burn topic home-node dac-id]
-  (str "bitecho-rendezvous-header-v1|"
-       caller "|" callee "|" offer-hash "|"
-       (long epoch) "|" (long burn) "|"
-       (or topic "") "|" (or home-node "") "|" (or dac-id "")))
+  "Computes canonical string for Phase 1 :rendezvous-offer-header caller signature,
+   optionally binding :crypto-suites."
+  ([caller callee offer-hash epoch burn topic home-node dac-id]
+   (canonical-rendezvous-header-str caller callee offer-hash epoch burn topic home-node dac-id nil))
+  ([caller callee offer-hash epoch burn topic home-node dac-id suites]
+   (let [base (str "bitecho-rendezvous-header-v1|"
+                   caller "|" callee "|" offer-hash "|"
+                   (long epoch) "|" (long burn) "|"
+                   (or topic "") "|" (or home-node "") "|" (or dac-id ""))
+         suites-str (when (seq suites)
+                      (str/join "," (map #(if (keyword? %) (name %) (str %)) suites)))]
+     (if (seq suites-str)
+       (str base "|" suites-str)
+       base))))
 
 (defn canonical-rendezvous-ack-str
-  "Computes canonical string for Phase 1b :rendezvous-ack-voucher callee signature."
-  [caller callee offer-hash callee-x25519 epoch ack-sig]
-  (str "bitecho-rendezvous-ack-v1|"
-       caller "|" callee "|" offer-hash "|"
-       callee-x25519 "|" (long epoch) "|" ack-sig))
+  "Computes canonical string for Phase 1b :rendezvous-ack-voucher callee signature,
+   optionally binding :selected-suite."
+  ([caller callee offer-hash callee-x25519 epoch ack-sig]
+   (canonical-rendezvous-ack-str caller callee offer-hash callee-x25519 epoch ack-sig nil))
+  ([caller callee offer-hash callee-x25519 epoch ack-sig selected-suite]
+   (let [base (str "bitecho-rendezvous-ack-v1|"
+                   caller "|" callee "|" offer-hash "|"
+                   callee-x25519 "|" (long epoch) "|" ack-sig)]
+     (if (and (string? selected-suite) (not (str/blank? selected-suite)))
+       (str base "|" selected-suite)
+       base))))
 
 (defn canonical-rendezvous-reveal-str
   "Computes canonical string for Phase 2 :rendezvous-reveal caller signature."
@@ -1366,6 +1464,7 @@
                                           (or (contains? sc "offer") (contains? sc "rendezvous"))))
                                d))
                 dac-id (when active-dac (or (:dac-id active-dac) (get active-dac "dac_id")))
+                suites (or (:crypto-suites state) sealed/default-crypto-suites)
                 offer-hash (compute-offer-hash {:session-id session-id
                                                 :caller caller
                                                 :callee callee
@@ -1374,10 +1473,12 @@
                                                 :price burn-amt
                                                 :burn burn-amt
                                                 :home-node home-node
+                                                :crypto-suites suites
                                                 :dac active-dac})
-                header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id)
+                header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id suites)
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes header-str)))
                 wire-payload (cond-> {:protocol-version current-wire-version
+                                      :wire-format current-wire-format
                                       :bitecho/type :rendezvous-offer-header
                                       :type :rendezvous-offer-header
                                       :caller caller
@@ -1387,6 +1488,7 @@
                                       :burn burn-amt
                                       :topic topic
                                       :home-node home-node
+                                      :crypto-suites suites
                                       :signature sig-hex}
                                active-dac (assoc :dac active-dac))
                 gossip-env (build-gossip-envelope caller privkey-bytes (freeze-payload wire-payload) burn-amt)
@@ -1396,6 +1498,7 @@
                                 :callee callee
                                 :caller-x25519-priv (:private kp-eph)
                                 :caller-x25519-pub caller-x25519-pub
+                                :crypto-suites suites
                                 :initial-text text
                                 :epoch epoch
                                 :burn burn-amt
@@ -1436,24 +1539,36 @@
         signed-ack (rendezvous/create-delivery-ack privkey-bytes callee home-node epoch offer-hash next-seq cumulative-debit)
         kp-callee (sealed/generate-x25519-keypair)
         callee-x25519-pub (basalt/bytes->hex (:public kp-callee))
-        ack-str (canonical-rendezvous-ack-str caller callee offer-hash callee-x25519-pub epoch (:signature signed-ack))
+        has-caller-suites? (boolean (seq (:crypto-suites pending-header)))
+        selected-suite (if has-caller-suites?
+                         (or (:selected-suite pending-header)
+                             (:selected-suite (sealed/negotiate-crypto-suite
+                                               (:crypto-suites pending-header)
+                                               (or (:crypto-suites state) sealed/default-crypto-suites)))
+                             sealed/suite-v1-aes256gcm)
+                         sealed/suite-v1-chacha20poly1305)
+        ack-str (canonical-rendezvous-ack-str caller callee offer-hash callee-x25519-pub epoch (:signature signed-ack)
+                                              (when has-caller-suites? selected-suite))
         sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes ack-str)))
-        ack-payload {:protocol-version current-wire-version
-                     :bitecho/type :rendezvous-ack-voucher
-                     :type :rendezvous-ack-voucher
-                     :caller caller
-                     :callee callee
-                     :offer-hash offer-hash
-                     :callee-x25519 callee-x25519-pub
-                     :epoch epoch
-                     :delivery-ack (into {} signed-ack)
-                     :signature sig-hex}
+        ack-payload (cond-> {:protocol-version current-wire-version
+                             :wire-format current-wire-format
+                             :bitecho/type :rendezvous-ack-voucher
+                             :type :rendezvous-ack-voucher
+                             :caller caller
+                             :callee callee
+                             :offer-hash offer-hash
+                             :callee-x25519 callee-x25519-pub
+                             :epoch epoch
+                             :delivery-ack (into {} signed-ack)
+                             :signature sig-hex}
+                      has-caller-suites? (assoc :selected-suite selected-suite))
         gossip-env (build-gossip-envelope callee privkey-bytes (freeze-payload ack-payload) 500)
         accept-entry {:callee-x25519-priv (:private kp-callee)
                       :callee-x25519-pub callee-x25519-pub
                       :caller caller
                       :callee callee
                       :epoch epoch
+                      :selected-suite selected-suite
                       :delivery-ack (into {} signed-ack)
                       :header pending-header}
         new-state (-> state
@@ -1540,6 +1655,7 @@
                                                         :revoked-dac-ids (:revoked-dacs state)
                                                         :required-scope "offer"}))
                                d))
+                suites (or (:crypto-suites state) sealed/default-crypto-suites)
                 offer-hash (compute-offer-hash {:session-id session-id
                                                 :caller caller
                                                 :callee callee
@@ -1547,9 +1663,11 @@
                                                 :epoch epoch
                                                 :price price
                                                 :home-node home-node
+                                                :crypto-suites suites
                                                 :dac active-dac})
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
                 offer-payload (cond-> {:protocol-version current-wire-version
+                                       :wire-format current-wire-format
                                        :bitecho/type :channel-offer
                                        :session-id session-id
                                        :caller caller
@@ -1558,6 +1676,7 @@
                                        :epoch epoch
                                        :price price
                                        :home-node home-node
+                                       :crypto-suites suites
                                        :offer-hash offer-hash
                                        :burn burn-amt
                                        :signature sig-hex}
@@ -1578,6 +1697,7 @@
                                :state "offered"
                                :tx-seq 0
                                :epoch epoch
+                               :crypto-suites suites
                                :ephemeral-pub (:public kp-eph)
                                :ephemeral-priv (:private kp-eph)
                                :price price
@@ -1636,16 +1756,29 @@
                       :seq 1
                       :min-burn 100})
             delivery-ack (into {} (:delivery-ack ack-res))
-            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes (str session-id "-" eph-pub-hex))))
-            accept-payload {:protocol-version current-wire-version
-                            :bitecho/type :channel-accept
-                            :session-id session-id
-                            :caller caller
-                            :callee (:pubkey state)
-                            :callee-ephemeral-pub eph-pub-hex
-                            :epoch epoch
-                            :delivery-ack delivery-ack
-                            :signature sig-hex}
+            has-caller-suites? (boolean (seq (:crypto-suites offer)))
+            selected-suite (if has-caller-suites?
+                             (or (:selected-suite offer)
+                                 (:selected-suite (sealed/negotiate-crypto-suite
+                                                   (:crypto-suites offer)
+                                                   (or (:crypto-suites state) sealed/default-crypto-suites)))
+                                 sealed/suite-v1-aes256gcm)
+                             sealed/suite-v1-chacha20poly1305)
+            sig-input (if has-caller-suites?
+                        (str session-id "-" eph-pub-hex "|" selected-suite)
+                        (str session-id "-" eph-pub-hex))
+            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes sig-input)))
+            accept-payload (cond-> {:protocol-version current-wire-version
+                                    :wire-format current-wire-format
+                                    :bitecho/type :channel-accept
+                                    :session-id session-id
+                                    :caller caller
+                                    :callee (:pubkey state)
+                                    :callee-ephemeral-pub eph-pub-hex
+                                    :epoch epoch
+                                    :delivery-ack delivery-ack
+                                    :signature sig-hex}
+                             has-caller-suites? (assoc :selected-suite selected-suite))
             gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload accept-payload) 500)
             session-entry {:session-id session-id
                            :peer caller
@@ -1660,6 +1793,7 @@
                            :outbox {}
                            :outbox-order []
                            :epoch epoch
+                           :suite selected-suite
                            :tx-key (:tx-key keys)
                            :rx-key (:rx-key keys)
                            :replay-window (sealed/init-replay-window)}
@@ -1669,7 +1803,8 @@
             event (cond-> {"event" "channel-opened" "session_id" session-id "peer" caller}
                     caller-pname (assoc "peer_petname" caller-pname))]
         {:state new-state
-         :response (cond-> {"ok" true "session_id" session-id "state" "open" "peer" caller}
+         :response (cond-> {"ok" true "session_id" session-id "state" "open" "peer" caller
+                            "selected_suite" selected-suite}
                      caller-pname (assoc "peer_petname" caller-pname))
          :net-envelopes [gossip-env]
          :stdout-events [event]}))))
@@ -1688,14 +1823,17 @@
                                 :else empty-bytes)
             burn-amt (long (or (get cmd-map "burn") 500))
             seq-num (inc (:tx-seq session 0))
-            sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (fressian/utf8->bytes session-id))
+            suite (or (:suite session) sealed/suite-v1-chacha20poly1305)
+            sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (fressian/utf8->bytes session-id) suite)
             msg-payload {:protocol-version current-wire-version
+                         :wire-format current-wire-format
                          :bitecho/type :sealed-message
                          :session-id session-id
                          :sender (:pubkey state)
                          :recipient (:peer session)
                          :epoch (long (or (:epoch session) (:epoch state) 0))
                          :seq seq-num
+                         :suite suite
                          :nonce (basalt/bytes->hex (:nonce sealed))
                          :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
             gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt)
@@ -2600,7 +2738,11 @@
                                          "min_supported" min-supported-wire-version
                                          "max_supported" max-supported-wire-version
                                          "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
-                                         "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])}}
+                                         "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])
+                                         "wire_format" current-wire-format
+                                         "supported_formats" ["fressian-v1" "legacy-nippy"]
+                                         "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
+                                         "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}}
                  (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state)))
      :net-envelopes []
      :stdout-events []}))
@@ -2721,7 +2863,13 @@
                                (or (= (:offer-hash msg) expected-hash-legacy)
                                    (= (:offer-hash msg) expected-hash-sealed)
                                    (= (:offer-hash msg) expected-hash-5field)))
+            caller-suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
+            callee-suites (or (:crypto-suites state) sealed/default-crypto-suites)
+            suite-negotiation (sealed/negotiate-crypto-suite (or caller-suites [sealed/suite-v1-chacha20poly1305]) callee-suites)
+            valid-suite? (:ok? suite-negotiation)
+            selected-suite (:selected-suite suite-negotiation)
             valid-sig? (and valid-hashes?
+                            valid-suite?
                             caller-pub sig-bytes
                             (crypto/verify caller-pub (fressian/utf8->bytes (:offer-hash msg)) sig-bytes))
             ref-epoch (:epoch state)
@@ -2732,10 +2880,12 @@
                                               :revoked-dac-ids (:revoked-dacs state)
                                               :required-scope "offer"}))]
         (if (or (not valid-sig?)
+                (not valid-suite?)
                 (and wire-dac (not (:ok? dac-check))))
           {:state state :net-envelopes [] :stdout-events []}
           (let [sid (:session-id msg)
-                clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature])
+                clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature :crypto-suites])
+                              selected-suite (assoc :selected-suite selected-suite)
                               (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))]
             (cond
               (contains? (:sessions state) sid)
@@ -2796,10 +2946,23 @@
           :else
           (let [callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                raw-sel-suite (or (:selected-suite msg) (:suite msg))
+                sel-str (when raw-sel-suite (if (keyword? raw-sel-suite) (name raw-sel-suite) (str raw-sel-suite)))
+                offered-suites (set (map #(if (keyword? %) (name %) (str %))
+                                         (or (:crypto-suites session) sealed/default-crypto-suites)))
+                suite-valid? (if sel-str
+                               (and (contains? offered-suites sel-str)
+                                    (contains? sealed/supported-crypto-suites sel-str))
+                               (contains? offered-suites sealed/suite-v1-chacha20poly1305))
+                effective-suite (or sel-str sealed/suite-v1-chacha20poly1305)
+                sig-input (if sel-str
+                            (str session-id "-" (:callee-ephemeral-pub msg) "|" sel-str)
+                            (str session-id "-" (:callee-ephemeral-pub msg)))
                 valid-ack? (rendezvous/verify-delivery-ack (:delivery-ack msg) (:callee msg))
-                valid-sig? (and callee-pub sig-bytes
+                valid-sig? (and suite-valid?
+                                callee-pub sig-bytes
                                 (crypto/verify callee-pub
-                                               (fressian/utf8->bytes (str session-id "-" (:callee-ephemeral-pub msg)))
+                                               (fressian/utf8->bytes sig-input)
                                                sig-bytes))]
             (if-not (and valid-ack? valid-sig?)
               {:state state :net-envelopes [] :stdout-events []}
@@ -2810,6 +2973,7 @@
                   (let [keys (sealed/derive-channel-keys shared-sec session-id :initiator)
                         updated-sess (-> session
                                          (assoc :state "open"
+                                                :suite effective-suite
                                                 :tx-seq 0
                                                 :acked-seq 0
                                                 :rx-high-seq 0
@@ -2886,7 +3050,7 @@
             (cond
               (:accepted? chk)
               (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id)))]
+                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id) (:suite session) (:suite msg)))]
                 (if-not decrypted
                   {:state state :net-envelopes [] :stdout-events []}
                   (let [new-rx-high-seq (max (long (:rx-high-seq session 0)) (long (:seq msg)))
@@ -2923,7 +3087,7 @@
 
               (= :replayed-seq (:error chk))
               (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id)))]
+                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id) (:suite session) (:suite msg)))]
                 (if-not decrypted
                   {:state state :net-envelopes [] :stdout-events []}
                   (let [contig (:contiguous-rx-seq session 0)
@@ -3078,10 +3242,14 @@
           {:state state :net-envelopes [] :stdout-events []}
           (let [dac-id (when (and wire-dac (:ok? dac-check))
                          (or (:dac-id (:dac dac-check)) (get (:dac dac-check) "dac_id")))
-                header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn topic home-node dac-id)
+                suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
+                header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn topic home-node dac-id suites)
                 caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                valid-sig? (and caller-pub sig-bytes
+                suite-neg (sealed/negotiate-crypto-suite (or suites [sealed/suite-v1-chacha20poly1305])
+                                                         (or (:crypto-suites state) sealed/default-crypto-suites))
+                valid-sig? (and (:ok? suite-neg)
+                                caller-pub sig-bytes
                                 (crypto/verify caller-pub (fressian/utf8->bytes header-str) sig-bytes))]
             (if-not valid-sig?
               {:state state :net-envelopes [] :stdout-events []}
@@ -3093,7 +3261,8 @@
                     rejected-burn? (< burn min-burn)]
                 (if (or rejected-allowlist? rejected-burn?)
                   {:state state :net-envelopes [] :stdout-events []}
-                  (let [clean-header (cond-> (select-keys msg [:bitecho/type :type :caller :callee :offer-hash :epoch :burn :topic :home-node :signature])
+                  (let [clean-header (cond-> (select-keys msg [:bitecho/type :type :caller :callee :offer-hash :epoch :burn :topic :home-node :signature :crypto-suites])
+                                       (:selected-suite suite-neg) (assoc :selected-suite (:selected-suite suite-neg))
                                        (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))
                         caller-pname (pubkey->petname state caller)
                         header-evt (cond-> {"event" "rendezvous-header-received"
@@ -3141,10 +3310,20 @@
                 ack-sig (str (or (:signature ack) (get ack "signature") ""))
                 callee-x25519 (:callee-x25519 msg)
                 epoch (long (:epoch msg))
-                ack-str (canonical-rendezvous-ack-str (:caller msg) (:callee msg) offer-hash callee-x25519 epoch ack-sig)
+                raw-sel-suite (or (:selected-suite msg) (:suite msg))
+                sel-str (when raw-sel-suite (if (keyword? raw-sel-suite) (name raw-sel-suite) (str raw-sel-suite)))
+                offered-suites (set (map #(if (keyword? %) (name %) (str %))
+                                         (or (:crypto-suites outbound) sealed/default-crypto-suites)))
+                suite-valid? (if sel-str
+                               (and (contains? offered-suites sel-str)
+                                    (contains? sealed/supported-crypto-suites sel-str))
+                               (contains? offered-suites sealed/suite-v1-chacha20poly1305))
+                effective-suite (or sel-str sealed/suite-v1-chacha20poly1305)
+                ack-str (canonical-rendezvous-ack-str (:caller msg) (:callee msg) offer-hash callee-x25519 epoch ack-sig sel-str)
                 callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                sig-valid? (and callee-pub sig-bytes
+                sig-valid? (and suite-valid?
+                                callee-pub sig-bytes
                                 (crypto/verify callee-pub (fressian/utf8->bytes ack-str) sig-bytes))]
             (if-not (and ack-valid? sig-valid?)
               {:state state :net-envelopes [] :stdout-events []}
@@ -3160,6 +3339,7 @@
                                                                     offer-hash (:caller-x25519-pub outbound) (:epoch state))
                         reveal-sig (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes reveal-str)))
                         reveal-payload {:protocol-version current-wire-version
+                                        :wire-format current-wire-format
                                         :bitecho/type :rendezvous-reveal
                                         :type :rendezvous-reveal
                                         :session-id session-id
@@ -3175,14 +3355,16 @@
                         (if (and initial-text (not (str/blank? initial-text)))
                           (let [text-bytes (fressian/utf8->bytes initial-text)
                                 seq-num 1
-                                sealed-m (sealed/seal-message (:tx-key keys) seq-num text-bytes (fressian/utf8->bytes session-id))
+                                sealed-m (sealed/seal-message (:tx-key keys) seq-num text-bytes (fressian/utf8->bytes session-id) effective-suite)
                                 msg-payload {:protocol-version current-wire-version
+                                             :wire-format current-wire-format
                                              :bitecho/type :sealed-message
                                              :session-id session-id
                                              :sender (:pubkey state)
                                              :recipient (:callee outbound)
                                              :epoch (long (or (:epoch outbound) (:epoch state) 0))
                                              :seq seq-num
+                                             :suite effective-suite
                                              :nonce (basalt/bytes->hex (:nonce sealed-m))
                                              :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
                                 msg-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) 500)]
@@ -3201,6 +3383,7 @@
                               :epoch (long (or (:epoch outbound) (:epoch state) 0))
                               :tx-key (:tx-key keys)
                               :rx-key (:rx-key keys)
+                              :suite effective-suite
                               :replay-window (sealed/init-replay-window)}
                              [reveal-env msg-env]])
                           [{:session-id session-id
@@ -3218,6 +3401,7 @@
                             :epoch (long (or (:epoch outbound) (:epoch state) 0))
                             :tx-key (:tx-key keys)
                             :rx-key (:rx-key keys)
+                            :suite effective-suite
                             :replay-window (sealed/init-replay-window)}
                            [reveal-env]])
                         new-state (-> state
@@ -3270,6 +3454,7 @@
                                                          :price (:burn header)
                                                          :burn (:burn header)
                                                          :home-node (:home-node header)
+                                                         :crypto-suites (:crypto-suites header)
                                                          :dac (:dac header)})
                 commitment-valid? (and (= sid expected-sid)
                                        (= offer-hash expected-offer-hash))]
@@ -3303,6 +3488,7 @@
                                            :epoch (long (or (:epoch header) (:epoch state) 0))
                                            :tx-key (:tx-key keys)
                                            :rx-key (:rx-key keys)
+                                           :suite (or (:selected-suite pending) (:selected-suite header) (first (:crypto-suites header)) sealed/suite-v1-chacha20poly1305)
                                            :replay-window (sealed/init-replay-window)}
                             new-state (-> state
                                           (update :pending-rendezvous-accepts dissoc offer-hash)
@@ -3386,35 +3572,51 @@
              :response {"ok" false "error" err-msg "version" unsupported-ver}
              :net-envelopes []
              :stdout-events [diag-event]})
-          (let [msg-type (or (:bitecho/type msg) (:type msg))
-                msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
-                sess-epoch (when-let [sid (:session-id msg)]
-                             (get-in state [:sessions sid :epoch]))
-                ref-epoch (if (or (:epoch-initialized? state)
-                                  (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
-                            (:epoch state)
-                            (or sess-epoch msg-epoch))
-                skew-exceeded? (and (not= msg-type :chain-state-snapshot)
-                                    msg-epoch ref-epoch
-                                    (> (math-abs (- msg-epoch (long ref-epoch))) 2)
-                                    (or (nil? sess-epoch)
-                                        (> (math-abs (- msg-epoch (long sess-epoch))) 2)))]
-            (if skew-exceeded?
-              {:state state :net-envelopes [] :stdout-events []}
-              (let [res (case msg-type
-                          :channel-offer (handle-wire-offer state msg privkey-bytes)
-                          :channel-accept (handle-wire-accept state msg)
-                          :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
-                          :session-ack (handle-wire-session-ack state msg)
-                          :channel-close (handle-wire-close state msg)
-                          :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
-                          :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
-                          :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
-                          :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
-                          {:state state :net-envelopes [] :stdout-events []})]
-                (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
-                  (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
-                  res)))))))))
+          (let [f-chk (check-wire-format-compatibility msg)]
+            (if-not (:ok? f-chk)
+              (let [unsupported-fmt (:wire-format f-chk)
+                    err-msg (:error f-chk)
+                    new-state (-> state
+                                  (update-in [:wire-version-diagnostics :unsupported-format-dropped] (fnil inc 0))
+                                  (assoc-in [:wire-version-diagnostics :last-unsupported-format] unsupported-fmt)
+                                  (assoc-in [:wire-version-diagnostics :last-error] err-msg))
+                    diag-event {"event" "wire-format-rejected"
+                                "error" err-msg
+                                "wire_format" unsupported-fmt
+                                "supported_formats" ["fressian-v1" "legacy-nippy"]}]
+                {:state new-state
+                 :response {"ok" false "error" err-msg "wire_format" unsupported-fmt}
+                 :net-envelopes []
+                 :stdout-events [diag-event]})
+              (let [msg-type (or (:bitecho/type msg) (:type msg))
+                    msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
+                    sess-epoch (when-let [sid (:session-id msg)]
+                                 (get-in state [:sessions sid :epoch]))
+                    ref-epoch (if (or (:epoch-initialized? state)
+                                      (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
+                                (:epoch state)
+                                (or sess-epoch msg-epoch))
+                    skew-exceeded? (and (not= msg-type :chain-state-snapshot)
+                                        msg-epoch ref-epoch
+                                        (> (math-abs (- msg-epoch (long ref-epoch))) 2)
+                                        (or (nil? sess-epoch)
+                                            (> (math-abs (- msg-epoch (long sess-epoch))) 2)))]
+                (if skew-exceeded?
+                  {:state state :net-envelopes [] :stdout-events []}
+                  (let [res (case msg-type
+                              :channel-offer (handle-wire-offer state msg privkey-bytes)
+                              :channel-accept (handle-wire-accept state msg)
+                              :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
+                              :session-ack (handle-wire-session-ack state msg)
+                              :channel-close (handle-wire-close state msg)
+                              :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
+                              :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
+                              :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
+                              :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
+                              {:state state :net-envelopes [] :stdout-events []})]
+                    (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
+                      (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
+                      res)))))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; JSONL Line Processor

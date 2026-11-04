@@ -410,13 +410,14 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
      - Byte arrays (`byte[]` on JVM, `Uint8Array` on CLJS) are compared lexicographically by unsigned byte values `0..255`.
      - Sequential collections (`vector`), sets, and maps compare length/count first, then element-wise via `canonical-compare`.
      - Map keys are sorted deterministically prior to emission, eliminating JVM hash-map vs. V8 object iteration non-determinism.
-     - Set elements are sorted deterministically by their canonical encoded byte values.
+     - Set elements are sorted deterministically using `canonical-compare` prior to emission.
      - Integers use canonical compact Fressian width tiers (1-byte, 2-byte, 3-byte, 4-byte, 8-byte).
      - Byte arrays and strings encode as raw Fressian chunks with length prefixes. Strings use CESU-8 encoding for full bidirectional parity with `org.clojure/data.fressian` on astral-plane code points (e.g. emoji surrogate pairs).
    - **JVM `org.clojure/data.fressian` Parity**: Full bidirectional interop verified on JVM via `write-standard-fressian` and `read-standard-fressian`, ensuring standard Fressian readers decode what the canonical encoder produces without error.
    - **Domain-Specific Non-Fressian Signing/Digest Constructs**:
      1. *Escrow Release Preimage Binding*: `bitecho.economy.escrow` uses a canonical pipe-delimited string `(str escrow-id "|" preimage "|" epoch)` for deliverable preimage release validation.
      2. *Attestation Exchange Digest*: `bitecho.economy.attestation` uses `(compute-exchange-digest epoch peer-a peer-b message-roles)` which computes a SHA-256 digest over deterministic `(pr-str [epoch peer-a peer-b sorted-roles])` exchange records.
+     3. *Rendezvous Inbox Reveal Display*: `bitecho.light-node.core` uses `(pr-str {:session-id session-id :caller caller :epoch epoch :caller-x25519 caller-x25519})` in `deliver-payload` for human-readable / JSONL inbox display of rendezvous reveal events.
 
 2. **N/N-1 Signing-Byte Fallback (`crypto/verify-with-fallback`)**:
    - Helper functions in `bitecho.crypto`:
@@ -440,6 +441,39 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
 5. **Cross-Runtime Test Parity**:
    - Test suites ported to `.cljc` and executed simultaneously across Clojure 1.12 JVM (`clojure -M:test`) and ClojureScript 1.11 / Node v22 (`clojure -M:test-cljs`).
    - Shared golden vectors in `fressian_test.cljc` verify hex-identical outputs across nested maps, unordered sets, compact integers, and UTF-8 strings.
+
+### Q. Wire Format + Crypto-Suite Negotiation (Milestone 9)
+
+1. **Dual Fressian Wire Codec (`bitecho.fressian`)**:
+   - **Wire Separation from Canonical Bytes**: Wire encoding (`encode-wire` / `decode-wire`) is explicitly separated from deterministic canonical signing bytes (`encode-canonical` / `decode`). Wire encoding prioritizes runtime efficiency, extensibility, and seamless Java/Node interop, while canonical encoding guarantees byte-for-byte deterministic invariant hashing across runtimes.
+   - **JVM Implementation (`:clj`)**: Uses `org.clojure.data.fressian/write` and `org.clojure.data.fressian/read`. Pre-normalizes Clojure records and lazy sequences into persistent maps/vectors (`normalize-for-wire`) prior to writing, and converts Java collection types (`java.util.List`, `java.util.Set`, `java.util.Map`) back to Clojure persistent data structures (`normalize-decoded-wire`).
+   - **ClojureScript Implementation (`:cljs`)**: Uses a zero-dependency pure ClojureScript Fressian codec. Fully supports decoding chunked strings (`tag-string-chunk` 226) and chunked byte arrays (`tag-bytes-chunk` 216) emitted by JVM `org.clojure/data.fressian` writers.
+   - **Nippy N/N-1 Rolling Fallback**: On JVM, `decode-wire` inspects the initial byte header. If Nippy magic bytes (`[78 80 89]` = `NPY` or `[-120 78 80 89]`) are present, it falls back seamlessly to `(nippy/thaw ba)`. This guarantees seamless rolling upgrade compatibility with nodes running earlier Nippy wire formats.
+   - **Untrusted Crypto Tag Stripping**: `decode-wire` recursively strips shell-boundary tags (`:crypto/verified?`, `:crypto/verified-a?`) at ingress.
+
+2. **Wire Format Versioning & Rolling Upgrade (`bitecho.light-node.core`, `bitecho.shell.mesh`)**:
+   - **Format Identifiers**:
+     - `current-wire-format`: `"fressian-v1"`
+     - `supported-wire-formats`: `#{"fressian-v1" "legacy-nippy"}`
+     - `reserved-wire-formats`: `#{"transit-json" "transit-msgpack"}`
+   - **Envelope Tagging**: Outbound agent envelopes and wire payloads attach `:wire-format current-wire-format`. Legacy unversioned (N-1) envelopes omitting `:wire-format` are accepted seamlessly.
+   - **Fail-Closed Drop & Diagnostics**: Inbound messages carrying unsupported or reserved formats (e.g. `"transit-json"`) are dropped fail-closed. Emits a counted `:diagnose` effect, increments `:unsupported-format-dropped` in state, records `:last-unsupported-format` and `:last-error "unsupported-wire-format"`, and emits a `"wire-format-rejected"` stdout event.
+   - **Status Exposure**: `status` and `connz` expose wire format health under `"wire_protocol"`: `{"version" 1, "wire_format" "fressian-v1", "supported_formats" ["fressian-v1" "legacy-nippy"], "unsupported_format_dropped" 0, "last_unsupported_format" nil}`.
+
+3. **Multi-Suite Crypto Architecture & Downgrade Protection (`bitecho.crypto.sealed`)**:
+   - **Supported Suites**:
+     - `suite-v1-aes256gcm`: AES-256-GCM AEAD with 96-bit nonce derived from 64-bit sequence counter via `seq->nonce`, and 16-byte authentication tag appended to ciphertext.
+     - `suite-v1-chacha20poly1305`: ChaCha20-Poly1305 AEAD with 96-bit nonce and 16-byte Poly1305 tag.
+     - Default advertised suite order: `["suite-v1-aes256gcm" "suite-v1-chacha20poly1305"]`.
+   - **Cross-Runtime Golden Parity**: JDK `Cipher` (`AES/GCM/NoPadding`) and Node.js `node:crypto` (`createCipheriv('aes-256-gcm', ...)` / `createDecipheriv`) produce byte-for-byte identical ciphertext and tag against shared golden test vectors.
+   - **Deterministic Suite Negotiation (`negotiate-crypto-suite`)**: Deterministic pure function selecting the caller's highest-priority suite supported by both parties. Fails closed with `{:ok? false :error "no-mutually-supported-crypto-suite"}` when no mutual suite exists.
+   - **Cryptographic Downgrade Resistance**:
+     - Channel offer: advertised `:crypto-suites` are bound into `offer-hash` via `|<suites-csv>`, signed by the initiator's Ed25519 identity key.
+     - Rendezvous offer header: `:crypto-suites` are bound into `canonical-rendezvous-header-str` and signed with Ed25519.
+     - Directory Authority descriptor: `:crypto-suites` are bound into the Proof-of-Possession and directory attestation canonical string.
+     - Any in-flight stripping or alteration of advertised suites causes signature verification failure, dropping the handshake fail-closed.
+   - **Strict Mid-Session Suite Mismatch Rejection**: `open-message` takes `session-suite` and `frame-suite` (6-arity). If a frame attempts mid-session suite substitution (`not= session-suite frame-suite`), decryption fails closed immediately, returning `nil` without leaking plaintext.
+
 
 
 

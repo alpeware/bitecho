@@ -417,8 +417,7 @@
                    (fn [evt]
                      (try
                        (let [payload (:payload evt)
-                             raw-msg (if (bytes? payload) (nippy/thaw payload) payload)
-                             msg (when raw-msg (fressian/strip-untrusted-crypto-tags raw-msg))]
+                             msg (if (bytes? payload) (fressian/decode-wire payload) (fressian/strip-untrusted-crypto-tags payload))]
                          (when (and (map? msg) (= :chain-state-snapshot (or (:bitecho/type msg) (:type msg))))
                            (deliver snapshot-promise msg)))
                        (catch Exception _ nil)))

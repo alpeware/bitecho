@@ -10,7 +10,8 @@
    - Canonical signing-byte construction and N/N-1 rolling-upgrade verification helpers."
   (:refer-clojure :exclude [bytes?])
   #?(:clj
-     (:require [clojure.data.fressian :as data-fressian])))
+     (:require [clojure.data.fressian :as data-fressian]
+               [taoensso.nippy :as nippy])))
 
 ;; =============================================================================
 ;; Portable Byte Utilities
@@ -27,6 +28,29 @@
   ^long [x]
   #?(:clj  (alength ^bytes x)
      :cljs (.-length x)))
+
+(defn- nth-byte
+  "Returns byte value at index i from a byte array."
+  [ba i]
+  #?(:clj  (aget ^bytes ba (int i))
+     :cljs (aget ba i)))
+
+(defn nippy-payload?
+  "Returns true if the byte array appears to be a Nippy serialized payload
+   (starts with Nippy uncompressed magic header 'NPY' [78 80 89] or compressed [0x88 78 80 89])."
+  [ba]
+  (and (bytes? ba)
+       (let [cnt (count-bytes ba)]
+         (or (and (>= cnt 3)
+                  (= (nth-byte ba 0) 78)
+                  (= (nth-byte ba 1) 80)
+                  (= (nth-byte ba 2) 89))
+             (and (>= cnt 4)
+                  (let [b0 (nth-byte ba 0)]
+                    (or (= b0 -120) (= b0 136) (= (bit-and b0 0xff) 0x88)))
+                  (= (nth-byte ba 1) 78)
+                  (= (nth-byte ba 2) 80)
+                  (= (nth-byte ba 3) 89))))))
 
 (defn utf8->bytes
   "Encodes a string to UTF-8 bytes."
@@ -845,6 +869,30 @@
       (let [len (- code tag-bytes-packed-length-start)]
         (read-slice rdr len))
 
+      (= code tag-bytes-chunk)
+      (let [initial-len (decode-count rdr)
+            initial-chunk (read-slice rdr initial-len)]
+        (loop [chunks [initial-chunk]]
+          (let [next-code (read-raw-byte rdr)]
+            (cond
+              (= next-code tag-bytes-chunk)
+              (let [len (decode-count rdr)
+                    chunk (read-slice rdr len)]
+                (recur (conj chunks chunk)))
+
+              (<= tag-bytes-packed-length-start next-code (dec tag-bytes-packed-length-end))
+              (let [len (- next-code tag-bytes-packed-length-start)
+                    chunk (read-slice rdr len)]
+                (apply concat-bytes (conj chunks chunk)))
+
+              (= next-code tag-bytes)
+              (let [len (decode-count rdr)
+                    chunk (read-slice rdr len)]
+                (apply concat-bytes (conj chunks chunk)))
+
+              :else
+              (throw (ex-info (str "Unexpected code in chunked bytes: " next-code) {:code next-code}))))))
+
       (= code tag-bytes)
       (let [len (decode-count rdr)]
         (read-slice rdr len))
@@ -853,6 +901,30 @@
       (let [len (- code tag-string-packed-length-start)
             cesu8 (read-slice rdr len)]
         (cesu8-bytes->string cesu8))
+
+      (= code tag-string-chunk)
+      (let [initial-len (decode-count rdr)
+            initial-chunk (read-slice rdr initial-len)]
+        (loop [chunks [initial-chunk]]
+          (let [next-code (read-raw-byte rdr)]
+            (cond
+              (= next-code tag-string-chunk)
+              (let [len (decode-count rdr)
+                    chunk (read-slice rdr len)]
+                (recur (conj chunks chunk)))
+
+              (<= tag-string-packed-length-start next-code (dec tag-string-packed-length-end))
+              (let [len (- next-code tag-string-packed-length-start)
+                    chunk (read-slice rdr len)]
+                (cesu8-bytes->string (apply concat-bytes (conj chunks chunk))))
+
+              (= next-code tag-string)
+              (let [len (decode-count rdr)
+                    chunk (read-slice rdr len)]
+                (cesu8-bytes->string (apply concat-bytes (conj chunks chunk))))
+
+              :else
+              (throw (ex-info (str "Unexpected code in chunked string: " next-code) {:code next-code}))))))
 
       (= code tag-string)
       (let [len (decode-count rdr)
@@ -964,3 +1036,117 @@
   (if (bytes? payload)
     payload
     (utf8->bytes (pr-str (strip-untrusted-crypto-tags payload)))))
+
+;; =============================================================================
+;; Wire Codec (Step 9A)
+;; =============================================================================
+
+(defn normalize-for-wire
+  "Recursively pre-normalizes Clojure data structures for wire encoding:
+   converts defrecords and maps into standard persistent maps,
+   and sequential collections/lazy seqs into persistent vectors."
+  [x]
+  (cond
+    (record? x)
+    (reduce-kv (fn [m k v]
+                 (assoc m (normalize-for-wire k) (normalize-for-wire v)))
+               {}
+               x)
+
+    (map? x)
+    (reduce-kv (fn [m k v]
+                 (assoc m (normalize-for-wire k) (normalize-for-wire v)))
+               {}
+               x)
+
+    (vector? x)
+    (mapv normalize-for-wire x)
+
+    (set? x)
+    (into #{} (map normalize-for-wire) x)
+
+    (sequential? x)
+    (mapv normalize-for-wire x)
+
+    :else x))
+
+#?(:clj
+   (defn normalize-decoded-wire
+     "Recursively normalizes Java collection types decoded by standard Fressian into
+      standard Clojure persistent data structures."
+     [x]
+     (cond
+       (instance? java.util.Map x)
+       (reduce (fn [m ^java.util.Map$Entry e]
+                 (assoc m
+                        (normalize-decoded-wire (.getKey e))
+                        (normalize-decoded-wire (.getValue e))))
+               {}
+               (.entrySet ^java.util.Map x))
+
+       (instance? java.util.List x)
+       (mapv normalize-decoded-wire x)
+
+       (instance? java.util.Set x)
+       (into #{} (map normalize-decoded-wire) x)
+
+       (sequential? x)
+       (mapv normalize-decoded-wire x)
+
+       :else x))
+   :cljs
+   (defn normalize-decoded-wire
+     "Normalizes collections into standard Clojure persistent data structures."
+     [x]
+     (cond
+       (map? x)
+       (reduce-kv (fn [m k v]
+                    (assoc m (normalize-decoded-wire k) (normalize-decoded-wire v)))
+                  {}
+                  x)
+
+       (vector? x)
+       (mapv normalize-decoded-wire x)
+
+       (set? x)
+       (into #{} (map normalize-decoded-wire) x)
+
+       (sequential? x)
+       (mapv normalize-decoded-wire x)
+
+       :else x)))
+
+(defn encode-wire
+  "Encodes val into wire bytes using Fressian.
+   Pre-normalizes Clojure records and lazy seqs into standard maps and vectors.
+   On JVM uses org.clojure.data.fressian; on CLJS uses the zero-dependency Fressian encoder."
+  [val]
+  (let [norm (normalize-for-wire val)]
+    #?(:clj  (write-standard-fressian norm)
+       :cljs (encode-canonical norm))))
+
+(defn decode-wire
+  "Decodes wire bytes into Clojure persistent data structures.
+   Supports Fressian-encoded payloads and legacy Nippy payloads (on JVM).
+   Recursively normalizes collections and strips untrusted shell-boundary crypto tags."
+  [ba]
+  (when (and (bytes? ba) (pos? (count-bytes ba)))
+    #?(:clj
+       (let [decoded (if (nippy-payload? ba)
+                       (try (nippy/thaw ba)
+                            (catch Exception _
+                              (try (read-standard-fressian ba)
+                                   (catch Exception _ (decode ba)))))
+                       (try (read-standard-fressian ba)
+                            (catch Exception _
+                              (try (decode ba)
+                                   (catch Exception _
+                                     (when (nippy-payload? ba)
+                                       (try (nippy/thaw ba) (catch Exception _ nil))))))))]
+         (when decoded
+           (strip-untrusted-crypto-tags (normalize-decoded-wire decoded))))
+       :cljs
+       (let [decoded (try (decode ba)
+                          (catch :default _ nil))]
+         (when decoded
+           (strip-untrusted-crypto-tags (normalize-decoded-wire decoded)))))))

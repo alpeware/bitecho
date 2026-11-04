@@ -17,8 +17,7 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
-            [clojure.test.check.properties :as prop]
-            [taoensso.nippy :as nippy]))
+            [clojure.test.check.properties :as prop]))
 
 (defn- sample-pubkey-hex
   "Returns an 88-character SubjectPublicKeyInfo hex string for testing."
@@ -207,7 +206,7 @@
                       st-alice (light-core/init-light-state (:identity alice) {:epoch epoch})
                       res-offer (light-core/handle-command st-alice cmd (:privkey-bytes alice))
                       offer-env (first (filter gossip-env? (:net-envelopes res-offer)))
-                      raw-msg (try (nippy/thaw (get-in offer-env [:event :message :payload])) (catch Exception _ nil))
+                      raw-msg (try (light-core/thaw-payload (get-in offer-env [:event :message :payload])) (catch Exception _ nil))
                       tampered-msg (case tamper-field
                                      :price (assoc raw-msg :price (inc price))
                                      :epoch (assoc raw-msg :epoch (+ epoch 5))
@@ -870,7 +869,7 @@
 
         ;; Inbound wire offer at Bob: event enriched with caller_petname "alice", wire petname ignored
         (let [gossip-offer (second (:net-envelopes res-offer))
-              wire-payload (assoc (nippy/thaw (get-in gossip-offer [:event :message :payload]))
+              wire-payload (assoc (light-core/thaw-payload (get-in gossip-offer [:event :message :payload]))
                                   :petname "spoofed-attacker-name"
                                   :nickname "spoofed-nick")
               res-b-wire (light-core/handle-wire-payload st-b0 wire-payload priv-bob)
@@ -905,7 +904,7 @@
 
             ;; Inbound wire accept at Alice: event enriched with peer_petname "bob"
             (let [accept-gossip (first (:net-envelopes res-accept))
-                  accept-wire (assoc (nippy/thaw (get-in accept-gossip [:event :message :payload])) :nickname "fake-bob")
+                  accept-wire (assoc (light-core/thaw-payload (get-in accept-gossip [:event :message :payload])) :nickname "fake-bob")
                   res-a-wire (light-core/handle-wire-payload st-a1 accept-wire priv-alice)
                   st-a2 (:state res-a-wire)
                   a-ev (first (:stdout-events res-a-wire))]
@@ -1359,7 +1358,7 @@
             ;; Caller sends offer
             offer-res (light-core/handle-command st-with-dac {"cmd" "offer" "callee" callee-pub "price" 10 "burn" 500} agent-priv)
             gossip-env (second (:net-envelopes offer-res))
-            wire-payload (nippy/thaw (get-in gossip-env [:event :message :payload]))]
+            wire-payload (light-core/thaw-payload (get-in gossip-env [:event :message :payload]))]
         (is (= :channel-offer (:bitecho/type wire-payload)))
         (is (some? (:dac wire-payload)) "Offer must attach active DAC")
         (is (= (:dac-id dac) (:dac-id (:dac wire-payload))))
@@ -2113,7 +2112,7 @@
           offer-hash (get-in offer-res [:response "offer_hash"])
           sid (get-in offer-res [:response "session_id"])
           hdr-gossip-env (first (:net-envelopes offer-res))
-          hdr-payload (nippy/thaw (get-in hdr-gossip-env [:event :message :payload]))]
+          hdr-payload (light-core/thaw-payload (get-in hdr-gossip-env [:event :message :payload]))]
 
       (is (= true (get-in offer-res [:response "ok"])))
       (is (string? offer-hash))
@@ -2138,7 +2137,7 @@
                                                     callee-priv)
               st-callee-2 (:state accept-res)
               ack-gossip-env (first (:net-envelopes accept-res))
-              ack-payload (nippy/thaw (get-in ack-gossip-env [:event :message :payload]))]
+              ack-payload (light-core/thaw-payload (get-in ack-gossip-env [:event :message :payload]))]
           (is (= true (get-in accept-res [:response "ok"])))
           (is (= 1 (count (:pending-rendezvous-accepts st-callee-2))))
           (is (= 0 (count (:pending-rendezvous st-callee-2))))
@@ -2151,8 +2150,8 @@
                 st-caller-2 (:state caller-recv-ack)
                 reveal-env (first (:net-envelopes caller-recv-ack))
                 msg-env (second (:net-envelopes caller-recv-ack))
-                reveal-payload (nippy/thaw (get-in reveal-env [:event :message :payload]))
-                sealed-payload (nippy/thaw (get-in msg-env [:event :message :payload]))]
+                reveal-payload (light-core/thaw-payload (get-in reveal-env [:event :message :payload]))
+                sealed-payload (light-core/thaw-payload (get-in msg-env [:event :message :payload]))]
             (is (= 0 (count (:outbound-rendezvous st-caller-2))))
             (is (= 1 (count (:vouchers st-caller-2))))
             (is (= "open" (get-in st-caller-2 [:sessions sid :state])))
@@ -2181,7 +2180,7 @@
                                                            callee-priv)
                       _st-callee-5 (:state reply-res)
                       reply-env (first (:net-envelopes reply-res))
-                      reply-payload (nippy/thaw (get-in reply-env [:event :message :payload]))
+                      reply-payload (light-core/thaw-payload (get-in reply-env [:event :message :payload]))
                       caller-recv-reply (light-core/handle-wire-payload st-caller-2 reply-payload caller-priv)
                       st-caller-3 (:state caller-recv-reply)
                       caller-inbox (light-core/handle-command st-caller-3 {"cmd" "inbox"} caller-priv)]
@@ -2208,13 +2207,13 @@
           st-caller (:state offer-res)
           offer-hash (get-in offer-res [:response "offer_hash"])
           _sid (get-in offer-res [:response "session_id"])
-          hdr-payload (nippy/thaw (get-in (first (:net-envelopes offer-res)) [:event :message :payload]))
+          hdr-payload (light-core/thaw-payload (get-in (first (:net-envelopes offer-res)) [:event :message :payload]))
           st-callee-1 (:state (light-core/handle-wire-payload init-callee hdr-payload callee-priv))
           accept-res (light-core/handle-command st-callee-1 {"cmd" "rendezvous-accept" "offer_hash" offer-hash} callee-priv)
           st-callee-2 (:state accept-res)
-          ack-payload (nippy/thaw (get-in (first (:net-envelopes accept-res)) [:event :message :payload]))
+          ack-payload (light-core/thaw-payload (get-in (first (:net-envelopes accept-res)) [:event :message :payload]))
           caller-res (light-core/handle-wire-payload st-caller ack-payload caller-priv)
-          reveal-payload (nippy/thaw (get-in (first (:net-envelopes caller-res)) [:event :message :payload]))]
+          reveal-payload (light-core/thaw-payload (get-in (first (:net-envelopes caller-res)) [:event :message :payload]))]
 
       ;; 1. Reveal with swapped :caller-x25519 fails offer-hash commitment verification -> drops cleanly
       (let [swapped-eph (basalt/bytes->hex (:public (sealed/generate-x25519-keypair)))
@@ -2278,7 +2277,7 @@
                       st-caller-1 (:state offer-res)
                       offer-hash (get-in offer-res [:response "offer_hash"])
                       sid (get-in offer-res [:response "session_id"])
-                      hdr-payload (nippy/thaw (get-in (first (:net-envelopes offer-res)) [:event :message :payload]))
+                      hdr-payload (light-core/thaw-payload (get-in (first (:net-envelopes offer-res)) [:event :message :payload]))
 
           ;; 2. Callee receives header
                       callee-recv-hdr (light-core/handle-wire-payload init-callee hdr-payload callee-priv)
@@ -2287,13 +2286,13 @@
           ;; 3. Callee accepts
                       accept-res (light-core/handle-command st-callee-1 {"cmd" "rendezvous-accept" "offer_hash" offer-hash} callee-priv)
                       st-callee-2 (:state accept-res)
-                      ack-payload (nippy/thaw (get-in (first (:net-envelopes accept-res)) [:event :message :payload]))
+                      ack-payload (light-core/thaw-payload (get-in (first (:net-envelopes accept-res)) [:event :message :payload]))
 
           ;; 4. Caller receives ack
                       caller-recv-ack (light-core/handle-wire-payload st-caller-1 ack-payload caller-priv)
                       st-caller-2 (:state caller-recv-ack)
-                      reveal-payload (nippy/thaw (get-in (first (:net-envelopes caller-recv-ack)) [:event :message :payload]))
-                      msg-payload (nippy/thaw (get-in (second (:net-envelopes caller-recv-ack)) [:event :message :payload]))
+                      reveal-payload (light-core/thaw-payload (get-in (first (:net-envelopes caller-recv-ack)) [:event :message :payload]))
+                      msg-payload (light-core/thaw-payload (get-in (second (:net-envelopes caller-recv-ack)) [:event :message :payload]))
 
           ;; 5. Callee receives reveal
                       callee-recv-reveal (light-core/handle-wire-payload st-callee-2 reveal-payload callee-priv)

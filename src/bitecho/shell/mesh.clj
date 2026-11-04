@@ -154,10 +154,29 @@
           (and (integer? v)
                (<= min-supported-wire-version (long v) max-supported-wire-version))))))
 
+(def ^{:doc "Default wire format identifier for agent mesh envelopes."}
+  current-wire-format "fressian-v1")
+
+(def ^{:doc "Set of supported wire encoding formats."}
+  supported-wire-formats #{"fressian-v1" "legacy-nippy" :fressian-v1 :legacy-nippy})
+
+(def ^{:doc "Set of reserved wire formats for future milestones."}
+  reserved-wire-formats #{"transit-json" "transit-msgpack" :transit-json :transit-msgpack})
+
+(defn valid-agent-envelope-format?
+  "Pure helper verifying agent wire protocol envelope format compatibility.
+   Returns true if :wire-format is absent/nil (legacy unversioned N-1) or in supported-wire-formats."
+  [msg]
+  (if-not (map? msg)
+    false
+    (let [fmt (or (:wire-format msg) (get msg "wire_format") (get msg "wire-format"))]
+      (or (nil? fmt)
+          (contains? supported-wire-formats fmt)))))
+
 (defn wrap-agent-event
   "Wraps an agent event into an envelope signed with agent-privkey-bytes.
    Optionally attaches a DAC to the envelope if provided.
-   Includes :protocol-version current-wire-version for rolling upgrade compatibility."
+   Includes :protocol-version current-wire-version and :wire-format for rolling upgrade compatibility."
   ([event agent-pubkey-hex ^bytes agent-privkey-bytes]
    (wrap-agent-event event agent-pubkey-hex agent-privkey-bytes nil))
   ([event agent-pubkey-hex ^bytes agent-privkey-bytes dac]
@@ -167,6 +186,7 @@
          sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
          effective-dac (or dac (:dac event))]
      (cond-> {:protocol-version current-wire-version
+              :wire-format current-wire-format
               :agent-pubkey agent-pubkey-hex
               :event clean-event
               :signature sig-hex}
@@ -194,11 +214,12 @@
   ([raw-msg opts]
    (try
      (let [raw-unwrapped (if (bytes? raw-msg)
-                           (try (nippy/thaw raw-msg) (catch Exception _ nil))
+                           (fressian/decode-wire raw-msg)
                            raw-msg)
            msg (when raw-unwrapped (fressian/strip-untrusted-crypto-tags raw-unwrapped))]
        (when (and (map? msg)
                   (valid-agent-envelope-version? msg)
+                  (valid-agent-envelope-format? msg)
                   (string? (:agent-pubkey msg))
                   (map? (:event msg))
                   (contains? allowed-agent-events (:type (:event msg)))
@@ -1417,7 +1438,7 @@
   "Extracts or computes a deterministic message ID from a frozen or thawed gossip event/envelope."
   [evt-or-bytes]
   (let [thawed (cond
-                 (bytes? evt-or-bytes) (try (nippy/thaw evt-or-bytes) (catch Exception _ nil))
+                 (bytes? evt-or-bytes) (fressian/decode-wire evt-or-bytes)
                  (map? evt-or-bytes) evt-or-bytes
                  :else nil)
         msg (cond
@@ -1469,11 +1490,11 @@
           (let [targets (extract-command-target-hexes cmd)
                 sender-hex (:pubkey-hex identity)
                 evt (command->network-event cmd sender-hex)
-                frozen (nippy/freeze evt)]
+                frozen (fressian/encode-wire evt)]
             (doseq [target targets]
               (if (= transport :in-memory)
                 (when-let [peer-entry (get @in-mem-bus target)]
-                  (let [thawed (assoc (fressian/strip-untrusted-crypto-tags (nippy/thaw frozen))
+                  (let [thawed (assoc (fressian/decode-wire frozen)
                                       :sender sender-hex
                                       :sender-pubkey-bytes (get-in identity [:keypair :public])
                                       :rng (java.util.Random.))]
@@ -1567,9 +1588,8 @@
                                           (cond-> {:type :on-message :generation next-gen :node node :peer pid}
                                             (:channel-id evt) (assoc :channel-id (:channel-id evt))))]
                              (when (= node (:node updated))
-                               (let [raw-thawed (try (nippy/thaw (:payload evt)) (catch Exception _ nil))
-                                     msg (when raw-thawed (fressian/strip-untrusted-crypto-tags raw-thawed))]
-                                 (if (nil? msg)
+                               (let [msg (fressian/decode-wire (:payload evt))]
+                                 (if-not (map? msg)
                                    (apply-mesh-conn-event! peer-conns peer-hex
                                                            {:type :invalid-frame :generation next-gen :node node :peer pid :error "malformed-peer-frame"})
                                    (when-not (= :keepalive (:type msg))

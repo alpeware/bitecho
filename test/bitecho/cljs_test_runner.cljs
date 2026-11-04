@@ -10,6 +10,7 @@
             [bitecho.rendezvous.core-test]
             [bitecho.state-machine-portability-test]
             [bitecho.streamlet.core-test]
+            [bitecho.wire-negotiation-test]
             [cljs.test :as test :refer-macros [run-tests]]))
 
 (def ^{:doc "Atom holding aggregate test run summary."} summary-atom (atom {:fail 0 :error 0 :pass 0 :test 0}))
@@ -39,6 +40,7 @@
              'bitecho.economy.burn-test
              'bitecho.economy.account-test
              'bitecho.economy.treasury-test
-             'bitecho.state-machine-portability-test))
+             'bitecho.state-machine-portability-test
+             'bitecho.wire-negotiation-test))
 
 (set! *main-cli-fn* -main)
