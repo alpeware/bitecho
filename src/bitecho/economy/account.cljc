@@ -26,13 +26,12 @@
                                          sig-col
                                          #?(:clj (byte-array (map byte sig-col))
                                             :cljs (js/Uint8Array. (clj->js sig-col)))))))
-        safe-transfer (assoc (dissoc (into {} transfer) :crypto/verified?) :signature sig-hex)]
+        safe-transfer (assoc (fressian/strip-untrusted-crypto-tags (into {} transfer)) :signature sig-hex)]
     (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical safe-transfer)))))
 
 (defn validate-transfer
   "Validates a transfer against a current account state.
-   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)
-   and shell-boundary pre-verification (:crypto/verified? true)."
+   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)."
   [current-state transfer]
   (try
     (let [sender (:sender transfer)
@@ -43,13 +42,12 @@
           valid-deps? (= (:deps transfer) (:deps current-state))
           valid-balance? (>= (:balance current-state) (:amount transfer))
 
-          unsigned-transfer (into (sorted-map) (dissoc transfer :signature :crypto/verified?))
+          unsigned-transfer (into (sorted-map) (fressian/strip-untrusted-crypto-tags (dissoc transfer :signature)))
           sig-bytes (if (coll? (:signature transfer))
                       #?(:clj (byte-array (map byte (:signature transfer)))
                          :cljs (js/Uint8Array. (clj->js (:signature transfer))))
                       (:signature transfer))
-          valid-signature? (or (:crypto/verified? transfer)
-                               (crypto/verify-with-fallback sender-bytes unsigned-transfer sig-bytes))]
+          valid-signature? (crypto/verify-with-fallback sender-bytes unsigned-transfer sig-bytes)]
 
       (and valid-seq? valid-deps? valid-balance? (boolean valid-signature?)))
     (catch #?(:clj Exception :cljs :default) _

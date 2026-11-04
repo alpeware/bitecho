@@ -49,41 +49,37 @@
 
 (defn verify-block-signature
   "Verifies the Ed25519 signature of a block against the proposer's public key bytes.
-   Supports N/N-1 rolling verification and shell-boundary pre-verification."
+   Supports N/N-1 rolling verification."
   [block proposer-pubkey-bytes]
-  (if (:crypto/verified? block)
-    true
-    (boolean
-     (when (and (map? block)
-                (valid-hex-string? (:signature block))
-                (bytes? proposer-pubkey-bytes))
-       (try
-         (crypto/verify-with-fallback proposer-pubkey-bytes
-                                      [(:epoch block) (:parent-hash block) (:payload block) (:proposer block)]
-                                      (hex->bytes (:signature block)))
-         (catch #?(:clj Exception :cljs :default) _ false))))))
+  (boolean
+   (when (and (map? block)
+              (valid-hex-string? (:signature block))
+              (bytes? proposer-pubkey-bytes))
+     (try
+       (crypto/verify-with-fallback proposer-pubkey-bytes
+                                    [(:epoch block) (:parent-hash block) (:payload block) (:proposer block)]
+                                    (hex->bytes (:signature block)))
+       (catch #?(:clj Exception :cljs :default) _ false)))))
 
 (defn verify-vote-signature
   "Verifies the Ed25519 signature of a vote against voter-pubkey-bytes.
-   Supports N/N-1 rolling verification and shell-boundary pre-verification.
+   Supports N/N-1 rolling verification.
    Returns false on any non-string field, malformed hex, or verification error."
   [vote voter-pubkey-bytes]
-  (if (:crypto/verified? vote)
-    true
-    (boolean
-     (when (and (map? vote)
-                (string? (:block-hash vote))
-                (valid-hex-string? (:voter-signature vote)))
-       (let [pk-bytes (if (string? voter-pubkey-bytes)
-                        (hex->bytes voter-pubkey-bytes)
-                        voter-pubkey-bytes)]
-         (when (bytes? pk-bytes)
-           (try
-             (let [sig-bytes (hex->bytes (:voter-signature vote))
-                   msg-bytes (fressian/utf8->bytes (:block-hash vote))]
-               (or (crypto/verify pk-bytes msg-bytes sig-bytes)
-                   (crypto/verify-with-fallback pk-bytes (:block-hash vote) sig-bytes)))
-             (catch #?(:clj Exception :cljs :default) _ false))))))))
+  (boolean
+   (when (and (map? vote)
+              (string? (:block-hash vote))
+              (valid-hex-string? (:voter-signature vote)))
+     (let [pk-bytes (if (string? voter-pubkey-bytes)
+                      (hex->bytes voter-pubkey-bytes)
+                      voter-pubkey-bytes)]
+       (when (bytes? pk-bytes)
+         (try
+           (let [sig-bytes (hex->bytes (:voter-signature vote))
+                 msg-bytes (fressian/utf8->bytes (:block-hash vote))]
+             (or (crypto/verify pk-bytes msg-bytes sig-bytes)
+                 (crypto/verify-with-fallback pk-bytes (:block-hash vote) sig-bytes)))
+           (catch #?(:clj Exception :cljs :default) _ false)))))))
 
 (defn hash-block
   "Serializes a block to canonical bytes, hashes via SHA-256, and returns a hex string."

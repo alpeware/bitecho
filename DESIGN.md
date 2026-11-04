@@ -403,30 +403,39 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
 ### P. Portable Core + Canonical Bytes (Milestone 8)
 
 1. **Scoped Deterministic Canonical Fressian Codec (`bitecho.fressian`)**:
-   - **Portable Type Support**: Portable across Clojure (JVM) and ClojureScript (Node/Browser) without external npm or heavy dependencies, supporting: `nil`, `boolean`, `int64` (compact integer tiers), `bytes` (`byte[]` / `Uint8Array`), `string` (UTF-8), `keyword`, `vector`, `set`, and `map`.
-   - **Deterministic Canonical Ordering**:
-     - Map keys are sorted deterministically by canonical byte ordering prior to emission, eliminating JVM vs. V8 iteration non-determinism.
+   - **Portable Type Support**: Portable across Clojure (JVM) and ClojureScript (Node/Browser) without external npm or heavy dependencies, supporting: `nil`, `boolean`, `int64` (compact integer tiers), `bytes` (`byte[]` / `Uint8Array`), `string` (CESU-8 / UTF-8), `keyword`, `vector`, `set`, and `map`.
+   - **Deterministic Canonical Ordering (`canonical-compare`)**:
+     - Strict type-rank hierarchy: `nil` (0) < `boolean` (1) < `int64`/integer (2) < `float`/`double` (3) < `string` (4) < `keyword` (5) < `symbol` (6) < `bytes` (7) < `vector`/sequential (8) < `set` (9) < `map` (10).
+     - Primitive values within identical type ranks are ordered by natural value comparison.
+     - Byte arrays (`byte[]` on JVM, `Uint8Array` on CLJS) are compared lexicographically by unsigned byte values `0..255`.
+     - Sequential collections (`vector`), sets, and maps compare length/count first, then element-wise via `canonical-compare`.
+     - Map keys are sorted deterministically prior to emission, eliminating JVM hash-map vs. V8 object iteration non-determinism.
      - Set elements are sorted deterministically by their canonical encoded byte values.
      - Integers use canonical compact Fressian width tiers (1-byte, 2-byte, 3-byte, 4-byte, 8-byte).
-     - Byte arrays and strings encode as raw Fressian chunks with length prefixes.
-   - **JVM `org.clojure/data.fressian` Parity**: Full interop verified on JVM via `write-standard-fressian` and `read-standard-fressian`, ensuring standard Fressian readers read what the canonical encoder produces.
+     - Byte arrays and strings encode as raw Fressian chunks with length prefixes. Strings use CESU-8 encoding for full bidirectional parity with `org.clojure/data.fressian` on astral-plane code points (e.g. emoji surrogate pairs).
+   - **JVM `org.clojure/data.fressian` Parity**: Full bidirectional interop verified on JVM via `write-standard-fressian` and `read-standard-fressian`, ensuring standard Fressian readers decode what the canonical encoder produces without error.
+   - **Domain-Specific Non-Fressian Signing/Digest Constructs**:
+     1. *Escrow Release Preimage Binding*: `bitecho.economy.escrow` uses a canonical pipe-delimited string `(str escrow-id "|" preimage "|" epoch)` for deliverable preimage release validation.
+     2. *Attestation Exchange Digest*: `bitecho.economy.attestation` uses `(compute-exchange-digest epoch peer-a peer-b message-roles)` which computes a SHA-256 digest over deterministic `(pr-str [epoch peer-a peer-b sorted-roles])` exchange records.
 
 2. **N/N-1 Signing-Byte Fallback (`crypto/verify-with-fallback`)**:
    - Helper functions in `bitecho.crypto`:
      - `canonical-signing-bytes [payload]`: deterministic canonical Fressian bytes (`v2` canonical signing format).
      - `legacy-pr-str-signing-bytes [payload]`: UTF-8 bytes of `(pr-str payload)` (`v1` legacy signing format).
      - `sign-canonical [privkey payload]`: signs canonical `v2` bytes using Ed25519.
-     - `verify-with-fallback [pubkey payload sig]`: verifies signature against `v2` canonical bytes first, falling back cleanly to `v1` legacy `pr-str` bytes if `v2` fails.
+     - `verify-with-fallback [pubkey payload sig opts?]`: verifies signature against `v2` canonical bytes first, falling back cleanly to `v1` legacy `pr-str` bytes if `v2` fails. Fallback is dynamically gated via `*allow-legacy-v1-signing-fallback*` (default `true`) or per-call `{:allow-v1-fallback? boolean}`.
    - Prevents breaking in-flight or persisted signatures during rolling cluster upgrades across `sieve`, `treasury`, `escrow`, `attestation`, `light_node`, and `mesh`.
 
 3. **Pure Synchronous SHA-256 & Seeded PRNG (`crypto.cljc`)**:
-   - **Keyless Synchronous SHA-256**: Maintained as a pure, synchronous Sans-IO function `(crypto/sha256 bytes-or-str)` returning byte arrays / `Uint8Array`. Backed by `java.security.MessageDigest` on JVM and a zero-dependency 64-round pure-CLJS implementation on Node/browser, matching NIST test vectors.
+   - **Keyless Synchronous SHA-256**: Maintained as a pure, synchronous Sans-IO function `(crypto/sha256 bytes-or-str)` returning byte arrays / `Uint8Array`. Backed by `java.security.MessageDigest` on JVM and a zero-dependency 64-round pure-CLJS implementation on Node/browser, matching NIST test vectors (including empty string, small ASCII, 55/56/64-byte threshold blocks, and multi-chunk 1000-byte streams).
    - **Portable Seeded PRNG (`IRandom`)**: Protocol providing `next-int`, `next-long`, and `next-double`. Backed by `java.util.Random` on JVM and a 64-bit BigInt SplitMix64 PRNG (`make-random`) on ClojureScript.
 
 4. **Shell-Boundary Crypto Architecture (Decision A(i))**:
    - Pure core reducers (`sieve`, `contagion`, `streamlet`, `state-machine`, `light-node`) remain 100% pure and synchronous Sans-IO.
-   - Inbound envelopes can carry boundary pre-verification tags (`:crypto/verified? true` via `pre-verify-envelope`), while preserving synchronous inline verification for tests and shell callers when keys are provided.
-   - Outbound signing emits effect descriptors (`:sign-and-emit`, `:seal-and-emit`) when running in asynchronous boundary contexts (such as WebCrypto `js/crypto.subtle` in Node/browser), while supporting direct synchronous signing when private key bytes are supplied.
+   - Inbound envelopes are sanitized by `strip-untrusted-crypto-tags` across all ingress and thaw paths (`fressian/decode`, `state-machine/thaw-payload-data`, `light-node.core/thaw-payload`, `light-node.core/unwrap-wire-message`, and `mesh.clj`). Pure validators never short-circuit on untrusted wire tags and always cryptographically verify signatures.
+   - `crypto/pre-verify-envelope` executes boundary verification, failing closed with `:crypto/verified? false` and emitting counted diagnostic effect `:diagnose {:effect :diagnose :reason :pre-verify-failed :sender sender}` on signature failure.
+   - Outbound signing emits effect descriptors (`:sign-and-emit`, `:seal-and-emit`) when running in asynchronous boundary contexts. `sign-and-emit` fails closed on missing `:private-key` emitting `:sign-and-emit-invalid-input`; `seal-and-emit` fails closed on missing `:seal-fn` or plaintext data emitting `:seal-and-emit-missing-seal-fn` without leaking plaintext.
+   - **Runtime Boundaries**: In M8/M9 Node.js environments, cryptographic operations use synchronous `node:crypto`. `WebCryptoBoundary` provides asynchronous W3C Web Cryptography API methods (`subtle-digest-sha256`, `subtle-verify-ed25519`) ready for the browser environment in Milestone 10.
 
 5. **Cross-Runtime Test Parity**:
    - Test suites ported to `.cljc` and executed simultaneously across Clojure 1.12 JVM (`clojure -M:test`) and ClojureScript 1.11 / Node v22 (`clojure -M:test-cljs`).

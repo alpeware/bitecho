@@ -152,24 +152,22 @@
   ([ack]
    (verify-delivery-ack ack (:callee ack)))
   ([ack callee-pubkey]
-   (if (:crypto/verified? ack)
-     true
-     (try
-       (let [pub-bytes (to-bytes (or callee-pubkey (:callee ack)))
-             sig-bytes (to-bytes (:signature ack))
-             verify-data (fn [data]
-                           (try
-                             (boolean (crypto/verify-with-fallback pub-bytes data sig-bytes))
-                             (catch #?(:clj Exception :cljs :default) _ false)))]
-         (boolean
-          (or (verify-data (ack-payload-data ack))
-              (when (and (:home-node ack) (or (string? (:home-node ack)) (keyword? (:home-node ack))))
-                (let [norm (normalize-home-node (:home-node ack))
-                      kw (keyword norm)]
-                  (or (verify-data (ack-payload-data (assoc ack :home-node kw)))
-                      (verify-data (ack-payload-data (assoc ack :home-node norm)))))))))
-       (catch #?(:clj Exception :cljs :default) _
-         false)))))
+   (try
+     (let [pub-bytes (to-bytes (or callee-pubkey (:callee ack)))
+           sig-bytes (to-bytes (:signature ack))
+           verify-data (fn [data]
+                         (try
+                           (boolean (crypto/verify-with-fallback pub-bytes data sig-bytes))
+                           (catch #?(:clj Exception :cljs :default) _ false)))]
+       (boolean
+        (or (verify-data (ack-payload-data ack))
+            (when (and (:home-node ack) (or (string? (:home-node ack)) (keyword? (:home-node ack))))
+              (let [norm (normalize-home-node (:home-node ack))
+                    kw (keyword norm)]
+                (or (verify-data (ack-payload-data (assoc ack :home-node kw)))
+                    (verify-data (ack-payload-data (assoc ack :home-node norm)))))))))
+     (catch #?(:clj Exception :cljs :default) _
+       false))))
 
 (defn verify-ack-for-settlement
   "Verifies a DeliveryAck voucher for epoch boundary settlement.

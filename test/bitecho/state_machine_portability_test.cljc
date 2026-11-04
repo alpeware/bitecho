@@ -6,10 +6,15 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.economy.attestation :as attestation]
+            [bitecho.economy.burn :as burn]
+            [bitecho.economy.treasury :as treasury]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
+            [bitecho.rendezvous.core :as rdv]
             [bitecho.sieve.core :as sieve]
             [bitecho.state-machine :as sm]
+            [bitecho.streamlet.core :as streamlet]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
@@ -149,3 +154,270 @@
                                                      :on-sealed #(reset! sealed-atom %)})]
       (is (= "sealed:secret-data" sealed-out))
       (is (= "sealed:secret-data" @sealed-atom)))))
+
+(deftest light-node-core-signing-paths-portability-test
+  (testing "light-node.core signing, attestation, DAC, and command paths run identically on JVM and CLJS without .getBytes errors"
+    (let [kp (crypto/generate-keypair)
+          pub-hex (basalt/bytes->hex (:public kp))
+          priv (:private kp)
+          dir-kp (crypto/generate-keypair)
+          dir-pub-hex (basalt/bytes->hex (:public dir-kp))
+          dir-priv (:private dir-kp)
+          anc-kp (crypto/generate-keypair)
+          anc-pub-hex (basalt/bytes->hex (:public anc-kp))
+          anc-priv (:private anc-kp)
+          peer-kp (crypto/generate-keypair)
+          peer-pub-hex (basalt/bytes->hex (:public peer-kp))
+
+          ;; 1. Directory PoP
+          pop-map (light-core/create-directory-pop priv {:domain "bitecho.org"
+                                                         :nickname "alice"
+                                                         :pubkey pub-hex
+                                                         :epoch 10})
+          _ (is (some? pop-map))
+          _ (is (true? (light-core/verify-directory-pop pop-map)))
+
+          ;; 2. Directory Attestation Descriptor
+          desc (light-core/sign-directory-descriptor dir-priv dir-pub-hex pop-map
+                                                     {:issued-epoch 10
+                                                      :expires-epoch 25
+                                                      :mailbox "mb-alice"})
+          _ (is (some? desc))
+          desc-res (light-core/verify-directory-descriptor desc dir-pub-hex 15)
+          _ (is (true? (:ok? desc-res)))
+          _ (is (true? (:valid? desc-res)))
+
+          ;; 3. DAC creation and verification
+          dac (light-core/create-dac anc-priv {:anchor-pubkey anc-pub-hex
+                                               :agent-pubkey pub-hex
+                                               :issued-epoch 10
+                                               :expires-epoch 30
+                                               :max-spend-per-epoch 1000
+                                               :scopes ["transfer" "lock-intent" "offer"]})
+          _ (is (some? dac))
+          dac-res (light-core/verify-dac dac {:expected-agent-pubkey pub-hex
+                                              :current-epoch 15
+                                              :required-scope "transfer"})
+          _ (is (true? (:ok? dac-res)))
+          _ (is (true? (:valid? dac-res)))
+
+          ;; 4. light-core/handle-command execution
+          st0 (-> (light-core/init-light-state {:pubkey-hex pub-hex
+                                                :fingerprint "fp-alice"
+                                                :ice-creds {:u "u" :p "p"}}
+                                               {:epoch 10})
+                  (assoc :account {:balance 5000 :spendable 5000 :seq 0}))
+
+          ;; 4a. directory-register
+          reg-res (light-core/handle-command st0 {"cmd" "directory-register"
+                                                  "nickname" "alice"
+                                                  "domain" "bitecho.org"} priv)
+          _ (is (= true (get-in reg-res [:response "ok"])))
+          _ (is (= "alice" (get-in reg-res [:response "nickname"])))
+
+          ;; 4b. transfer
+          tf-res (light-core/handle-command st0 {"cmd" "transfer"
+                                                 "receiver" peer-pub-hex
+                                                 "amount" 250} priv)
+          _ (is (= true (get-in tf-res [:response "ok"])))
+          _ (is (pos? (count (:net-envelopes tf-res))))
+
+          ;; 4c. lock-intent
+          d-hash (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes "secret-deliverable")))
+          lock-res (light-core/handle-command st0 {"cmd" "lock-intent"
+                                                   "receiver" peer-pub-hex
+                                                   "amount" 300
+                                                   "deliverable_hash" d-hash
+                                                   "expires_epoch" 25} priv)
+          _ (is (= true (get-in lock-res [:response "ok"])))
+          eid (get-in lock-res [:response "escrow_id"])
+          _ (is (string? eid))
+          st-locked (:state lock-res)
+
+          ;; 4d. release-intent
+          rel-res (light-core/handle-command st-locked {"cmd" "release-intent"
+                                                        "escrow_id" eid} priv)
+          _ (is (= true (get-in rel-res [:response "ok"])))
+          _ (is (= "release-submitted" (get-in rel-res [:response "status"])))
+
+          ;; 4e. refund-intent
+          ref-res (light-core/handle-command st-locked {"cmd" "refund-intent"
+                                                        "escrow_id" eid} priv)
+          _ (is (= true (get-in ref-res [:response "ok"])))
+          _ (is (= "refund-submitted" (get-in ref-res [:response "status"])))
+
+          ;; 4f. rendezvous-offer
+          rdv-res (light-core/handle-command st0 {"cmd" "rendezvous-offer"
+                                                  "callee" peer-pub-hex
+                                                  "burn" 25
+                                                  "topic" "chat"} priv)
+          _ (is (= true (get-in rdv-res [:response "ok"])))
+          _ (is (= 1 (count (:net-envelopes rdv-res))))
+
+          ;; 5. verify-chain-state-quorum
+          val-kps [(crypto/generate-keypair) (crypto/generate-keypair) (crypto/generate-keypair)]
+          val-pubs (mapv #(basalt/bytes->hex (:public %)) val-kps)
+          base-snap {:pubkey pub-hex
+                     :balance 2000
+                     :spendable 2000
+                     :finalized-epoch 10
+                     :seq 1
+                     :deps []
+                     :escrows {}
+                     :nonce "quorum-nonce-1"}
+          signed-snaps (mapv (fn [i]
+                               (light-core/sign-chain-state-snapshot
+                                (assoc base-snap :validator-pubkey (nth val-pubs i))
+                                (:private (nth val-kps i))))
+                             (range 3))
+          q-res (light-core/verify-chain-state-quorum signed-snaps
+                                                      {:expected-pubkey pub-hex
+                                                       :trusted-validators (set val-pubs)
+                                                       :min-finalized-epoch 5})]
+      (is (true? (:ok? q-res)))
+      (is (= 3 (:quorum-count q-res))))))
+
+(deftest test-crypto-verified-bypass-rejected-across-all-validators
+  (testing "Forged incoming envelopes/messages carrying :crypto/verified? true and garbage signatures are rejected across all core validators"
+    (let [kp (crypto/generate-keypair)
+          pub-hex (basalt/bytes->hex (:public kp))
+          other-kp (crypto/generate-keypair)
+          other-pub-hex (basalt/bytes->hex (:public other-kp))
+          garbage-sig "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+          ;; 1. sieve/validate-message
+          bad-sieve-msg {:payload (fressian/utf8->bytes "tampered-gossip")
+                         :sender pub-hex
+                         :signature garbage-sig
+                         :crypto/verified? true
+                         :crypto/verified-a? true}
+          _ (is (nil? (sieve/validate-message bad-sieve-msg)))
+
+          ;; 2. sieve/validate-control-frame
+          bad-control-frame {:sender pub-hex
+                             :message-id "mid-bad"
+                             :signature garbage-sig
+                             :crypto/verified? true
+                             :crypto/verified-a? true}
+          _ (is (false? (sieve/validate-control-frame bad-control-frame :subscribe)))
+
+          ;; 3. streamlet/verify-block-signature
+          bad-block {:epoch 1
+                     :parent-hash "genesis"
+                     :payload []
+                     :proposer pub-hex
+                     :signature garbage-sig
+                     :crypto/verified? true
+                     :crypto/verified-a? true}
+          _ (is (false? (streamlet/verify-block-signature bad-block (:public kp))))
+
+          ;; 4. streamlet/verify-vote-signature
+          bad-vote {:epoch 1
+                    :block-hash "blk-1"
+                    :voter pub-hex
+                    :voter-signature garbage-sig
+                    :crypto/verified? true
+                    :crypto/verified-a? true}
+          _ (is (false? (streamlet/verify-vote-signature bad-vote (:public kp))))
+
+          ;; 5. account/validate-transfer
+          account-st {:balance 1000 :seq 0 :deps []}
+          bad-transfer {:sender pub-hex
+                        :receiver other-pub-hex
+                        :amount 100
+                        :seq 1
+                        :deps []
+                        :signature garbage-sig
+                        :crypto/verified? true
+                        :crypto/verified-a? true}
+          _ (is (false? (account/validate-transfer account-st bad-transfer)))
+
+          ;; 6. treasury/apply-epoch-mint
+          treasury-st {:treasury-pubkey pub-hex
+                       :total-minted 0
+                       :minted-epochs #{}
+                       :ledger {}}
+          bad-mint {:epoch 1
+                    :allocations {other-pub-hex 500}
+                    :treasury-pubkey pub-hex
+                    :signature garbage-sig
+                    :crypto/verified? true
+                    :crypto/verified-a? true}
+          minted-st (treasury/apply-epoch-mint treasury-st bad-mint)
+          _ (is (= treasury-st minted-st))
+
+          ;; 7. attestation/verify-transcript
+          transcript-digest (attestation/compute-exchange-digest 1 pub-hex other-pub-hex [{:role :alice :message-id "m-1"}])
+          bad-transcript {:epoch 1
+                          :peer-a pub-hex
+                          :peer-b other-pub-hex
+                          :digest transcript-digest
+                          :message-roles [{:role :alice :message-id "m-1"}]
+                          :sig-a garbage-sig
+                          :crypto/verified? true
+                          :crypto/verified-a? true}
+          _ (is (false? (attestation/verify-transcript bad-transcript)))
+
+          ;; 8. attestation/verify-frozen-log
+          bad-frozen-log {:epoch 1
+                          :peer pub-hex
+                          :frozen-ids ["m-1"]
+                          :signature garbage-sig
+                          :crypto/verified? true
+                          :crypto/verified-a? true}
+          _ (is (false? (attestation/verify-frozen-log bad-frozen-log)))
+
+          ;; 9. rendezvous/verify-delivery-ack
+          bad-ack {:epoch 1
+                   :caller pub-hex
+                   :callee other-pub-hex
+                   :offer-hash "oh-1"
+                   :home-node "node1"
+                   :signature garbage-sig
+                   :crypto/verified? true
+                   :crypto/verified-a? true}
+          _ (is (false? (rdv/verify-delivery-ack bad-ack)))
+
+          ;; 10. crypto/pre-verify-envelope
+          bad-envelope {:bitecho/type :light-node-query
+                        :sender pub-hex
+                        :signature garbage-sig
+                        :crypto/verified? true
+                        :crypto/verified-a? true}
+          pre-res (crypto/pre-verify-envelope (crypto/make-crypto-boundary) bad-envelope)
+          _ (is (false? (:crypto/verified? pre-res)))
+          _ (is (= :failed (:crypto/verification-status pre-res)))
+          _ (is (= :pre-verify-failed (get-in pre-res [:diagnose :reason])))
+
+          ;; 11. state-machine/handle-event rejects forged gossip
+          sm-st (sm/init-state [] pub-hex config/default-config)
+          gossip-event {:type :receive-gossip
+                        :message {:payload (fressian/utf8->bytes "forged-gossip")
+                                  :sender pub-hex
+                                  :burn-amount burn/min-signaling-burn
+                                  :signature garbage-sig
+                                  :crypto/verified? true
+                                  :crypto/verified-a? true}}
+          sm-res (sm/handle-event sm-st gossip-event)]
+      (is (empty? (:commands sm-res))))))
+
+(deftest shell-boundary-crypto-fail-closed-test
+  (testing "Shell boundary crypto primitives fail closed with :diagnose effect on invalid inputs"
+    (let [boundary (crypto/make-crypto-boundary)]
+      ;; 1. sign-and-emit missing private key
+      (let [res (crypto/sign-and-emit boundary {:payload {:data 123}})]
+        (is (false? (:ok? res)))
+        (is (= :missing-private-key-or-payload (:error res)))
+        (is (= :sign-and-emit-invalid-input (get-in res [:diagnose :reason]))))
+
+      ;; 2. seal-and-emit missing seal-fn
+      (let [res (crypto/seal-and-emit boundary {:plaintext "secret"})]
+        (is (false? (:ok? res)))
+        (is (= :missing-seal-fn (:error res)))
+        (is (= :seal-and-emit-missing-seal-fn (get-in res [:diagnose :reason]))))
+
+      ;; 3. seal-and-emit missing plaintext/data
+      (let [res (crypto/seal-and-emit boundary {:seal-fn #(str "sealed:" %)})]
+        (is (false? (:ok? res)))
+        (is (= :missing-seal-fn (:error res)))
+        (is (= :seal-and-emit-missing-seal-fn (get-in res [:diagnose :reason])))))))

@@ -49,22 +49,19 @@
   "Validates a signed message.
    Takes a message containing :payload, :sender (hex), and :signature.
    When :burn-amount is present, verifies signature against payload bound with :burn-amount.
-   Supports shell-boundary pre-verification (:crypto/verified? true).
    Returns the message if the signature is valid, nil otherwise."
   [message]
-  (if (:crypto/verified? message)
-    message
-    (try
-      (let [payload (:payload message)
-            burn-amount (:burn-amount message)
-            sign-payload (signing-bytes payload burn-amount)
-            sender-pub-key (basalt/hex->bytes ^String (:sender message))
-            signature (:signature message)]
-        (if (crypto/verify sender-pub-key sign-payload signature)
-          message
-          nil))
-      (catch #?(:clj Exception :cljs :default) _
-        nil))))
+  (try
+    (let [payload (:payload message)
+          burn-amount (:burn-amount message)
+          sign-payload (signing-bytes payload burn-amount)
+          sender-pub-key (basalt/hex->bytes ^String (:sender message))
+          signature (:signature message)]
+      (if (crypto/verify sender-pub-key sign-payload signature)
+        message
+        nil))
+    (catch #?(:clj Exception :cljs :default) _
+      nil)))
 
 (defn sign-control-frame
   "Signs a canonical control payload for frame-type and message-id.
@@ -87,26 +84,24 @@
   ([event expected-type]
    (validate-control-frame event expected-type false))
   ([event expected-type require-signed?]
-   (if (:crypto/verified? event)
-     true
-     (try
-       (let [sender (:sender event)
-             sig (:signature event)
-             mid (:message-id event)
-             payload (:payload event)]
-         (cond
-           (some? sig)
-           (and (some? sender)
-                (or (some? mid) (some? payload))
-                (let [sender-bytes (to-bytes sender)
-                      sig-bytes (to-bytes sig)
-                      target-payload (or payload {:type expected-type :message-id mid})]
-                  (boolean (crypto/verify-with-fallback sender-bytes target-payload sig-bytes))))
+   (try
+     (let [sender (:sender event)
+           sig (:signature event)
+           mid (:message-id event)
+           payload (:payload event)]
+       (cond
+         (some? sig)
+         (and (some? sender)
+              (or (some? mid) (some? payload))
+              (let [sender-bytes (to-bytes sender)
+                    sig-bytes (to-bytes sig)
+                    target-payload (or payload {:type expected-type :message-id mid})]
+                (boolean (crypto/verify-with-fallback sender-bytes target-payload sig-bytes))))
 
-           require-signed?
-           false
+         require-signed?
+         false
 
-           :else
-           true))
-       (catch #?(:clj Exception :cljs :default) _
-         false)))))
+         :else
+         true))
+     (catch #?(:clj Exception :cljs :default) _
+       false))))

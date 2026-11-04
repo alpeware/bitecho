@@ -285,16 +285,25 @@
   (let [b (canonical-signing-bytes payload)]
     (sign private-key b)))
 
+(def ^:dynamic *allow-legacy-v1-signing-fallback*
+  "Controls whether verify-with-fallback accepts v1 pr-str signatures during N/N-1 rolling upgrades.
+   Scheduled for sunset in Milestone 10."
+  true)
+
 (defn verify-with-fallback
   "Verifies signature against v2 canonical Fressian signing bytes first.
-   If false, falls back to v1 legacy (pr-str) signing bytes.
+   If false, falls back to v1 legacy (pr-str) signing bytes when allowed.
    Enforces Standing Constraint 4: N/N-1 rolling upgrade compatibility without breaking in-flight signatures."
-  [public-key payload signature]
-  (let [v2-bytes (canonical-signing-bytes payload)]
-    (if (verify public-key v2-bytes signature)
-      true
-      (let [v1-bytes (legacy-pr-str-signing-bytes payload)]
-        (verify public-key v1-bytes signature)))))
+  ([public-key payload signature]
+   (verify-with-fallback public-key payload signature {:allow-v1-fallback? *allow-legacy-v1-signing-fallback*}))
+  ([public-key payload signature opts]
+   (let [v2-bytes (canonical-signing-bytes payload)]
+     (if (verify public-key v2-bytes signature)
+       true
+       (if (get opts :allow-v1-fallback? *allow-legacy-v1-signing-fallback*)
+         (let [v1-bytes (legacy-pr-str-signing-bytes payload)]
+           (boolean (verify public-key v1-bytes signature)))
+         false)))))
 
 ;; =============================================================================
 ;; Shell-Boundary Crypto Protocol (Decision A(i))
@@ -308,36 +317,61 @@
   (seal-and-emit [this effect]
     "Executes an egress encryption/sealing effect at the shell boundary."))
 
+(defn- canonicalize-agent-event
+  [x]
+  (cond
+    (fressian/bytes? x)
+    [:bytes (fressian/bytes->hex x)]
+
+    (map? x)
+    (into (sorted-map-by (fn [a b] (compare (pr-str a) (pr-str b))))
+          (map (fn [[k v]] [(canonicalize-agent-event k) (canonicalize-agent-event v)]) x))
+
+    (set? x)
+    (vec (sort-by pr-str (map canonicalize-agent-event x)))
+
+    (sequential? x)
+    (mapv canonicalize-agent-event x)
+
+    :else x))
+
 (defn- execute-pre-verify
   [envelope]
-  (if (:crypto/verified? envelope)
-    envelope
-    (let [sender (or (:sender envelope) (:from envelope) (:agent-pubkey envelope))
-          sig (or (:signature envelope) (:sig envelope))
-          payload (cond
-                    (and (:agent-pubkey envelope) (:event envelope))
-                    [(:agent-pubkey envelope) (:event envelope)]
+  (let [clean-env (fressian/strip-untrusted-crypto-tags envelope)
+        sender (or (:sender clean-env) (:from clean-env) (:agent-pubkey clean-env))
+        sig (or (:signature clean-env) (:sig clean-env))
+        payload (cond
+                  (and (:agent-pubkey clean-env) (:event clean-env))
+                  [(:agent-pubkey clean-env)
+                   (canonicalize-agent-event (dissoc (:event clean-env) :sender :sender-pubkey-bytes :rng))]
 
-                    (contains? envelope :payload)
-                    (if-let [burn (:burn-amount envelope)]
-                      (let [p-bytes (if (fressian/bytes? (:payload envelope))
-                                      (:payload envelope)
-                                      (fressian/utf8->bytes (str (:payload envelope))))]
-                        (fressian/concat-bytes p-bytes (fressian/utf8->bytes (str ":burn:" burn))))
-                      (:payload envelope))
+                  (contains? clean-env :payload)
+                  (if-let [burn (:burn-amount clean-env)]
+                    (let [p-bytes (if (fressian/bytes? (:payload clean-env))
+                                    (:payload clean-env)
+                                    (fressian/utf8->bytes (str (:payload clean-env))))]
+                      (fressian/concat-bytes p-bytes (fressian/utf8->bytes (str ":burn:" burn))))
+                    (:payload clean-env))
 
-                    (and (:frame-type envelope) (:message-id envelope))
-                    {:type (:frame-type envelope) :message-id (:message-id envelope)}
+                  (and (:frame-type clean-env) (:message-id clean-env))
+                  {:type (:frame-type clean-env) :message-id (:message-id clean-env)}
 
-                    (and (:sender envelope) (:receiver envelope) (:amount envelope))
-                    (into (sorted-map) (dissoc envelope :signature :crypto/verified?))
+                  (and (:sender clean-env) (:receiver clean-env) (:amount clean-env))
+                  (into (sorted-map) (dissoc clean-env :signature :crypto/verified? :crypto/verified-a? :crypto/verified-b?))
 
-                    :else nil)]
-      (if (and sender sig (some? payload)
-               (or (and (fressian/bytes? payload) (verify sender payload sig))
-                   (verify-with-fallback sender payload sig)))
-        (assoc envelope :crypto/verified? true)
-        envelope))))
+                  :else nil)
+        verified? (boolean
+                   (and sender sig (some? payload)
+                        (try
+                          (if (fressian/bytes? payload)
+                            (verify sender payload sig)
+                            (verify-with-fallback sender payload sig))
+                          (catch #?(:clj Exception :cljs :default) _ false))))]
+    (if verified?
+      (assoc clean-env :crypto/verified? true :crypto/verification-status :ok)
+      (assoc clean-env :crypto/verified? false
+             :crypto/verification-status :failed
+             :diagnose {:effect :diagnose :reason :pre-verify-failed :sender sender}))))
 
 (defn- execute-sign-and-emit
   [effect]
@@ -345,30 +379,42 @@
         payload (if (contains? sub-eff :signing-payload)
                   (:signing-payload sub-eff)
                   (:payload sub-eff))
-        priv (:private-key effect)
-        sig-field (or (:signature-field sub-eff) :signature)
-        env (or (:envelope sub-eff) (when (:crypto-effect effect) (dissoc effect :crypto-effect)))
-        on-signed (:on-signed effect)
-        sig-bytes (when (and priv (some? payload))
-                    (if (fressian/bytes? payload)
-                      (sign priv payload)
-                      (sign-canonical priv payload)))
-        sig-hex (when sig-bytes (fressian/bytes->hex sig-bytes))
-        signed-env (if (and env sig-hex)
-                     (assoc (dissoc env :crypto-effect) sig-field sig-hex)
-                     sig-bytes)]
-    (when (fn? on-signed)
-      (on-signed signed-env))
-    signed-env))
+        priv (:private-key effect)]
+    (if (or (nil? priv) (nil? payload))
+      (let [fail-res {:ok? false
+                      :error :missing-private-key-or-payload
+                      :diagnose {:effect :diagnose :reason :sign-and-emit-invalid-input}}
+            on-signed (:on-signed effect)]
+        (when (fn? on-signed) (on-signed fail-res))
+        fail-res)
+      (let [sig-field (or (:signature-field sub-eff) :signature)
+            env (or (:envelope sub-eff) (when (:crypto-effect effect) (dissoc effect :crypto-effect)))
+            on-signed (:on-signed effect)
+            sig-bytes (if (fressian/bytes? payload)
+                        (sign priv payload)
+                        (sign-canonical priv payload))
+            sig-hex (when sig-bytes (fressian/bytes->hex sig-bytes))
+            signed-env (if (and env sig-hex)
+                         (assoc (dissoc env :crypto-effect) sig-field sig-hex)
+                         sig-bytes)]
+        (when (fn? on-signed)
+          (on-signed signed-env))
+        signed-env))))
 
 (defn- execute-seal-and-emit
   [effect]
   (let [{:keys [payload plaintext seal-fn on-sealed]} effect
-        data (or plaintext payload)
-        sealed-out (if (fn? seal-fn) (seal-fn data) data)]
-    (when (fn? on-sealed)
-      (on-sealed sealed-out))
-    sealed-out))
+        data (or plaintext payload)]
+    (if (or (not (fn? seal-fn)) (nil? data))
+      (let [fail-res {:ok? false
+                      :error :missing-seal-fn
+                      :diagnose {:effect :diagnose :reason :seal-and-emit-missing-seal-fn}}]
+        (when (fn? on-sealed) (on-sealed fail-res))
+        fail-res)
+      (let [sealed-out (seal-fn data)]
+        (when (fn? on-sealed)
+          (on-sealed sealed-out))
+        sealed-out))))
 
 #?(:clj
    (deftype JVMCryptoBoundary []
@@ -388,7 +434,15 @@
      (sign-and-emit [_ effect]
        (execute-sign-and-emit effect))
      (seal-and-emit [_ effect]
-       (execute-seal-and-emit effect))))
+       (execute-seal-and-emit effect))
+
+     Object
+     (subtle-digest-sha256 [_ data-bytes]
+       (when subtle
+         (.digest subtle "SHA-256" data-bytes)))
+     (subtle-verify-ed25519 [_ pub-crypto-key sig-bytes data-bytes]
+       (when subtle
+         (.verify subtle (clj->js {:name "Ed25519"}) pub-crypto-key sig-bytes data-bytes)))))
 
 (defn make-crypto-boundary
   "Creates an ICryptoBoundary instance for the active runtime (JVM or Node/Browser)."

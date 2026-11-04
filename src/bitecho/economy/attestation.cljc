@@ -120,8 +120,7 @@
 
 (defn verify-transcript
   "Verifies that the transcript's digest matches the canonical exchange data,
-   sig-a is valid for peer-a, and sig-b (if present) is valid for peer-b.
-   Supports shell-boundary pre-verification (:crypto/verified? or :crypto/verified-a?)."
+   sig-a is valid for peer-a, and sig-b (if present) is valid for peer-b."
   [transcript]
   (try
     (if (and (map? transcript)
@@ -136,17 +135,13 @@
                                                      (:message-roles transcript))]
         (if (= expected-digest (:digest transcript))
           (let [digest-bytes (fressian/utf8->bytes (:digest transcript))
-                valid-a? (or (:crypto/verified-a? transcript)
-                             (:crypto/verified? transcript)
-                             (crypto/verify (to-bytes (:peer-a transcript))
-                                            digest-bytes
-                                            (to-bytes (:sig-a transcript))))
+                valid-a? (crypto/verify (to-bytes (:peer-a transcript))
+                                        digest-bytes
+                                        (to-bytes (:sig-a transcript)))
                 valid-b? (if-let [sig-b (:sig-b transcript)]
-                           (or (:crypto/verified-b? transcript)
-                               (:crypto/verified? transcript)
-                               (crypto/verify (to-bytes (:peer-b transcript))
-                                              digest-bytes
-                                              (to-bytes sig-b)))
+                           (crypto/verify (to-bytes (:peer-b transcript))
+                                          digest-bytes
+                                          (to-bytes sig-b))
                            true)]
             (boolean (and valid-a? valid-b?)))
           false))
@@ -245,8 +240,7 @@
   "Verifies a cryptographically signed counterparty frozen log map.
    Validates map shape, integer epoch, non-blank peer and signature,
    and verifies that the signature matches the canonical payload under peer's public key.
-   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)
-   and shell-boundary pre-verification (:crypto/verified? true)."
+   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)."
   [signed-log]
   (try
     (if (and (map? signed-log)
@@ -262,8 +256,7 @@
             payload [(:epoch signed-log) peer-hex sorted-ids]
             pub-bytes (to-bytes peer-hex)
             sig-bytes (to-bytes (:signature signed-log))]
-        (boolean (or (:crypto/verified? signed-log)
-                     (crypto/verify-with-fallback pub-bytes payload sig-bytes))))
+        (boolean (crypto/verify-with-fallback pub-bytes payload sig-bytes)))
       false)
     (catch #?(:clj Exception :cljs :default) _
       false)))

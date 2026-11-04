@@ -66,6 +66,12 @@
    {:label "str-hello"
     :val "hello"
     :hex "df68656c6c6f"}
+   {:label "str-emoji-grinning"
+    :val "😀"
+    :hex "e0eda0bdedb880"}
+   {:label "str-astral-mixed"
+    :val "hi 🌍🚀!"
+    :hex "e310686920eda0bcedbc8deda0bdedba8021"}
 
    ;; Keywords & Symbols
    {:label "kw-foo"
@@ -115,7 +121,15 @@
    {:input "abc"
     :hex "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
    {:input "hello world"
-    :hex "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"}])
+    :hex "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"}
+   {:input (apply str (repeat 55 "a"))
+    :hex "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"}
+   {:input "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+    :hex "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"}
+   {:input (apply str (repeat 64 "a"))
+    :hex "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"}
+   {:input (apply str (repeat 1000 "a"))
+    :hex "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"}])
 
 ;; =============================================================================
 ;; Golden Vector Assertions (Both JVM and CLJS)
@@ -161,12 +175,38 @@
           ;; v1 legacy signature
           v1-bytes (crypto/legacy-pr-str-signing-bytes payload)
           sig-v1 (crypto/sign (:private kp) v1-bytes)]
-      ;; Both v2 and v1 verify successfully
+      ;; Both v2 and v1 verify successfully with fallback enabled
       (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v2)))
       (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v1)))
+      ;; When fallback is disabled via dynamic binding, v1 is rejected and v2 passes
+      (binding [crypto/*allow-legacy-v1-signing-fallback* false]
+        (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v2)))
+        (is (false? (crypto/verify-with-fallback (:public kp) payload sig-v1))))
+      ;; When fallback is disabled via 4-arity options map, v1 is rejected and v2 passes
+      (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v2 {:allow-v1-fallback? false})))
+      (is (false? (crypto/verify-with-fallback (:public kp) payload sig-v1 {:allow-v1-fallback? false})))
       ;; Tampered payload fails closed
       (is (false? (crypto/verify-with-fallback (:public kp) (assoc payload :price 999) sig-v2)))
       (is (false? (crypto/verify-with-fallback (:public kp) (assoc payload :price 999) sig-v1))))))
+
+(deftest test-standard-data-fressian-vectors-decode
+  (testing "Decodes standard org.clojure/data.fressian byte sequences on both JVM and CLJS"
+    ;; Priority cached map: {:a 1, :b "hello"}
+    (let [m-bytes (fressian/hex->bytes "c0e8caf7cddb6101caf7cddb62df68656c6c6f")
+          m-decoded (fressian/decode m-bytes)]
+      (is (= {:a 1 :b "hello"} m-decoded)))
+    ;; Priority cached keyword: :foo/bar
+    (let [kw-bytes (fressian/hex->bytes "cacddd666f6fcddd626172")
+          kw-decoded (fressian/decode kw-bytes)]
+      (is (= :foo/bar kw-decoded)))
+    ;; Astral string: "😀"
+    (let [astral-bytes (fressian/hex->bytes "e0eda0bdedb880")
+          astral-decoded (fressian/decode astral-bytes)]
+      (is (= "😀" astral-decoded)))
+    ;; Mixed astral string: "hi 🌍🚀!"
+    (let [mixed-bytes (fressian/hex->bytes "e310686920eda0bcedbc8deda0bdedba8021")
+          mixed-decoded (fressian/decode mixed-bytes)]
+      (is (= "hi 🌍🚀!" mixed-decoded)))))
 
 #?(:clj
    (deftest test-data-fressian-reader-compatibility
@@ -180,6 +220,17 @@
                     (if (instance? java.util.List std-read) (seq std-read) std-read))
                  (str "data.fressian read mismatch for: " label))))))))
 
+#?(:clj
+   (defspec ^{:doc "Property: Bidirectional roundtrip between canonical encoder and standard data.fressian including astral characters."}
+     prop-data-fressian-bidirectional-astral-roundtrip 50
+     (for-all [s (gen/one-of [gen/string (gen/return "😀") (gen/return "hi 🌍🚀!")])]
+              (let [canon-bytes (fressian/encode-canonical s)
+                    read-by-std (data-fressian/read (java.nio.ByteBuffer/wrap canon-bytes))
+                    std-bytes (fressian/write-standard-fressian s)
+                    read-by-canon (fressian/decode std-bytes)]
+                (and (= s read-by-std)
+                     (= s read-by-canon))))))
+
 ;; =============================================================================
 ;; Generative Property Tests
 ;; =============================================================================
@@ -191,6 +242,7 @@
     (gen/return nil)
     gen/boolean
     gen/string-alphanumeric
+    gen/string
     gen/keyword
     gen/keyword-ns]))
 

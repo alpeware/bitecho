@@ -394,7 +394,6 @@
 (defn apply-epoch-mint
   "Applies an authorized, capped epoch demand-gated mint to state.
    Requires cryptographic verification against the authoritative treasury public key.
-   Supports shell-boundary pre-verification (:crypto/verified? true).
    Rejects in full (leaving :ledger, :total-minted, and :minted-epochs unchanged) if:
      - epoch is missing or already in :minted-epochs (double-mint rejected);
      - treasury pubkey or signature is missing, empty, mismatched, or invalid;
@@ -440,10 +439,9 @@
       state
 
       ;; 5. Cryptographic signature verification against allocations, binding mint-dust if present
-      (not (or (:crypto/verified? mint-ctx)
-               (if has-dust?
-                 (verify-mint-signature state-pub sig epoch allocations raw-dust)
-                 (verify-mint-signature state-pub sig epoch allocations))))
+      (not (if has-dust?
+             (verify-mint-signature state-pub sig epoch allocations raw-dust)
+             (verify-mint-signature state-pub sig epoch allocations)))
       state
 
       :else

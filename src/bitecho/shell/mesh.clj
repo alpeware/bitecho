@@ -183,6 +183,8 @@
       (:ok? res))
     false))
 
+(defonce ^:private mesh-crypto-boundary (crypto/make-crypto-boundary))
+
 (defn unwrap-authenticated-agent-event
   "Unwraps and verifies an authenticated agent envelope.
    Returns sanitized event with bound :sender and :sender-pubkey-bytes if valid, or nil.
@@ -191,221 +193,217 @@
    (unwrap-authenticated-agent-event raw-msg nil))
   ([raw-msg opts]
    (try
-     (let [msg (if (bytes? raw-msg)
-                 (try (nippy/thaw raw-msg) (catch Exception _ nil))
-                 raw-msg)]
+     (let [raw-unwrapped (if (bytes? raw-msg)
+                           (try (nippy/thaw raw-msg) (catch Exception _ nil))
+                           raw-msg)
+           msg (when raw-unwrapped (fressian/strip-untrusted-crypto-tags raw-unwrapped))]
        (when (and (map? msg)
                   (valid-agent-envelope-version? msg)
                   (string? (:agent-pubkey msg))
                   (map? (:event msg))
                   (contains? allowed-agent-events (:type (:event msg)))
                   (or (string? (:signature msg)) (bytes? (:signature msg))))
-         (let [agent-pub-hex (:agent-pubkey msg)
-               agent-pub-bytes (basalt/hex->bytes agent-pub-hex)
-               sig-bytes (if (bytes? (:signature msg))
-                           (:signature msg)
-                           (basalt/hex->bytes (:signature msg)))
-               event (:event msg)
-               sb (agent-event-signing-bytes agent-pub-hex event)
-               envelope-dac (or (:dac msg) (:dac event))
-               effective-epoch (or (:current-epoch opts) (:epoch event))]
-           (when (and (some? agent-pub-bytes)
-                      (some? sig-bytes)
-                      (crypto/verify agent-pub-bytes sb sig-bytes)
-                      (or (nil? envelope-dac)
-                          (and (integer? effective-epoch)
-                               (verify-mesh-agent-dac envelope-dac agent-pub-hex effective-epoch opts))))
-             (let [ev-type (:type event)
-                   protocol-ver (long (or (:protocol-version msg)
-                                          (get msg "protocol_version")
-                                          current-wire-version))
-                   base-event (cond-> event
-                                envelope-dac (assoc :dac envelope-dac)
-                                true (assoc :protocol-version protocol-ver))]
-               (case ev-type
-                 :settle-intent
-                 (let [payer (:payer base-event)
-                       receiver (:receiver base-event)
-                       amount (:amount base-event)]
-                   (when (and (or (nil? payer) (= payer agent-pub-hex))
-                              (string? receiver)
-                              (not (str/blank? receiver))
-                              (integer? amount)
-                              (pos? amount))
-                     (-> base-event
-                         (dissoc :sender :sender-pubkey-bytes :rng)
-                         (assoc :sender agent-pub-hex
-                                :payer agent-pub-hex
-                                :sender-pubkey-bytes agent-pub-bytes
-                                :rng (java.util.Random.)))))
-
-                 :lock-intent
-                 (let [payer (:payer base-event)
-                       receiver (:receiver base-event)
-                       amount (:amount base-event)
-                       deliverable-hash (:deliverable-hash base-event)
-                       expires-epoch (:expires-epoch base-event)
-                       created-epoch (or (:created-epoch base-event) (:epoch base-event) 0)]
-                   (when (and (or (nil? payer) (= payer agent-pub-hex))
-                              (string? receiver)
-                              (not (str/blank? receiver))
-                              (not= agent-pub-hex receiver)
-                              (integer? amount)
-                              (pos? amount)
-                              (string? deliverable-hash)
-                              (escrow/valid-deliverable-hash? deliverable-hash)
-                              (integer? expires-epoch)
-                              (integer? created-epoch)
-                              (> expires-epoch created-epoch))
-                     (-> base-event
-                         (dissoc :sender :sender-pubkey-bytes :rng)
-                         (assoc :sender agent-pub-hex
-                                :payer agent-pub-hex
-                                :created-epoch created-epoch
-                                :sender-pubkey-bytes agent-pub-bytes
-                                :rng (java.util.Random.)))))
-
-                 :release-intent
-                 (let [escrow-id (:escrow-id base-event)
-                       preimage (:preimage base-event)
-                       payer-sig (:payer-signature base-event)]
-                   (when (and (string? escrow-id)
-                              (not (str/blank? escrow-id))
-                              (or (nil? preimage) (string? preimage))
-                              (or (nil? payer-sig) (string? payer-sig)))
-                     (-> base-event
-                         (dissoc :sender :sender-pubkey-bytes :rng)
-                         (assoc :sender agent-pub-hex
-                                :sender-pubkey-bytes agent-pub-bytes
-                                :rng (java.util.Random.)))))
-
-                 :refund-intent
-                 (let [escrow-id (:escrow-id base-event)]
-                   (when (and (string? escrow-id)
-                              (not (str/blank? escrow-id)))
-                     (-> base-event
-                         (dissoc :sender :sender-pubkey-bytes :rng)
-                         (assoc :sender agent-pub-hex
-                                :sender-pubkey-bytes agent-pub-bytes
-                                :rng (java.util.Random.)))))
-
-                 :query-chain-state
-                 (when (or (nil? (:pubkey base-event)) (= (:pubkey base-event) agent-pub-hex))
-                   (-> base-event
-                       (dissoc :sender :sender-pubkey-bytes :rng)
-                       (assoc :sender agent-pub-hex
-                              :pubkey agent-pub-hex
-                              :sender-pubkey-bytes agent-pub-bytes
-                              :rng (java.util.Random.))))
-
-                 :register-home-set
-                 (let [callee (:callee base-event)
-                       raw-candidates (or (:candidates base-event) [])
-                       candidates (mapv (fn [c]
-                                          (if (contains? c :node-id)
-                                            (assoc c :node-id (rendezvous/normalize-home-node (:node-id c)))
-                                            c))
-                                        raw-candidates)]
-                   (when (or (nil? callee) (= callee agent-pub-hex))
-                     (-> base-event
-                         (dissoc :sender :sender-pubkey-bytes :rng)
-                         (assoc :sender agent-pub-hex
-                                :callee agent-pub-hex
-                                :candidates candidates
-                                :sender-pubkey-bytes agent-pub-bytes
-                                :rng (java.util.Random.)))))
-
-                 :on-deliver
-                 (let [p (:payload base-event)
-                       p-bytes (cond
-                                 (bytes? p) p
-                                 (sequential? p) (byte-array (map byte p))
-                                 :else nil)]
-                   (when p-bytes
-                     (let [p-data (or (try (let [v (fressian/decode p-bytes)]
-                                             (when (or (map? v) (record? v)) v))
-                                           (catch Exception _ nil))
-                                      (try (when-let [p-str (try (String. ^bytes p-bytes StandardCharsets/UTF_8) (catch Exception _ nil))]
-                                             (edn/read-string {:default tagged-literal
-                                                               :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                                         'bitecho.economy.account.AccountState account/map->AccountState}}
-                                                              p-str))
-                                           (catch Exception _ nil)))
-                           raw-transfer (when (and (map? p-data) (:transfer p-data))
-                                          (:transfer p-data))
-                           transfer-map (when raw-transfer
-                                          (if (instance? clojure.lang.TaggedLiteral raw-transfer)
-                                            (:form raw-transfer)
-                                            (into {} raw-transfer)))
-                           sig (:signature transfer-map)
-                           tx-sig-bytes (cond
-                                          (bytes? sig) sig
-                                          (and (sequential? sig) (seq sig)) (byte-array (map byte sig))
-                                          (and (string? sig) (not (str/blank? sig)))
-                                          (if (re-matches #"^[0-9a-fA-F]+$" sig)
-                                            (basalt/hex->bytes sig)
-                                            (.getBytes ^String sig StandardCharsets/UTF_8))
-                                          :else nil)
-                           unsigned-tx (when (map? transfer-map)
-                                         (into (sorted-map) (dissoc transfer-map :signature)))]
-                       (when (and (map? transfer-map)
-                                  (= (:sender transfer-map) agent-pub-hex)
-                                  (some? tx-sig-bytes)
-                                  (some? unsigned-tx)
-                                  (crypto/verify-with-fallback agent-pub-bytes unsigned-tx tx-sig-bytes))
+         (let [pre-verified (crypto/pre-verify-envelope mesh-crypto-boundary msg)]
+           (when (:crypto/verified? pre-verified)
+             (let [agent-pub-hex (:agent-pubkey msg)
+                   agent-pub-bytes (basalt/hex->bytes agent-pub-hex)
+                   event (:event msg)
+                   envelope-dac (or (:dac msg) (:dac event))
+                   effective-epoch (or (:current-epoch opts) (:epoch event))]
+               (when (or (nil? envelope-dac)
+                         (and (integer? effective-epoch)
+                              (verify-mesh-agent-dac envelope-dac agent-pub-hex effective-epoch opts)))
+                 (let [ev-type (:type event)
+                       protocol-ver (long (or (:protocol-version msg)
+                                              (get msg "protocol_version")
+                                              current-wire-version))
+                       base-event (cond-> event
+                                    envelope-dac (assoc :dac envelope-dac)
+                                    true (assoc :protocol-version protocol-ver))]
+                   (case ev-type
+                     :settle-intent
+                     (let [payer (:payer base-event)
+                           receiver (:receiver base-event)
+                           amount (:amount base-event)]
+                       (when (and (or (nil? payer) (= payer agent-pub-hex))
+                                  (string? receiver)
+                                  (not (str/blank? receiver))
+                                  (integer? amount)
+                                  (pos? amount))
                          (-> base-event
                              (dissoc :sender :sender-pubkey-bytes :rng)
                              (assoc :sender agent-pub-hex
-                                    :payload p-bytes
+                                    :payer agent-pub-hex
                                     :sender-pubkey-bytes agent-pub-bytes
-                                    :rng (java.util.Random.)))))))
+                                    :rng (java.util.Random.)))))
 
-                 :submit-vouchers
-                 (let [vouchers (:vouchers base-event)
-                       norm-vouchers (when (and (sequential? vouchers) (seq vouchers))
-                                       (mapv (fn [v]
-                                               (let [hn (rendezvous/normalize-home-node (:home-node v))]
-                                                 (when (and (string? hn) (not (str/blank? hn)))
-                                                   (assoc v :home-node hn))))
-                                             vouchers))]
-                   (when (and (sequential? norm-vouchers)
-                              (seq norm-vouchers)
-                              (every? some? norm-vouchers)
-                              (every? (fn [v]
-                                        (let [ack (if (instance? bitecho.rendezvous.core.DeliveryAck v)
-                                                    v
-                                                    (try (rendezvous/map->DeliveryAck v) (catch Exception _ nil)))]
-                                          (and ack (rendezvous/verify-delivery-ack ack))))
-                                      norm-vouchers))
-                     (-> base-event
-                         (dissoc :sender :sender-pubkey-bytes :rng)
-                         (assoc :sender agent-pub-hex
-                                :vouchers norm-vouchers
-                                :sender-pubkey-bytes agent-pub-bytes
-                                :rng (java.util.Random.)))))
+                     :lock-intent
+                     (let [payer (:payer base-event)
+                           receiver (:receiver base-event)
+                           amount (:amount base-event)
+                           deliverable-hash (:deliverable-hash base-event)
+                           expires-epoch (:expires-epoch base-event)
+                           created-epoch (or (:created-epoch base-event) (:epoch base-event) 0)]
+                       (when (and (or (nil? payer) (= payer agent-pub-hex))
+                                  (string? receiver)
+                                  (not (str/blank? receiver))
+                                  (not= agent-pub-hex receiver)
+                                  (integer? amount)
+                                  (pos? amount)
+                                  (string? deliverable-hash)
+                                  (escrow/valid-deliverable-hash? deliverable-hash)
+                                  (integer? expires-epoch)
+                                  (integer? created-epoch)
+                                  (> expires-epoch created-epoch))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :payer agent-pub-hex
+                                    :created-epoch created-epoch
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
 
-                 :receive-offer-header
-                 (if (contains? base-event :home-node)
-                   (let [hn (rendezvous/normalize-home-node (:home-node base-event))]
-                     (when (and (string? hn) (not (str/blank? hn)))
+                     :release-intent
+                     (let [escrow-id (:escrow-id base-event)
+                           preimage (:preimage base-event)
+                           payer-sig (:payer-signature base-event)]
+                       (when (and (string? escrow-id)
+                                  (not (str/blank? escrow-id))
+                                  (or (nil? preimage) (string? preimage))
+                                  (or (nil? payer-sig) (string? payer-sig)))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
+
+                     :refund-intent
+                     (let [escrow-id (:escrow-id base-event)]
+                       (when (and (string? escrow-id)
+                                  (not (str/blank? escrow-id)))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
+
+                     :query-chain-state
+                     (when (or (nil? (:pubkey base-event)) (= (:pubkey base-event) agent-pub-hex))
                        (-> base-event
                            (dissoc :sender :sender-pubkey-bytes :rng)
                            (assoc :sender agent-pub-hex
-                                  :home-node hn
+                                  :pubkey agent-pub-hex
                                   :sender-pubkey-bytes agent-pub-bytes
-                                  :rng (java.util.Random.)))))
-                   (-> base-event
-                       (dissoc :sender :sender-pubkey-bytes :rng)
-                       (assoc :sender agent-pub-hex
-                              :sender-pubkey-bytes agent-pub-bytes
-                              :rng (java.util.Random.))))
+                                  :rng (java.util.Random.))))
+
+                     :register-home-set
+                     (let [callee (:callee base-event)
+                           raw-candidates (or (:candidates base-event) [])
+                           candidates (mapv (fn [c]
+                                              (if (contains? c :node-id)
+                                                (assoc c :node-id (rendezvous/normalize-home-node (:node-id c)))
+                                                c))
+                                            raw-candidates)]
+                       (when (or (nil? callee) (= callee agent-pub-hex))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :callee agent-pub-hex
+                                    :candidates candidates
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
+
+                     :on-deliver
+                     (let [p (:payload base-event)
+                           p-bytes (cond
+                                     (bytes? p) p
+                                     (sequential? p) (byte-array (map byte p))
+                                     :else nil)]
+                       (when p-bytes
+                         (let [p-data (or (try (let [v (fressian/decode p-bytes)]
+                                                 (when (or (map? v) (record? v)) v))
+                                               (catch Exception _ nil))
+                                          (try (when-let [p-str (try (String. ^bytes p-bytes StandardCharsets/UTF_8) (catch Exception _ nil))]
+                                                 (edn/read-string {:default tagged-literal
+                                                                   :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                                             'bitecho.economy.account.AccountState account/map->AccountState}}
+                                                                  p-str))
+                                               (catch Exception _ nil)))
+                               raw-transfer (when (and (map? p-data) (:transfer p-data))
+                                              (:transfer p-data))
+                               transfer-map (when raw-transfer
+                                              (if (instance? clojure.lang.TaggedLiteral raw-transfer)
+                                                (:form raw-transfer)
+                                                (into {} raw-transfer)))
+                               sig (:signature transfer-map)
+                               tx-sig-bytes (cond
+                                              (bytes? sig) sig
+                                              (and (sequential? sig) (seq sig)) (byte-array (map byte sig))
+                                              (and (string? sig) (not (str/blank? sig)))
+                                              (if (re-matches #"^[0-9a-fA-F]+$" sig)
+                                                (basalt/hex->bytes sig)
+                                                (.getBytes ^String sig StandardCharsets/UTF_8))
+                                              :else nil)
+                               unsigned-tx (when (map? transfer-map)
+                                             (into (sorted-map) (dissoc transfer-map :signature)))]
+                           (when (and (map? transfer-map)
+                                      (= (:sender transfer-map) agent-pub-hex)
+                                      (some? tx-sig-bytes)
+                                      (some? unsigned-tx)
+                                      (crypto/verify-with-fallback agent-pub-bytes unsigned-tx tx-sig-bytes))
+                             (-> base-event
+                                 (dissoc :sender :sender-pubkey-bytes :rng)
+                                 (assoc :sender agent-pub-hex
+                                        :payload p-bytes
+                                        :sender-pubkey-bytes agent-pub-bytes
+                                        :rng (java.util.Random.)))))))
+
+                     :submit-vouchers
+                     (let [vouchers (:vouchers base-event)
+                           norm-vouchers (when (and (sequential? vouchers) (seq vouchers))
+                                           (mapv (fn [v]
+                                                   (let [hn (rendezvous/normalize-home-node (:home-node v))]
+                                                     (when (and (string? hn) (not (str/blank? hn)))
+                                                       (assoc v :home-node hn))))
+                                                 vouchers))]
+                       (when (and (sequential? norm-vouchers)
+                                  (seq norm-vouchers)
+                                  (every? some? norm-vouchers)
+                                  (every? (fn [v]
+                                            (let [ack (if (instance? bitecho.rendezvous.core.DeliveryAck v)
+                                                        v
+                                                        (try (rendezvous/map->DeliveryAck v) (catch Exception _ nil)))]
+                                              (and ack (rendezvous/verify-delivery-ack ack))))
+                                          norm-vouchers))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :vouchers norm-vouchers
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
+
+                     :receive-offer-header
+                     (if (contains? base-event :home-node)
+                       (let [hn (rendezvous/normalize-home-node (:home-node base-event))]
+                         (when (and (string? hn) (not (str/blank? hn)))
+                           (-> base-event
+                               (dissoc :sender :sender-pubkey-bytes :rng)
+                               (assoc :sender agent-pub-hex
+                                      :home-node hn
+                                      :sender-pubkey-bytes agent-pub-bytes
+                                      :rng (java.util.Random.)))))
+                       (-> base-event
+                           (dissoc :sender :sender-pubkey-bytes :rng)
+                           (assoc :sender agent-pub-hex
+                                  :sender-pubkey-bytes agent-pub-bytes
+                                  :rng (java.util.Random.))))
 
                 ;; Default for other allowed events: :receive-gossip, :receive-summary, :receive-pull-request
-                 (-> base-event
-                     (dissoc :sender :sender-pubkey-bytes :rng)
-                     (assoc :sender agent-pub-hex
-                            :sender-pubkey-bytes agent-pub-bytes
-                            :rng (java.util.Random.)))))))))
+                     (-> base-event
+                         (dissoc :sender :sender-pubkey-bytes :rng)
+                         (assoc :sender agent-pub-hex
+                                :sender-pubkey-bytes agent-pub-bytes
+                                :rng (java.util.Random.)))))))))))
      (catch Exception _ nil))))
 
 ;; ---------------------------------------------------------------------------
@@ -1475,7 +1473,7 @@
             (doseq [target targets]
               (if (= transport :in-memory)
                 (when-let [peer-entry (get @in-mem-bus target)]
-                  (let [thawed (assoc (nippy/thaw frozen)
+                  (let [thawed (assoc (fressian/strip-untrusted-crypto-tags (nippy/thaw frozen))
                                       :sender sender-hex
                                       :sender-pubkey-bytes (get-in identity [:keypair :public])
                                       :rng (java.util.Random.))]
@@ -1569,7 +1567,8 @@
                                           (cond-> {:type :on-message :generation next-gen :node node :peer pid}
                                             (:channel-id evt) (assoc :channel-id (:channel-id evt))))]
                              (when (= node (:node updated))
-                               (let [msg (try (nippy/thaw (:payload evt)) (catch Exception _ nil))]
+                               (let [raw-thawed (try (nippy/thaw (:payload evt)) (catch Exception _ nil))
+                                     msg (when raw-thawed (fressian/strip-untrusted-crypto-tags raw-thawed))]
                                  (if (nil? msg)
                                    (apply-mesh-conn-event! peer-conns peer-hex
                                                            {:type :invalid-frame :generation next-gen :node node :peer pid :error "malformed-peer-frame"})

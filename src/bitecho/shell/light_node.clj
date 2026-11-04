@@ -3,6 +3,7 @@
    Handles CLI invocation, JSONL STDIN/STDOUT serve loop, state persistence
    with atomic rename (0600 permissions), and WebRTC DataChannel agent connections."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.discovery :as discovery]
@@ -416,7 +417,8 @@
                    (fn [evt]
                      (try
                        (let [payload (:payload evt)
-                             msg (if (bytes? payload) (nippy/thaw payload) payload)]
+                             raw-msg (if (bytes? payload) (nippy/thaw payload) payload)
+                             msg (when raw-msg (fressian/strip-untrusted-crypto-tags raw-msg))]
                          (when (and (map? msg) (= :chain-state-snapshot (or (:bitecho/type msg) (:type msg))))
                            (deliver snapshot-promise msg)))
                        (catch Exception _ nil)))

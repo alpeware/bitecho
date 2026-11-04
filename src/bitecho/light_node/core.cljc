@@ -59,18 +59,21 @@
      :cljs (fressian/encode-canonical payload)))
 
 (defn- thaw-payload
-  "Decodes a wire payload, checking for Nippy on JVM first, falling back to Canonical Fressian."
+  "Decodes a wire payload, checking for Nippy on JVM first, falling back to Canonical Fressian.
+   Always strips untrusted shell-boundary crypto tags from the result."
   [payload-bytes]
-  (if (nippy-payload? payload-bytes)
-    #?(:clj (try (nippy/thaw payload-bytes)
-                 (catch Exception _ nil))
-       :cljs nil)
-    (or (try (let [v (fressian/decode payload-bytes)]
-               (when (or (map? v) (record? v)) v))
-             (catch #?(:clj Exception :cljs :default) _ nil))
-        #?(:clj (try (nippy/thaw payload-bytes)
-                     (catch Exception _ nil))
-           :cljs nil))))
+  (let [res (if (nippy-payload? payload-bytes)
+              #?(:clj (try (nippy/thaw payload-bytes)
+                           (catch Exception _ nil))
+                 :cljs nil)
+              (or (try (let [v (fressian/decode payload-bytes)]
+                         (when (or (map? v) (record? v)) v))
+                       (catch #?(:clj Exception :cljs :default) _ nil))
+                  #?(:clj (try (nippy/thaw payload-bytes)
+                               (catch Exception _ nil))
+                     :cljs nil)))]
+    (when res
+      (fressian/strip-untrusted-crypto-tags res))))
 
 ;; -----------------------------------------------------------------------------
 ;; Wire Protocol Versioning & Rolling Upgrade Compatibility (FLAG B)
@@ -352,10 +355,10 @@
           norm-prev (when prev-pubkey (normalize-pubkey-hex prev-pubkey))
           canonical-str (str "bitecho-directory-pop-v1|" norm-domain "|" norm-nick "|" norm-pub "|"
                              (str/join "," sorted-hs) "|" ep "|" (or norm-prev ""))
-          sig-bytes (crypto/sign agent-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          sig-bytes (crypto/sign agent-privkey-bytes (fressian/utf8->bytes canonical-str))
           sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
           rot-sig-bytes (when norm-prev
-                          (crypto/sign prev-privkey-bytes (.getBytes canonical-str "UTF-8")))
+                          (crypto/sign prev-privkey-bytes (fressian/utf8->bytes canonical-str)))
           rot-sig-hex (when rot-sig-bytes
                         (if (string? rot-sig-bytes) rot-sig-bytes (basalt/bytes->hex rot-sig-bytes)))]
       (cond-> {:domain norm-domain
@@ -429,7 +432,7 @@
                pub-bytes (try (basalt/hex->bytes norm-pub) (catch #?(:clj Exception :cljs :default) _ nil))
                sig-bytes (try (basalt/hex->bytes (:pop-signature pop-m)) (catch #?(:clj Exception :cljs :default) _ nil))
                pop-valid? (boolean (and pub-bytes sig-bytes
-                                        (crypto/verify pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes)))]
+                                        (crypto/verify pub-bytes (fressian/utf8->bytes canonical-str) sig-bytes)))]
            (if-not pop-valid?
              false
              (if has-rot?
@@ -442,7 +445,7 @@
                      prev-pub-bytes (when rot-keys-valid? (try (basalt/hex->bytes norm-prev) (catch #?(:clj Exception :cljs :default) _ nil)))
                      rot-sig-bytes (when rot-keys-valid? (try (basalt/hex->bytes rot-sig) (catch #?(:clj Exception :cljs :default) _ nil)))]
                  (boolean (and prev-pub-bytes rot-sig-bytes
-                               (crypto/verify prev-pub-bytes (.getBytes canonical-str "UTF-8") rot-sig-bytes))))
+                               (crypto/verify prev-pub-bytes (fressian/utf8->bytes canonical-str) rot-sig-bytes))))
                true))))))
     (catch #?(:clj Exception :cljs :default) _ false)))
 
@@ -473,7 +476,7 @@
           canonical-str (str "bitecho-directory-attestation-v1|" domain "|" norm-nick "|" norm-pub "|"
                              (str/join "," sorted-hs) "|" mbox "|" iss-ep "|" exp-ep "|"
                              (or norm-prev "") "|" pop-sig "|" rot-sig)
-          dir-sig-bytes (crypto/sign directory-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          dir-sig-bytes (crypto/sign directory-privkey-bytes (fressian/utf8->bytes canonical-str))
           dir-sig-hex (if (string? dir-sig-bytes) dir-sig-bytes (basalt/bytes->hex dir-sig-bytes))]
       (cond-> {:bitecho/type :directory-descriptor
                :domain domain
@@ -555,7 +558,7 @@
               dir-pub-bytes (try (basalt/hex->bytes (normalize-pubkey-hex trusted-directory-pubkey)) (catch #?(:clj Exception :cljs :default) _ nil))
               dir-sig-bytes (try (basalt/hex->bytes (:directory-signature desc)) (catch #?(:clj Exception :cljs :default) _ nil))]
           (if-not (and dir-pub-bytes dir-sig-bytes
-                       (crypto/verify dir-pub-bytes (.getBytes canonical-str "UTF-8") dir-sig-bytes))
+                       (crypto/verify dir-pub-bytes (fressian/utf8->bytes canonical-str) dir-sig-bytes))
             {:ok? false :valid? false :error "invalid-directory-signature"}
             (let [canonical-desc (cond-> {:bitecho/type :directory-descriptor
                                           :domain domain
@@ -627,8 +630,8 @@
           sorted-scopes (vec (sort (distinct (map (fn [s] (str/lower-case (name s)))
                                                   (or scopes ["gossip" "offer" "settle-intent" "transfer"])))))
           canonical-str (str "bitecho-dac-v1|" norm-anchor "|" norm-agent "|" iss-ep "|" exp-ep "|" max-spend "|" (str/join "," sorted-scopes))
-          dac-id (basalt/bytes->hex (crypto/sha256 (.getBytes canonical-str "UTF-8")))
-          sig-bytes (crypto/sign anchor-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          dac-id (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes canonical-str)))
+          sig-bytes (crypto/sign anchor-privkey-bytes (fressian/utf8->bytes canonical-str))
           sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))]
       {:bitecho/type :dac
        :dac-id dac-id
@@ -654,7 +657,7 @@
           norm-agent (normalize-pubkey-hex agent-pubkey)
           rev-ep (long (or revoked-epoch 0))
           canonical-str (str "bitecho-dac-revoke-v1|" norm-anchor "|" norm-agent "|" dac-id "|" rev-ep)
-          sig-bytes (crypto/sign anchor-privkey-bytes (.getBytes canonical-str "UTF-8"))
+          sig-bytes (crypto/sign anchor-privkey-bytes (fressian/utf8->bytes canonical-str))
           sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))]
       {:bitecho/type :dac-revocation
        :dac-id dac-id
@@ -688,7 +691,7 @@
                pub-bytes (try (basalt/hex->bytes norm-anchor) (catch #?(:clj Exception :cljs :default) _ nil))
                sig-bytes (try (basalt/hex->bytes (:signature rev)) (catch #?(:clj Exception :cljs :default) _ nil))]
            (and pub-bytes sig-bytes
-                (crypto/verify pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes))))))
+                (crypto/verify pub-bytes (fressian/utf8->bytes canonical-str) sig-bytes))))))
     (catch #?(:clj Exception :cljs :default) _ false)))
 
 (defn verify-dac
@@ -751,12 +754,12 @@
                      (not (some req-set sorted-scopes))))
             {:ok? false :valid? false :error "dac-scope-not-permitted"}
             (let [canonical-str (str "bitecho-dac-v1|" norm-anchor "|" norm-agent "|" iss-ep "|" exp-ep "|" max-spend "|" (str/join "," sorted-scopes))
-                  expected-id (basalt/bytes->hex (crypto/sha256 (.getBytes canonical-str "UTF-8")))
+                  expected-id (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes canonical-str)))
                   anchor-pub-bytes (try (basalt/hex->bytes norm-anchor) (catch #?(:clj Exception :cljs :default) _ nil))
                   sig-bytes (try (basalt/hex->bytes (:signature d)) (catch #?(:clj Exception :cljs :default) _ nil))]
               (if-not (and (= (:dac-id d) expected-id)
                            anchor-pub-bytes sig-bytes
-                           (crypto/verify anchor-pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes))
+                           (crypto/verify anchor-pub-bytes (fressian/utf8->bytes canonical-str) sig-bytes))
                 {:ok? false :valid? false :error "invalid-dac-signature"}
                 (let [canonical-dac {:bitecho/type :dac
                                      :dac-id (:dac-id d)
@@ -853,7 +856,7 @@
    Returns snapshot with :bitecho/type :chain-state-snapshot, :type :chain-state-snapshot, and :signature hex."
   [snapshot ^bytes validator-privkey-bytes]
   (let [canonical-str (canonical-chain-state-snapshot-str snapshot)
-        sig-bytes (crypto/sign validator-privkey-bytes (.getBytes canonical-str "UTF-8"))]
+        sig-bytes (crypto/sign validator-privkey-bytes (fressian/utf8->bytes canonical-str))]
     (assoc snapshot
            :protocol-version current-wire-version
            :bitecho/type :chain-state-snapshot
@@ -903,7 +906,7 @@
           val-pub-bytes (try (basalt/hex->bytes val-pub) (catch #?(:clj Exception :cljs :default) _ nil))
           sig-bytes (try (basalt/hex->bytes sig) (catch #?(:clj Exception :cljs :default) _ nil))
           valid? (and val-pub-bytes sig-bytes
-                      (try (crypto/verify val-pub-bytes (.getBytes canonical-str "UTF-8") sig-bytes)
+                      (try (crypto/verify val-pub-bytes (fressian/utf8->bytes canonical-str) sig-bytes)
                            (catch #?(:clj Exception :cljs :default) _ false)))]
       (if valid?
         (let [raw-escrows (or (:escrows snapshot) (get snapshot "escrows") [])
@@ -1212,7 +1215,7 @@
   "Computes deterministic session-id from caller, callee, and caller-ephemeral-pub."
   [caller callee caller-ephemeral-pub]
   (let [sid-input (str caller "-" callee "-" caller-ephemeral-pub)]
-    (basalt/bytes->hex (crypto/sha256 (.getBytes ^String sid-input "UTF-8")))))
+    (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes sid-input)))))
 
 (defn compute-offer-hash
   "Computes deterministic offer-hash binding session-id, caller, callee, ephemeral key, epoch, price, home-node, and optional DAC.
@@ -1241,7 +1244,7 @@
         hash-input (str sid "-" caller "-" callee "-" eph-pub "-" epoch "-" price-or-burn "-" hn-str
                         (when (and (string? dac-id) (not (str/blank? dac-id)))
                           (str "|" dac-id)))]
-    (basalt/bytes->hex (crypto/sha256 (.getBytes ^String hash-input "UTF-8")))))
+    (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes hash-input)))))
 
 (defn canonical-rendezvous-header-str
   "Computes canonical string for Phase 1 :rendezvous-offer-header caller signature."
@@ -1373,7 +1376,7 @@
                                                 :home-node home-node
                                                 :dac active-dac})
                 header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id)
-                sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes header-str "UTF-8")))
+                sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes header-str)))
                 wire-payload (cond-> {:protocol-version current-wire-version
                                       :bitecho/type :rendezvous-offer-header
                                       :type :rendezvous-offer-header
@@ -1434,7 +1437,7 @@
         kp-callee (sealed/generate-x25519-keypair)
         callee-x25519-pub (basalt/bytes->hex (:public kp-callee))
         ack-str (canonical-rendezvous-ack-str caller callee offer-hash callee-x25519-pub epoch (:signature signed-ack))
-        sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes ack-str "UTF-8")))
+        sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes ack-str)))
         ack-payload {:protocol-version current-wire-version
                      :bitecho/type :rendezvous-ack-voucher
                      :type :rendezvous-ack-voucher
@@ -1545,7 +1548,7 @@
                                                 :price price
                                                 :home-node home-node
                                                 :dac active-dac})
-                sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes offer-hash "UTF-8")))
+                sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
                 offer-payload (cond-> {:protocol-version current-wire-version
                                        :bitecho/type :channel-offer
                                        :session-id session-id
@@ -1633,7 +1636,7 @@
                       :seq 1
                       :min-burn 100})
             delivery-ack (into {} (:delivery-ack ack-res))
-            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes (str session-id "-" eph-pub-hex) "UTF-8")))
+            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes (str session-id "-" eph-pub-hex))))
             accept-payload {:protocol-version current-wire-version
                             :bitecho/type :channel-accept
                             :session-id session-id
@@ -1680,12 +1683,12 @@
             text (or (get cmd-map "text") (:text cmd-map))
             payload-hex (or (get cmd-map "payload_hex") (get cmd-map "payload-hex")
                             (:payload_hex cmd-map) (:payload-hex cmd-map))
-            payload-bytes (cond (some? text) (.getBytes ^String text "UTF-8")
+            payload-bytes (cond (some? text) (fressian/utf8->bytes text)
                                 (some? payload-hex) (basalt/hex->bytes payload-hex)
                                 :else empty-bytes)
             burn-amt (long (or (get cmd-map "burn") 500))
             seq-num (inc (:tx-seq session 0))
-            sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (.getBytes session-id "UTF-8"))
+            sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (fressian/utf8->bytes session-id))
             msg-payload {:protocol-version current-wire-version
                          :bitecho/type :sealed-message
                          :session-id session-id
@@ -1761,7 +1764,7 @@
     (if-not session
       {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
       (let [pname (pubkey->petname state (:peer session))
-            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes (str "close-" session-id) "UTF-8")))
+            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes (str "close-" session-id))))
             close-payload {:protocol-version current-wire-version
                            :bitecho/type :channel-close
                            :session-id session-id
@@ -1967,7 +1970,7 @@
                              privkey-bytes
                              {:receiver receiver :amount amount :seq seq-num :deps deps}
                              burn-amt)
-                        deliver-payload (vec (.getBytes ^String (pr-str {:transfer (into {} (:transfer res))}) "UTF-8"))
+                        deliver-payload (vec (fressian/utf8->bytes (pr-str {:transfer (into {} (:transfer res))})))
                         deliver-env (wrap-agent-event
                                      {:type :on-deliver
                                       :payload deliver-payload
@@ -2066,7 +2069,7 @@
                       (get cmd-map "preimage") (:preimage cmd-map))
         deliverable-hash (cond
                            (and (string? raw-dh) (escrow/valid-deliverable-hash? raw-dh)) (escrow/normalize-hex raw-dh)
-                           (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (.getBytes ^String raw-deliv "UTF-8")))
+                           (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes raw-deliv)))
                            :else nil)
         curr-ep (effective-chain-epoch state)
         raw-expires (or (get cmd-map "expires_epoch") (get cmd-map "expires-epoch")
@@ -2680,12 +2683,12 @@
              (contains? raw-payload-or-event :type)
              (contains? raw-payload-or-event "type")
              (contains? raw-payload-or-event "cmd")))
-    raw-payload-or-event
+    (fressian/strip-untrusted-crypto-tags raw-payload-or-event)
 
     (and (map? raw-payload-or-event)
          (or (contains? raw-payload-or-event :protocol-version)
              (contains? raw-payload-or-event "protocol_version")))
-    raw-payload-or-event
+    (fressian/strip-untrusted-crypto-tags raw-payload-or-event)
 
     :else nil))
 
@@ -2713,14 +2716,14 @@
                        (when wire-dac (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id"))))
             burn-num (parse-long-safe (or (:price msg) (:burn msg)) 0)
             epoch-num (parse-long-safe (:epoch msg) 0)
-            expected-hash-5field (basalt/bytes->hex (crypto/sha256 (.getBytes ^String (str (:caller msg) "-" (:callee msg) "-" (:caller-ephemeral-pub msg) "-" epoch-num "-" burn-num (when (and (string? dac-id) (not (str/blank? dac-id))) (str "|" dac-id))) "UTF-8")))
+            expected-hash-5field (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes (str (:caller msg) "-" (:callee msg) "-" (:caller-ephemeral-pub msg) "-" epoch-num "-" burn-num (when (and (string? dac-id) (not (str/blank? dac-id))) (str "|" dac-id))))))
             valid-hashes? (and (= (:session-id msg) expected-sid)
                                (or (= (:offer-hash msg) expected-hash-legacy)
                                    (= (:offer-hash msg) expected-hash-sealed)
                                    (= (:offer-hash msg) expected-hash-5field)))
             valid-sig? (and valid-hashes?
                             caller-pub sig-bytes
-                            (crypto/verify caller-pub (.getBytes ^String (:offer-hash msg) "UTF-8") sig-bytes))
+                            (crypto/verify caller-pub (fressian/utf8->bytes (:offer-hash msg)) sig-bytes))
             ref-epoch (:epoch state)
             wire-dac (or (:dac msg) (get msg "dac"))
             dac-check (when wire-dac
@@ -2796,7 +2799,7 @@
                 valid-ack? (rendezvous/verify-delivery-ack (:delivery-ack msg) (:callee msg))
                 valid-sig? (and callee-pub sig-bytes
                                 (crypto/verify callee-pub
-                                               (.getBytes (str session-id "-" (:callee-ephemeral-pub msg)) "UTF-8")
+                                               (fressian/utf8->bytes (str session-id "-" (:callee-ephemeral-pub msg)))
                                                sig-bytes))]
             (if-not (and valid-ack? valid-sig?)
               {:state state :net-envelopes [] :stdout-events []}
@@ -2851,7 +2854,7 @@
   ([state session-id peer-pub contiguous-ack-seq msg-seq seen-seqs privkey-bytes]
    (when privkey-bytes
      (let [seen-vec (vec (sort (or seen-seqs [])))
-           ack-sign-bytes (.getBytes (str "ack-" session-id "-" contiguous-ack-seq "-" msg-seq "-" (str/join "," seen-vec)) "UTF-8")
+           ack-sign-bytes (fressian/utf8->bytes (str "ack-" session-id "-" contiguous-ack-seq "-" msg-seq "-" (str/join "," seen-vec)))
            sig (crypto/sign privkey-bytes ack-sign-bytes)
            sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
            ack-payload {:protocol-version current-wire-version
@@ -2883,7 +2886,7 @@
             (cond
               (:accepted? chk)
               (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (.getBytes session-id "UTF-8")))]
+                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id)))]
                 (if-not decrypted
                   {:state state :net-envelopes [] :stdout-events []}
                   (let [new-rx-high-seq (max (long (:rx-high-seq session 0)) (long (:seq msg)))
@@ -2920,7 +2923,7 @@
 
               (= :replayed-seq (:error chk))
               (let [ct (try (basalt/hex->bytes (:ciphertext msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (.getBytes session-id "UTF-8")))]
+                    decrypted (when ct (sealed/open-message (:rx-key session) (:seq msg) ct (fressian/utf8->bytes session-id)))]
                 (if-not decrypted
                   {:state state :net-envelopes [] :stdout-events []}
                   (let [contig (:contiguous-rx-seq session 0)
@@ -2957,7 +2960,7 @@
                 ack-seq (long (or (:ack-seq msg) 0))
                 acked-seq (long (or (:acked-seq msg) 0))
                 seen-vec (vec (sort (or (:seen-seqs msg) [])))
-                canonical-bytes (.getBytes (str "ack-" session-id "-" ack-seq "-" acked-seq "-" (str/join "," seen-vec)) "UTF-8")
+                canonical-bytes (fressian/utf8->bytes (str "ack-" session-id "-" ack-seq "-" acked-seq "-" (str/join "," seen-vec)))
                 valid-sig? (and peer-pub sig-bytes
                                 (crypto/verify peer-pub canonical-bytes sig-bytes))]
             (if-not valid-sig?
@@ -3026,7 +3029,7 @@
           (let [sender-pub (try (basalt/hex->bytes (:sender msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 valid-sig? (and sender-pub sig-bytes
-                                (crypto/verify sender-pub (.getBytes (str "close-" session-id) "UTF-8") sig-bytes))]
+                                (crypto/verify sender-pub (fressian/utf8->bytes (str "close-" session-id)) sig-bytes))]
             (if-not valid-sig?
               {:state state :net-envelopes [] :stdout-events []}
               (let [closed-sess (-> session
@@ -3079,7 +3082,7 @@
                 caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 valid-sig? (and caller-pub sig-bytes
-                                (crypto/verify caller-pub (.getBytes header-str "UTF-8") sig-bytes))]
+                                (crypto/verify caller-pub (fressian/utf8->bytes header-str) sig-bytes))]
             (if-not valid-sig?
               {:state state :net-envelopes [] :stdout-events []}
               (let [pol (or (:rendezvous-policy state)
@@ -3142,7 +3145,7 @@
                 callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                 sig-valid? (and callee-pub sig-bytes
-                                (crypto/verify callee-pub (.getBytes ack-str "UTF-8") sig-bytes))]
+                                (crypto/verify callee-pub (fressian/utf8->bytes ack-str) sig-bytes))]
             (if-not (and ack-valid? sig-valid?)
               {:state state :net-envelopes [] :stdout-events []}
               (let [session-id (:session-id outbound)
@@ -3155,7 +3158,7 @@
                   {:state state :net-envelopes [] :stdout-events []}
                   (let [reveal-str (canonical-rendezvous-reveal-str session-id (:pubkey state) (:callee outbound)
                                                                     offer-hash (:caller-x25519-pub outbound) (:epoch state))
-                        reveal-sig (basalt/bytes->hex (crypto/sign privkey-bytes (.getBytes reveal-str "UTF-8")))
+                        reveal-sig (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes reveal-str)))
                         reveal-payload {:protocol-version current-wire-version
                                         :bitecho/type :rendezvous-reveal
                                         :type :rendezvous-reveal
@@ -3170,9 +3173,9 @@
                         initial-text (:initial-text outbound)
                         [session-with-tx net-envs]
                         (if (and initial-text (not (str/blank? initial-text)))
-                          (let [text-bytes (.getBytes ^String initial-text "UTF-8")
+                          (let [text-bytes (fressian/utf8->bytes initial-text)
                                 seq-num 1
-                                sealed-m (sealed/seal-message (:tx-key keys) seq-num text-bytes (.getBytes session-id "UTF-8"))
+                                sealed-m (sealed/seal-message (:tx-key keys) seq-num text-bytes (fressian/utf8->bytes session-id))
                                 msg-payload {:protocol-version current-wire-version
                                              :bitecho/type :sealed-message
                                              :session-id session-id
@@ -3276,7 +3279,7 @@
                     caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
                     sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
                     sig-valid? (and caller-pub sig-bytes
-                                    (crypto/verify caller-pub (.getBytes reveal-str "UTF-8") sig-bytes))]
+                                    (crypto/verify caller-pub (fressian/utf8->bytes reveal-str) sig-bytes))]
                 (if-not sig-valid?
                   {:state state :net-envelopes [] :stdout-events []}
                   (let [caller-eph (try (basalt/hex->bytes caller-x25519) (catch #?(:clj Exception :cljs :default) _ nil))

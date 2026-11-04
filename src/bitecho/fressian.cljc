@@ -40,6 +40,189 @@
   #?(:clj  (String. ^bytes ba "UTF-8")
      :cljs (.decode (js/TextDecoder.) ba)))
 
+(def ^:private untrusted-crypto-keys
+  #{:crypto/verified? :crypto/verified-a? :crypto/verified-b?
+    "crypto/verified?" "crypto/verified-a?" "crypto/verified-b?"
+    ":crypto/verified?" ":crypto/verified-a?" ":crypto/verified-b?"})
+
+(defn- untrusted-crypto-key? [k]
+  (contains? untrusted-crypto-keys k))
+
+(defn strip-untrusted-crypto-tags
+  "Recursively removes untrusted shell-boundary crypto tags (:crypto/verified?, :crypto/verified-a?,
+   :crypto/verified-b?, and their string equivalents) from data structures (maps, vectors, sets), preserving records."
+  [x]
+  (cond
+    (record? x)
+    (reduce-kv (fn [r k v]
+                 (if (untrusted-crypto-key? k)
+                   (dissoc r k)
+                   (assoc r k (strip-untrusted-crypto-tags v))))
+               x
+               x)
+
+    (map? x)
+    (reduce-kv (fn [m k v]
+                 (if (untrusted-crypto-key? k)
+                   m
+                   (assoc m k (strip-untrusted-crypto-tags v))))
+               (empty x)
+               x)
+
+    (vector? x)
+    (mapv strip-untrusted-crypto-tags x)
+
+    (set? x)
+    (into (empty x) (map strip-untrusted-crypto-tags x))
+
+    (seq? x)
+    (map strip-untrusted-crypto-tags x)
+
+    :else x))
+
+(defn string->cesu8-bytes
+  "Encodes a string as CESU-8 bytes (UTF-16 code units encoded in 1-3 bytes each).
+   Guarantees byte-level compatibility with org.clojure/data.fressian on astral-plane characters."
+  [s]
+  #?(:clj
+     (let [s (str s)
+           len (.length ^String s)
+           bos (java.io.ByteArrayOutputStream.)]
+       (dotimes [i len]
+         (let [c (int (.charAt ^String s i))]
+           (cond
+             (<= c 0x007f)
+             (.write bos (unchecked-byte c))
+
+             (<= c 0x07ff)
+             (do
+               (.write bos (unchecked-byte (bit-or 0xc0 (bit-shift-right c 6))))
+               (.write bos (unchecked-byte (bit-or 0x80 (bit-and c 0x3f)))))
+
+             :else
+             (do
+               (.write bos (unchecked-byte (bit-or 0xe0 (bit-shift-right c 12))))
+               (.write bos (unchecked-byte (bit-or 0x80 (bit-and (bit-shift-right c 6) 0x3f))))
+               (.write bos (unchecked-byte (bit-or 0x80 (bit-and c 0x3f))))))))
+       (.toByteArray bos))
+     :cljs
+     (let [s (str s)
+           len (.-length s)
+           out (js/Array.)]
+       (dotimes [i len]
+         (let [c (.charCodeAt s i)]
+           (cond
+             (<= c 0x007f)
+             (.push out c)
+
+             (<= c 0x07ff)
+             (do
+               (.push out (bit-or 0xc0 (bit-shift-right c 6)))
+               (.push out (bit-or 0x80 (bit-and c 0x3f))))
+
+             :else
+             (do
+               (.push out (bit-or 0xe0 (bit-shift-right c 12)))
+               (.push out (bit-or 0x80 (bit-and (bit-shift-right c 6) 0x3f)))
+               (.push out (bit-or 0x80 (bit-and c 0x3f)))))))
+       (js/Uint8Array. out))))
+
+(defn cesu8-bytes->string
+  "Decodes CESU-8 bytes into a string, with permissive 4-byte UTF-8 fallback."
+  [ba]
+  #?(:clj
+     (let [len (alength ^bytes ba)
+           sb (StringBuilder.)]
+       (loop [i 0]
+         (when (< i len)
+           (let [b0 (bit-and (aget ^bytes ba i) 0xff)]
+             (cond
+               (< b0 0x80)
+               (do (.append sb (char b0)) (recur (inc i)))
+
+               (< b0 0xe0)
+               (let [b1 (bit-and (aget ^bytes ba (inc i)) 0xff)
+                     c (bit-or (bit-shift-left (bit-and b0 0x1f) 6) (bit-and b1 0x3f))]
+                 (.append sb (char c))
+                 (recur (+ i 2)))
+
+               (< b0 0xf0)
+               (let [b1 (bit-and (aget ^bytes ba (inc i)) 0xff)
+                     b2 (bit-and (aget ^bytes ba (+ i 2)) 0xff)
+                     c (bit-or (bit-shift-left (bit-and b0 0x0f) 12)
+                               (bit-shift-left (bit-and b1 0x3f) 6)
+                               (bit-and b2 0x3f))]
+                 (.append sb (char c))
+                 (recur (+ i 3)))
+
+               (< b0 0xf8)
+               (let [b1 (bit-and (aget ^bytes ba (inc i)) 0xff)
+                     b2 (bit-and (aget ^bytes ba (+ i 2)) 0xff)
+                     b3 (bit-and (aget ^bytes ba (+ i 3)) 0xff)
+                     cp (bit-or (bit-shift-left (bit-and b0 0x07) 18)
+                                (bit-shift-left (bit-and b1 0x3f) 12)
+                                (bit-shift-left (bit-and b2 0x3f) 6)
+                                (bit-and b3 0x3f))
+                     adj (- cp 0x10000)
+                     hi (+ 0xd800 (bit-shift-right adj 10))
+                     lo (+ 0xdc00 (bit-and adj 0x3ff))]
+                 (.append sb (char hi))
+                 (.append sb (char lo))
+                 (recur (+ i 4)))
+
+               :else
+               (recur (inc i))))))
+       (.toString sb))
+     :cljs
+     (let [len (.-length ba)
+           chars (js/Array.)]
+       (loop [i 0]
+         (when (< i len)
+           (let [b0 (aget ba i)]
+             (cond
+               (< b0 0x80)
+               (do (.push chars b0) (recur (inc i)))
+
+               (< b0 0xe0)
+               (let [b1 (aget ba (inc i))
+                     c (bit-or (bit-shift-left (bit-and b0 0x1f) 6) (bit-and b1 0x3f))]
+                 (.push chars c)
+                 (recur (+ i 2)))
+
+               (< b0 0xf0)
+               (let [b1 (aget ba (+ i 1))
+                     b2 (aget ba (+ i 2))
+                     c (bit-or (bit-shift-left (bit-and b0 0x0f) 12)
+                               (bit-shift-left (bit-and b1 0x3f) 6)
+                               (bit-and b2 0x3f))]
+                 (.push chars c)
+                 (recur (+ i 3)))
+
+               (< b0 0xf8)
+               (let [b1 (aget ba (+ i 1))
+                     b2 (aget ba (+ i 2))
+                     b3 (aget ba (+ i 3))
+                     cp (bit-or (bit-shift-left (bit-and b0 0x07) 18)
+                                (bit-shift-left (bit-and b1 0x3f) 12)
+                                (bit-shift-left (bit-and b2 0x3f) 6)
+                                (bit-and b3 0x3f))
+                     adj (- cp 0x10000)
+                     hi (+ 0xd800 (bit-shift-right adj 10))
+                     lo (+ 0xdc00 (bit-and adj 0x3ff))]
+                 (.push chars hi)
+                 (.push chars lo)
+                 (recur (+ i 4)))
+
+               :else
+               (recur (inc i))))))
+       (let [chunk-size 4096
+             num-chunks (js/Math.ceil (/ (.-length chars) chunk-size))
+             result (js/Array.)]
+         (dotimes [c num-chunks]
+           (let [sub (.slice chars (* c chunk-size) (* (inc c) chunk-size))]
+             (.push result (.apply (.-fromCharCode js/String) nil sub))))
+         (.join result "")))))
+
 (defn byte-array-equals?
   "Checks byte equality between two byte arrays."
   [a b]
@@ -378,16 +561,16 @@
 
 (defn- write-canonical-string
   [w s]
-  (let [utf8 (utf8->bytes s)
-        len (count-bytes utf8)]
+  (let [cesu8 (string->cesu8-bytes s)
+        len (count-bytes cesu8)]
     (if (< len 8)
       (do
         (write-raw-byte w (+ tag-string-packed-length-start len))
-        (write-raw-bytes w utf8))
+        (write-raw-bytes w cesu8))
       (do
         (write-raw-byte w tag-string)
         (write-count w len)
-        (write-raw-bytes w utf8)))))
+        (write-raw-bytes w cesu8)))))
 
 (defn- write-canonical-vector
   [w v]
@@ -668,13 +851,13 @@
 
       (<= tag-string-packed-length-start code (dec tag-string-packed-length-end))
       (let [len (- code tag-string-packed-length-start)
-            utf8 (read-slice rdr len)]
-        (bytes->utf8 utf8))
+            cesu8 (read-slice rdr len)]
+        (cesu8-bytes->string cesu8))
 
       (= code tag-string)
       (let [len (decode-count rdr)
-            utf8 (read-slice rdr len)]
-        (bytes->utf8 utf8))
+            cesu8 (read-slice rdr len)]
+        (cesu8-bytes->string cesu8))
 
       (= code tag-key)
       (let [ns (decode-value rdr cache-atom)
@@ -732,11 +915,13 @@
 (defn decode
   "Decodes a Fressian byte array into Clojure persistent data structures.
    Accepts byte[] on JVM, Uint8Array on ClojureScript.
-   Decodes both Canonical Fressian mode and standard priority-cached Fressian streams."
+   Decodes both Canonical Fressian mode and standard priority-cached Fressian streams.
+   Recursively strips untrusted shell-boundary crypto tags from the result."
   [ba]
   (let [rdr (make-byte-reader ba)
-        cache (atom [])]
-    (decode-value rdr cache)))
+        cache (atom [])
+        val (decode-value rdr cache)]
+    (strip-untrusted-crypto-tags val)))
 
 ;; =============================================================================
 ;; JVM Standard data.fressian Interop
@@ -764,15 +949,18 @@
 
 (defn canonical-signing-bytes
   "Encodes payload into deterministic canonical Fressian bytes (v2 format).
-   If payload is already a raw byte array, returns it directly."
+   If payload is already a raw byte array, returns it directly.
+   Always recursively strips untrusted shell-boundary crypto tags before encoding."
   [payload]
   (if (bytes? payload)
     payload
-    (encode-canonical payload)))
+    (encode-canonical (strip-untrusted-crypto-tags payload))))
 
 (defn legacy-pr-str-signing-bytes
-  "Encodes payload using (pr-str payload) as UTF-8 bytes (v1 legacy format)."
+  "Encodes payload using (pr-str payload) as UTF-8 bytes (v1 legacy format).
+   If payload is already a raw byte array, returns it directly.
+   Always recursively strips untrusted shell-boundary crypto tags before encoding."
   [payload]
   (if (bytes? payload)
     payload
-    (utf8->bytes (pr-str payload))))
+    (utf8->bytes (pr-str (strip-untrusted-crypto-tags payload)))))

@@ -1280,20 +1280,23 @@
 
 (defn- thaw-payload-data
   "Deserializes a payload map, trying canonical Fressian first.
-   If decoding fails or does not yield a map/record, falls back to legacy EDN string parsing."
+   If decoding fails or does not yield a map/record, falls back to legacy EDN string parsing.
+   Always recursively strips untrusted shell-boundary crypto tags."
   [payload-bytes]
   (let [pb (to-byte-array payload-bytes)]
     (or (try
           (let [v (fressian/decode pb)]
             (when (or (map? v) (record? v))
-              v))
+              (fressian/strip-untrusted-crypto-tags v)))
           (catch #?(:clj Exception :cljs :default) _ nil))
         (try
-          (let [payload-str (fressian/bytes->utf8 pb)]
-            (edn/read-string {:default tagged-literal
-                              :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                        'bitecho.economy.account.AccountState account/map->AccountState}}
-                             payload-str))
+          (let [payload-str (fressian/bytes->utf8 pb)
+                edn-val (edn/read-string {:default tagged-literal
+                                          :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                    'bitecho.economy.account.AccountState account/map->AccountState}}
+                                         payload-str)]
+            (when (or (map? edn-val) (record? edn-val))
+              (fressian/strip-untrusted-crypto-tags edn-val)))
           (catch #?(:clj Exception :cljs :default) _ nil)))))
 
 (defn- apply-transfer-payload-to-ledger
