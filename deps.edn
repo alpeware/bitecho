@@ -5,7 +5,7 @@
         org.clojure/data.fressian {:mvn/version "1.1.0"}
         com.taoensso/nippy {:mvn/version "3.6.0"}
         alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
-                                  :git/sha "2abeab82cfaa39fc2df4b9dfa047915794fa496b"}}
+                                  :git/sha "556a13a0c626ba2109d475aa987c9e15d220d768"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]

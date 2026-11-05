@@ -93,19 +93,25 @@
     (str hrp-str "1" (apply str (map charset-map (concat data-words chks))))))
 
 (defn decode
-  "Decodes a Bech32m string into `[hrp data-words]` (omitting checksum), or nil if invalid."
+  "Decodes a Bech32m string into `[hrp data-words]` (omitting checksum), or nil if invalid.
+   Enforces BIP-0350: length between 8 and 90 chars, no mixed case, valid charset and checksum."
   [bech32m-str]
-  (when (string? bech32m-str)
-    (let [s (str/lower-case bech32m-str)
-          sep (str/last-index-of s "1")]
-      (when (and (some? sep) (pos? sep) (< sep (dec (count s))))
-        (let [hrp (subs s 0 sep)
-              data-str (subs s (inc sep))
-              data (mapv value-map data-str)]
-          (when (and (every? some? data)
-                     (>= (count data) 6)
-                     (verify-checksum hrp data))
-            [hrp (subvec data 0 (- (count data) 6))]))))))
+  (when (and (string? bech32m-str)
+             (>= (count bech32m-str) 8)
+             (<= (count bech32m-str) 90))
+    (let [has-lower? (boolean (re-find #"[a-z]" bech32m-str))
+          has-upper? (boolean (re-find #"[A-Z]" bech32m-str))]
+      (when-not (and has-lower? has-upper?)
+        (let [s (str/lower-case bech32m-str)
+              sep (str/last-index-of s "1")]
+          (when (and (some? sep) (pos? sep) (< sep (dec (count s))))
+            (let [hrp (subs s 0 sep)
+                  data-str (subs s (inc sep))
+                  data (mapv value-map data-str)]
+              (when (and (every? some? data)
+                         (>= (count data) 6)
+                         (verify-checksum hrp data))
+                [hrp (subvec data 0 (- (count data) 6))]))))))))
 
 (defn- to-byte-seq [bytes-or-seq]
   #?(:clj

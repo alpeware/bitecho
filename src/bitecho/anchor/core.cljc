@@ -111,7 +111,8 @@
 
 (defn register-supervised-agent
   "Registers an autonomous or semi-autonomous agent supervised by this human anchor.
-   Issues or binds a cold-certifies-hot DAC."
+   Requires a valid signed DAC (either explicitly provided or signed using cold key in state).
+   If no signed DAC can be established, fails closed and returns state unchanged."
   [state {:keys [agent-id hot-pubkey dac permissions max-spend scopes issued-epoch expires-epoch]}]
   (let [anchor-pub (:anchor-pubkey state)
         agent-key-hex (cond
@@ -126,16 +127,18 @@
                              {:issued-epoch issued-epoch
                               :expires-epoch expires-epoch
                               :max-spend-per-epoch max-spend
-                              :scopes scopes})))
-        agent-record {:agent-id agent-id
-                      :hot-pubkey agent-key-hex
-                      :hot-address (when agent-key-hex (bech32m/pubkey->bech32m agent-key-hex "ech"))
-                      :dac effective-dac
-                      :status :active
-                      :permissions (or permissions scopes [:offer :message :escrow])
-                      :activity-log []
-                      :registered-at (or (:epoch state) 0)}]
-    (assoc-in state [:supervised-agents agent-id] agent-record)))
+                              :scopes scopes})))]
+    (if-not (and (map? effective-dac) (:signature effective-dac) (:dac-id effective-dac))
+      state
+      (let [agent-record {:agent-id agent-id
+                          :hot-pubkey agent-key-hex
+                          :hot-address (when agent-key-hex (bech32m/pubkey->bech32m agent-key-hex "ech"))
+                          :dac effective-dac
+                          :status :active
+                          :permissions (or permissions scopes [:offer :message :escrow])
+                          :activity-log []
+                          :registered-at (or (:epoch state) 0)}]
+        (assoc-in state [:supervised-agents agent-id] agent-record)))))
 
 (defn log-agent-activity
   "Appends an activity event to a supervised agent's activity log."
@@ -163,7 +166,8 @@
 (defn revoke-agent-dac
   "Emergency revocation of a supervised agent's DAC.
    Immediately updates status to :revoked, constructs signed DAC revocation,
-   records revocation in state, and returns [new-state effects]."
+   records revocation in state, and returns [new-state effects].
+   Only emits :broadcast-dac-revocation effect if signed revocation was constructed."
   [state agent-id & [reason]]
   (let [agent (get-in state [:supervised-agents agent-id])]
     (if-not agent
@@ -181,20 +185,31 @@
                            :agent-pubkey agent-pub
                            :dac-id dac-id
                            :revoked-epoch (or (:epoch state) 0)}))
-            new-state (-> state
-                          (assoc-in [:supervised-agents agent-id :status] :revoked)
-                          (assoc-in [:supervised-agents agent-id :revocation] revocation)
-                          (update :revoked-dacs (fnil conj []) (or revocation {:dac-id dac-id :reason rev-reason})))
-            effects [{:effect :diagnose
-                      :reason :supervised-agent-dac-revoked
-                      :agent-id agent-id
-                      :dac-id dac-id
-                      :revocation-reason rev-reason}
-                     {:effect :broadcast-dac-revocation
-                      :agent-id agent-id
-                      :dac-id dac-id
-                      :revocation revocation}]]
+            new-state (cond-> (assoc-in state [:supervised-agents agent-id :status] :revoked)
+                        revocation (assoc-in [:supervised-agents agent-id :revocation] revocation)
+                        revocation (update :revoked-dacs (fnil conj []) revocation))
+            effects (cond-> [{:effect :diagnose
+                              :reason :supervised-agent-dac-revoked
+                              :agent-id agent-id
+                              :dac-id dac-id
+                              :revocation-reason rev-reason}]
+                      revocation (conj {:effect :broadcast-dac-revocation
+                                        :agent-id agent-id
+                                        :dac-id dac-id
+                                        :revocation revocation}))]
         [new-state effects]))))
+
+(defn sanitize-anchor-state-for-persistence
+  "Sanitizes anchor state for persistence to disk or IndexedDB.
+   Strips all private key material (:privkey-bytes, :cold-privkey, :private-key, :seed),
+   raw keypairs, and non-serializable objects."
+  [state]
+  (let [clean (dissoc state :privkey-bytes :cold-privkey :private-key :seed :keypair)]
+    (cond-> clean
+      (:backup-key clean)
+      (update :backup-key dissoc :private-key :backup-seed :public-key)
+      (:identity clean)
+      (update :identity dissoc :private-key :seed :keypair))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Team-Call Subnet Management (Milestone 11A)

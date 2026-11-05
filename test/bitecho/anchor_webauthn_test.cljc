@@ -58,12 +58,17 @@
     (let [words [24 23 25 24 22 28 1 16 11 29 8 25 23 29 19 13 16 23 29 22 25 28 1 16 11 3 25 29 27 25 3 3 29 19 11 25 3 3 25 13 24 29 1 25 3 3 25 13]
           expected "split1checkupstagehandshakeupstreamerranterredcaperredlc445v"]
       (is (= (bech32m/encode "split" words) expected))
-      (is (= ["split" words] (bech32m/decode expected))))))
+      (is (= ["split" words] (bech32m/decode expected))))
 
-(defspec ^{:doc "Property: Bech32m address encoding and decoding roundtrips arbitrary byte sequences."}
+    ;; BIP-0350 invalid strings: length limits (8..90) and mixed case
+    (is (nil? (bech32m/decode "ech1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq")))
+    (is (nil? (bech32m/decode "ech1q")))
+    (is (nil? (bech32m/decode "Abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx")))))
+
+(defspec ^{:doc "Property: Bech32m address encoding and decoding roundtrips arbitrary byte sequences within BIP-0350 90-char limit."}
   prop-bech32m-roundtrip 50
   (for-all [hrp (gen/elements ["ech" "bitecho" "test" "agent"])
-            data (gen/not-empty (gen/vector (gen/choose 0 255) 1 64))]
+            data (gen/not-empty (gen/vector (gen/choose 0 255) 1 45))]
            (let [addr (bech32m/encode-address hrp data)
                  dec (bech32m/decode-address addr)]
              (and (some? dec)
@@ -74,11 +79,12 @@
   prop-bech32m-tamper-detection 50
   (for-all [hrp (gen/elements ["ech" "bitecho"])
             data (gen/not-empty (gen/vector (gen/choose 0 255) 4 32))
-            mut-char (gen/elements (map str bech32m/charset))]
+            mut-char (gen/elements (map str bech32m/charset))
+            target-idx-pct (gen/choose 0 99)]
            (let [valid-addr (bech32m/encode-address hrp data)
                  sep (str/last-index-of valid-addr "1")
                  data-part (subs valid-addr (inc sep))
-                 idx (rand-int (count data-part))
+                 idx (int (mod target-idx-pct (count data-part)))
                  corrupted (str (subs valid-addr 0 (+ sep 1 idx))
                                 mut-char
                                 (subs valid-addr (+ sep 2 idx)))]

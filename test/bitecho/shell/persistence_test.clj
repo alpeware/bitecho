@@ -1,5 +1,6 @@
 (ns bitecho.shell.persistence-test
-  (:require [bitecho.shell.persistence :as persistence]
+  (:require [bitecho.shell.light-node :as light-node]
+            [bitecho.shell.persistence :as persistence]
             [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]))
 
@@ -63,3 +64,37 @@
       (is (nil? (:rng stripped)))
       (is (nil? (:more-rand (:nested stripped))))
       (is (= "data" (:data (:nested stripped)))))))
+
+(deftest ^{:doc "Tests 16 concurrent threads saving state simultaneously without NoSuchFileException"}
+  concurrent-save-race-resilience-test
+  (testing "16 concurrent threads saving snapshot-save-to-disk and save-light-state! without race conditions"
+    (let [temp-snap (java.io.File/createTempFile "snap-race" ".bin")
+          snap-path (.getAbsolutePath temp-snap)
+          temp-light (java.io.File/createTempFile "light-race" ".bin")
+          light-path (.getAbsolutePath temp-light)
+          n-threads 16
+          pool (java.util.concurrent.Executors/newFixedThreadPool n-threads)]
+      (try
+        ;; Test persistence/save-state-to-disk
+        (let [tasks (mapv (fn [i]
+                            (fn []
+                              (persistence/save-state-to-disk snap-path {:index i :payload (str "data-" i)})))
+                          (range n-threads))
+              futures (.invokeAll pool tasks)
+              results (mapv (fn [^java.util.concurrent.Future f] (.get f)) futures)]
+          (is (every? true? results))
+          (is (some? (persistence/load-state-from-disk snap-path))))
+
+        ;; Test light-node/save-light-state!
+        (let [tasks (mapv (fn [i]
+                            (fn []
+                              (light-node/save-light-state! light-path {:index i :identity {:pubkey (str "pk-" i)}})))
+                          (range n-threads))
+              futures (.invokeAll pool tasks)
+              results (mapv (fn [^java.util.concurrent.Future f] (.get f)) futures)]
+          (is (every? true? results))
+          (is (some? (light-node/load-light-state! light-path))))
+        (finally
+          (.shutdown pool)
+          (try (.delete temp-snap) (catch Exception _ nil))
+          (try (.delete temp-light) (catch Exception _ nil)))))))

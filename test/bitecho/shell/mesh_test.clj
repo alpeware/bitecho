@@ -4,6 +4,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.mesh :as mesh]
@@ -854,7 +855,7 @@
                           "peer-2" {:node mock-node-2 :channel-id (atom nil)}
                           "peer-3" {:node mock-node-3 :channel-id (atom 20)}})]
     (with-redefs [api/send! (fn [node data cid]
-                              (swap! sent conj {:node node :data (nippy/thaw data) :cid cid}))]
+                              (swap! sent conj {:node node :data (fressian/decode-wire data) :cid cid}))]
       (mesh/send-peer-keepalives! peer-conns)
       (is (= 2 (count @sent)))
       (is (= #{1 3} (set (map #(get-in % [:node :id]) @sent))))
@@ -1264,7 +1265,7 @@
         ;; 3. Snapshot sent back to query-node
         (is (= 1 (count @sent-messages)))
         (is (= query-node (:node (first @sent-messages))))
-        (let [resp-snapshot (nippy/thaw (:payload (first @sent-messages)))]
+        (let [resp-snapshot (fressian/decode-wire (:payload (first @sent-messages)))]
           (is (= :chain-state-snapshot (:type resp-snapshot)))
           (is (= 50000 (:balance resp-snapshot))))
 

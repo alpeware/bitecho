@@ -546,4 +546,4 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
    - End-to-end zero-burn team subnet demo (`run-zero-burn-team-subnet-demo`) and two-domain federation demo (`run-two-domain-federation-demo`).
    - Browser static bundle build (`./scripts/build-browser-bundle.sh`) 100% byte-for-byte reproducible with SRI hashes and synced to `clj-web/public/app/`.
    - Live browser UX bug remediations implemented for `https://bitecho.org/app` (nested identity/accounting view, map-safe supervised agents iteration, absolute script URL `/app/bitecho-browser.js`, hardware YubiKey discoverable credential creation/recovery, simulated offers).
-   - Full test suite passes: 428 JVM tests (3491 assertions) and 157 Node/CLJS tests (1040 assertions) green with 0 failures, 0 errors, and 0 lint warnings.
+   - Full test suite passes: 431 JVM tests (3510 assertions) and 159 Node/CLJS tests (1055 assertions) green with 0 failures, 0 errors, and 0 lint warnings.

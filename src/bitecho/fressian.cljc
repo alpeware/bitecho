@@ -1125,6 +1125,14 @@
     #?(:clj  (write-standard-fressian norm)
        :cljs (encode-canonical norm))))
 
+(def false-sentinel
+  "Explicit namespaced sentinel to distinguish boolean false from decoding errors or nil."
+  :bitecho.fressian/boolean-false-sentinel-v1)
+
+(def decode-error-sentinel
+  "Internal sentinel representing a decode error or failure."
+  :bitecho.fressian/decode-error-sentinel-v1)
+
 (defn decode-wire
   "Decodes wire bytes into Clojure persistent data structures.
    Supports Fressian-encoded payloads and legacy Nippy payloads (on JVM).
@@ -1132,7 +1140,7 @@
    Distinguishes boolean false and nil payloads from decoding failures using an internal sentinel."
   [ba]
   (when (and (bytes? ba) (pos? (count-bytes ba)))
-    (let [sentinel ::decode-error
+    (let [sentinel decode-error-sentinel
           raw #?(:clj
                  (if (nippy-payload? ba)
                    (try (nippy/thaw ba)

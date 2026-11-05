@@ -154,20 +154,35 @@
 (declare decode-item)
 
 (defn- decode-header [bytes-seq offset]
-  (let [b (bit-and (int (nth bytes-seq offset)) 0xff)
-        major (unsigned-bit-shift-right b 5)
-        info (bit-and b 0x1f)]
-    (cond
-      (< info 24) [major info (inc offset)]
-      (= info 24) [major (bit-and (int (nth bytes-seq (inc offset))) 0xff) (+ offset 2)]
-      (= info 25) [major (u16 (nth bytes-seq (inc offset)) (nth bytes-seq (+ offset 2))) (+ offset 3)]
-      (= info 26) [major (u32 (nth bytes-seq (+ offset 1)) (nth bytes-seq (+ offset 2))
-                              (nth bytes-seq (+ offset 3)) (nth bytes-seq (+ offset 4))) (+ offset 5)]
-      (= info 27) [major (u64 (nth bytes-seq (+ offset 1)) (nth bytes-seq (+ offset 2))
-                              (nth bytes-seq (+ offset 3)) (nth bytes-seq (+ offset 4))
-                              (nth bytes-seq (+ offset 5)) (nth bytes-seq (+ offset 6))
-                              (nth bytes-seq (+ offset 7)) (nth bytes-seq (+ offset 8))) (+ offset 9)]
-      :else (throw (ex-info (str "Unsupported CBOR additional info: " info) {:info info :offset offset})))))
+  (let [cnt (count bytes-seq)]
+    (when (>= offset cnt)
+      (throw (ex-info "CBOR input truncated at header" {:offset offset :count cnt})))
+    (let [b (bit-and (int (nth bytes-seq offset)) 0xff)
+          major (unsigned-bit-shift-right b 5)
+          info (bit-and b 0x1f)]
+      (cond
+        (< info 24) [major info (inc offset)]
+        (= info 24)
+        (if (< (inc offset) cnt)
+          [major (bit-and (int (nth bytes-seq (inc offset))) 0xff) (+ offset 2)]
+          (throw (ex-info "CBOR input truncated at 1-byte int" {:offset offset})))
+        (= info 25)
+        (if (< (+ offset 2) cnt)
+          [major (u16 (nth bytes-seq (inc offset)) (nth bytes-seq (+ offset 2))) (+ offset 3)]
+          (throw (ex-info "CBOR input truncated at 2-byte int" {:offset offset})))
+        (= info 26)
+        (if (< (+ offset 4) cnt)
+          [major (u32 (nth bytes-seq (+ offset 1)) (nth bytes-seq (+ offset 2))
+                      (nth bytes-seq (+ offset 3)) (nth bytes-seq (+ offset 4))) (+ offset 5)]
+          (throw (ex-info "CBOR input truncated at 4-byte int" {:offset offset})))
+        (= info 27)
+        (if (< (+ offset 8) cnt)
+          [major (u64 (nth bytes-seq (+ offset 1)) (nth bytes-seq (+ offset 2))
+                      (nth bytes-seq (+ offset 3)) (nth bytes-seq (+ offset 4))
+                      (nth bytes-seq (+ offset 5)) (nth bytes-seq (+ offset 6))
+                      (nth bytes-seq (+ offset 7)) (nth bytes-seq (+ offset 8))) (+ offset 9)]
+          (throw (ex-info "CBOR input truncated at 8-byte int" {:offset offset})))
+        :else (throw (ex-info (str "Unsupported CBOR additional info: " info) {:info info :offset offset}))))))
 
 (defn decode-item
   "Decodes a single CBOR data item from `bytes-seq` starting at index `offset`.
@@ -177,8 +192,12 @@
     (case major
       0 [arg next-offset]
       1 [(- -1 arg) next-offset]
-      2 [(to-byte-array (subvec bytes-seq next-offset (+ next-offset arg))) (+ next-offset arg)]
-      3 [(utf8-str (subvec bytes-seq next-offset (+ next-offset arg))) (+ next-offset arg)]
+      2 (if (<= (+ next-offset arg) (count bytes-seq))
+          [(to-byte-array (subvec bytes-seq next-offset (+ next-offset arg))) (+ next-offset arg)]
+          (throw (ex-info "CBOR byte string truncated" {:needed arg :remaining (- (count bytes-seq) next-offset)})))
+      3 (if (<= (+ next-offset arg) (count bytes-seq))
+          [(utf8-str (subvec bytes-seq next-offset (+ next-offset arg))) (+ next-offset arg)]
+          (throw (ex-info "CBOR text string truncated" {:needed arg :remaining (- (count bytes-seq) next-offset)})))
       4 (loop [i 0 cur next-offset acc []]
           (if (< i arg)
             (let [[item nxt] (decode-item bytes-seq cur)]
@@ -204,23 +223,35 @@
    Returns `[item next-offset]`."
   ([bytes-or-seq] (decode-first bytes-or-seq 0))
   ([bytes-or-seq offset]
-   (when-let [b-seq (to-byte-seq bytes-or-seq)]
-     (when (< offset (count b-seq))
-       (decode-item b-seq offset)))))
+   (try
+     (when-let [b-seq (to-byte-seq bytes-or-seq)]
+       (when (< offset (count b-seq))
+         (decode-item b-seq offset)))
+     (catch #?(:clj Exception :cljs :default) _
+       nil))))
 
 (defn decode
   "Decodes the first CBOR item from `bytes-or-seq`. Returns the decoded value."
   [bytes-or-seq]
-  (first (decode-first bytes-or-seq 0)))
+  (try
+    (first (decode-first bytes-or-seq 0))
+    (catch #?(:clj Exception :cljs :default) _
+      nil)))
 
 (defn decode-sequence
   "Decodes a sequence of concatenated CBOR data items from `bytes-or-seq` starting at `offset` (default 0)
    until end-of-input. Returns a vector of all decoded items."
   ([bytes-or-seq] (decode-sequence bytes-or-seq 0))
   ([bytes-or-seq offset]
-   (when-let [b-seq (to-byte-seq bytes-or-seq)]
-     (loop [cur offset acc []]
-       (if (< cur (count b-seq))
-         (let [[item nxt] (decode-item b-seq cur)]
-           (recur nxt (conj acc item)))
-         acc)))))
+   (try
+     (when-let [b-seq (to-byte-seq bytes-or-seq)]
+       (loop [cur offset acc []]
+         (if (< cur (count b-seq))
+           (let [res (decode-item b-seq cur)
+                 [item nxt] res]
+             (if (and nxt (> nxt cur))
+               (recur nxt (conj acc item))
+               acc))
+           acc)))
+     (catch #?(:clj Exception :cljs :default) _
+       nil))))

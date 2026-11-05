@@ -9,8 +9,7 @@
             [bitecho.sieve.core :as sieve]
             [clojure.edn :as edn]
             [clojure.string :as str]
-            [datachannel.api :as api]
-            [taoensso.nippy :as nippy])
+            [datachannel.api :as api])
   (:import [java.nio.charset StandardCharsets]
            [java.util UUID]))
 
@@ -242,7 +241,7 @@
                                         (UUID/randomUUID))
                     payload-bytes (.getBytes ^String payload-str StandardCharsets/UTF_8)
                     envelope (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount)
-                    frozen (nippy/freeze envelope)]
+                    frozen (fressian/encode-wire envelope)]
                 (try
                   (api/send! (:node conn) frozen cid)
                   (swap! sent inc)
@@ -328,7 +327,7 @@
                                                                             sender-priv-bytes
                                                                             transfer-opts
                                                                             burn-amount)
-           frozen (nippy/freeze envelope)
+           frozen (fressian/encode-wire envelope)
            _ (println (format "Connecting to %d validator nodes..." (count val-nodes)))
            connections (connect-swarm! val-nodes (count val-nodes) 10000)
            active-conns (filterv :connected? connections)

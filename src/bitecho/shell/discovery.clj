@@ -1,7 +1,8 @@
 (ns bitecho.shell.discovery
   "Bootstrap peer and WebRTC connection descriptor discovery and parsing.
    Supports both canonical EDN (devnet/bootstrap.edn) and text (devnet/bootstrap.txt) formats."
-  (:require [bitecho.shell.identity :as identity]
+  (:require [bitecho.light-node.core :as light-node]
+            [bitecho.shell.identity :as identity]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -215,26 +216,64 @@
     (throw (ex-info "Unsupported descriptor format: expected EDN map or string"
                     {:error :invalid-descriptor :input str-or-map}))))
 
+(def default-devnet-authority-pubkey
+  "Pinned Directory Authority public key for bitecho.org devnet."
+  "302a300506032b657003210056b505baa32c3b99663d163d6ee00b5018a26e182405f5ec4d5062f12f633ce9")
+
 (defn load-bootstrap-descriptor!
   "Loads and parses a bootstrap descriptor from a file path or HTTP/HTTPS URL.
-   Defaults to 'https://bitecho.org/devnet/bootstrap.txt', falling back to local file when offline."
-  ([] (load-bootstrap-descriptor! "https://bitecho.org/devnet/bootstrap.txt"))
-  ([source-or-url]
-   (if (map? source-or-url)
-     source-or-url
-     (let [content (if (and (string? source-or-url) (re-matches #"^https?://.*" (or source-or-url "")))
-                     (try
-                       (slurp (.toURL (URI/create source-or-url)))
-                       (catch Exception e
-                         (let [fallback-file (io/file "devnet/bootstrap.txt")]
-                           (if (.exists fallback-file)
-                             (slurp fallback-file)
-                             (throw (ex-info (str "Failed to load remote bootstrap descriptor: " (ex-message e))
-                                             {:error :descriptor-load-failed :url source-or-url}
-                                             e))))))
-                     (let [f (io/file source-or-url)]
-                       (if (.exists f)
-                         (slurp f)
-                         (throw (ex-info (str "Bootstrap descriptor file not found: " source-or-url)
-                                         {:error :descriptor-file-not-found :file source-or-url})))))]
-       (parse-bootstrap-descriptor content)))))
+   Defaults to 'https://bitecho.org/devnet/bootstrap.txt', falling back to local file when offline.
+   Accepts optional opts map: {:expected-authority-pubkey <hex> :verify-signature? <bool> :current-epoch <int>}."
+  ([] (load-bootstrap-descriptor! "https://bitecho.org/devnet/bootstrap.txt" nil))
+  ([source-or-url] (load-bootstrap-descriptor! source-or-url nil))
+  ([source-or-url opts]
+   (let [remote-url? (and (string? source-or-url) (boolean (re-matches #"^https?://.*" source-or-url)))
+         desc (if (map? source-or-url)
+                source-or-url
+                (let [content (if remote-url?
+                                (try
+                                  (slurp (.toURL (URI/create source-or-url)))
+                                  (catch Exception e
+                                    (let [fallback-file (io/file "devnet/bootstrap.txt")]
+                                      (if (.exists fallback-file)
+                                        (slurp fallback-file)
+                                        (throw (ex-info (str "Failed to load remote bootstrap descriptor: " (ex-message e))
+                                                        {:error :descriptor-load-failed :url source-or-url}
+                                                        e))))))
+                                (let [f (io/file source-or-url)]
+                                  (if (.exists f)
+                                    (slurp f)
+                                    (throw (ex-info (str "Bootstrap descriptor file not found: " source-or-url)
+                                                    {:error :descriptor-file-not-found :file source-or-url})))))]
+                  (parse-bootstrap-descriptor content)))
+         expected-pk (:expected-authority-pubkey opts)
+         verify-sig? (:verify-signature? opts)
+         current-epoch (:current-epoch opts)
+         must-verify? (or (true? verify-sig?)
+                          (some? expected-pk)
+                          (and (not (false? verify-sig?))
+                               (or remote-url? (some? (:signature desc)))))]
+     (when must-verify?
+       (if (and (true? verify-sig?) (str/blank? (str expected-pk)))
+         (throw (ex-info "Missing required expected-authority-pubkey for bootstrap verification"
+                         {:type :UntrustedBootstrapDescriptor :error :missing-expected-authority-pubkey :descriptor desc}))
+         (let [auth-pk (or expected-pk default-devnet-authority-pubkey)
+               v-res (light-node/verify-bootstrap-descriptor auth-pk desc current-epoch)]
+           (when-not (:ok? v-res)
+             (throw (ex-info (str "Bootstrap descriptor verification failed: " (:error v-res))
+                             {:type :UntrustedBootstrapDescriptor :error (:error v-res) :descriptor desc}))))))
+     desc)))
+
+(defn load-verified-bootstrap-descriptor!
+  "Unconditionally verifies expected-authority-pubkey signature on bootstrap descriptor.
+   Fails closed throwing ex-info if descriptor is missing, unsigned, tampered, or expired."
+  ([source-or-url expected-authority-pubkey]
+   (load-verified-bootstrap-descriptor! source-or-url expected-authority-pubkey nil))
+  ([source-or-url expected-authority-pubkey current-epoch]
+   (when (str/blank? (str expected-authority-pubkey))
+     (throw (ex-info "expected-authority-pubkey must not be blank"
+                     {:type :UntrustedBootstrapDescriptor :error :missing-expected-authority-pubkey})))
+   (load-bootstrap-descriptor! source-or-url
+                               {:expected-authority-pubkey expected-authority-pubkey
+                                :verify-signature? true
+                                :current-epoch current-epoch})))

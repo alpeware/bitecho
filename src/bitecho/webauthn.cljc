@@ -50,6 +50,23 @@
   #?(:clj  (byte-array (map byte (map #(if (> % 127) (- % 256) %) seq-of-ints)))
      :cljs (js/Uint8Array. (clj->js seq-of-ints))))
 
+(defn ->byte-array
+  "Converts input (byte[], Uint8Array, sequential of ints, or hex string) to platform byte array representation."
+  [x]
+  (cond
+    (string? x)
+    (let [cleaned (str/trim x)]
+      (if (and (even? (count cleaned)) (re-matches #"^[0-9a-fA-F]+$" cleaned))
+        (to-byte-array (mapv #(let [sub (subs cleaned (* 2 %) (+ (* 2 %) 2))]
+                                #?(:clj (Integer/parseInt sub 16) :cljs (js/parseInt sub 16)))
+                             (range (/ (count cleaned) 2))))
+        (to-byte-array (mapv #(bit-and (int %) 0xff) #?(:clj (.getBytes cleaned "UTF-8")
+                                                        :cljs (js/Array.from (.encode (js/TextEncoder.) cleaned)))))))
+    #?(:clj (bytes? x) :cljs (instance? js/Uint8Array x)) x
+    :else
+    (when-let [bs (to-byte-seq x)]
+      (to-byte-array bs))))
+
 (defn- bytes->hex-str [ba]
   #?(:clj
      (let [sb (StringBuilder.)]
@@ -83,68 +100,73 @@
    and if attestedCredentialData is present: AAGUID, credentialId, decoded COSE key,
    and optional decoded CBOR extensions."
   [data-bytes]
-  (when-let [bs (to-byte-seq data-bytes)]
-    (when (>= (count bs) 37)
-      (let [rp-id-hash (subvec bs 0 32)
-            flags-byte (nth bs 32)
-            up? (pos? (bit-and flags-byte 0x01))
-            uv? (pos? (bit-and flags-byte 0x04))
-            be? (pos? (bit-and flags-byte 0x08))
-            bs? (pos? (bit-and flags-byte 0x10))
-            at? (pos? (bit-and flags-byte 0x40))
-            ed? (pos? (bit-and flags-byte 0x80))
-            sign-count (u32 (nth bs 33) (nth bs 34) (nth bs 35) (nth bs 36))
-            flags {:up? up? :uv? uv? :be? be? :bs? bs? :at? at? :ed? ed?}
-            base-result {:rp-id-hash-bytes (to-byte-array rp-id-hash)
-                         :rp-id-hash-hex (bytes->hex-str rp-id-hash)
-                         :flags flags
-                         :sign-count sign-count}]
-        (if-not at?
-          base-result
-          (let [aaguid-bytes (subvec bs 37 53)
-                aaguid-hex (bytes->hex-str aaguid-bytes)
-                aaguid-uuid (fido/normalize-aaguid aaguid-hex)
-                cred-id-len (u16 (nth bs 53) (nth bs 54))
-                cred-id-end (+ 55 cred-id-len)
-                cred-id (subvec bs 55 cred-id-end)
-                remaining-offset cred-id-end
-                [cose-key after-cose-offset] (if (< remaining-offset (count bs))
-                                               (cbor/decode-first bs remaining-offset)
-                                               [nil remaining-offset])
-                [extensions _] (if (and ed? (< after-cose-offset (count bs)))
-                                 (cbor/decode-first bs after-cose-offset)
-                                 [nil after-cose-offset])
-                strength-hint (fido/evaluate-authenticator-strength {:aaguid aaguid-uuid
-                                                                     :up? up? :uv? uv?
-                                                                     :be? be? :bs? bs?})]
-            (assoc base-result
-                   :aaguid aaguid-uuid
-                   :aaguid-bytes (to-byte-array aaguid-bytes)
-                   :cred-id-len cred-id-len
-                   :credential-id (to-byte-array cred-id)
-                   :credential-id-hex (bytes->hex-str cred-id)
-                   :cose-key cose-key
-                   :extensions extensions
-                   :strength-hint strength-hint)))))))
+  (try
+    (when-let [bs (to-byte-seq data-bytes)]
+      (when (>= (count bs) 37)
+        (let [rp-id-hash (subvec bs 0 32)
+              flags-byte (nth bs 32)
+              up? (pos? (bit-and flags-byte 0x01))
+              uv? (pos? (bit-and flags-byte 0x04))
+              be? (pos? (bit-and flags-byte 0x08))
+              bs? (pos? (bit-and flags-byte 0x10))
+              at? (pos? (bit-and flags-byte 0x40))
+              ed? (pos? (bit-and flags-byte 0x80))
+              sign-count (u32 (nth bs 33) (nth bs 34) (nth bs 35) (nth bs 36))
+              flags {:up? up? :uv? uv? :be? be? :bs? bs? :at? at? :ed? ed?}
+              base-result {:rp-id-hash-bytes (to-byte-array rp-id-hash)
+                           :rp-id-hash-hex (bytes->hex-str rp-id-hash)
+                           :flags flags
+                           :sign-count sign-count}]
+          (if-not at?
+            base-result
+            (let [aaguid-bytes (subvec bs 37 53)
+                  aaguid-hex (bytes->hex-str aaguid-bytes)
+                  aaguid-uuid (fido/normalize-aaguid aaguid-hex)
+                  cred-id-len (u16 (nth bs 53) (nth bs 54))
+                  cred-id-end (+ 55 cred-id-len)]
+              (when (<= cred-id-end (count bs))
+                (let [cred-id (subvec bs 55 cred-id-end)
+                      remaining-offset cred-id-end
+                      [cose-key after-cose-offset] (if (< remaining-offset (count bs))
+                                                     (cbor/decode-first bs remaining-offset)
+                                                     [nil remaining-offset])
+                      [extensions _] (if (and ed? (< after-cose-offset (count bs)))
+                                       (cbor/decode-first bs after-cose-offset)
+                                       [nil after-cose-offset])
+                      strength-hint (fido/evaluate-authenticator-strength {:aaguid aaguid-uuid
+                                                                           :up? up? :uv? uv?
+                                                                           :be? be? :bs? bs?})]
+                  (assoc base-result
+                         :aaguid aaguid-uuid
+                         :aaguid-bytes (to-byte-array aaguid-bytes)
+                         :cred-id-len cred-id-len
+                         :credential-id (to-byte-array cred-id)
+                         :credential-id-hex (bytes->hex-str cred-id)
+                         :cose-key cose-key
+                         :extensions extensions
+                         :strength-hint strength-hint))))))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
 
 (defn parse-attestation-object
   "Decodes a WebAuthn attestationObject CBOR structure (fmt, attStmt, authData)
    and parses its authenticatorData."
   [cbor-bytes]
-  (when-let [decoded (cbor/decode cbor-bytes)]
-    (when (map? decoded)
-      (let [fmt (get decoded "fmt" (get decoded :fmt))
-            att-stmt (get decoded "attStmt" (get decoded :attStmt))
-            auth-data-raw (get decoded "authData" (get decoded :authData))
-            parsed-auth (parse-auth-data auth-data-raw)]
-        {:fmt fmt
-         :att-stmt att-stmt
-         :auth-data parsed-auth
-         :aaguid (:aaguid parsed-auth)
-         :credential-id (:credential-id parsed-auth)
-         :cose-key (:cose-key parsed-auth)
-         :strength-hint (:strength-hint parsed-auth)
-         :yubico-enrollment :parked}))))
+  (try
+    (when-let [decoded (cbor/decode cbor-bytes)]
+      (when (map? decoded)
+        (let [fmt (get decoded "fmt" (get decoded :fmt))
+              att-stmt (get decoded "attStmt" (get decoded :attStmt))
+              auth-data-raw (get decoded "authData" (get decoded :authData))
+              parsed-auth (parse-auth-data auth-data-raw)]
+          {:fmt fmt
+           :att-stmt att-stmt
+           :auth-data parsed-auth
+           :aaguid (:aaguid parsed-auth)
+           :credential-id (:credential-id parsed-auth)
+           :cose-key (:cose-key parsed-auth)
+           :strength-hint (:strength-hint parsed-auth)
+           :yubico-enrollment :parked})))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Discoverable Credential & PRF Seed Management (Step 11B)
@@ -200,47 +222,51 @@
                  :trust-boundary trust-boundary-disclosure}})))
 
 (defn recover-seed-from-assertion
-  "Recovers the 32-byte seed from WebAuthn assertion response (PRF extension output or userHandle)
+  "Recovers the 32-byte seed from WebAuthn assertion response (userHandle as canonical default, with PRF extension fallback)
    and deterministically derives the Ed25519 identity keypair."
   [assertion-or-response]
-  (let [prf-out (or (when (map? assertion-or-response)
-                      (or (:prf-output assertion-or-response)
-                          (get-in assertion-or-response [:extensions :prf :results :first])
-                          (get-in assertion-or-response [:client-extension-results :prf :results :first])))
-                    #?(:cljs (when (and (some? assertion-or-response)
-                                        (fn? (.-getClientExtensionResults assertion-or-response)))
-                               (some-> (.getClientExtensionResults assertion-or-response)
-                                       (.-prf)
-                                       (.-results)
-                                       (.-first)))))
-        user-handle (or (when (map? assertion-or-response)
-                          (or (get assertion-or-response :user-handle)
-                              (get assertion-or-response "userHandle")
-                              (get-in assertion-or-response [:response :user-handle])
-                              (:user-id assertion-or-response)))
-                        #?(:cljs (when (and (some? assertion-or-response)
-                                            (some? (.-response assertion-or-response)))
-                                   (.-userHandle (.-response assertion-or-response)))))
-        raw-seed (or prf-out user-handle)
-        recovery-source (if (some? prf-out) :prf :user-handle)]
-    (when-let [bs (to-byte-seq raw-seed)]
-      (let [seed-32 (cond
-                      (= (count bs) 32) bs
-                      (> (count bs) 32) (subvec bs 0 32)
-                      :else (to-byte-seq (crypto/sha256 (to-byte-array bs))))
-            seed-arr (to-byte-array seed-32)
-            kp (crypto/pure-ed25519-keypair seed-arr)
-            pub-hex (bytes->hex-str (to-byte-seq (:public kp)))
-            bech-addr (bech32m/pubkey->bech32m pub-hex "ech")]
-        {:seed seed-arr
-         :recovery-source recovery-source
-         :keypair kp
-         :public-key (:public kp)
-         :private-key (:private kp)
-         :public-hex pub-hex
-         :address bech-addr
-         :origin-scoping origin-scoping-disclosure
-         :trust-boundary trust-boundary-disclosure}))))
+  (try
+    (let [user-handle (or (when (map? assertion-or-response)
+                            (or (get assertion-or-response :user-handle)
+                                (get assertion-or-response "userHandle")
+                                (get-in assertion-or-response [:response :user-handle])
+                                (get-in assertion-or-response [:response "userHandle"])
+                                (:user-id assertion-or-response)
+                                (get assertion-or-response "user_id")))
+                          #?(:cljs (when (and (some? assertion-or-response)
+                                              (some? (.-response assertion-or-response)))
+                                     (.-userHandle (.-response assertion-or-response)))))
+          prf-out (or (when (map? assertion-or-response)
+                        (or (:prf-output assertion-or-response)
+                            (get-in assertion-or-response [:extensions :prf :results :first])
+                            (get-in assertion-or-response [:client-extension-results :prf :results :first])))
+                      #?(:cljs (when (and (some? assertion-or-response)
+                                          (fn? (.-getClientExtensionResults assertion-or-response)))
+                                 (some-> (.getClientExtensionResults assertion-or-response)
+                                         (.-prf)
+                                         (.-results)
+                                         (.-first)))))
+          raw-seed (or user-handle prf-out)
+          recovery-source (if (some? user-handle) :user-handle :prf)]
+      (when-let [bs (to-byte-seq raw-seed)]
+        (let [seed-32 (cond
+                        (= (count bs) 32) bs
+                        (> (count bs) 32) (subvec bs 0 32)
+                        :else (to-byte-seq (crypto/sha256 (to-byte-array bs))))
+              seed-arr (to-byte-array seed-32)
+              kp (crypto/pure-ed25519-keypair seed-arr)
+              pub-hex (bytes->hex-str (to-byte-seq (:public kp)))
+              bech-addr (bech32m/pubkey->bech32m pub-hex "ech")]
+          {:seed seed-arr
+           :recovery-source recovery-source
+           :keypair kp
+           :public-key (:public kp)
+           :private-key (:private kp)
+           :public-hex pub-hex
+           :address bech-addr
+           :origin-scoping origin-scoping-disclosure
+           :trust-boundary trust-boundary-disclosure})))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Non-Extractable WebCrypto Key Specification & Browser Interop (Step 11B.1)
@@ -374,17 +400,26 @@
     (light-core/create-dac pkcs8-priv params)))
 
 (defn register-backup-key
-  "Registers a second hardware backup key configuration."
+  "Registers a second hardware backup key configuration.
+   Accepts optional :backup-seed in backup-opts and includes derived key material in return map."
   [primary-state backup-opts]
-  (let [backup-seed (or (:backup-seed backup-opts) (crypto/random-bytes 32))
-        backup-kp (crypto/pure-ed25519-keypair backup-seed)
-        backup-pub-hex (bytes->hex-str (to-byte-seq (:public backup-kp)))]
-    (assoc primary-state
-           :backup-key {:public-hex backup-pub-hex
-                        :address (bech32m/pubkey->bech32m backup-pub-hex "ech")
-                        :registered-at (or (:current-epoch primary-state) 0)
-                        :description (or (:description backup-opts) "Secondary Hardware YubiKey Backup")
-                        :yubico-enrollment :parked})))
+  (let [backup-seed (or (:backup-seed backup-opts)
+                        (get backup-opts "backup_seed")
+                        (get backup-opts "backup-seed")
+                        (crypto/random-bytes 32))
+        backup-seed-arr (if #?(:clj (bytes? backup-seed) :cljs (instance? js/Uint8Array backup-seed))
+                          backup-seed
+                          (to-byte-array (to-byte-seq backup-seed)))
+        backup-kp (crypto/pure-ed25519-keypair backup-seed-arr)
+        backup-pub-hex (bytes->hex-str (to-byte-seq (:public backup-kp)))
+        backup-info {:public-hex backup-pub-hex
+                     :public-key (:public backup-kp)
+                     :backup-seed backup-seed-arr
+                     :address (bech32m/pubkey->bech32m backup-pub-hex "ech")
+                     :registered-at (or (:current-epoch primary-state) 0)
+                     :description (or (:description backup-opts) "Secondary Hardware YubiKey Backup")
+                     :yubico-enrollment :parked}]
+    (assoc primary-state :backup-key backup-info)))
 
 (defn recover-from-backup-key
   "Recovers identity state using a verified backup key seed."

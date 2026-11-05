@@ -686,7 +686,10 @@ return { sha512, publicKey, sign, verify };"))))
   (seal-and-emit [this effect]
     "Executes an egress encryption/sealing effect at the shell boundary."))
 
-(defn- canonicalize-agent-event
+(defn canonicalize-agent-event
+  "Recursively converts an agent event data structure into a content-deterministic
+   canonical form for Fressian/pr-str signing (converting byte arrays to [:bytes hex]
+   and sorting maps and sets deterministically)."
   [x]
   (cond
     (fressian/bytes? x)

@@ -140,12 +140,12 @@
                     effective-dac (assoc :dac effective-dac))]
          (assoc base :crypto-effect {:effect :sign-and-emit
                                      :sender pubkey
-                                     :signing-payload [pubkey clean]
+                                     :signing-payload [(or pubkey "") (crypto/canonicalize-agent-event clean)]
                                      :signature-field :signature
                                      :envelope base}))
        #?(:clj (mesh/wrap-agent-event event pubkey privkey dac)
           :cljs (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
-                      sb (crypto/canonical-signing-bytes [pubkey clean])
+                      sb (crypto/canonical-signing-bytes [(or pubkey "") (crypto/canonicalize-agent-event clean)])
                       sig (crypto/sign privkey sb)
                       sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
                       effective-dac (or dac (:dac event))]
@@ -1333,13 +1333,19 @@
         dac (or (:dac offer-map) (get offer-map "dac"))
         dac-id (or (:dac-id offer-map) (get offer-map "dac_id") (get offer-map "dac-id")
                    (when dac (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id") (:dac_id dac))))
+        subnet (or (:subnet-id offer-map) (get offer-map "subnet_id") (get offer-map "subnet-id"))
+        subnet-str (when (and (string? subnet) (not (str/blank? subnet)) (not= subnet "global"))
+                     subnet)
         base-input (str sid "-" caller "-" callee "-" eph-pub "-" epoch "-" price-or-burn "-" hn-str)
         with-suites (if (seq suites-str)
                       (str base-input "|" suites-str)
                       base-input)
-        hash-input (if (and (string? dac-id) (not (str/blank? dac-id)))
-                     (str with-suites "|" dac-id)
-                     with-suites)]
+        with-dac (if (and (string? dac-id) (not (str/blank? dac-id)))
+                   (str with-suites "|" dac-id)
+                   with-suites)
+        hash-input (if subnet-str
+                     (str with-dac "|" subnet-str)
+                     with-dac)]
     (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes hash-input)))))
 
 (defn canonical-rendezvous-header-str
@@ -1489,6 +1495,7 @@
                                d))
                 dac-id (when active-dac (or (:dac-id active-dac) (get active-dac "dac_id")))
                 suites (or (:crypto-suites state) sealed/default-crypto-suites)
+                sub-id (str (or (:subnet-id state) "global"))
                 offer-hash (compute-offer-hash {:session-id session-id
                                                 :caller caller
                                                 :callee callee
@@ -1498,10 +1505,10 @@
                                                 :burn burn-amt
                                                 :home-node home-node
                                                 :crypto-suites suites
-                                                :dac active-dac})
+                                                :dac active-dac
+                                                :subnet-id sub-id})
                 header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id suites)
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes header-str)))
-                sub-id (str (or (:subnet-id state) "global"))
                 wire-payload (cond-> {:protocol-version current-wire-version
                                       :wire-format current-wire-format
                                       :subnet-id sub-id
@@ -1684,6 +1691,7 @@
                                                         :required-scope "offer"}))
                                d))
                 suites (or (:crypto-suites state) sealed/default-crypto-suites)
+                sub-id (str (or (:subnet-id state) "global"))
                 offer-hash (compute-offer-hash {:session-id session-id
                                                 :caller caller
                                                 :callee callee
@@ -1692,9 +1700,9 @@
                                                 :price price
                                                 :home-node home-node
                                                 :crypto-suites suites
-                                                :dac active-dac})
+                                                :dac active-dac
+                                                :subnet-id sub-id})
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
-                sub-id (str (or (:subnet-id state) "global"))
                 offer-payload (cond-> {:protocol-version current-wire-version
                                        :wire-format current-wire-format
                                        :subnet-id sub-id
@@ -2940,9 +2948,13 @@
                         (verify-dac wire-dac {:expected-agent-pubkey (:caller msg)
                                               :current-epoch ref-epoch
                                               :revoked-dac-ids (:revoked-dacs state)
-                                              :required-scope "offer"}))]
+                                              :required-scope "offer"}))
+            economy-enabled? (get state :economy-enabled? true)
+            burn-floor (long (or (:burn-floor state) 100))
+            actual-burn (long (or (:burn msg) 0))]
         (if (or (not valid-sig?)
                 (not valid-suite?)
+                (and economy-enabled? (< actual-burn burn-floor))
                 (and wire-dac (not (:ok? dac-check))))
           {:state state :net-envelopes [] :stdout-events []}
           (let [sid (:session-id msg)
@@ -3517,7 +3529,8 @@
                                                          :burn (:burn header)
                                                          :home-node (:home-node header)
                                                          :crypto-suites (:crypto-suites header)
-                                                         :dac (:dac header)})
+                                                         :dac (:dac header)
+                                                         :subnet-id (or (:subnet-id header) (:subnet-id msg) (:subnet-id state) "global")})
                 commitment-valid? (and (= sid expected-sid)
                                        (= offer-hash expected-offer-hash))]
             (if-not commitment-valid?
@@ -3650,27 +3663,34 @@
                  :response {"ok" false "error" err-msg "wire_format" unsupported-fmt}
                  :net-envelopes []
                  :stdout-events [diag-event]})
-              (let [event-subnet (str (or (when (map? raw-payload-or-event)
-                                            (or (:subnet-id raw-payload-or-event)
-                                                (get raw-payload-or-event "subnet-id")
-                                                (get raw-payload-or-event "subnet_id")))
-                                          (:subnet-id msg)
-                                          (get msg "subnet-id")
-                                          (get msg "subnet_id")
-                                          "global"))
-                    state-subnet (str (or (:subnet-id state) "global"))]
-                (if (and (not= event-subnet "*")
-                         (not= state-subnet "*")
-                         (not= event-subnet state-subnet))
-                  (let [new-state (-> state
+              (let [expected-subnet (str (or (:subnet-id state) "global"))
+                    outer-subnet (when-let [s (when (map? raw-payload-or-event)
+                                                (or (:subnet-id raw-payload-or-event)
+                                                    (get raw-payload-or-event "subnet-id")
+                                                    (get raw-payload-or-event "subnet_id")))]
+                                   (str s))
+                    inner-subnet (when (map? msg)
+                                   (when-let [s (or (:subnet-id msg)
+                                                    (get msg "subnet-id")
+                                                    (get msg "subnet_id"))]
+                                     (str s)))
+                    subnet-mismatch? (or (and outer-subnet (not= outer-subnet "*") (not= expected-subnet "*") (not= outer-subnet expected-subnet))
+                                         (and inner-subnet (not= inner-subnet "*") (not= expected-subnet "*") (not= inner-subnet expected-subnet))
+                                         (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*") (not= outer-subnet inner-subnet)))]
+                (if subnet-mismatch?
+                  (let [eff-subnet (or outer-subnet inner-subnet "unknown")
+                        new-state (-> state
+                                      (update :subnet-mismatch-dropped (fnil inc 0))
                                       (update-in [:diagnostics :subnet-mismatch-dropped] (fnil inc 0))
                                       (update-in [:wire-version-diagnostics :subnet-mismatch-dropped] (fnil inc 0)))
                         diag-event {"event" "subnet-mismatch-dropped"
                                     "error" "subnet-mismatch"
-                                    "event_subnet" event-subnet
-                                    "node_subnet" state-subnet}]
+                                    "outer_subnet" outer-subnet
+                                    "inner_subnet" inner-subnet
+                                    "event_subnet" eff-subnet
+                                    "node_subnet" expected-subnet}]
                     {:state new-state
-                     :response {"ok" false "error" "subnet-mismatch" "subnet" event-subnet}
+                     :response {"ok" false "error" "subnet-mismatch" "subnet" eff-subnet}
                      :net-envelopes []
                      :stdout-events [diag-event]})
                   (let [msg-type (or (:bitecho/type msg) (:type msg))
@@ -3766,7 +3786,17 @@
          :net-envelopes []
          :stdout-events [diag-event]})
       (let [res (handle-wire-payload instance envelope privkey-bytes)
-            new-mux (assoc-in mux [:subnets sub-id] (:state res))]
+            old-mismatch (or (get-in instance [:diagnostics :subnet-mismatch-dropped])
+                             (:subnet-mismatch-dropped instance)
+                             0)
+            new-mismatch (or (get-in (:state res) [:diagnostics :subnet-mismatch-dropped])
+                             (:subnet-mismatch-dropped (:state res))
+                             0)
+            delta (max 0 (- (long new-mismatch) (long old-mismatch)))
+            new-mux (-> mux
+                        (assoc-in [:subnets sub-id] (:state res))
+                        (cond-> (pos? delta)
+                          (update-in [:diagnostics :subnet-mismatch-dropped] (fnil + 0) delta)))]
         {:mux new-mux
          :net-envelopes (or (:net-envelopes res) [])
          :stdout-events (or (:stdout-events res) [])}))))
@@ -3843,41 +3873,52 @@
     (assoc descriptor :signature sig-hex)))
 
 (defn verify-bootstrap-descriptor
-  "Cryptographically verifies an authority-signed bootstrap descriptor against trusted-authority-pubkey.
+  "Cryptographically verifies an authority-signed bootstrap descriptor against expected-authority-pubkey.
+   Requires expected-authority-pubkey to be a non-blank valid pubkey hex string (fails closed if missing).
    Validates epoch expiration against current-epoch when provided.
    Returns {:ok? boolean :valid? boolean :descriptor desc :error err}."
-  [trusted-authority-pubkey descriptor current-epoch]
-  (try
-    (if-not (map? descriptor)
-      {:ok? false :valid? false :error "invalid-descriptor-map"}
-      (let [auth-pub (or (:authority-pubkey descriptor) trusted-authority-pubkey)
-            sig (:signature descriptor)]
-        (cond
-          (str/blank? (str sig))
-          {:ok? false :valid? false :error "missing-signature"}
+  [expected-authority-pubkey descriptor current-epoch]
+  (let [[expected-pk desc epoch]
+        (if (and (map? expected-authority-pubkey) (string? descriptor))
+          [descriptor expected-authority-pubkey current-epoch]
+          [expected-authority-pubkey descriptor current-epoch])]
+    (try
+      (cond
+        (or (nil? expected-pk) (not (string? expected-pk)) (str/blank? (str/trim (str expected-pk))))
+        {:ok? false :valid? false :error :missing-expected-authority-pubkey}
 
-          (and trusted-authority-pubkey
-               (not= (str/lower-case (str auth-pub)) (str/lower-case (str trusted-authority-pubkey))))
-          {:ok? false :valid? false :error "authority-pubkey-mismatch"}
+        (not (map? desc))
+        {:ok? false :valid? false :error "invalid-descriptor-map"}
 
-          (and (some? current-epoch) (integer? current-epoch)
-               (integer? (:expires-epoch descriptor))
-               (> (long current-epoch) (long (:expires-epoch descriptor))))
-          {:ok? false :valid? false :error "descriptor-expired"}
+        :else
+        (let [auth-pub (when-let [p (:authority-pubkey desc)] (str/lower-case (str/trim (str p))))
+              expected-pub (str/lower-case (str/trim (str expected-pk)))
+              sig (:signature desc)]
+          (cond
+            (str/blank? (str sig))
+            {:ok? false :valid? false :error "missing-signature"}
 
-          (and (some? current-epoch) (integer? current-epoch)
-               (integer? (:issued-epoch descriptor))
-               (< (long current-epoch) (long (:issued-epoch descriptor))))
-          {:ok? false :valid? false :error "descriptor-not-yet-valid"}
+            (and (some? auth-pub) (not= auth-pub expected-pub))
+            {:ok? false :valid? false :error :authority-pubkey-mismatch}
 
-          :else
-          (let [payload (canonical-bootstrap-payload descriptor)
-                valid? (crypto/verify-with-fallback auth-pub payload sig)]
-            (if valid?
-              {:ok? true :valid? true :descriptor descriptor}
-              {:ok? false :valid? false :error "invalid-authority-signature"})))))
-    (catch #?(:clj Exception :cljs :default) e
-      {:ok? false :valid? false :error (str "verification-failed: " #?(:clj (.getMessage e) :cljs (.-message e)))})))
+            (and (some? epoch) (integer? epoch)
+                 (integer? (:expires-epoch desc))
+                 (> (long epoch) (long (:expires-epoch desc))))
+            {:ok? false :valid? false :error "descriptor-expired"}
+
+            (and (some? epoch) (integer? epoch)
+                 (integer? (:issued-epoch desc))
+                 (< (long epoch) (long (:issued-epoch desc))))
+            {:ok? false :valid? false :error "descriptor-not-yet-valid"}
+
+            :else
+            (let [payload (canonical-bootstrap-payload desc)
+                  valid? (crypto/verify-with-fallback expected-pub payload sig)]
+              (if valid?
+                {:ok? true :valid? true :descriptor desc}
+                {:ok? false :valid? false :error "invalid-authority-signature"})))))
+      (catch #?(:clj Exception :cljs :default) e
+        {:ok? false :valid? false :error (str "verification-failed: " #?(:clj (.getMessage e) :cljs (.-message e)))}))))
 
 (defn- parse-single-node-txt-block-pure
   "Extracts a validator node map from a text block starting with 'Node: <id>' in pure .cljc."
@@ -3972,21 +4013,24 @@
 
 (defn verify-federated-domain-bootstrap
   "Validates that a domain descriptor (EDN or text) was signed by expected authority pubkey and has not expired."
-  ([domain doh-or-edn-txt current-epoch]
-   (verify-federated-domain-bootstrap domain doh-or-edn-txt current-epoch nil))
+  ([domain _doh-or-edn-txt _current-epoch]
+   {:ok? false :valid? false :error :missing-expected-authority-pubkey :domain domain})
   ([domain doh-or-edn-txt current-epoch expected-authority-pubkey]
-   (let [desc (parse-bootstrap-descriptor-pure doh-or-edn-txt)]
-     (cond
-       (nil? desc)
-       {:ok? false :valid? false :error "malformed-descriptor" :domain domain}
+   (if (or (nil? expected-authority-pubkey)
+           (not (string? expected-authority-pubkey))
+           (str/blank? (str/trim (str expected-authority-pubkey))))
+     {:ok? false :valid? false :error :missing-expected-authority-pubkey :domain domain}
+     (let [desc (parse-bootstrap-descriptor-pure doh-or-edn-txt)]
+       (cond
+         (nil? desc)
+         {:ok? false :valid? false :error "malformed-descriptor" :domain domain}
 
-       (and domain (not= (str (:domain desc)) (str domain)))
-       {:ok? false :valid? false :error "domain-mismatch" :domain domain :descriptor-domain (:domain desc)}
+         (and domain (not= (str (:domain desc)) (str domain)))
+         {:ok? false :valid? false :error "domain-mismatch" :domain domain :descriptor-domain (:domain desc)}
 
-       :else
-       (let [auth-pk (or expected-authority-pubkey (:authority-pubkey desc))
-             res (verify-bootstrap-descriptor auth-pk desc current-epoch)]
-         (assoc res :domain domain))))))
+         :else
+         (let [res (verify-bootstrap-descriptor expected-authority-pubkey desc current-epoch)]
+           (assoc res :domain domain)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Rendezvous Subnet Advertisements

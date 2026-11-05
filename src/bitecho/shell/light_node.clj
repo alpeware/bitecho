@@ -281,28 +281,35 @@
 ;; State Persistence & Identity Loading
 ;; -----------------------------------------------------------------------------
 
+(defonce ^:private light-state-save-lock (Object.))
+
 (defn save-light-state!
   "Persists sanitized light-node state via Nippy with atomic move and 0600 permissions."
   [state-file state]
   (when (and (some? state-file) (not (str/blank? (str state-file))))
-    (let [f (io/file state-file)
-          dir (.getParentFile f)
-          _ (when dir (.mkdirs dir))
-          tmp-file (io/file (str state-file ".tmp"))
-          clean-state (strip-sensitive-keys state)
-          frozen (nippy/freeze clean-state)]
-      (Files/write (.toPath tmp-file) ^bytes frozen (into-array java.nio.file.OpenOption []))
-      (try
-        (Files/setPosixFilePermissions (.toPath tmp-file) (PosixFilePermissions/fromString "rw-------"))
-        (catch UnsupportedOperationException _ nil))
-      (try
-        (Files/move (.toPath tmp-file) (.toPath f)
-                    (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
-                                                          StandardCopyOption/REPLACE_EXISTING]))
-        (catch Exception _
-          (Files/move (.toPath tmp-file) (.toPath f)
-                      (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
-      true)))
+    (locking light-state-save-lock
+      (let [f (io/file state-file)
+            dir (or (.getParentFile f) (io/file "."))
+            _ (.mkdirs dir)
+            tmp-file (java.io.File/createTempFile "light-state-" ".tmp" dir)]
+        (try
+          (let [clean-state (strip-sensitive-keys state)
+                frozen (nippy/freeze clean-state)]
+            (Files/write (.toPath tmp-file) ^bytes frozen (into-array java.nio.file.OpenOption []))
+            (try
+              (Files/setPosixFilePermissions (.toPath tmp-file) (PosixFilePermissions/fromString "rw-------"))
+              (catch UnsupportedOperationException _ nil))
+            (try
+              (Files/move (.toPath tmp-file) (.toPath f)
+                          (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                                                StandardCopyOption/REPLACE_EXISTING]))
+              (catch Exception _
+                (Files/move (.toPath tmp-file) (.toPath f)
+                            (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+            true)
+          (finally
+            (when (.exists tmp-file)
+              (try (.delete tmp-file) (catch Exception _ nil)))))))))
 
 (defn load-light-state!
   "Loads persisted light-node state via Nippy, or nil if file does not exist."
@@ -412,7 +419,7 @@
                    (fn [evt]
                      (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
                            query-env (light-core/build-chain-state-query-envelope pubkey privkey-bytes {:nonce nonce})
-                           frozen (nippy/freeze query-env)]
+                           frozen (fressian/encode-wire query-env)]
                        (try
                          (api/send! client-node frozen cid)
                          (catch Exception _
@@ -1017,7 +1024,7 @@
         (let [send-fn (fn [env]
                         (if-let [cid @channel-id]
                           (try
-                            (let [payload (if (bytes? env) env (nippy/freeze env))]
+                            (let [payload (if (bytes? env) env (fressian/encode-wire env))]
                               (api/send! client-node payload cid)
                               true)
                             (catch Exception _

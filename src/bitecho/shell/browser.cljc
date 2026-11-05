@@ -270,39 +270,43 @@
   ([state cb]
    (let [clean-state (sanitize-state-for-persistence state)
          encoded-bytes (try (fressian/encode-wire clean-state) (catch #?(:clj Exception :cljs :default) _ nil))]
-     #?(:cljs
-        (if (and (exists? js/indexedDB) (some? js/indexedDB))
-          (try
-            (let [req (.open js/indexedDB "bitecho-db" 1)]
-              (set! (.-onupgradeneeded req)
-                    (fn [e]
-                      (let [db (.. e -target -result)]
-                        (when-not (.contains (.-objectStoreNames db) "bitecho-state")
-                          (.createObjectStore db "bitecho-state")))))
-              (set! (.-onsuccess req)
-                    (fn [e]
-                      (let [db (.. e -target -result)
-                            tx (.transaction db (clj->js ["bitecho-state"]) "readwrite")
-                            store (.objectStore tx "bitecho-state")
-                            put-req (.put store encoded-bytes "light-node-state")]
-                        (set! (.-onsuccess put-req)
-                              (fn [_] (when cb (cb nil {:ok? true :bytes-stored (count encoded-bytes)}))))
-                        (set! (.-onerror put-req)
-                              (fn [err] (when cb (cb err nil)))))))
-              (set! (.-onerror req)
-                    (fn [_err]
-                      (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
-                      (when cb (cb nil {:ok? true :in-memory? true})))))
-            (catch :default _err
+     (if (or (nil? encoded-bytes) (zero? (fressian/count-bytes encoded-bytes)))
+       (let [err-res {:ok? false :error :encode-failed}]
+         (when cb (cb err-res nil))
+         err-res)
+       #?(:cljs
+          (if (and (exists? js/indexedDB) (some? js/indexedDB))
+            (try
+              (let [req (.open js/indexedDB "bitecho-db" 1)]
+                (set! (.-onupgradeneeded req)
+                      (fn [e]
+                        (let [db (.. e -target -result)]
+                          (when-not (.contains (.-objectStoreNames db) "bitecho-state")
+                            (.createObjectStore db "bitecho-state")))))
+                (set! (.-onsuccess req)
+                      (fn [e]
+                        (let [db (.. e -target -result)
+                              tx (.transaction db (clj->js ["bitecho-state"]) "readwrite")
+                              store (.objectStore tx "bitecho-state")
+                              put-req (.put store encoded-bytes "light-node-state")]
+                          (set! (.-onsuccess put-req)
+                                (fn [_] (when cb (cb nil {:ok? true :bytes-stored (fressian/count-bytes encoded-bytes)}))))
+                          (set! (.-onerror put-req)
+                                (fn [err] (when cb (cb err nil)))))))
+                (set! (.-onerror req)
+                      (fn [_err]
+                        (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
+                        (when cb (cb nil {:ok? true :in-memory? true})))))
+              (catch :default _err
+                (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
+                (when cb (cb nil {:ok? true :in-memory? true}))))
+            (do
               (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
               (when cb (cb nil {:ok? true :in-memory? true}))))
+          :clj
           (do
             (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
-            (when cb (cb nil {:ok? true :in-memory? true}))))
-        :clj
-        (do
-          (swap! *in-memory-idb-store* assoc "light-node-state" encoded-bytes)
-          (when cb (cb nil {:ok? true :in-memory? true})))))))
+            (when cb (cb nil {:ok? true :in-memory? true}))))))))
 
 (defn load-persisted-state
   "Loads persisted state from IndexedDB or in-memory fallback, invoking cb (cb [err state])."
@@ -415,6 +419,68 @@
         (effect-handler-fn eff)))
     @effects-box))
 
+(defn install-visibility-listener!
+  "Installs a document 'visibilitychange' listener that dispatches :visibility-change
+   events into conn-atom via transition-conn (Rule 4). Returns a cleanup fn."
+  ([conn-atom] (install-visibility-listener! conn-atom nil))
+  ([_conn-atom _on-change-fn]
+   #?(:cljs
+      (if (and (exists? js/document) (some? (.-addEventListener js/document)))
+        (let [handler (fn [_]
+                        (let [vis-state (if (= (.-visibilityState js/document) "hidden") "hidden" "visible")
+                              effects (dispatch-conn-event! _conn-atom
+                                                            {:type :visibility-change :state vis-state}
+                                                            _on-change-fn)]
+                          (when _on-change-fn
+                            (_on-change-fn vis-state effects))))]
+          (.addEventListener js/document "visibilitychange" handler)
+          (fn [] (.removeEventListener js/document "visibilitychange" handler)))
+        (fn [] nil))
+      :clj (fn [] nil))))
+
+(defn format-validator-sdp-answer
+  "Generates passive WebRTC SDP answer (ice-lite, setup:passive) for connecting to a Bitecho validator."
+  [node-cfg]
+  (let [ip (or (:ip node-cfg) "127.0.0.1")
+        port (or (:agent-port node-cfg) (:port node-cfg) 9001)
+        ufrag (or (:ice-ufrag node-cfg) "ufrag")
+        pwd (or (:ice-pwd node-cfg) "pwd")
+        fp (or (:fingerprint node-cfg) "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00")]
+    (str "v=0\r\n"
+         "o=- 123456789 2 IN IP4 " ip "\r\n"
+         "s=-\r\n"
+         "t=0 0\r\n"
+         "a=group:BUNDLE 0\r\n"
+         "m=application " port " UDP/DTLS/SCTP webrtc-datachannel\r\n"
+         "c=IN IP4 " ip "\r\n"
+         "a=setup:passive\r\n"
+         "a=mid:0\r\n"
+         "a=max-message-size:100000\r\n"
+         "a=sctp-port:5000\r\n"
+         "a=fingerprint:sha-256 " fp "\r\n"
+         "a=ice-ufrag:" ufrag "\r\n"
+         "a=ice-pwd:" pwd "\r\n"
+         "a=ice-lite\r\n"
+         "a=rtcp-mux\r\n"
+         "a=candidate:1 1 UDP 2130706431 " ip " " port " typ host\r\n")))
+
+(defn send-webrtc-envelope!
+  "Sends an envelope over the active WebRTC DataChannel via Rule 4 :send transition."
+  [conn-atom env]
+  (let [[new-conn effects] (transition-conn @conn-atom {:type :send :envelope env})]
+    (reset! conn-atom new-conn)
+    #?(:cljs
+       (let [dc (:channel new-conn)
+             wire-bytes (fressian/encode-wire env)]
+         (if (and dc (= (.-readyState dc) "open"))
+           (try
+             (.send dc wire-bytes)
+             {:ok? true :effects effects}
+             (catch :default err
+               {:ok? false :error (str err) :effects effects}))
+           {:ok? false :error "channel-not-open" :effects effects}))
+       :clj {:ok? false :error "not-in-browser" :effects effects})))
+
 (defn connect-webrtc!
   "Establishes a generation-tagged RTCPeerConnection + RTCDataChannel in the browser
    (matching clj-datachannel/dev/example/index.html SDP offer/answer flow + STUN/ICE).
@@ -426,7 +492,7 @@
                                            nil)
         gen (:generation (first dial-effects))]
     #?(:cljs
-       (let [{:keys [answer-sdp ice-servers channel-label on-deliver-message]} opts]
+       (let [{:keys [answer-sdp ice-servers channel-label on-deliver-message on-open]} opts]
          (if-not (webrtc-available?)
            (do
              (dispatch-conn-event! conn-atom
@@ -436,13 +502,14 @@
            (try
              (let [rtc-cfg (clj->js {:iceServers (or ice-servers default-ice-servers)})
                    pc (js/RTCPeerConnection. rtc-cfg)
-                   dc (.createDataChannel pc (or channel-label "bitecho-data"))]
+                   dc (.createDataChannel pc (or channel-label "bitecho"))]
                (set! (.-binaryType dc) "arraybuffer")
                (set! (.-onopen dc)
-                     (fn [_]
+                     (fn [ev]
                        (dispatch-conn-event! conn-atom
                                              {:type :open :generation gen :peer-id peer-id :channel dc :transport pc}
-                                             nil)))
+                                             nil)
+                       (when on-open (on-open {:type :open :generation gen :channel dc :transport pc :event ev}))))
                (set! (.-onmessage dc)
                      (fn [ev]
                        (let [raw (.-data ev)

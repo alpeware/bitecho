@@ -11,6 +11,8 @@
   "The default filename used for saving and loading the state snapshot."
   "snapshot.bin")
 
+(defonce ^:private snapshot-save-lock (Object.))
+
 (defn strip-unserializable-state
   "Transforms the pure state map into a serializable format.
    Strips raw java.util.Random instances, clojure.core.async channels,
@@ -48,23 +50,33 @@
    Sets 0600 (rw-------) POSIX file permissions.
    Returns true if successful, or throws an exception on failure."
   [filepath state]
-  (let [safe-state (strip-unserializable-state state)
-        temp-filepath (str filepath ".tmp")
-        file (io/file filepath)
-        temp-file (io/file temp-filepath)]
-    (when-let [parent (.getParentFile file)]
-      (.mkdirs parent))
-    (nippy/freeze-to-file temp-filepath safe-state)
-    (try
-      (Files/setPosixFilePermissions (.toPath temp-file) (PosixFilePermissions/fromString "rw-------"))
-      (catch UnsupportedOperationException _ nil))
-    ;; Atomic rename using java.nio.file.Files/move
-    (Files/move (.toPath temp-file)
-                (.toPath file)
-                (into-array java.nio.file.CopyOption
-                            [StandardCopyOption/REPLACE_EXISTING
-                             StandardCopyOption/ATOMIC_MOVE]))
-    true))
+  (locking snapshot-save-lock
+    (let [safe-state (strip-unserializable-state state)
+          file (io/file filepath)
+          parent (or (.getParentFile file) (io/file "."))
+          _ (.mkdirs parent)
+          temp-file (java.io.File/createTempFile "snapshot-" ".tmp" parent)]
+      (try
+        (nippy/freeze-to-file (.getAbsolutePath temp-file) safe-state)
+        (try
+          (Files/setPosixFilePermissions (.toPath temp-file) (PosixFilePermissions/fromString "rw-------"))
+          (catch UnsupportedOperationException _ nil))
+        ;; Atomic rename using java.nio.file.Files/move
+        (try
+          (Files/move (.toPath temp-file)
+                      (.toPath file)
+                      (into-array java.nio.file.CopyOption
+                                  [StandardCopyOption/REPLACE_EXISTING
+                                   StandardCopyOption/ATOMIC_MOVE]))
+          (catch Exception _
+            (Files/move (.toPath temp-file)
+                        (.toPath file)
+                        (into-array java.nio.file.CopyOption
+                                    [StandardCopyOption/REPLACE_EXISTING]))))
+        true
+        (finally
+          (when (.exists temp-file)
+            (try (.delete temp-file) (catch Exception _ nil))))))))
 
 (defn load-state-from-disk
   "Reads a serialized state map from the specified filepath and restores unserializable types.

@@ -19,8 +19,7 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [datachannel.api :as api]
-            [taoensso.nippy :as nippy])
+            [datachannel.api :as api])
   (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
            [java.net InetSocketAddress]
            [java.nio.charset StandardCharsets]
@@ -1373,7 +1372,7 @@
   "Sends a keepalive frame to each connected peer DataChannel."
   [peer-conns]
   (when peer-conns
-    (let [keepalive-bytes (nippy/freeze {:type :keepalive})]
+    (let [keepalive-bytes (fressian/encode-wire {:type :keepalive})]
       (doseq [[peer-hex conn] @peer-conns
               :let [cid (conn-channel-id conn)]
               :when (some? cid)]
@@ -1454,7 +1453,7 @@
           (let [b (cond
                     (bytes? p) p
                     (string? p) (.getBytes ^String p StandardCharsets/UTF_8)
-                    :else (try (nippy/freeze p) (catch Exception _ nil)))]
+                    :else (try (fressian/encode-wire p) (catch Exception _ nil)))]
             (when b
               (basalt/bytes->hex (crypto/sha256 b)))))
         (when (bytes? evt-or-bytes)
@@ -1631,7 +1630,7 @@
             (let [sent-ids (conn-sent-msg-ids conn)]
               (when-not (contains? sent-ids mid)
                 (let [cid (or (conn-channel-id conn) 0)
-                      frozen (nippy/freeze {:type :receive-gossip :message message})]
+                      frozen (fressian/encode-wire {:type :receive-gossip :message message})]
                   (try
                     (api/send! node frozen cid)
                     (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
@@ -1783,13 +1782,16 @@
                                    snapshot (build-validator-chain-state-snapshot st v-id (:pubkey unwrapped) (:nonce unwrapped))]
                                (when (and (map? snapshot) (string? (:signature snapshot)) (not (str/blank? (:signature snapshot))))
                                  (try
-                                   (api/send! agent-node (nippy/freeze snapshot) cid)
+                                   (api/send! agent-node (fressian/encode-wire snapshot) cid)
                                    (catch Exception e
                                      (log-mesh-error "Failed to send chain-state-snapshot to agent" e)))))
                              (do
                                (async/put! (:network-in shell-node) unwrapped)
                                (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
-                                 (forward-gossip-to-agents! agent-conns (:payload evt) (:sender unwrapped))))))))))))))
+                                 (let [fressian-payload (if (and (bytes? (:payload evt)) (fressian/nippy-payload? (:payload evt)))
+                                                          (fressian/encode-wire {:type :receive-gossip :message (:message unwrapped)})
+                                                          (:payload evt))]
+                                   (forward-gossip-to-agents! agent-conns fressian-payload (:sender unwrapped)))))))))))))))
          :on-close (fn [_]
                      (when agent-conns
                        (apply-mesh-conn-event! agent-conns @conn-key

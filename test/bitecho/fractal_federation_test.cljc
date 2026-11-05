@@ -177,3 +177,56 @@
       (is (= true (:advertisement-verified? res)))
       (is (= true (:inter-subnet-routed? res)))
       (is (= 1 (:unroutable-dropped res))))))
+
+(deftest test-subnet-retagging-prevention-and-mismatch-diagnostics
+  (testing "Retagged zero-burn offer envelope (team-alpha rewritten to global) drops fail-closed"
+    (let [kp-alice (crypto/generate-keypair)
+          kp-bob (crypto/generate-keypair)
+          pub-alice (basalt/bytes->hex (:public kp-alice))
+          pub-bob (basalt/bytes->hex (:public kp-bob))
+          alice-st (light-core/init-light-state {:pubkey-hex pub-alice}
+                                                {:subnet-id "team-alpha"
+                                                 :economy-enabled? false
+                                                 :burn-floor 0})
+          offer-res (light-core/handle-command alice-st
+                                               {"cmd" "offer" "callee" pub-bob "price" 0 "burn" 0}
+                                               (:private kp-alice))
+          orig-env (first (:net-envelopes offer-res))
+          _ (is (some? orig-env))
+          _ (is (= "team-alpha" (:subnet-id orig-env)))
+          tampered-outer-env (assoc orig-env :subnet-id "global")
+          bob-global-st (light-core/init-light-state {:pubkey-hex pub-bob}
+                                                     {:subnet-id "global"
+                                                      :economy-enabled? true
+                                                      :burn-floor 100})
+          receive-res (light-core/handle-wire-payload bob-global-st tampered-outer-env (:private kp-bob))
+          new-bob-st (:state receive-res)
+          _ (is (empty? (:pending-offers new-bob-st)))
+          _ (is (>= (long (or (:subnet-mismatch-dropped new-bob-st) 0)) 1))
+          mux (-> (light-core/init-multi-subnet-multiplexer {})
+                  (light-core/register-subnet-instance "global" bob-global-st))
+          mux-res (light-core/route-multiplexed-envelope mux tampered-outer-env (:private kp-bob))
+          mux-bob-st (get-in (:mux mux-res) [:subnets "global"])]
+      (is (empty? (:pending-offers mux-bob-st)))
+      (is (>= (long (or (get-in mux-res [:mux :diagnostics :subnet-mismatch-dropped]) 0)) 1)))))
+
+(deftest test-bootstrap-verification-fail-closed
+  (testing "verify-bootstrap-descriptor fails closed on nil, blank, or mismatched authority pubkey"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          other-kp (crypto/generate-keypair)
+          other-pub (basalt/bytes->hex (:public other-kp))
+          desc {:domain "test.bitecho.local"
+                :authority-pubkey pub
+                :issued-epoch 10
+                :expires-epoch 100
+                :nodes [{:node-id "val-1" :ip "10.0.0.1" :port 9000 :agent-port 9001 :pubkey pub
+                         :fingerprint "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+                         :ice-ufrag "ufrag" :ice-pwd "pwd"}]}
+          signed (light-core/sign-bootstrap-descriptor (:private kp) desc)]
+      (is (= :missing-expected-authority-pubkey (:error (light-core/verify-bootstrap-descriptor nil signed 20))))
+      (is (= :missing-expected-authority-pubkey (:error (light-core/verify-bootstrap-descriptor "" signed 20))))
+      (is (= :missing-expected-authority-pubkey (:error (light-core/verify-federated-domain-bootstrap "test.bitecho.local" signed 20))))
+      (is (= :missing-expected-authority-pubkey (:error (light-core/verify-federated-domain-bootstrap "test.bitecho.local" signed 20 nil))))
+      (is (= :authority-pubkey-mismatch (:error (light-core/verify-bootstrap-descriptor other-pub signed 20))))
+      (is (= :authority-pubkey-mismatch (:error (light-core/verify-federated-domain-bootstrap "test.bitecho.local" signed 20 other-pub)))))))
