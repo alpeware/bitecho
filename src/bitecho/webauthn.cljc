@@ -38,11 +38,22 @@
   #?(:clj
      (cond
        (bytes? bytes-or-seq) (mapv #(bit-and (int %) 0xff) ^bytes bytes-or-seq)
+       (instance? java.nio.ByteBuffer bytes-or-seq)
+       (let [dup (.duplicate ^java.nio.ByteBuffer bytes-or-seq)
+             arr (byte-array (.remaining dup))]
+         (.get dup arr)
+         (mapv #(bit-and (int %) 0xff) arr))
        (sequential? bytes-or-seq) (mapv #(bit-and (int %) 0xff) bytes-or-seq)
        :else nil)
      :cljs
      (cond
        (instance? js/Uint8Array bytes-or-seq) (vec (js/Array.from bytes-or-seq))
+       (and (exists? js/ArrayBuffer) (instance? js/ArrayBuffer bytes-or-seq))
+       (vec (js/Array.from (js/Uint8Array. bytes-or-seq)))
+       (and (exists? js/ArrayBuffer) (.isView js/ArrayBuffer bytes-or-seq))
+       (vec (js/Array.from (js/Uint8Array. (.-buffer bytes-or-seq)
+                                           (.-byteOffset bytes-or-seq)
+                                           (.-byteLength bytes-or-seq))))
        (sequential? bytes-or-seq) (mapv #(bit-and (int %) 0xff) bytes-or-seq)
        :else nil)))
 

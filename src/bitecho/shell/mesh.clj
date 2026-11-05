@@ -1348,25 +1348,29 @@
 (defn create-peer-datachannel-node
   "Constructs a DataChannel node map using persistent DTLS cert-data and deterministic ICE credentials,
    avoiding runtime throwaway certificate generation."
-  [local-port setup cert-data local-ice local-fp]
-  (let [opts {:port local-port :setup setup}
-        local-sdp-params {:port local-port
-                          :ice-ufrag (:ufrag local-ice)
-                          :ice-pwd (:pwd local-ice)
-                          :fingerprint local-fp
-                          :setup setup}]
-    {:opts opts
-     :cert-data cert-data
-     :ice-creds local-ice
-     :local-sdp-params local-sdp-params
-     :running (atom false)
-     :state-atom (atom nil)
-     :channel (atom nil)
-     :selector (atom nil)
-     :loop-future (atom nil)
-     :remote-addr (atom nil)
-     :shared-channel? false
-     :callbacks (atom nil)}))
+  ([local-port setup cert-data local-ice local-fp]
+   (create-peer-datachannel-node local-port setup cert-data local-ice local-fp nil))
+  ([local-port setup cert-data local-ice local-fp turn-config]
+   (let [opts (cond-> {:port local-port :setup setup}
+                turn-config (assoc :turn-config turn-config
+                                   :use-turn-relay? (boolean (:force-relay? turn-config))))
+         local-sdp-params {:port local-port
+                           :ice-ufrag (:ufrag local-ice)
+                           :ice-pwd (:pwd local-ice)
+                           :fingerprint local-fp
+                           :setup setup}]
+     {:opts opts
+      :cert-data cert-data
+      :ice-creds local-ice
+      :local-sdp-params local-sdp-params
+      :running (atom false)
+      :state-atom (atom nil)
+      :channel (atom nil)
+      :selector (atom nil)
+      :loop-future (atom nil)
+      :remote-addr (atom nil)
+      :shared-channel? false
+      :callbacks (atom nil)})))
 
 (defn send-peer-keepalives!
   "Sends a keepalive frame to each connected peer DataChannel."
@@ -1459,28 +1463,46 @@
         (when (bytes? evt-or-bytes)
           (basalt/bytes->hex (crypto/sha256 evt-or-bytes))))))
 
+(defn- ensure-fressian-wire-bytes
+  "Ensures outbound agent wire payload is Fressian-encoded,
+   re-encoding if given a map or a legacy Nippy byte array."
+  [evt-or-bytes]
+  (cond
+    (and (bytes? evt-or-bytes) (not (fressian/nippy-payload? evt-or-bytes)))
+    evt-or-bytes
+
+    (bytes? evt-or-bytes)
+    (when-let [decoded (fressian/decode-wire evt-or-bytes)]
+      (fressian/encode-wire decoded))
+
+    (map? evt-or-bytes)
+    (fressian/encode-wire evt-or-bytes)
+
+    :else nil))
+
 (defn- forward-gossip-to-agents!
   "Forwards a frozen gossip network event to all connected agent DataChannels, optionally excluding a sender.
-   Deduplicates messages per agent connection using :sent-msg-ids."
+   Deduplicates messages per agent connection using :sent-msg-ids and enforces Fressian wire encoding."
   [agent-conns frozen-evt exclude-sender]
   (when agent-conns
-    (let [msg-id (extract-gossip-msg-id frozen-evt)]
-      (doseq [[pk conn] @agent-conns
-              :when (not= pk exclude-sender)]
-        (let [sent-ids (conn-sent-msg-ids conn)]
-          (when-not (and msg-id (contains? sent-ids msg-id))
-            (when-let [cid (or (conn-channel-id conn) 0)]
-              (when-let [node (:node conn)]
-                (try
-                  (api/send! node frozen-evt cid)
-                  (when msg-id
-                    (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
-                      (swap! (:sent-msg-ids conn) conj msg-id)
-                      (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id})))
-                  (catch Exception e
-                    (apply-mesh-conn-event! agent-conns pk
-                                            {:type :send-failed :error (or (.getMessage e) "send-failed")})
-                    nil))))))))))
+    (when-let [wire-bytes (ensure-fressian-wire-bytes frozen-evt)]
+      (let [msg-id (extract-gossip-msg-id wire-bytes)]
+        (doseq [[pk conn] @agent-conns
+                :when (not= pk exclude-sender)]
+          (let [sent-ids (conn-sent-msg-ids conn)]
+            (when-not (and msg-id (contains? sent-ids msg-id))
+              (when-let [cid (or (conn-channel-id conn) 0)]
+                (when-let [node (:node conn)]
+                  (try
+                    (api/send! node wire-bytes cid)
+                    (when msg-id
+                      (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
+                        (swap! (:sent-msg-ids conn) conj msg-id)
+                        (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id})))
+                    (catch Exception e
+                      (apply-mesh-conn-event! agent-conns pk
+                                              {:type :send-failed :error (or (.getMessage e) "send-failed")})
+                      nil)))))))))))
 
 (defn- start-net-out-loop!
   "Consumes net-out commands, transforms them to peer events, and delivers to targets."
@@ -1563,7 +1585,8 @@
               base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))
               local-port (+ base-local-port (int (get node-idx pid 0)))
               setup (if (neg? (compare (name node-id) (name pid))) "active" "passive")
-              node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp)
+              turn-cfg (or (:turn-config peer-cfg) (get-in ctx [:config :cluster :turn-config]))
+              node (create-peer-datachannel-node local-port setup (:cert-data identity) local-ice local-fp turn-cfg)
               _ (apply-mesh-conn-event! peer-conns peer-hex
                                         {:type :dial-started :generation next-gen :node node :peer pid})
               remote-sdp {:ip peer-ip
@@ -1601,7 +1624,7 @@
                                                         :rng (java.util.Random.))]
                                        (async/put! (:network-in shell-node) event)
                                        (when (= :receive-gossip (:type msg))
-                                         (forward-gossip-to-agents! agent-conns (:payload evt) nil)))))))))
+                                         (forward-gossip-to-agents! agent-conns (fressian/encode-wire msg) nil)))))))))
                          :on-close
                          (fn [_]
                            (apply-mesh-conn-event! peer-conns peer-hex

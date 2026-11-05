@@ -67,6 +67,20 @@
     (when @active-node-atom
       (cb (get-status @active-node-atom)))))
 
+(def ^:private redacted-js-keys
+  #{:privkey-bytes :cold-privkey :private-key :privkey :privkey-hex :seed :seed-bytes
+    :keypair :x25519 :ephemeral-priv :ephemeral-privkey :tx-key :rx-key :session-keys
+    :shared-secret :user-handle :raw-id :prf-output :backup-seed
+    :private_key :privkey_bytes :cold_privkey :seed_bytes :user_handle :raw_id
+    :ephemeral_priv :tx_key :rx_key :session_keys :shared_secret :prf_output :backup_seed
+    :privateKey :privkeyBytes :coldPrivkey :seedBytes :userHandle :rawId
+    :ephemeralPriv :txKey :rxKey :sessionKeys :sharedSecret :prfOutput :backupSeed})
+
+(defn- redacted-js-key? [k]
+  (or (contains? redacted-js-keys k)
+      (and (or (keyword? k) (string? k))
+           (contains? redacted-js-keys (keyword (name k))))))
+
 (defn- redact-for-js
   "Recursively redacts private key material and credentials before converting to JS."
   [x]
@@ -74,7 +88,7 @@
     (map? x)
     (into {}
           (keep (fn [[k v]]
-                  (when-not (#{:privkey-bytes :cold-privkey :private-key :seed :keypair} k)
+                  (when-not (redacted-js-key? k)
                     [k (redact-for-js v)])))
           x)
     (vector? x) (mapv redact-for-js x)
@@ -145,17 +159,46 @@
   "Recovers identity from WebAuthn assertion/userHandle without generating silent random identity.
    Fails closed with {:ok false :error 'recovery-failed'} if recovery input is missing or invalid."
   [seed-or-opts]
-  (let [opts-map (if (map? seed-or-opts) seed-or-opts (when seed-or-opts (js->clj seed-or-opts :keywordize-keys true)))
-        existing-ident (or (:identity opts-map)
+  (let [raw-bytes? (or (instance? js/Uint8Array seed-or-opts)
+                       (and (exists? js/ArrayBuffer)
+                            (or (instance? js/ArrayBuffer seed-or-opts)
+                                (.isView js/ArrayBuffer seed-or-opts))))
+        opts-map (cond
+                   raw-bytes? {:user-handle seed-or-opts}
+                   (map? seed-or-opts) seed-or-opts
+                   (some? seed-or-opts) (js->clj seed-or-opts :keywordize-keys true)
+                   :else nil)
+        existing-ident (or (when (map? opts-map) (:identity opts-map))
                            (when (and (map? opts-map) (:public-hex opts-map)) opts-map))
-        user-handle (or (when existing-ident (or (:user-handle existing-ident) (:seed existing-ident)))
-                        (:user-handle opts-map)
-                        (:seed-bytes opts-map)
+        user-handle (or (when raw-bytes? seed-or-opts)
+                        (when (and (some? seed-or-opts) (object? seed-or-opts))
+                          (or (unchecked-get seed-or-opts "userHandle")
+                              (unchecked-get seed-or-opts "user_handle")
+                              (when-let [r (unchecked-get seed-or-opts "response")]
+                                (or (unchecked-get r "userHandle")
+                                    (unchecked-get r "user_handle")))))
+                        (when existing-ident (or (:user-handle existing-ident) (:seed existing-ident)))
+                        (when (map? opts-map)
+                          (or (:user-handle opts-map)
+                              (:userHandle opts-map)
+                              (:user_handle opts-map)
+                              (get-in opts-map [:response :userHandle])
+                              (get-in opts-map [:response :user-handle])
+                              (get-in opts-map [:response :user_handle])
+                              (:seed-bytes opts-map)
+                              (:seedBytes opts-map)
+                              (:seed_bytes opts-map)
+                              (:prf-output opts-map)
+                              (:prfOutput opts-map)
+                              (:prf_output opts-map)))
                         (when (string? seed-or-opts) seed-or-opts)
-                        (when (instance? js/Uint8Array seed-or-opts) seed-or-opts))
+                        (when (sequential? seed-or-opts) seed-or-opts))
         recovered (cond
                     (some? user-handle)
-                    (webauthn/recover-seed-from-assertion (if (map? opts-map) opts-map {:user-handle user-handle}))
+                    (webauthn/recover-seed-from-assertion
+                     (if (map? opts-map)
+                       (assoc opts-map :user-handle user-handle)
+                       {:user-handle user-handle}))
 
                     (and existing-ident (:public-hex existing-ident) (:address existing-ident))
                     existing-ident
@@ -491,7 +534,8 @@
                                             privkey)
          new-st (:state cmd-res)
          out-envs (:net-envelopes cmd-res)
-         resp (:response cmd-res)]
+         resp (:response cmd-res)
+         cmd-ok? (boolean (get resp "ok" true))]
      (swap! na (fn [curr]
                  (-> curr
                      (assoc :light-state new-st)
@@ -500,11 +544,12 @@
        (send-to-all-channels! na env))
      (browser/persist-state! (browser/sanitize-state-for-persistence @na))
      (notify-ui-listeners!)
-     (clj->js {:ok true
-               :callee callee
-               :sessionId (get resp "session_id")
-               :envelopesSent (count out-envs)
-               :response resp}))))
+     (clj->js (cond-> {:ok cmd-ok?
+                       :callee callee
+                       :sessionId (get resp "session_id")
+                       :envelopesSent (count out-envs)
+                       :response resp}
+                (not cmd-ok?) (assoc :error (get resp "error")))))))
 
 (defn accept-channel-offer
   "Accepts a pending session offer by session-id over the live mesh DataChannel."
@@ -517,7 +562,9 @@
                                             {"cmd" "accept" "session_id" session-id}
                                             privkey)
          new-st (:state cmd-res)
-         out-envs (:net-envelopes cmd-res)]
+         out-envs (:net-envelopes cmd-res)
+         resp (:response cmd-res)
+         cmd-ok? (boolean (get resp "ok" true))]
      (swap! na (fn [curr]
                  (-> curr
                      (assoc :light-state new-st)
@@ -526,9 +573,10 @@
        (send-to-all-channels! na env))
      (browser/persist-state! (browser/sanitize-state-for-persistence @na))
      (notify-ui-listeners!)
-     (clj->js {:ok true
-               :sessionId session-id
-               :response (:response cmd-res)}))))
+     (clj->js (cond-> {:ok cmd-ok?
+                       :sessionId session-id
+                       :response resp}
+                (not cmd-ok?) (assoc :error (get resp "error")))))))
 
 (defn send-message
   "Sends a cryptographically sealed message to a peer over the live mesh DataChannel."
@@ -547,25 +595,30 @@
                                              "message" (str text)}
                                             privkey)
          new-st (:state cmd-res)
-         out-envs (:net-envelopes cmd-res)]
+         out-envs (:net-envelopes cmd-res)
+         resp (:response cmd-res)
+         cmd-ok? (and (boolean (get resp "ok" true))
+                      (pos? (count out-envs)))]
      (swap! na (fn [curr]
-                 (-> curr
-                     (assoc :light-state new-st)
-                     (assoc :sessions (:sessions new-st))
-                     (update :chat-history conj {:timestamp (.toISOString (js/Date.))
-                                                 :direction :outgoing
-                                                 :peer peer-id
-                                                 :text text
-                                                 :status (if (seq out-envs) :sent :queued)}))))
+                 (cond-> (-> curr
+                             (assoc :light-state new-st)
+                             (assoc :sessions (:sessions new-st)))
+                   cmd-ok?
+                   (update :chat-history conj {:timestamp (.toISOString (js/Date.))
+                                               :direction :outgoing
+                                               :peer peer-id
+                                               :text text
+                                               :status :sent}))))
      (doseq [env out-envs]
        (send-to-all-channels! na env))
      (browser/persist-state! (browser/sanitize-state-for-persistence @na))
      (notify-ui-listeners!)
-     (clj->js {:ok true
-               :peer peer-id
-               :text text
-               :envelopesSent (count out-envs)
-               :response (:response cmd-res)}))))
+     (clj->js (cond-> {:ok cmd-ok?
+                       :peer peer-id
+                       :text text
+                       :envelopesSent (count out-envs)
+                       :response resp}
+                (not cmd-ok?) (assoc :error (or (get resp "error") "no-open-session-for-peer")))))))
 
 (defn get-chat-history
   "Returns the vector of chat messages exchanged with peers."

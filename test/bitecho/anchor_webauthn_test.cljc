@@ -236,7 +236,17 @@
       (is (= :webcrypto-non-extractable (:key-mode spec)))
       (is (false? (:extractable? spec)))
       (is (false? (:backup-available? spec)))
-      (is (str/includes? (:warning spec) "Non-extractable WebCrypto key")))))
+      (is (str/includes? (:warning spec) "Non-extractable WebCrypto key"))))
+
+  (testing "ArrayBuffer / ByteBuffer seed recovery succeeds identically to Uint8Array / byte[]"
+    (let [seed-bytes (crypto/random-bytes 32)
+          buf-input #?(:clj (java.nio.ByteBuffer/wrap seed-bytes)
+                       :cljs (.-buffer (js/Uint8Array. seed-bytes)))
+          rec-direct (webauthn/recover-seed-from-assertion {:user-handle seed-bytes})
+          rec-buf (webauthn/recover-seed-from-assertion {:user-handle buf-input})]
+      (is (some? rec-buf))
+      (is (= (:public-hex rec-direct) (:public-hex rec-buf)))
+      (is (= (:address rec-direct) (:address rec-buf))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Human Anchor End-to-End Workflow Tests (Milestone 11A)

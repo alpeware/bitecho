@@ -394,10 +394,14 @@
    awaits and returns the signed :chain-state-snapshot map (or nil on timeout/error)."
   [identity node pubkey privkey-bytes opts]
   (let [query-ice-creds (identity/generate-random-ice-creds)
-        client-node (api/create-node {:port 0
-                                      :cert-data (:cert-data identity)
-                                      :ice-creds query-ice-creds
-                                      :setup "active"})
+        turn-cfg (or (:turn-config opts) (:turn-config node))
+        client-node (api/create-node (cond-> {:port 0
+                                              :cert-data (:cert-data identity)
+                                              :ice-creds query-ice-creds
+                                              :setup "active"}
+                                       turn-cfg (assoc :turn-config turn-cfg
+                                                       :use-turn-relay? (boolean (or (:use-turn-relay? opts)
+                                                                                     (:force-relay? turn-cfg))))))
         snapshot-promise (promise)
         nonce (or (:nonce opts) (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID)))
         transport (or (:transport opts) :datachannel)
@@ -970,10 +974,14 @@
 (defn- dial-single-node!
   "Dials a single validator node via WebRTC DataChannel (UDP, TCP, or HTTP CONNECT proxy)."
   [identity node opts]
-  (let [client-node (api/create-node {:port 0
-                                      :cert-data (:cert-data identity)
-                                      :ice-creds (:ice-creds identity)
-                                      :setup "active"})
+  (let [turn-cfg (or (:turn-config opts) (:turn-config node))
+        client-node (api/create-node (cond-> {:port 0
+                                              :cert-data (:cert-data identity)
+                                              :ice-creds (:ice-creds identity)
+                                              :setup "active"}
+                                       turn-cfg (assoc :turn-config turn-cfg
+                                                       :use-turn-relay? (boolean (or (:use-turn-relay? opts)
+                                                                                     (:force-relay? turn-cfg))))))
         channel-id (atom nil)
         connected? (promise)
         send-fn-atom (atom nil)

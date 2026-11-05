@@ -236,4 +236,38 @@
                        #?(:clj (aset-byte ^bytes b 0 (unchecked-byte (bit-xor (aget ^bytes b 0) 0x01)))
                           :cljs (aset b 0 (bit-xor (int (aget b 0)) 0x01)))
                        b)]
-        (is (nil? (sealed/pure-aes-gcm-open key nonce tampered aad)))))))
+        (is (nil? (sealed/pure-aes-gcm-open key nonce tampered aad))))))
+
+  (testing "Recursive persistence sanitizer strips all private keys, x25519, seeds, and session keys at all nesting levels"
+    (let [node-state {:peer-id "browser-test"
+                      :keypair {:public-key "pub" :private-key "SECRET-ED25519-PRIV"}
+                      :x25519 {:public-key "xpub" :private-key "SECRET-X25519-PRIV"}
+                      :seed "SECRET-SEED"
+                      :privkey-bytes "SECRET-PRIVKEY-BYTES"
+                      :cold-privkey "SECRET-COLD-PRIV"
+                      :conn {:phase :open :generation 3}
+                      :active-channels {"node1" :mock-dc}
+                      :light-state {:pubkey "pub-hex"
+                                    :private-key "NESTED-PRIV"
+                                    :sessions {"sess-1" {:peer "axiom"
+                                                         :status :open
+                                                         :ephemeral-priv "SECRET-EPH-PRIV"
+                                                         :tx-key "SECRET-TX-KEY"
+                                                         :rx-key "SECRET-RX-KEY"
+                                                         :session-keys {:tx "k1" :rx "k2"}
+                                                         :shared-secret "SECRET-SHARED"}}}}
+          sanitized (browser/sanitize-state-for-persistence node-state)]
+      (is (nil? (:keypair sanitized)))
+      (is (nil? (:x25519 sanitized)))
+      (is (nil? (:seed sanitized)))
+      (is (nil? (:privkey-bytes sanitized)))
+      (is (nil? (:cold-privkey sanitized)))
+      (is (nil? (:conn sanitized)))
+      (is (nil? (:active-channels sanitized)))
+      (is (nil? (get-in sanitized [:light-state :private-key])))
+      (is (= :open (get-in sanitized [:light-state :sessions "sess-1" :status])))
+      (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :ephemeral-priv])))
+      (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :tx-key])))
+      (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :rx-key])))
+      (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :session-keys])))
+      (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :shared-secret]))))))

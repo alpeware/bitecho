@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # scripts/build-browser-bundle.sh
 # Compiles the Bitecho CLJS browser client into a deterministic static bundle,
-# computes Subresource Integrity (SRI) hashes (SHA-384 and SHA-256),
-# generates dist/index.html with SRI script tags, verifies reproducible determinism
-# across consecutive builds, and syncs the distribution into clj-web/public/app.
+# normalizes compiler-emitted gensym counters ($dyn_* and macro gensyms) so consecutive
+# CLJS :simple builds are 100% byte-for-byte identical, computes Subresource Integrity (SRI)
+# hashes (SHA-384 and SHA-256), generates dist/index.html with CSP and SRI script tags,
+# verifies reproducible determinism across consecutive builds, and syncs to clj-web/public/app.
 
 set -euo pipefail
 
@@ -91,6 +92,7 @@ cat <<EOF > dist/index.html
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: wss:; img-src 'self' data:; object-src 'none'; base-uri 'self';">
   <title>Bitecho Human Anchor Dashboard</title>
   <style>
     :root {
@@ -490,7 +492,21 @@ cat <<EOF > dist/index.html
       function sanitizeLogData(obj) {
         if (!obj || typeof obj !== "object") return obj;
         if (Array.isArray(obj)) return obj.map(sanitizeLogData);
-        const forbidden = new Set(["seed", "private-key", "privkey-bytes", "keypair", "privateKey", "privkeyBytes", "id", "rawId", "x25519"]);
+        const forbidden = new Set([
+          "seed", "seed-bytes", "seed_bytes", "seedBytes",
+          "private-key", "private_key", "privateKey", "privkey",
+          "privkey-bytes", "privkey_bytes", "privkeyBytes",
+          "privkey-hex", "privkey_hex", "privkeyHex",
+          "cold-privkey", "cold_privkey", "coldPrivkey",
+          "keypair", "id", "rawId", "raw_id", "raw-id",
+          "userHandle", "user_handle", "user-handle",
+          "x25519", "ephemeral-priv", "ephemeral_priv", "ephemeralPriv",
+          "tx-key", "tx_key", "txKey", "rx-key", "rx_key", "rxKey",
+          "session-keys", "session_keys", "sessionKeys",
+          "shared-secret", "shared_secret", "sharedSecret",
+          "prfOutput", "prf_output", "prf-output",
+          "backup-seed", "backup_seed", "backupSeed"
+        ]);
         const clean = {};
         for (const k of Object.keys(obj)) {
           if (!forbidden.has(k)) {
@@ -775,6 +791,10 @@ cat <<EOF > dist/index.html
         writeLog("Sending sealed message to " + target + ": " + text);
         try {
           const res = globalThis.BitechoBrowser.sendMessage(target, text);
+          if (!res || res.ok === false) {
+            writeLog("Send message failed: " + ((res && res.error) || "no-open-session-for-peer"), res);
+            return;
+          }
           writeLog("Message sent:", res);
           chatInput.value = "";
         } catch (err) {

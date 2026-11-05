@@ -234,29 +234,41 @@
 
 (def forbidden-persistence-keys
   "Set of sensitive or derived lifecycle keys strictly stripped prior to persistence."
-  #{:ephemeral-priv :connected? :connection-error :conn-diagnostics :conn-atom
-    :channel :transport :socket :last-error})
+  #{:ephemeral-priv :ephemeral-privkey :keypair :x25519 :seed :seed-bytes
+    :private-key :privkey :privkey-bytes :privkey-hex :cold-privkey
+    :tx-key :rx-key :session-keys :shared-secret
+    :connected? :connection-error :conn-diagnostics :conn-atom :conn
+    :channel :active-channels :connections :transport :socket :last-error})
+
+(def ^:private forbidden-persistence-key-names
+  (into #{} (map name forbidden-persistence-keys)))
+
+(defn- forbidden-persistence-key? [k]
+  (or (contains? forbidden-persistence-keys k)
+      (and (or (keyword? k) (string? k))
+           (contains? forbidden-persistence-key-names (name k)))))
 
 (defn sanitize-state-for-persistence
-  "Sanitizes light-node state before storage in IndexedDB/disk.
-   Strips ephemeral secrets (:ephemeral-priv), transport references, and derived
-   liveness (:connected?, :connection-error) per Rule 4."
+  "Sanitizes browser/light-node state recursively before storage in IndexedDB/disk.
+   Strips all private key material (:keypair, :x25519, :seed, :private-key, :privkey-bytes,
+   :cold-privkey, :ephemeral-priv, :tx-key, :rx-key, :session-keys), transport references,
+   and derived liveness (:connected?, :connection-error, :conn) at every nesting depth per Rule 4."
   [state]
-  (when (map? state)
-    (let [clean (apply dissoc state forbidden-persistence-keys)]
-      (cond-> clean
-        (:sessions clean)
-        (update :sessions
-                (fn [sessions]
-                  (when (map? sessions)
-                    (into {}
-                          (map (fn [[k s]]
-                                 [k (if (map? s)
-                                      (apply dissoc s forbidden-persistence-keys)
-                                      s)]))
-                          sessions))))
-        (:connections clean)
-        (dissoc :connections)))))
+  (letfn [(sanitize-val [v]
+            (cond
+              (map? v)
+              (into {}
+                    (keep (fn [[k sub-v]]
+                            (when-not (forbidden-persistence-key? k)
+                              [k (sanitize-val sub-v)])))
+                    v)
+              (vector? v)
+              (mapv sanitize-val v)
+              (set? v)
+              (into #{} (map sanitize-val v))
+              :else v))]
+    (when (map? state)
+      (sanitize-val state))))
 
 (defonce ^{:doc "In-memory storage map fallback for environments without native IndexedDB."
            :dynamic true}
@@ -330,7 +342,7 @@
                            (fn [ev]
                              (let [bytes (.. ev -target -result)]
                                (if bytes
-                                 (let [decoded (fressian/decode-wire bytes)]
+                                 (let [decoded (sanitize-state-for-persistence (fressian/decode-wire bytes))]
                                    (cb nil decoded))
                                  (cb nil nil)))))
                      (set! (.-onerror get-req)
@@ -338,18 +350,18 @@
            (set! (.-onerror req)
                  (fn [_]
                    (let [bytes (get @*in-memory-idb-store* "light-node-state")
-                         decoded (when bytes (fressian/decode-wire bytes))]
+                         decoded (when bytes (sanitize-state-for-persistence (fressian/decode-wire bytes)))]
                      (cb nil decoded)))))
          (catch :default _
            (let [bytes (get @*in-memory-idb-store* "light-node-state")
-                 decoded (when bytes (fressian/decode-wire bytes))]
+                 decoded (when bytes (sanitize-state-for-persistence (fressian/decode-wire bytes)))]
              (cb nil decoded))))
        (let [bytes (get @*in-memory-idb-store* "light-node-state")
-             decoded (when bytes (fressian/decode-wire bytes))]
+             decoded (when bytes (sanitize-state-for-persistence (fressian/decode-wire bytes)))]
          (cb nil decoded)))
      :clj
      (let [bytes (get @*in-memory-idb-store* "light-node-state")
-           decoded (when bytes (fressian/decode-wire bytes))]
+           decoded (when bytes (sanitize-state-for-persistence (fressian/decode-wire bytes)))]
        (cb nil decoded))))
 
 ;; =============================================================================
