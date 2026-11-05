@@ -335,7 +335,7 @@
       (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
       (is (= [{:id :c}] (vec (:nested-list sanitized))))))
 
-  (testing "Canonicalize-then-match across 100% of forbidden-persistence-keys + 40+ disjoint independent secret stems, 9 casings (incl. compact), and 3 key types + public/innocent carve-outs (0 survivors AND 0 false positives) + persist->load roundtrip (R5-M1)"
+  (testing "Canonicalize-then-match across 100% of forbidden-persistence-keys + 55+ disjoint independent secret stems, 9 casings (incl. compact), and 3 key types + 100% of public/innocent carve-outs (0 survivors AND 0 false positives) + persist->load roundtrip (R6-M1)"
     (let [independent-secret-stems ["backup-code" "verification-code" "auth-code" "security-code"
                                     "pin-code" "otp-code" "totp-code" "one-time-code"
                                     "access-code" "secret-code" "mfa-code" "unlock-code" "pairing-code"
@@ -345,13 +345,20 @@
                                     "local-passcode" "admin-passcode" "device-passcode"
                                     "login-secret" "vault-seed" "refresh-cookie" "bearer-jwt"
                                     "oauth-cred" "totp-pin" "session-auth"
-                                    "ephemeral-key" "sender-key" "receiver-key" "header-key"]
+                                    "ephemeral-key" "sender-key" "receiver-key" "header-key"
+                                    "credential-handle" "auth-handle" "secret-handle" "key-handle" "token-handle"
+                                    "master-xprv" "hd-tprv" "wallet-wif"
+                                    "login-phrase" "security-phrase" "twelve-words" "twenty-four-words"
+                                    "hash-pepper" "key-derivation-path" "seed-path" "wallet-pkcs8" "cert-pkcs12"]
           stems (vec (distinct (concat (sort browser/forbidden-persistence-keys)
                                        independent-secret-stems
                                        (for [s ["private-key" "privkey" "seed" "secret-key" "session-key"
                                                 "api-key" "access-token" "session-token" "signing-key"
                                                 "x25519-privkey" "ed25519-privkey" "prf-output" "user-handle"
-                                                "recovery-code" "session-id" "wallet-key" "passcode" "kek" "dek"]
+                                                "recovery-code" "session-id" "session-handle" "wallet-key"
+                                                "passcode" "kek" "dek" "entropy" "xprv" "tprv" "wif"
+                                                "recovery-phrase" "backup-phrase" "recovery-words"
+                                                "pk" "pw" "pass" "pepper" "derivation-path" "pkcs8" "pkcs12"]
                                              sfx ["-bytes" "-hex" "-raw" "-b64"]]
                                          (str s sfx)))))
           to-camel (fn [s]
@@ -375,14 +382,10 @@
                                    cased (casings stem)
                                    k [cased (keyword cased) (symbol cased)]]
                                k)
-          carve-out-stems ["pubkey" "public-key" "x25519-pubkey" "x25519-public-key"
-                           "ed25519-pubkey" "ed25519-public-key" "peer-pubkey" "agent-pubkey"
-                           "hot-pubkey" "anchor-pubkey" "authority-pubkey" "directory-pubkey"
-                           "caller-pubkey" "callee-pubkey" "key-mode" "keys-verified?" "cose-key"
-                           "is-private" "passwordless" "private-notes" "seed-count" "seedling"
-                           "key-count" "status-code" "error-code" "country-code" "postal-code"
-                           "token-count" "session-count" "channel-count" "author"
-                           "authenticated?" "first-name" "evaluate" "pinned"]
+          extra-carve-out-stems ["peer-pubkey" "agent-pubkey" "hot-pubkey" "anchor-pubkey"
+                                 "authority-pubkey" "directory-pubkey" "caller-pubkey" "callee-pubkey"]
+          carve-out-stems (vec (distinct (concat (sort browser/carved-out-public-and-innocent-keys)
+                                                 extra-carve-out-stems)))
           all-carve-out-keys (vec (distinct (for [stem carve-out-stems
                                                   cased (casings stem)
                                                   k [cased (keyword cased) (symbol cased)]]
@@ -394,6 +397,7 @@
           survivors (remove (set all-carve-out-keys) (keys sanitized))
           false-positives (remove #(contains? sanitized %) all-carve-out-keys)]
       (is (every? (set stems) browser/forbidden-persistence-keys))
+      (is (every? (set carve-out-stems) browser/carved-out-public-and-innocent-keys))
       (is (not-any? browser/forbidden-persistence-keys independent-secret-stems))
       (is (>= (count all-forbidden-keys) 4320))
       (is (empty? survivors) (str "Forbidden survivors found: " (pr-str (take 10 survivors))))
@@ -409,6 +413,16 @@
                            :seed-count 3
                            :seedling "SEEDLING-OK"
                            :key-count 2
+                           :monkey "MONKEY-OK"
+                           :turkey "TURKEY-OK"
+                           :donkey "DONKEY-OK"
+                           :keychain "KEYCHAIN-OK"
+                           :keyring "KEYRING-OK"
+                           :discount-code "DISC-OK"
+                           :coupon-code "COUPON-OK"
+                           :morsecode "MORSE-OK"
+                           :api-key-id "API-KEY-ID-OK"
+                           :key-rotation "ROTATION-OK"
                            :privateKeyBytes "LEAK-1"
                            :x25519Privkey "LEAK-2"
                            :x25519-private-key "LEAK-3"
@@ -421,9 +435,26 @@
                            :recovery-code "LEAK-10"
                            :session-id "LEAK-11"
                            :walletkey "LEAK-12"
-                           :nested {:privateKeyBytes "LEAK-13"
-                                    :x25519Privkey "LEAK-14"
-                                    :api-token "LEAK-15"
+                           :session-handle "LEAK-13"
+                           :entropy "LEAK-14"
+                           :xprv "LEAK-15"
+                           :tprv "LEAK-16"
+                           :wif "LEAK-17"
+                           :recovery-phrase "LEAK-18"
+                           :backup-phrase "LEAK-19"
+                           :recovery-words "LEAK-20"
+                           :pk "LEAK-21"
+                           :pw "LEAK-22"
+                           :pass "LEAK-23"
+                           :pepper "LEAK-24"
+                           :derivation-path "LEAK-25"
+                           :pkcs8 "LEAK-26"
+                           :pkcs12 "LEAK-27"
+                           :password-hint "LEAK-28"
+                           :nested {:privateKeyBytes "LEAK-29"
+                                    :x25519Privkey "LEAK-30"
+                                    :api-token "LEAK-31"
+                                    :session-handle "LEAK-32"
                                     :x25519-pubkey "NESTED-PUB-OK"
                                     :safe-val 99}}
           loaded-atom (atom nil)]
@@ -439,13 +470,23 @@
               :seed-count 3
               :seedling "SEEDLING-OK"
               :key-count 2
+              :monkey "MONKEY-OK"
+              :turkey "TURKEY-OK"
+              :donkey "DONKEY-OK"
+              :keychain "KEYCHAIN-OK"
+              :keyring "KEYRING-OK"
+              :discount-code "DISC-OK"
+              :coupon-code "COUPON-OK"
+              :morsecode "MORSE-OK"
+              :api-key-id "API-KEY-ID-OK"
+              :key-rotation "ROTATION-OK"
               :nested {:x25519-pubkey "NESTED-PUB-OK"
                        :safe-val 99}}
              @loaded-atom)))))
 
 #?(:cljs
    (deftest browser-main-accept-offer-and-send-sealed-message-guards-test
-     (testing "accept-offer and send-sealed-message nil argument guards and happy path (R5-L1)"
+     (testing "accept-offer and send-sealed-message nil/blank/1-arity/fallback argument guards and happy path (R5-L1, R6-L6)"
        (let [node-atom (browser-main/init-node {:peer-id "browser-guard-test"})
              caller-kp (crypto/generate-keypair)
              caller-x (sealed/generate-x25519-keypair)
@@ -460,24 +501,36 @@
                           :burn 100}
              r-nil-1 (js->clj (browser-main/accept-offer nil) :keywordize-keys true)
              r-nil-2 (js->clj (browser-main/accept-offer node-atom nil) :keywordize-keys true)
+             r-send-1-arity (js->clj (browser-main/send-sealed-message caller-pub-hex) :keywordize-keys true)
              r-send-nil-peer-1 (js->clj (browser-main/send-sealed-message nil "hi") :keywordize-keys true)
              r-send-nil-peer-2 (js->clj (browser-main/send-sealed-message node-atom nil "hi") :keywordize-keys true)
+             r-send-blank-peer-1 (js->clj (browser-main/send-sealed-message "" "hi") :keywordize-keys true)
+             r-send-blank-peer-2 (js->clj (browser-main/send-sealed-message node-atom "   " "hi") :keywordize-keys true)
              r-send-nil-msg-1 (js->clj (browser-main/send-sealed-message caller-pub-hex nil) :keywordize-keys true)
              r-send-nil-msg-2 (js->clj (browser-main/send-sealed-message node-atom caller-pub-hex nil) :keywordize-keys true)
-             r-send-no-sess (js->clj (browser-main/send-sealed-message node-atom caller-pub-hex "hi") :keywordize-keys true)]
+             r-send-no-sess (js->clj (browser-main/send-sealed-message node-atom caller-pub-hex "hi") :keywordize-keys true)
+             r-send-empty-no-sess (js->clj (browser-main/send-sealed-message nil caller-pub-hex "") :keywordize-keys true)]
          (is (= {:ok false :accepted false :error "invalid-offer"} r-nil-1))
          (is (= {:ok false :accepted false :error "invalid-offer"} r-nil-2))
+         (is (= {:ok false :sent false :error "invalid-message"} r-send-1-arity))
          (is (= {:ok false :sent false :error "invalid-peer"} r-send-nil-peer-1))
          (is (= {:ok false :sent false :error "invalid-peer"} r-send-nil-peer-2))
+         (is (= {:ok false :sent false :error "invalid-peer"} r-send-blank-peer-1))
+         (is (= {:ok false :sent false :error "invalid-peer"} r-send-blank-peer-2))
          (is (= {:ok false :sent false :error "invalid-message"} r-send-nil-msg-1))
          (is (= {:ok false :sent false :error "invalid-message"} r-send-nil-msg-2))
          (is (= {:ok false :sent false :error "no-open-session"} r-send-no-sess))
+         (is (= {:ok false :sent false :error "no-open-session"} r-send-empty-no-sess))
          (is (empty? (:sessions @node-atom)))
          (is (empty? (:outbox @node-atom)))
          (let [r-acc (js->clj (browser-main/accept-offer nil valid-offer) :keywordize-keys true)
-               r-send-ok (js->clj (browser-main/send-sealed-message nil caller-pub-hex "hello-r5") :keywordize-keys true)]
+               r-send-ok-1 (js->clj (browser-main/send-sealed-message nil caller-pub-hex "hello-r5") :keywordize-keys true)
+               r-send-ok-2 (js->clj (browser-main/send-sealed-message caller-pub-hex "") :keywordize-keys true)]
            (is (true? (:ok r-acc)))
            (is (true? (:accepted r-acc)))
-           (is (true? (:ok r-send-ok)))
-           (is (true? (:sent r-send-ok)))
-           (is (= 1 (:seq r-send-ok))))))))
+           (is (true? (:ok r-send-ok-1)))
+           (is (true? (:sent r-send-ok-1)))
+           (is (= 1 (:seq r-send-ok-1)))
+           (is (true? (:ok r-send-ok-2)))
+           (is (true? (:sent r-send-ok-2)))
+           (is (= 2 (:seq r-send-ok-2))))))))
