@@ -279,6 +279,47 @@
            :trust-boundary trust-boundary-disclosure})))
     (catch #?(:clj Exception :cljs :default) _ nil)))
 
+(defn derive-identity-from-prf
+  "Deterministically derives an Ed25519 identity keypair and Bech32m address
+   directly from WebAuthn PRF extension output (Uint8Array, byte array, or assertion map)."
+  [prf-or-assertion]
+  (try
+    (let [prf-raw (cond
+                    (map? prf-or-assertion)
+                    (or (:prf-output prf-or-assertion)
+                        (get-in prf-or-assertion [:extensions :prf :results :first])
+                        (get-in prf-or-assertion [:client-extension-results :prf :results :first])
+                        (get prf-or-assertion :first)
+                        (get-in prf-or-assertion [:results :first]))
+
+                    #?@(:cljs
+                        [(and (some? prf-or-assertion) (fn? (.-getClientExtensionResults prf-or-assertion)))
+                         (some-> (.getClientExtensionResults prf-or-assertion)
+                                 (.-prf)
+                                 (.-results)
+                                 (.-first))])
+
+                    :else prf-or-assertion)]
+      (when-let [bs (to-byte-seq prf-raw)]
+        (let [seed-32 (cond
+                        (= (count bs) 32) bs
+                        (> (count bs) 32) (subvec bs 0 32)
+                        :else (to-byte-seq (crypto/sha256 (to-byte-array bs))))
+              seed-arr (to-byte-array seed-32)
+              kp (crypto/pure-ed25519-keypair seed-arr)
+              pub-hex (bytes->hex-str (to-byte-seq (:public kp)))
+              bech-addr (bech32m/pubkey->bech32m pub-hex "ech")]
+          {:seed seed-arr
+           :recovery-source :prf
+           :keypair kp
+           :public-key (:public kp)
+           :private-key (:private kp)
+           :public-hex pub-hex
+           :address bech-addr
+           :origin-scoping origin-scoping-disclosure
+           :trust-boundary trust-boundary-disclosure})))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Non-Extractable WebCrypto Key Specification & Browser Interop (Step 11B.1)
 ;;; ---------------------------------------------------------------------------

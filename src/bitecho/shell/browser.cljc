@@ -12,7 +12,8 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
-            [bitecho.light-node.core :as light-node]))
+            [bitecho.light-node.core :as light-node]
+            [clojure.string :as str]))
 
 ;; =============================================================================
 ;; Rule 4 & Rule 5 Single-Authority Connection Lifecycle State Machine
@@ -232,32 +233,50 @@
 ;; State Sanitization & Persistence (Rule 4)
 ;; =============================================================================
 
+(defn canonical-key-name
+  "Converts camelCase, snake_case, or kebab-case keyword/string/symbol to lowercase kebab-case."
+  [k]
+  (when (or (keyword? k) (string? k) (symbol? k))
+    (-> (name k)
+        (str/replace #"([a-z0-9])([A-Z])" "$1-$2")
+        (str/replace #"([A-Z]+)([A-Z][a-z])" "$1-$2")
+        (str/replace "_" "-")
+        str/lower-case)))
+
 (def forbidden-persistence-keys
-  "Set of sensitive or derived lifecycle keys strictly stripped prior to persistence."
-  #{:ephemeral-priv :ephemeral-privkey :keypair :x25519 :seed :seed-bytes
-    :private-key :privkey :privkey-bytes :privkey-hex :cold-privkey
-    :tx-key :rx-key :session-keys :shared-secret
-    :connected? :connection-error :conn-diagnostics :conn-atom :conn
-    :channel :active-channels :connections :transport :socket :last-error})
+  "Set of sensitive credential, key material, and derived lifecycle keys in canonical lowercase kebab-case."
+  #{"private" "private-key" "private-key-hex" "privkey" "privkey-bytes" "seed" "seed-bytes" "seed-hex"
+    "secret" "secret-key" "shared-secret" "root-key" "chain-key" "send-chain-key" "recv-chain-key"
+    "skipped-keys" "session-keys" "ratchet-key" "ephemeral-private" "prf-output" "raw-id"
+    "user-handle" "backup-seed" "mnemonic" "first" "eval"
+    "cold-privkey" "keypair" "x25519" "tx-key" "rx-key" "ephemeral-priv" "ephemeral-privkey"
+    "connected?" "connection-error" "conn-diagnostics" "conn-atom" "conn"
+    "channel" "active-channels" "connections" "transport" "socket" "last-error"})
 
-(def ^:private forbidden-persistence-key-names
-  (into #{} (map name forbidden-persistence-keys)))
+(def ^:private forbidden-persistence-keys-compact
+  (into #{} (map #(str/replace % "-" "") forbidden-persistence-keys)))
 
-(defn- forbidden-persistence-key? [k]
-  (or (contains? forbidden-persistence-keys k)
-      (and (or (keyword? k) (string? k))
-           (contains? forbidden-persistence-key-names (name k)))))
+(defn forbidden-persistence-key?
+  "Returns true if key k (in any case: camelCase, PascalCase, snake_case, UPPER_SNAKE, kebab-case,
+   compact lowercase, keyword, or string) is a sensitive credential, private key material, or derived
+   transport/lifecycle state."
+  [k]
+  (boolean
+   (when-let [canon (canonical-key-name k)]
+     (or (contains? forbidden-persistence-keys canon)
+         (contains? forbidden-persistence-keys-compact (str/replace canon "-" ""))))))
 
 (defn sanitize-state-for-persistence
   "Sanitizes browser/light-node state recursively before storage in IndexedDB/disk.
    Strips all private key material (:keypair, :x25519, :seed, :private-key, :privkey-bytes,
    :cold-privkey, :ephemeral-priv, :tx-key, :rx-key, :session-keys), transport references,
-   and derived liveness (:connected?, :connection-error, :conn) at every nesting depth per Rule 4."
+   and derived liveness (:connected?, :connection-error, :conn) at every nesting depth per Rule 4.
+   Supports camelCase, snake_case, and kebab-case variants across maps, vectors, sets, and sequences."
   [state]
   (letfn [(sanitize-val [v]
             (cond
               (map? v)
-              (into {}
+              (into (empty v)
                     (keep (fn [[k sub-v]]
                             (when-not (forbidden-persistence-key? k)
                               [k (sanitize-val sub-v)])))
@@ -266,6 +285,8 @@
               (mapv sanitize-val v)
               (set? v)
               (into #{} (map sanitize-val v))
+              (seq? v)
+              (map sanitize-val v)
               :else v))]
     (when (map? state)
       (sanitize-val state))))

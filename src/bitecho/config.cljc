@@ -51,7 +51,9 @@
    :delivery-threshold    8
 
    ;; Sieve / Contagion signed control frames
-   :require-signed-control-frames true})
+   :require-signed-control-frames true
+   ;; TURN relay configuration (host, port, credentials, force-relay)
+   :turn-config                  nil})
 
 ;; ---------------------------------------------------------------------------
 ;; Large-network preset (N ≈ 1000, up to 25 % Byzantine)

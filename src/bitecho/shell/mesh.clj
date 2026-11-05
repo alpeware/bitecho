@@ -1463,29 +1463,34 @@
         (when (bytes? evt-or-bytes)
           (basalt/bytes->hex (crypto/sha256 evt-or-bytes))))))
 
-(defn- ensure-fressian-wire-bytes
-  "Ensures outbound agent wire payload is Fressian-encoded,
-   re-encoding if given a map or a legacy Nippy byte array."
+(defn ensure-fressian-wire-bytes
+  "Ensures outbound agent wire payload is valid Fressian-encoded map,
+   re-encoding if given a map or a legacy Nippy byte array.
+   Strictly validates non-Nippy byte arrays via fressian/decode-wire,
+   returning nil for non-map or malformed/garbage bytes."
   [evt-or-bytes]
   (cond
-    (and (bytes? evt-or-bytes) (not (fressian/nippy-payload? evt-or-bytes)))
-    evt-or-bytes
-
-    (bytes? evt-or-bytes)
-    (when-let [decoded (fressian/decode-wire evt-or-bytes)]
-      (fressian/encode-wire decoded))
-
     (map? evt-or-bytes)
     (fressian/encode-wire evt-or-bytes)
+
+    (bytes? evt-or-bytes)
+    (if (fressian/nippy-payload? evt-or-bytes)
+      (when-let [decoded (try (fressian/decode-wire evt-or-bytes) (catch Exception _ nil))]
+        (when (map? decoded)
+          (fressian/encode-wire decoded)))
+      (when-let [decoded (try (fressian/decode-wire evt-or-bytes) (catch Exception _ nil))]
+        (when (map? decoded)
+          evt-or-bytes)))
 
     :else nil))
 
 (defn- forward-gossip-to-agents!
   "Forwards a frozen gossip network event to all connected agent DataChannels, optionally excluding a sender.
-   Deduplicates messages per agent connection using :sent-msg-ids and enforces Fressian wire encoding."
+   Deduplicates messages per agent connection using :sent-msg-ids and enforces Fressian wire encoding.
+   Drops malformed or non-Fressian garbage bytes with counted diagnostic effect across active agent connections."
   [agent-conns frozen-evt exclude-sender]
   (when agent-conns
-    (when-let [wire-bytes (ensure-fressian-wire-bytes frozen-evt)]
+    (if-let [wire-bytes (ensure-fressian-wire-bytes frozen-evt)]
       (let [msg-id (extract-gossip-msg-id wire-bytes)]
         (doseq [[pk conn] @agent-conns
                 :when (not= pk exclude-sender)]
@@ -1502,7 +1507,11 @@
                     (catch Exception e
                       (apply-mesh-conn-event! agent-conns pk
                                               {:type :send-failed :error (or (.getMessage e) "send-failed")})
-                      nil)))))))))))
+                      nil))))))))
+      (doseq [[pk _] @agent-conns
+              :when (not= pk exclude-sender)]
+        (apply-mesh-conn-event! agent-conns pk
+                                {:type :invalid-frame :error "garbage-wire-bytes-dropped"})))))
 
 (defn- start-net-out-loop!
   "Consumes net-out commands, transforms them to peer events, and delivers to targets."

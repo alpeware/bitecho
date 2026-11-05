@@ -263,7 +263,20 @@
         timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
         proxy-cli (extract-flag-value clean-args "--proxy" nil)
         proxy-url (resolve-proxy-url proxy-cli)
-        subnet-id (extract-flag-value clean-args "--subnet-id" nil)]
+        subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+        turn-server (extract-flag-value clean-args "--turn-server" nil)
+        turn-username (extract-flag-value clean-args "--turn-username" nil)
+        turn-password (extract-flag-value clean-args "--turn-password" nil)
+        turn-realm (extract-flag-value clean-args "--turn-realm" nil)
+        turn-force-relay? (boolean (some #{"--turn-force-relay"} clean-args))
+        turn-config (when (or turn-server turn-username turn-password turn-realm turn-force-relay?)
+                      (let [[h p] (when turn-server (str/split turn-server #":" 2))]
+                        {:server-host (or h "127.0.0.1")
+                         :server-port (if (and p (seq p)) (try (Integer/parseInt p) (catch Exception _ 3478)) 3478)
+                         :username turn-username
+                         :password turn-password
+                         :realm turn-realm
+                         :force-relay? turn-force-relay?}))]
     (cond-> {:mode (if serve? :serve :one-shot)
              :verb verb
              :state-dir state-dir
@@ -275,7 +288,8 @@
                           subnet-id (assoc "subnet_id" subnet-id)))}
       subnet-id (assoc :subnet-id subnet-id)
       timeout-ms (assoc :timeout-ms timeout-ms)
-      proxy-url (assoc :proxy proxy-url))))
+      proxy-url (assoc :proxy proxy-url)
+      turn-config (assoc :turn-config turn-config))))
 
 ;; -----------------------------------------------------------------------------
 ;; State Persistence & Identity Loading

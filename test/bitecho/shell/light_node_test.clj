@@ -1252,7 +1252,8 @@
                   "--offer-hash" "--from"
                   "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"
                   "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"
-                  "--subnet-id"}]
+                  "--subnet-id"
+                  "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1339,7 +1340,19 @@
       (is (= 7 (get-in (light-shell/parse-light-node-args ["transfer" "--seq" "7"]) [:cmd-map "seq"])))
       (is (= ["n1" "n2"] (get-in (light-shell/parse-light-node-args ["register-home-set" "--nodes" "n1,n2"]) [:cmd-map "home_nodes"])))
       (is (= 5000 (get-in (light-shell/parse-light-node-args ["account" "--balance" "5000"]) [:cmd-map "balance"])))
-      (is (true? (get-in (light-shell/parse-light-node-args ["account" "--sync"]) [:cmd-map "sync"]))))))
+      (is (true? (get-in (light-shell/parse-light-node-args ["account" "--sync"]) [:cmd-map "sync"])))
+      (is (= {:server-host "turn.example.com"
+              :server-port 3478
+              :username "testuser"
+              :password "secretpass"
+              :realm "bitecho.org"
+              :force-relay? true}
+             (:turn-config (light-shell/parse-light-node-args ["status"
+                                                               "--turn-server" "turn.example.com:3478"
+                                                               "--turn-username" "testuser"
+                                                               "--turn-password" "secretpass"
+                                                               "--turn-realm" "bitecho.org"
+                                                               "--turn-force-relay"])))))))
 
 ;; -----------------------------------------------------------------------------
 ;; 13. Candidate Ordering, Failover Rotation & Session Durability Tests (Priority 2)

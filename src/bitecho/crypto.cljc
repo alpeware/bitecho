@@ -226,215 +226,287 @@
 ;; =============================================================================
 
 #?(:cljs
-   (def ^:private pure-ed25519-engine
-     ((js/Function.
-       "const K512 = [
-  0x428a2f98d728ae22n,0x7137449123ef65cdn,0xb5c0fbcfec4d3b2fn,0xe9b5dba58189dbbcn,
-  0x3956c25bf348b538n,0x59f111f1b605d019n,0x923f82a4af194f9bn,0xab1c5ed5da6d8118n,
-  0xd807aa98a3030242n,0x12835b0145706fben,0x243185be4ee4b28cn,0x550c7dc3d5ffb4e2n,
-  0x72be5d74f27b896fn,0x80deb1fe3b1696b1n,0x9bdc06a725c71235n,0xc19bf174cf692694n,
-  0xe49b69c19ef14ad2n,0xefbe4786384f25e3n,0x0fc19dc68b8cd5b5n,0x240ca1cc77ac9c65n,
-  0x2de92c6f592b0275n,0x4a7484aa6ea6e483n,0x5cb0a9dcbd41fbd4n,0x76f988da831153b5n,
-  0x983e5152ee66dfabn,0xa831c66d2db43210n,0xb00327c898fb213fn,0xbf597fc7beef0ee4n,
-  0xc6e00bf33da88fc2n,0xd5a79147930aa725n,0x06ca6351e003826fn,0x142929670a0e6e70n,
-  0x27b70a8546d22ffcn,0x2e1b21385c26c926n,0x4d2c6dfc5ac42aedn,0x53380d139d95b3dfn,
-  0x650a73548baf63den,0x766a0abb3c77b2a8n,0x81c2c92e47edaee6n,0x92722c851482353bn,
-  0xa2bfe8a14cf10364n,0xa81a664bbc423001n,0xc24b8b70d0f89791n,0xc76c51a30654be30n,
-  0xd192e819d6ef5218n,0xd69906245565a910n,0xf40e35855771202an,0x106aa07032bbd1b8n,
-  0x19a4c116b8d2d0c8n,0x1e376c085141ab53n,0x2748774cdf8eeb99n,0x34b0bcb5e19b48a8n,
-  0x391c0cb3c5c95a63n,0x4ed8aa4ae3418acbn,0x5b9cca4f7763e373n,0x682e6ff3d6b2b8a3n,
-  0x748f82ee5defb2fcn,0x78a5636f43172f60n,0x84c87814a1f0ab72n,0x8cc702081a6439ecn,
-  0x90befffa23631e28n,0xa4506cebde82bde9n,0xbef9a3f7b2c67915n,0xc67178f2e372532bn,
-  0xca273eceea26619cn,0xd186b8c721c0c207n,0xeada7dd6cde0eb1en,0xf57d4f7fee6ed178n,
-  0x06f067aa72176fban,0x0a637dc5a2c898a6n,0x113f9804bef90daen,0x1b710b35131c471bn,
-  0x28db77f523047d84n,0x32caab7b40c72493n,0x3c9ebe0a15c9bebcn,0x431d67c49c100d4cn,
-  0x4cc5d4becb3e42b6n,0x597f299cfc657e2an,0x5fcb6fab3ad6faecn,0x6c44198c4a475817n
-];
-const H512 = [
-  0x6a09e667f3bcc908n,0xbb67ae8584caa73bn,0x3c6ef372fe94f82bn,0xa54ff53a5f1d36f1n,
-  0x510e527fade682d1n,0x9b05688c2b3e6c1fn,0x1f83d9abfb41bd6bn,0x5be0cd19137e2179n
-];
-const M64 = 0xffffffffffffffffn;
-function rotr64(x, n) { return ((x >> n) | ((x << (64n - n)) & M64)) & M64; }
-function sha512(msg) {
-  const len = msg.length;
-  const bitLen = BigInt(len) * 8n;
-  const padLen = ((len + 17 + 127) & ~127);
-  const buf = new Uint8Array(padLen);
-  buf.set(msg, 0);
-  buf[len] = 0x80;
-  let bl = bitLen;
-  for (let i = 0; i < 8; i++) {
-    buf[padLen - 1 - i] = Number(bl & 0xffn);
-    bl >>= 8n;
-  }
-  let h0 = H512[0], h1 = H512[1], h2 = H512[2], h3 = H512[3],
-      h4 = H512[4], h5 = H512[5], h6 = H512[6], h7 = H512[7];
-  const W = new Array(80);
-  for (let off = 0; off < padLen; off += 128) {
-    for (let i = 0; i < 16; i++) {
-      let w = 0n;
-      for (let b = 0; b < 8; b++) w = (w << 8n) | BigInt(buf[off + i * 8 + b]);
-      W[i] = w;
-    }
-    for (let i = 16; i < 80; i++) {
-      const s0 = rotr64(W[i-15], 1n) ^ rotr64(W[i-15], 8n) ^ (W[i-15] >> 7n);
-      const s1 = rotr64(W[i-2], 19n) ^ rotr64(W[i-2], 61n) ^ (W[i-2] >> 6n);
-      W[i] = (W[i-16] + s0 + W[i-7] + s1) & M64;
-    }
-    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
-    for (let i = 0; i < 80; i++) {
-      const S1 = rotr64(e, 14n) ^ rotr64(e, 18n) ^ rotr64(e, 41n);
-      const ch = (e & f) ^ ((~e & M64) & g);
-      const temp1 = (h + S1 + ch + K512[i] + W[i]) & M64;
-      const S0 = rotr64(a, 28n) ^ rotr64(a, 34n) ^ rotr64(a, 39n);
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const temp2 = (S0 + maj) & M64;
-      h = g; g = f; f = e; e = (d + temp1) & M64;
-      d = c; c = b; b = a; a = (temp1 + temp2) & M64;
-    }
-    h0 = (h0 + a) & M64; h1 = (h1 + b) & M64; h2 = (h2 + c) & M64; h3 = (h3 + d) & M64;
-    h4 = (h4 + e) & M64; h5 = (h5 + f) & M64; h6 = (h6 + g) & M64; h7 = (h7 + h) & M64;
-  }
-  const out = new Uint8Array(64);
-  const hs = [h0, h1, h2, h3, h4, h5, h6, h7];
-  for (let i = 0; i < 8; i++) {
-    let v = hs[i];
-    for (let b = 7; b >= 0; b--) { out[i * 8 + b] = Number(v & 0xffn); v >>= 8n; }
-  }
-  return out;
-}
-const P = (1n << 255n) - 19n;
-const L = (1n << 252n) + 27742317777372353535851937790883648493n;
-function modP(x) { return ((x % P) + P) % P; }
-function modL(x) { return ((x % L) + L) % L; }
-function modPow(base, exp) {
-  let res = 1n, b = modP(base), e = exp;
-  while (e > 0n) {
-    if (e & 1n) res = modP(res * b);
-    b = modP(b * b);
-    e >>= 1n;
-  }
-  return res;
-}
-function invP(x) { return modPow(x, P - 2n); }
-const D = modP(-121665n * invP(121666n));
-const I_SQRT = modPow(2n, (P - 1n) / 4n);
-const BY = modP(4n * invP(5n));
-const BX = 15112221349535400772501151409588531511454012693041857206046113283949847762202n;
-const B_PT = [BX, BY, 1n, modP(BX * BY)];
-function ptAdd(P1, P2) {
-  const [X1, Y1, Z1, T1] = P1;
-  const [X2, Y2, Z2, T2] = P2;
-  const A = modP((Y1 - X1) * (Y2 - X2));
-  const B = modP((Y1 + X1) * (Y2 + X2));
-  const C = modP(2n * D * T1 * T2);
-  const D2 = modP(2n * Z1 * Z2);
-  const E = modP(B - A);
-  const F = modP(D2 - C);
-  const G = modP(D2 + C);
-  const H = modP(B + A);
-  return [modP(E * F), modP(G * H), modP(F * G), modP(E * H)];
-}
-function scalarMult(k, pt) {
-  let R = [0n, 1n, 1n, 0n];
-  let Q = pt;
-  let n = k;
-  while (n > 0n) {
-    if (n & 1n) R = ptAdd(R, Q);
-    Q = ptAdd(Q, Q);
-    n >>= 1n;
-  }
-  return R;
-}
-function encodePoint(pt) {
-  const [X, Y, Z] = pt;
-  const zi = invP(Z);
-  const x = modP(X * zi);
-  const y = modP(Y * zi);
-  const out = new Uint8Array(32);
-  let n = y;
-  for (let i = 0; i < 32; i++) { out[i] = Number(n & 0xffn); n >>= 8n; }
-  out[31] |= Number(x & 1n) << 7;
-  return out;
-}
-function decodePoint(bytes) {
-  if (!bytes || bytes.length !== 32) return null;
-  const sign = (bytes[31] >> 7) & 1;
-  let y = 0n;
-  for (let i = 0; i < 32; i++) {
-    const b = (i === 31) ? (bytes[i] & 0x7f) : bytes[i];
-    y |= BigInt(b) << (BigInt(i) * 8n);
-  }
-  if (y >= P) return null;
-  const y2 = modP(y * y);
-  const u = modP(y2 - 1n);
-  const v = modP(D * y2 + 1n);
-  let x = modP(u * invP(v));
-  x = modPow(x, (P + 3n) / 8n);
-  if (modP(x * x * v) !== u) {
-    x = modP(x * I_SQRT);
-    if (modP(x * x * v) !== u) return null;
-  }
-  if (x === 0n && sign === 1) return null;
-  if (Number(x & 1n) !== sign) x = P - x;
-  return [x, y, 1n, modP(x * y)];
-}
-function decodeLE(bytes) {
-  let n = 0n;
-  for (let i = 0; i < bytes.length; i++) n |= BigInt(bytes[i]) << (BigInt(i) * 8n);
-  return n;
-}
-function encodeLE32(num) {
-  const out = new Uint8Array(32);
-  let n = num;
-  for (let i = 0; i < 32; i++) { out[i] = Number(n & 0xffn); n >>= 8n; }
-  return out;
-}
-function expandSecret(seed32) {
-  const h = sha512(seed32);
-  const sBytes = h.slice(0, 32);
-  sBytes[0] &= 248;
-  sBytes[31] &= 127;
-  sBytes[31] |= 64;
-  const s = decodeLE(sBytes);
-  const prefix = h.slice(32, 64);
-  const pub = encodePoint(scalarMult(s, B_PT));
-  return { s, prefix, pub };
-}
-function publicKey(seed32) { return expandSecret(seed32).pub; }
-function sign(seed32, msgBytes) {
-  const { s, prefix, pub } = expandSecret(seed32);
-  const rInput = new Uint8Array(32 + msgBytes.length);
-  rInput.set(prefix, 0); rInput.set(msgBytes, 32);
-  const r = modL(decodeLE(sha512(rInput)));
-  const R = encodePoint(scalarMult(r, B_PT));
-  const kInput = new Uint8Array(64 + msgBytes.length);
-  kInput.set(R, 0); kInput.set(pub, 32); kInput.set(msgBytes, 64);
-  const k = modL(decodeLE(sha512(kInput)));
-  const S = modL(r + k * s);
-  const sig = new Uint8Array(64);
-  sig.set(R, 0); sig.set(encodeLE32(S), 32);
-  return sig;
-}
-function verify(pub32, msgBytes, sig64) {
-  if (!sig64 || sig64.length !== 64 || !pub32 || pub32.length !== 32) return false;
-  const Rbytes = sig64.subarray(0, 32);
-  const Sbytes = sig64.subarray(32, 64);
-  const S = decodeLE(Sbytes);
-  if (S >= L) return false;
-  const A = decodePoint(pub32);
-  const R = decodePoint(Rbytes);
-  if (!A || !R) return false;
-  const kInput = new Uint8Array(64 + msgBytes.length);
-  kInput.set(Rbytes, 0); kInput.set(pub32, 32); kInput.set(msgBytes, 64);
-  const k = modL(decodeLE(sha512(kInput)));
-  const lhs = encodePoint(scalarMult(S, B_PT));
-  const rhs = encodePoint(ptAdd(R, scalarMult(k, A)));
-  for (let i = 0; i < 32; i++) if (lhs[i] !== rhs[i]) return false;
-  return true;
-}
-return { sha512, publicKey, sign, verify };"))))
+   (do
+     (def ^:private K512
+       (into-array
+        [(js/BigInt "0x428a2f98d728ae22") (js/BigInt "0x7137449123ef65cd") (js/BigInt "0xb5c0fbcfec4d3b2f") (js/BigInt "0xe9b5dba58189dbbc")
+         (js/BigInt "0x3956c25bf348b538") (js/BigInt "0x59f111f1b605d019") (js/BigInt "0x923f82a4af194f9b") (js/BigInt "0xab1c5ed5da6d8118")
+         (js/BigInt "0xd807aa98a3030242") (js/BigInt "0x12835b0145706fbe") (js/BigInt "0x243185be4ee4b28c") (js/BigInt "0x550c7dc3d5ffb4e2")
+         (js/BigInt "0x72be5d74f27b896f") (js/BigInt "0x80deb1fe3b1696b1") (js/BigInt "0x9bdc06a725c71235") (js/BigInt "0xc19bf174cf692694")
+         (js/BigInt "0xe49b69c19ef14ad2") (js/BigInt "0xefbe4786384f25e3") (js/BigInt "0x0fc19dc68b8cd5b5") (js/BigInt "0x240ca1cc77ac9c65")
+         (js/BigInt "0x2de92c6f592b0275") (js/BigInt "0x4a7484aa6ea6e483") (js/BigInt "0x5cb0a9dcbd41fbd4") (js/BigInt "0x76f988da831153b5")
+         (js/BigInt "0x983e5152ee66dfab") (js/BigInt "0xa831c66d2db43210") (js/BigInt "0xb00327c898fb213f") (js/BigInt "0xbf597fc7beef0ee4")
+         (js/BigInt "0xc6e00bf33da88fc2") (js/BigInt "0xd5a79147930aa725") (js/BigInt "0x06ca6351e003826f") (js/BigInt "0x142929670a0e6e70")
+         (js/BigInt "0x27b70a8546d22ffc") (js/BigInt "0x2e1b21385c26c926") (js/BigInt "0x4d2c6dfc5ac42aed") (js/BigInt "0x53380d139d95b3df")
+         (js/BigInt "0x650a73548baf63de") (js/BigInt "0x766a0abb3c77b2a8") (js/BigInt "0x81c2c92e47edaee6") (js/BigInt "0x92722c851482353b")
+         (js/BigInt "0xa2bfe8a14cf10364") (js/BigInt "0xa81a664bbc423001") (js/BigInt "0xc24b8b70d0f89791") (js/BigInt "0xc76c51a30654be30")
+         (js/BigInt "0xd192e819d6ef5218") (js/BigInt "0xd69906245565a910") (js/BigInt "0xf40e35855771202a") (js/BigInt "0x106aa07032bbd1b8")
+         (js/BigInt "0x19a4c116b8d2d0c8") (js/BigInt "0x1e376c085141ab53") (js/BigInt "0x2748774cdf8eeb99") (js/BigInt "0x34b0bcb5e19b48a8")
+         (js/BigInt "0x391c0cb3c5c95a63") (js/BigInt "0x4ed8aa4ae3418acb") (js/BigInt "0x5b9cca4f7763e373") (js/BigInt "0x682e6ff3d6b2b8a3")
+         (js/BigInt "0x748f82ee5defb2fc") (js/BigInt "0x78a5636f43172f60") (js/BigInt "0x84c87814a1f0ab72") (js/BigInt "0x8cc702081a6439ec")
+         (js/BigInt "0x90befffa23631e28") (js/BigInt "0xa4506cebde82bde9") (js/BigInt "0xbef9a3f7b2c67915") (js/BigInt "0xc67178f2e372532b")
+         (js/BigInt "0xca273eceea26619c") (js/BigInt "0xd186b8c721c0c207") (js/BigInt "0xeada7dd6cde0eb1e") (js/BigInt "0xf57d4f7fee6ed178")
+         (js/BigInt "0x06f067aa72176fba") (js/BigInt "0x0a637dc5a2c898a6") (js/BigInt "0x113f9804bef90dae") (js/BigInt "0x1b710b35131c471b")
+         (js/BigInt "0x28db77f523047d84") (js/BigInt "0x32caab7b40c72493") (js/BigInt "0x3c9ebe0a15c9bebc") (js/BigInt "0x431d67c49c100d4c")
+         (js/BigInt "0x4cc5d4becb3e42b6") (js/BigInt "0x597f299cfc657e2a") (js/BigInt "0x5fcb6fab3ad6faec") (js/BigInt "0x6c44198c4a475817")]))
+
+     (def ^:private H512
+       (into-array
+        [(js/BigInt "0x6a09e667f3bcc908") (js/BigInt "0xbb67ae8584caa73b") (js/BigInt "0x3c6ef372fe94f82b") (js/BigInt "0xa54ff53a5f1d36f1")
+         (js/BigInt "0x510e527fade682d1") (js/BigInt "0x9b05688c2b3e6c1f") (js/BigInt "0x1f83d9abfb41bd6b") (js/BigInt "0x5be0cd19137e2179")]))
+
+     (def ^:private M64 (js/BigInt "0xffffffffffffffff"))
+
+     (defn- rotr64 [x n]
+       (let [bn (js/BigInt n)
+             b64-n (js/BigInt (- 64 n))]
+         (js* "((((~{} >> ~{}) | ((~{} << ~{}) & ~{})) & ~{}))" x bn x b64-n M64 M64)))
+
+     (defn- ed-sha512 [msg]
+       (let [len (.-length msg)
+             bit-len (js* "(BigInt(~{}) * 8n)" len)
+             pad-len (bit-and (+ len 17 127) (bit-not 127))
+             buf (js/Uint8Array. pad-len)]
+         (.set buf msg 0)
+         (aset buf len 0x80)
+         (let [bl (atom bit-len)]
+           (dotimes [i 8]
+             (aset buf (- pad-len 1 i) (js/Number (js* "(~{} & 0xffn)" @bl)))
+             (reset! bl (js* "(~{} >> 8n)" @bl))))
+         (let [h (into-array (map #(js/BigInt %) H512))
+               W (js/Array. 80)]
+           (loop [off 0]
+             (when (< off pad-len)
+               (dotimes [i 16]
+                 (let [w (atom (js/BigInt 0))]
+                   (dotimes [b 8]
+                     (reset! w (js* "((~{} << 8n) | BigInt(~{}))" @w (aget buf (+ off (* i 8) b)))))
+                   (aset W i @w)))
+               (dotimes [idx (- 80 16)]
+                 (let [i (+ idx 16)
+                       w-i15 (aget W (- i 15))
+                       w-i2 (aget W (- i 2))
+                       s0 (js* "(~{} ^ ~{} ^ (~{} >> 7n))" (rotr64 w-i15 1) (rotr64 w-i15 8) w-i15)
+                       s1 (js* "(~{} ^ ~{} ^ (~{} >> 6n))" (rotr64 w-i2 19) (rotr64 w-i2 61) w-i2)]
+                   (aset W i (js* "((~{} + ~{} + ~{} + ~{}) & ~{})" (aget W (- i 16)) s0 (aget W (- i 7)) s1 M64))))
+               (let [a (atom (aget h 0))
+                     b (atom (aget h 1))
+                     c (atom (aget h 2))
+                     d (atom (aget h 3))
+                     e (atom (aget h 4))
+                     f (atom (aget h 5))
+                     g (atom (aget h 6))
+                     h-val (atom (aget h 7))]
+                 (dotimes [i 80]
+                   (let [cur-e @e
+                         S1 (js* "(~{} ^ ~{} ^ ~{})" (rotr64 cur-e 14) (rotr64 cur-e 18) (rotr64 cur-e 41))
+                         ch (js* "((~{} & ~{}) ^ ((~{} ^ ~{}) & ~{}))" cur-e @f cur-e M64 @g)
+                         temp1 (js* "((~{} + ~{} + ~{} + ~{} + ~{}) & ~{})" @h-val S1 ch (aget K512 i) (aget W i) M64)
+                         cur-a @a
+                         S0 (js* "(~{} ^ ~{} ^ ~{})" (rotr64 cur-a 28) (rotr64 cur-a 34) (rotr64 cur-a 39))
+                         maj (js* "(((~{} & ~{}) ^ (~{} & ~{}) ^ (~{} & ~{})))" cur-a @b cur-a @c @b @c)
+                         temp2 (js* "((~{} + ~{}) & ~{})" S0 maj M64)]
+                     (reset! h-val @g)
+                     (reset! g @f)
+                     (reset! f @e)
+                     (reset! e (js* "((~{} + ~{}) & ~{})" @d temp1 M64))
+                     (reset! d @c)
+                     (reset! c @b)
+                     (reset! b @a)
+                     (reset! a (js* "((~{} + ~{}) & ~{})" temp1 temp2 M64))))
+                 (aset h 0 (js* "((~{} + ~{}) & ~{})" (aget h 0) @a M64))
+                 (aset h 1 (js* "((~{} + ~{}) & ~{})" (aget h 1) @b M64))
+                 (aset h 2 (js* "((~{} + ~{}) & ~{})" (aget h 2) @c M64))
+                 (aset h 3 (js* "((~{} + ~{}) & ~{})" (aget h 3) @d M64))
+                 (aset h 4 (js* "((~{} + ~{}) & ~{})" (aget h 4) @e M64))
+                 (aset h 5 (js* "((~{} + ~{}) & ~{})" (aget h 5) @f M64))
+                 (aset h 6 (js* "((~{} + ~{}) & ~{})" (aget h 6) @g M64))
+                 (aset h 7 (js* "((~{} + ~{}) & ~{})" (aget h 7) @h-val M64)))
+               (recur (+ off 128))))
+           (let [out (js/Uint8Array. 64)]
+             (dotimes [i 8]
+               (let [v (atom (aget h i))]
+                 (loop [b 7]
+                   (when (>= b 0)
+                     (aset out (+ (* i 8) b) (js/Number (js* "(~{} & 0xffn)" @v)))
+                     (reset! v (js* "(~{} >> 8n)" @v))
+                     (recur (dec b))))))
+             out))))
+
+     (def ^:private ed-P (js/BigInt "57896044618658097711785492504343953926634992332820282019728792003956564819949"))
+     (def ^:private ed-L (js/BigInt "7237005577332262213973186563042994240857116359379907606001950938285454250989"))
+     (defn- modP [x] (js* "((((~{} % ~{}) + ~{}) % ~{}))" x ed-P ed-P ed-P))
+     (defn- modL [x] (js* "((((~{} % ~{}) + ~{}) % ~{}))" x ed-L ed-L ed-L))
+     (defn- modPow [base exp]
+       (let [res (atom (js/BigInt 1))
+             b (atom (modP base))
+             e (atom exp)]
+         (while (js* "(~{} > 0n)" @e)
+           (when (js* "((~{} & 1n) !== 0n)" @e)
+             (reset! res (modP (js* "(~{} * ~{})" @res @b))))
+           (reset! b (modP (js* "(~{} * ~{})" @b @b)))
+           (reset! e (js* "(~{} >> 1n)" @e)))
+         @res))
+     (defn- invP [x] (modPow x (js* "(~{} - 2n)" ed-P)))
+     (def ^:private ed-D (modP (js* "(-121665n * ~{})" (invP (js/BigInt 121666)))))
+     (def ^:private ed-I-SQRT (modPow (js/BigInt 2) (js* "((~{} - 1n) / 4n)" ed-P)))
+     (def ^:private ed-BY (modP (js* "(4n * ~{})" (invP (js/BigInt 5)))))
+     (def ^:private ed-BX (js/BigInt "15112221349535400772501151409588531511454012693041857206046113283949847762202"))
+     (def ^:private ed-B-PT #js [ed-BX ed-BY (js/BigInt 1) (modP (js* "(~{} * ~{})" ed-BX ed-BY))])
+
+     (defn- ptAdd [P1 P2]
+       (let [X1 (aget P1 0) Y1 (aget P1 1) Z1 (aget P1 2) T1 (aget P1 3)
+             X2 (aget P2 0) Y2 (aget P2 1) Z2 (aget P2 2) T2 (aget P2 3)
+             A (modP (js* "((~{} - ~{}) * (~{} - ~{}))" Y1 X1 Y2 X2))
+             B (modP (js* "((~{} + ~{}) * (~{} + ~{}))" Y1 X1 Y2 X2))
+             C (modP (js* "(2n * ~{} * ~{} * ~{})" ed-D T1 T2))
+             D2 (modP (js* "(2n * ~{} * ~{})" Z1 Z2))
+             E (modP (js* "(~{} - ~{})" B A))
+             F (modP (js* "(~{} - ~{})" D2 C))
+             G (modP (js* "(~{} + ~{})" D2 C))
+             H (modP (js* "(~{} + ~{})" B A))]
+         #js [(modP (js* "(~{} * ~{})" E F))
+              (modP (js* "(~{} * ~{})" G H))
+              (modP (js* "(~{} * ~{})" F G))
+              (modP (js* "(~{} * ~{})" E H))]))
+
+     (defn- scalarMult [k pt]
+       (let [R (atom #js [(js/BigInt 0) (js/BigInt 1) (js/BigInt 1) (js/BigInt 0)])
+             Q (atom pt)
+             n (atom k)]
+         (while (js* "(~{} > 0n)" @n)
+           (when (js* "((~{} & 1n) !== 0n)" @n)
+             (reset! R (ptAdd @R @Q)))
+           (reset! Q (ptAdd @Q @Q))
+           (reset! n (js* "(~{} >> 1n)" @n)))
+         @R))
+
+     (defn- encodePoint [pt]
+       (let [X (aget pt 0) Y (aget pt 1) Z (aget pt 2)
+             zi (invP Z)
+             x (modP (js* "(~{} * ~{})" X zi))
+             y (modP (js* "(~{} * ~{})" Y zi))
+             out (js/Uint8Array. 32)
+             n (atom y)]
+         (dotimes [i 32]
+           (aset out i (js/Number (js* "(~{} & 0xffn)" @n)))
+           (reset! n (js* "(~{} >> 8n)" @n)))
+         (aset out 31 (bit-or (aget out 31) (bit-shift-left (js/Number (js* "(~{} & 1n)" x)) 7)))
+         out))
+
+     (defn- decodePoint [bytes]
+       (if (or (nil? bytes) (not= (.-length bytes) 32))
+         nil
+         (let [sign (bit-and (unsigned-bit-shift-right (aget bytes 31) 7) 1)
+               y (atom (js/BigInt 0))]
+           (dotimes [i 32]
+             (let [b (if (= i 31) (bit-and (aget bytes i) 0x7f) (aget bytes i))
+                   bi (js/BigInt (* i 8))]
+               (reset! y (js* "(~{} | (BigInt(~{}) << ~{}))" @y b bi))))
+           (if (js* "(~{} >= ~{})" @y ed-P)
+             nil
+             (let [y-val @y
+                   y2 (modP (js* "(~{} * ~{})" y-val y-val))
+                   u (modP (js* "(~{} - 1n)" y2))
+                   v (modP (js* "((~{} * ~{}) + 1n)" ed-D y2))
+                   x-cand1 (modP (js* "(~{} * ~{})" u (invP v)))
+                   x-root (modPow x-cand1 (js* "((~{} + 3n) / 8n)" ed-P))
+                   x-cand2 (if (js* "(~{} !== ~{})" (modP (js* "(~{} * ~{} * ~{})" x-root x-root v)) u)
+                             (let [x-alt (modP (js* "(~{} * ~{})" x-root ed-I-SQRT))]
+                               (if (js* "(~{} !== ~{})" (modP (js* "(~{} * ~{} * ~{})" x-alt x-alt v)) u)
+                                 nil
+                                 x-alt))
+                             x-root)]
+               (when x-cand2
+                 (if (and (js* "(~{} === 0n)" x-cand2) (= sign 1))
+                   nil
+                   (let [x (if (not= (js/Number (js* "(~{} & 1n)" x-cand2)) sign)
+                             (js* "(~{} - ~{})" ed-P x-cand2)
+                             x-cand2)]
+                     #js [x y-val (js/BigInt 1) (modP (js* "(~{} * ~{})" x y-val))]))))))))
+
+     (defn- decodeLE [bytes]
+       (let [n (atom (js/BigInt 0))]
+         (dotimes [i (.-length bytes)]
+           (let [bi (js/BigInt (* i 8))]
+             (reset! n (js* "(~{} | (BigInt(~{}) << ~{}))" @n (aget bytes i) bi))))
+         @n))
+
+     (defn- encodeLE32 [num]
+       (let [out (js/Uint8Array. 32)
+             n (atom num)]
+         (dotimes [i 32]
+           (aset out i (js/Number (js* "(~{} & 0xffn)" @n)))
+           (reset! n (js* "(~{} >> 8n)" @n)))
+         out))
+
+     (defn- expandSecret [seed32]
+       (let [h (ed-sha512 seed32)
+             sBytes (.slice h 0 32)]
+         (aset sBytes 0 (bit-and (aget sBytes 0) 248))
+         (aset sBytes 31 (bit-and (aget sBytes 31) 127))
+         (aset sBytes 31 (bit-or (aget sBytes 31) 64))
+         (let [s (decodeLE sBytes)
+               prefix (.slice h 32 64)
+               pub (encodePoint (scalarMult s ed-B-PT))]
+           #js {:s s :prefix prefix :pub pub})))
+
+     (defn- ed-public-key [seed32]
+       (.-pub (expandSecret seed32)))
+
+     (defn- ed-sign [seed32 msgBytes]
+       (let [expanded (expandSecret seed32)
+             s (.-s expanded)
+             prefix (.-prefix expanded)
+             pub (.-pub expanded)
+             rInput (js/Uint8Array. (+ 32 (.-length msgBytes)))]
+         (.set rInput prefix 0)
+         (.set rInput msgBytes 32)
+         (let [r (modL (decodeLE (ed-sha512 rInput)))
+               R (encodePoint (scalarMult r ed-B-PT))
+               kInput (js/Uint8Array. (+ 64 (.-length msgBytes)))]
+           (.set kInput R 0)
+           (.set kInput pub 32)
+           (.set kInput msgBytes 64)
+           (let [k (modL (decodeLE (ed-sha512 kInput)))
+                 S (modL (js* "(~{} + (~{} * ~{}))" r k s))
+                 sig (js/Uint8Array. 64)]
+             (.set sig R 0)
+             (.set sig (encodeLE32 S) 32)
+             sig))))
+
+     (defn- ed-verify [pub32 msgBytes sig64]
+       (if (or (nil? sig64) (not= (.-length sig64) 64) (nil? pub32) (not= (.-length pub32) 32))
+         false
+         (let [Rbytes (.subarray sig64 0 32)
+               Sbytes (.subarray sig64 32 64)
+               S (decodeLE Sbytes)]
+           (if (js* "(~{} >= ~{})" S ed-L)
+             false
+             (let [A (decodePoint pub32)
+                   R (decodePoint Rbytes)]
+               (if (or (nil? A) (nil? R))
+                 false
+                 (let [kInput (js/Uint8Array. (+ 64 (.-length msgBytes)))]
+                   (.set kInput Rbytes 0)
+                   (.set kInput pub32 32)
+                   (.set kInput msgBytes 64)
+                   (let [k (modL (decodeLE (ed-sha512 kInput)))
+                         lhs (encodePoint (scalarMult S ed-B-PT))
+                         rhs (encodePoint (ptAdd R (scalarMult k A)))]
+                     (loop [i 0]
+                       (if (< i 32)
+                         (if (not= (aget lhs i) (aget rhs i))
+                           false
+                           (recur (inc i)))
+                         true))))))))))
+
+     (def ^:private pure-ed25519-engine
+       #js {:sha512 ed-sha512
+            :publicKey ed-public-key
+            :getPublicKey ed-public-key
+            :sign ed-sign
+            :verify ed-verify})))
 
 #?(:cljs
    (def ^:private ed25519-spki-prefix (fressian/hex->bytes "302a300506032b6570032100")))

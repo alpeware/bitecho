@@ -63,75 +63,84 @@
        (try (js/require "node:crypto") (catch :default _ nil)))))
 
 #?(:cljs
-   (def ^{:doc "Pure ClojureScript Montgomery ladder scalar multiplication over Curve25519 (RFC 7748 §5)."}
-     pure-curve25519
-     (js/Function. "scalarBytes" "uBytes"
-                   "const p = (1n << 255n) - 19n;
-const a24 = 121665n;
-function modP(x) { return ((x % p) + p) % p; }
-function modPow(b, exp) {
-  let res = 1n;
-  let base = modP(b);
-  let e = exp;
-  while (e > 0n) {
-    if (e & 1n) res = modP(res * base);
-    base = modP(base * base);
-    e >>= 1n;
-  }
-  return res;
-}
-function decodeLE(buf) {
-  let res = 0n;
-  for (let i = 0; i < buf.length; i++) {
-    res |= BigInt(buf[i]) << (BigInt(i) * 8n);
-  }
-  return res;
-}
-function encodeLE(num) {
-  const buf = new Uint8Array(32);
-  let n = num;
-  for (let i = 0; i < 32; i++) {
-    buf[i] = Number(n & 0xFFn);
-    n >>= 8n;
-  }
-  return buf;
-}
-const kClamped = new Uint8Array(scalarBytes);
-kClamped[0] &= 248;
-kClamped[31] &= 127;
-kClamped[31] |= 64;
-const k = decodeLE(kClamped);
-const u = modP(decodeLE(uBytes));
-let x1 = u, x2 = 1n, z2 = 0n, x3 = u, z3 = 1n;
-let swap = 0n;
-for (let t = 254; t >= 0; t--) {
-  const kt = (k >> BigInt(t)) & 1n;
-  swap ^= kt;
-  if (swap === 1n) {
-    let tmp = x2; x2 = x3; x3 = tmp;
-    tmp = z2; z2 = z3; z3 = tmp;
-  }
-  swap = kt;
-  const A = modP(x2 + z2);
-  const AA = modP(A * A);
-  const B = modP(x2 - z2);
-  const BB = modP(B * B);
-  const E = modP(AA - BB);
-  const C = modP(x3 + z3);
-  const D = modP(x3 - z3);
-  const DA = modP(D * A);
-  const CB = modP(C * B);
-  x3 = modP((DA + CB) * (DA + CB));
-  z3 = modP(x1 * modP((DA - CB) * (DA - CB)));
-  x2 = modP(AA * BB);
-  z2 = modP(E * (AA + a24 * E));
-}
-if (swap === 1n) {
-  let tmp = x2; x2 = x3; x3 = tmp;
-  tmp = z2; z2 = z3; z3 = tmp;
-}
-const result = modP(x2 * modPow(z2, p - 2n));
-return encodeLE(result);")))
+   (do
+     (def ^:private c25519-p (js/BigInt "57896044618658097711785492504343953926634992332820282019728792003956564819949"))
+     (def ^:private c25519-a24 (js/BigInt 121665))
+     (defn- c25519-modP [x] (js* "((((~{} % ~{}) + ~{}) % ~{}))" x c25519-p c25519-p c25519-p))
+     (defn- c25519-modPow [b exp]
+       (let [res (atom (js/BigInt 1))
+             base (atom (c25519-modP b))
+             e (atom exp)]
+         (while (js* "(~{} > 0n)" @e)
+           (when (js* "((~{} & 1n) !== 0n)" @e)
+             (reset! res (c25519-modP (js* "(~{} * ~{})" @res @base))))
+           (reset! base (c25519-modP (js* "(~{} * ~{})" @base @base)))
+           (reset! e (js* "(~{} >> 1n)" @e)))
+         @res))
+     (defn- c25519-decodeLE [buf]
+       (let [res (atom (js/BigInt 0))]
+         (dotimes [i (.-length buf)]
+           (let [bi (js/BigInt (* i 8))]
+             (reset! res (js* "(~{} | (BigInt(~{}) << ~{}))" @res (aget buf i) bi))))
+         @res))
+     (defn- c25519-encodeLE [num]
+       (let [buf (js/Uint8Array. 32)
+             n (atom num)]
+         (dotimes [i 32]
+           (aset buf i (js/Number (js* "(~{} & 0xffn)" @n)))
+           (reset! n (js* "(~{} >> 8n)" @n)))
+         buf))
+
+     (defn pure-curve25519
+       "Pure ClojureScript Montgomery ladder scalar multiplication over Curve25519 (RFC 7748 §5)."
+       [scalar-bytes u-bytes]
+       (let [k-clamped (js/Uint8Array. scalar-bytes)]
+         (aset k-clamped 0 (bit-and (aget k-clamped 0) 248))
+         (aset k-clamped 31 (bit-and (aget k-clamped 31) 127))
+         (aset k-clamped 31 (bit-or (aget k-clamped 31) 64))
+         (let [k (c25519-decodeLE k-clamped)
+               u (c25519-modP (c25519-decodeLE u-bytes))
+               x1 u
+               x2 (atom (js/BigInt 1))
+               z2 (atom (js/BigInt 0))
+               x3 (atom u)
+               z3 (atom (js/BigInt 1))
+               swap (atom (js/BigInt 0))]
+           (loop [t 254]
+             (when (>= t 0)
+               (let [bt (js/BigInt t)
+                     kt (js* "((~{} >> ~{}) & 1n)" k bt)]
+                 (reset! swap (js* "(~{} ^ ~{})" @swap kt))
+                 (when (js* "(~{} === 1n)" @swap)
+                   (let [tmp-x @x2] (reset! x2 @x3) (reset! x3 tmp-x))
+                   (let [tmp-z @z2] (reset! z2 @z3) (reset! z3 tmp-z)))
+                 (reset! swap kt)
+                 (let [A (c25519-modP (js* "(~{} + ~{})" @x2 @z2))
+                       AA (c25519-modP (js* "(~{} * ~{})" A A))
+                       B (c25519-modP (js* "(~{} - ~{})" @x2 @z2))
+                       BB (c25519-modP (js* "(~{} * ~{})" B B))
+                       E (c25519-modP (js* "(~{} - ~{})" AA BB))
+                       C (c25519-modP (js* "(~{} + ~{})" @x3 @z3))
+                       D (c25519-modP (js* "(~{} - ~{})" @x3 @z3))
+                       DA (c25519-modP (js* "(~{} * ~{})" D A))
+                       CB (c25519-modP (js* "(~{} * ~{})" C B))]
+                   (reset! x3 (c25519-modP (js* "((~{} + ~{}) * (~{} + ~{}))" DA CB DA CB)))
+                   (reset! z3 (c25519-modP (js* "(~{} * (~{} - ~{}) * (~{} - ~{}))" x1 DA CB DA CB)))
+                   (reset! x2 (c25519-modP (js* "(~{} * ~{})" AA BB)))
+                   (reset! z2 (c25519-modP (js* "(~{} * (~{} + (~{} * ~{})))" E AA c25519-a24 E))))
+                 (recur (dec t)))))
+           (when (js* "(~{} === 1n)" @swap)
+             (let [tmp-x @x2] (reset! x2 @x3) (reset! x3 tmp-x))
+             (let [tmp-z @z2] (reset! z2 @z3) (reset! z3 tmp-z)))
+           (let [result (c25519-modP (js* "(~{} * ~{})" @x2 (c25519-modPow @z2 (js* "(~{} - 2n)" c25519-p))))]
+             (c25519-encodeLE result)))))
+
+     (set! (.-scalarMult pure-curve25519) (fn [s u] (pure-curve25519 s u)))
+     (set! (.-scalarMultBase pure-curve25519)
+           (fn [s]
+             (let [u9 (js/Uint8Array. 32)]
+               (aset u9 0 9)
+               (pure-curve25519 s u9))))))
 
 #?(:cljs
    (def ^:private spki-header (fressian/hex->bytes "302a300506032b656e032100")))
@@ -224,109 +233,141 @@ return encodeLE(result);")))
        (pure-hkdf-expand prk info length))))
 
 #?(:cljs
-   (def ^{:doc "Pure ClojureScript ChaCha20-Poly1305 AEAD (RFC 8439)."}
-     pure-chacha20-poly1305
-     (js/Function. "key" "nonce" "input" "aad" "isEncrypt"
-                   "function rotl(a, b) { return ((a << b) | (a >>> (32 - b))) >>> 0; }
-function qround(x, a, b, c, d) {
-  x[a] = (x[a] + x[b]) >>> 0; x[d] = rotl(x[d] ^ x[a], 16);
-  x[c] = (x[c] + x[d]) >>> 0; x[b] = rotl(x[b] ^ x[c], 12);
-  x[a] = (x[a] + x[b]) >>> 0; x[d] = rotl(x[d] ^ x[a], 8);
-  x[c] = (x[c] + x[d]) >>> 0; x[b] = rotl(x[b] ^ x[c], 7);
-}
-function chacha20Block(k, counter, n) {
-  const state = new Uint32Array(16);
-  state[0] = 0x61707865; state[1] = 0x3320646e; state[2] = 0x79622d32; state[3] = 0x6b206574;
-  for (let i = 0; i < 8; i++) {
-    state[4 + i] = (k[4*i] | (k[4*i+1] << 8) | (k[4*i+2] << 16) | (k[4*i+3] << 24)) >>> 0;
-  }
-  state[12] = counter >>> 0;
-  for (let i = 0; i < 3; i++) {
-    state[13 + i] = (n[4*i] | (n[4*i+1] << 8) | (n[4*i+2] << 16) | (n[4*i+3] << 24)) >>> 0;
-  }
-  const working = new Uint32Array(state);
-  for (let i = 0; i < 10; i++) {
-    qround(working, 0, 4, 8, 12);
-    qround(working, 1, 5, 9, 13);
-    qround(working, 2, 6, 10, 14);
-    qround(working, 3, 7, 11, 15);
-    qround(working, 0, 5, 10, 15);
-    qround(working, 1, 6, 11, 12);
-    qround(working, 2, 7, 8, 13);
-    qround(working, 3, 4, 9, 14);
-  }
-  const out = new Uint8Array(64);
-  for (let i = 0; i < 16; i++) {
-    const val = (working[i] + state[i]) >>> 0;
-    out[4*i] = val & 0xff;
-    out[4*i+1] = (val >>> 8) & 0xff;
-    out[4*i+2] = (val >>> 16) & 0xff;
-    out[4*i+3] = (val >>> 24) & 0xff;
-  }
-  return out;
-}
-function poly1305(k, msg) {
-  let r = 0n;
-  for (let i = 0; i < 16; i++) r |= BigInt(k[i]) << (BigInt(i) * 8n);
-  r &= 0x0ffffffc0ffffffc0ffffffc0fffffffn;
-  let s = 0n;
-  for (let i = 0; i < 16; i++) s |= BigInt(k[16 + i]) << (BigInt(i) * 8n);
-  const p = (1n << 130n) - 5n;
-  let a = 0n;
-  const len = msg.length;
-  for (let i = 0; i < len; i += 16) {
-    const chunk = msg.subarray(i, Math.min(i + 16, len));
-    let num = 0n;
-    for (let j = 0; j < chunk.length; j++) num |= BigInt(chunk[j]) << (BigInt(j) * 8n);
-    num |= 1n << (BigInt(chunk.length) * 8n);
-    a = ((a + num) * r) % p;
-  }
-  a = (a + s) % (1n << 128n);
-  const tag = new Uint8Array(16);
-  let n = a;
-  for (let i = 0; i < 16; i++) {
-    tag[i] = Number(n & 0xffn);
-    n >>= 8n;
-  }
-  return tag;
-}
-const block0 = chacha20Block(key, 0, nonce);
-const polyKey = block0.subarray(0, 32);
-const inLen = input ? input.length : 0;
-const ptLen = isEncrypt ? inLen : (inLen - 16);
-if (ptLen < 0) return null;
-const out = new Uint8Array(ptLen);
-let counter = 1;
-for (let i = 0; i < ptLen; i += 64) {
-  const ks = chacha20Block(key, counter++, nonce);
-  const chunkLen = Math.min(64, ptLen - i);
-  for (let j = 0; j < chunkLen; j++) out[i + j] = input[i + j] ^ ks[j];
-}
-const ct = isEncrypt ? out : input.subarray(0, ptLen);
-const aadBuf = aad || new Uint8Array(0);
-const aadPadLen = (16 - (aadBuf.length % 16)) % 16;
-const ctPadLen = (16 - (ct.length % 16)) % 16;
-const polyInput = new Uint8Array(aadBuf.length + aadPadLen + ct.length + ctPadLen + 16);
-let off = 0;
-polyInput.set(aadBuf, off); off += aadBuf.length + aadPadLen;
-polyInput.set(ct, off); off += ct.length + ctPadLen;
-let aadLenBig = BigInt(aadBuf.length);
-for (let i = 0; i < 8; i++) { polyInput[off + i] = Number(aadLenBig & 0xffn); aadLenBig >>= 8n; }
-let ctLenBig = BigInt(ct.length);
-for (let i = 0; i < 8; i++) { polyInput[off + 8 + i] = Number(ctLenBig & 0xffn); ctLenBig >>= 8n; }
-const tag = poly1305(polyKey, polyInput);
-if (isEncrypt) {
-  const res = new Uint8Array(ptLen + 16);
-  res.set(out, 0);
-  res.set(tag, ptLen);
-  return res;
-} else {
-  const expectedTag = input.subarray(ptLen);
-  let diff = 0;
-  for (let i = 0; i < 16; i++) diff |= (tag[i] ^ expectedTag[i]);
-  if (diff !== 0) return null;
-  return out;
-}")))
+   (do
+     (defn- chacha20-block [k counter n]
+       (let [state (js/Uint32Array. 16)]
+         (aset state 0 0x61707865)
+         (aset state 1 0x3320646e)
+         (aset state 2 0x79622d32)
+         (aset state 3 0x6b206574)
+         (dotimes [i 8]
+           (let [i4 (* 4 i)]
+             (aset state (+ 4 i)
+                   (js* "((~{}[~{}] | (~{}[~{} + 1] << 8) | (~{}[~{} + 2] << 16) | (~{}[~{} + 3] << 24)) >>> 0)"
+                        k i4 k i4 k i4 k i4))))
+         (aset state 12 (unsigned-bit-shift-right counter 0))
+         (dotimes [i 3]
+           (let [i4 (* 4 i)]
+             (aset state (+ 13 i)
+                   (js* "((~{}[~{}] | (~{}[~{} + 1] << 8) | (~{}[~{} + 2] << 16) | (~{}[~{} + 3] << 24)) >>> 0)"
+                        n i4 n i4 n i4 n i4))))
+         (let [working (js/Uint32Array. state)
+               qround (fn [a b c d]
+                        (let [rotl (fn [v shift] (js* "(((~{} << ~{}) | (~{} >>> (32 - ~{}))) >>> 0)" v shift v shift))]
+                          (aset working a (js* "((~{}[~{}] + ~{}[~{}]) >>> 0)" working a working b))
+                          (aset working d (rotl (bit-xor (aget working d) (aget working a)) 16))
+                          (aset working c (js* "((~{}[~{}] + ~{}[~{}]) >>> 0)" working c working d))
+                          (aset working b (rotl (bit-xor (aget working b) (aget working c)) 12))
+                          (aset working a (js* "((~{}[~{}] + ~{}[~{}]) >>> 0)" working a working b))
+                          (aset working d (rotl (bit-xor (aget working d) (aget working a)) 8))
+                          (aset working c (js* "((~{}[~{}] + ~{}[~{}]) >>> 0)" working c working d))
+                          (aset working b (rotl (bit-xor (aget working b) (aget working c)) 7))))]
+           (dotimes [_ 10]
+             (qround 0 4 8 12)
+             (qround 1 5 9 13)
+             (qround 2 6 10 14)
+             (qround 3 7 11 15)
+             (qround 0 5 10 15)
+             (qround 1 6 11 12)
+             (qround 2 7 8 13)
+             (qround 3 4 9 14))
+           (let [out (js/Uint8Array. 64)]
+             (dotimes [i 16]
+               (let [val (js* "((~{}[~{}] + ~{}[~{}]) >>> 0)" working i state i)
+                     i4 (* 4 i)]
+                 (aset out i4 (bit-and val 0xff))
+                 (aset out (+ i4 1) (bit-and (unsigned-bit-shift-right val 8) 0xff))
+                 (aset out (+ i4 2) (bit-and (unsigned-bit-shift-right val 16) 0xff))
+                 (aset out (+ i4 3) (bit-and (unsigned-bit-shift-right val 24) 0xff))))
+             out))))
+
+     (defn- poly1305-mac [k msg]
+       (let [r-val (atom (js/BigInt 0))]
+         (dotimes [i 16]
+           (let [bi (js/BigInt (* i 8))]
+             (reset! r-val (js* "(~{} | (BigInt(~{}[~{}]) << ~{}))" @r-val k i bi))))
+         (reset! r-val (js* "(~{} & 0x0ffffffc0ffffffc0ffffffc0fffffffn)" @r-val))
+         (let [s-val (atom (js/BigInt 0))]
+           (dotimes [i 16]
+             (let [bi (js/BigInt (* i 8))]
+               (reset! s-val (js* "(~{} | (BigInt(~{}[16 + ~{}]) << ~{}))" @s-val k i bi))))
+           (let [p (js* "((1n << 130n) - 5n)")
+                 a (atom (js/BigInt 0))
+                 len (.-length msg)]
+             (loop [i 0]
+               (when (< i len)
+                 (let [chunk-len (js/Math.min 16 (- len i))
+                       chunk (.subarray msg i (+ i chunk-len))
+                       num (atom (js/BigInt 0))]
+                   (dotimes [j chunk-len]
+                     (let [bj (js/BigInt (* j 8))]
+                       (reset! num (js* "(~{} | (BigInt(~{}[~{}]) << ~{}))" @num chunk j bj))))
+                   (let [bcl (js/BigInt (* chunk-len 8))]
+                     (reset! num (js* "(~{} | (1n << ~{}))" @num bcl)))
+                   (reset! a (js* "(((~{} + ~{}) * ~{}) % ~{})" @a @num @r-val p))
+                   (recur (+ i 16)))))
+             (reset! a (js* "((~{} + ~{}) % (1n << 128n))" @a @s-val))
+             (let [tag (js/Uint8Array. 16)
+                   n (atom @a)]
+               (dotimes [i 16]
+                 (aset tag i (js/Number (js* "(~{} & 0xffn)" @n)))
+                 (reset! n (js* "(~{} >> 8n)" @n)))
+               tag)))))
+
+     (defn pure-chacha20-poly1305
+       "Pure ClojureScript ChaCha20-Poly1305 AEAD (RFC 8439)."
+       [key nonce input aad is-encrypt?]
+       (let [block0 (chacha20-block key 0 nonce)
+             poly-key (.subarray block0 0 32)
+             in-len (if input (.-length input) 0)
+             pt-len (if is-encrypt? in-len (- in-len 16))]
+         (if (< pt-len 0)
+           nil
+           (let [out (js/Uint8Array. pt-len)
+                 counter (atom 1)]
+             (loop [i 0]
+               (when (< i pt-len)
+                 (let [ks (chacha20-block key @counter nonce)
+                       chunk-len (js/Math.min 64 (- pt-len i))]
+                   (swap! counter inc)
+                   (dotimes [j chunk-len]
+                     (aset out (+ i j) (bit-xor (aget input (+ i j)) (aget ks j))))
+                   (recur (+ i 64)))))
+             (let [ct (if is-encrypt? out (.subarray input 0 pt-len))
+                   aad-buf (or aad (js/Uint8Array. 0))
+                   aad-len (.-length aad-buf)
+                   ct-len (.-length ct)
+                   aad-pad-len (mod (- 16 (mod aad-len 16)) 16)
+                   ct-pad-len (mod (- 16 (mod ct-len 16)) 16)
+                   poly-input (js/Uint8Array. (+ aad-len aad-pad-len ct-len ct-pad-len 16))]
+               (.set poly-input aad-buf 0)
+               (let [off1 (+ aad-len aad-pad-len)]
+                 (.set poly-input ct off1)
+                 (let [off2 (+ off1 ct-len ct-pad-len)
+                       aad-len-big (atom (js/BigInt aad-len))]
+                   (dotimes [i 8]
+                     (aset poly-input (+ off2 i) (js/Number (js* "(~{} & 0xffn)" @aad-len-big)))
+                     (reset! aad-len-big (js* "(~{} >> 8n)" @aad-len-big)))
+                   (let [ct-len-big (atom (js/BigInt ct-len))]
+                     (dotimes [i 8]
+                       (aset poly-input (+ off2 8 i) (js/Number (js* "(~{} & 0xffn)" @ct-len-big)))
+                       (reset! ct-len-big (js* "(~{} >> 8n)" @ct-len-big)))
+                     (let [tag (poly1305-mac poly-key poly-input)]
+                       (if is-encrypt?
+                         (let [res (js/Uint8Array. (+ pt-len 16))]
+                           (.set res out 0)
+                           (.set res tag pt-len)
+                           res)
+                         (let [expected-tag (.subarray input pt-len)
+                               diff (atom 0)]
+                           (dotimes [i 16]
+                             (reset! diff (bit-or @diff (bit-xor (aget tag i) (aget expected-tag i)))))
+                           (if (zero? @diff)
+                             out
+                             nil))))))))))))
+
+     (set! (.-encrypt pure-chacha20-poly1305) (fn [k n in aad] (pure-chacha20-poly1305 k n in aad true)))
+     (set! (.-decrypt pure-chacha20-poly1305) (fn [k n in aad] (pure-chacha20-poly1305 k n in aad false)))))
 
 #?(:cljs
    (defn pure-chacha-poly-seal
@@ -341,161 +382,210 @@ if (isEncrypt) {
      (pure-chacha20-poly1305 key nonce ciphertext (or aad (js/Uint8Array. 0)) false)))
 
 #?(:cljs
-   (def ^{:doc "Pure ClojureScript AES-256-GCM AEAD (NIST SP 800-38D)."}
-     pure-aes-gcm
-     (js/Function. "key" "nonce" "input" "aad" "isEncrypt"
-                   "const sbox = new Uint8Array(256);
-{
-  let p = 1, q = 1;
-  do {
-    p = p ^ (p << 1) ^ (p & 0x80 ? 0x11b : 0);
-    q ^= q << 1; q ^= q << 2; q ^= q << 4; q ^= q & 0x80 ? 0x09 : 0;
-    q &= 0xff;
-    const xformed = q ^ (q << 1 | q >> 7) ^ (q << 2 | q >> 6) ^ (q << 3 | q >> 5) ^ (q << 4 | q >> 4) ^ 0x63;
-    sbox[p] = xformed & 0xff;
-  } while (p !== 1);
-  sbox[0] = 0x63;
-}
-const Rcon = [0, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
-function expandKey(k) {
-  const w = new Uint32Array(60);
-  for (let i = 0; i < 8; i++) w[i] = (k[4*i] << 24) | (k[4*i+1] << 16) | (k[4*i+2] << 8) | k[4*i+3];
-  for (let i = 8; i < 60; i++) {
-    let temp = w[i - 1];
-    if (i % 8 === 0) {
-      temp = (sbox[(temp >>> 16) & 0xff] << 24) |
-             (sbox[(temp >>> 8) & 0xff] << 16) |
-             (sbox[temp & 0xff] << 8) |
-             sbox[(temp >>> 24) & 0xff];
-      temp ^= Rcon[i / 8] << 24;
-    } else if (i % 8 === 4) {
-      temp = (sbox[(temp >>> 24) & 0xff] << 24) |
-             (sbox[(temp >>> 16) & 0xff] << 16) |
-             (sbox[(temp >>> 8) & 0xff] << 8) |
-             sbox[temp & 0xff];
-    }
-    w[i] = (w[i - 8] ^ temp) >>> 0;
-  }
-  return w;
-}
-function subBytes(s) { for (let i = 0; i < 16; i++) s[i] = sbox[s[i]]; }
-function shiftRows(s) {
-  let t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
-  t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
-  t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
-}
-const xtime = (x) => ((x << 1) ^ (((x >> 7) & 1) * 0x11b)) & 0xff;
-function mixColumns(s) {
-  for (let i = 0; i < 4; i++) {
-    const i4 = i * 4;
-    const a = s[i4], b = s[i4+1], c = s[i4+2], d = s[i4+3];
-    const t = a ^ b ^ c ^ d;
-    s[i4]   ^= t ^ xtime(a ^ b);
-    s[i4+1] ^= t ^ xtime(b ^ c);
-    s[i4+2] ^= t ^ xtime(c ^ d);
-    s[i4+3] ^= t ^ xtime(d ^ a);
-  }
-}
-function addRoundKey(s, w, round) {
-  for (let i = 0; i < 4; i++) {
-    const word = w[round * 4 + i];
-    s[i * 4]     ^= (word >>> 24) & 0xff;
-    s[i * 4 + 1] ^= (word >>> 16) & 0xff;
-    s[i * 4 + 2] ^= (word >>> 8)  & 0xff;
-    s[i * 4 + 3] ^= word & 0xff;
-  }
-}
-function cipherBlock(inp, w) {
-  const s = new Uint8Array(inp);
-  addRoundKey(s, w, 0);
-  for (let round = 1; round < 14; round++) {
-    subBytes(s); shiftRows(s); mixColumns(s); addRoundKey(s, w, round);
-  }
-  subBytes(s); shiftRows(s); addRoundKey(s, w, 14);
-  return s;
-}
-function ghashMul(X, Y) {
-  let z0 = 0n, z1 = 0n;
-  let v0 = (BigInt(Y[0]) << 56n) | (BigInt(Y[1]) << 48n) | (BigInt(Y[2]) << 40n) | (BigInt(Y[3]) << 32n) |
-           (BigInt(Y[4]) << 24n) | (BigInt(Y[5]) << 16n) | (BigInt(Y[6]) << 8n)  | BigInt(Y[7]);
-  let v1 = (BigInt(Y[8]) << 56n) | (BigInt(Y[9]) << 48n) | (BigInt(Y[10]) << 40n) | (BigInt(Y[11]) << 32n) |
-           (BigInt(Y[12]) << 24n) | (BigInt(Y[13]) << 16n) | (BigInt(Y[14]) << 8n) | BigInt(Y[15]);
-  const R = 0xe100000000000000n;
-  for (let i = 0; i < 16; i++) {
-    const byte = X[i];
-    for (let j = 7; j >= 0; j--) {
-      if ((byte >> j) & 1) { z0 ^= v0; z1 ^= v1; }
-      const lsb = v1 & 1n;
-      v1 = (v1 >> 1n) | ((v0 & 1n) << 63n);
-      v0 = v0 >> 1n;
-      if (lsb) v0 ^= R;
-    }
-  }
-  const out = new Uint8Array(16);
-  for (let i = 7; i >= 0; i--) {
-    out[i] = Number(z0 & 0xffn); z0 >>= 8n;
-    out[8 + i] = Number(z1 & 0xffn); z1 >>= 8n;
-  }
-  return out;
-}
-const w = expandKey(key);
-const H = cipherBlock(new Uint8Array(16), w);
-const J0 = new Uint8Array(16);
-J0.set(nonce, 0); J0[15] = 1;
-const inLen = input ? input.length : 0;
-const ptLen = isEncrypt ? inLen : (inLen - 16);
-if (ptLen < 0) return null;
-const out = new Uint8Array(ptLen);
-const cb = new Uint8Array(J0);
-function inc32(blk) {
-  let val = (blk[12] << 24) | (blk[13] << 16) | (blk[14] << 8) | blk[15];
-  val = (val + 1) >>> 0;
-  blk[12] = (val >>> 24) & 0xff; blk[13] = (val >>> 16) & 0xff;
-  blk[14] = (val >>> 8) & 0xff; blk[15] = val & 0xff;
-}
-for (let i = 0; i < ptLen; i += 16) {
-  inc32(cb);
-  const ks = cipherBlock(cb, w);
-  const chunkLen = Math.min(16, ptLen - i);
-  for (let j = 0; j < chunkLen; j++) out[i + j] = input[i + j] ^ ks[j];
-}
-const ct = isEncrypt ? out : input.subarray(0, ptLen);
-let S = new Uint8Array(16);
-function updateGhash(data) {
-  const len = data.length;
-  for (let i = 0; i < len; i += 16) {
-    const block = new Uint8Array(16);
-    const chunkLen = Math.min(16, len - i);
-    block.set(data.subarray(i, i + chunkLen), 0);
-    for (let j = 0; j < 16; j++) S[j] ^= block[j];
-    S = ghashMul(S, H);
-  }
-}
-if (aad && aad.length > 0) updateGhash(aad);
-if (ct.length > 0) updateGhash(ct);
-const lenBlock = new Uint8Array(16);
-let aadBits = BigInt(aad ? aad.length * 8 : 0);
-let ctBits = BigInt(ct.length * 8);
-for (let i = 7; i >= 0; i--) {
-  lenBlock[i] = Number(aadBits & 0xffn); aadBits >>= 8n;
-  lenBlock[8 + i] = Number(ctBits & 0xffn); ctBits >>= 8n;
-}
-for (let j = 0; j < 16; j++) S[j] ^= lenBlock[j];
-S = ghashMul(S, H);
-const tagMask = cipherBlock(J0, w);
-const tag = new Uint8Array(16);
-for (let i = 0; i < 16; i++) tag[i] = S[i] ^ tagMask[i];
-if (isEncrypt) {
-  const res = new Uint8Array(ptLen + 16);
-  res.set(out, 0); res.set(tag, ptLen);
-  return res;
-} else {
-  const expectedTag = input.subarray(ptLen);
-  let diff = 0;
-  for (let i = 0; i < 16; i++) diff |= (tag[i] ^ expectedTag[i]);
-  if (diff !== 0) return null;
-  return out;
-}")))
+   (do
+     (def ^:private aes-sbox
+       (js/Uint8Array.
+        #js [0x63 0x7c 0x77 0x7b 0xf2 0x6b 0x6f 0xc5 0x30 0x01 0x67 0x2b 0xfe 0xd7 0xab 0x76
+             0xca 0x82 0xc9 0x7d 0xfa 0x59 0x47 0xf0 0xad 0xd4 0xa2 0xaf 0x9c 0xa4 0x72 0xc0
+             0xb7 0xfd 0x93 0x26 0x36 0x3f 0xf7 0xcc 0x34 0xa5 0xe5 0xf1 0x71 0xd8 0x31 0x15
+             0x04 0xc7 0x23 0xc3 0x18 0x96 0x05 0x9a 0x07 0x12 0x80 0xe2 0xeb 0x27 0xb2 0x75
+             0x09 0x83 0x2c 0x1a 0x1b 0x6e 0x5a 0xa0 0x52 0x3b 0xd6 0xb3 0x29 0xe3 0x2f 0x84
+             0x53 0xd1 0x00 0xed 0x20 0xfc 0xb1 0x5b 0x6a 0xcb 0xbe 0x39 0x4a 0x4c 0x58 0xcf
+             0xd0 0xef 0xaa 0xfb 0x43 0x4d 0x33 0x85 0x45 0xf9 0x02 0x7f 0x50 0x3c 0x9f 0xa8
+             0x51 0xa3 0x40 0x8f 0x92 0x9d 0x38 0xf5 0xbc 0xb6 0xda 0x21 0x10 0xff 0xf3 0xd2
+             0xcd 0x0c 0x13 0xec 0x5f 0x97 0x44 0x17 0xc4 0xa7 0x7e 0x3d 0x64 0x5d 0x19 0x73
+             0x60 0x81 0x4f 0xdc 0x22 0x2a 0x90 0x88 0x46 0xee 0xb8 0x14 0xde 0x5e 0x0b 0xdb
+             0xe0 0x32 0x3a 0x0a 0x49 0x06 0x24 0x5c 0xc2 0xd3 0xac 0x62 0x91 0x95 0xe4 0x79
+             0xe7 0xc8 0x37 0x6d 0x8d 0xd5 0x4e 0xa9 0x6c 0x56 0xf4 0xea 0x65 0x7a 0xae 0x08
+             0xba 0x78 0x25 0x2e 0x1c 0xa6 0xb4 0xc6 0xe8 0xdd 0x74 0x1f 0x4b 0xbd 0x8b 0x8a
+             0x70 0x3e 0xb5 0x66 0x48 0x03 0xf6 0x0e 0x61 0x35 0x57 0xb9 0x86 0xc1 0x1d 0x9e
+             0xe1 0xf8 0x98 0x11 0x69 0xd9 0x8e 0x94 0x9b 0x1e 0x87 0xe9 0xce 0x55 0x28 0xdf
+             0x8c 0xa1 0x89 0x0d 0xbf 0xe6 0x42 0x68 0x41 0x99 0x2d 0x0f 0xb0 0x54 0xbb 0x16]))
+
+     (def ^:private aes-rcon
+       (into-array [0 0x01 0x02 0x04 0x08 0x10 0x20 0x40 0x80 0x1b 0x36]))
+
+     (defn- aes-expand-key [k]
+       (let [w (js/Uint32Array. 60)]
+         (dotimes [i 8]
+           (let [i4 (* 4 i)]
+             (aset w i (js* "(((~{}[~{}] << 24) | (~{}[~{} + 1] << 16) | (~{}[~{} + 2] << 8) | ~{}[~{} + 3]) >>> 0)"
+                            k i4 k i4 k i4 k i4))))
+         (dotimes [idx (- 60 8)]
+           (let [i (+ idx 8)
+                 temp (atom (aget w (dec i)))]
+             (cond
+               (zero? (mod i 8))
+               (let [t @temp
+                     sub (js* "(((~{}[(~{} >>> 16) & 0xff] << 24) | (~{}[(~{} >>> 8) & 0xff] << 16) | (~{}[~{} & 0xff] << 8) | ~{}[(~{} >>> 24) & 0xff]) >>> 0)"
+                              aes-sbox t aes-sbox t aes-sbox t aes-sbox t)
+                     rcon-val (bit-shift-left (aget aes-rcon (quot i 8)) 24)]
+                 (reset! temp (bit-xor sub rcon-val)))
+
+               (= (mod i 8) 4)
+               (let [t @temp
+                     sub (js* "(((~{}[(~{} >>> 24) & 0xff] << 24) | (~{}[(~{} >>> 16) & 0xff] << 16) | (~{}[(~{} >>> 8) & 0xff] << 8) | ~{}[~{} & 0xff]) >>> 0)"
+                              aes-sbox t aes-sbox t aes-sbox t aes-sbox t)]
+                 (reset! temp sub)))
+             (aset w i (unsigned-bit-shift-right (bit-xor (aget w (- i 8)) @temp) 0))))
+         w))
+
+     (defn- aes-sub-bytes [s]
+       (dotimes [i 16]
+         (aset s i (aget aes-sbox (aget s i)))))
+
+     (defn- aes-shift-rows [s]
+       (let [t1 (aget s 1)] (aset s 1 (aget s 5)) (aset s 5 (aget s 9)) (aset s 9 (aget s 13)) (aset s 13 t1))
+       (let [t2 (aget s 2)] (aset s 2 (aget s 10)) (aset s 10 t2))
+       (let [t6 (aget s 6)] (aset s 6 (aget s 14)) (aset s 14 t6))
+       (let [t15 (aget s 15)] (aset s 15 (aget s 11)) (aset s 11 (aget s 7)) (aset s 7 (aget s 3)) (aset s 3 t15)))
+
+     (defn- aes-xtime [x]
+       (bit-and (bit-xor (bit-shift-left x 1)
+                         (* (bit-and (unsigned-bit-shift-right x 7) 1) 0x11b))
+                0xff))
+
+     (defn- aes-mix-columns [s]
+       (dotimes [i 4]
+         (let [i4 (* i 4)
+               a (aget s i4) b (aget s (+ i4 1)) c (aget s (+ i4 2)) d (aget s (+ i4 3))
+               t (bit-xor a b c d)]
+           (aset s i4 (bit-xor (aget s i4) t (aes-xtime (bit-xor a b))))
+           (aset s (+ i4 1) (bit-xor (aget s (+ i4 1)) t (aes-xtime (bit-xor b c))))
+           (aset s (+ i4 2) (bit-xor (aget s (+ i4 2)) t (aes-xtime (bit-xor c d))))
+           (aset s (+ i4 3) (bit-xor (aget s (+ i4 3)) t (aes-xtime (bit-xor d a)))))))
+
+     (defn- aes-add-round-key [s w round]
+       (dotimes [i 4]
+         (let [word (aget w (+ (* round 4) i))
+               i4 (* i 4)]
+           (aset s i4 (bit-xor (aget s i4) (bit-and (unsigned-bit-shift-right word 24) 0xff)))
+           (aset s (+ i4 1) (bit-xor (aget s (+ i4 1)) (bit-and (unsigned-bit-shift-right word 16) 0xff)))
+           (aset s (+ i4 2) (bit-xor (aget s (+ i4 2)) (bit-and (unsigned-bit-shift-right word 8) 0xff)))
+           (aset s (+ i4 3) (bit-xor (aget s (+ i4 3)) (bit-and word 0xff))))))
+
+     (defn- aes-cipher-block [inp w]
+       (let [s (js/Uint8Array. inp)]
+         (aes-add-round-key s w 0)
+         (loop [round 1]
+           (when (< round 14)
+             (aes-sub-bytes s)
+             (aes-shift-rows s)
+             (aes-mix-columns s)
+             (aes-add-round-key s w round)
+             (recur (inc round))))
+         (aes-sub-bytes s)
+         (aes-shift-rows s)
+         (aes-add-round-key s w 14)
+         s))
+
+     (defn- aes-ghash-mul [X Y]
+       (let [v0 (atom (js* "((BigInt(~{}[0]) << 56n) | (BigInt(~{}[1]) << 48n) | (BigInt(~{}[2]) << 40n) | (BigInt(~{}[3]) << 32n) | (BigInt(~{}[4]) << 24n) | (BigInt(~{}[5]) << 16n) | (BigInt(~{}[6]) << 8n) | BigInt(~{}[7]))" Y Y Y Y Y Y Y Y))
+             v1 (atom (js* "((BigInt(~{}[8]) << 56n) | (BigInt(~{}[9]) << 48n) | (BigInt(~{}[10]) << 40n) | (BigInt(~{}[11]) << 32n) | (BigInt(~{}[12]) << 24n) | (BigInt(~{}[13]) << 16n) | (BigInt(~{}[14]) << 8n) | BigInt(~{}[15]))" Y Y Y Y Y Y Y Y))
+             z0 (atom (js/BigInt 0))
+             z1 (atom (js/BigInt 0))
+             R (js/BigInt "0xe100000000000000")]
+         (dotimes [i 16]
+           (let [b (aget X i)]
+             (loop [j 7]
+               (when (>= j 0)
+                 (when (not= (bit-and (unsigned-bit-shift-right b j) 1) 0)
+                   (reset! z0 (js* "(~{} ^ ~{})" @z0 @v0))
+                   (reset! z1 (js* "(~{} ^ ~{})" @z1 @v1)))
+                 (let [lsb (js* "(~{} & 1n)" @v1)]
+                   (reset! v1 (js* "((~{} >> 1n) | ((~{} & 1n) << 63n))" @v1 @v0))
+                   (reset! v0 (js* "(~{} >> 1n)" @v0))
+                   (when (js* "(~{} !== 0n)" lsb)
+                     (reset! v0 (js* "(~{} ^ ~{})" @v0 R))))
+                 (recur (dec j))))))
+         (let [out (js/Uint8Array. 16)]
+           (loop [i 7]
+             (when (>= i 0)
+               (aset out i (js/Number (js* "(~{} & 0xffn)" @z0)))
+               (reset! z0 (js* "(~{} >> 8n)" @z0))
+               (aset out (+ 8 i) (js/Number (js* "(~{} & 0xffn)" @z1)))
+               (reset! z1 (js* "(~{} >> 8n)" @z1))
+               (recur (dec i))))
+           out)))
+
+     (defn pure-aes-gcm
+       "Pure ClojureScript AES-256-GCM AEAD (NIST SP 800-38D)."
+       [key nonce input aad is-encrypt?]
+       (let [w (aes-expand-key key)
+             H (aes-cipher-block (js/Uint8Array. 16) w)
+             J0 (js/Uint8Array. 16)]
+         (.set J0 nonce 0)
+         (aset J0 15 1)
+         (let [in-len (if input (.-length input) 0)
+               pt-len (if is-encrypt? in-len (- in-len 16))]
+           (if (< pt-len 0)
+             nil
+             (let [out (js/Uint8Array. pt-len)
+                   cb (js/Uint8Array. J0)
+                   inc32 (fn [blk]
+                           (let [val (js* "((((~{}[12] << 24) | (~{}[13] << 16) | (~{}[14] << 8) | ~{}[15]) + 1) >>> 0)"
+                                          blk blk blk blk)]
+                             (aset blk 12 (bit-and (unsigned-bit-shift-right val 24) 0xff))
+                             (aset blk 13 (bit-and (unsigned-bit-shift-right val 16) 0xff))
+                             (aset blk 14 (bit-and (unsigned-bit-shift-right val 8) 0xff))
+                             (aset blk 15 (bit-and val 0xff))))]
+               (loop [i 0]
+                 (when (< i pt-len)
+                   (inc32 cb)
+                   (let [ks (aes-cipher-block cb w)
+                         chunk-len (js/Math.min 16 (- pt-len i))]
+                     (dotimes [j chunk-len]
+                       (aset out (+ i j) (bit-xor (aget input (+ i j)) (aget ks j))))
+                     (recur (+ i 16)))))
+               (let [ct (if is-encrypt? out (.subarray input 0 pt-len))
+                     S (atom (js/Uint8Array. 16))
+                     update-ghash (fn [data]
+                                    (let [len (.-length data)]
+                                      (loop [i 0]
+                                        (when (< i len)
+                                          (let [block (js/Uint8Array. 16)
+                                                chunk-len (js/Math.min 16 (- len i))]
+                                            (.set block (.subarray data i (+ i chunk-len)) 0)
+                                            (dotimes [j 16]
+                                              (aset @S j (bit-xor (aget @S j) (aget block j))))
+                                            (reset! S (aes-ghash-mul @S H))
+                                            (recur (+ i 16)))))))]
+                 (when (and aad (> (.-length aad) 0))
+                   (update-ghash aad))
+                 (when (> (.-length ct) 0)
+                   (update-ghash ct))
+                 (let [len-block (js/Uint8Array. 16)
+                       aad-bits (atom (if aad (js/BigInt (* (.-length aad) 8)) (js/BigInt 0)))
+                       ct-bits (atom (js/BigInt (* (.-length ct) 8)))]
+                   (loop [i 7]
+                     (when (>= i 0)
+                       (aset len-block i (js/Number (js* "(~{} & 0xffn)" @aad-bits)))
+                       (reset! aad-bits (js* "(~{} >> 8n)" @aad-bits))
+                       (aset len-block (+ 8 i) (js/Number (js* "(~{} & 0xffn)" @ct-bits)))
+                       (reset! ct-bits (js* "(~{} >> 8n)" @ct-bits))
+                       (recur (dec i))))
+                   (dotimes [j 16]
+                     (aset @S j (bit-xor (aget @S j) (aget len-block j))))
+                   (reset! S (aes-ghash-mul @S H))
+                   (let [tag-mask (aes-cipher-block J0 w)
+                         tag (js/Uint8Array. 16)]
+                     (dotimes [i 16]
+                       (aset tag i (bit-xor (aget @S i) (aget tag-mask i))))
+                     (if is-encrypt?
+                       (let [res (js/Uint8Array. (+ pt-len 16))]
+                         (.set res out 0)
+                         (.set res tag pt-len)
+                         res)
+                       (let [expected-tag (.subarray input pt-len)
+                             diff (atom 0)]
+                         (dotimes [i 16]
+                           (reset! diff (bit-or @diff (bit-xor (aget tag i) (aget expected-tag i)))))
+                         (if (zero? @diff)
+                           out
+                           nil)))))))))))
+
+     (set! (.-encrypt pure-aes-gcm) (fn [k n in aad] (pure-aes-gcm k n in aad true)))
+     (set! (.-decrypt pure-aes-gcm) (fn [k n in aad] (pure-aes-gcm k n in aad false)))))
 
 #?(:cljs
    (defn pure-aes-gcm-seal

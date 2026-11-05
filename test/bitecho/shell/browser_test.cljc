@@ -270,4 +270,65 @@
       (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :tx-key])))
       (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :rx-key])))
       (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :session-keys])))
-      (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :shared-secret]))))))
+      (is (nil? (get-in sanitized [:light-state :sessions "sess-1" :shared-secret])))))
+
+  (testing "canonical-key-name converts camelCase, snake_case, and kebab-case"
+    (is (= "seed-bytes" (browser/canonical-key-name :seedBytes)))
+    (is (= "seed-bytes" (browser/canonical-key-name "seed_bytes")))
+    (is (= "seed-bytes" (browser/canonical-key-name :seed-bytes)))
+    (is (= "privkey-bytes" (browser/canonical-key-name :privkeyBytes)))
+    (is (= "private-key" (browser/canonical-key-name "privateKey")))
+    (is (= "private-key" (browser/canonical-key-name :private_key)))
+    (is (= "user-handle" (browser/canonical-key-name :userHandle)))
+    (is (= "raw-id" (browser/canonical-key-name "raw_id")))
+    (is (= "prf-output" (browser/canonical-key-name :prfOutput)))
+    (is (= "backup-seed" (browser/canonical-key-name "backupSeed")))
+    (is (= "first" (browser/canonical-key-name :first)))
+    (is (= "eval" (browser/canonical-key-name :eval))))
+
+  (testing "forbidden-persistence-key? recognizes all casing variants"
+    (doseq [k [:seedBytes "seed_bytes" :seed-bytes
+               :privkeyBytes "privkey_bytes" :privkey-bytes
+               :privateKey "private_key" :private-key
+               :coldPrivkey "cold_privkey" :cold-privkey
+               :userHandle "user_handle" :user-handle
+               :rawId "raw_id" :raw-id
+               :prfOutput "prf_output" :prf-output
+               :backupSeed "backup_seed" :backup-seed
+               :mnemonic "mnemonic"
+               :first "first"
+               :eval "eval"
+               :ephemeralPriv "ephemeral_priv" :ephemeral-priv
+               :sharedSecret "shared_secret" :shared-secret
+               :sessionKeys "session_keys" :session-keys
+               :txKey "tx_key" :tx-key
+               :rxKey "rx_key" :rx-key
+               :connected? "connected?"
+               :connectionError "connection_error" :connection-error
+               :lastError "last_error" :last-error]]
+      (is (true? (browser/forbidden-persistence-key? k)) (str "Should be forbidden: " k)))
+    (is (false? (browser/forbidden-persistence-key? :public-key)))
+    (is (false? (browser/forbidden-persistence-key? :pubkey)))
+    (is (false? (browser/forbidden-persistence-key? :node-id)))
+    (is (false? (browser/forbidden-persistence-key? "address"))))
+
+  (testing "Sanitization recursively purges sensitive variants inside maps, vectors, sets, and lists"
+    (let [input {:safe-field "safe"
+                 :seedBytes "SECRET-1"
+                 "private_key" "SECRET-2"
+                 :nested-map {:userHandle "SECRET-3"
+                              :keep-me 42
+                              "raw_id" "SECRET-4"}
+                 :nested-vec [{:prfOutput "SECRET-5" :val 1}
+                              {:backupSeed "SECRET-6" :val 2}]
+                 :nested-set #{{:first "SECRET-7" :id :a}
+                               {:eval "SECRET-8" :id :b}}
+                 :nested-list (list {:mnemonic "SECRET-9" :id :c})}
+          sanitized (browser/sanitize-state-for-persistence input)]
+      (is (= "safe" (:safe-field sanitized)))
+      (is (nil? (:seedBytes sanitized)))
+      (is (nil? (get sanitized "private_key")))
+      (is (= {:keep-me 42} (:nested-map sanitized)))
+      (is (= [{:val 1} {:val 2}] (:nested-vec sanitized)))
+      (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
+      (is (= [{:id :c}] (vec (:nested-list sanitized)))))))

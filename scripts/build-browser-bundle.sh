@@ -329,7 +329,7 @@ cat <<EOF > dist/index.html
       <button class="btn btn-outline" id="simOfferBtn">Simulate Incoming Offer</button>
       <button class="btn btn-outline" id="registerYubiKeyBtn">Register Hardware YubiKey</button>
       <button class="btn btn-outline" id="recoverYubiKeyBtn">Recover from YubiKey</button>
-      <button class="btn btn-outline" id="spawnAgentBtn">Spawn Supervised Agent</button>
+      <button class="btn btn-outline" id="spawnAgentBtn">Spawn Supervised Agent (Demo)</button>
       <button class="btn btn-outline" id="resetAnchorBtn">Reset Anchor State</button>
     </div>
   </details>

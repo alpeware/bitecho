@@ -44,6 +44,11 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--proxy <url>`: HTTP CONNECT proxy URL (e.g., `http://user:pass@proxy.corp.internal:8080`). If omitted when using `--transport connect`, the node checks environment variables in order: `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`.
 - `--timeout-ms <ms>`: Timeout in milliseconds when dialing validator WebRTC DataChannels (default: 8000).
 - `--subnet-id <id>`: Subnet identifier for multi-subnet isolation and routing (default: `global`).
+- `--turn-server <host:port>`: TURN relay server host and port (e.g., `turn.example.com:3478`).
+- `--turn-username <user>`: Username for TURN long-term credential authentication.
+- `--turn-password <pass>`: Password for TURN long-term credential authentication.
+- `--turn-realm <realm>`: Authentication realm for TURN server.
+- `--turn-force-relay`: Force all WebRTC traffic through TURN relay (drops unrelayable packets rather than falling back to direct UDP).
 
 ---
 

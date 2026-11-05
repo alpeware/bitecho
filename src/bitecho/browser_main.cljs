@@ -67,31 +67,27 @@
     (when @active-node-atom
       (cb (get-status @active-node-atom)))))
 
-(def ^:private redacted-js-keys
-  #{:privkey-bytes :cold-privkey :private-key :privkey :privkey-hex :seed :seed-bytes
-    :keypair :x25519 :ephemeral-priv :ephemeral-privkey :tx-key :rx-key :session-keys
-    :shared-secret :user-handle :raw-id :prf-output :backup-seed
-    :private_key :privkey_bytes :cold_privkey :seed_bytes :user_handle :raw_id
-    :ephemeral_priv :tx_key :rx_key :session_keys :shared_secret :prf_output :backup_seed
-    :privateKey :privkeyBytes :coldPrivkey :seedBytes :userHandle :rawId
-    :ephemeralPriv :txKey :rxKey :sessionKeys :sharedSecret :prfOutput :backupSeed})
+(def redacted-js-keys
+  "Canonical forbidden keys aliased from bitecho.shell.browser."
+  browser/forbidden-persistence-keys)
 
-(defn- redacted-js-key? [k]
-  (or (contains? redacted-js-keys k)
-      (and (or (keyword? k) (string? k))
-           (contains? redacted-js-keys (keyword (name k))))))
+(def redacted-js-key?
+  "Canonical forbidden key predicate aliased from bitecho.shell.browser."
+  browser/forbidden-persistence-key?)
 
-(defn- redact-for-js
-  "Recursively redacts private key material and credentials before converting to JS."
+(defn redact-for-js
+  "Recursively redacts private key material and credentials before converting to JS.
+   Handles maps, vectors, sets, and sequences at any nesting depth."
   [x]
   (cond
     (map? x)
-    (into {}
+    (into (empty x)
           (keep (fn [[k v]]
                   (when-not (redacted-js-key? k)
                     [k (redact-for-js v)])))
           x)
     (vector? x) (mapv redact-for-js x)
+    (set? x) (into #{} (map redact-for-js x))
     (seq? x) (map redact-for-js x)
     :else x))
 
@@ -170,6 +166,34 @@
                    :else nil)
         existing-ident (or (when (map? opts-map) (:identity opts-map))
                            (when (and (map? opts-map) (:public-hex opts-map)) opts-map))
+        prf-out (or (when (and (some? seed-or-opts) (object? seed-or-opts))
+                      (or (unchecked-get seed-or-opts "prfOutput")
+                          (unchecked-get seed-or-opts "prf_output")
+                          (unchecked-get seed-or-opts "prf-output")
+                          (when-let [cer (or (unchecked-get seed-or-opts "clientExtensionResults")
+                                             (unchecked-get seed-or-opts "client_extension_results")
+                                             (unchecked-get seed-or-opts "extensions")
+                                             (when (fn? (.-getClientExtensionResults seed-or-opts))
+                                               (.getClientExtensionResults seed-or-opts)))]
+                            (when-let [prf (or (unchecked-get cer "prf") cer)]
+                              (or (unchecked-get prf "first")
+                                  (when-let [r (unchecked-get prf "results")]
+                                    (unchecked-get r "first")))))
+                          (when-let [prf (unchecked-get seed-or-opts "prf")]
+                            (or (unchecked-get prf "first")
+                                (when-let [r (unchecked-get prf "results")]
+                                  (unchecked-get r "first"))))
+                          (when-let [r (unchecked-get seed-or-opts "results")]
+                            (unchecked-get r "first"))))
+                    (when (map? opts-map)
+                      (or (:prf-output opts-map)
+                          (:prfOutput opts-map)
+                          (:prf_output opts-map)
+                          (get-in opts-map [:results :first])
+                          (get-in opts-map [:prf :results :first])
+                          (get-in opts-map [:extensions :prf :results :first])
+                          (get-in opts-map [:clientExtensionResults :prf :results :first])
+                          (get-in opts-map [:client-extension-results :prf :results :first]))))
         user-handle (or (when raw-bytes? seed-or-opts)
                         (when (and (some? seed-or-opts) (object? seed-or-opts))
                           (or (unchecked-get seed-or-opts "userHandle")
@@ -187,13 +211,13 @@
                               (get-in opts-map [:response :user_handle])
                               (:seed-bytes opts-map)
                               (:seedBytes opts-map)
-                              (:seed_bytes opts-map)
-                              (:prf-output opts-map)
-                              (:prfOutput opts-map)
-                              (:prf_output opts-map)))
+                              (:seed_bytes opts-map)))
                         (when (string? seed-or-opts) seed-or-opts)
                         (when (sequential? seed-or-opts) seed-or-opts))
         recovered (cond
+                    (some? prf-out)
+                    (webauthn/derive-identity-from-prf prf-out)
+
                     (some? user-handle)
                     (webauthn/recover-seed-from-assertion
                      (if (map? opts-map)
@@ -516,40 +540,73 @@
                  :ip (:ip node1)
                  :port (:agent-port node1)})))))
 
+(defn- resolve-peer-target
+  "Resolves peer identifier or petname against :petnames, default-petnames,
+   and anchor-state-atom :supervised-agents, returning hex public key string."
+  [node peer-or-petname]
+  (let [target (if (keyword? peer-or-petname) (name peer-or-petname) (str peer-or-petname))
+        agents (when-let [st @anchor-state-atom] (:supervised-agents st))]
+    (or (get (:petnames node) target)
+        (get (:petnames node) (keyword target))
+        (get default-petnames target)
+        (get default-petnames (keyword target))
+        (when (map? agents)
+          (or (get-in agents [target :agent-pubkey])
+              (get-in agents [(keyword target) :agent-pubkey])
+              (get-in agents [target "agent-pubkey"])
+              (get-in agents [target :pubkey])
+              (get-in agents [target "pubkey"])))
+        target)))
+
 (defn open-channel
-  "Initiates a cryptographically signed channel offer to callee over the live mesh DataChannel."
+  "Initiates a cryptographically signed channel offer to callee over the live mesh DataChannel.
+   Returns {:ok false :error 'not-connected'} if no channels are open and phase is not :open."
   ([callee] (open-channel @active-node-atom callee 10 500))
-  ([node-atom callee & [price burn]]
-   (let [na (or node-atom @active-node-atom)
-         node @na
-         target-pub (or (get (:petnames node) callee)
-                        (get default-petnames callee)
-                        callee)
-         privkey (:private-key (:keypair node))
-         cmd-res (light-core/handle-command (:light-state node)
-                                            {"cmd" "offer"
-                                             "callee" target-pub
-                                             "price" (or price 10)
-                                             "burn" (or burn 500)}
-                                            privkey)
-         new-st (:state cmd-res)
-         out-envs (:net-envelopes cmd-res)
-         resp (:response cmd-res)
-         cmd-ok? (boolean (get resp "ok" true))]
-     (swap! na (fn [curr]
-                 (-> curr
-                     (assoc :light-state new-st)
-                     (assoc :sessions (:sessions new-st)))))
-     (doseq [env out-envs]
-       (send-to-all-channels! na env))
-     (browser/persist-state! (browser/sanitize-state-for-persistence @na))
-     (notify-ui-listeners!)
-     (clj->js (cond-> {:ok cmd-ok?
-                       :callee callee
-                       :sessionId (get resp "session_id")
-                       :envelopesSent (count out-envs)
-                       :response resp}
-                (not cmd-ok?) (assoc :error (get resp "error")))))))
+  ([arg1 arg2]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (open-channel arg1 arg2 10 500)
+     (open-channel @active-node-atom arg1 arg2 500)))
+  ([arg1 arg2 arg3]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (open-channel arg1 arg2 arg3 500)
+     (open-channel @active-node-atom arg1 arg2 arg3)))
+  ([node-atom callee price burn]
+   (let [na (or node-atom @active-node-atom)]
+     (if-not na
+       (clj->js {:ok false :error "not-connected"})
+       (let [node @na
+             channels (or (:active-channels node) {})
+             phase (get-in node [:conn :phase])]
+         (if (and (empty? channels) (not= phase :open))
+           (clj->js {:ok false :error "not-connected"})
+           (let [target-pub (resolve-peer-target node callee)
+                 privkey (:private-key (:keypair node))
+                 cmd-res (light-core/handle-command (:light-state node)
+                                                    {"cmd" "offer"
+                                                     "callee" target-pub
+                                                     "price" (or price 10)
+                                                     "burn" (or burn 500)}
+                                                    privkey)
+                 new-st (:state cmd-res)
+                 out-envs (:net-envelopes cmd-res)
+                 resp (:response cmd-res)
+                 cmd-ok? (boolean (get resp "ok" true))]
+             (swap! na (fn [curr]
+                         (-> curr
+                             (assoc :light-state new-st)
+                             (assoc :sessions (:sessions new-st)))))
+             (doseq [env out-envs]
+               (send-to-all-channels! na env))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+             (notify-ui-listeners!)
+             (clj->js (cond-> {:ok cmd-ok?
+                               :callee callee
+                               :sessionId (get resp "session_id")
+                               :envelopesSent (count out-envs)
+                               :response resp}
+                        (not cmd-ok?) (assoc :error (get resp "error")))))))))))
 
 (defn accept-channel-offer
   "Accepts a pending session offer by session-id over the live mesh DataChannel."
@@ -710,54 +767,87 @@
               :effects effects})))
 
 (defn create-offer
-  "Creates a cryptographically signed rendezvous/channel offer descriptor conforming to Phase 1 wire format."
-  [node-atom peer-id & [opts]]
-  (let [node @node-atom
-        opts-map (when opts (js->clj opts :keywordize-keys true))
-        x25519 (:x25519 node)
-        keypair (:keypair node)
-        caller-pub (fressian/bytes->hex (:public-key keypair))
-        caller-eph (fressian/bytes->hex (:public-key x25519))
-        callee-pub (str peer-id)
-        epoch (or (:epoch opts-map) 1)
-        burn (or (:burn opts-map) (:burn-amount opts-map) 100)
-        price (or (:price opts-map) burn)
-        sub-id (or (:subnet-id node) "global")
-        suites (or (:crypto-suites opts-map) ["suite-v1-aes256gcm"])
-        sid (light-core/compute-session-id caller-pub callee-pub caller-eph)
-        offer-hash (light-core/compute-offer-hash {:session-id sid
-                                                   :caller caller-pub
-                                                   :callee callee-pub
-                                                   :caller-ephemeral-pub caller-eph
-                                                   :epoch epoch
-                                                   :price price
-                                                   :burn burn
-                                                   :home-node ""
-                                                   :crypto-suites suites
-                                                   :subnet-id sub-id})
-        privkey-bytes (:private-key keypair)
-        sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
-        offer {:type :rendezvous-offer
-               :bitecho/type :channel-offer
-               :protocol-version 1
-               :wire-format "fressian-v1"
-               :subnet-id sub-id
-               :session-id sid
-               :caller caller-pub
-               :caller-pubkey caller-pub
-               :callee callee-pub
-               :callee-pubkey callee-pub
-               :caller-ephemeral-pub caller-eph
-               :caller-x25519 caller-eph
-               :crypto-suites suites
-               :epoch epoch
-               :price price
-               :burn burn
-               :burn-amount burn
-               :offer-hash offer-hash
-               :signature sig-hex}]
-    (swap! node-atom update :burned-ech (fnil + 0) burn)
-    (clj->js offer)))
+  "Creates a cryptographically signed rendezvous/channel offer descriptor conforming to Phase 1 wire format.
+   Supports:
+     (create-offer peer-or-petname)
+     (create-offer peer-or-petname amount)
+     (create-offer peer-or-petname amount memo)
+     (create-offer node-atom peer-id & [opts])
+   Resolves peer-or-petname against (:petnames node), default-petnames, and (:supervised-agents @anchor-state-atom)."
+  ([arg1]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (create-offer arg1 nil nil)
+     (create-offer @active-node-atom arg1 nil)))
+  ([arg1 arg2]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (create-offer arg1 arg2 nil)
+     (create-offer @active-node-atom arg1 (if (map? arg2) arg2 {:burn arg2 :price arg2}))))
+  ([arg1 arg2 arg3]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (let [node-atom arg1
+           peer-id arg2
+           opts arg3
+           node @node-atom
+           opts-map (cond
+                      (map? opts) opts
+                      (some? opts) (js->clj opts :keywordize-keys true)
+                      :else {})
+           x25519 (:x25519 node)
+           keypair (:keypair node)
+           caller-pub (fressian/bytes->hex (:public-key keypair))
+           caller-eph (fressian/bytes->hex (:public-key x25519))
+           raw-callee (or peer-id (:callee opts-map) (:callee-pubkey opts-map))
+           callee-pub (resolve-peer-target node raw-callee)
+           epoch (or (:epoch opts-map) 1)
+           burn (or (:burn opts-map) (:burn-amount opts-map) 100)
+           price (or (:price opts-map) burn)
+           memo (or (:memo opts-map) "")
+           sub-id (or (:subnet-id node) "global")
+           suites (or (:crypto-suites opts-map) ["suite-v1-aes256gcm"])
+           sid (light-core/compute-session-id caller-pub callee-pub caller-eph)
+           offer-hash (light-core/compute-offer-hash {:session-id sid
+                                                      :caller caller-pub
+                                                      :callee callee-pub
+                                                      :caller-ephemeral-pub caller-eph
+                                                      :epoch epoch
+                                                      :price price
+                                                      :burn burn
+                                                      :home-node ""
+                                                      :crypto-suites suites
+                                                      :subnet-id sub-id})
+           privkey-bytes (:private-key keypair)
+           sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
+           offer (cond-> {:type :rendezvous-offer
+                          :bitecho/type :channel-offer
+                          :protocol-version 1
+                          :wire-format "fressian-v1"
+                          :subnet-id sub-id
+                          :session-id sid
+                          :caller caller-pub
+                          :caller-pubkey caller-pub
+                          :callee callee-pub
+                          :callee-pubkey callee-pub
+                          :caller-ephemeral-pub caller-eph
+                          :caller-x25519 caller-eph
+                          :crypto-suites suites
+                          :epoch epoch
+                          :price price
+                          :burn burn
+                          :burn-amount burn
+                          :offer-hash offer-hash
+                          :signature sig-hex}
+                   (and (string? memo) (seq memo)) (assoc :memo memo))]
+       (swap! node-atom update :burned-ech (fnil + 0) burn)
+       (clj->js offer))
+     (let [peer-id arg1
+           amount arg2
+           memo arg3]
+       (create-offer @active-node-atom peer-id (cond-> {:burn (or amount 100)
+                                                        :price (or amount 100)}
+                                                 memo (assoc :memo memo)))))))
 
 (defn accept-offer
   "Explicitly accepts an incoming offer after validating its cryptographic signature."

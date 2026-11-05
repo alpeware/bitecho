@@ -1625,5 +1625,43 @@
         (is (= alice-pub-hex (:sender unwrapped)))
         (is (= 1 (count (:vouchers unwrapped))))))))
 
+(deftest test-ensure-fressian-wire-bytes-garbage-rejection
+  (testing "ensure-fressian-wire-bytes accepts valid map and encodes to Fressian"
+    (let [m {:type :gossip :id "msg-1" :payload "hello"}
+          encoded (mesh/ensure-fressian-wire-bytes m)]
+      (is (bytes? encoded))
+      (is (not (fressian/nippy-payload? encoded)))
+      (is (= m (fressian/decode-wire encoded)))))
+
+  (testing "ensure-fressian-wire-bytes accepts valid Fressian-encoded map"
+    (let [m {:type :test :num 42}
+          b (fressian/encode-wire m)]
+      (is (identical? b (mesh/ensure-fressian-wire-bytes b)))))
+
+  (testing "ensure-fressian-wire-bytes transcode-re-encodes legacy Nippy payload to Fressian"
+    (let [m {:type :legacy :val "ok"}
+          nippy-bytes (taoensso.nippy/freeze m)
+          fressian-bytes (mesh/ensure-fressian-wire-bytes nippy-bytes)]
+      (is (bytes? fressian-bytes))
+      (is (not (fressian/nippy-payload? fressian-bytes)))
+      (is (= m (fressian/decode-wire fressian-bytes)))))
+
+  (testing "ensure-fressian-wire-bytes returns nil for arbitrary garbage byte arrays"
+    (let [garbage1 (byte-array [0x01 0x02 0x03 0x04])
+          garbage2 (byte-array (repeat 128 (unchecked-byte 0xff)))
+          random-bytes (let [ba (byte-array 64)]
+                         (.nextBytes (java.security.SecureRandom.) ba)
+                         ba)]
+      (is (nil? (mesh/ensure-fressian-wire-bytes garbage1)))
+      (is (nil? (mesh/ensure-fressian-wire-bytes garbage2)))
+      (is (nil? (mesh/ensure-fressian-wire-bytes random-bytes)))
+      (is (nil? (mesh/ensure-fressian-wire-bytes (byte-array 0))))
+      (is (nil? (mesh/ensure-fressian-wire-bytes nil)))
+      (is (nil? (mesh/ensure-fressian-wire-bytes "not-bytes")))))
+
+  (testing "ensure-fressian-wire-bytes returns nil for non-map Fressian payloads"
+    (let [non-map-fressian (fressian/encode-wire "just-a-string")]
+      (is (nil? (mesh/ensure-fressian-wire-bytes non-map-fressian))))))
+
 
 
