@@ -451,6 +451,8 @@
     "validator-pubkey" "node-pubkey" "sender-pubkey" "recipient-pubkey" "remote-pubkey"
     "local-pubkey" "target-pubkey" "signer-pubkey" "owner-pubkey" "issuer-pubkey"
     "subject-pubkey" "delegate-pubkey" "ephemeral-pubkey" "caller-x25519-pub" "callee-x25519-pub"
+    "caller-x25519" "callee-x25519" "coordinator-pubkey" "expected-agent-pubkey" "expected-pubkey"
+    "prev-pubkey" "sender-pubkey-bytes" "key-protection"
     "ephemeral-pub" "caller-ephemeral-pub" "callee-ephemeral-pub" "spki" "cose-key" "cose-pubkey"
     "key-mode" "keys-verified?" "keys-verified" "key-count" "keys-count"
     "key-type" "key-types" "key-id" "key-ids" "api-key-id" "api-key-ids"
@@ -465,7 +467,7 @@
     "routing-key" "cache-key" "lookup-key" "safe-key" "innocent-key" "control-key" "allowed-key"
     "resident-key" "require-resident-key" "pub-key-cred-params" "cred-props"
     "cred-protect" "credential-protection-policy" "allow-credentials" "backup-available?"
-    "authenticator-selection" "authenticator-attachment"
+    "authenticator-selection" "authenticator-attachment" "authenticator-type"
     "keychain" "keychains" "keyring" "keyrings" "keyboard" "keyboards" "keypad" "keypads"
     "keycode" "keycodes"
     "key-code" "key-codes" "keydown" "keyup" "keypress" "keystroke" "keystrokes"
@@ -560,6 +562,14 @@
          "msg-payload" "gossip-env" "message-id" "payload" "payload-hex" "frame-type" "nonce" "ciphertext" "sealed-frame"
          "burned-ech" "total-burned-ech" "alice-burned" "bob-burned" "vouchers" "vouchers-count" "voucher-id"
          "escrows" "escrows-count" "escrow-id" "deliverable-hash" "last-transfer-hash"
+         "settled-epoch" "net-amount" "settlement-mode" "take-amount" "take-burned"
+         "refund-amount" "refund-reason" "payer-signature" "preimage" "deliverable"
+         "release-submitted" "refund-submitted" "settled-escrow-ids" "settled-escrow-order" "canonical-escrows"
+         "payer-petname" "receiver-petname" "recipient-petname" "caller-petname" "callee-petname"
+         "chain-state-snapshots" "max-outbox-size" "ufrag" "spent" "delivery-ack" "header"
+         "initial-text" "topic" "cumulative-debit" "selected-suite" "ack-seq" "seen-seqs"
+         "receipt-id" "nickname" "mailbox" "pop-signature" "directory-signature" "rotation-signature"
+         "responsive?" "latency-ms" "price-max" "subnets" "dac-001"
          "local-accounting" "accounting" "scope" "scopes" "permissions" "max-spend" "max-spend-per-epoch"
          "dac" "dac-id" "dac-spend" "active-dac" "active-dac-id" "revoked-dacs" "revoked-dacs-count" "revoked-dac-ids"
          "revocation" "revocation-reason" "denial-reason" "reason"
@@ -573,6 +583,7 @@
          "fido-strength" "fido-authenticator" "fido-security" "strength" "score" "verification-status"
          "warning" "yubico-enrollment" "aaguid" "up?" "uv?" "be?" "bs?" "at?" "ed?" "flags" "sign-count"
          "rp-id-hash-hex" "strength-hint" "fmt" "att-stmt"
+         "vendor" "user-verification-details" "attestation-types" "certification-level"
          "trust-boundary" "origin-scoping" "rp" "rp-id" "rp-name" "user" "user-id" "username" "display-name" "email"
          "challenge" "alg"
          "user-verification" "attestation" "extensions"
@@ -632,7 +643,7 @@
          (= 2 (count k))
          (string? (first k))
          (integer? (second k))
-         (not (explicitly-forbidden-persistence-key? (first k)))) true
+         (allowed-persistence-key? (first k))) true
     (and (string? k)
          (boolean (re-matches #"^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{88})$" k))) true
     :else

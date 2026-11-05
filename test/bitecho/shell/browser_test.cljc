@@ -13,6 +13,7 @@
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.browser :as browser]
+            [bitecho.state-machine :as state-machine]
             [clojure.string :as str]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
@@ -337,7 +338,7 @@
       (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
       (is (= [{:id :c}] (vec (:nested-list sanitized))))))
 
-  (testing "Structural default-deny persistence (allowed-persistence-key?) + canonicalize-then-match denylist across 100% independently-enumerated forbidden-persistence-keys (431) + 115+ disjoint secret stems, 10 casings (incl. compact & prefixed/suffixed), and 3 key types + 100% independently-enumerated public/innocent carve-outs (322) & schema allowlist (735) + R8-M1/M2/L3/L4/L5 probes"
+  (testing "Structural default-deny persistence (allowed-persistence-key?) + canonicalize-then-match denylist across 100% independently-enumerated forbidden-persistence-keys (431) + 115+ disjoint secret stems, 10 casings (incl. compact & prefixed/suffixed), and 3 key types + 100% independently-enumerated public/innocent carve-outs (331) & schema allowlist (791) + R8-M1/M2/L3/L4/L5 + R9-M1/L1/L3 probes"
     (let [independent-forbidden-stems
           ["private" "private-key" "private-key-bytes" "private-key-hex"
            "privkey" "privkey-bytes" "privkey-hex" "prv"
@@ -478,6 +479,8 @@
            "validator-pubkey" "node-pubkey" "sender-pubkey" "recipient-pubkey" "remote-pubkey"
            "local-pubkey" "target-pubkey" "signer-pubkey" "owner-pubkey" "issuer-pubkey"
            "subject-pubkey" "delegate-pubkey" "ephemeral-pubkey" "caller-x25519-pub" "callee-x25519-pub"
+           "caller-x25519" "callee-x25519" "coordinator-pubkey" "expected-agent-pubkey" "expected-pubkey"
+           "prev-pubkey" "sender-pubkey-bytes" "key-protection"
            "ephemeral-pub" "caller-ephemeral-pub" "callee-ephemeral-pub" "spki" "cose-key" "cose-pubkey"
            "key-mode" "keys-verified?" "keys-verified" "key-count" "keys-count"
            "key-type" "key-types" "key-id" "key-ids" "api-key-id" "api-key-ids"
@@ -492,7 +495,7 @@
            "routing-key" "cache-key" "lookup-key" "safe-key" "innocent-key" "control-key" "allowed-key"
            "resident-key" "require-resident-key" "pub-key-cred-params" "cred-props"
            "cred-protect" "credential-protection-policy" "allow-credentials" "backup-available?"
-           "authenticator-selection" "authenticator-attachment"
+           "authenticator-selection" "authenticator-attachment" "authenticator-type"
            "keychain" "keychains" "keyring" "keyrings" "keyboard" "keyboards" "keypad" "keypads"
            "keycode" "keycodes"
            "key-code" "key-codes" "keydown" "keyup" "keypress" "keystroke" "keystrokes"
@@ -561,6 +564,14 @@
            "msg-payload" "gossip-env" "message-id" "payload" "payload-hex" "frame-type" "nonce" "ciphertext" "sealed-frame"
            "burned-ech" "total-burned-ech" "alice-burned" "bob-burned" "vouchers" "vouchers-count" "voucher-id"
            "escrows" "escrows-count" "escrow-id" "deliverable-hash" "last-transfer-hash"
+           "settled-epoch" "net-amount" "settlement-mode" "take-amount" "take-burned"
+           "refund-amount" "refund-reason" "payer-signature" "preimage" "deliverable"
+           "release-submitted" "refund-submitted" "settled-escrow-ids" "settled-escrow-order" "canonical-escrows"
+           "payer-petname" "receiver-petname" "recipient-petname" "caller-petname" "callee-petname"
+           "chain-state-snapshots" "max-outbox-size" "ufrag" "spent" "delivery-ack" "header"
+           "initial-text" "topic" "cumulative-debit" "selected-suite" "ack-seq" "seen-seqs"
+           "receipt-id" "nickname" "mailbox" "pop-signature" "directory-signature" "rotation-signature"
+           "responsive?" "latency-ms" "price-max" "subnets" "dac-001"
            "local-accounting" "accounting" "scope" "scopes" "permissions" "max-spend" "max-spend-per-epoch"
            "dac" "dac-id" "dac-spend" "active-dac" "active-dac-id" "revoked-dacs" "revoked-dacs-count" "revoked-dac-ids"
            "revocation" "revocation-reason" "denial-reason" "reason"
@@ -574,6 +585,7 @@
            "fido-strength" "fido-authenticator" "fido-security" "strength" "score" "verification-status"
            "warning" "yubico-enrollment" "aaguid" "up?" "uv?" "be?" "bs?" "at?" "ed?" "flags" "sign-count"
            "rp-id-hash-hex" "strength-hint" "fmt" "att-stmt"
+           "vendor" "user-verification-details" "attestation-types" "certification-level"
            "trust-boundary" "origin-scoping" "rp" "rp-id" "rp-name" "user" "user-id" "username" "display-name" "email"
            "challenge" "alg"
            "user-verification" "attestation" "extensions"
@@ -633,14 +645,65 @@
       (is (every? #(false? (browser/allowed-persistence-key? %)) prefixed-foreign-keys))
       (is (every? #(false? (browser/allowed-persistence-key? %)) pubkey-foreign-keys))
       (is (empty? survivors) (str "Forbidden survivors found: " (pr-str (take 10 survivors))))
-      (is (empty? false-positives) (str "Carve-out false positives found: " (pr-str (take 10 false-positives)))))
+      (is (empty? false-positives) (str "Carve-out false positives found: " (pr-str (take 10 false-positives))))
+      ;; R9-L1: 2-tuple [string int] branch requires first element to satisfy allowed-persistence-key?
+      (is (false? (browser/allowed-persistence-key? ["kennwort" 5])))
+      (is (false? (browser/allowed-persistence-key? ["passw0rd" 5])))
+      (is (false? (browser/allowed-persistence-key? ["mot-de-passe" 5])))
+      (is (false? (browser/allowed-persistence-key? ["private-key" 5])))
+      (is (true? (browser/allowed-persistence-key? ["node1" 42])))
+      (is (true? (browser/allowed-persistence-key? ["dac-001" 42]))))
 
-    (testing "R8-M2: Real-state roundtrip preserves all 33 init-light-state keys, escrows, sessions, replay-window, outbox, voucher-seqs, and init-anchor-state while stripping secrets"
+    (testing "R8-M2, R9-M1, R9-L3: Real-state roundtrip preserves all 35 init-light-state keys, locked/released/refunded escrows from state-machine, sessions, replay-window, outbox, voucher-seqs, and init-anchor-state while stripping secrets"
       (let [pub1 "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
             pub2 "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
             sid "91e4541f458367db92b629c77a07633d4110889590ea707f1c3f740d44eefb68"
-            esc-id "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            esc-id-locked "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            esc-id-released "a1b2c3d498fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b856"
+            esc-id-refunded "f5e6d7c898fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b857"
             deliv-hash "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+            ;; R9-M1 & R9-L3: Construct locked, released, and refunded escrows using real state-machine reducer
+            sm0 {:epoch 40
+                 :ledger {pub1 {:balance 10000 :seq 0 :deps []}
+                          pub2 {:balance 1000 :seq 0 :deps []}}}
+            sm1 (:state (state-machine/handle-event sm0 {:type :lock-intent
+                                                         :escrow-id esc-id-locked
+                                                         :payer pub1
+                                                         :receiver pub2
+                                                         :amount 500
+                                                         :deliverable-hash deliv-hash
+                                                         :created-epoch 40
+                                                         :expires-epoch 60
+                                                         :sender pub1}))
+            sm2 (:state (state-machine/handle-event sm1 {:type :lock-intent
+                                                         :escrow-id esc-id-released
+                                                         :payer pub1
+                                                         :receiver pub2
+                                                         :amount 1000
+                                                         :deliverable-hash deliv-hash
+                                                         :created-epoch 40
+                                                         :expires-epoch 60
+                                                         :sender pub1}))
+            sm3 (:state (state-machine/handle-event sm2 {:type :release-intent
+                                                         :escrow-id esc-id-released
+                                                         :epoch 42
+                                                         :sender pub1}))
+            sm4 (:state (state-machine/handle-event sm3 {:type :lock-intent
+                                                         :escrow-id esc-id-refunded
+                                                         :payer pub1
+                                                         :receiver pub2
+                                                         :amount 800
+                                                         :deliverable-hash deliv-hash
+                                                         :created-epoch 40
+                                                         :expires-epoch 45
+                                                         :sender pub1}))
+            sm5 (:state (state-machine/handle-event sm4 {:type :refund-intent
+                                                         :escrow-id esc-id-refunded
+                                                         :epoch 46
+                                                         :sender pub2}))
+            locked-escrow (assoc (get-in sm5 [:escrows esc-id-locked]) :finalized-epoch nil :subnet-id "global")
+            released-escrow (get-in sm5 [:escrows esc-id-released])
+            refunded-escrow (get-in sm5 [:escrows esc-id-refunded])
             base-light (light-core/init-light-state {:pubkey-hex pub1}
                                                     {:economy-enabled? true
                                                      :burn-floor 100
@@ -649,26 +712,21 @@
                                    :epoch 42
                                    :epoch-initialized? true
                                    :account {:balance 9500 :spendable 9000}
-                                   :dac-spend {["dac-001" 42] 500}
+                                   :dac-spend {["dac-001" 42] 500
+                                               sid {:epoch 42 :spent 500}}
                                    :home-set {:nodes ["node1" "node2" "node3"] :price 10 :signature "sig-hex"}
                                    :ice-creds {"node1" {:ice-ufrag "1ec0ae74" :ice-pwd "SECRET-ICE-PWD"}}
                                    :transfer-seq 7
                                    :intent-seq 3
-                                   :voucher-seqs {["node1" 42] 2}
+                                   :voucher-seqs {["node1" 42] 2
+                                                  [sid 42] 1}
                                    :last-transfer-hash deliv-hash
                                    :outbound-rendezvous {sid {:peer pub2 :price 10 :burn 100 :epoch 42
                                                               :caller-x25519-priv "SECRET-CALLER-X25519"}}
                                    :pending-rendezvous-accepts [sid]
-                                   :escrows {esc-id {:escrow-id esc-id
-                                                     :payer pub1
-                                                     :receiver pub2
-                                                     :amount 500
-                                                     :deliverable-hash deliv-hash
-                                                     :created-epoch 40
-                                                     :expires-epoch 60
-                                                     :finalized-epoch nil
-                                                     :status :locked
-                                                     :subnet-id "global"}}
+                                   :escrows {esc-id-locked locked-escrow
+                                             esc-id-released released-escrow
+                                             esc-id-refunded refunded-escrow}
                                    :sessions {sid {:peer pub2
                                                    :role :caller
                                                    :status :open
@@ -705,29 +763,74 @@
             sanitized-light (browser/sanitize-state-for-persistence populated-light)
             base-anchor (anchor/init-anchor-state {:pubkey pub1} {:privkey-bytes "SECRET-ANCHOR-PRIV"})
             sanitized-anchor (browser/sanitize-state-for-persistence base-anchor)
+            base-conn (browser/initial-conn-state {:peer-id "node1" :subnet-id "global"})
+            sanitized-conn (browser/sanitize-state-for-persistence base-conn)
+            ;; R9-L3: Recursively collect all keys from real code-constructed state shapes
+            collect-keys (fn collect-keys [x]
+                           (cond
+                             (map? x) (into (set (keys x)) (mapcat collect-keys (vals x)))
+                             (coll? x) (into #{} (mapcat collect-keys x))
+                             :else #{}))
+            intentional-drops #{:privkey-bytes :caller-x25519-priv :callee-x25519-priv :ephemeral-priv
+                                :tx-key :rx-key :shared-secret :session-keys :tx :rx :ice-pwd :pwd
+                                :session-id :channel :transport :last-error}
+            real-code-keys (disj (into #{} (concat (collect-keys base-light)
+                                                   (collect-keys populated-light)
+                                                   (collect-keys base-anchor)
+                                                   (collect-keys base-conn)
+                                                   (collect-keys (:escrows sm5))))
+                                 :privkey-bytes :caller-x25519-priv :callee-x25519-priv :ephemeral-priv
+                                 :tx-key :rx-key :shared-secret :session-keys :tx :rx :ice-pwd :pwd
+                                 :session-id :channel :transport :last-error)
             loaded-light (atom nil)]
         (browser/persist-state! populated-light nil)
         (browser/load-persisted-state (fn [_err st] (reset! loaded-light st)))
-        ;; All 35 top-level init-light-state keys and all non-secret init-anchor-state keys survive intact
+        ;; R9-L3: Every non-secret key produced by real state constructors and reducers is allowed
+        (is (every? browser/allowed-persistence-key? real-code-keys)
+            (str "Disallowed real-code keys: " (pr-str (remove browser/allowed-persistence-key? real-code-keys))))
+        (is (every? intentional-drops
+                    (remove browser/allowed-persistence-key?
+                            (concat (collect-keys base-light)
+                                    (collect-keys populated-light)
+                                    (collect-keys base-anchor)
+                                    (collect-keys base-conn)))))
+        ;; All 35 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
         (is (= 35 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)
                (set (keys sanitized-anchor))))
+        (is (= (disj (set (keys base-conn)) :channel :transport)
+               (set (keys sanitized-conn))))
         ;; Non-secret nested structures survive intact
-        (is (= {["dac-001" 42] 500} (:dac-spend @loaded-light)))
+        (is (= {["dac-001" 42] 500
+                sid {:epoch 42 :spent 500}}
+               (:dac-spend @loaded-light)))
         (is (= {:nodes ["node1" "node2" "node3"] :price 10 :signature "sig-hex"} (:home-set @loaded-light)))
         (is (= {"node1" {:ice-ufrag "1ec0ae74"}} (:ice-creds @loaded-light)))
         (is (= 7 (:transfer-seq @loaded-light)))
         (is (= 3 (:intent-seq @loaded-light)))
-        (is (= {["node1" 42] 2} (:voucher-seqs @loaded-light)))
+        (is (= {["node1" 42] 2
+                [sid 42] 1}
+               (:voucher-seqs @loaded-light)))
         (is (= deliv-hash (:last-transfer-hash @loaded-light)))
         (is (= [sid] (:pending-rendezvous-accepts @loaded-light)))
         (is (= {:peer pub2 :price 10 :burn 100 :epoch 42}
                (get-in @loaded-light [:outbound-rendezvous sid])))
-        ;; Escrow record preserves all 10 fields
-        (is (= (get-in populated-light [:escrows esc-id])
-               (get-in @loaded-light [:escrows esc-id])))
+        ;; R9-M1: Locked, settled (:released), and refunded (:refunded) escrows survive with all fields intact
+        (is (= :locked (:status locked-escrow)))
+        (is (= :released (:status released-escrow)))
+        (is (= 42 (:settled-epoch released-escrow)))
+        (is (pos? (:take-amount released-escrow)))
+        (is (pos? (:net-amount released-escrow)))
+        (is (= :payer-authorized (:settlement-mode released-escrow)))
+        (is (= :refunded (:status refunded-escrow)))
+        (is (= 46 (:settled-epoch refunded-escrow)))
+        (is (= 800 (:refund-amount refunded-escrow)))
+        (is (= :receiver-voluntary (:refund-reason refunded-escrow)))
+        (is (= locked-escrow (get-in @loaded-light [:escrows esc-id-locked])))
+        (is (= released-escrow (get-in @loaded-light [:escrows esc-id-released])))
+        (is (= refunded-escrow (get-in @loaded-light [:escrows esc-id-refunded])))
         ;; Session record preserves replay-window, contiguous-rx-seq, outbox-order, and outbox while stripping secrets
         (let [sess (get-in @loaded-light [:sessions sid])]
           (is (= pub2 (:peer sess)))
