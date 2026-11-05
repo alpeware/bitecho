@@ -334,23 +334,23 @@
       (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
       (is (= [{:id :c}] (vec (:nested-list sanitized))))))
 
-  (testing "1,377+ combo enumeration across all 51+ stems, 9 casings, and 3 key types + persist->load roundtrip (R3-M1)"
-    (let [stems ["private" "private-key" "private-key-bytes" "private-key-hex"
-                 "privkey" "privkey-bytes" "privkey-hex"
-                 "seed" "seed-bytes" "seed-hex" "backup-seed"
-                 "secret" "secret-key" "secret-key-bytes" "shared-secret"
-                 "root-key" "chain-key" "send-chain-key" "recv-chain-key"
-                 "skipped-keys" "session-key" "session-keys" "ratchet-key"
-                 "ephemeral-private" "ephemeral-private-key" "ephemeral-priv" "ephemeral-privkey"
-                 "x25519" "x25519-priv" "x25519-privkey" "x25519-private" "x25519-private-key"
-                 "x25519-privkey-bytes" "x25519-private-key-bytes" "x25519-secret"
-                 "ed25519-privkey" "ed25519-private-key" "ed25519-seed"
-                 "cold-privkey" "cold-private-key" "keypair" "tx-key" "rx-key"
-                 "prf" "prf-output" "raw-id" "user-handle" "credential-id"
-                 "attestation-object" "client-data-json"
-                 "mnemonic" "passphrase" "password" "first" "eval"
-                 "connected?" "connection-error" "conn-diagnostics" "conn-atom" "conn"
-                 "channel" "active-channels" "connections" "transport" "socket" "last-error"]
+  (testing "4,320+ combo enumeration across 100% of forbidden-persistence-keys, 30+ credential/token/key stems, 9 casings, and 3 key types + public-key carve-out (0 survivors AND 0 false positives) + persist->load roundtrip (R4-M1)"
+    (let [extra-stems ["api-key" "api-token" "api-secret" "jwt" "jwt-token"
+                       "access-token" "refresh-token" "session-token" "auth-token" "bearer-token"
+                       "id-token" "csrf-token" "oauth-token" "token" "tokens"
+                       "bearer" "authorization" "auth-secret" "auth-key" "client-secret" "server-secret"
+                       "signing-key" "encryption-key" "decryption-key" "master-key" "hmac-key"
+                       "symmetric-key" "aes-key" "chacha-key" "wrapping-key" "derived-key"
+                       "hkdf-key" "kdf-key" "mac-key" "backup-key" "recovery-key" "identity-key"
+                       "node-key" "host-key" "peer-key" "hot-key" "cold-key" "device-key"
+                       "credential" "credentials" "cookie" "cookies" "pin" "otp" "totp"]
+          stems (vec (distinct (concat (sort browser/forbidden-persistence-keys)
+                                       extra-stems
+                                       (for [s ["private-key" "privkey" "seed" "secret-key" "session-key"
+                                                "api-key" "access-token" "session-token" "signing-key"
+                                                "x25519-privkey" "ed25519-privkey" "prf-output" "user-handle"]
+                                             sfx ["-bytes" "-hex" "-raw" "-b64"]]
+                                         (str s sfx)))))
           to-camel (fn [s]
                      (let [parts (str/split s #"-")]
                        (apply str (first parts) (map str/capitalize (rest parts)))))
@@ -368,25 +368,52 @@
                      (str/replace s "-" "")
                      (str/replace s "-" ".")
                      (to-title-snake s)])
-          all-keys (for [stem stems
-                         cased (casings stem)
-                         k [cased (keyword cased) (symbol cased)]]
-                     k)
-          test-map (into {:safe-pubkey "pub-ok"} (map (fn [k] [k "SENSITIVE"]) all-keys))
+          all-forbidden-keys (for [stem stems
+                                   cased (casings stem)
+                                   k [cased (keyword cased) (symbol cased)]]
+                               k)
+          carve-out-stems ["pubkey" "public-key" "x25519-pubkey" "x25519-public-key"
+                           "ed25519-pubkey" "ed25519-public-key" "peer-pubkey" "agent-pubkey"
+                           "hot-pubkey" "anchor-pubkey" "authority-pubkey" "directory-pubkey"
+                           "caller-pubkey" "callee-pubkey" "key-mode" "keys-verified?"]
+          all-carve-out-keys (vec (distinct (for [stem carve-out-stems
+                                                  cased (casings stem)
+                                                  k [cased (keyword cased) (symbol cased)]]
+                                              k)))
+          test-map (into {}
+                         (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
+                                 (map (fn [k] [k "PUBLIC-OK"]) all-carve-out-keys)))
           sanitized (browser/sanitize-state-for-persistence test-map)
-          survivors (dissoc sanitized :safe-pubkey)]
-      (is (>= (count all-keys) 1377))
-      (is (empty? survivors) (str "Survivors found: " (pr-str (take 10 (keys survivors)))))
-      (is (= {:safe-pubkey "pub-ok"} sanitized)))
+          survivors (remove (set all-carve-out-keys) (keys sanitized))
+          false-positives (remove #(contains? sanitized %) all-carve-out-keys)]
+      (is (every? (set stems) browser/forbidden-persistence-keys))
+      (is (>= (count all-forbidden-keys) 4320))
+      (is (empty? survivors) (str "Forbidden survivors found: " (pr-str (take 10 survivors))))
+      (is (empty? false-positives) (str "Carve-out false positives found: " (pr-str (take 10 false-positives)))))
 
     (let [roundtrip-input {:peer-id "rt-node"
+                           :x25519-pubkey "PUB-X25519-OK"
+                           :x25519Pubkey "PUB-X25519-CAMEL-OK"
+                           :public-key "PUB-ED25519-OK"
                            :privateKeyBytes "LEAK-1"
                            :x25519Privkey "LEAK-2"
                            :x25519-private-key "LEAK-3"
-                           :nested {:privateKeyBytes "LEAK-4"
-                                    :x25519Privkey "LEAK-5"
+                           :api-key "LEAK-4"
+                           :jwt "LEAK-5"
+                           :access-token "LEAK-6"
+                           :session-token "LEAK-7"
+                           :nested {:privateKeyBytes "LEAK-8"
+                                    :x25519Privkey "LEAK-9"
+                                    :api-token "LEAK-10"
+                                    :x25519-pubkey "NESTED-PUB-OK"
                                     :safe-val 99}}
           loaded-atom (atom nil)]
       (browser/persist-state! roundtrip-input nil)
       (browser/load-persisted-state (fn [_err st] (reset! loaded-atom st)))
-      (is (= {:peer-id "rt-node" :nested {:safe-val 99}} @loaded-atom)))))
+      (is (= {:peer-id "rt-node"
+              :x25519-pubkey "PUB-X25519-OK"
+              :x25519Pubkey "PUB-X25519-CAMEL-OK"
+              :public-key "PUB-ED25519-OK"
+              :nested {:x25519-pubkey "NESTED-PUB-OK"
+                       :safe-val 99}}
+             @loaded-atom)))))

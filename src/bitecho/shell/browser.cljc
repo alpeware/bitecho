@@ -261,6 +261,16 @@
     "prf" "prf-output" "prf-bytes" "prf-seed" "prf-secret" "hmac-secret"
     "raw-id" "raw-id-bytes" "user-handle" "user-handle-bytes" "credential-id" "credential-id-bytes"
     "attestation-object" "client-data-json"
+    "api-key" "api-key-hex" "api-key-bytes" "api-token" "api-secret"
+    "jwt" "jwt-token" "access-token" "refresh-token" "session-token" "auth-token"
+    "bearer-token" "id-token" "csrf-token" "oauth-token" "token" "tokens"
+    "bearer" "authorization" "auth-secret" "auth-key" "client-secret" "server-secret"
+    "signing-key" "signing-privkey" "signing-private-key" "encryption-key" "decryption-key"
+    "master-key" "master-seed" "hmac-key" "symmetric-key" "aes-key" "chacha-key"
+    "wrapping-key" "derived-key" "hkdf-key" "kdf-key" "mac-key" "backup-key"
+    "recovery-key" "recovery-seed" "identity-key" "identity-seed" "node-key" "host-key"
+    "peer-key" "hot-key" "cold-key" "device-key" "turn-password" "turn-secret"
+    "credential" "credentials" "cookie" "cookies" "pin" "otp" "totp"
     "mnemonic" "passphrase" "password" "first" "eval"
     "connected?" "connected" "connection-error" "conn-diagnostics" "conn-atom" "conn"
     "channel" "active-channels" "connections" "transport" "socket" "last-error"})
@@ -270,28 +280,66 @@
 
 (def ^:private forbidden-persistence-tokens
   #{"private" "privkey" "priv" "seed" "seeds" "secret" "secrets"
-    "mnemonic" "passphrase" "password" "keypair" "keypairs" "x25519" "prf" "eval"})
+    "mnemonic" "passphrase" "password" "passwd" "pwd" "keypair" "keypairs"
+    "prf" "eval" "jwt" "bearer" "token" "tokens" "cookie" "cookies"
+    "credential" "credentials" "pin" "otp" "totp"})
 
 (def ^:private forbidden-persistence-compact-substrings
-  ["private" "privkey" "seed" "secret" "mnemonic" "passphrase" "password" "keypair" "x25519"
+  ["private" "privkey" "seed" "secret" "mnemonic" "passphrase" "password" "keypair"
+   "x25519priv" "x25519sec" "ed25519priv" "ed25519sec" "ed25519seed"
    "sessionkey" "sharedsecret" "rootkey" "chainkey" "ratchetkey" "skippedkey" "txkey" "rxkey"
    "ephemeralpriv" "coldpriv" "prfoutput" "prfbytes" "prfseed" "userhandle" "rawid"
    "credentialid" "attestationobject" "clientdatajson" "connectionerror" "conndiagnostics"
-   "connatom" "activechannels" "lasterror"])
+   "connatom" "activechannels" "lasterror"
+   "apikey" "apitoken" "apisecret" "jwttoken" "accesstoken" "refreshtoken" "sessiontoken"
+   "authtoken" "bearertoken" "idtoken" "csrftoken" "oauthtoken" "authsecret" "authkey"
+   "clientsecret" "serversecret" "signingkey" "encryptionkey" "decryptionkey" "masterkey"
+   "hmackey" "symmetrickey" "aeskey" "chachakey" "wrappingkey" "derivedkey" "hkdfkey"
+   "kdfkey" "mackey" "backupkey" "recoverykey" "identitykey" "nodekey" "hostkey" "peerkey"
+   "hotkey" "coldkey" "devicekey"])
+
+(def ^:private carved-out-public-keys
+  #{"pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
+    "pubkey-hex" "public-key-hex" "pubkey-bytes" "public-key-bytes"
+    "key-mode" "keys-verified?" "keys-verified" "cose-key"})
+
+(defn- public-key-carve-out?
+  "Returns true if canonical key `canon` (and its compact form and token vector) represents
+   a public key or non-secret key metadata field (e.g., :pubkey, :public-key, :x25519-pubkey,
+   :ed25519-public-key, :peer-pubkey, :key-mode, :keys-verified?) that must never be stripped."
+  [canon compact tokens]
+  (or (contains? carved-out-public-keys canon)
+      (and (not-any? #(contains? forbidden-persistence-tokens %) tokens)
+           (not-any? #(str/includes? compact %)
+                     ["private" "privkey" "secret" "seed" "password" "passphrase"
+                      "mnemonic" "token" "jwt" "bearer" "cookie"])
+           (or (some #{"pubkey" "pubkeys"} tokens)
+               (and (some #{"public"} tokens) (some #{"key" "keys"} tokens))
+               (str/ends-with? compact "pubkey")
+               (str/ends-with? compact "pubkeys")
+               (str/ends-with? compact "publickey")
+               (str/ends-with? compact "publickeys")
+               (str/ends-with? compact "pubkeyhex")
+               (str/ends-with? compact "publickeyhex")
+               (str/ends-with? compact "pubkeybytes")
+               (str/ends-with? compact "publickeybytes")))))
 
 (defn forbidden-persistence-key?
   "Returns true if key k (in any case: camelCase, PascalCase, snake_case, UPPER_SNAKE, kebab-case,
    compact lowercase, keyword, string, or symbol, with any prefix/suffix) is a sensitive credential,
-   private key material, or derived transport/lifecycle state."
+   private key material, or derived transport/lifecycle state, while preserving carved-out public-key
+   identifiers (e.g. :pubkey, :public-key, :x25519-pubkey)."
   [k]
   (boolean
    (when-let [canon (canonical-key-name k)]
      (let [compact (str/replace canon #"[-?]" "")
            tokens (str/split (str/replace canon "?" "") #"-")]
-       (or (contains? forbidden-persistence-keys canon)
-           (contains? forbidden-persistence-keys-compact compact)
-           (some #(contains? forbidden-persistence-tokens %) tokens)
-           (some #(str/includes? compact %) forbidden-persistence-compact-substrings))))))
+       (and (not (public-key-carve-out? canon compact tokens))
+            (or (contains? forbidden-persistence-keys canon)
+                (contains? forbidden-persistence-keys-compact compact)
+                (some #(contains? forbidden-persistence-tokens %) tokens)
+                (and (>= (count tokens) 2) (some #{"key" "keys"} tokens))
+                (some #(str/includes? compact %) forbidden-persistence-compact-substrings)))))))
 
 (defn sanitize-state-for-persistence
   "Sanitizes browser/light-node state recursively before storage in IndexedDB/disk.
