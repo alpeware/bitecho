@@ -200,8 +200,9 @@
       :user {:id seed
              :name username
              :displayName display-name}
-      :pubKeyCredParams [{:type "public-key" :alg -7}   ;; ES256
-                         {:type "public-key" :alg -8}]  ;; Ed25519
+      :pubKeyCredParams [{:type "public-key" :alg -7}     ;; ES256
+                         {:type "public-key" :alg -8}     ;; Ed25519
+                         {:type "public-key" :alg -257}]  ;; RS256
       :authenticatorSelection {:residentKey "required"
                                :requireResidentKey true
                                :userVerification "required"

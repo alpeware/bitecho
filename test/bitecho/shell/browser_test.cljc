@@ -411,7 +411,7 @@
             "harmless" "benign" "normal" "regular" "pub" "label" "name" "title" "description"
             "text" "message" "msg" "memo" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
             "num" "number" "amount" "burn-amount" "balance" "spendable" "price" "burn" "burn-floor" "fee"
-            "epoch" "epoch-initialized?" "created-epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
+            "epoch" "epoch-initialized?" "max-epoch-skew" "created-epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
             "seq" "tx-seq" "acked-seq" "rx-high-seq" "contiguous-rx-seq" "transfer-seq" "intent-seq" "voucher-seqs"
             "unacked-count" "replays-deduped" "outbox-evicted" "outbox-order" "deps"
             "replay-window" "highest-seq" "seen" "window-size"
@@ -878,3 +878,84 @@
              (is (fn? (.-loadStateFromIndexedDb browser-main/api)))
              (is (nil? (:keypair stored-after-hw)))
              (is (nil? (:x25519 stored-after-hw)))))))))
+
+#?(:cljs
+   (deftest browser-live-fixes-dashboard-balance-ghost-sessions-and-send-message-test
+     (testing "Live testing fixes: dashboard balance sync, ghost session pruning on reload, multi-session resolution in send-message, incoming chat peer label, and max-epoch-skew"
+       (reset! browser/*in-memory-idb-store* {})
+       (let [node (browser-main/init-node {:peer-id "browser-test"})
+             _ (browser-main/init-anchor {:pubkey (get-in @node [:light-state :pubkey])})
+             peer-kp (crypto/generate-keypair)
+             peer-pub (fressian/bytes->hex (:public-key peer-kp))
+             peer-priv (:private-key peer-kp)
+             my-pub (get-in @node [:light-state :pubkey])
+             _my-priv (get-in @node [:keypair :private-key])]
+         ;; 1. init-node sets :max-epoch-skew 15 on :light-state
+         (is (= 15 (get-in @node [:light-state :max-epoch-skew])))
+         ;; 2. get-anchor-dashboard syncs :balance and :burned-ech from active-node-atom's :light-state
+         (swap! node #(-> %
+                          (assoc-in [:light-state :account :balance] 99000)
+                          (assoc-in [:light-state :account :spendable] 99000)
+                          (assoc-in [:light-state :local-accounting :burned-ech] 1500)))
+         (let [dash (js->clj (browser-main/get-anchor-dashboard) :keywordize-keys true)]
+           (is (= 99000 (get-in dash [:accounting :balance])))
+           (is (= 1500 (get-in dash [:accounting :burned-ech]))))
+         ;; 3. Register peer petname "nexus", create an unaccepted "offered" session AND an "open" session
+         (swap! node assoc-in [:light-state :petnames "nexus"] peer-pub)
+         (swap! node assoc-in [:petnames "nexus"] peer-pub)
+         (swap! node assoc-in [:conn :phase] :open)
+         ;; Outbound offer 1 (remains "offered")
+         (let [off1 (js->clj (browser-main/open-channel node "nexus" 10 500) :keywordize-keys true)
+               sid-offered (:sessionId off1)
+               ;; Peer sends an inbound offer at epoch + 10 (within max-epoch-skew 15, > default 2)
+               peer-st0 (-> (light-core/init-light-state {:pubkey-hex peer-pub}
+                                                         {:subnet-id "global" :economy-enabled? false})
+                            (assoc :epoch 12 :epoch-initialized? true))
+               peer-off-cmd (light-core/handle-command peer-st0
+                                                       {"cmd" "offer" "callee" my-pub "price" 10 "burn" 500}
+                                                       peer-priv)
+               offer-env (last (:net-envelopes peer-off-cmd))
+               sid-open (get (:response peer-off-cmd) "session_id")]
+           (swap! node assoc-in [:light-state :epoch] 2)
+           (swap! node assoc-in [:light-state :epoch-initialized?] true)
+           (browser-main/handle-inbound-wire-envelope! node offer-env)
+           ;; Inbound offer with +10 epoch skew is accepted into :pending-offers because max-epoch-skew is 15
+           (is (contains? (get-in @node [:light-state :pending-offers]) sid-open))
+           ;; Capture outgoing accept envelope via a mock DataChannel on node
+           (let [sent-wire-atom (atom [])
+                 mock-dc #js {:readyState "open"
+                              :send (fn [b] (swap! sent-wire-atom conj b))}
+                 _ (swap! node assoc-in [:active-channels "node1"] mock-dc)
+                 acc-res (js->clj (browser-main/accept-channel-offer node sid-open) :keywordize-keys true)
+                 accept-env (fressian/decode-wire (last @sent-wire-atom))]
+             (is (true? (:ok acc-res)))
+             (is (= "offered" (get-in @node [:light-state :sessions sid-offered :state])))
+             (is (= "open" (get-in @node [:light-state :sessions sid-open :state])))
+             ;; 4. send-message by petname resolves the usable "open" session even when an "offered" or second session exists
+             (let [send-res (js->clj (browser-main/send-message node "nexus" "hello over open session") :keywordize-keys true)]
+               (is (true? (:ok send-res)))
+               (is (= 1 (:envelopesSent send-res))))
+             ;; Also supports sending by explicit session-id
+             (let [send-by-sid (js->clj (browser-main/send-message node sid-open "hello by explicit sid") :keywordize-keys true)]
+               (is (true? (:ok send-by-sid)))
+               (is (= 1 (:envelopesSent send-by-sid))))
+             ;; 5. Incoming sealed message populates :peer in :chat-history from :from_petname / :from
+             (let [peer-st1 (:state (light-core/handle-wire-payload (:state peer-off-cmd) accept-env peer-priv))
+                   peer-msg-cmd (light-core/handle-command peer-st1
+                                                           {"cmd" "send" "session_id" sid-open "text" "welcome from nexus"}
+                                                           peer-priv)
+                   msg-env (last (:net-envelopes peer-msg-cmd))]
+               (browser-main/handle-inbound-wire-envelope! node msg-env)
+               (let [last-chat (last (:chat-history @node))]
+                 (is (= :incoming (:direction last-chat)))
+                 (is (= "welcome from nexus" (:text last-chat)))
+                 (is (= "nexus" (:peer last-chat)))))
+             ;; 6. Browser refresh (apply-restored-state!) prunes ghost sessions whose keys were stripped during persistence
+             (let [sanitized (browser/sanitize-state-for-persistence @node)
+                   node-reloaded (browser-main/init-node {:peer-id "browser-test"})]
+               ;; Before apply-restored-state!, sanitized still has session records without :tx-key
+               (is (contains? (get-in sanitized [:light-state :sessions]) sid-open))
+               (is (nil? (get-in sanitized [:light-state :sessions sid-open :tx-key])))
+               (browser-main/apply-restored-state! node-reloaded sanitized)
+               (is (empty? (get-in @node-reloaded [:light-state :sessions])))
+               (is (empty? (:sessions @node-reloaded))))))))))

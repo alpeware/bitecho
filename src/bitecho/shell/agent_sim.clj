@@ -1,6 +1,7 @@
 (ns bitecho.shell.agent-sim
   "Light Agent Swarm Simulator: pure envelope builders and WebRTC DataChannel swarm runner."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.bech32m :as bech32m]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
             [bitecho.fressian :as fressian]
@@ -119,7 +120,13 @@
               (str/starts-with? amount-str "-"))
       (throw (ex-info "Usage: fund-agent <bootstrap.edn> <keypair.edn> <recipient-pubkey-hex> <amount> [--seq S] [--deps D] [--burn B]"
                       {:args args})))
-    (let [amount (try (let [v (Long/parseLong amount-str)]
+    (let [resolved-recipient (if (str/starts-with? (str/lower-case recipient) "ech1")
+                               (if-let [decoded (bech32m/bech32m->pubkey recipient)]
+                                 (:spki-hex decoded)
+                                 (throw (ex-info (str "Invalid Bech32m recipient address: " recipient)
+                                                 {:recipient recipient})))
+                               recipient)
+          amount (try (let [v (Long/parseLong amount-str)]
                         (when-not (pos? v)
                           (throw (ex-info "Amount must be positive" {:amount v})))
                         v)
@@ -133,7 +140,7 @@
         (if (empty? remaining)
           {:bootstrap-file bootstrap-file
            :keypair-file keypair-file
-           :recipient recipient
+           :recipient resolved-recipient
            :amount amount
            :opts opts}
           (let [flag (first remaining)

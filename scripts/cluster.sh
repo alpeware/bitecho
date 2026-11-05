@@ -1381,7 +1381,23 @@ cmd_fund() {
   local amount="${2:-1000000}"
 
   if [[ -z "$recipient" ]]; then
-    echo "Usage: ./scripts/cluster.sh fund <recipient-pubkey-hex> [amount]" >&2
+    echo "Usage: ./scripts/cluster.sh fund <recipient-pubkey-hex|ech1-address> [amount]" >&2
+    return 1
+  fi
+
+  if [[ "${recipient,,}" == ech1* ]]; then
+    echo "--> Auto-decoding Bech32m address ${recipient} to SPKI hex..."
+    local decoded_hex
+    decoded_hex="$(cd "${ROOT_DIR}" && clojure -M -e "(require '[bitecho.bech32m :as b]) (if-let [d (b/bech32m->pubkey \"${recipient}\")] (println (:spki-hex d)) (System/exit 1))" 2>/dev/null || echo "")"
+    if [[ -z "$decoded_hex" ]]; then
+      echo "Error: Invalid Bech32m recipient address: ${recipient}" >&2
+      return 1
+    fi
+    recipient="$decoded_hex"
+  fi
+
+  if [[ ! "$recipient" =~ ^[0-9a-fA-F]{88}$ ]]; then
+    echo "Error: Recipient must be an 88-character SPKI hex string or valid ech1... Bech32m address (got: ${recipient})" >&2
     return 1
   fi
 

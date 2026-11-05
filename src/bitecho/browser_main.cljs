@@ -88,6 +88,23 @@
     (seq? x) (map redact-for-js x)
     :else x))
 
+(declare send-to-all-channels! send-chain-state-query!)
+
+(defn- prune-ghost-sessions
+  "Removes restored sessions whose ephemeral/session keys (:tx-key, :ephemeral-priv)
+   were stripped during IndexedDB persistence sanitization."
+  [sessions]
+  (if-not (map? sessions)
+    {}
+    (into {}
+          (filter (fn [[_sid s]]
+                    (let [st (or (:state s) (when (:status s) (name (:status s))))]
+                      (cond
+                        (= st "open") (or (some? (:tx-key s)) (some? (:session-keys s)))
+                        (= st "offered") (some? (:ephemeral-priv s))
+                        :else false))))
+          sessions)))
+
 (defn- apply-hardware-identity!
   "Applies a recovered hardware identity map to anchor-state-atom and active-node-atom,
    and persists the sanitized public state to IndexedDB for refresh continuity (H-5, A-5)."
@@ -106,13 +123,32 @@
                  (:private-key recovered)
                  (assoc :privkey-bytes (:private-key recovered))))))
     (when (and @active-node-atom (:private-key recovered) (:public-key recovered))
-      (swap! @active-node-atom
-             (fn [node]
-               (-> node
-                   (assoc :keypair {:public-key (:public-key recovered)
-                                    :private-key (:private-key recovered)})
-                   (assoc-in [:light-state :pubkey] (:public-hex recovered)))))
-      (browser/persist-state! (browser/sanitize-state-for-persistence @@active-node-atom)))
+      (let [na @active-node-atom
+            prev-pub (get-in @na [:light-state :pubkey])
+            new-pub (:public-hex recovered)
+            pub-changed? (not= prev-pub new-pub)]
+        (swap! na
+               (fn [node]
+                 (cond-> (-> node
+                             (assoc :keypair {:public-key (:public-key recovered)
+                                              :private-key (:private-key recovered)})
+                             (assoc-in [:light-state :pubkey] new-pub))
+                   pub-changed?
+                   (-> (assoc-in [:light-state :chain-state-snapshots] {})
+                       (assoc-in [:light-state :account] {:balance 0 :spendable 0 :seq 0 :deps []})))))
+        ;; If already connected to mesh DataChannels, re-register home-set and query chain state for unlocked identity
+        (let [channels (:active-channels @na)
+              open-dcs (keep (fn [[_id dc]] (when (and dc (= (.-readyState dc) "open")) dc)) channels)]
+          (when (seq open-dcs)
+            (let [reg-res (light-core/handle-command (:light-state @na)
+                                                     {"cmd" "register-home-set" "price" 10 "nodes" ["node1" "node2" "node3"]}
+                                                     (:private-key recovered))]
+              (swap! na assoc :light-state (:state reg-res))
+              (doseq [env (:net-envelopes reg-res)]
+                (send-to-all-channels! na env)))
+            (doseq [dc open-dcs]
+              (send-chain-state-query! na dc))))
+        (browser/persist-state! (browser/sanitize-state-for-persistence @na))))
     (notify-ui-listeners!)))
 
 (defn apply-restored-state!
@@ -127,7 +163,13 @@
                         (:pubkey loaded))]
       (if (and (string? saved-pub) (not (str/blank? saved-pub)))
         (let [saved-addr (bech32m/pubkey->bech32m saved-pub "ech")
-              pub-bytes (basalt/hex->bytes saved-pub)]
+              pub-bytes (basalt/hex->bytes saved-pub)
+              clean-loaded (-> loaded
+                               (dissoc :conn :keypair :x25519 :active-channels)
+                               (update :sessions prune-ghost-sessions)
+                               (update-in [:light-state :sessions] prune-ghost-sessions)
+                               (assoc-in [:light-state :max-epoch-skew]
+                                         (or (get-in loaded [:light-state :max-epoch-skew]) 15)))]
           (swap! node-atom
                  (fn [curr]
                    (let [curr-kp (:keypair curr)
@@ -135,7 +177,7 @@
                                     (fressian/bytes->hex (:public-key curr-kp)))
                          same-pub? (= curr-pub saved-pub)]
                      (-> curr
-                         (merge (dissoc loaded :conn :keypair :x25519 :active-channels))
+                         (merge clean-loaded)
                          (assoc-in [:light-state :pubkey] saved-pub)
                          (assoc :keypair (if same-pub?
                                            curr-kp
@@ -156,7 +198,7 @@
                     (anchor/init-anchor-state {:pubkey saved-pub} {})))
           (notify-ui-listeners!)
           (let [hw-locked? (nil? (get-in @node-atom [:keypair :private-key]))]
-            (-> loaded
+            (-> clean-loaded
                 (assoc :pubkey saved-pub
                        :address saved-addr
                        :hardwareLocked hw-locked?))))
@@ -171,6 +213,7 @@
                          (crypto/generate-keypair))
          pubkey-hex (or (:pubkey opts-map)
                         (:pubkey-hex opts-map)
+                        (when-let [na @active-node-atom] (get-in @na [:light-state :pubkey]))
                         (when fallback-kp (fressian/bytes->hex (:public-key fallback-kp))))
          privkey-bytes (or (:privkey-bytes opts-map)
                            (:cold-privkey opts-map)
@@ -182,11 +225,31 @@
      (clj->js (redact-for-js (anchor/anchor-dashboard-view st))))))
 
 (defn get-anchor-dashboard
-  "Returns the Human Anchor dashboard view as a JavaScript object."
+  "Returns the Human Anchor dashboard view as a JavaScript object, syncing live balance and burn metrics from active-node-atom."
   []
   (when-not @anchor-state-atom
     (init-anchor nil))
-  (clj->js (redact-for-js (anchor/anchor-dashboard-view @anchor-state-atom))))
+  (when-let [na @active-node-atom]
+    (let [node @na
+          light-st (:light-state node)
+          pub (or (:anchor-pubkey @anchor-state-atom) (:pubkey light-st))
+          light-bal (or (get-in light-st [:account :balance]) (:balance light-st))
+          light-burned (or (get-in light-st [:local-accounting :burned-ech]) (:burned-ech node))]
+      (when (or (and pub (number? light-bal)) (number? light-burned))
+        (swap! anchor-state-atom
+               (fn [st]
+                 (cond-> st
+                   (and pub (number? light-bal))
+                   (assoc-in [:accounts pub :balance] light-bal)
+                   (number? light-burned)
+                   (assoc-in [:local-accounting :burned-ech] light-burned)))))))
+  (let [hw-locked? (if-let [na @active-node-atom]
+                     (nil? (get-in @na [:keypair :private-key]))
+                     (nil? (:privkey-bytes @anchor-state-atom)))
+        view (-> (anchor/anchor-dashboard-view @anchor-state-atom)
+                 (assoc :hardware-locked hw-locked?)
+                 (assoc-in [:identity :hardware-locked] hw-locked?))]
+    (clj->js (redact-for-js view))))
 
 (defn register-yubikey
   "Configures YubiKey discoverable credential options and updates anchor key-mode."
@@ -298,12 +361,18 @@
   [offer-id & [opts]]
   (let [id (str offer-id)
         opts-map (when opts (js->clj opts :keywordize-keys true))
-        [new-state effects] (anchor/approve-offer (or @anchor-state-atom (anchor/init-anchor-state)) id opts-map)]
-    (reset! anchor-state-atom new-state)
-    (when-let [na @active-node-atom]
-      (when (get-in @na [:light-state :pending-offers id])
-        (accept-channel-offer na id)))
-    (clj->js {:ok true :effects effects :dashboard (redact-for-js (anchor/anchor-dashboard-view new-state))})))
+        na @active-node-atom
+        live-offer? (and na (some? (get-in @na [:light-state :pending-offers id])))
+        hw-locked? (and na (nil? (get-in @na [:keypair :private-key])))]
+    (if (and live-offer? hw-locked?)
+      (clj->js {:ok false
+                :error "hardware-unlock-required"
+                :dashboard (redact-for-js (anchor/anchor-dashboard-view (or @anchor-state-atom (anchor/init-anchor-state))))})
+      (let [[new-state effects] (anchor/approve-offer (or @anchor-state-atom (anchor/init-anchor-state)) id opts-map)]
+        (reset! anchor-state-atom new-state)
+        (when live-offer?
+          (accept-channel-offer na id))
+        (clj->js {:ok true :effects effects :dashboard (redact-for-js (anchor/anchor-dashboard-view new-state))})))))
 
 (defn deny-offer-cmd
   "Denies a pending offer in the Human Anchor queue with an explicit reason."
@@ -312,6 +381,8 @@
         rej-reason (or reason "denied-by-human-anchor")
         [new-state effects] (anchor/deny-offer (or @anchor-state-atom (anchor/init-anchor-state)) id rej-reason)]
     (reset! anchor-state-atom new-state)
+    (when-let [na @active-node-atom]
+      (swap! na update-in [:light-state :pending-offers] dissoc id))
     (clj->js {:ok true :effects effects :dashboard (redact-for-js (anchor/anchor-dashboard-view new-state))})))
 
 (defn supervise-agent-cmd
@@ -398,7 +469,7 @@
                                                   :economy-enabled? true
                                                   :burn-floor 100
                                                   :autonomous? false})
-         light-st (assoc init-light :petnames default-petnames)
+         light-st (assoc init-light :petnames default-petnames :max-epoch-skew 15)
          conn-state (browser/initial-conn-state {:peer-id node-id :subnet-id subnet-id})
          node-atom (atom {:peer-id node-id
                           :subnet-id subnet-id
@@ -491,14 +562,20 @@
                                (assoc :light-state new-st)
                                (assoc :sessions (:sessions new-st))
                                (update :chat-history (fn [hist]
-                                                       (into (or hist [])
-                                                             (map (fn [m]
-                                                                    {:timestamp (.toISOString (js/Date.))
-                                                                     :direction :incoming
-                                                                     :peer (or (:sender m) (:peer-id m) "peer")
-                                                                     :text (or (:text m) (:message m) (str m))
-                                                                     :status :received}))
-                                                             new-msgs)))))))
+                                                       (let [pnames (or (:petnames curr) (:petnames new-st) default-petnames)]
+                                                         (into (or hist [])
+                                                               (map (fn [m]
+                                                                      (let [sender-hex (or (:sender m) (:from m) (:peer-id m))
+                                                                            pname (some (fn [[k v]]
+                                                                                          (when (= v sender-hex)
+                                                                                            (if (keyword? k) (name k) (str k))))
+                                                                                        pnames)]
+                                                                        {:timestamp (.toISOString (js/Date.))
+                                                                         :direction :incoming
+                                                                         :peer (or (:from_petname m) (:from-petname m) pname sender-hex "peer")
+                                                                         :text (or (:text m) (:message m) (str m))
+                                                                         :status :received})))
+                                                               new-msgs))))))))
       ;; Surface any new live incoming channel offers into the Human Anchor queue
       (doseq [[sid offer] curr-offers]
         (when-not (contains? prev-offers sid)
@@ -524,10 +601,11 @@
   (when (and node-atom dc (= (.-readyState dc) "open"))
     (let [node @node-atom
           pubkey (get-in node [:light-state :pubkey])
-          privkey (:private-key (:keypair node))
-          nonce (str "csq-" (fressian/bytes->hex (crypto/random-bytes 4)))
-          q-env (light-core/build-chain-state-query-envelope pubkey privkey {:nonce nonce})]
-      (try (.send dc (fressian/encode-wire q-env)) (catch :default _ nil)))))
+          privkey (:private-key (:keypair node))]
+      (when (and pubkey privkey)
+        (let [nonce (str "csq-" (fressian/bytes->hex (crypto/random-bytes 4)))
+              q-env (light-core/build-chain-state-query-envelope pubkey privkey {:nonce nonce})]
+          (try (.send dc (fressian/encode-wire q-env)) (catch :default _ nil)))))))
 
 (defn- on-validator-channel-open!
   "Handles validator DataChannel open: records channel, registers home set, queries chain state, and starts keepalive."
@@ -535,20 +613,21 @@
   (swap! node-atom (fn [st]
                      (cond-> (assoc-in st [:active-channels nid] dc)
                        (= nid "node1") (assoc :conn @conn-atom))))
-  ;; Register home set with devnet nodes
-  (let [reg-res (light-core/handle-command (:light-state @node-atom)
-                                           {"cmd" "register-home-set" "price" 10 "nodes" ["node1" "node2" "node3"]}
-                                           (:private-key (:keypair @node-atom)))]
-    (swap! node-atom assoc :light-state (:state reg-res))
-    (doseq [env (:net-envelopes reg-res)]
-      (try (.send dc (fressian/encode-wire env)) (catch :default _ nil))))
+  ;; Register home set with devnet nodes when signing key is unlocked
+  (when-let [privkey (:private-key (:keypair @node-atom))]
+    (let [reg-res (light-core/handle-command (:light-state @node-atom)
+                                             {"cmd" "register-home-set" "price" 10 "nodes" ["node1" "node2" "node3"]}
+                                             privkey)]
+      (swap! node-atom assoc :light-state (:state reg-res))
+      (doseq [env (:net-envelopes reg-res)]
+        (try (.send dc (fressian/encode-wire env)) (catch :default _ nil)))))
   ;; Query chain state from validator so 2-of-3 BFT quorum syncs epoch and account
   (send-chain-state-query! node-atom dc)
-  ;; Keepalive + epoch sync every 25s
+  ;; Keepalive + epoch/balance sync every 5s
   (js/setInterval (fn []
                     (when (and dc (= (.-readyState dc) "open"))
                       (send-chain-state-query! node-atom dc)))
-                  25000)
+                  5000)
   (notify-ui-listeners!))
 
 (defn connect-mesh
@@ -696,23 +775,58 @@
                            :response resp}
                     (not cmd-ok?) (assoc :error (get resp "error")))))))))
 
+(defn- resolve-best-open-session-id
+  "Resolves the newest usable 'open' session-id (with :tx-key present) for target-pub,
+   or explicit-sid if provided."
+  [sessions target-pub explicit-sid]
+  (cond
+    (and (string? explicit-sid) (contains? sessions explicit-sid))
+    explicit-sid
+
+    (and (string? target-pub) (contains? sessions target-pub))
+    target-pub
+
+    :else
+    (let [open-candidates (->> sessions
+                               (filter (fn [[_sid s]]
+                                         (and (= (:peer s) target-pub)
+                                              (= (:state s) "open")
+                                              (some? (:tx-key s)))))
+                               (sort-by (fn [[sid s]]
+                                          [(long (or (:epoch s) 0))
+                                           (long (or (:tx-seq s) 0))
+                                           (str sid)])))]
+      (first (last open-candidates)))))
+
 (defn send-message
-  "Sends a cryptographically sealed message to a peer over the live mesh DataChannel."
-  ([peer-id text] (send-message @active-node-atom peer-id text))
-  ([node-atom peer-id text]
+  "Sends a cryptographically sealed message to a peer or explicit session-id over the live mesh DataChannel."
+  ([peer-id text] (send-message @active-node-atom peer-id text nil))
+  ([arg1 arg2 arg3]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (send-message arg1 arg2 arg3 nil)
+     (send-message @active-node-atom arg1 arg2 arg3)))
+  ([node-atom peer-id text explicit-session-id]
    (let [na (or node-atom @active-node-atom)
          node @na
-         target-pub (or (get (:petnames node) peer-id)
-                        (get default-petnames peer-id)
-                        peer-id)
+         sessions (or (get-in node [:light-state :sessions]) {})
+         direct-sess (get sessions peer-id)
+         target-pub (if direct-sess
+                      (:peer direct-sess)
+                      (or (get (:petnames node) peer-id)
+                          (get default-petnames peer-id)
+                          peer-id))
+         resolved-sid (resolve-best-open-session-id sessions target-pub (or explicit-session-id (when direct-sess peer-id)))
          privkey (:private-key (:keypair node))]
      (if-not privkey
        (clj->js {:ok false :error "hardware-unlock-required"})
-       (let [cmd-res (light-core/handle-command (:light-state node)
-                                                {"cmd" "send"
-                                                 "peer" target-pub
-                                                 "text" (str text)
-                                                 "message" (str text)}
+       (let [cmd-map (cond-> {"cmd" "send"
+                              "peer" target-pub
+                              "text" (str text)
+                              "message" (str text)}
+                       resolved-sid (assoc "session_id" resolved-sid))
+             cmd-res (light-core/handle-command (:light-state node)
+                                                cmd-map
                                                 privkey)
              new-st (:state cmd-res)
              out-envs (:net-envelopes cmd-res)
@@ -727,6 +841,7 @@
                        (update :chat-history conj {:timestamp (.toISOString (js/Date.))
                                                    :direction :outgoing
                                                    :peer peer-id
+                                                   :sessionId resolved-sid
                                                    :text text
                                                    :status :sent}))))
          (doseq [env out-envs]
@@ -735,10 +850,26 @@
          (notify-ui-listeners!)
          (clj->js (cond-> {:ok cmd-ok?
                            :peer peer-id
+                           :sessionId resolved-sid
                            :text text
                            :envelopesSent (count out-envs)
                            :response resp}
                     (not cmd-ok?) (assoc :error (or (get resp "error") "no-open-session-for-peer")))))))))
+
+(defn close-session
+  "Removes or closes a session by session-id from the browser light-node state."
+  ([session-id] (close-session @active-node-atom session-id))
+  ([node-atom session-id]
+   (let [na (or node-atom @active-node-atom)
+         sid (str session-id)]
+     (when na
+       (swap! na (fn [curr]
+                   (-> curr
+                       (update-in [:light-state :sessions] dissoc sid)
+                       (update :sessions dissoc sid))))
+       (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+       (notify-ui-listeners!))
+     (clj->js {:ok true :closedSessionId sid}))))
 
 (defn get-chat-history
   "Returns the vector of chat messages exchanged with peers."
@@ -1117,6 +1248,7 @@
        :openChannel open-channel
        :acceptChannelOffer accept-channel-offer
        :sendMessage send-message
+       :closeSession close-session
        :getChatHistory get-chat-history
        :getSessions get-sessions
        :resolvePeer resolve-peer

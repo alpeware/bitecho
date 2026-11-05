@@ -198,6 +198,7 @@
           recovered (webauthn/recover-seed-from-assertion {:user-handle seed})
           recovered-prf (webauthn/recover-seed-from-assertion {:extensions {:prf {:results {:first seed}}}})]
       (is (= "required" (get-in reg-opts [:authenticatorSelection :residentKey])))
+      (is (= #{-7 -8 -257} (set (map :alg (:pubKeyCredParams reg-opts)))))
       (is (empty? (:allowCredentials assert-opts)))
       (is (= "required" (:userVerification assert-opts)))
       (is (some? recovered))

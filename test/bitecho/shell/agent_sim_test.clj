@@ -295,4 +295,13 @@
     (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "not-a-number"])))
     (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "-100"])))
     (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "1000" "--unknown" "foo"])))
-    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "1000" "--seq"])))))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "target-hex" "1000" "--seq"]))))
+
+  (testing "parse-fund-args auto-decodes ech1 Bech32m address to SPKI hex and rejects invalid ech1 address"
+    (let [parsed (sim/parse-fund-args ["b.edn" "k.edn"
+                                       "ech1y0eqznlurppea0u8xxa8jphsxc5vxd4jyvnlj8c7epeemrjhps7sjwt8xg"
+                                       "100000"])]
+      (is (= "302a300506032b657003210023f2014ffc18439ebf8731ba7906f03628c336b22327f91f1ec8739d8e570c3d"
+             (:recipient parsed)))
+      (is (= 100000 (:amount parsed))))
+    (is (thrown? Exception (sim/parse-fund-args ["b.edn" "k.edn" "ech1invalidchecksum000" "100000"])))))

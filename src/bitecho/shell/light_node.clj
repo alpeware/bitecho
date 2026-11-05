@@ -1022,6 +1022,32 @@
         channel-id (atom nil)
         connected? (promise)
         send-fn-atom (atom nil)
+        cb-opts (cond-> {}
+                  (:diagnostics-atom opts) (assoc :diagnostics-atom (:diagnostics-atom opts))
+                  (:diagnose-fn opts) (assoc :diagnose-fn (:diagnose-fn opts)))
+        send-fn (fn [env]
+                  (if-let [cid @channel-id]
+                    (let [payload (try
+                                    (if (bytes? env) env (fressian/encode-wire env))
+                                    (catch Throwable t
+                                      (let [err (str "encode-failed: " (or (.getMessage t) (.getSimpleName (class t))))]
+                                        (when-let [ca (:conn-atom opts)]
+                                          (apply-conn-event! ca {:type :encode-failed :error err} cb-opts)
+                                          (sync-conn-diagnostics! (:state-atom opts) ca))
+                                        nil)))]
+                      (if (nil? payload)
+                        false
+                        (try
+                          (api/send! client-node payload cid)
+                          true
+                          (catch Throwable t
+                            (let [err (str "send-failed: " (or (.getMessage t) (.getSimpleName (class t))))]
+                              (when-let [ca (:conn-atom opts)]
+                                (apply-conn-event! ca {:type :send-failed :error err} cb-opts)
+                                (sync-conn-diagnostics! (:state-atom opts) ca))
+                              false)))))
+                    false))
+        _ (reset! send-fn-atom send-fn)
         callbacks (make-client-callbacks client-node channel-id connected? send-fn-atom
                                          {:identity identity
                                           :state-atom (:state-atom opts)
@@ -1069,36 +1095,10 @@
         (do (try (api/close! client-node) (catch Exception _ nil))
             {:ok? false :error "listener-disabled"})
         :else
-        (let [cb-opts (cond-> {}
-                        (:diagnostics-atom opts) (assoc :diagnostics-atom (:diagnostics-atom opts))
-                        (:diagnose-fn opts) (assoc :diagnose-fn (:diagnose-fn opts)))
-              send-fn (fn [env]
-                        (if-let [cid @channel-id]
-                          (let [payload (try
-                                          (if (bytes? env) env (fressian/encode-wire env))
-                                          (catch Throwable t
-                                            (let [err (str "encode-failed: " (or (.getMessage t) (.getSimpleName (class t))))]
-                                              (when-let [ca (:conn-atom opts)]
-                                                (apply-conn-event! ca {:type :encode-failed :error err} cb-opts)
-                                                (sync-conn-diagnostics! (:state-atom opts) ca))
-                                              nil)))]
-                            (if (nil? payload)
-                              false
-                              (try
-                                (api/send! client-node payload cid)
-                                true
-                                (catch Throwable t
-                                  (let [err (str "send-failed: " (or (.getMessage t) (.getSimpleName (class t))))]
-                                    (when-let [ca (:conn-atom opts)]
-                                      (apply-conn-event! ca {:type :send-failed :error err} cb-opts)
-                                      (sync-conn-diagnostics! (:state-atom opts) ca))
-                                    false)))))
-                          false))]
-          (reset! send-fn-atom send-fn)
-          {:ok? true
-           :node client-node
-           :channel-id channel-id
-           :send-fn send-fn})))))
+        {:ok? true
+         :node client-node
+         :channel-id channel-id
+         :send-fn send-fn}))))
 
 (defn connect-validators!
   "Establishes WebRTC DataChannel connections to validators in bootstrap-descriptor.

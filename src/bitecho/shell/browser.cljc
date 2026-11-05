@@ -297,7 +297,7 @@
     "harmless" "benign" "normal" "regular" "pub" "label" "name" "title" "description"
     "text" "message" "msg" "memo" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
     "num" "number" "amount" "burn-amount" "balance" "spendable" "price" "burn" "burn-floor" "fee"
-    "epoch" "epoch-initialized?" "created-epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
+    "epoch" "epoch-initialized?" "max-epoch-skew" "created-epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
     "seq" "tx-seq" "acked-seq" "rx-high-seq" "contiguous-rx-seq" "transfer-seq" "intent-seq" "voucher-seqs"
     "unacked-count" "replays-deduped" "outbox-evicted" "outbox-order" "deps"
     "replay-window" "highest-seq" "seen" "window-size"

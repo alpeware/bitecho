@@ -3705,11 +3705,12 @@
                                           (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
                                     (:epoch state)
                                     (or sess-epoch msg-epoch))
+                        max-skew (long (or (:max-epoch-skew state) 2))
                         skew-exceeded? (and (not= msg-type :chain-state-snapshot)
                                             msg-epoch ref-epoch
-                                            (> (math-abs (- msg-epoch (long ref-epoch))) 2)
+                                            (> (math-abs (- msg-epoch (long ref-epoch))) max-skew)
                                             (or (nil? sess-epoch)
-                                                (> (math-abs (- msg-epoch (long sess-epoch))) 2)))]
+                                                (> (math-abs (- msg-epoch (long sess-epoch))) max-skew)))]
                     (if skew-exceeded?
                       {:state state :net-envelopes [] :stdout-events []}
                       (let [res (case msg-type
