@@ -1,6 +1,7 @@
 (ns bitecho.test-runner
   "Test runner for Bitecho"
-  (:require [bitecho.basalt.core-test]
+  (:require [bitecho.anchor-webauthn-test]
+            [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
             [bitecho.crypto-test]
             [bitecho.crypto.sealed-test]

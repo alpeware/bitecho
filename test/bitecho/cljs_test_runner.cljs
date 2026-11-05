@@ -1,6 +1,7 @@
 (ns bitecho.cljs-test-runner
   "Node.js ClojureScript test runner for Bitecho portable core namespaces."
-  (:require [bitecho.basalt.core-test]
+  (:require [bitecho.anchor-webauthn-test]
+            [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
@@ -32,7 +33,8 @@
   "Main entry point for Node.js ClojureScript test runner."
   [& _args]
   (println "Running Bitecho ClojureScript tests on Node.js...")
-  (run-tests 'bitecho.fressian-test
+  (run-tests 'bitecho.anchor-webauthn-test
+             'bitecho.fressian-test
              'bitecho.basalt.core-test
              'bitecho.murmur.core-test
              'bitecho.contagion.core-test

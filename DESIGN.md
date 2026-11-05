@@ -516,6 +516,59 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
    - **Cross-Origin Resource Sharing (CORS)**: `clj-web` static content handler serves permissive CORS headers (`Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, HEAD, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, Authorization`) and `204 No Content` for preflight `OPTIONS` requests, allowing browser nodes hosted on any origin or `localhost` to fetch bootstrap descriptors and directory attestations.
    - **Secure Context Requirement**: Browser APIs (`SubtleCrypto`, `RTCPeerConnection`) require a Secure Context (`https://` or `http://localhost`).
 
+### S. Human Anchor UX + WebAuthn Architecture (Milestone 11)
+
+1. **BIP-0350 Bech32m Address Encoding (`bitecho.bech32m`)**:
+   - **Human-Readable Checksummed Addresses**: Checksummed human-readable encoding for Ed25519 identity public keys formatted with human-readable prefix `ech1...` (e.g. `ech1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4`).
+   - **Pure Portable Implementation**: Pure Sans-IO `.cljc` implementation with zero third-party library or npm dependencies, adhering to BIP-0350 specifications.
+   - **Checksum Polynomial & Bit Re-Grouping**: Uses the Bech32m polymod polynomial generator with constant `0x2bc830a3`. Converts 8-bit byte sequences to 5-bit group arrays via pure `convert-bits`.
+   - **Cross-Platform Parity**: Employs cross-platform `char-code` (`#?(:clj (int c) :cljs (.charCodeAt c 0))`) preventing ClojureScript `NaN` bugs during ASCII integer conversions.
+   - **Exhaustive Error Detection**: Validates against single-bit flips, bit transpositions, case-mixing, and invalid checksums.
+
+2. **Pure Recursive CBOR Codec (RFC 8949) (`bitecho.cbor`)**:
+   - **Standards Compliance**: Zero-dependency pure `.cljc` recursive parser and deterministic serializer conforming to RFC 8949 (Concise Binary Object Representation).
+   - **Major Type Support**:
+     - Major 0: Unsigned integers (1, 2, 4, 8-byte width headers)
+     - Major 1: Negative integers
+     - Major 2: Raw byte arrays (`byte[]` on JVM, `Uint8Array` on CLJS)
+     - Major 3: UTF-8 text strings (and keywords/symbols encoded as text)
+     - Major 4: Ordered arrays/vectors
+     - Major 5: Maps/dictionaries
+     - Major 6: Semantic tags
+     - Major 7: Simple values (`true`, `false`, `nil`)
+   - **Streaming Sequence Decoding (`decode-sequence`)**: Decodes concatenated CBOR objects without trailing-byte truncation, enabling seamless parsing of multi-map CTAP2 WebAuthn extensions (e.g. COSE public key map followed by `credProtect` extension map).
+   - **Hardware Vector Parity**: Verified byte-for-byte against physical YubiKey 5 hardware captures (91-byte COSE key + `credProtect` extension map; 1049-byte `packed` WebAuthn attestation object).
+
+3. **FIDO MDS v3 Authenticator Strength & Standing Constraint 6 (`bitecho.fido`)**:
+   - **AAGUID Metadata Registry**: Embedded registry of FIDO Alliance certified metadata statements for hardware authenticators including YubiKey 5 Series (`2fc0579f-8113-47ea-b116-bb5a8db9202a`), YubiKey 5 FIPS, Windows Hello, Apple Touch ID / Face ID, and Android KeyStore.
+   - **Standing Constraint 6 Compliance**: FIDO MDS v3 authenticator strength evaluations (`evaluate-authenticator-strength`) and MDS JWT parsing (`parse-mds-jwt-unverified`) are explicitly marked:
+     - `:verification-status "UNVERIFIED"`
+     - `:label "UNVERIFIED"`
+     - Mandatory warning string: `"Standing Constraint 6: FIDO MDS v3 authenticator strength evaluations and MDS JWT parser are labeled UNVERIFIED pending full x5c attestation chain verification."`
+   - **Parked Central Enrollment**: Centralized Yubico enrollment is explicitly designated `:yubico-enrollment :parked` due to fundamental architectural tension with the decentralized ethos of self-sovereign mesh participation.
+
+4. **WebAuthn Credential Architecture & Delegation (`bitecho.webauthn`)**:
+   - **Discoverable Credential Seed Pattern**: Uses `navigator.credentials.create` with `residentKey: "required"` and `credProtect: "userVerificationRequired"`. Stores a 32-byte cryptographic seed in `user.id` on the hardware authenticator, generating deterministic identities without exposing secrets to a remote server.
+   - **Seed Recovery & PRF Extension**: `navigator.credentials.get` with `allowCredentials: []` recovers the 32-byte seed from `response.userHandle`. The WebAuthn PRF extension (`{:prf {:eval {:first ...}}}`) is supported as a standardized seed-release mechanism.
+   - **Cold-Certifies-Hot DAC Delegation**:
+     - Hardware-derived identity key acts as long-lived cold anchor key.
+     - Cold anchor issues Delegation Authorization Certificates (DAC) via `cold-certify-hot-key` / `light-core/create-dac` granting scoped permissions to short-lived hot keys.
+     - Autonomous agents run high-frequency tasks using hot keys while human anchors retain sovereign control.
+   - **Emergency Revocation**: Anchor issues signed revocation certificates (`revoke-agent-dac`) broadcasting immediate termination of compromised or rotated hot keys.
+   - **Redundancy & Fallbacks**:
+     - Second-key backup registration (`register-backup-key`, `recover-from-backup-key`).
+     - Native non-extractable WebCrypto key specification (`generate-non-extractable-keypair-spec`) with explicit disclosure that non-extractable keys cannot be backed up.
+   - **Origin-Scoping & Trust Boundary Disclosures**:
+     - Hardware credentials are bound to `window.location.origin`; self-hosted deployments must re-register per origin.
+     - Trust boundary: recovered seed entropy passes through browser memory; users must trust local hardware, OS, and browser runtime.
+
+5. **Human Anchor UX & Supervised Reducer (`bitecho.anchor.core`, `bitecho.browser-main`)**:
+   - **Pure Sans-IO Reducer**: State transitions modeled in pure Clojure/ClojureScript data structures.
+   - **Human-in-the-Loop Offers**: Incoming service requests hold in `:pending-offers` queue awaiting explicit human approval (`approve-offer`) or denial (`deny-offer`).
+   - **Supervised Agent Management**: Track supervised agents, log delegated activity, and enforce spending and capability boundaries.
+   - **Team-Call Subnets**: Groups of human anchors in active voice/video calls can dynamically spin up ad-hoc subnets (`create-team-call-subnet` `"team-call/<topic>"`).
+   - **Verifiable Browser Dashboard**: Dark-mode dashboard in `dist/index.html` exposing Bech32m addresses, key mode selection, prominent `[ UNVERIFIED ]` FIDO strength badge, offers review, supervised agent controls, and real-time diagnostic logs.
+
 
 
 

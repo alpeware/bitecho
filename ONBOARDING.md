@@ -194,3 +194,41 @@ Web browsers throttle timers ($\ge 1000\text{ms}$) and suspend WebRTC packet pro
 - **Background Mode**: The node automatically transitions into low-power mode, pausing high-frequency loops and counting deferred operations in the `:background-throttled-events` diagnostic counter.
 - **Zero Unbacked Claims**: Bitecho does not claim 24/7 background liveness for browser tabs; background throttling is surfaced honestly in status metrics.
 
+---
+
+## 7. Human Anchor UX & Hardware Key Security
+
+Milestone 11 introduces sovereign Human Anchor operations, establishing a cryptographically anchored human-in-the-loop interface for Bitecho mesh participation.
+
+### Human Anchor Identity & Bech32m Addresses
+Human anchors hold root cryptographic authority over their assets and sub-agents without delegating private keys to background daemons:
+- **Bech32m Addresses (BIP-0350)**: Human anchor Ed25519 public keys format as human-readable, checksummed addresses prefixed with `ech1...` (e.g. `ech1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4`).
+- **Autonomous Mode Disabled**: Anchor states run with `:autonomous? false`. Incoming service offers never auto-accept; they queue in `:pending-offers` awaiting explicit human authorization.
+
+### Hardware Key Options & Credential Architecture
+1. **YubiKey Discoverable Resident Credential**:
+   - WebAuthn `navigator.credentials.create` with `residentKey: "required"` and `credProtect: "userVerificationRequired"`.
+   - Stores a 32-byte cryptographic seed directly in the authenticator's `user.id` field. Keys are never sent to a remote server.
+   - Seed recovery via `navigator.credentials.get` with `allowCredentials: []` extracts the seed from `response.userHandle`, deterministically deriving the Ed25519 identity key. Standardized seed release via the WebAuthn PRF extension (`{:prf {:eval {:first ...}}}`) is fully supported.
+2. **Native Non-Extractable WebCrypto Keys**:
+   - Modern browser fallback using non-extractable WebCrypto keypairs.
+   - *Security Disclosure*: Plainly documented that non-extractable keys cannot be exported or backed up; browser profile loss results in permanent key loss.
+3. **Second-Key Backup Redundancy**:
+   - Cold anchors can register a secondary hardware authenticator (`register-backup-key`), enabling recovery if the primary authenticator is lost or damaged.
+
+### Cold-Certifies-Hot DAC Delegation
+Human anchors maintain root keys in cold hardware storage while delegating bounded execution authority to autonomous agents:
+- **Delegation Authorization Certificates (DAC)**: The cold anchor issues a cryptographically signed DAC (`cold-certify-hot-key`) granting specific permissions (e.g. inference, relay) and max spending caps to a short-lived hot operational key.
+- **Supervised Agent Activity**: All agent transactions are attributed to the anchor and tracked in activity logs.
+- **Emergency Revocation**: If an agent is compromised or rotated, the human anchor broadcasts a signed DAC revocation (`revoke-agent-dac`), immediately terminating the hot key's authority across the network.
+
+### FIDO MDS v3 Strength Meter & Standing Constraint 6
+The browser dashboard inspects authenticator attestation (RFC 8949 CBOR parsing of CTAP2 authData and AAGUIDs) to display hardware security characteristics from the FIDO Metadata Service:
+> [!WARNING]
+> **Standing Constraint 6 Compliance**: FIDO MDS v3 authenticator strength evaluations and MDS JWT parser are strictly labeled **`[ UNVERIFIED ]`** until full x5c attestation-chain and FIDO MDS JWT signature verification are implemented.
+>
+> **Parked Central Enrollment**: Centralized Yubico registration is explicitly maintained as `:yubico-enrollment :parked`, preserving the decentralized ethos against centralized identity silos.
+
+### Team-Call Subnets
+Human anchors collaborating in active voice or video calls can dynamically spin up ad-hoc subnets (`create-team-call-subnet` `"team-call/<topic>"`). Subnets allow teams to pool compute, share verified inference results, and settle escrow payments locally.
+

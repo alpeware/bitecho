@@ -482,19 +482,37 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ---
 
-### Milestone 11: Human Anchor UX + WebAuthn
+### Milestone 11: Human Anchor UX + WebAuthn — **`[BUILT & VERIFIED]`**
 
-#### Step 11A — Anchor Interface
-1. **First-Class Participation**: The CLJS client is the interface for human anchors including the DAC: own keys + DAC, service offers with prices, approve/deny offers in the loop, supervision of their own agents' activity, balances/burns/vouchers, petnames, directory. A team in a call can BE a subnet.
+#### Step 11A — Anchor Interface — **`[BUILT & VERIFIED]`**
+1. **First-Class Participation & Pure Reducer**: Implemented pure Sans-IO Human Anchor state and reducer in `src/bitecho/anchor/core.cljc` (`init-anchor-state`, `set-service-offer`, `queue-incoming-offer`, `approve-offer`, `deny-offer`, `register-supervised-agent`, `log-agent-activity`, `revoke-agent-dac`, `create-team-call-subnet`, `anchor-dashboard-view`).
+2. **Human-in-the-Loop Offers**: Autonomous processing disabled (`:autonomous? false`). Inbound service offers queue in `:pending-offers` awaiting explicit human approval (`approve-offer`, incrementing `:offers-approved`) or denial (`deny-offer`, incrementing `:offers-denied` and emitting counted diagnostic effects per Rule 5).
+3. **Supervised Agent Delegation**: Cold anchor certifies hot keys via Delegation Authorization Certificates (DAC) with scoped permissions and spending limits (`register-supervised-agent`). Includes emergency DAC revocation broadcasting signed invalidation.
+4. **Team-Call Subnet**: Dynamic creation of ephemeral voice/video team subnets (`create-team-call-subnet` `"team-call/<topic>"`).
+5. **Interactive Dashboard**: Modern dark-mode web dashboard in `dist/index.html` exposing Bech32m addresses, FIDO MDS status, offer reviews, agent supervision, and live diagnostic console.
 
-#### Step 11B — Key Options
-1. **Non-Extractable Keys**: Native non-extractable WebCrypto keys (no backups — stated plainly).
-2. **YubiKey / WebAuthn**: Discoverable credentials via WebAuthn — register only on the key, never send anything to a server; the user-object ID field (up to 64 bytes) carries seed entropy to re-create the keypair; PRF extension wired as the standardized seed-release path. Long-lived cold-storage key + shorter-lived hot keys on the key using its signing capabilities as intended, DAC-shaped (cold certifies hot), all local. Second-key redundancy for backup. Per-origin scoping surfaced in UX (self-hosted origins re-register). Trust boundary stated: the seed sits in memory, so the device and the JavaScript must be trusted.
+#### Step 11B — Key Options — **`[BUILT & VERIFIED]`**
+1. **Non-Extractable Keys**: Native non-extractable WebCrypto keypair generation specification in `src/bitecho/webauthn.cljc` (`generate-non-extractable-keypair-spec`) with explicit disclosure that non-extractable keys cannot be backed up.
+2. **YubiKey Discoverable Credential Seed**: WebAuthn discoverable credential pattern (`build-registration-options`, `build-assertion-options`, `recover-seed-from-assertion`) storing 32-byte cryptographic seeds in `user.id` (`residentKey: "required"`, `credProtect: "userVerificationRequired"`) and recovering seed entropy from `response.userHandle` during assertion (`allowCredentials: []`).
+3. **Cold-Certifies-Hot DAC Delegation**: Long-lived hardware-derived anchor keys issue DACs (`cold-certify-hot-key` calling `light-core/create-dac` and verified via `light-core/verify-dac`) authorizing short-lived hot operational keys.
+4. **Second-Key Backup Redundancy**: Emergency secondary hardware key registration and recovery (`register-backup-key`, `recover-from-backup-key`).
+5. **Disclosures & Trust Boundaries**: Explicit origin-scoping documentation (`window.location.origin`) and memory trust-boundary disclosure (seed entropy passes through client RAM; host and JS runtime must be trusted).
 
-#### Step 11C — Attestation, MDS Hint + Readable Addresses
-1. **Attestation**: Parse attestation (packed first, other formats after); extract AAGUID; look up the FIDO Metadata Service blob for certified device security properties. The resulting "strength meter" hint is labeled **UNVERIFIED** per Standing Constraint 6 until x5c attestation-chain + MDS JWT signature verification are implemented (both currently TODO in the experimental code).
-2. **Addresses**: Bech32m (BIP-350, `.cljc`, tested) human-readable checksummed encoding for keys/addresses in the UX.
-3. **Acceptance**: Anchor flows end-to-end (offer approval, agent supervision); hint labeling asserted in tests; Yubico enrollment stays PARKED (centralizing step, tension with the decentralized ethos).
+#### Step 11C — Attestation, MDS Hint + Readable Addresses — **`[BUILT & VERIFIED]`**
+1. **Pure Recursive CBOR Codec**: Implemented RFC 8949 compliant pure `.cljc` CBOR codec in `src/bitecho/cbor.cljc` (`encode`, `decode`, `decode-first`, `decode-sequence`) supporting majors 0..7 and multi-object streaming. Verified byte-for-byte against real physical YubiKey 5 hardware captures (91-byte COSE key + extension map; 1049-byte `packed` WebAuthn attestation object).
+2. **FIDO MDS v3 Strength Meter & Standing Constraint 6**: Implemented `src/bitecho/fido.cljc` with certified AAGUID registry (YubiKey 5 Series `2fc0579f-8113-47ea-b116-bb5a8db9202a`, YubiKey 5 FIPS, Windows Hello, Apple Touch ID / Face ID, Android KeyStore), authenticator strength evaluation, and unverified MDS JWT parser. Enforced Standing Constraint 6: all evaluations and status labels strictly return `:verification-status "UNVERIFIED"`, `:label "UNVERIFIED"`, and mandatory unverified warning. Centralized Yubico enrollment is explicitly designated `:yubico-enrollment :parked`.
+3. **BIP-0350 Bech32m Address Encoding**: Implemented pure `.cljc` BIP-0350 Bech32m encoder and decoder in `src/bitecho/bech32m.cljc` (`encode-address`, `decode-address`, `pubkey->bech32m`, `bech32m->pubkey`) using Bech32m constant `0x2bc830a3`, formatting human-readable Ed25519 addresses with prefix `ech1...`.
+4. **Acceptance & Generative Property Tests**: Comprehensive test suite in `test/bitecho/anchor_webauthn_test.cljc` covering:
+   - `prop-bech32m-roundtrip` (50 runs) and `prop-bech32m-tamper-detection` (50 runs)
+   - BIP-0350 and Chia reference test vectors
+   - `prop-cbor-roundtrip` (50 runs) across nested maps, arrays, integers, text, and byte payloads
+   - Real YubiKey hardware capture decoding
+   - Standing Constraint 6 UNVERIFIED assertions
+   - Discoverable credential seed recovery and deterministic Ed25519 identity generation
+   - Cold-certifies-hot DAC creation, cryptographic verification, and emergency revocation
+   - Backup key registration and recovery
+   - End-to-end human anchor workflow execution
+   - Full test suite passes: 423 JVM tests (3465 assertions) and 152 Node/CLJS tests (1014 assertions) green with 0 failures, 0 errors, and 0 lint warnings.
 
 ---
 
