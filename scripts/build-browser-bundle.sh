@@ -60,7 +60,7 @@ def repl_gen(m):
     if orig not in gen_map:
         gen_map[orig] = f'{prefix}{len(gen_map) + 1}'
     return gen_map[orig]
-content = re.sub(r'(map__|p__|vec__|seq__|first__|G__)[0-9]+', repl_gen, content)
+content = re.sub(r'(map__|p__|vec__|seq__|first__|G__|t_cljs\\\$core|meta)[0-9]+', repl_gen, content)
 
 with open(path, 'w', encoding='utf-8') as f:
     f.write(content)
@@ -832,11 +832,12 @@ cat <<EOF > dist/index.html
         globalThis.BitechoBrowser.initNode();
         const initialDash = globalThis.BitechoBrowser.initAnchor();
         updateUI(initialDash);
-        if (typeof globalThis.BitechoBrowser.loadStateFromIndexedDb === "function") {
-          Promise.resolve(globalThis.BitechoBrowser.loadStateFromIndexedDb()).then(function (restored) {
-            if (restored && restored.pubkey) {
+        if (typeof globalThis.BitechoBrowser.loadStateFromIndexedDB === "function") {
+          Promise.resolve(globalThis.BitechoBrowser.loadStateFromIndexedDB()).then(function (restored) {
+            const restoredPub = restored && (restored.pubkey || (restored["light-state"] && restored["light-state"].pubkey));
+            if (restoredPub) {
               writeLog("Restored persisted public identity from IndexedDB (tap Recover from YubiKey to unlock signing):", {
-                pubkey: restored.pubkey,
+                pubkey: restoredPub,
                 address: restored.address,
                 hardwareLocked: restored.hardwareLocked
               });

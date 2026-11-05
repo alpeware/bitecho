@@ -356,6 +356,7 @@
     "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag"
     "enabled" "enabled?" "active" "active?" "verified" "verified?" "valid" "valid?" "open" "closed" "idle" "dialing"
     "mesh-connected" "connected-nodes" "demo" "stale-generation-ignored" "in-memory?" "bytes-stored"
+    "hardware-locked" "hardware-locked?"
     "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol"
     "peer-alice" "peer-bob" "peer-carol" "node-alice" "node-bob" "node-carol"
     "browser-alice" "browser-bob" "browser-carol" "rt-node" "browser-test" "browser-guard-test" "test-peer" "test-subnet" "global"

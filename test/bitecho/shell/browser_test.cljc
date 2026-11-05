@@ -470,6 +470,7 @@
             "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag"
             "enabled" "enabled?" "active" "active?" "verified" "verified?" "valid" "valid?" "open" "closed" "idle" "dialing"
             "mesh-connected" "connected-nodes" "demo" "stale-generation-ignored" "in-memory?" "bytes-stored"
+            "hardware-locked" "hardware-locked?"
             "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol"
             "peer-alice" "peer-bob" "peer-carol" "node-alice" "node-bob" "node-carol"
             "browser-alice" "browser-bob" "browser-carol" "rt-node" "browser-test" "browser-guard-test" "test-peer" "test-subnet" "global"
@@ -862,12 +863,18 @@
                  ;; Simulate another browser refresh after hardware enrollment
                  node3 (browser-main/init-node {:peer-id "refresh-node-3"})
                  _ (browser-main/init-anchor)
-                 _ (browser-main/restore-from-indexed-db! node3)
+                 restored-cb-val (atom nil)
+                 _ (browser-main/restore-from-indexed-db! node3 (fn [_err r] (reset! restored-cb-val r)))
                  status3 (js->clj (browser-main/get-status node3) :keywordize-keys true)
                  dash3 (js->clj (browser-main/get-anchor-dashboard) :keywordize-keys true)
                  stored-after-hw (fressian/decode-wire (get @browser/*in-memory-idb-store* "light-node-state"))]
              (is (true? (:ok rec-res)))
              (is (= hw-pub (:pubkey status3)))
              (is (= hw-addr (get-in dash3 [:identity :address])))
+             (is (= hw-pub (:pubkey @restored-cb-val)))
+             (is (= hw-addr (:address @restored-cb-val)))
+             (is (true? (:hardwareLocked @restored-cb-val)))
+             (is (fn? (.-loadStateFromIndexedDB browser-main/api)))
+             (is (fn? (.-loadStateFromIndexedDb browser-main/api)))
              (is (nil? (:keypair stored-after-hw)))
              (is (nil? (:x25519 stored-after-hw)))))))))

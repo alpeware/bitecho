@@ -119,12 +119,13 @@
   "Applies sanitized persisted state loaded from IndexedDB to node-atom and anchor-state-atom.
    Preserves public identity (pubkey + ech1 address) across browser refresh without generating
    a conflicting random keypair (avoiding Frankenstein state). Private key remains nil until
-   unlocked via hardware recovery (H-5, A-5)."
+   unlocked via hardware recovery (H-5, A-5).
+   Returns enriched restored state map with top-level :pubkey, :address, and :hardwareLocked."
   [node-atom loaded]
   (when (and node-atom (map? loaded))
     (let [saved-pub (or (get-in loaded [:light-state :pubkey])
                         (:pubkey loaded))]
-      (when (and (string? saved-pub) (not (str/blank? saved-pub)))
+      (if (and (string? saved-pub) (not (str/blank? saved-pub)))
         (let [saved-addr (bech32m/pubkey->bech32m saved-pub "ech")
               pub-bytes (basalt/hex->bytes saved-pub)]
           (swap! node-atom
@@ -153,7 +154,13 @@
                          (dissoc :privkey-bytes))))
             (reset! anchor-state-atom
                     (anchor/init-anchor-state {:pubkey saved-pub} {})))
-          (notify-ui-listeners!))))))
+          (notify-ui-listeners!)
+          (let [hw-locked? (nil? (get-in @node-atom [:keypair :private-key]))]
+            (-> loaded
+                (assoc :pubkey saved-pub
+                       :address saved-addr
+                       :hardwareLocked hw-locked?))))
+        loaded))))
 
 (defn init-anchor
   "Initializes or resets the global Human Anchor state atom."
@@ -800,10 +807,11 @@
    (let [na (or node-atom @active-node-atom)]
      (browser/load-persisted-state
       (fn [err loaded]
-        (when (and (nil? err) na (map? loaded))
-          (apply-restored-state! na loaded))
-        (when cb
-          (cb err loaded)))))))
+        (let [restored (if (and (nil? err) na (map? loaded))
+                         (apply-restored-state! na loaded)
+                         loaded)]
+          (when cb
+            (cb err restored))))))))
 
 (defn load-state-from-indexed-db
   "Loads persisted sanitized state from IndexedDB and restores public identity continuity. Returns a Promise."
@@ -813,10 +821,10 @@
     (fn [resolve reject]
       (restore-from-indexed-db!
        node-atom
-       (fn [err loaded]
+       (fn [err restored]
          (if err
            (reject (js/Error. (str err)))
-           (resolve (clj->js (redact-for-js (or loaded {})))))))))))
+           (resolve (clj->js (redact-for-js (or restored {})))))))))))
 
 (defn connect
   "Initiates dialing transition on the node's connection state and executes effects.
@@ -1116,7 +1124,9 @@
        :handleVisibilityChange handle-visibility-change!
        :saveStateToIndexedDB save-state-to-indexed-db
        :loadStateFromIndexedDB load-state-from-indexed-db
+       :loadStateFromIndexedDb load-state-from-indexed-db
        :restoreFromIndexedDB restore-from-indexed-db!
+       :restoreFromIndexedDb restore-from-indexed-db!
        :createOffer create-offer
        :acceptOffer accept-offer
        :sendSealedMessage send-sealed-message

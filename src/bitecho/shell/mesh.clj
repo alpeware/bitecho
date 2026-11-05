@@ -1102,6 +1102,7 @@
                     :total_conn_dropped 0
                     :total_conn_stale 0
                     :max_finalization_lag 0
+                    :max_execution_lag 0
                     :finality_healthy? true}
      :converged? true}
     (let [parsed-snapshots
@@ -1114,8 +1115,10 @@
                              fin-epoch (long (or (:finalized_epoch st-map)
                                                  (get-in snap [:burnsz :anchor-epoch])
                                                  0))
+                             streamlet-fin (long (or (:finalized st-map) fin-epoch))
                              curr-epoch (long (or (:epoch st-map) fin-epoch))
                              fin-lag (max 0 (- curr-epoch fin-epoch))
+                             exec-lag (max 0 (- streamlet-fin fin-epoch))
                              minted (long (or (:minted st-map) 0))
                              burn-digest (:burn_digest st-map)
                              failed-rcpts (long (or (:failed_receipts st-map) 0))
@@ -1131,6 +1134,7 @@
                                :connz (:connz snap)
                                :fin-epoch fin-epoch
                                :fin-lag fin-lag
+                               :exec-lag exec-lag
                                :minted minted
                                :burn-digest burn-digest
                                :failed-rcpts failed-rcpts
@@ -1209,11 +1213,16 @@
           max-fin-lag (if (seq (vals parsed-snapshots))
                         (apply max (map :fin-lag (vals parsed-snapshots)))
                         0)
+          max-exec-lag (if (seq (vals parsed-snapshots))
+                         (apply max (map :exec-lag (vals parsed-snapshots)))
+                         0)
           max-allowed-lag (long (or (:max-finalization-lag opts) 10))
+          max-allowed-exec-lag (long (or (:max-execution-lag opts) 2))
           total-dropped (reduce + 0 (map :conn-drop (vals parsed-snapshots)))
           total-stale (reduce + 0 (map :conn-stale (vals parsed-snapshots)))
           finality-healthy? (and (<= fin-epoch-skew 2)
-                                 (<= max-fin-lag max-allowed-lag))
+                                 (<= max-fin-lag max-allowed-lag)
+                                 (<= max-exec-lag max-allowed-exec-lag))
 
           ;; Wire protocol version convergence check (rolling upgrade window <= 1)
           wire-versions (vec (keep (fn [[_ snap]]
@@ -1244,6 +1253,7 @@
                         :total_conn_dropped total-dropped
                         :total_conn_stale total-stale
                         :max_finalization_lag max-fin-lag
+                        :max_execution_lag max-exec-lag
                         :finality_healthy? finality-healthy?}
 
           converged? (and window-burns-converged?

@@ -643,8 +643,12 @@ chmod 600 /etc/bitecho/config.edn.new
   --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
   -jar /opt/bitecho/bitecho.jar validate-config /etc/bitecho/config.edn.new
 if [ "${reset_state}" = "true" ]; then
-  echo "Resetting node state on ${node}..."
+  echo "Archiving pre-reset snapshot backup and resetting node state on ${node}..."
   sudo systemctl stop bitecho.service || true
+  if [ -d /var/lib/bitecho/state ] && [ -n "$(ls -A /var/lib/bitecho/state 2>/dev/null || true)" ]; then
+    sudo mkdir -p /var/lib/bitecho/state-backup
+    sudo cp -af /var/lib/bitecho/state/. /var/lib/bitecho/state-backup/
+  fi
   rm -rf /var/lib/bitecho/state/*
 fi
 mv -f /etc/bitecho/config.edn.new /etc/bitecho/config.edn
@@ -824,8 +828,10 @@ SERVICE_UNIT
 
   if [[ "$skip_e2e_gate" != "true" ]]; then
     echo "--> Step 8/8: Running Post-Deploy Live E2E Transfer & Finality Confirmation Gate..."
-    if ! cmd_fund "${CUSTODY_PUB}" 1; then
-      echo "Error: Post-deploy live E2E transfer gate failed to finalize within timeout." >&2
+    local PROBE_PUB
+    PROBE_PUB="302a300506032b6570032100$(openssl rand -hex 32)"
+    if ! cmd_fund "${PROBE_PUB}" 1; then
+      echo "Error: Post-deploy live E2E transfer gate failed to finalize fresh non-custody probe recipient within timeout." >&2
       return 1
     fi
     if ! cmd_audit; then
@@ -1086,6 +1092,7 @@ for n, d in data.items():
 all_ok = True
 fin_epochs = {}
 fin_lags = {}
+exec_lags = {}
 minted_vals = {}
 burn_digests = {}
 failed_rcpts = {}
@@ -1098,9 +1105,12 @@ for n in nodes:
     except Exception:
         ep_int = 0
     fin_ep = int(st.get('finalized_epoch', 0))
+    streamlet_fin = int(st.get('finalized', fin_ep))
     fin_epochs[n] = fin_ep
     fin_lag = max(0, ep_int - fin_ep)
+    exec_lag = max(0, streamlet_fin - fin_ep)
     fin_lags[n] = fin_lag
+    exec_lags[n] = exec_lag
     minted = int(st.get('minted', 0))
     minted_vals[n] = minted
     bdig = st.get('burn_digest', 'N/A')
@@ -1111,7 +1121,7 @@ for n in nodes:
     stale = st.get('conn_stale', '0')
     rss = data[n]['rss']
     
-    node_ok = (failed == 0 and fin_lag <= 10)
+    node_ok = (failed == 0 and fin_lag <= 10 and exec_lag <= 2)
     if not node_ok:
         all_ok = False
     
@@ -1121,6 +1131,7 @@ min_fin = min(fin_epochs.values())
 max_fin = max(fin_epochs.values())
 skew = max_fin - min_fin
 max_fin_lag = max(fin_lags.values()) if fin_lags else 0
+max_exec_lag = max(exec_lags.values()) if exec_lags else 0
 minted_skew = max(minted_vals.values()) - min(minted_vals.values())
 
 node_windows = {}
@@ -1210,6 +1221,7 @@ print('\n--- Convergence & Soak Assessment ---')
 print(f'Common Finalized Epoch: {min_fin}')
 print(f'Finalized Epoch Skew:   {skew} (healthy <= 2)')
 print(f'Max Finalization Lag:   {max_fin_lag} (healthy <= 10)')
+print(f'Max Execution Lag:      {max_exec_lag} (healthy <= 2)')
 print(f'Minted Values / Skew:   {minted_vals} (skew={minted_skew})')
 print(f'Burn Digest Parity:     {\"PASSED\" if not digest_mismatch else \"FAILED\"}')
 print(f'Accountz Ledger Parity: {\"PASSED\" if not accountz_mismatch else \"FAILED\"}')
@@ -1218,7 +1230,7 @@ print(f'Failed Receipts Max:    {max(failed_rcpts.values())} (healthy == 0)')
 print(f'Treasury SLA Status:    {\"PASSED\" if treasury_sla_ok else \"FAILED\"} (configured_k_bps={k_bps_str}/5000, redundant_validators={len(nodes)}/3)')
 print(f'Wire Protocol Version:  {wire_ver_str} ({\"CONVERGED\" if wire_converged else \"DIVERGED\"})')
 
-if skew > 2 or max_fin_lag > 10 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch or not treasury_sla_ok or not wire_converged:
+if skew > 2 or max_fin_lag > 10 or max_exec_lag > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch or not treasury_sla_ok or not wire_converged:
     print('\nVerdict: DIVERGENCE DETECTED')
     sys.exit(1)
 else:
@@ -1533,7 +1545,8 @@ Usage:
 
 Commands:
   init                                Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
-  deploy [--reset-state]              Build local uberjar, run pre/post-deploy E2E transfer gates, sync configs, and restart
+  deploy [--reset-state] [--skip-e2e-gate]
+                                      Build local uberjar, run pre/post-deploy E2E transfer gates, sync configs, and restart
   verify-e2e                          Run pre-deploy E2E transfer & 3-epoch Streamlet finalization gate (60s bound)
   status                              Display live status table across all 3 cluster nodes
   audit                               Audit /statusz, /burnsz, /accountz, /connz, and memory convergence across all 3 nodes

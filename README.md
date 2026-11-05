@@ -84,12 +84,19 @@ Transport protocols supported via `--transport`:
 # Run pre-deploy full-pipeline E2E wire & Streamlet finalization gate (< 60s)
 ./scripts/cluster.sh verify-e2e
 
-# Audit live validator convergence, finalized epoch height, and max_finalization_lag (<= 10)
+# Audit live validator convergence, finalized epoch height, max_finalization_lag (<= 10), and max_execution_lag (<= 2)
 ./scripts/cluster.sh audit
 
-# Deploy validator cluster (runs pre-deploy verify-e2e gate, rolling restart, and post-deploy live E2E transfer + audit gate)
+# Deploy validator cluster (runs pre-deploy verify-e2e gate, rolling restart, and post-deploy live non-custody probe transfer + audit gate)
 ./scripts/cluster.sh deploy
+
+# Deploy and reset validator state to deterministic Genesis ledger (archives /var/lib/bitecho/state to /var/lib/bitecho/state-backup first)
+./scripts/cluster.sh deploy --reset-state
 ```
+
+> **Note on `--skip-e2e-gate`:** `./scripts/cluster.sh deploy --skip-e2e-gate` is an emergency/offline build flag only and must never be used in standard devnet or production deployments.
+>
+> **Finalization / Execution Stall Runbook:** If `./scripts/cluster.sh audit` reports `Max Finalization Lag > 10` (`epoch - finalized_epoch`), `Max Execution Lag > 2` (`finalized - finalized_epoch`), or `:encode-failed` / `:send-failed` diagnostics in `/connz`, inspect `/statusz` and `/connz` across `node1..node3`. If a pre-hardening snapshot pruned unexecuted ancestor blocks before `H-3`, run `./scripts/cluster.sh deploy --reset-state` to archive `/var/lib/bitecho/state` to `/var/lib/bitecho/state-backup`, re-initialize all 3 validators cleanly from the deterministic Genesis ledger, and verify live finality via Step 8/8's non-custody probe transfer and convergence audit (if Step 8/8 fails, stop `bitecho.service`, restore `/var/lib/bitecho/state-backup/*` to `/var/lib/bitecho/state/`, and restart).
 
 For complete protocol schemas, payload specifications, and parent agent integration examples, see [`skill/SKILL.md`](skill/SKILL.md).
 

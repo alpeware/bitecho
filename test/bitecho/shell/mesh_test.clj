@@ -1415,7 +1415,13 @@
                       expected-max-lag (apply max (mapv #(- (long (get-in % [1 :statusz :epoch]))
                                                             (long (get-in % [1 :statusz :finalized_epoch])))
                                                         snapshots))
-                      expected-finality-healthy? (and (<= expected-skew 2) (<= expected-max-lag 10))
+                      expected-max-exec-lag (apply max (mapv #(max 0 (- (long (or (get-in % [1 :statusz :finalized])
+                                                                                  (get-in % [1 :statusz :finalized_epoch])))
+                                                                        (long (get-in % [1 :statusz :finalized_epoch]))))
+                                                             snapshots))
+                      expected-finality-healthy? (and (<= expected-skew 2)
+                                                      (<= expected-max-lag 10)
+                                                      (<= expected-max-exec-lag 2))
                       max-failed (apply max (mapv #(get-in % [1 :statusz :failed_receipts]) snapshots))]
                   (and (boolean? (:converged? result))
                        (boolean? (:burn-digest-converged? result))
@@ -1423,6 +1429,7 @@
                        (= min-fin (:common-finalized-epoch result))
                        (= expected-skew (:finalized-epoch-skew result))
                        (= expected-max-lag (get-in result [:soak-summary :max_finalization_lag]))
+                       (= expected-max-exec-lag (get-in result [:soak-summary :max_execution_lag]))
                        (= max-failed (get-in result [:soak-summary :max_failed_receipts]))
                        (= expected-finality-healthy? (get-in result [:soak-summary :finality_healthy?]))
                        (= (:converged? result)
@@ -1536,13 +1543,26 @@
       (is (false? (get-in res [:soak-summary :finality_healthy?])))))
 
   (testing "evaluate-cluster-convergence detects cluster-wide finalization stall (max_finalization_lag > 10 despite skew = 0)"
-    (let [s1 {:statusz {:epoch 24400 :finalized_epoch 23631 :burn_digest "d1" :failed_receipts 0}
+    (let [s1 {:statusz {:epoch 24400 :finalized 23631 :finalized_epoch 23631 :burn_digest "d1" :failed_receipts 0}
               :burnsz {:anchor-epoch 23631 :window [[23631 100 0]]}}
-          s2 {:statusz {:epoch 24400 :finalized_epoch 23631 :burn_digest "d1" :failed_receipts 0}
+          s2 {:statusz {:epoch 24400 :finalized 23631 :finalized_epoch 23631 :burn_digest "d1" :failed_receipts 0}
               :burnsz {:anchor-epoch 23631 :window [[23631 100 0]]}}
           res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
       (is (= 0 (:finalized-epoch-skew res)))
       (is (= 769 (get-in res [:soak-summary :max_finalization_lag])))
+      (is (= 0 (get-in res [:soak-summary :max_execution_lag])))
+      (is (false? (get-in res [:soak-summary :finality_healthy?])))
+      (is (false? (:converged? res)))))
+
+  (testing "evaluate-cluster-convergence detects execution stall (max_execution_lag > 2 when Streamlet finalized > finalized_epoch)"
+    (let [s1 {:statusz {:epoch 100 :finalized 98 :finalized_epoch 94 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 94 :window [[94 100 0]]}}
+          s2 {:statusz {:epoch 100 :finalized 98 :finalized_epoch 94 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 94 :window [[94 100 0]]}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (= 0 (:finalized-epoch-skew res)))
+      (is (= 6 (get-in res [:soak-summary :max_finalization_lag])))
+      (is (= 4 (get-in res [:soak-summary :max_execution_lag])))
       (is (false? (get-in res [:soak-summary :finality_healthy?])))
       (is (false? (:converged? res)))))
 
