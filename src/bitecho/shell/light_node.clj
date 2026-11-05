@@ -262,14 +262,18 @@
                     :udp)
         timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
         proxy-cli (extract-flag-value clean-args "--proxy" nil)
-        proxy-url (resolve-proxy-url proxy-cli)]
+        proxy-url (resolve-proxy-url proxy-cli)
+        subnet-id (extract-flag-value clean-args "--subnet-id" nil)]
     (cond-> {:mode (if serve? :serve :one-shot)
              :verb verb
              :state-dir state-dir
              :bootstrap bootstrap-path
              :autonomous? (boolean autonomous?)
              :transport transport
-             :cmd-map (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))}
+             :cmd-map (let [m (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))]
+                        (cond-> m
+                          subnet-id (assoc "subnet_id" subnet-id)))}
+      subnet-id (assoc :subnet-id subnet-id)
       timeout-ms (assoc :timeout-ms timeout-ms)
       proxy-url (assoc :proxy proxy-url))))
 
@@ -1177,8 +1181,9 @@
                               (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                               (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                               (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
-                          (light-core/init-light-state identity {:bootstrap bootstrap
-                                                                 :autonomous? (boolean (:autonomous? opts false))}))
+                          (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
+                                                                         :autonomous? (boolean (:autonomous? opts false))}
+                                                                  (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
         state-atom (atom initial-state)
         conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
@@ -1259,8 +1264,9 @@
                               (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                               (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                               (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
-                          (light-core/init-light-state identity {:bootstrap bootstrap
-                                                                 :autonomous? (boolean (:autonomous? opts false))}))
+                          (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
+                                                                         :autonomous? (boolean (:autonomous? opts false))}
+                                                                  (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
         state-atom (atom initial-state)
         raw-cmd-map (:cmd-map opts)
         verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))

@@ -569,6 +569,40 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
    - **Team-Call Subnets**: Groups of human anchors in active voice/video calls can dynamically spin up ad-hoc subnets (`create-team-call-subnet` `"team-call/<topic>"`).
    - **Verifiable Browser Dashboard**: Dark-mode dashboard in `dist/index.html` exposing Bech32m addresses, key mode selection, prominent `[ UNVERIFIED ]` FIDO strength badge, offers review, supervised agent controls, and real-time diagnostic logs.
 
+---
+
+### T. Fractal Composition & Federation Architecture (Milestone 12)
+
+1. **Subnets (Fractal Down) & Multi-Subnet Multiplexer (`bitecho.light-node.core`, `bitecho.state-machine`)**:
+   - **Subnet Identity (`:subnet-id`)**: Envelopes and state-machine instances carry an explicit `:subnet-id` string, defaulting to `"global"` when omitted for 100% N/N-1 rolling-upgrade compatibility.
+   - **Isolation & Fail-Closed Routing (Rule 5)**: If an incoming envelope targets an unregistered or mismatched subnet (when neither is wildcard `*`), single-instance reducers drop it with a counted `:subnet-mismatch-dropped` diagnostic effect.
+   - **Single-Authority Shell Lifecycle Multiplexing (Rule 4)**: The multi-subnet multiplexer (`init-multi-subnet-multiplexer`, `register-subnet-instance`, `remove-subnet-instance`, `route-multiplexed-envelope`, `dispatch-multiplexed-command`) routes envelopes across multiple `{subnet-id -> state-machine}` instances over a single shared connection state (`:conn`), ensuring connection lifecycle is never split across competing atoms.
+   - **Zero-Burn Team Subnets**: Subnet instances configure per-instance economy parameters (`:economy-enabled? false`, `:burn-floor 0`). In permissioned, enterprise, or team topologies, offers, messages, and state transitions process without requiring ECH balances or deducting burned fees.
+
+2. **Domain-Anchored Discovery & Federation (Fractal Up) (`bitecho.shell.discovery`, `bitecho.light-node.core`)**:
+   - **Domain-Anchored Descriptors**: Authoritative domains publish cryptographic bootstrap descriptors (via DNS TXT / DoH or HTTPS) declaring validator topologies, authority pubkeys, issued epochs, and expiration epochs.
+   - **Cryptographic Verification**:
+     - `normalize-nodes-for-bootstrap`: Deterministically sorts validator nodes into a canonical sequence.
+     - `canonical-bootstrap-payload`: Constructs the canonical byte tuple `["bitecho-bootstrap-descriptor-v1" domain nodes authority-pubkey issued-epoch expires-epoch]`.
+     - `sign-bootstrap-descriptor` & `verify-bootstrap-descriptor`: Ed25519 signing and verification with clock-skew and epoch expiration validation.
+     - `verify-federated-domain-bootstrap`: Validates that a domain descriptor was signed by the expected authority pubkey and has not expired.
+   - **Federated Rendezvous & Inter-Subnet Relay**: Subnet coordinators broadcast signed rendezvous advertisements (`build-subnet-advertisement`, `parse-subnet-advertisement`) carrying `:subnet-id`, `:topic`, supported crypto suites, and wire formats, allowing peers to discover and route across domain boundaries.
+
+3. **Cross-Subnet Rollup & State-Root Settlement Anchoring Specification (Milestone 12B Spec-Only)**:
+   - **Subnet State Roots**: Each child subnet periodically computes a cryptographic state root $R_{t} = \text{MerkleRoot}(\mathcal{S}_t)$ over its finalized local ledger and state machine state at epoch $t$.
+   - **Rollup Commitment Tuples**: The rollup commitment posted by the subnet coordinator to the parent/settlement chain is defined as:
+     $$\mathcal{C} = \langle \text{"bitecho-subnet-rollup-v1"}, \text{subnet-id}, \text{parent-epoch}, \text{child-epoch}, R_{t}, \text{prev-rollup-hash}, \text{batch-receipts-hash}, \text{withdrawal-merkle-root} \rangle$$
+   - **Settlement Chain Invariants**:
+     - **Monotonicity**: Successive rollups for a subnet must strictly advance `child-epoch` ($t_{i+1} > t_i$).
+     - **Predecessor Continuity**: Each rollup must hash-chain to the previous rollup commitment ($\text{prev-rollup-hash} = H(\mathcal{C}_{i-1})$).
+     - **Multi-Quorum Certification**: In consensus subnets, the rollup commitment must be signed by at least $2f+1$ notarized validator votes or the authoritative coordinator key.
+   - **Cross-Subnet Withdrawals & Asset Transfers**:
+     - **Two-Phase Lock and Mint / Burn and Release**: To transfer value or state between subnets, the source subnet executes an intent lock/burn producing a cryptographic receipt $\mathcal{R}_{\text{xfer}}$.
+     - **Inclusion Proofs**: The receipt $\mathcal{R}_{\text{xfer}}$ is anchored in the source subnet's `withdrawal-merkle-root`.
+     - **Settlement Verification**: The destination subnet verifies the Merkle inclusion proof against the source subnet's finalized state root anchored on the global/parent settlement chain before minting or unlocking funds.
+   - **Fraud & Validity Windows**:
+     - Spec-only protocol parameter defines a challenge window $\Delta_{\text{challenge}}$ (default: 3 epochs) during which dispute proofs or state inconsistencies can be challenged before final state withdrawal execution.
+
 
 
 

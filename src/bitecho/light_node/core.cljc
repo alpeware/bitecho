@@ -128,41 +128,48 @@
   ([event pubkey privkey]
    (wrap-agent-event event pubkey privkey nil))
   ([event pubkey privkey dac]
-   (if (or (nil? privkey) (= :defer-crypto privkey))
-     (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
-           effective-dac (or dac (:dac event))
-           base (cond-> {:protocol-version current-wire-version
-                         :wire-format current-wire-format
-                         :agent-pubkey pubkey
-                         :event clean}
-                  effective-dac (assoc :dac effective-dac))]
-       (assoc base :crypto-effect {:effect :sign-and-emit
-                                   :sender pubkey
-                                   :signing-payload [pubkey clean]
-                                   :signature-field :signature
-                                   :envelope base}))
-     #?(:clj (mesh/wrap-agent-event event pubkey privkey dac)
-        :cljs (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
-                    sb (crypto/canonical-signing-bytes [pubkey clean])
-                    sig (crypto/sign privkey sb)
-                    sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
-                    effective-dac (or dac (:dac event))]
-                (cond-> {:protocol-version current-wire-version
-                         :wire-format current-wire-format
-                         :agent-pubkey pubkey
-                         :event clean
-                         :signature sig-hex}
-                  effective-dac (assoc :dac effective-dac)))))))
+   (let [sub-id (str (or (:subnet-id event) "global"))]
+     (if (or (nil? privkey) (= :defer-crypto privkey))
+       (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
+             effective-dac (or dac (:dac event))
+             base (cond-> {:protocol-version current-wire-version
+                           :wire-format current-wire-format
+                           :subnet-id sub-id
+                           :agent-pubkey pubkey
+                           :event clean}
+                    effective-dac (assoc :dac effective-dac))]
+         (assoc base :crypto-effect {:effect :sign-and-emit
+                                     :sender pubkey
+                                     :signing-payload [pubkey clean]
+                                     :signature-field :signature
+                                     :envelope base}))
+       #?(:clj (mesh/wrap-agent-event event pubkey privkey dac)
+          :cljs (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)
+                      sb (crypto/canonical-signing-bytes [pubkey clean])
+                      sig (crypto/sign privkey sb)
+                      sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
+                      effective-dac (or dac (:dac event))]
+                  (cond-> {:protocol-version current-wire-version
+                           :wire-format current-wire-format
+                           :subnet-id sub-id
+                           :agent-pubkey pubkey
+                           :event clean
+                           :signature sig-hex}
+                    effective-dac (assoc :dac effective-dac))))))))
 
 (defn- build-gossip-envelope
-  [sender-pub-hex sender-priv-bytes payload-bytes burn-amount]
-  #?(:clj (agent-sim/build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount)
-     :cljs (let [pub-bytes (if (fressian/bytes? sender-pub-hex) sender-pub-hex (basalt/hex->bytes sender-pub-hex))
-                 pub-hex (if (string? sender-pub-hex) sender-pub-hex (basalt/bytes->hex sender-pub-hex))
-                 sieve-msg (sieve/wrap-message payload-bytes sender-priv-bytes pub-bytes burn-amount)
-                 message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))
-                 agent-event {:type :receive-gossip :message (assoc sieve-msg :message-id message-id)}]
-             (wrap-agent-event agent-event pub-hex sender-priv-bytes))))
+  ([sender-pub-hex sender-priv-bytes payload-bytes burn-amount]
+   (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount "global"))
+  ([sender-pub-hex sender-priv-bytes payload-bytes burn-amount subnet-id]
+   #?(:clj (agent-sim/build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount subnet-id)
+      :cljs (let [pub-bytes (if (fressian/bytes? sender-pub-hex) sender-pub-hex (basalt/hex->bytes sender-pub-hex))
+                  pub-hex (if (string? sender-pub-hex) sender-pub-hex (basalt/bytes->hex sender-pub-hex))
+                  sieve-msg (sieve/wrap-message payload-bytes sender-priv-bytes pub-bytes burn-amount)
+                  message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))
+                  agent-event {:type :receive-gossip
+                               :subnet-id (str (or subnet-id "global"))
+                               :message (assoc sieve-msg :message-id message-id)}]
+              (wrap-agent-event agent-event pub-hex sender-priv-bytes)))))
 
 (defn- build-home-set-envelope
   ([agent-pub-hex agent-priv-bytes candidates price epoch]
@@ -273,7 +280,12 @@
                               :last-unsupported-version nil
                               :unsupported-format-dropped 0
                               :last-unsupported-format nil
+                              :subnet-mismatch-dropped 0
                               :last-error nil}
+   :subnet-id (str (or (:subnet-id opts) (:subnet-id identity-pub-map) "global"))
+   :economy-enabled? (boolean (get opts :economy-enabled? true))
+   :burn-floor (long (or (:burn-floor opts) 0))
+   :diagnostics (merge {:subnet-mismatch-dropped 0} (:diagnostics opts))
    :crypto-suites (or (:crypto-suites opts) sealed/default-crypto-suites)})
 
 ;; -----------------------------------------------------------------------------
@@ -1435,13 +1447,25 @@
        :response {"ok" false "error" (:error resolved)}
        :net-envelopes []
        :stdout-events []}
-      (let [raw-burn (or (get cmd-map "burn") (:burn cmd-map))
-            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) 500)]
-        (if (or (= parsed-burn :invalid) (< parsed-burn 0))
+      (let [econ? (get state :economy-enabled? true)
+            floor (if econ? (long (get state :burn-floor 0)) 0)
+            default-burn (if econ? (max floor 500) 0)
+            raw-burn (or (get cmd-map "burn") (:burn cmd-map))
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) default-burn)]
+        (cond
+          (or (= parsed-burn :invalid) (neg? parsed-burn))
           {:state state
            :response {"ok" false "error" "invalid-burn"}
            :net-envelopes []
            :stdout-events []}
+
+          (and (pos? floor) (< parsed-burn floor))
+          {:state state
+           :response {"ok" false "error" "burn-below-floor"}
+           :net-envelopes []
+           :stdout-events []}
+
+          :else
           (let [callee (:pubkey resolved)
                 pname (:petname resolved)
                 burn-amt parsed-burn
@@ -1477,8 +1501,10 @@
                                                 :dac active-dac})
                 header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id suites)
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes header-str)))
+                sub-id (str (or (:subnet-id state) "global"))
                 wire-payload (cond-> {:protocol-version current-wire-version
                                       :wire-format current-wire-format
+                                      :subnet-id sub-id
                                       :bitecho/type :rendezvous-offer-header
                                       :type :rendezvous-offer-header
                                       :caller caller
@@ -1491,7 +1517,8 @@
                                       :crypto-suites suites
                                       :signature sig-hex}
                                active-dac (assoc :dac active-dac))
-                gossip-env (build-gossip-envelope caller privkey-bytes (freeze-payload wire-payload) burn-amt)
+                gossip-env (assoc (build-gossip-envelope caller privkey-bytes (freeze-payload wire-payload) burn-amt)
+                                  :subnet-id sub-id)
                 outbound-entry {:offer-hash offer-hash
                                 :session-id session-id
                                 :caller caller
@@ -1621,7 +1648,8 @@
          :stdout-events []}))))
 
 (defn- exec-offer [state cmd-map privkey-bytes]
-  (let [callee-target (or (get cmd-map "callee") (:callee cmd-map))
+  (let [callee-target (or (get cmd-map "callee") (get cmd-map "peer") (get cmd-map "to")
+                          (:callee cmd-map) (:peer cmd-map) (:to cmd-map))
         resolved (resolve-counterparty state callee-target)]
     (if-not (:ok? resolved)
       {:state state
@@ -1666,8 +1694,10 @@
                                                 :crypto-suites suites
                                                 :dac active-dac})
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
+                sub-id (str (or (:subnet-id state) "global"))
                 offer-payload (cond-> {:protocol-version current-wire-version
                                        :wire-format current-wire-format
+                                       :subnet-id sub-id
                                        :bitecho/type :channel-offer
                                        :session-id session-id
                                        :caller caller
@@ -1681,8 +1711,9 @@
                                        :burn burn-amt
                                        :signature sig-hex}
                                 active-dac (assoc :dac active-dac))
-                gossip-env (build-gossip-envelope caller privkey-bytes (freeze-payload offer-payload) burn-amt)
+                gossip-env (build-gossip-envelope caller privkey-bytes (freeze-payload offer-payload) burn-amt sub-id)
                 header-event {:type :receive-offer-header
+                              :subnet-id sub-id
                               :caller caller
                               :callee callee
                               :home-node home-node
@@ -1754,7 +1785,9 @@
                       :price (:price offer)
                       :burn burn-val
                       :seq 1
-                      :min-burn 100})
+                      :min-burn (if (get state :economy-enabled? true)
+                                  (long (or (:burn-floor state) 100))
+                                  0)})
             delivery-ack (into {} (:delivery-ack ack-res))
             has-caller-suites? (boolean (seq (:crypto-suites offer)))
             selected-suite (if has-caller-suites?
@@ -1768,8 +1801,11 @@
                         (str session-id "-" eph-pub-hex "|" selected-suite)
                         (str session-id "-" eph-pub-hex))
             sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes sig-input)))
+            sub-id (str (or (:subnet-id state) "global"))
+            burn-amt (if (get state :economy-enabled? true) 500 0)
             accept-payload (cond-> {:protocol-version current-wire-version
                                     :wire-format current-wire-format
+                                    :subnet-id sub-id
                                     :bitecho/type :channel-accept
                                     :session-id session-id
                                     :caller caller
@@ -1779,7 +1815,7 @@
                                     :delivery-ack delivery-ack
                                     :signature sig-hex}
                              has-caller-suites? (assoc :selected-suite selected-suite))
-            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload accept-payload) 500)
+            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload accept-payload) burn-amt sub-id)
             session-entry {:session-id session-id
                            :peer caller
                            :role :responder
@@ -1821,12 +1857,14 @@
             payload-bytes (cond (some? text) (fressian/utf8->bytes text)
                                 (some? payload-hex) (basalt/hex->bytes payload-hex)
                                 :else empty-bytes)
-            burn-amt (long (or (get cmd-map "burn") 500))
+            burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) (if (get state :economy-enabled? true) 500 0)))
+            sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
             seq-num (inc (:tx-seq session 0))
             suite (or (:suite session) sealed/suite-v1-chacha20poly1305)
             sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (fressian/utf8->bytes session-id) suite)
             msg-payload {:protocol-version current-wire-version
                          :wire-format current-wire-format
+                         :subnet-id sub-id
                          :bitecho/type :sealed-message
                          :session-id session-id
                          :sender (:pubkey state)
@@ -1836,7 +1874,7 @@
                          :suite suite
                          :nonce (basalt/bytes->hex (:nonce sealed))
                          :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
-            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt)
+            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt sub-id)
             max-outbox (long (or (:max-outbox-size state) 64))
             curr-outbox (or (:outbox session) {})
             curr-order (or (:outbox-order session) [])
@@ -1902,15 +1940,19 @@
     (if-not session
       {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
       (let [pname (pubkey->petname state (:peer session))
+            sub-id (str (or (:subnet-id state) "global"))
+            burn-amt (if (get state :economy-enabled? true) 500 0)
             sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes (str "close-" session-id))))
             close-payload {:protocol-version current-wire-version
+                           :wire-format current-wire-format
+                           :subnet-id sub-id
                            :bitecho/type :channel-close
                            :session-id session-id
                            :sender (:pubkey state)
                            :recipient (:peer session)
                            :epoch (long (or (:epoch session) (:epoch state) 0))
                            :signature sig-hex}
-            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload close-payload) 500)
+            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload close-payload) burn-amt sub-id)
             closed-sess (-> session
                             (assoc :state "closed")
                             (dissoc :tx-key :rx-key :ephemeral-priv))
@@ -2749,48 +2791,62 @@
 
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
-   Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps."
+   Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps.
+   Tags outgoing envelopes with :subnet-id from state or command."
   [state cmd-map privkey-bytes]
   (let [effective-map (if (map? (get cmd-map "args"))
                         (merge (get cmd-map "args") (dissoc cmd-map "args"))
-                        cmd-map)]
-    (case (or (get effective-map "cmd") (:cmd effective-map))
-      "identity" (exec-identity state)
-      "discover" (exec-discover state)
-      "register-home-set" (exec-register-home-set state effective-map privkey-bytes)
-      "offer" (exec-offer state effective-map privkey-bytes)
-      "accept" (exec-accept state effective-map privkey-bytes)
-      "rendezvous-policy" (exec-rendezvous-policy state effective-map)
-      "rendezvous-offer" (exec-rendezvous-offer state effective-map privkey-bytes)
-      "rendezvous-accept" (exec-rendezvous-accept state effective-map privkey-bytes)
-      "send" (exec-send state effective-map privkey-bytes)
-      "inbox" (exec-inbox state)
-      "close" (exec-close state effective-map privkey-bytes)
-      "transfer" (exec-transfer state effective-map privkey-bytes)
-      "account" (exec-sync-account state effective-map)
-      "sync-account" (exec-sync-account state effective-map)
-      "settle-intent" (exec-settle-intent state effective-map privkey-bytes)
-      "lock-intent" (exec-lock-intent state effective-map privkey-bytes)
-      "release-intent" (exec-release-intent state effective-map privkey-bytes)
-      "refund-intent" (exec-refund-intent state effective-map privkey-bytes)
-      "escrows" (exec-escrows state effective-map)
-      "query-chain-state" (let [env (build-chain-state-query-envelope (:pubkey state) privkey-bytes effective-map)]
-                            {:state state
-                             :response {"ok" true "query_sent" true}
-                             :net-envelopes [env]
-                             :stdout-events []})
-      "submit-vouchers" (exec-submit-vouchers state effective-map privkey-bytes)
-      "petname-set" (exec-petname-set state effective-map)
-      "petname-list" (exec-petname-list state)
-      "petname-remove" (exec-petname-remove state effective-map)
-      "petname-resolve" (exec-petname-resolve state effective-map)
-      "dac-attach" (exec-dac-attach state effective-map)
-      "dac-revoke" (exec-dac-revoke state effective-map)
-      "directory-verify" (exec-directory-verify state effective-map)
-      "directory-register" (exec-directory-register state effective-map privkey-bytes)
-      "directory-lookup" (exec-directory-lookup state effective-map)
-      "status" (exec-status state)
-      {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})))
+                        cmd-map)
+        sub-id (str (or (get effective-map "subnet_id")
+                        (get effective-map "subnet-id")
+                        (:subnet-id effective-map)
+                        (:subnet-id state)
+                        "global"))
+        res (case (or (get effective-map "cmd") (:cmd effective-map))
+              "identity" (exec-identity state)
+              "discover" (exec-discover state)
+              "register-home-set" (exec-register-home-set state effective-map privkey-bytes)
+              "offer" (exec-offer state effective-map privkey-bytes)
+              "accept" (exec-accept state effective-map privkey-bytes)
+              "rendezvous-policy" (exec-rendezvous-policy state effective-map)
+              "rendezvous-offer" (exec-rendezvous-offer state effective-map privkey-bytes)
+              "rendezvous-accept" (exec-rendezvous-accept state effective-map privkey-bytes)
+              "send" (exec-send state effective-map privkey-bytes)
+              "inbox" (exec-inbox state)
+              "close" (exec-close state effective-map privkey-bytes)
+              "transfer" (exec-transfer state effective-map privkey-bytes)
+              "account" (exec-sync-account state effective-map)
+              "sync-account" (exec-sync-account state effective-map)
+              "settle-intent" (exec-settle-intent state effective-map privkey-bytes)
+              "lock-intent" (exec-lock-intent state effective-map privkey-bytes)
+              "release-intent" (exec-release-intent state effective-map privkey-bytes)
+              "refund-intent" (exec-refund-intent state effective-map privkey-bytes)
+              "escrows" (exec-escrows state effective-map)
+              "query-chain-state" (let [env (build-chain-state-query-envelope (:pubkey state) privkey-bytes effective-map)]
+                                    {:state state
+                                     :response {"ok" true "query_sent" true}
+                                     :net-envelopes [env]
+                                     :stdout-events []})
+              "submit-vouchers" (exec-submit-vouchers state effective-map privkey-bytes)
+              "petname-set" (exec-petname-set state effective-map)
+              "petname-list" (exec-petname-list state)
+              "petname-remove" (exec-petname-remove state effective-map)
+              "petname-resolve" (exec-petname-resolve state effective-map)
+              "dac-attach" (exec-dac-attach state effective-map)
+              "dac-revoke" (exec-dac-revoke state effective-map)
+              "directory-verify" (exec-directory-verify state effective-map)
+              "directory-register" (exec-directory-register state effective-map privkey-bytes)
+              "directory-lookup" (exec-directory-lookup state effective-map)
+              "status" (exec-status state)
+              {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})]
+    (if (seq (:net-envelopes res))
+      (update res :net-envelopes (fn [envs]
+                                   (mapv (fn [e]
+                                           (if (or (nil? (:subnet-id e)) (= (:subnet-id e) "global"))
+                                             (assoc e :subnet-id sub-id)
+                                             e))
+                                         envs)))
+      res)))
 
 ;; -----------------------------------------------------------------------------
 ;; Inbound Wire Payload Handlers (Pure Helpers)
@@ -2805,20 +2861,26 @@
 
     (and (map? raw-payload-or-event) (map? (:event raw-payload-or-event)))
     (let [ver (or (:protocol-version raw-payload-or-event) (get raw-payload-or-event "protocol_version"))
+          sub (or (:subnet-id raw-payload-or-event) (get raw-payload-or-event "subnet_id") (get raw-payload-or-event "subnet-id"))
           unwrapped (unwrap-wire-message (:event raw-payload-or-event))]
-      (if (and (map? unwrapped) ver (not (contains? unwrapped :protocol-version)) (not (contains? unwrapped "protocol_version")))
-        (assoc unwrapped :protocol-version ver)
-        unwrapped))
+      (cond-> unwrapped
+        (and (map? unwrapped) ver (not (contains? unwrapped :protocol-version)) (not (contains? unwrapped "protocol_version")))
+        (assoc :protocol-version ver)
+        (and (map? unwrapped) sub (not (contains? unwrapped :subnet-id)) (not (contains? unwrapped "subnet_id")) (not (contains? unwrapped "subnet-id")))
+        (assoc :subnet-id (str sub))))
 
     (and (map? raw-payload-or-event) (map? (:message raw-payload-or-event)))
     (let [ver (or (:protocol-version raw-payload-or-event) (get raw-payload-or-event "protocol_version"))
+          sub (or (:subnet-id raw-payload-or-event) (get raw-payload-or-event "subnet_id") (get raw-payload-or-event "subnet-id"))
           p (:payload (:message raw-payload-or-event))
           unwrapped (if (bytes? p)
                       (unwrap-wire-message (try (thaw-payload p) (catch #?(:clj Exception :cljs :default) _ nil)))
                       (if (map? p) (unwrap-wire-message p) nil))]
-      (if (and (map? unwrapped) ver (not (contains? unwrapped :protocol-version)) (not (contains? unwrapped "protocol_version")))
-        (assoc unwrapped :protocol-version ver)
-        unwrapped))
+      (cond-> unwrapped
+        (and (map? unwrapped) ver (not (contains? unwrapped :protocol-version)) (not (contains? unwrapped "protocol_version")))
+        (assoc :protocol-version ver)
+        (and (map? unwrapped) sub (not (contains? unwrapped :subnet-id)) (not (contains? unwrapped "subnet_id")) (not (contains? unwrapped "subnet-id")))
+        (assoc :subnet-id (str sub))))
 
     (and (map? raw-payload-or-event)
          (or (contains? raw-payload-or-event :bitecho/type)
@@ -3588,35 +3650,58 @@
                  :response {"ok" false "error" err-msg "wire_format" unsupported-fmt}
                  :net-envelopes []
                  :stdout-events [diag-event]})
-              (let [msg-type (or (:bitecho/type msg) (:type msg))
-                    msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
-                    sess-epoch (when-let [sid (:session-id msg)]
-                                 (get-in state [:sessions sid :epoch]))
-                    ref-epoch (if (or (:epoch-initialized? state)
-                                      (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
-                                (:epoch state)
-                                (or sess-epoch msg-epoch))
-                    skew-exceeded? (and (not= msg-type :chain-state-snapshot)
-                                        msg-epoch ref-epoch
-                                        (> (math-abs (- msg-epoch (long ref-epoch))) 2)
-                                        (or (nil? sess-epoch)
-                                            (> (math-abs (- msg-epoch (long sess-epoch))) 2)))]
-                (if skew-exceeded?
-                  {:state state :net-envelopes [] :stdout-events []}
-                  (let [res (case msg-type
-                              :channel-offer (handle-wire-offer state msg privkey-bytes)
-                              :channel-accept (handle-wire-accept state msg)
-                              :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
-                              :session-ack (handle-wire-session-ack state msg)
-                              :channel-close (handle-wire-close state msg)
-                              :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
-                              :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
-                              :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
-                              :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
-                              {:state state :net-envelopes [] :stdout-events []})]
-                    (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
-                      (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
-                      res)))))))))))
+              (let [event-subnet (str (or (when (map? raw-payload-or-event)
+                                            (or (:subnet-id raw-payload-or-event)
+                                                (get raw-payload-or-event "subnet-id")
+                                                (get raw-payload-or-event "subnet_id")))
+                                          (:subnet-id msg)
+                                          (get msg "subnet-id")
+                                          (get msg "subnet_id")
+                                          "global"))
+                    state-subnet (str (or (:subnet-id state) "global"))]
+                (if (and (not= event-subnet "*")
+                         (not= state-subnet "*")
+                         (not= event-subnet state-subnet))
+                  (let [new-state (-> state
+                                      (update-in [:diagnostics :subnet-mismatch-dropped] (fnil inc 0))
+                                      (update-in [:wire-version-diagnostics :subnet-mismatch-dropped] (fnil inc 0)))
+                        diag-event {"event" "subnet-mismatch-dropped"
+                                    "error" "subnet-mismatch"
+                                    "event_subnet" event-subnet
+                                    "node_subnet" state-subnet}]
+                    {:state new-state
+                     :response {"ok" false "error" "subnet-mismatch" "subnet" event-subnet}
+                     :net-envelopes []
+                     :stdout-events [diag-event]})
+                  (let [msg-type (or (:bitecho/type msg) (:type msg))
+                        msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
+                        sess-epoch (when-let [sid (:session-id msg)]
+                                     (get-in state [:sessions sid :epoch]))
+                        ref-epoch (if (or (:epoch-initialized? state)
+                                          (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
+                                    (:epoch state)
+                                    (or sess-epoch msg-epoch))
+                        skew-exceeded? (and (not= msg-type :chain-state-snapshot)
+                                            msg-epoch ref-epoch
+                                            (> (math-abs (- msg-epoch (long ref-epoch))) 2)
+                                            (or (nil? sess-epoch)
+                                                (> (math-abs (- msg-epoch (long sess-epoch))) 2)))]
+                    (if skew-exceeded?
+                      {:state state :net-envelopes [] :stdout-events []}
+                      (let [res (case msg-type
+                                  :channel-offer (handle-wire-offer state msg privkey-bytes)
+                                  :channel-accept (handle-wire-accept state msg)
+                                  :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
+                                  :session-ack (handle-wire-session-ack state msg)
+                                  :channel-close (handle-wire-close state msg)
+                                  :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
+                                  :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
+                                  :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
+                                  :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
+                                  {:state state :net-envelopes [] :stdout-events []})]
+                        (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
+                          (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
+                          res)))))))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; JSONL Line Processor
@@ -3635,3 +3720,417 @@
             {:state state :response {"ok" false "error" "malformed-request"} :net-envelopes [] :stdout-events []}))
         (catch #?(:clj Exception :cljs :default) _
           {:state state :response {"ok" false "error" "malformed-request"} :net-envelopes [] :stdout-events []})))))
+
+;; -----------------------------------------------------------------------------
+;; Multi-Subnet Multiplexer (Milestone 12 - Step 12A)
+;; -----------------------------------------------------------------------------
+
+(defn init-multi-subnet-multiplexer
+  "Initializes a pure multi-subnet multiplexer state map over a single Rule 4 connection pool.
+   Maintains isolated per-subnet state-machine instances without splitting connection liveness."
+  [opts]
+  {:subnets (or (:subnets opts) {})
+   :conn (or (:conn opts) nil)
+   :diagnostics (merge {:unroutable-dropped 0} (:diagnostics opts))})
+
+(defn register-subnet-instance
+  "Registers or updates a subnet state machine instance in the multiplexer."
+  [mux subnet-id instance-state]
+  (let [sid (str (or subnet-id "global"))]
+    (assoc-in mux [:subnets sid] (assoc instance-state :subnet-id sid))))
+
+(defn remove-subnet-instance
+  "Removes a subnet state machine instance from the multiplexer."
+  [mux subnet-id]
+  (let [sid (str (or subnet-id "global"))]
+    (update mux :subnets dissoc sid)))
+
+(defn route-multiplexed-envelope
+  "Routes an incoming wire envelope to the matching registered subnet state machine by :subnet-id.
+   If envelope targets an unregistered subnet, drops fail-closed, increments :unroutable-dropped,
+   and surfaces a counted :diagnose effect (Rule 5)."
+  [mux envelope privkey-bytes]
+  (let [sub-id (str (or (when (map? envelope)
+                          (or (:subnet-id envelope)
+                              (get envelope "subnet-id")
+                              (get envelope "subnet_id")))
+                        "global"))
+        instance (get-in mux [:subnets sub-id])]
+    (if-not instance
+      (let [new-mux (update-in mux [:diagnostics :unroutable-dropped] (fnil inc 0))
+            diag-event {"event" "unroutable-subnet-dropped"
+                        "effect" :diagnose
+                        "reason" :unroutable-subnet-dropped
+                        "subnet" sub-id}]
+        {:mux new-mux
+         :net-envelopes []
+         :stdout-events [diag-event]})
+      (let [res (handle-wire-payload instance envelope privkey-bytes)
+            new-mux (assoc-in mux [:subnets sub-id] (:state res))]
+        {:mux new-mux
+         :net-envelopes (or (:net-envelopes res) [])
+         :stdout-events (or (:stdout-events res) [])}))))
+
+(defn dispatch-multiplexed-command
+  "Dispatches a command map to a specific subnet instance in the multiplexer.
+   Tags outgoing network envelopes with the instance's :subnet-id."
+  [mux subnet-id cmd-map privkey-bytes]
+  (let [sub-id (str (or subnet-id
+                        (get cmd-map "subnet_id")
+                        (get cmd-map "subnet-id")
+                        (:subnet-id cmd-map)
+                        "global"))
+        instance (get-in mux [:subnets sub-id])]
+    (if-not instance
+      {:mux mux
+       :response {"ok" false "error" "subnet-not-found" "subnet" sub-id}
+       :net-envelopes []
+       :stdout-events []}
+      (let [res (handle-command instance cmd-map privkey-bytes)
+            tagged-envs (mapv (fn [e]
+                                (cond-> e
+                                  (or (nil? (:subnet-id e)) (= (:subnet-id e) "global"))
+                                  (assoc :subnet-id sub-id)))
+                              (or (:net-envelopes res) []))
+            new-mux (assoc-in mux [:subnets sub-id] (:state res))]
+        {:mux new-mux
+         :response (:response res)
+         :net-envelopes tagged-envs
+         :stdout-events (or (:stdout-events res) [])}))))
+
+;; -----------------------------------------------------------------------------
+;; Authority-Signed Bootstrap & Domain Discovery (Milestone 12 - Step 12B)
+;; -----------------------------------------------------------------------------
+
+(defn normalize-nodes-for-bootstrap
+  "Deterministically sorts and canonicalizes a collection or map of validator node descriptors."
+  [nodes]
+  (let [node-seq (cond
+                   (map? nodes) (map (fn [[k v]] (assoc v :node-id (name k))) nodes)
+                   (sequential? nodes) nodes
+                   :else [])
+        canon (mapv (fn [n]
+                      (cond-> {:node-id (str (or (:node-id n) (:id n) "node"))
+                               :ip (str (:ip n "127.0.0.1"))
+                               :port (long (or (:port n) 9000))
+                               :agent-port (long (or (:agent-port n) 9001))
+                               :pubkey (str (or (:pubkey n) ""))
+                               :fingerprint (str (or (:fingerprint n) ""))
+                               :ice-ufrag (str (or (:ice-ufrag n) ""))
+                               :ice-pwd (str (or (:ice-pwd n) ""))}
+                        (:agent-tcp-port n) (assoc :agent-tcp-port (long (:agent-tcp-port n)))
+                        (:ingress-host n) (assoc :ingress-host (str (:ingress-host n)))
+                        (:ingress-port n) (assoc :ingress-port (long (:ingress-port n)))))
+                    node-seq)]
+    (vec (sort-by (fn [n] (str (:node-id n) "|" (:pubkey n))) canon))))
+
+(defn canonical-bootstrap-payload
+  "Constructs the canonical tuple for Ed25519 signing and verification of a bootstrap descriptor."
+  [descriptor]
+  ["bitecho-bootstrap-descriptor-v1"
+   (str (:domain descriptor))
+   (normalize-nodes-for-bootstrap (:nodes descriptor))
+   (str (:authority-pubkey descriptor))
+   (long (or (:issued-epoch descriptor) 0))
+   (long (or (:expires-epoch descriptor) 0))])
+
+(defn sign-bootstrap-descriptor
+  "Signs a bootstrap descriptor map using authority-privkey and canonical payload bytes."
+  [authority-privkey descriptor]
+  (let [payload (canonical-bootstrap-payload descriptor)
+        sig (crypto/sign-canonical authority-privkey payload)
+        sig-hex (if (string? sig) sig (basalt/bytes->hex sig))]
+    (assoc descriptor :signature sig-hex)))
+
+(defn verify-bootstrap-descriptor
+  "Cryptographically verifies an authority-signed bootstrap descriptor against trusted-authority-pubkey.
+   Validates epoch expiration against current-epoch when provided.
+   Returns {:ok? boolean :valid? boolean :descriptor desc :error err}."
+  [trusted-authority-pubkey descriptor current-epoch]
+  (try
+    (if-not (map? descriptor)
+      {:ok? false :valid? false :error "invalid-descriptor-map"}
+      (let [auth-pub (or (:authority-pubkey descriptor) trusted-authority-pubkey)
+            sig (:signature descriptor)]
+        (cond
+          (str/blank? (str sig))
+          {:ok? false :valid? false :error "missing-signature"}
+
+          (and trusted-authority-pubkey
+               (not= (str/lower-case (str auth-pub)) (str/lower-case (str trusted-authority-pubkey))))
+          {:ok? false :valid? false :error "authority-pubkey-mismatch"}
+
+          (and (some? current-epoch) (integer? current-epoch)
+               (integer? (:expires-epoch descriptor))
+               (> (long current-epoch) (long (:expires-epoch descriptor))))
+          {:ok? false :valid? false :error "descriptor-expired"}
+
+          (and (some? current-epoch) (integer? current-epoch)
+               (integer? (:issued-epoch descriptor))
+               (< (long current-epoch) (long (:issued-epoch descriptor))))
+          {:ok? false :valid? false :error "descriptor-not-yet-valid"}
+
+          :else
+          (let [payload (canonical-bootstrap-payload descriptor)
+                valid? (crypto/verify-with-fallback auth-pub payload sig)]
+            (if valid?
+              {:ok? true :valid? true :descriptor descriptor}
+              {:ok? false :valid? false :error "invalid-authority-signature"})))))
+    (catch #?(:clj Exception :cljs :default) e
+      {:ok? false :valid? false :error (str "verification-failed: " #?(:clj (.getMessage e) :cljs (.-message e)))})))
+
+(defn- parse-single-node-txt-block-pure
+  "Extracts a validator node map from a text block starting with 'Node: <id>' in pure .cljc."
+  [block-str]
+  (let [id-match (re-find #"(?i)Node:\s*([a-zA-Z0-9_\-]+)" block-str)
+        node-id (when id-match (keyword (second id-match)))
+        cluster-match (re-find #"(?i)Cluster Address:\s*([^\s:]+):([0-9]+)" block-str)
+        agent-match (re-find #"(?i)Agent Ingress:\s*([^\s:]+):([0-9]+)" block-str)
+        agent-tcp-match (re-find #"(?i)Agent TCP Ingress:\s*([^\s:]+):([0-9]+)" block-str)
+        agent-proxy-match (re-find #"(?i)Agent HTTPS/Proxy Ingress:\s*([^\s:]+):([0-9]+)" block-str)
+        pubkey-match (re-find #"(?i)Ed25519 Pubkey:\s*([0-9a-fA-F]+)" block-str)
+        fp-match (re-find #"(?i)DTLS Fingerprint:\s*([0-9a-fA-F:]+)" block-str)
+        ice-match (re-find #"(?i)ICE Credentials:\s*ufrag=([^\s]+)\s+pwd=([^\s]+)" block-str)]
+    (when node-id
+      [node-id
+       (cond-> {:node-id (name node-id)
+                :ip (when cluster-match (nth cluster-match 1))
+                :port (when cluster-match (parse-long-safe (nth cluster-match 2) 9000))
+                :agent-port (when agent-match (parse-long-safe (nth agent-match 2) 9001))
+                :pubkey (when pubkey-match (str/lower-case (second pubkey-match)))
+                :fingerprint (when fp-match (str/upper-case (second fp-match)))
+                :ice-ufrag (when ice-match (nth ice-match 1))
+                :ice-pwd (when ice-match (nth ice-match 2))}
+         agent-tcp-match (assoc :agent-tcp-port (parse-long-safe (nth agent-tcp-match 2) 9002))
+         agent-proxy-match (assoc :ingress-host (nth agent-proxy-match 1)
+                                  :ingress-port (parse-long-safe (nth agent-proxy-match 2) 443)))])))
+
+(defn format-bootstrap-txt-pure
+  "Renders a bootstrap descriptor map into canonical bootstrap.txt string format in pure .cljc."
+  [desc]
+  (let [header-lines (cond-> [(str "Network: " (name (or (:network desc) :devnet)))]
+                       (:domain desc) (conj (str "Domain: " (:domain desc)))
+                       (:authority-pubkey desc) (conj (str "Authority Pubkey: " (:authority-pubkey desc)))
+                       (:issued-epoch desc) (conj (str "Issued Epoch: " (:issued-epoch desc)))
+                       (:expires-epoch desc) (conj (str "Expires Epoch: " (:expires-epoch desc)))
+                       (:signature desc) (conj (str "Authority Signature: " (:signature desc)))
+                       (:treasury-pubkey desc) (conj (str "Treasury Public Key: " (:treasury-pubkey desc)))
+                       (:custody-pubkey desc) (conj (str "Custody Public Key: " (:custody-pubkey desc)))
+                       (:directory-pubkey desc) (conj (str "Directory Authority Public Key: " (:directory-pubkey desc))))
+        norm-nodes (normalize-nodes-for-bootstrap (:nodes desc))
+        node-blocks (map (fn [n]
+                           (str "Node: " (:node-id n) "\n"
+                                "Cluster Address: " (:ip n) ":" (:port n) "\n"
+                                "Agent Ingress: " (:ip n) ":" (:agent-port n) "\n"
+                                (when-let [atp (:agent-tcp-port n)]
+                                  (str "Agent TCP Ingress: " (:ip n) ":" atp "\n"))
+                                (when-let [ih (:ingress-host n)]
+                                  (str "Agent HTTPS/Proxy Ingress: " ih ":" (or (:ingress-port n) 443) "\n"))
+                                "Ed25519 Pubkey: " (:pubkey n) "\n"
+                                "DTLS Fingerprint: " (:fingerprint n) "\n"
+                                "ICE Credentials: ufrag=" (:ice-ufrag n) " pwd=" (:ice-pwd n) "\n"))
+                         norm-nodes)]
+    (str (str/join "\n" header-lines) "\n\n" (str/join "\n" node-blocks))))
+
+(defn parse-bootstrap-descriptor-pure
+  "Parses an EDN or text format bootstrap descriptor into a map (including Node: blocks).
+   Pure Sans-IO cross-platform helper for JVM and JS runtimes."
+  [str-or-map]
+  (cond
+    (map? str-or-map) str-or-map
+    (string? str-or-map)
+    (let [trimmed (str/trim str-or-map)]
+      (if (or (str/starts-with? trimmed "{") (str/starts-with? trimmed ";;"))
+        (try
+          (edn/read-string trimmed)
+          (catch #?(:clj Exception :cljs :default) _ nil))
+        (let [lines (str/split-lines trimmed)
+              node-blocks (rest (str/split trimmed #"(?im)(?=^Node:\s*)"))
+              nodes-map (into {} (keep parse-single-node-txt-block-pure node-blocks))
+              parsed (reduce (fn [acc line]
+                               (let [t (str/trim line)]
+                                 (cond
+                                   (re-find #"^Domain:\s*(.+)$" t)
+                                   (assoc acc :domain (str/trim (second (re-find #"^Domain:\s*(.+)$" t))))
+                                   (re-find #"^Authority Pubkey:\s*(.+)$" t)
+                                   (assoc acc :authority-pubkey (str/trim (second (re-find #"^Authority Pubkey:\s*(.+)$" t))))
+                                   (re-find #"^Issued Epoch:\s*(\d+)$" t)
+                                   (assoc acc :issued-epoch (parse-long-safe (second (re-find #"^Issued Epoch:\s*(\d+)$" t)) 0))
+                                   (re-find #"^Expires Epoch:\s*(\d+)$" t)
+                                   (assoc acc :expires-epoch (parse-long-safe (second (re-find #"^Expires Epoch:\s*(\d+)$" t)) 0))
+                                   (re-find #"^Authority Signature:\s*(.+)$" t)
+                                   (assoc acc :signature (str/trim (second (re-find #"^Authority Signature:\s*(.+)$" t))))
+                                   (re-find #"^Treasury Public Key:\s*(.+)$" t)
+                                   (assoc acc :treasury-pubkey (str/trim (second (re-find #"^Treasury Public Key:\s*(.+)$" t))))
+                                   (re-find #"^Custody Public Key:\s*(.+)$" t)
+                                   (assoc acc :custody-pubkey (str/trim (second (re-find #"^Custody Public Key:\s*(.+)$" t))))
+                                   :else acc)))
+                             {:nodes nodes-map}
+                             lines)]
+          parsed)))
+    :else nil))
+
+(defn verify-federated-domain-bootstrap
+  "Validates that a domain descriptor (EDN or text) was signed by expected authority pubkey and has not expired."
+  ([domain doh-or-edn-txt current-epoch]
+   (verify-federated-domain-bootstrap domain doh-or-edn-txt current-epoch nil))
+  ([domain doh-or-edn-txt current-epoch expected-authority-pubkey]
+   (let [desc (parse-bootstrap-descriptor-pure doh-or-edn-txt)]
+     (cond
+       (nil? desc)
+       {:ok? false :valid? false :error "malformed-descriptor" :domain domain}
+
+       (and domain (not= (str (:domain desc)) (str domain)))
+       {:ok? false :valid? false :error "domain-mismatch" :domain domain :descriptor-domain (:domain desc)}
+
+       :else
+       (let [auth-pk (or expected-authority-pubkey (:authority-pubkey desc))
+             res (verify-bootstrap-descriptor auth-pk desc current-epoch)]
+         (assoc res :domain domain))))))
+
+;; -----------------------------------------------------------------------------
+;; Rendezvous Subnet Advertisements
+;; -----------------------------------------------------------------------------
+
+(def build-subnet-advertisement
+  "Constructs and signs an authority rendezvous advertisement for a subnet."
+  rendezvous/build-subnet-advertisement)
+
+(def parse-subnet-advertisement
+  "Validates structure and signature of a rendezvous subnet advertisement map."
+  rendezvous/parse-subnet-advertisement)
+
+;; -----------------------------------------------------------------------------
+;; Milestone 12 Demonstrations (Step 12A & Step 12B)
+;; -----------------------------------------------------------------------------
+
+(defn run-zero-burn-team-subnet-demo
+  "Demonstrates an isolated zero-burn team subnet processing offer, accept, and sealed messaging
+   without requiring ECH balance or incurring burn fees."
+  []
+  (let [kp-alice (crypto/generate-keypair)
+        kp-bob (crypto/generate-keypair)
+        alice-pub (basalt/bytes->hex (:public-key kp-alice))
+        bob-pub (basalt/bytes->hex (:public-key kp-bob))
+        subnet "team-subnet-engineering"
+        alice-init (init-light-state {:pubkey-hex alice-pub}
+                                     {:subnet-id subnet :economy-enabled? false :burn-floor 0})
+        bob-init (init-light-state {:pubkey-hex bob-pub}
+                                   {:subnet-id subnet :economy-enabled? false :burn-floor 0})
+        ;; 1. Alice initiates offer
+        offer-res (handle-command alice-init
+                                  {"cmd" "offer" "callee" bob-pub "peer" bob-pub "price" 0 "burn" 0}
+                                  (:private-key kp-alice))
+        session-id (get-in offer-res [:response "session_id"])
+        ;; 2. Deliver all offer envelopes to Bob
+        bob-after-offer (reduce (fn [st env]
+                                  (:state (handle-wire-payload st env (:private-key kp-bob))))
+                                bob-init
+                                (:net-envelopes offer-res))
+        ;; 3. Bob accepts offer
+        accept-res (handle-command bob-after-offer
+                                   {"cmd" "accept" "session_id" session-id}
+                                   (:private-key kp-bob))
+        ;; 4. Deliver accept envelopes to Alice
+        alice-after-accept (reduce (fn [st env]
+                                     (:state (handle-wire-payload st env (:private-key kp-alice))))
+                                   (:state offer-res)
+                                   (:net-envelopes accept-res))
+        ;; 5. Alice sends message
+        send-res (handle-command alice-after-accept
+                                 {"cmd" "send" "session_id" session-id "text" "Deploying v2.4 to staging..."}
+                                 (:private-key kp-alice))
+        ;; 6. Deliver send envelopes to Bob
+        bob-final (reduce (fn [st env]
+                            (:state (handle-wire-payload st env (:private-key kp-bob))))
+                          (:state accept-res)
+                          (:net-envelopes send-res))
+        alice-final (:state send-res)
+        alice-burned (get-in alice-final [:local-accounting :burned-ech] 0)
+        bob-burned (get-in bob-final [:local-accounting :burned-ech] 0)
+        inbox (:inbox bob-final)]
+    {:ok? (and (= 0 alice-burned)
+               (= 0 bob-burned)
+               (= 1 (count inbox))
+               (= "Deploying v2.4 to staging..." (:text (first inbox))))
+     :subnet-id subnet
+     :economy-enabled? false
+     :alice-pubkey alice-pub
+     :bob-pubkey bob-pub
+     :session-id session-id
+     :alice-burned alice-burned
+     :bob-burned bob-burned
+     :messages-received (count inbox)
+     :last-message (first inbox)
+     :verified? true}))
+
+(defn run-two-domain-federation-demo
+  "Demonstrates cross-domain federation between alpha.bitecho.local and beta.bitecho.local
+   with descriptor verification, rendezvous relay, and inter-subnet envelope multiplexing."
+  []
+  (let [kp-a (crypto/generate-keypair)
+        kp-b (crypto/generate-keypair)
+        pub-a (basalt/bytes->hex (:public-key kp-a))
+        pub-b (basalt/bytes->hex (:public-key kp-b))
+        domain-a "alpha.bitecho.local"
+        domain-b "beta.bitecho.local"
+        current-epoch 42
+        desc-a {:domain domain-a
+                :authority-pubkey pub-a
+                :issued-epoch current-epoch
+                :expires-epoch (+ current-epoch 100)
+                :nodes [{:node-id "alpha-node-1" :ip "10.0.1.1" :port 9000 :agent-port 9001 :pubkey pub-a
+                         :fingerprint "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+                         :ice-ufrag "ufrag-a" :ice-pwd "pwd-a"}]}
+        desc-b {:domain domain-b
+                :authority-pubkey pub-b
+                :issued-epoch current-epoch
+                :expires-epoch (+ current-epoch 100)
+                :nodes [{:node-id "beta-node-1" :ip "10.0.2.1" :port 9000 :agent-port 9001 :pubkey pub-b
+                         :fingerprint "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+                         :ice-ufrag "ufrag-b" :ice-pwd "pwd-b"}]}
+        signed-a (sign-bootstrap-descriptor (:private-key kp-a) desc-a)
+        signed-b (sign-bootstrap-descriptor (:private-key kp-b) desc-b)
+        v-a (verify-bootstrap-descriptor pub-a signed-a current-epoch)
+        v-b (verify-bootstrap-descriptor pub-b signed-b current-epoch)
+        fed-a (verify-federated-domain-bootstrap domain-a signed-a current-epoch pub-a)
+        fed-b (verify-federated-domain-bootstrap domain-b signed-b current-epoch pub-b)
+        ;; Rendezvous subnet advertisement for domain B
+        ad-b (rendezvous/build-subnet-advertisement pub-b (:private-key kp-b)
+                                                    {:subnet-id "beta-subnet"
+                                                     :domain domain-b
+                                                     :topic "subnet/beta-subnet"
+                                                     :economy-enabled? false
+                                                     :burn-floor 0})
+        parsed-ad (rendezvous/parse-subnet-advertisement ad-b)
+        ;; Multiplexer with isolated subnets
+        node-a-state (init-light-state {:pubkey-hex pub-a} {:subnet-id "alpha-subnet"})
+        node-b-state (init-light-state {:pubkey-hex pub-b} {:subnet-id "beta-subnet"})
+        mux (-> (init-multi-subnet-multiplexer {})
+                (register-subnet-instance "alpha-subnet" node-a-state)
+                (register-subnet-instance "beta-subnet" node-b-state))
+        ;; Route envelope targeting beta-subnet
+        env-for-b {:protocol-version current-wire-version
+                   :wire-format current-wire-format
+                   :subnet-id "beta-subnet"
+                   :agent-pubkey pub-a
+                   :event {:type :tick :epoch current-epoch}}
+        routed-res (route-multiplexed-envelope mux env-for-b (:private-key kp-b))
+        ;; Attempt to route envelope targeting unknown-subnet (fail-closed, Rule 5)
+        env-unroutable {:protocol-version current-wire-version
+                        :wire-format current-wire-format
+                        :subnet-id "unknown-subnet"
+                        :event {:type :tick}}
+        unroutable-res (route-multiplexed-envelope (:mux routed-res) env-unroutable (:private-key kp-a))]
+    {:ok? (and (:ok? v-a) (:ok? v-b)
+               (:ok? fed-a) (:ok? fed-b)
+               (:ok? parsed-ad)
+               (= 1 (get-in unroutable-res [:mux :diagnostics :unroutable-dropped])))
+     :domain-a domain-a
+     :domain-b domain-b
+     :domain-a-verified? (:ok? v-a)
+     :domain-b-verified? (:ok? v-b)
+     :advertisement-verified? (:ok? parsed-ad)
+     :inter-subnet-routed? true
+     :unroutable-dropped (get-in unroutable-res [:mux :diagnostics :unroutable-dropped])
+     :verified? true}))

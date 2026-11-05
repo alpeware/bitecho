@@ -2,10 +2,12 @@
   "Bitecho Browser Node static bundle entry point.
    Exposes high-level browser API on js/globalThis.BitechoBrowser conforming to Rules 1-6."
   (:require [bitecho.anchor.core :as anchor]
+            [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.core :as light-core]
             [bitecho.shell.browser :as browser]
             [bitecho.webauthn :as webauthn]))
 
@@ -43,11 +45,21 @@
   "Simulates or executes WebAuthn userHandle seed recovery, updating anchor identity."
   [seed-or-opts]
   (let [opts-map (if (map? seed-or-opts) seed-or-opts (when seed-or-opts (js->clj seed-or-opts :keywordize-keys true)))
-        user-handle (or (:user-handle opts-map) (:seed-bytes opts-map) seed-or-opts (crypto/random-bytes 32))
-        recovered (webauthn/recover-seed-from-assertion {:user-handle user-handle})]
+        existing-ident (or (:identity opts-map)
+                           (when (and (map? opts-map) (:public-hex opts-map)) opts-map))
+        user-handle (or (when existing-ident (or (:user-handle existing-ident) (:seed existing-ident)))
+                        (:user-handle opts-map)
+                        (:seed-bytes opts-map)
+                        (when-not (map? seed-or-opts) seed-or-opts)
+                        (crypto/random-bytes 32))
+        recovered (or (when (and existing-ident (:public-hex existing-ident) (:address existing-ident))
+                        existing-ident)
+                      (webauthn/recover-seed-from-assertion (or opts-map {:user-handle user-handle})))]
     (when (and @anchor-state-atom recovered)
       (swap! anchor-state-atom (fn [st]
                                  (-> st
+                                     (assoc-in [:identity :anchor-pubkey] (:public-hex recovered))
+                                     (assoc-in [:identity :address] (:address recovered))
                                      (assoc :anchor-pubkey (:public-hex recovered))
                                      (assoc :anchor-address (:address recovered))
                                      (assoc :privkey-bytes (:private-key recovered))
@@ -269,6 +281,68 @@
   [& _args]
   (clj->js (browser/run-browser-subnet-demo)))
 
+(defn run-zero-burn-subnet-demo
+  "Runs the zero-burn team subnet demo and returns a JavaScript summary object."
+  [& _args]
+  (clj->js (light-core/run-zero-burn-team-subnet-demo)))
+
+(defn run-federation-demo
+  "Runs the two-domain federation demo and returns a JavaScript summary object."
+  [& _args]
+  (clj->js (light-core/run-two-domain-federation-demo)))
+
+(defn queue-offer
+  "Queues a simulated incoming offer on the active Human Anchor state atom.
+   Returns the updated dashboard view as a JavaScript object."
+  ([] (queue-offer nil))
+  ([offer-map]
+   (when-not @anchor-state-atom
+     (init-anchor nil))
+   (let [callee (get-in @anchor-state-atom [:identity :anchor-pubkey])
+         rand-num (rand-int 9000)
+         off (merge {:offer-id (str "off-" (+ 1000 rand-num))
+                     :caller-pubkey (basalt/bytes->hex (:public (crypto/generate-keypair)))
+                     :callee-pubkey callee
+                     :price 10
+                     :burn 500
+                     :epoch 1}
+                    (when offer-map (js->clj offer-map :keywordize-keys true)))
+         new-st (anchor/queue-incoming-offer @anchor-state-atom off)]
+     (reset! anchor-state-atom new-st)
+     (clj->js (anchor/anchor-dashboard-view new-st)))))
+
+(defn create-discoverable-credential
+  "Invokes WebAuthn navigator.credentials.create with discoverable resident key
+   and PRF extension for hardware seed generation. Returns a Promise."
+  ([] (create-discoverable-credential nil))
+  ([opts]
+   (let [rp-id (or (when opts (aget opts "rpId"))
+                   (if (exists? js/window) js/window.location.hostname "bitecho.org"))
+         user-name (or (when opts (aget opts "userName")) "human-anchor@bitecho.org")]
+     (js/Promise.
+      (fn [resolve reject]
+        (webauthn/create-discoverable-credential!
+         {:rp-id rp-id :user-name user-name}
+         (fn [err res]
+           (if err
+             (reject (js/Error. (or (:error err) "credential-creation-failed")))
+             (resolve (clj->js res))))))))))
+
+(defn get-discoverable-credential
+  "Invokes WebAuthn navigator.credentials.get to recover discoverable credential seed. Returns a Promise."
+  ([] (get-discoverable-credential nil))
+  ([opts]
+   (let [rp-id (or (when opts (aget opts "rpId"))
+                   (if (exists? js/window) js/window.location.hostname "bitecho.org"))]
+     (js/Promise.
+      (fn [resolve reject]
+        (webauthn/get-discoverable-credential!
+         {:rp-id rp-id}
+         (fn [err res]
+           (if err
+             (reject (js/Error. (or (:error err) "credential-get-failed")))
+             (resolve (clj->js res))))))))))
+
 (def api
   "Global BitechoBrowser API object."
   #js {:initNode init-node
@@ -278,10 +352,15 @@
        :acceptOffer accept-offer
        :sendSealedMessage send-sealed-message
        :runSubnetDemo run-subnet-demo
+       :runZeroBurnSubnetDemo run-zero-burn-subnet-demo
+       :runFederationDemo run-federation-demo
        :initAnchor init-anchor
        :getAnchorDashboard get-anchor-dashboard
        :registerYubiKey register-yubikey
        :recoverFromYubiKey recover-from-yubikey
+       :createDiscoverableCredential create-discoverable-credential
+       :getDiscoverableCredential get-discoverable-credential
+       :queueOffer queue-offer
        :generateNonExtractableKey generate-non-extractable-key
        :approveOffer approve-offer-cmd
        :denyOffer deny-offer-cmd
@@ -290,7 +369,7 @@
        :encodeBech32m encode-bech32m-cmd
        :decodeBech32m decode-bech32m-cmd
        :runAnchorEndToEndDemo run-anchor-end-to-end-demo
-       :version "1.0.0-m11"})
+       :version "1.0.0-m12"})
 
 (when (exists? js/globalThis)
   (set! (.-BitechoBrowser js/globalThis) api))

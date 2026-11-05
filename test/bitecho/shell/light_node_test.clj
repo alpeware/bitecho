@@ -1251,7 +1251,8 @@
                   "--min-burn" "--allowlist" "--auto-accept" "--topic" "--to"
                   "--offer-hash" "--from"
                   "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"
-                  "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"}]
+                  "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"
+                  "--subnet-id"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))

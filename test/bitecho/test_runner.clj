@@ -13,6 +13,7 @@
             [bitecho.economy.burn-test]
             [bitecho.economy.escrow-test]
             [bitecho.economy.treasury-test]
+            [bitecho.fractal-federation-test]
             [bitecho.fressian-test]
             [bitecho.light-node.core-test]
             [bitecho.murmur.core-test]

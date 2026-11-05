@@ -182,12 +182,14 @@
    (wrap-agent-event event agent-pubkey-hex agent-privkey-bytes nil))
   ([event agent-pubkey-hex ^bytes agent-privkey-bytes dac]
    (let [clean-event (dissoc event :sender :sender-pubkey-bytes :rng)
+         sub-id (str (or (:subnet-id event) "global"))
          sb (agent-event-signing-bytes agent-pubkey-hex clean-event)
          sig (crypto/sign agent-privkey-bytes sb)
          sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
          effective-dac (or dac (:dac event))]
      (cond-> {:protocol-version current-wire-version
               :wire-format current-wire-format
+              :subnet-id sub-id
               :agent-pubkey agent-pubkey-hex
               :event clean-event
               :signature sig-hex}

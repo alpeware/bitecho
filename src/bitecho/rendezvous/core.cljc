@@ -215,3 +215,71 @@
       {:valid? true
        :debit debit
        :tuple tuple})))
+
+;; -----------------------------------------------------------------------------
+;; Rendezvous Subnet Advertisement (Step 12A)
+;; -----------------------------------------------------------------------------
+
+(defn subnet-advertisement-payload
+  "Extracts canonical tuple for subnet advertisement signing."
+  [ad]
+  ["bitecho-subnet-ad-v1"
+   (str (:subnet-id ad))
+   (str (:topic ad))
+   (boolean (:economy-enabled? ad))
+   (long (:burn-floor ad))
+   (vec (sort (map str (:crypto-suites ad))))
+   (str (:wire-format ad))
+   (str (:coordinator-pubkey ad))])
+
+(defn build-subnet-advertisement
+  "Constructs and signs an authority rendezvous advertisement for a subnet."
+  [coordinator-pubkey coordinator-privkey opts]
+  (let [coord-pub (if (string? coordinator-pubkey)
+                    coordinator-pubkey
+                    (basalt/bytes->hex coordinator-pubkey))
+        sub-id (str (or (:subnet-id opts) "global"))
+        topic (str (or (:topic opts) (str "subnet/" sub-id)))
+        econ? (boolean (get opts :economy-enabled? true))
+        burn-fl (long (or (:burn-floor opts) (if econ? 100 0)))
+        suites (vec (or (:crypto-suites opts) ["suite-v1-aes256gcm"]))
+        wire-fmt (str (or (:wire-format opts) "fressian-v1"))
+        base-ad {:subnet-id sub-id
+                 :topic topic
+                 :economy-enabled? econ?
+                 :burn-floor burn-fl
+                 :crypto-suites suites
+                 :wire-format wire-fmt
+                 :coordinator-pubkey coord-pub}
+        payload (subnet-advertisement-payload base-ad)
+        sig (crypto/sign-canonical coordinator-privkey payload)
+        sig-hex (if (string? sig) sig (basalt/bytes->hex sig))]
+    (assoc base-ad :signature sig-hex)))
+
+(defn parse-subnet-advertisement
+  "Validates structure and signature of a rendezvous subnet advertisement map."
+  [ad-map & [_opts]]
+  (if-not (map? ad-map)
+    {:ok? false :error "invalid-advertisement-map"}
+    (let [sub-id (:subnet-id ad-map)
+          topic (:topic ad-map)
+          coord-pub (:coordinator-pubkey ad-map)
+          sig (:signature ad-map)]
+      (if-not (and sub-id topic coord-pub sig)
+        {:ok? false :error "missing-required-fields"}
+        (let [econ? (boolean (get ad-map :economy-enabled? true))
+              burn-fl (long (or (:burn-floor ad-map) (if econ? 100 0)))
+              suites (vec (or (:crypto-suites ad-map) ["suite-v1-aes256gcm"]))
+              wire-fmt (str (or (:wire-format ad-map) "fressian-v1"))
+              base-ad {:subnet-id (str sub-id)
+                       :topic (str topic)
+                       :economy-enabled? econ?
+                       :burn-floor burn-fl
+                       :crypto-suites suites
+                       :wire-format wire-fmt
+                       :coordinator-pubkey (str coord-pub)}
+              payload (subnet-advertisement-payload base-ad)
+              valid? (crypto/verify-with-fallback (str coord-pub) payload sig)]
+          (if valid?
+            {:ok? true :advertisement (assoc base-ad :signature sig)}
+            {:ok? false :error "invalid-signature"}))))))

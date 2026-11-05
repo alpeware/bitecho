@@ -134,7 +134,12 @@
       :failed-receipts-count 0
       :escrows {}
       :settled-escrow-ids #{}
-      :settled-escrow-order []})))
+      :settled-escrow-order []
+      ;; Subnet & Economy configuration (Milestone 12)
+      :subnet-id (str (or (:subnet-id cfg) "global"))
+      :economy-enabled? (boolean (get cfg :economy-enabled? true))
+      :burn-floor (long (or (:burn-floor cfg) (if (get cfg :economy-enabled? true) 100 0)))
+      :diagnostics (merge {:subnet-mismatch-dropped 0} (:diagnostics cfg))})))
 
 (defn fifo-track
   "Maintains a bounded set and order vector with deterministic FIFO eviction.
@@ -879,48 +884,55 @@
         (apply-streamlet-tick treasury-state all-commands closing-epoch)))))
 
 (defn- apply-broadcast-burn
-  "Enforces a mandatory signaling burn (>= burn/min-signaling-burn) on every broadcast.
-   Deducts burn from sender's ledger account and updates epoch-burns.
+  "Enforces a signaling burn on broadcast. If :economy-enabled? is false or burn-floor is 0,
+   allows 0 burn. Otherwise deducts burn (>= burn-floor) from sender's ledger account.
    Returns {:state updated-state :burn-amount burn-amt} or nil if deduction failed or burn invalid."
   [state event current-epoch]
-  (let [burn-spec (if (contains? event :burn)
+  (let [econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
+        floor (long (get-in state [:config :burn-floor] (get state :burn-floor (if econ-enabled? burn/min-signaling-burn 0))))
+        burn-spec (if (contains? event :burn)
                     (:burn event)
                     (:signaling-burn event))
         burn-amt (cond
-                   (number? burn-spec) (when (>= burn-spec burn/min-signaling-burn) burn-spec)
+                   (number? burn-spec) (when (>= burn-spec floor) burn-spec)
                    (false? burn-spec) nil
-                   :else burn/min-signaling-burn)]
-    (when burn-amt
-      (let [sender (or (:sender event)
-                       (when-let [pk (:public-key event)]
-                         (if (string? pk) pk (basalt/bytes->hex pk)))
-                       (:node-pubkey state))]
-        (when-let [res (burn/deduct-signaling-burn (:ledger state) sender burn-amt)]
-          {:state (-> state
-                      (assoc :ledger (:ledger res))
-                      (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
-           :burn-amount (:burn-amount res)})))))
+                   :else floor)]
+    (if (and (not econ-enabled?) (zero? (or burn-amt 0)))
+      {:state state :burn-amount 0}
+      (when burn-amt
+        (let [sender (or (:sender event)
+                         (when-let [pk (:public-key event)]
+                           (if (string? pk) pk (basalt/bytes->hex pk)))
+                         (:node-pubkey state))]
+          (when-let [res (burn/deduct-signaling-burn (:ledger state) sender burn-amt)]
+            {:state (-> state
+                        (assoc :ledger (:ledger res))
+                        (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
+             :burn-amount (:burn-amount res)}))))))
 
 (defn- handle-broadcast
   "Handles an internal request to broadcast a payload.
    Deducts mandatory signaling burn; drops broadcast if burn deduction fails."
   [state event]
   (let [current-epoch (or (:epoch state) 0)
+        econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
+        floor (long (get-in state [:config :burn-floor] (get state :burn-floor (if econ-enabled? burn/min-signaling-burn 0))))
         burn-spec (if (contains? event :burn) (:burn event) (:signaling-burn event))
         burn-amt (cond
-                   (number? burn-spec) (when (>= burn-spec burn/min-signaling-burn) burn-spec)
+                   (number? burn-spec) (when (>= burn-spec floor) burn-spec)
                    (false? burn-spec) nil
-                   :else burn/min-signaling-burn)
+                   :else floor)
         sender (or (:sender event)
                    (when-let [pk (:public-key event)]
                      (if (string? pk) pk (basalt/bytes->hex pk)))
                    (:node-pubkey state))
         sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))]
     (if (consensus-mode? state)
-      (if (and burn-amt
-               sender-hex
-               (get-in state [:ledger sender-hex])
-               (>= (spendable-balance state sender-hex) burn-amt))
+      (if (or (and (not econ-enabled?) (zero? (or burn-amt 0)))
+              (and burn-amt
+                   sender-hex
+                   (get-in state [:ledger sender-hex])
+                   (>= (spendable-balance state sender-hex) burn-amt)))
         (let [cfg (:config state)
               murmur-k (:murmur-k cfg)
               murmur-max-cache-size (:murmur-max-cache-size cfg)
@@ -933,10 +945,12 @@
               broadcast-result (murmur/initiate-broadcast payload rng extracted-peers murmur-k)
               message-id (:message-id broadcast-result)
               message (assoc sieve-message :message-id message-id :burn-amount burn-amt)
-              staged (stage-receipt state {:receipt-id (str "gossip-burn:" message-id)
-                                           :type :burn
-                                           :sender sender-hex
-                                           :amount burn-amt})]
+              staged (if (and econ-enabled? (pos? (or burn-amt 0)))
+                       (stage-receipt state {:receipt-id (str "gossip-burn:" message-id)
+                                             :type :burn
+                                             :sender sender-hex
+                                             :amount burn-amt})
+                       {:ok? true :state state})]
           (if (:ok? staged)
             (let [staged-state (:state staged)
                   commands (if (seq (:targets broadcast-result))
@@ -1897,32 +1911,36 @@
   "Handles a direct signaling burn event, deducting burn from the sender's account
    and incrementing the epoch's burn accumulator."
   [state event]
-  (let [sender (:sender event)
+  (let [econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
+        floor (long (get-in state [:config :burn-floor] (get state :burn-floor (if econ-enabled? burn/min-signaling-burn 0))))
+        sender (:sender event)
         sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))
-        burn-amt (or (:burn event) (:burn-amount event) burn/min-signaling-burn)]
-    (if (consensus-mode? state)
-      (let [sender-acct (when sender-hex (get-in state [:ledger sender-hex]))]
-        (if (and sender-hex
-                 sender-acct
-                 (number? burn-amt)
-                 (>= burn-amt burn/min-signaling-burn)
-                 (>= (spendable-balance state sender-hex) burn-amt))
-          (let [rid (or (:receipt-id event)
-                        (str "burn:" sender-hex ":" (or (:epoch state) 0) ":" (:receipt-seq state 0)))
-                staged (stage-receipt state {:receipt-id rid :type :burn :sender sender-hex :amount burn-amt})]
-            (if (:ok? staged)
-              {:state (:state staged) :commands []}
-              {:state state :commands []}))
-          {:state state :commands []}))
-      (let [ledger (or (:ledger state) {})
-            res (when sender-hex (burn/deduct-signaling-burn ledger sender-hex burn-amt))]
-        (if res
-          (let [current-epoch (or (:epoch state) 0)]
-            {:state (-> state
-                        (assoc :ledger (:ledger res))
-                        (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
-             :commands []})
-          {:state state :commands []})))))
+        burn-amt (or (:burn event) (:burn-amount event) floor)]
+    (if (and (not econ-enabled?) (zero? (or burn-amt 0)))
+      {:state state :commands []}
+      (if (consensus-mode? state)
+        (let [sender-acct (when sender-hex (get-in state [:ledger sender-hex]))]
+          (if (and sender-hex
+                   sender-acct
+                   (number? burn-amt)
+                   (>= burn-amt floor)
+                   (>= (spendable-balance state sender-hex) burn-amt))
+            (let [rid (or (:receipt-id event)
+                          (str "burn:" sender-hex ":" (or (:epoch state) 0) ":" (:receipt-seq state 0)))
+                  staged (stage-receipt state {:receipt-id rid :type :burn :sender sender-hex :amount burn-amt})]
+              (if (:ok? staged)
+                {:state (:state staged) :commands []}
+                {:state state :commands []}))
+            {:state state :commands []}))
+        (let [ledger (or (:ledger state) {})
+              res (when sender-hex (burn/deduct-signaling-burn ledger sender-hex burn-amt))]
+          (if res
+            (let [current-epoch (or (:epoch state) 0)]
+              {:state (-> state
+                          (assoc :ledger (:ledger res))
+                          (update-in [:epoch-burns current-epoch] (fnil + 0) (:burn-amount res)))
+               :commands []})
+            {:state state :commands []}))))))
 
 (defn- handle-epoch-mint
   "Handles an authorized epoch mint event, applying demand-gated mint allocations."
@@ -2624,34 +2642,46 @@
   "Pure root reducer. Takes the current state and an event,
    returns a map with :state (new state) and :commands (side-effects to perform)."
   [state event]
-  (case (:type event)
-    :contagion-broadcast (handle-contagion-broadcast state event)
-    :tick (handle-tick state event)
-    :broadcast (handle-broadcast state event)
-    :signaling-burn (handle-signaling-burn state event)
-    :settle-intent (handle-settle-intent state event)
-    :lock-intent (handle-lock-intent state event)
-    :release-intent (handle-release-intent state event)
-    :refund-intent (handle-refund-intent state event)
-    :epoch-mint (handle-epoch-mint state event)
-    :apply-epoch-mint (handle-epoch-mint state event)
-    :submit-transcript (handle-submit-transcript state event)
-    :register-home-set (handle-register-home-set state event)
-    :receive-offer-header (handle-receive-offer-header state event)
-    :receive-push-view (handle-receive-push-view state event)
-    :receive-summary (handle-receive-summary state event)
-    :receive-subscribe (handle-receive-subscribe state event)
-    :receive-pull-request (handle-receive-pull-request state event)
-    :receive-gossip (handle-receive-gossip state event)
-    :receive-sieve-echo (handle-receive-sieve-echo state event)
-    :receive-contagion-ready (handle-receive-contagion-ready state event)
-    :receive-propose (let [res (streamlet/handle-streamlet-event state event)]
-                       {:state (execute-finalized-blocks (:state res))
-                        :commands (:commands res)})
-    :receive-vote (let [res (streamlet/handle-streamlet-event state event)]
-                    {:state (execute-finalized-blocks (:state res))
-                     :commands (:commands res)})
-    :on-deliver (handle-on-deliver state event)
-    :submit-vouchers (handle-submit-vouchers state event)
-    :receive-transcript-sig (handle-receive-transcript-sig state event)
-    {:state state :commands []}))
+  (let [event-subnet (or (:subnet-id event) (get event "subnet-id"))
+        state-subnet (or (:subnet-id state) "global")]
+    (if (and (some? event-subnet)
+             (not= (str event-subnet) "*")
+             (not= (str state-subnet) "*")
+             (not= (str event-subnet) (str state-subnet)))
+      {:state (update-in state [:diagnostics :subnet-mismatch-dropped] (fnil inc 0))
+       :commands [{:type :diagnose
+                   :effect :diagnose
+                   :reason :subnet-mismatch-dropped
+                   :event-subnet event-subnet
+                   :state-subnet state-subnet}]}
+      (case (:type event)
+        :contagion-broadcast (handle-contagion-broadcast state event)
+        :tick (handle-tick state event)
+        :broadcast (handle-broadcast state event)
+        :signaling-burn (handle-signaling-burn state event)
+        :settle-intent (handle-settle-intent state event)
+        :lock-intent (handle-lock-intent state event)
+        :release-intent (handle-release-intent state event)
+        :refund-intent (handle-refund-intent state event)
+        :epoch-mint (handle-epoch-mint state event)
+        :apply-epoch-mint (handle-epoch-mint state event)
+        :submit-transcript (handle-submit-transcript state event)
+        :register-home-set (handle-register-home-set state event)
+        :receive-offer-header (handle-receive-offer-header state event)
+        :receive-push-view (handle-receive-push-view state event)
+        :receive-summary (handle-receive-summary state event)
+        :receive-subscribe (handle-receive-subscribe state event)
+        :receive-pull-request (handle-receive-pull-request state event)
+        :receive-gossip (handle-receive-gossip state event)
+        :receive-sieve-echo (handle-receive-sieve-echo state event)
+        :receive-contagion-ready (handle-receive-contagion-ready state event)
+        :receive-propose (let [res (streamlet/handle-streamlet-event state event)]
+                           {:state (execute-finalized-blocks (:state res))
+                            :commands (:commands res)})
+        :receive-vote (let [res (streamlet/handle-streamlet-event state event)]
+                        {:state (execute-finalized-blocks (:state res))
+                         :commands (:commands res)})
+        :on-deliver (handle-on-deliver state event)
+        :submit-vouchers (handle-submit-vouchers state event)
+        :receive-transcript-sig (handle-receive-transcript-sig state event)
+        {:state state :commands []}))))

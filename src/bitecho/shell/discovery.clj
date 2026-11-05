@@ -72,6 +72,11 @@
         treasury-pk (validate-pubkey! (:treasury-pubkey data) "treasury")
         custody-pk (validate-pubkey! (:custody-pubkey data) "custody")
         dir-pk (when-let [dp (:directory-pubkey data)] (validate-pubkey! dp "directory"))
+        dom (when-let [d (:domain data)] (str/trim (str d)))
+        auth-pk (when-let [ap (:authority-pubkey data)] (validate-pubkey! ap "authority"))
+        issued-ep (when-let [ie (:issued-epoch data)] (long ie))
+        expires-ep (when-let [ee (:expires-epoch data)] (long ee))
+        sig (when-let [s (:signature data)] (str/trim (str s)))
         nodes-map (or (:nodes data) {})
         _ (when (empty? nodes-map)
             (throw (ex-info "Bootstrap descriptor contains no validator nodes"
@@ -82,7 +87,12 @@
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes normalized-nodes}
-      dir-pk (assoc :directory-pubkey dir-pk))))
+      dir-pk (assoc :directory-pubkey dir-pk)
+      dom (assoc :domain dom)
+      auth-pk (assoc :authority-pubkey auth-pk)
+      issued-ep (assoc :issued-epoch issued-ep)
+      expires-ep (assoc :expires-epoch expires-ep)
+      sig (assoc :signature sig))))
 
 (defn- parse-single-node-txt-block
   "Extracts a validator node map from a text block starting with 'Node: <id>'."
@@ -117,10 +127,20 @@
   (when (or (nil? txt-str) (str/blank? txt-str))
     (throw (ex-info "Empty bootstrap.txt descriptor" {:error :invalid-descriptor})))
   (let [net-match (re-find #"(?im)^Network:\s*([a-zA-Z0-9_\-]+)" txt-str)
+        dom-match (re-find #"(?im)^Domain:\s*([^\s]+)" txt-str)
+        auth-match (re-find #"(?im)^Authority Pubkey:\s*([0-9a-fA-F]+)" txt-str)
+        issued-match (re-find #"(?im)^Issued Epoch:\s*([0-9]+)" txt-str)
+        expires-match (re-find #"(?im)^Expires Epoch:\s*([0-9]+)" txt-str)
+        sig-match (re-find #"(?im)^Authority Signature:\s*([0-9a-fA-F]+)" txt-str)
         treasury-match (re-find #"(?im)^Treasury Public Key:\s*([0-9a-fA-F]+)" txt-str)
         custody-match (re-find #"(?im)^Custody Public Key:\s*([0-9a-fA-F]+)" txt-str)
         dir-match (re-find #"(?im)^Directory Authority Public Key:\s*([0-9a-fA-F]+)" txt-str)
         network (keyword (str/lower-case (or (second net-match) "devnet")))
+        dom (when dom-match (second dom-match))
+        auth-pk (when (second auth-match) (validate-pubkey! (second auth-match) "authority"))
+        issued-ep (when (second issued-match) (Long/parseLong (second issued-match)))
+        expires-ep (when (second expires-match) (Long/parseLong (second expires-match)))
+        sig (when sig-match (second sig-match))
         treasury-pk (validate-pubkey! (second treasury-match) "treasury")
         custody-pk (validate-pubkey! (second custody-match) "custody")
         dir-pk (when (second dir-match) (validate-pubkey! (second dir-match) "directory"))
@@ -134,7 +154,45 @@
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes nodes-map}
-      dir-pk (assoc :directory-pubkey dir-pk))))
+      dir-pk (assoc :directory-pubkey dir-pk)
+      dom (assoc :domain dom)
+      auth-pk (assoc :authority-pubkey auth-pk)
+      issued-ep (assoc :issued-epoch issued-ep)
+      expires-ep (assoc :expires-epoch expires-ep)
+      sig (assoc :signature sig))))
+
+(defn format-bootstrap-txt
+  "Renders a validated bootstrap descriptor map into canonical bootstrap.txt string format."
+  [desc]
+  (let [sb (StringBuilder.)]
+    (.append sb (str "Network: " (name (or (:network desc) :devnet)) "\n"))
+    (when-let [dom (:domain desc)]
+      (.append sb (str "Domain: " dom "\n")))
+    (when-let [auth-pk (:authority-pubkey desc)]
+      (.append sb (str "Authority Pubkey: " auth-pk "\n")))
+    (when-let [ie (:issued-epoch desc)]
+      (.append sb (str "Issued Epoch: " ie "\n")))
+    (when-let [ee (:expires-epoch desc)]
+      (.append sb (str "Expires Epoch: " ee "\n")))
+    (when-let [sig (:signature desc)]
+      (.append sb (str "Authority Signature: " sig "\n")))
+    (.append sb (str "Treasury Public Key: " (:treasury-pubkey desc) "\n"))
+    (.append sb (str "Custody Public Key: " (:custody-pubkey desc) "\n"))
+    (when-let [dp (:directory-pubkey desc)]
+      (.append sb (str "Directory Authority Public Key: " dp "\n")))
+    (.append sb "\n")
+    (doseq [[node-id n] (sort-by #(name (first %)) (:nodes desc))]
+      (.append sb (str "Node: " (name node-id) "\n"))
+      (.append sb (str "Cluster Address: " (:ip n) ":" (:port n) "\n"))
+      (.append sb (str "Agent Ingress: " (:ip n) ":" (:agent-port n) "\n"))
+      (when-let [atp (:agent-tcp-port n)]
+        (.append sb (str "Agent TCP Ingress: " (:ip n) ":" atp "\n")))
+      (when-let [ih (:ingress-host n)]
+        (.append sb (str "Agent HTTPS/Proxy Ingress: " ih ":" (or (:ingress-port n) 443) "\n")))
+      (.append sb (str "Ed25519 Pubkey: " (:pubkey n) "\n"))
+      (.append sb (str "DTLS Fingerprint: " (:fingerprint n) "\n"))
+      (.append sb (str "ICE Credentials: ufrag=" (:ice-ufrag n) " pwd=" (:ice-pwd n) "\n\n")))
+    (.toString sb)))
 
 (defn parse-bootstrap-descriptor
   "Auto-detects EDN or text format and parses into a validated descriptor map."

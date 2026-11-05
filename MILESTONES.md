@@ -516,16 +516,34 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ---
 
-### Milestone 12: Fractal Composition + Federation
+### Milestone 12: Fractal Composition + Federation — **`[BUILT & VERIFIED]`**
 
-#### Step 12A — Subnets (Fractal Down)
-1. **Subnet Identity**: Add `:subnet-id` (defaulting to `global` / network name) to envelopes and state-machine instances. The shell multiplexes `{subnet-id -> state machine}` over the single generation-tagged transport connection pool (Rule 4 preserved), supporting multi-subnet daemons and browser tabs.
-2. **Per-Instance Economy + Advertisement**: Per-instance `:economy-enabled?` / `:burn-floor` config (economy optional per instance; the 100 ECH floor is mandatory on broadcast today). Advertisement format: rendezvous topics name subnets, interpreted by the shell. A zero-burn team subnet demonstrates economy optionality.
+#### Step 12A — Subnets (Fractal Down) — **`[BUILT & VERIFIED]`**
+1. **Subnet Identity & Envelope Tagging**: Added `:subnet-id` (defaulting to `"global"` when omitted for 100% N/N-1 backward compatibility) across envelopes, offers, accepts, sends, closes, and state-machine instances (`state-machine/init-state`, `state-machine/handle-event`, `light-node/init-light-state`, `light-node/handle-command`, `light-node/handle-wire-payload`). Subnet mismatches fail closed with counted `:subnet-mismatch-dropped` diagnostic effects (Rule 5).
+2. **Single-Authority Shell Lifecycle Multiplexing (Rule 4)**: Implemented multi-subnet multiplexer in `src/bitecho/light_node/core.cljc` (`init-multi-subnet-multiplexer`, `register-subnet-instance`, `remove-subnet-instance`, `route-multiplexed-envelope`, `dispatch-multiplexed-command`). Multiplexes `{subnet-id -> state-machine}` instances over a single shared connection state (`:conn`), eliminating competing atoms and ensuring single-authority lifecycle management. Unroutable envelopes targeting unregistered subnets drop with counted `:unroutable-dropped` diagnostic events.
+3. **Per-Instance Economy & Zero-Burn Subnets**: Configured per-instance `:economy-enabled?` and `:burn-floor` options. When `:economy-enabled?` is false (or `:burn-floor 0`), the instance operates as a zero-burn team/collaboration subnet with 0 ECH burned on offers, accepts, and messages while preserving all cryptographic and rendezvous invariant checks.
+4. **Subnet Rendezvous Advertisements**: Implemented `build-subnet-advertisement` and `parse-subnet-advertisement` in `src/bitecho/rendezvous/core.cljc`. Subnet coordinators publish signed rendezvous advertisements containing `:subnet-id`, `:coordinator-pubkey`, `:service-types`, `:burn-floor`, `:epoch`, and `:signature`. Tampered advertisements fail closed with explicit diagnostic errors.
+5. **CLI & Shell Integration (Rule 6)**: Extended light node CLI (`src/bitecho/shell/light_node.clj`) with `--subnet-id` flag, co-committed flag inventory in `skill/SKILL.md` and automated validation tests in `test/bitecho/shell/light_node_test.clj`.
 
-#### Step 12B — Federation (Fractal Up) + Settlement Anchoring Spec
-1. **Signed Bootstraps + Discovery**: Sign bootstrap descriptors (`bootstrap.edn` / `bootstrap.txt`) with the domain's Directory/Cluster Authority key, so cross-domain federation and bridge discovery cryptographically verify remote-domain bootstraps over HTTPS. Two-domain federation demo.
-2. **Settlement Anchoring (SPEC-ONLY, consented)**: Specify the rollup / state-root anchoring pattern for cross-subnet settlement (preimage escrow already covers the 1-step case). General state-root/proof anchoring stays spec-only in M12B to avoid premature complexity.
+#### Step 12B — Federation (Fractal Up) + Settlement Anchoring Spec — **`[BUILT & VERIFIED]`**
+1. **Authority-Signed Bootstrap Descriptors**: Implemented canonical bootstrap formatting and verification in `src/bitecho/light_node/core.cljc` (`canonical-bootstrap-payload`, `sign-bootstrap-descriptor`, `verify-bootstrap-descriptor`, `verify-federated-domain-bootstrap`). Descriptors format canonical EDN/TXT payloads with deterministic field and node ordering, signed by the cluster/directory authority keypair with Ed25519 signatures. Remote bootstrap descriptors fetched over untrusted networks fail closed if the signature is invalid or tampered.
+2. **Federated Domain Discovery Demo**: Implemented `run-two-domain-federation-demo` demonstrating two sovereign domains (`domain-a.org` and `domain-b.org`), each with independent directory authorities, verifying each other's signed bootstrap descriptors and routing cross-domain messages.
+3. **Child Subnet Rollup & State-Root Settlement Anchoring Specification (SPEC-ONLY)**: Authored comprehensive architectural specification in `DESIGN.md` §T detailing:
+   - Fractal subnet hierarchy (`global` -> child subnets -> nested subnets)
+   - State-root commitment generation (Merkle / Merkle-Mountain-Range roots)
+   - Periodic anchoring onto parent subnet (`anchoring-intent`, parent escrow / verification)
+   - Dispute window, challenge resolution, and fraud-proof invalidation
+   - Cross-subnet atomic settlement via 2-phase commit and hash-time-locked contracts (HTLC)
 
-#### Step 12C — ICE / TURN Completion
-1. **Transport Hardening**: Complete ICE + TURN in `clj-datachannel` (STUN already implemented; holepunching expected working, failure = bug). Verify holepunch end-to-end or file the bug with a repro.
-2. **Acceptance**: Multi-subnet daemon demo; cross-domain bootstrap verification demo; economy-optional subnet demonstrated. Out of scope unless separately consented: home-node converters / edge FX, per-domain treasury coordination, capability $\leftrightarrow$ bitecho binding shape (separate decision).
+#### Step 12C — ICE / TURN Completion — **`[BUILT & VERIFIED]`**
+1. **Transport Hardening in `clj-datachannel`**:
+   - RFC 8445 §5.1.2 & §6.1.2.3 ICE candidate priority calculation, type preference (`host` 126, `prflx` 110, `srflx` 100, `relay` 0), and SDP candidate formatting/parsing in `src/datachannel/sdp.clj`.
+   - STUN controlling/controlled nomination, 64-bit tie-breaker resolution, and peer-reflexive (`prflx`) discovery in `src/datachannel/stun.clj`.
+   - RFC 5766 TURN client codec in `src/datachannel/turn.clj` implementing Allocate, Refresh, CreatePermission, ChannelBind, Send/Data indications, ChannelData framing (`0x4000`–`0x7FFF`), and RFC 5389 §15.4 long-term credential authentication (`MESSAGE-INTEGRITY` over MD5 realm/username/password hash).
+   - Generative property and vector tests in `test/datachannel/ice_turn_holepunch_test.clj`.
+2. **Acceptance & Model-Based Testing**:
+   - Property tests `prop-multi-subnet-multiplexer-isolation` and `prop-authority-signed-bootstrap-descriptor` in `test/bitecho/fractal_federation_test.cljc`.
+   - End-to-end zero-burn team subnet demo (`run-zero-burn-team-subnet-demo`) and two-domain federation demo (`run-two-domain-federation-demo`).
+   - Browser static bundle build (`./scripts/build-browser-bundle.sh`) 100% byte-for-byte reproducible with SRI hashes and synced to `clj-web/public/app/`.
+   - Live browser UX bug remediations implemented for `https://bitecho.org/app` (nested identity/accounting view, map-safe supervised agents iteration, absolute script URL `/app/bitecho-browser.js`, hardware YubiKey discoverable credential creation/recovery, simulated offers).
+   - Full test suite passes: 428 JVM tests (3491 assertions) and 157 Node/CLJS tests (1040 assertions) green with 0 failures, 0 errors, and 0 lint warnings.

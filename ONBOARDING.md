@@ -232,3 +232,32 @@ The browser dashboard inspects authenticator attestation (RFC 8949 CBOR parsing 
 ### Team-Call Subnets
 Human anchors collaborating in active voice or video calls can dynamically spin up ad-hoc subnets (`create-team-call-subnet` `"team-call/<topic>"`). Subnets allow teams to pool compute, share verified inference results, and settle escrow payments locally.
 
+---
+
+## 8. Subnets, Zero-Burn Topologies & Federated Domain Discovery
+
+Milestone 12 introduces fractal composition, enabling hierarchical subnets, private/zero-burn team collaboration topologies, and cross-domain federated discovery.
+
+### Subnet Identity & Shell Multiplexing
+- **Subnet Identity (`:subnet-id`)**: Envelopes and state-machine instances are tagged with `:subnet-id`. In the absence of an explicit subnet, instances default to `"global"`, maintaining 100% backward compatibility with prior versions.
+- **Single-Authority Lifecycle Multiplexing (Rule 4)**: Multi-subnet daemons and browser instances multiplex `{subnet-id -> state-machine}` over a single transport connection pool (`:conn`), preserving single-authority lifecycle state without competing atoms.
+- **Fail-Closed Mismatch & Routing Diagnostics (Rule 5)**: Envelopes targeting mismatched or unroutable subnets fail closed immediately with counted `:subnet-mismatch-dropped` and `:unroutable-dropped` diagnostic events.
+
+### Zero-Burn Subnet Topologies
+- **Economy Optionality**: Each subnet instance can independently configure its economic policy via `:economy-enabled?` (default `true`) and `:burn-floor` (default `100` ECH on global broadcast).
+- **Zero-Burn Team Subnets**: Setting `:economy-enabled? false` or `:burn-floor 0` allows private teams, workgroups, or internal agent swarms to exchange offers, rendezvous sessions, and sealed messages with **0 ECH burned**, while maintaining complete end-to-end cryptographic authentication and delivery verification.
+- **Subnet Rendezvous Advertisements**: Coordinators broadcast signed subnet advertisements specifying `:subnet-id`, `:coordinator-pubkey`, `:service-types`, and `:burn-floor`. Tampered advertisements fail closed upon cryptographic signature verification.
+
+### Federated Domain Discovery & Authority-Signed Bootstraps
+- **Cryptographic Domain Bootstrapping**: Remote federated domains publish bootstrap descriptors (`bootstrap.edn` / `bootstrap.txt`) signed with their Directory/Cluster Authority Ed25519 keypair.
+- **Tamper-Evident HTTPS Ingress**: Nodes discovering peer nodes across sovereign domains verify the remote authority's Ed25519 signature over the canonical bootstrap descriptor before establishing WebRTC DataChannels. Tampered or unsigned bootstrap descriptors are rejected fail-closed.
+- **Settlement Anchoring Architecture (Spec-Only)**: Cross-subnet atomic settlement and state-root anchoring specifications are defined in `DESIGN.md` §T, detailing Merkle Mountain Range commitments, periodic parent subnet escrow anchoring, and dispute resolution windows.
+
+### CLI Usage for Subnets
+To launch or query a light node scoped to a specific subnet:
+```bash
+./scripts/light-node.sh status --subnet-id team-alpha
+./scripts/light-node.sh serve --subnet-id team-alpha
+```
+
+

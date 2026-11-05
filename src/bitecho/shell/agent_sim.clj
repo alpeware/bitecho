@@ -19,32 +19,39 @@
 ;; ---------------------------------------------------------------------------
 
 (defn build-gossip-envelope
-  "Builds a signed Sieve gossip message with burn-amount and wraps it in an Ed25519 agent envelope."
-  [sender-pub-hex sender-priv-bytes payload-bytes burn-amount]
-  (let [sender-pub-bytes (if (bytes? sender-pub-hex)
-                           sender-pub-hex
-                           (basalt/hex->bytes sender-pub-hex))
-        pub-hex (if (string? sender-pub-hex)
-                  sender-pub-hex
-                  (basalt/bytes->hex sender-pub-hex))
-        sieve-msg (sieve/wrap-message payload-bytes sender-priv-bytes sender-pub-bytes burn-amount)
-        message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))
-        agent-event {:type :receive-gossip :message (assoc sieve-msg :message-id message-id)}]
-    (mesh/wrap-agent-event agent-event pub-hex sender-priv-bytes)))
+  "Builds a signed Sieve gossip message with burn-amount and wraps it in an Ed25519 agent envelope.
+   Includes optional :subnet-id (default 'global') on the agent event."
+  ([sender-pub-hex sender-priv-bytes payload-bytes burn-amount]
+   (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount "global"))
+  ([sender-pub-hex sender-priv-bytes payload-bytes burn-amount subnet-id]
+   (let [sender-pub-bytes (if (bytes? sender-pub-hex)
+                            sender-pub-hex
+                            (basalt/hex->bytes sender-pub-hex))
+         pub-hex (if (string? sender-pub-hex)
+                   sender-pub-hex
+                   (basalt/bytes->hex sender-pub-hex))
+         sieve-msg (sieve/wrap-message payload-bytes sender-priv-bytes sender-pub-bytes burn-amount)
+         message-id (basalt/bytes->hex (crypto/sha256 payload-bytes))
+         agent-event {:type :receive-gossip
+                      :subnet-id (str (or subnet-id "global"))
+                      :message (assoc sieve-msg :message-id message-id)}]
+     (mesh/wrap-agent-event agent-event pub-hex sender-priv-bytes))))
 
 (defn build-transfer-gossip-envelope
   "Creates a signed account Transfer, serializes it as an EDN payload, and wraps it in a gossip envelope.
    Returns {:envelope envelope :transfer signed-transfer :transfer-hash transfer-hash}."
-  [sender-pub-hex sender-priv-bytes transfer-opts burn-amount]
-  (let [unsigned (assoc transfer-opts :sender sender-pub-hex)
-        signed-transfer (account/create-transfer sender-priv-bytes unsigned)
-        transfer-map (into {} signed-transfer)
-        payload-bytes (fressian/encode-canonical {:transfer transfer-map})
-        envelope (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount)
-        thash (account/transfer-hash signed-transfer)]
-    {:envelope envelope
-     :transfer signed-transfer
-     :transfer-hash thash}))
+  ([sender-pub-hex sender-priv-bytes transfer-opts burn-amount]
+   (build-transfer-gossip-envelope sender-pub-hex sender-priv-bytes transfer-opts burn-amount "global"))
+  ([sender-pub-hex sender-priv-bytes transfer-opts burn-amount subnet-id]
+   (let [unsigned (assoc transfer-opts :sender sender-pub-hex)
+         signed-transfer (account/create-transfer sender-priv-bytes unsigned)
+         transfer-map (into {} signed-transfer)
+         payload-bytes (fressian/encode-canonical {:transfer transfer-map})
+         envelope (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount subnet-id)
+         thash (account/transfer-hash signed-transfer)]
+     {:envelope envelope
+      :transfer signed-transfer
+      :transfer-hash thash})))
 
 (defn build-home-set-envelope
   "Builds a signed agent envelope registering Rendezvous home-set candidates for callee,

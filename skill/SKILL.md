@@ -43,6 +43,7 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
   - `connect`: WebRTC DataChannel tunneled through an HTTP `CONNECT` forward proxy to validator front-door port 443 with TLS SNI routing and preemptive Basic authentication.
 - `--proxy <url>`: HTTP CONNECT proxy URL (e.g., `http://user:pass@proxy.corp.internal:8080`). If omitted when using `--transport connect`, the node checks environment variables in order: `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`.
 - `--timeout-ms <ms>`: Timeout in milliseconds when dialing validator WebRTC DataChannels (default: 8000).
+- `--subnet-id <id>`: Subnet identifier for multi-subnet isolation and routing (default: `global`).
 
 ---
 

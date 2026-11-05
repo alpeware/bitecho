@@ -6,6 +6,7 @@
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
             [bitecho.economy.treasury-test]
+            [bitecho.fractal-federation-test]
             [bitecho.fressian-test]
             [bitecho.murmur.core-test]
             [bitecho.rendezvous.core-test]
@@ -45,6 +46,7 @@
              'bitecho.economy.treasury-test
              'bitecho.shell.browser-test
              'bitecho.state-machine-portability-test
-             'bitecho.wire-negotiation-test))
+             'bitecho.wire-negotiation-test
+             'bitecho.fractal-federation-test))
 
 (set! *main-cli-fn* -main)
