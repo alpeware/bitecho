@@ -6,7 +6,8 @@
    - Browser IndexedDB persistence sanitization & roundtrip.
    - Deterministic multi-peer browser subnet demo verification."
   (:refer-clojure :exclude [bytes?])
-  (:require [bitecho.crypto :as crypto]
+  (:require #?(:cljs [bitecho.browser-main :as browser-main])
+            [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.fressian :as fressian]
             [bitecho.shell.browser :as browser]
@@ -334,21 +335,23 @@
       (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
       (is (= [{:id :c}] (vec (:nested-list sanitized))))))
 
-  (testing "4,320+ combo enumeration across 100% of forbidden-persistence-keys, 30+ credential/token/key stems, 9 casings, and 3 key types + public-key carve-out (0 survivors AND 0 false positives) + persist->load roundtrip (R4-M1)"
-    (let [extra-stems ["api-key" "api-token" "api-secret" "jwt" "jwt-token"
-                       "access-token" "refresh-token" "session-token" "auth-token" "bearer-token"
-                       "id-token" "csrf-token" "oauth-token" "token" "tokens"
-                       "bearer" "authorization" "auth-secret" "auth-key" "client-secret" "server-secret"
-                       "signing-key" "encryption-key" "decryption-key" "master-key" "hmac-key"
-                       "symmetric-key" "aes-key" "chacha-key" "wrapping-key" "derived-key"
-                       "hkdf-key" "kdf-key" "mac-key" "backup-key" "recovery-key" "identity-key"
-                       "node-key" "host-key" "peer-key" "hot-key" "cold-key" "device-key"
-                       "credential" "credentials" "cookie" "cookies" "pin" "otp" "totp"]
+  (testing "Canonicalize-then-match across 100% of forbidden-persistence-keys + 40+ disjoint independent secret stems, 9 casings (incl. compact), and 3 key types + public/innocent carve-outs (0 survivors AND 0 false positives) + persist->load roundtrip (R5-M1)"
+    (let [independent-secret-stems ["backup-code" "verification-code" "auth-code" "security-code"
+                                    "pin-code" "otp-code" "totp-code" "one-time-code"
+                                    "access-code" "secret-code" "mfa-code" "unlock-code" "pairing-code"
+                                    "wallet-key" "vault-key" "storage-key" "channel-key"
+                                    "sub-key" "data-key" "user-key" "account-key" "app-key" "service-key"
+                                    "master-kek" "data-dek" "wrap-kek"
+                                    "local-passcode" "admin-passcode" "device-passcode"
+                                    "login-secret" "vault-seed" "refresh-cookie" "bearer-jwt"
+                                    "oauth-cred" "totp-pin" "session-auth"
+                                    "ephemeral-key" "sender-key" "receiver-key" "header-key"]
           stems (vec (distinct (concat (sort browser/forbidden-persistence-keys)
-                                       extra-stems
+                                       independent-secret-stems
                                        (for [s ["private-key" "privkey" "seed" "secret-key" "session-key"
                                                 "api-key" "access-token" "session-token" "signing-key"
-                                                "x25519-privkey" "ed25519-privkey" "prf-output" "user-handle"]
+                                                "x25519-privkey" "ed25519-privkey" "prf-output" "user-handle"
+                                                "recovery-code" "session-id" "wallet-key" "passcode" "kek" "dek"]
                                              sfx ["-bytes" "-hex" "-raw" "-b64"]]
                                          (str s sfx)))))
           to-camel (fn [s]
@@ -375,7 +378,11 @@
           carve-out-stems ["pubkey" "public-key" "x25519-pubkey" "x25519-public-key"
                            "ed25519-pubkey" "ed25519-public-key" "peer-pubkey" "agent-pubkey"
                            "hot-pubkey" "anchor-pubkey" "authority-pubkey" "directory-pubkey"
-                           "caller-pubkey" "callee-pubkey" "key-mode" "keys-verified?"]
+                           "caller-pubkey" "callee-pubkey" "key-mode" "keys-verified?" "cose-key"
+                           "is-private" "passwordless" "private-notes" "seed-count" "seedling"
+                           "key-count" "status-code" "error-code" "country-code" "postal-code"
+                           "token-count" "session-count" "channel-count" "author"
+                           "authenticated?" "first-name" "evaluate" "pinned"]
           all-carve-out-keys (vec (distinct (for [stem carve-out-stems
                                                   cased (casings stem)
                                                   k [cased (keyword cased) (symbol cased)]]
@@ -387,6 +394,7 @@
           survivors (remove (set all-carve-out-keys) (keys sanitized))
           false-positives (remove #(contains? sanitized %) all-carve-out-keys)]
       (is (every? (set stems) browser/forbidden-persistence-keys))
+      (is (not-any? browser/forbidden-persistence-keys independent-secret-stems))
       (is (>= (count all-forbidden-keys) 4320))
       (is (empty? survivors) (str "Forbidden survivors found: " (pr-str (take 10 survivors))))
       (is (empty? false-positives) (str "Carve-out false positives found: " (pr-str (take 10 false-positives)))))
@@ -395,6 +403,12 @@
                            :x25519-pubkey "PUB-X25519-OK"
                            :x25519Pubkey "PUB-X25519-CAMEL-OK"
                            :public-key "PUB-ED25519-OK"
+                           :is-private false
+                           :passwordless true
+                           :private-notes "NOTE-OK"
+                           :seed-count 3
+                           :seedling "SEEDLING-OK"
+                           :key-count 2
                            :privateKeyBytes "LEAK-1"
                            :x25519Privkey "LEAK-2"
                            :x25519-private-key "LEAK-3"
@@ -402,9 +416,14 @@
                            :jwt "LEAK-5"
                            :access-token "LEAK-6"
                            :session-token "LEAK-7"
-                           :nested {:privateKeyBytes "LEAK-8"
-                                    :x25519Privkey "LEAK-9"
-                                    :api-token "LEAK-10"
+                           :passcode "LEAK-8"
+                           :kek "LEAK-9"
+                           :recovery-code "LEAK-10"
+                           :session-id "LEAK-11"
+                           :walletkey "LEAK-12"
+                           :nested {:privateKeyBytes "LEAK-13"
+                                    :x25519Privkey "LEAK-14"
+                                    :api-token "LEAK-15"
                                     :x25519-pubkey "NESTED-PUB-OK"
                                     :safe-val 99}}
           loaded-atom (atom nil)]
@@ -414,6 +433,51 @@
               :x25519-pubkey "PUB-X25519-OK"
               :x25519Pubkey "PUB-X25519-CAMEL-OK"
               :public-key "PUB-ED25519-OK"
+              :is-private false
+              :passwordless true
+              :private-notes "NOTE-OK"
+              :seed-count 3
+              :seedling "SEEDLING-OK"
+              :key-count 2
               :nested {:x25519-pubkey "NESTED-PUB-OK"
                        :safe-val 99}}
              @loaded-atom)))))
+
+#?(:cljs
+   (deftest browser-main-accept-offer-and-send-sealed-message-guards-test
+     (testing "accept-offer and send-sealed-message nil argument guards and happy path (R5-L1)"
+       (let [node-atom (browser-main/init-node {:peer-id "browser-guard-test"})
+             caller-kp (crypto/generate-keypair)
+             caller-x (sealed/generate-x25519-keypair)
+             caller-pub-hex (fressian/bytes->hex (:public-key caller-kp))
+             offer-hash "offer-hash-r5-l1"
+             sig-hex (fressian/bytes->hex (crypto/sign (:private-key caller-kp)
+                                                       (fressian/utf8->bytes offer-hash)))
+             valid-offer {:caller-pubkey caller-pub-hex
+                          :caller-x25519 (fressian/bytes->hex (:public-key caller-x))
+                          :offer-hash offer-hash
+                          :signature sig-hex
+                          :burn 100}
+             r-nil-1 (js->clj (browser-main/accept-offer nil) :keywordize-keys true)
+             r-nil-2 (js->clj (browser-main/accept-offer node-atom nil) :keywordize-keys true)
+             r-send-nil-peer-1 (js->clj (browser-main/send-sealed-message nil "hi") :keywordize-keys true)
+             r-send-nil-peer-2 (js->clj (browser-main/send-sealed-message node-atom nil "hi") :keywordize-keys true)
+             r-send-nil-msg-1 (js->clj (browser-main/send-sealed-message caller-pub-hex nil) :keywordize-keys true)
+             r-send-nil-msg-2 (js->clj (browser-main/send-sealed-message node-atom caller-pub-hex nil) :keywordize-keys true)
+             r-send-no-sess (js->clj (browser-main/send-sealed-message node-atom caller-pub-hex "hi") :keywordize-keys true)]
+         (is (= {:ok false :accepted false :error "invalid-offer"} r-nil-1))
+         (is (= {:ok false :accepted false :error "invalid-offer"} r-nil-2))
+         (is (= {:ok false :sent false :error "invalid-peer"} r-send-nil-peer-1))
+         (is (= {:ok false :sent false :error "invalid-peer"} r-send-nil-peer-2))
+         (is (= {:ok false :sent false :error "invalid-message"} r-send-nil-msg-1))
+         (is (= {:ok false :sent false :error "invalid-message"} r-send-nil-msg-2))
+         (is (= {:ok false :sent false :error "no-open-session"} r-send-no-sess))
+         (is (empty? (:sessions @node-atom)))
+         (is (empty? (:outbox @node-atom)))
+         (let [r-acc (js->clj (browser-main/accept-offer nil valid-offer) :keywordize-keys true)
+               r-send-ok (js->clj (browser-main/send-sealed-message nil caller-pub-hex "hello-r5") :keywordize-keys true)]
+           (is (true? (:ok r-acc)))
+           (is (true? (:accepted r-acc)))
+           (is (true? (:ok r-send-ok)))
+           (is (true? (:sent r-send-ok)))
+           (is (= 1 (:seq r-send-ok))))))))

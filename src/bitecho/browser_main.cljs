@@ -9,7 +9,8 @@
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.browser :as browser]
-            [bitecho.webauthn :as webauthn]))
+            [bitecho.webauthn :as webauthn]
+            [clojure.string :as str]))
 
 (defonce
   ^{:doc "Global atom holding active Human Anchor state for browser UI."}
@@ -907,41 +908,63 @@
 
 (defn send-sealed-message
   "Seals and sends a message to an active peer session."
+  ([peer-id]
+   (send-sealed-message nil peer-id nil))
   ([peer-id text]
-   (if-let [na @active-node-atom]
-     (send-sealed-message na peer-id text)
-     (clj->js {:ok false :sent false :error "no-active-node"})))
+   (cond
+     (or (nil? peer-id) (and (string? peer-id) (str/blank? peer-id)))
+     (clj->js {:ok false :sent false :error "invalid-peer"})
+
+     (nil? text)
+     (clj->js {:ok false :sent false :error "invalid-message"})
+
+     :else
+     (if-let [na @active-node-atom]
+       (send-sealed-message na peer-id text)
+       (clj->js {:ok false :sent false :error "no-active-node"}))))
   ([node-atom peer-id text]
-   (let [na (or node-atom @active-node-atom)]
-     (if-not na
-       (clj->js {:ok false :sent false :error "no-active-node"})
-       (let [node @na
-             resolved-peer (resolve-peer-target node peer-id)
-             session (or (get-in node [:sessions resolved-peer])
-                         (get-in node [:sessions peer-id]))
-             eff-peer (if (get-in node [:sessions resolved-peer]) resolved-peer peer-id)
-             session-keys (:session-keys session)
-             seq-num (inc (or (:seq session) 0))
-             plaintext (fressian/utf8->bytes (str text))
-             sealed-frame (when session-keys
-                            (sealed/seal-message session-keys seq-num plaintext "suite-v1-aes256gcm"))
-             env {:type :sealed-message
-                  :protocol-version 1
-                  :wire-format "fressian-v1"
-                  :sender (fressian/bytes->hex (:public-key (:keypair node)))
-                  :recipient eff-peer
-                  :sealed-frame sealed-frame}
-             [new-conn effects] (browser/transition-conn (:conn node)
-                                                         {:type :send :envelope env})]
-         (swap! na (fn [st]
-                     (-> st
-                         (assoc :conn new-conn)
-                         (assoc-in [:sessions eff-peer :seq] seq-num)
-                         (update :outbox conj env))))
-         (clj->js {:ok (some? sealed-frame)
-                   :sent (some? sealed-frame)
-                   :seq seq-num
-                   :effects effects}))))))
+   (cond
+     (or (nil? peer-id) (and (string? peer-id) (str/blank? peer-id)))
+     (clj->js {:ok false :sent false :error "invalid-peer"})
+
+     (nil? text)
+     (clj->js {:ok false :sent false :error "invalid-message"})
+
+     :else
+     (let [na (or (when (or (satisfies? IAtom node-atom)
+                            (and (some? node-atom) (fn? (.-deref node-atom))))
+                    node-atom)
+                  @active-node-atom)]
+       (if-not na
+         (clj->js {:ok false :sent false :error "no-active-node"})
+         (let [node @na
+               resolved-peer (resolve-peer-target node peer-id)
+               session (or (get-in node [:sessions resolved-peer])
+                           (get-in node [:sessions peer-id]))
+               eff-peer (if (get-in node [:sessions resolved-peer]) resolved-peer peer-id)
+               session-keys (:session-keys session)]
+           (if-not session-keys
+             (clj->js {:ok false :sent false :error "no-open-session"})
+             (let [seq-num (inc (or (:seq session) 0))
+                   plaintext (fressian/utf8->bytes (str text))
+                   sealed-frame (sealed/seal-message session-keys seq-num plaintext "suite-v1-aes256gcm")
+                   env {:type :sealed-message
+                        :protocol-version 1
+                        :wire-format "fressian-v1"
+                        :sender (fressian/bytes->hex (:public-key (:keypair node)))
+                        :recipient eff-peer
+                        :sealed-frame sealed-frame}
+                   [new-conn effects] (browser/transition-conn (:conn node)
+                                                               {:type :send :envelope env})]
+               (swap! na (fn [st]
+                           (-> st
+                               (assoc :conn new-conn)
+                               (assoc-in [:sessions eff-peer :seq] seq-num)
+                               (update :outbox conj env))))
+               (clj->js {:ok (some? sealed-frame)
+                         :sent (some? sealed-frame)
+                         :seq seq-num
+                         :effects effects})))))))))
 
 (defn run-subnet-demo
   "Runs the browser-only subnet demo and returns a JavaScript summary object."

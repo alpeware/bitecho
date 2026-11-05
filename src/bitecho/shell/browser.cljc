@@ -251,7 +251,7 @@
     "seed" "seed-bytes" "seed-hex" "backup-seed" "backup-seed-bytes" "backup-seed-hex"
     "secret" "secret-key" "secret-key-bytes" "secret-key-hex" "shared-secret" "shared-secret-bytes"
     "root-key" "chain-key" "send-chain-key" "recv-chain-key"
-    "skipped-keys" "session-key" "session-keys" "session-key-bytes" "ratchet-key"
+    "skipped-keys" "session-key" "session-keys" "session-key-bytes" "session-id" "ratchet-key"
     "ephemeral-private" "ephemeral-private-key" "ephemeral-priv" "ephemeral-privkey" "ephemeral-secret"
     "x25519" "x25519-priv" "x25519-privkey" "x25519-private" "x25519-private-key"
     "x25519-privkey-bytes" "x25519-private-key-bytes" "x25519-secret" "x25519-secret-key"
@@ -261,84 +261,172 @@
     "prf" "prf-output" "prf-bytes" "prf-seed" "prf-secret" "hmac-secret"
     "raw-id" "raw-id-bytes" "user-handle" "user-handle-bytes" "credential-id" "credential-id-bytes"
     "attestation-object" "client-data-json"
-    "api-key" "api-key-hex" "api-key-bytes" "api-token" "api-secret"
+    "api-key" "apikey" "api-key-hex" "api-key-bytes" "api-token" "api-secret"
     "jwt" "jwt-token" "access-token" "refresh-token" "session-token" "auth-token"
-    "bearer-token" "id-token" "csrf-token" "oauth-token" "token" "tokens"
-    "bearer" "authorization" "auth-secret" "auth-key" "client-secret" "server-secret"
+    "bearer-token" "id-token" "csrf-token" "xsrf-token" "oauth-token" "token" "tokens"
+    "bearer" "authorization" "auth-header" "auth-secret" "auth-key" "auth"
+    "client-secret" "server-secret" "app-secret" "webhook-secret" "signing-secret" "session-secret"
     "signing-key" "signing-privkey" "signing-private-key" "encryption-key" "decryption-key"
-    "master-key" "master-seed" "hmac-key" "symmetric-key" "aes-key" "chacha-key"
-    "wrapping-key" "derived-key" "hkdf-key" "kdf-key" "mac-key" "backup-key"
-    "recovery-key" "recovery-seed" "identity-key" "identity-seed" "node-key" "host-key"
+    "master-key" "master-seed" "hmac-key" "symmetric-key" "sym-key" "aes-key" "chacha-key"
+    "wrapping-key" "unwrapping-key" "derived-key" "hkdf-key" "kdf-key" "mac-key" "backup-key"
+    "recovery-key" "recovery-seed" "recovery-code" "identity-key" "identity-seed" "node-key" "host-key"
     "peer-key" "hot-key" "cold-key" "device-key" "turn-password" "turn-secret"
-    "credential" "credentials" "cookie" "cookies" "pin" "otp" "totp"
-    "mnemonic" "passphrase" "password" "first" "eval"
+    "key" "keys" "kek" "dek" "code" "codes" "passcode" "passcodes" "passkey" "passkeys"
+    "keystore" "keychain" "secret-value" "token-value"
+    "credential" "credentials" "cookie" "cookies" "pin" "otp" "totp" "hotp"
+    "mnemonic" "passphrase" "password" "passwd" "pwd" "first" "eval"
     "connected?" "connected" "connection-error" "conn-diagnostics" "conn-atom" "conn"
     "channel" "active-channels" "connections" "transport" "socket" "last-error"})
 
 (def ^:private forbidden-persistence-keys-compact
-  (into #{} (map #(str/replace % "-" "") forbidden-persistence-keys)))
+  (into #{} (map #(str/replace % #"[-?]" "") forbidden-persistence-keys)))
+
+(def ^:private encoding-suffixes
+  ["bytes" "hex" "raw" "b64" "base64" "str" "string" "buf" "buffer" "val" "value" "arr" "array" "data"])
+
+(defn- strip-encoding-suffixes
+  "Strips trailing encoding/format suffixes (e.g. -bytes, -hex, -raw, -b64) from a compact key."
+  [compact]
+  (loop [s compact]
+    (if-let [sfx (first (filter #(and (> (count s) (count %))
+                                      (str/ends-with? s %))
+                                encoding-suffixes))]
+      (recur (subs s 0 (- (count s) (count sfx))))
+      s)))
 
 (def ^:private forbidden-persistence-tokens
   #{"private" "privkey" "priv" "seed" "seeds" "secret" "secrets"
-    "mnemonic" "passphrase" "password" "passwd" "pwd" "keypair" "keypairs"
-    "prf" "eval" "jwt" "bearer" "token" "tokens" "cookie" "cookies"
-    "credential" "credentials" "pin" "otp" "totp"})
+    "mnemonic" "passphrase" "password" "passwords" "passwd" "pwd" "passcode" "passcodes"
+    "passkey" "passkeys" "keypair" "keypairs" "key" "keys" "code" "codes"
+    "kek" "dek" "mek" "tek" "psk" "msk" "sk"
+    "prf" "eval" "jwt" "jwk" "jwks" "jwe" "jws" "bearer" "token" "tokens"
+    "cookie" "cookies" "credential" "credentials" "cred" "creds"
+    "pin" "otp" "totp" "hotp" "auth" "authn" "authz" "authorization"
+    "apikey" "apitoken" "apisecret" "keystore" "keychain" "sessionid"})
+
+(def ^:private forbidden-compact-stem-endings
+  ["key" "keys" "priv" "privkey" "private" "privatekey" "secret" "secrets"
+   "seed" "seeds" "token" "tokens" "code" "codes" "password" "passwords"
+   "passwd" "pwd" "passphrase" "passcode" "passcodes" "passkey" "passkeys"
+   "mnemonic" "credential" "credentials" "cred" "creds" "cookie" "cookies"
+   "bearer" "jwt" "jwk" "jwks" "prf" "keypair" "keypairs" "sessionid"
+   "kek" "dek" "mek" "tek" "psk" "totp" "hotp" "otp" "pin"
+   "auth" "authn" "authz" "keystore" "keychain" "authorization" "authheader" "xsrf" "csrf" "oauth"])
 
 (def ^:private forbidden-persistence-compact-substrings
-  ["private" "privkey" "seed" "secret" "mnemonic" "passphrase" "password" "keypair"
+  ["private" "privkey" "secret" "seed" "mnemonic" "passphrase" "password" "passwd"
+   "passcode" "passkey" "keypair"
    "x25519priv" "x25519sec" "ed25519priv" "ed25519sec" "ed25519seed"
-   "sessionkey" "sharedsecret" "rootkey" "chainkey" "ratchetkey" "skippedkey" "txkey" "rxkey"
-   "ephemeralpriv" "coldpriv" "prfoutput" "prfbytes" "prfseed" "userhandle" "rawid"
-   "credentialid" "attestationobject" "clientdatajson" "connectionerror" "conndiagnostics"
-   "connatom" "activechannels" "lasterror"
+   "sessionkey" "sessionid" "sharedsecret" "rootkey" "chainkey" "ratchetkey" "skippedkey" "txkey" "rxkey"
+   "ephemeralpriv" "coldpriv" "prfoutput" "prfbytes" "prfseed" "prfsecret" "hmacsecret"
+   "userhandle" "rawid" "credentialid" "attestationobject" "clientdatajson"
+   "connectionerror" "conndiagnostics" "connatom" "activechannels" "lasterror"
    "apikey" "apitoken" "apisecret" "jwttoken" "accesstoken" "refreshtoken" "sessiontoken"
-   "authtoken" "bearertoken" "idtoken" "csrftoken" "oauthtoken" "authsecret" "authkey"
-   "clientsecret" "serversecret" "signingkey" "encryptionkey" "decryptionkey" "masterkey"
-   "hmackey" "symmetrickey" "aeskey" "chachakey" "wrappingkey" "derivedkey" "hkdfkey"
-   "kdfkey" "mackey" "backupkey" "recoverykey" "identitykey" "nodekey" "hostkey" "peerkey"
-   "hotkey" "coldkey" "devicekey"])
+   "authtoken" "bearertoken" "idtoken" "csrftoken" "xsrftoken" "oauthtoken"
+   "authsecret" "authkey" "authheader" "authorization"
+   "clientsecret" "serversecret" "appsecret" "webhooksecret" "signingsecret" "sessionsecret"
+   "signingkey" "encryptionkey" "decryptionkey" "masterkey" "hmackey" "symmetrickey" "symkey"
+   "aeskey" "chachakey" "wrappingkey" "unwrappingkey" "derivedkey" "hkdfkey" "kdfkey" "mackey"
+   "backupkey" "recoverykey" "recoverycode" "backupcode" "authcode" "securitycode"
+   "verificationcode" "accesscode" "pincode" "otpcode" "totpcode" "onetimecode" "secretcode"
+   "identitykey" "nodekey" "hostkey" "peerkey" "hotkey" "coldkey" "devicekey"
+   "walletkey" "userkey" "accountkey" "appkey" "servicekey" "storagekey" "vaultkey"
+   "channelkey" "datakey" "subkey" "streamkey" "messagekey" "headerkey" "senderkey"
+   "receiverkey" "ephemeralkey" "statickey" "prekey"
+   "turnpassword" "turnsecret" "keystore" "keychain" "secretvalue" "tokenvalue"])
 
-(def ^:private carved-out-public-keys
+(def ^:private carved-out-public-and-innocent-keys
   #{"pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
     "pubkey-hex" "public-key-hex" "pubkey-bytes" "public-key-bytes"
-    "key-mode" "keys-verified?" "keys-verified" "cose-key"})
+    "x25519-pubkey" "x25519-public-key" "ed25519-pubkey" "ed25519-public-key"
+    "ephemeral-pub" "caller-ephemeral-pub" "callee-ephemeral-pub" "spki" "cose-key" "cose-pubkey"
+    "key-mode" "keys-verified?" "keys-verified" "key-count" "keys-count"
+    "key-type" "key-types" "key-id" "key-ids" "key-algorithm" "key-algo"
+    "key-length" "key-size" "key-bits" "key-format" "key-usage" "key-ops"
+    "key-version" "key-index" "key-name" "key-label" "key-path" "key-uri" "key-url"
+    "key-status" "key-state" "key-created-at" "key-expires-at" "key-expired?" "key-rotated-at"
+    "key-fingerprint" "key-hash" "primary-key" "foreign-key" "sort-key" "partition-key"
+    "routing-key" "cache-key" "lookup-key" "keyboard" "keyboards" "keycode" "keycodes"
+    "key-code" "key-codes" "keydown" "keyup" "keypress" "keystroke" "keystrokes"
+    "keybinding" "keybindings" "keymap" "keyword" "keywords" "keyframe" "keyframes"
+    "keynote" "keystone" "keyhole"
+    "is-private" "private-notes" "private-mode" "private-browsing"
+    "private-channel?" "private-group?" "privacy" "privacy-policy" "privacy-mode"
+    "passwordless" "password-required?" "password-policy" "password-strength"
+    "password-updated-at" "password-reset-sent?" "password-hint"
+    "seed-count" "seed-nodes" "seed-peers" "seed-url" "seed-urls" "seed-list"
+    "seed-epoch" "seedling" "seedlings" "seeded?" "is-seeded"
+    "token-count" "tokens-count" "token-supply" "token-balance" "token-symbol"
+    "token-decimals" "token-name" "token-type" "tokenomics" "tokenize" "tokenizer" "tokenized"
+    "status-code" "error-code" "country-code" "postal-code" "zip-code" "area-code"
+    "language-code" "lang-code" "currency-code" "http-code" "response-code"
+    "exit-code" "return-code" "reason-code" "color-code" "qr-code" "bar-code" "barcode"
+    "op-code" "opcode" "byte-code" "bytecode" "hash-code" "hashcode" "char-code" "charcode"
+    "source-code" "code-version" "code-hash" "code-size" "code-path" "code-line" "code-block"
+    "codebase" "codec" "codecs" "coder" "encoder" "decoder" "encode" "decode" "unicode"
+    "author" "authors" "authored" "authority" "authorities" "authorized?" "is-authorized"
+    "authenticated?" "is-authenticated" "auth-mode" "auth-method" "auth-type"
+    "auth-status" "auth-provider" "auth-level" "auth-retries" "auth-count"
+    "sessions" "session-count" "sessions-count" "session-state" "session-status"
+    "session-role" "session-epoch" "session-timeout" "session-duration"
+    "session-created-at" "session-expires-at" "session-active?" "is-session-active"
+    "channel-count" "channels-count" "channel-id" "channel-name" "channel-type"
+    "channel-state" "channel-status" "channel-capacity" "channel-balance"
+    "first-name" "first-seen" "first-epoch" "first-block" "first-item" "first-index" "first-page"
+    "eval-count" "evaluate" "evaluation" "evaluator"
+    "pin-count" "pinned" "pinned?" "is-pinned"})
 
-(defn- public-key-carve-out?
-  "Returns true if canonical key `canon` (and its compact form and token vector) represents
-   a public key or non-secret key metadata field (e.g., :pubkey, :public-key, :x25519-pubkey,
-   :ed25519-public-key, :peer-pubkey, :key-mode, :keys-verified?) that must never be stripped."
-  [canon compact tokens]
-  (or (contains? carved-out-public-keys canon)
-      (and (not-any? #(contains? forbidden-persistence-tokens %) tokens)
+(def ^:private carved-out-public-and-innocent-keys-compact
+  (into #{} (map #(str/replace % #"[-?]" "") carved-out-public-and-innocent-keys)))
+
+(def ^:private secret-modifier-tokens
+  (disj forbidden-persistence-tokens "key" "keys"))
+
+(defn- public-or-innocent-carve-out?
+  "Returns true if canonical key `canon` (and its compact form, suffix-stripped compact-stem,
+   and token vector) represents a public key or innocent non-secret metadata field
+   (e.g., :pubkey, :public-key, :x25519-pubkey, :key-mode, :keys-verified?, :is-private,
+   :passwordless, :private-notes, :seed-count, :seedling, :key-count, :status-code)
+   that must never be stripped."
+  [canon compact compact-stem tokens]
+  (or (contains? carved-out-public-and-innocent-keys canon)
+      (contains? carved-out-public-and-innocent-keys-compact compact)
+      (contains? carved-out-public-and-innocent-keys-compact compact-stem)
+      (and (not-any? #(contains? secret-modifier-tokens %) tokens)
            (not-any? #(str/includes? compact %)
-                     ["private" "privkey" "secret" "seed" "password" "passphrase"
-                      "mnemonic" "token" "jwt" "bearer" "cookie"])
+                     ["private" "privkey" "secret" "seed" "password" "passphrase" "passcode"
+                      "mnemonic" "token" "jwt" "bearer" "cookie" "kek" "dek"])
            (or (some #{"pubkey" "pubkeys"} tokens)
                (and (some #{"public"} tokens) (some #{"key" "keys"} tokens))
+               (str/ends-with? compact-stem "pubkey")
+               (str/ends-with? compact-stem "pubkeys")
+               (str/ends-with? compact-stem "publickey")
+               (str/ends-with? compact-stem "publickeys")
                (str/ends-with? compact "pubkey")
                (str/ends-with? compact "pubkeys")
                (str/ends-with? compact "publickey")
-               (str/ends-with? compact "publickeys")
-               (str/ends-with? compact "pubkeyhex")
-               (str/ends-with? compact "publickeyhex")
-               (str/ends-with? compact "pubkeybytes")
-               (str/ends-with? compact "publickeybytes")))))
+               (str/ends-with? compact "publickeys")))))
 
 (defn forbidden-persistence-key?
   "Returns true if key k (in any case: camelCase, PascalCase, snake_case, UPPER_SNAKE, kebab-case,
    compact lowercase, keyword, string, or symbol, with any prefix/suffix) is a sensitive credential,
    private key material, or derived transport/lifecycle state, while preserving carved-out public-key
-   identifiers (e.g. :pubkey, :public-key, :x25519-pubkey)."
+   and innocent metadata identifiers (e.g. :pubkey, :public-key, :x25519-pubkey, :is-private,
+   :passwordless, :private-notes, :seed-count, :seedling, :key-count)."
   [k]
   (boolean
    (when-let [canon (canonical-key-name k)]
      (let [compact (str/replace canon #"[-?]" "")
+           compact-stem (strip-encoding-suffixes compact)
            tokens (str/split (str/replace canon "?" "") #"-")]
-       (and (not (public-key-carve-out? canon compact tokens))
+       (and (not (public-or-innocent-carve-out? canon compact compact-stem tokens))
             (or (contains? forbidden-persistence-keys canon)
                 (contains? forbidden-persistence-keys-compact compact)
+                (contains? forbidden-persistence-keys-compact compact-stem)
                 (some #(contains? forbidden-persistence-tokens %) tokens)
-                (and (>= (count tokens) 2) (some #{"key" "keys"} tokens))
+                (some #(or (str/ends-with? compact-stem %)
+                           (str/ends-with? compact %))
+                      forbidden-compact-stem-endings)
                 (some #(str/includes? compact %) forbidden-persistence-compact-substrings)))))))
 
 (defn sanitize-state-for-persistence
