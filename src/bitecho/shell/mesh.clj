@@ -1352,8 +1352,11 @@
    (create-peer-datachannel-node local-port setup cert-data local-ice local-fp nil))
   ([local-port setup cert-data local-ice local-fp turn-config]
    (let [opts (cond-> {:port local-port :setup setup}
-                turn-config (assoc :turn-config turn-config
-                                   :use-turn-relay? (boolean (:force-relay? turn-config))))
+                turn-config (assoc :turn-config turn-config)
+                (and turn-config (some? (:use-turn-relay? turn-config)))
+                (assoc :use-turn-relay? (boolean (:use-turn-relay? turn-config)))
+                (and turn-config (nil? (:use-turn-relay? turn-config)) (true? (:force-relay? turn-config)))
+                (assoc :use-turn-relay? true))
          local-sdp-params {:port local-port
                            :ice-ufrag (:ufrag local-ice)
                            :ice-pwd (:pwd local-ice)

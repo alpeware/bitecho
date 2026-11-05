@@ -413,9 +413,13 @@
                                               :cert-data (:cert-data identity)
                                               :ice-creds query-ice-creds
                                               :setup "active"}
-                                       turn-cfg (assoc :turn-config turn-cfg
-                                                       :use-turn-relay? (boolean (or (:use-turn-relay? opts)
-                                                                                     (:force-relay? turn-cfg))))))
+                                       turn-cfg (assoc :turn-config turn-cfg)
+                                       (some? (:use-turn-relay? opts))
+                                       (assoc :use-turn-relay? (boolean (:use-turn-relay? opts)))
+                                       (and (nil? (:use-turn-relay? opts)) (some? (:use-turn-relay? turn-cfg)))
+                                       (assoc :use-turn-relay? (boolean (:use-turn-relay? turn-cfg)))
+                                       (and (nil? (:use-turn-relay? opts)) (nil? (:use-turn-relay? turn-cfg)) (true? (:force-relay? turn-cfg)))
+                                       (assoc :use-turn-relay? true)))
         snapshot-promise (promise)
         nonce (or (:nonce opts) (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID)))
         transport (or (:transport opts) :datachannel)
@@ -993,9 +997,13 @@
                                               :cert-data (:cert-data identity)
                                               :ice-creds (:ice-creds identity)
                                               :setup "active"}
-                                       turn-cfg (assoc :turn-config turn-cfg
-                                                       :use-turn-relay? (boolean (or (:use-turn-relay? opts)
-                                                                                     (:force-relay? turn-cfg))))))
+                                       turn-cfg (assoc :turn-config turn-cfg)
+                                       (some? (:use-turn-relay? opts))
+                                       (assoc :use-turn-relay? (boolean (:use-turn-relay? opts)))
+                                       (and (nil? (:use-turn-relay? opts)) (some? (:use-turn-relay? turn-cfg)))
+                                       (assoc :use-turn-relay? (boolean (:use-turn-relay? turn-cfg)))
+                                       (and (nil? (:use-turn-relay? opts)) (nil? (:use-turn-relay? turn-cfg)) (true? (:force-relay? turn-cfg)))
+                                       (assoc :use-turn-relay? true)))
         channel-id (atom nil)
         connected? (promise)
         send-fn-atom (atom nil)

@@ -375,7 +375,7 @@ cat <<EOF > dist/index.html
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
         <div style="background: #141418; padding: 12px; border-radius: 6px; border: 1px solid #24242e;">
           <div class="field-label">Balance</div>
-          <div style="font-size: 1.4rem; font-weight: 700; color: #fff;" id="balanceDisplay">10,000 ECH</div>
+          <div style="font-size: 1.4rem; font-weight: 700; color: #fff;" id="balanceDisplay">0 ECH</div>
         </div>
         <div style="background: #141418; padding: 12px; border-radius: 6px; border: 1px solid #24242e;">
           <div class="field-label">Total Burned</div>
@@ -536,7 +536,7 @@ cat <<EOF > dist/index.html
 
         const balanceEl = document.getElementById("balanceDisplay");
         if (balanceEl) {
-          const bal = acct.balance ?? dash.balance ?? 10000;
+          const bal = acct.balance ?? dash.balance ?? 0;
           balanceEl.textContent = Number(bal).toLocaleString() + " ECH";
         }
 
@@ -645,6 +645,10 @@ cat <<EOF > dist/index.html
 
       function renderChatAndSessions(status) {
         if (!status) return;
+        const balanceEl = document.getElementById("balanceDisplay");
+        if (balanceEl && status.balance != null) {
+          balanceEl.textContent = Number(status.balance).toLocaleString() + " ECH";
+        }
 
         // 1. Mesh Connection Status
         if (meshStatusBadge) {

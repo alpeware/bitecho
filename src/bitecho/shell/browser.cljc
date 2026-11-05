@@ -234,37 +234,64 @@
 ;; =============================================================================
 
 (defn canonical-key-name
-  "Converts camelCase, snake_case, or kebab-case keyword/string/symbol to lowercase kebab-case."
+  "Converts camelCase, PascalCase, snake_case, dot.case, or kebab-case keyword/string/symbol
+   to lowercase kebab-case."
   [k]
   (when (or (keyword? k) (string? k) (symbol? k))
     (-> (name k)
         (str/replace #"([a-z0-9])([A-Z])" "$1-$2")
         (str/replace #"([A-Z]+)([A-Z][a-z])" "$1-$2")
-        (str/replace "_" "-")
+        (str/replace #"[_./\s]+" "-")
         str/lower-case)))
 
 (def forbidden-persistence-keys
   "Set of sensitive credential, key material, and derived lifecycle keys in canonical lowercase kebab-case."
-  #{"private" "private-key" "private-key-hex" "privkey" "privkey-bytes" "seed" "seed-bytes" "seed-hex"
-    "secret" "secret-key" "shared-secret" "root-key" "chain-key" "send-chain-key" "recv-chain-key"
-    "skipped-keys" "session-keys" "ratchet-key" "ephemeral-private" "prf-output" "raw-id"
-    "user-handle" "backup-seed" "mnemonic" "first" "eval"
-    "cold-privkey" "keypair" "x25519" "tx-key" "rx-key" "ephemeral-priv" "ephemeral-privkey"
-    "connected?" "connection-error" "conn-diagnostics" "conn-atom" "conn"
+  #{"private" "private-key" "private-key-bytes" "private-key-hex"
+    "privkey" "privkey-bytes" "privkey-hex"
+    "seed" "seed-bytes" "seed-hex" "backup-seed" "backup-seed-bytes" "backup-seed-hex"
+    "secret" "secret-key" "secret-key-bytes" "secret-key-hex" "shared-secret" "shared-secret-bytes"
+    "root-key" "chain-key" "send-chain-key" "recv-chain-key"
+    "skipped-keys" "session-key" "session-keys" "session-key-bytes" "ratchet-key"
+    "ephemeral-private" "ephemeral-private-key" "ephemeral-priv" "ephemeral-privkey" "ephemeral-secret"
+    "x25519" "x25519-priv" "x25519-privkey" "x25519-private" "x25519-private-key"
+    "x25519-privkey-bytes" "x25519-private-key-bytes" "x25519-secret" "x25519-secret-key"
+    "ed25519-priv" "ed25519-privkey" "ed25519-private" "ed25519-private-key"
+    "ed25519-privkey-bytes" "ed25519-private-key-bytes" "ed25519-seed" "ed25519-secret"
+    "cold-privkey" "cold-private-key" "cold-seed" "keypair" "tx-key" "rx-key"
+    "prf" "prf-output" "prf-bytes" "prf-seed" "prf-secret" "hmac-secret"
+    "raw-id" "raw-id-bytes" "user-handle" "user-handle-bytes" "credential-id" "credential-id-bytes"
+    "attestation-object" "client-data-json"
+    "mnemonic" "passphrase" "password" "first" "eval"
+    "connected?" "connected" "connection-error" "conn-diagnostics" "conn-atom" "conn"
     "channel" "active-channels" "connections" "transport" "socket" "last-error"})
 
 (def ^:private forbidden-persistence-keys-compact
   (into #{} (map #(str/replace % "-" "") forbidden-persistence-keys)))
 
+(def ^:private forbidden-persistence-tokens
+  #{"private" "privkey" "priv" "seed" "seeds" "secret" "secrets"
+    "mnemonic" "passphrase" "password" "keypair" "keypairs" "x25519" "prf" "eval"})
+
+(def ^:private forbidden-persistence-compact-substrings
+  ["private" "privkey" "seed" "secret" "mnemonic" "passphrase" "password" "keypair" "x25519"
+   "sessionkey" "sharedsecret" "rootkey" "chainkey" "ratchetkey" "skippedkey" "txkey" "rxkey"
+   "ephemeralpriv" "coldpriv" "prfoutput" "prfbytes" "prfseed" "userhandle" "rawid"
+   "credentialid" "attestationobject" "clientdatajson" "connectionerror" "conndiagnostics"
+   "connatom" "activechannels" "lasterror"])
+
 (defn forbidden-persistence-key?
   "Returns true if key k (in any case: camelCase, PascalCase, snake_case, UPPER_SNAKE, kebab-case,
-   compact lowercase, keyword, or string) is a sensitive credential, private key material, or derived
-   transport/lifecycle state."
+   compact lowercase, keyword, string, or symbol, with any prefix/suffix) is a sensitive credential,
+   private key material, or derived transport/lifecycle state."
   [k]
   (boolean
    (when-let [canon (canonical-key-name k)]
-     (or (contains? forbidden-persistence-keys canon)
-         (contains? forbidden-persistence-keys-compact (str/replace canon "-" ""))))))
+     (let [compact (str/replace canon #"[-?]" "")
+           tokens (str/split (str/replace canon "?" "") #"-")]
+       (or (contains? forbidden-persistence-keys canon)
+           (contains? forbidden-persistence-keys-compact compact)
+           (some #(contains? forbidden-persistence-tokens %) tokens)
+           (some #(str/includes? compact %) forbidden-persistence-compact-substrings))))))
 
 (defn sanitize-state-for-persistence
   "Sanitizes browser/light-node state recursively before storage in IndexedDB/disk.

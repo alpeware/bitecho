@@ -16,6 +16,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [datachannel.api :as api]
+            [datachannel.core :as dc-core]
             [taoensso.nippy :as nippy])
   (:import [java.io PrintWriter StringWriter]
            [java.net ServerSocket Socket]
@@ -1924,4 +1925,20 @@
         (finally
           (run! #(try (.delete ^java.io.File %) (catch Exception _ nil))
                 (reverse (file-seq (io/file state-dir)))))))))
+
+(deftest test-turn-relay-default-enabled-when-turn-config-configured
+  (testing "--turn-server without --turn-force-relay enables :use-turn-relay? by default across light-node and mesh call sites (R3-M2)"
+    (let [parsed (light-shell/parse-light-node-args ["serve" "--turn-server" "198.51.100.10:3478" "--turn-username" "u" "--turn-password" "p"])
+          tc (:turn-config parsed)
+          peer-node (mesh/create-peer-datachannel-node 0 "active" nil {:ufrag "u" :pwd "p"} "AA:BB" tc)
+          dc-conn (dc-core/create-connection (:opts peer-node) true)
+          explicit-off-conn (dc-core/create-connection
+                             (:opts (mesh/create-peer-datachannel-node 0 "active" nil {:ufrag "u" :pwd "p"} "AA:BB"
+                                                                       (assoc tc :use-turn-relay? false)))
+                             true)]
+      (is (some? tc))
+      (is (false? (:force-relay? tc)))
+      (is (not (contains? (:opts peer-node) :use-turn-relay?)))
+      (is (true? (:use-turn-relay? dc-conn)))
+      (is (false? (:use-turn-relay? explicit-off-conn))))))
 

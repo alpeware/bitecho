@@ -215,14 +215,14 @@
                         (when (string? seed-or-opts) seed-or-opts)
                         (when (sequential? seed-or-opts) seed-or-opts))
         recovered (cond
-                    (some? prf-out)
-                    (webauthn/derive-identity-from-prf prf-out)
-
                     (some? user-handle)
                     (webauthn/recover-seed-from-assertion
                      (if (map? opts-map)
                        (assoc opts-map :user-handle user-handle)
                        {:user-handle user-handle}))
+
+                    (some? prf-out)
+                    (webauthn/derive-identity-from-prf prf-out)
 
                     (and existing-ident (:public-hex existing-ident) (:address existing-ident))
                     existing-ident
@@ -390,6 +390,8 @@
                  :subnetId (:subnet-id node)
                  :pubkey (when-let [kp (:keypair node)] (fressian/bytes->hex (:public-key kp)))
                  :epoch (or (:epoch light-st) 0)
+                 :balance (or (get-in light-st [:account :balance]) (:balance light-st) 0)
+                 :spendable (or (get-in light-st [:account :spendable]) (:spendable light-st) 0)
                  :phase (name (or (:phase conn) :idle))
                  :generation (or (:generation conn) 0)
                  :visibilityState (or (:visibility-state conn) "visible")
@@ -535,6 +537,8 @@
                                    (handle-inbound-wire-envelope! node-atom env))})))
        (notify-ui-listeners!)
        (clj->js {:ok true
+                 :connected false
+                 :dialing true
                  :status "connecting"
                  :targetNode "node1"
                  :ip (:ip node1)
@@ -751,20 +755,28 @@
              (resolve (clj->js (redact-for-js (or loaded {}))))))))))))
 
 (defn connect
-  "Initiates dialing transition on the node's connection state and executes effects."
-  [node-atom opts]
-  (let [opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
-        target-url (or (:target-url opts-map) (:targetUrl opts-map) "rtc://default")
-        [new-conn effects] (browser/transition-conn (:conn @node-atom)
-                                                    {:type :dial :target-url target-url})]
-    (swap! node-atom assoc :conn new-conn)
-    (doseq [eff effects]
-      (case (:type eff)
-        :diagnose nil
-        :close-transport (when-let [t (:transport eff)] (try (.close t) (catch :default _ nil)))
-        nil))
-    (clj->js {:conn (get-status node-atom)
-              :effects effects})))
+  "Initiates dialing transition on the node's connection state and executes effects.
+   When called with 0 arguments or an options object (without node-atom), delegates to connect-mesh."
+  ([] (connect-mesh nil))
+  ([arg1]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (connect arg1 nil)
+     (connect-mesh arg1)))
+  ([node-atom opts]
+   (let [na (or node-atom @active-node-atom)
+         opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
+         target-url (or (:target-url opts-map) (:targetUrl opts-map) "rtc://default")
+         [new-conn effects] (browser/transition-conn (:conn @na)
+                                                     {:type :dial :target-url target-url})]
+     (swap! na assoc :conn new-conn)
+     (doseq [eff effects]
+       (case (:type eff)
+         :diagnose nil
+         :close-transport (when-let [t (:transport eff)] (try (.close t) (catch :default _ nil)))
+         nil))
+     (clj->js {:conn (get-status na)
+               :effects effects}))))
 
 (defn create-offer
   "Creates a cryptographically signed rendezvous/channel offer descriptor conforming to Phase 1 wire format.
@@ -851,59 +863,73 @@
 
 (defn accept-offer
   "Explicitly accepts an incoming offer after validating its cryptographic signature."
-  [node-atom offer]
-  (let [offer-map (if (map? offer) offer (js->clj offer :keywordize-keys true))
-        caller-pub (or (:caller-pubkey offer-map) (:caller offer-map))
-        caller-x25519 (or (when-let [x (:caller-x25519 offer-map)] (fressian/hex->bytes x))
-                          (when-let [x (:caller-ephemeral-pub offer-map)] (fressian/hex->bytes x)))
-        offer-hash (:offer-hash offer-map)
-        sig-hex (:signature offer-map)
-        sig-valid? (and (string? caller-pub) (string? offer-hash) (string? sig-hex)
-                        (crypto/verify (basalt/hex->bytes caller-pub)
-                                       (fressian/utf8->bytes offer-hash)
-                                       (basalt/hex->bytes sig-hex)))]
-    (if-not sig-valid?
-      (clj->js {:accepted false :error "invalid-offer-signature"})
-      (let [my-x25519 (:x25519 @node-atom)
-            shared-secret (sealed/x25519-shared-secret (:private-key my-x25519) caller-x25519)
-            session-keys (sealed/derive-channel-keys shared-secret "bitecho-browser-session-salt" :responder)
-            burn (long (or (:burn offer-map) (:burn-amount offer-map) 50))]
-        (swap! node-atom (fn [st]
-                           (-> st
-                               (assoc-in [:sessions caller-pub] {:session-keys session-keys
-                                                                 :suite "suite-v1-aes256gcm"
-                                                                 :seq 0})
-                               (update :burned-ech (fnil + 0) burn))))
-        (clj->js {:accepted true
-                  :peerId caller-pub
-                  :suite "suite-v1-aes256gcm"})))))
+  ([offer] (accept-offer @active-node-atom offer))
+  ([node-atom offer]
+   (let [na (or (when (or (satisfies? IAtom node-atom)
+                          (and (some? node-atom) (fn? (.-deref node-atom))))
+                  node-atom)
+                @active-node-atom)
+         eff-offer (if (or (satisfies? IAtom node-atom)
+                           (and (some? node-atom) (fn? (.-deref node-atom))))
+                     offer
+                     node-atom)
+         offer-map (if (map? eff-offer) eff-offer (js->clj eff-offer :keywordize-keys true))
+         caller-pub (or (:caller-pubkey offer-map) (:caller offer-map))
+         caller-x25519 (or (when-let [x (:caller-x25519 offer-map)] (fressian/hex->bytes x))
+                           (when-let [x (:caller-ephemeral-pub offer-map)] (fressian/hex->bytes x)))
+         offer-hash (:offer-hash offer-map)
+         sig-hex (:signature offer-map)
+         sig-valid? (and (string? caller-pub) (string? offer-hash) (string? sig-hex)
+                         (crypto/verify (basalt/hex->bytes caller-pub)
+                                        (fressian/utf8->bytes offer-hash)
+                                        (basalt/hex->bytes sig-hex)))]
+     (if-not sig-valid?
+       (clj->js {:accepted false :error "invalid-offer-signature"})
+       (let [my-x25519 (:x25519 @na)
+             shared-secret (sealed/x25519-shared-secret (:private-key my-x25519) caller-x25519)
+             session-keys (sealed/derive-channel-keys shared-secret "bitecho-browser-session-salt" :responder)
+             burn (long (or (:burn offer-map) (:burn-amount offer-map) 50))]
+         (swap! na (fn [st]
+                     (-> st
+                         (assoc-in [:sessions caller-pub] {:session-keys session-keys
+                                                           :suite "suite-v1-aes256gcm"
+                                                           :seq 0})
+                         (update :burned-ech (fnil + 0) burn))))
+         (clj->js {:accepted true
+                   :peerId caller-pub
+                   :suite "suite-v1-aes256gcm"}))))))
 
 (defn send-sealed-message
   "Seals and sends a message to an active peer session."
-  [node-atom peer-id text]
-  (let [node @node-atom
-        session (get-in node [:sessions peer-id])
-        session-keys (:session-keys session)
-        seq-num (inc (or (:seq session) 0))
-        plaintext (fressian/utf8->bytes text)
-        sealed-frame (when session-keys
-                       (sealed/seal-message session-keys seq-num plaintext "suite-v1-aes256gcm"))
-        env {:type :sealed-message
-             :protocol-version 1
-             :wire-format "fressian-v1"
-             :sender (fressian/bytes->hex (:public-key (:keypair node)))
-             :recipient peer-id
-             :sealed-frame sealed-frame}
-        [new-conn effects] (browser/transition-conn (:conn node)
-                                                    {:type :send :envelope env})]
-    (swap! node-atom (fn [st]
-                       (-> st
-                           (assoc :conn new-conn)
-                           (assoc-in [:sessions peer-id :seq] seq-num)
-                           (update :outbox conj env))))
-    (clj->js {:sent (some? sealed-frame)
-              :seq seq-num
-              :effects effects})))
+  ([peer-id text] (send-sealed-message @active-node-atom peer-id text))
+  ([node-atom peer-id text]
+   (let [na (or node-atom @active-node-atom)
+         node @na
+         resolved-peer (resolve-peer-target node peer-id)
+         session (or (get-in node [:sessions resolved-peer])
+                     (get-in node [:sessions peer-id]))
+         eff-peer (if (get-in node [:sessions resolved-peer]) resolved-peer peer-id)
+         session-keys (:session-keys session)
+         seq-num (inc (or (:seq session) 0))
+         plaintext (fressian/utf8->bytes text)
+         sealed-frame (when session-keys
+                        (sealed/seal-message session-keys seq-num plaintext "suite-v1-aes256gcm"))
+         env {:type :sealed-message
+              :protocol-version 1
+              :wire-format "fressian-v1"
+              :sender (fressian/bytes->hex (:public-key (:keypair node)))
+              :recipient eff-peer
+              :sealed-frame sealed-frame}
+         [new-conn effects] (browser/transition-conn (:conn node)
+                                                     {:type :send :envelope env})]
+     (swap! na (fn [st]
+                 (-> st
+                     (assoc :conn new-conn)
+                     (assoc-in [:sessions eff-peer :seq] seq-num)
+                     (update :outbox conj env))))
+     (clj->js {:sent (some? sealed-frame)
+               :seq seq-num
+               :effects effects}))))
 
 (defn run-subnet-demo
   "Runs the browser-only subnet demo and returns a JavaScript summary object."

@@ -10,6 +10,7 @@
             [bitecho.crypto.sealed :as sealed]
             [bitecho.fressian :as fressian]
             [bitecho.shell.browser :as browser]
+            [clojure.string :as str]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
@@ -331,4 +332,61 @@
       (is (= {:keep-me 42} (:nested-map sanitized)))
       (is (= [{:val 1} {:val 2}] (:nested-vec sanitized)))
       (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
-      (is (= [{:id :c}] (vec (:nested-list sanitized)))))))
+      (is (= [{:id :c}] (vec (:nested-list sanitized))))))
+
+  (testing "1,377+ combo enumeration across all 51+ stems, 9 casings, and 3 key types + persist->load roundtrip (R3-M1)"
+    (let [stems ["private" "private-key" "private-key-bytes" "private-key-hex"
+                 "privkey" "privkey-bytes" "privkey-hex"
+                 "seed" "seed-bytes" "seed-hex" "backup-seed"
+                 "secret" "secret-key" "secret-key-bytes" "shared-secret"
+                 "root-key" "chain-key" "send-chain-key" "recv-chain-key"
+                 "skipped-keys" "session-key" "session-keys" "ratchet-key"
+                 "ephemeral-private" "ephemeral-private-key" "ephemeral-priv" "ephemeral-privkey"
+                 "x25519" "x25519-priv" "x25519-privkey" "x25519-private" "x25519-private-key"
+                 "x25519-privkey-bytes" "x25519-private-key-bytes" "x25519-secret"
+                 "ed25519-privkey" "ed25519-private-key" "ed25519-seed"
+                 "cold-privkey" "cold-private-key" "keypair" "tx-key" "rx-key"
+                 "prf" "prf-output" "raw-id" "user-handle" "credential-id"
+                 "attestation-object" "client-data-json"
+                 "mnemonic" "passphrase" "password" "first" "eval"
+                 "connected?" "connection-error" "conn-diagnostics" "conn-atom" "conn"
+                 "channel" "active-channels" "connections" "transport" "socket" "last-error"]
+          to-camel (fn [s]
+                     (let [parts (str/split s #"-")]
+                       (apply str (first parts) (map str/capitalize (rest parts)))))
+          to-pascal (fn [s]
+                      (apply str (map str/capitalize (str/split s #"-"))))
+          to-title-snake (fn [s]
+                           (str/join "_" (map str/capitalize (str/split s #"-"))))
+          casings (fn [s]
+                    [s
+                     (str/replace s "-" "_")
+                     (to-camel s)
+                     (to-pascal s)
+                     (str/upper-case (str/replace s "-" "_"))
+                     (str/upper-case s)
+                     (str/replace s "-" "")
+                     (str/replace s "-" ".")
+                     (to-title-snake s)])
+          all-keys (for [stem stems
+                         cased (casings stem)
+                         k [cased (keyword cased) (symbol cased)]]
+                     k)
+          test-map (into {:safe-pubkey "pub-ok"} (map (fn [k] [k "SENSITIVE"]) all-keys))
+          sanitized (browser/sanitize-state-for-persistence test-map)
+          survivors (dissoc sanitized :safe-pubkey)]
+      (is (>= (count all-keys) 1377))
+      (is (empty? survivors) (str "Survivors found: " (pr-str (take 10 (keys survivors)))))
+      (is (= {:safe-pubkey "pub-ok"} sanitized)))
+
+    (let [roundtrip-input {:peer-id "rt-node"
+                           :privateKeyBytes "LEAK-1"
+                           :x25519Privkey "LEAK-2"
+                           :x25519-private-key "LEAK-3"
+                           :nested {:privateKeyBytes "LEAK-4"
+                                    :x25519Privkey "LEAK-5"
+                                    :safe-val 99}}
+          loaded-atom (atom nil)]
+      (browser/persist-state! roundtrip-input nil)
+      (browser/load-persisted-state (fn [_err st] (reset! loaded-atom st)))
+      (is (= {:peer-id "rt-node" :nested {:safe-val 99}} @loaded-atom)))))
