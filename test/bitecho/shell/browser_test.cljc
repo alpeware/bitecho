@@ -335,10 +335,22 @@
       (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
       (is (= [{:id :c}] (vec (:nested-list sanitized))))))
 
-  (testing "Canonicalize-then-match across 100% of forbidden-persistence-keys + 55+ disjoint independent secret stems, 9 casings (incl. compact), and 3 key types + 100% of public/innocent carve-outs (0 survivors AND 0 false positives) + persist->load roundtrip (R6-M1)"
-    (let [independent-secret-stems ["backup-code" "verification-code" "auth-code" "security-code"
+  (testing "Structural default-deny persistence (allowed-persistence-key?) + canonicalize-then-match denylist across 100% of forbidden-persistence-keys + 115+ disjoint independent secret stems, 10 casings (incl. compact & prefixed/suffixed), and 3 key types + 100% independently-enumerated public/innocent carve-outs (0 survivors AND 0 false positives) + persist->load roundtrip (R7-M1)"
+    (let [independent-secret-stems ["refresh-code" "email-code" "backup-code" "verification-code" "auth-code" "security-code"
                                     "pin-code" "otp-code" "totp-code" "one-time-code"
                                     "access-code" "secret-code" "mfa-code" "unlock-code" "pairing-code"
+                                    "exchange-code" "grant-code" "claim-code" "redeem-code" "redemption-code"
+                                    "transfer-code" "withdrawal-code" "payment-code" "transaction-code" "tx-code"
+                                    "approval-code" "release-code" "escrow-code" "voucher-code" "magic-code"
+                                    "link-code" "temp-code" "reauth-code" "stepup-code" "second-factor-code" "client-code" "server-code"
+                                    "key-backup" "key-wrap" "key-escrow" "key-share" "key-shard"
+                                    "key-export" "key-import" "key-dump" "key-blob" "key-buffer"
+                                    "key-payload" "key-record" "key-entry" "key-secret" "key-seed"
+                                    "private-key-id" "secret-key-id" "passkey-id" "privkey-id" "seed-key-id" "token-key-id" "auth-key-id"
+                                    "passkey-rotation" "private-key-rotation" "secret-key-rotation" "privkey-rotation" "session-key-rotation" "master-key-rotation"
+                                    "private-key-path" "secret-key-path" "passkey-path" "privkey-path" "seed-key-path"
+                                    "private-key-version" "secret-key-version" "passkey-version" "privkey-version"
+                                    "private-key-name" "secret-key-name" "passkey-name"
                                     "wallet-key" "vault-key" "storage-key" "channel-key"
                                     "sub-key" "data-key" "user-key" "account-key" "app-key" "service-key"
                                     "master-kek" "data-dek" "wrap-kek"
@@ -349,16 +361,25 @@
                                     "credential-handle" "auth-handle" "secret-handle" "key-handle" "token-handle"
                                     "master-xprv" "hd-tprv" "wallet-wif"
                                     "login-phrase" "security-phrase" "twelve-words" "twenty-four-words"
-                                    "hash-pepper" "key-derivation-path" "seed-path" "wallet-pkcs8" "cert-pkcs12"]
+                                    "hash-pepper" "key-derivation-path" "seed-path" "wallet-pkcs8" "cert-pkcs12"
+                                    "user-otpauth-url" "totp-otpauth-uri" "tls-session-ticket" "sim-puk" "user-puk-code"
+                                    "gcp-service-account-json" "app-dotenv" "local-env-file" "user-brainwallet" "btc-paperwallet"
+                                    "seed-recovery-sentence" "encrypted-backup-file" "master-wordlist"
+                                    "user-pk" "peer-sk" "login-pw" "admin-pass" "card-cvv" "user-ssn" "github-pat" "kerberos-tgt"
+                                    "keybackup" "keywrap" "keyescrow" "refreshcode" "emailcode" "privatekeyid" "secretkeyid" "passkeyrotation"]
           stems (vec (distinct (concat (sort browser/forbidden-persistence-keys)
                                        independent-secret-stems
                                        (for [s ["private-key" "privkey" "seed" "secret-key" "session-key"
                                                 "api-key" "access-token" "session-token" "signing-key"
                                                 "x25519-privkey" "ed25519-privkey" "prf-output" "user-handle"
-                                                "recovery-code" "session-id" "session-handle" "wallet-key"
+                                                "recovery-code" "refresh-code" "email-code" "session-id" "session-handle" "session-ticket"
+                                                "wallet-key" "key-backup" "key-file" "key-wrap" "key-escrow"
+                                                "private-key-id" "secret-key-id" "passkey-rotation"
+                                                "otpauth-url" "puk" "service-account-json" "dotenv" "env-file"
+                                                "brainwallet" "recovery-sentence" "backup-file"
                                                 "passcode" "kek" "dek" "entropy" "xprv" "tprv" "wif"
                                                 "recovery-phrase" "backup-phrase" "recovery-words"
-                                                "pk" "pw" "pass" "pepper" "derivation-path" "pkcs8" "pkcs12"]
+                                                "pk" "sk" "pw" "pass" "pepper" "derivation-path" "pkcs8" "pkcs12"]
                                              sfx ["-bytes" "-hex" "-raw" "-b64"]]
                                          (str s sfx)))))
           to-camel (fn [s]
@@ -376,30 +397,86 @@
                      (str/upper-case (str/replace s "-" "_"))
                      (str/upper-case s)
                      (str/replace s "-" "")
+                     (str/upper-case (str/replace s "-" ""))
                      (str/replace s "-" ".")
                      (to-title-snake s)])
-          all-forbidden-keys (for [stem stems
-                                   cased (casings stem)
-                                   k [cased (keyword cased) (symbol cased)]]
-                               k)
+          all-forbidden-keys (vec (distinct (for [stem stems
+                                                  cased (casings stem)
+                                                  k [cased (keyword cased) (symbol cased)]]
+                                              k)))
+          independent-carve-out-stems
+          ["pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
+           "pubkey-hex" "public-key-hex" "pubkey-bytes" "public-key-bytes"
+           "x25519-pubkey" "x25519-public-key" "ed25519-pubkey" "ed25519-public-key"
+           "ephemeral-pub" "caller-ephemeral-pub" "callee-ephemeral-pub" "spki" "cose-key" "cose-pubkey"
+           "key-mode" "keys-verified?" "keys-verified" "key-count" "keys-count"
+           "key-type" "key-types" "key-id" "key-ids" "api-key-id" "api-key-ids"
+           "session-key-id" "signing-key-id" "encryption-key-id" "master-key-id" "public-key-id"
+           "key-rotation" "key-rotations" "key-rotation-epoch" "key-rotation-interval" "key-rotation-period"
+           "key-schedule" "key-policy" "key-ceremony" "key-holder" "key-owner" "key-age" "key-ttl" "key-epoch"
+           "key-algorithm" "key-algo"
+           "key-length" "key-size" "key-bits" "key-format" "key-usage" "key-ops"
+           "key-version" "key-index" "key-name" "key-label" "key-path" "key-uri" "key-url"
+           "key-status" "key-state" "key-created-at" "key-expires-at" "key-expired?" "key-rotated-at"
+           "key-fingerprint" "key-hash" "primary-key" "foreign-key" "sort-key" "partition-key"
+           "routing-key" "cache-key" "lookup-key"
+           "keychain" "keychains" "keyring" "keyrings" "keyboard" "keyboards" "keypad" "keypads"
+           "keycode" "keycodes"
+           "key-code" "key-codes" "keydown" "keyup" "keypress" "keystroke" "keystrokes"
+           "keybinding" "keybindings" "keymap" "keyword" "keywords" "keyframe" "keyframes"
+           "keynote" "keystone" "keyhole"
+           "monkey" "monkeys" "turkey" "turkeys" "donkey" "donkeys" "hockey" "jockey" "whiskey" "turnkey"
+           "is-private" "private-notes" "private-mode" "private-browsing"
+           "private-channel?" "private-group?" "privacy" "privacy-policy" "privacy-mode"
+           "passwordless" "password-required?" "password-policy" "password-strength"
+           "password-updated-at" "password-reset-sent?"
+           "seed-count" "seed-nodes" "seed-peers" "seed-url" "seed-urls" "seed-list"
+           "seed-epoch" "seedling" "seedlings" "seeded?" "is-seeded"
+           "token-count" "tokens-count" "token-supply" "token-balance" "token-symbol"
+           "token-decimals" "token-name" "token-type" "tokenomics" "tokenize" "tokenizer" "tokenized"
+           "status-code" "error-code" "country-code" "postal-code" "zip-code" "area-code"
+           "language-code" "lang-code" "currency-code" "http-code" "response-code"
+           "exit-code" "return-code" "reason-code" "color-code" "qr-code" "bar-code" "barcode"
+           "op-code" "opcode" "byte-code" "bytecode" "hash-code" "hashcode" "char-code" "charcode"
+           "discount-code" "coupon-code" "promo-code" "promotion-code" "referral-code" "product-code" "tracking-code"
+           "morse-code" "morsecode" "short-code" "shortcode" "time-code" "timecode" "micro-code" "microcode" "pseudo-code" "pseudocode"
+           "source-code" "code-version" "code-hash" "code-size" "code-path" "code-line" "code-block"
+           "codebase" "codec" "codecs" "coder" "encoder" "decoder" "encode" "decode" "unicode"
+           "author" "authors" "authored" "authority" "authorities" "authorized?" "is-authorized"
+           "authenticated?" "is-authenticated" "auth-mode" "auth-method" "auth-type"
+           "auth-status" "auth-provider" "auth-level" "auth-retries" "auth-count"
+           "sessions" "session-count" "sessions-count" "session-state" "session-status"
+           "session-role" "session-epoch" "session-timeout" "session-duration"
+           "session-created-at" "session-expires-at" "session-active?" "is-session-active"
+           "channel-count" "channels-count" "channel-id" "channel-name" "channel-type"
+           "channel-state" "channel-status" "channel-capacity" "channel-balance"
+           "first-name" "first-seen" "first-epoch" "first-block" "first-item" "first-index" "first-page"
+           "eval-count" "evaluate" "evaluation" "evaluator"
+           "pin-count" "pinned" "pinned?" "is-pinned"]
           extra-carve-out-stems ["peer-pubkey" "agent-pubkey" "hot-pubkey" "anchor-pubkey"
                                  "authority-pubkey" "directory-pubkey" "caller-pubkey" "callee-pubkey"]
-          carve-out-stems (vec (distinct (concat (sort browser/carved-out-public-and-innocent-keys)
+          carve-out-stems (vec (distinct (concat independent-carve-out-stems
                                                  extra-carve-out-stems)))
           all-carve-out-keys (vec (distinct (for [stem carve-out-stems
                                                   cased (casings stem)
                                                   k [cased (keyword cased) (symbol cased)]]
                                               k)))
+          unlisted-default-deny-keys [:kennwort :mot-de-passe :contrasena :cle-privee :wachtwoord
+                                      :passw0rd :s3cr3t :unlisted-custom-credential]
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
+                                 (map (fn [k] [k "UNLISTED"]) unlisted-default-deny-keys)
                                  (map (fn [k] [k "PUBLIC-OK"]) all-carve-out-keys)))
           sanitized (browser/sanitize-state-for-persistence test-map)
           survivors (remove (set all-carve-out-keys) (keys sanitized))
+          denylist-misses (remove browser/explicitly-forbidden-persistence-key? all-forbidden-keys)
           false-positives (remove #(contains? sanitized %) all-carve-out-keys)]
+      (is (= (set independent-carve-out-stems) browser/carved-out-public-and-innocent-keys))
       (is (every? (set stems) browser/forbidden-persistence-keys))
-      (is (every? (set carve-out-stems) browser/carved-out-public-and-innocent-keys))
       (is (not-any? browser/forbidden-persistence-keys independent-secret-stems))
-      (is (>= (count all-forbidden-keys) 4320))
+      (is (>= (count all-forbidden-keys) 16800))
+      (is (empty? denylist-misses) (str "Denylist misses found: " (pr-str (take 10 denylist-misses))))
+      (is (every? #(false? (browser/allowed-persistence-key? %)) unlisted-default-deny-keys))
       (is (empty? survivors) (str "Forbidden survivors found: " (pr-str (take 10 survivors))))
       (is (empty? false-positives) (str "Carve-out false positives found: " (pr-str (take 10 false-positives)))))
 
@@ -451,10 +528,28 @@
                            :pkcs8 "LEAK-26"
                            :pkcs12 "LEAK-27"
                            :password-hint "LEAK-28"
-                           :nested {:privateKeyBytes "LEAK-29"
-                                    :x25519Privkey "LEAK-30"
-                                    :api-token "LEAK-31"
-                                    :session-handle "LEAK-32"
+                           :refresh-code "LEAK-29"
+                           :email-code "LEAK-30"
+                           :private-key-id "LEAK-31"
+                           :secret-key-id "LEAK-32"
+                           :passkey-rotation "LEAK-33"
+                           :key-backup "LEAK-34"
+                           :otpauth-url "LEAK-35"
+                           :session-ticket "LEAK-36"
+                           :puk "LEAK-37"
+                           :service-account-json "LEAK-38"
+                           :dotenv "LEAK-39"
+                           :brainwallet "LEAK-40"
+                           :recovery-sentence "LEAK-41"
+                           :backup-file "LEAK-42"
+                           :nested {:privateKeyBytes "LEAK-43"
+                                    :x25519Privkey "LEAK-44"
+                                    :api-token "LEAK-45"
+                                    :session-handle "LEAK-46"
+                                    :refresh-code "LEAK-47"
+                                    :key-backup "LEAK-48"
+                                    :private-key-id "LEAK-49"
+                                    :otpauth-url "LEAK-50"
                                     :x25519-pubkey "NESTED-PUB-OK"
                                     :safe-val 99}}
           loaded-atom (atom nil)]

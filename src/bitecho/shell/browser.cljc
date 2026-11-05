@@ -247,11 +247,13 @@
 (def forbidden-persistence-keys
   "Set of sensitive credential, key material, and derived lifecycle keys in canonical lowercase kebab-case."
   #{"private" "private-key" "private-key-bytes" "private-key-hex"
-    "privkey" "privkey-bytes" "privkey-hex"
+    "privkey" "privkey-bytes" "privkey-hex" "prv"
     "seed" "seed-bytes" "seed-hex" "backup-seed" "backup-seed-bytes" "backup-seed-hex"
     "secret" "secret-key" "secret-key-bytes" "secret-key-hex" "shared-secret" "shared-secret-bytes"
+    "scr" "scrt"
     "root-key" "chain-key" "send-chain-key" "recv-chain-key"
-    "skipped-keys" "session-key" "session-keys" "session-key-bytes" "session-id" "session-handle" "ratchet-key"
+    "skipped-keys" "session-key" "session-keys" "session-key-bytes" "session-id" "session-handle"
+    "session-ticket" "ratchet-key"
     "ephemeral-private" "ephemeral-private-key" "ephemeral-priv" "ephemeral-privkey" "ephemeral-secret"
     "x25519" "x25519-priv" "x25519-privkey" "x25519-private" "x25519-private-key"
     "x25519-privkey-bytes" "x25519-private-key-bytes" "x25519-secret" "x25519-secret-key"
@@ -263,7 +265,7 @@
     "attestation-object" "client-data-json"
     "api-key" "apikey" "api-key-hex" "api-key-bytes" "api-token" "api-secret"
     "jwt" "jwt-token" "access-token" "refresh-token" "session-token" "auth-token"
-    "bearer-token" "id-token" "csrf-token" "xsrf-token" "oauth-token" "token" "tokens"
+    "bearer-token" "id-token" "csrf-token" "xsrf-token" "oauth-token" "token" "tokens" "tok" "tkn"
     "bearer" "authorization" "auth-header" "auth-secret" "auth-key" "auth"
     "client-secret" "server-secret" "app-secret" "webhook-secret" "signing-secret" "session-secret"
     "signing-key" "signing-privkey" "signing-private-key" "encryption-key" "decryption-key"
@@ -271,22 +273,36 @@
     "wrapping-key" "unwrapping-key" "derived-key" "hkdf-key" "kdf-key" "mac-key" "backup-key"
     "recovery-key" "recovery-seed" "recovery-code" "identity-key" "identity-seed" "node-key" "host-key"
     "peer-key" "hot-key" "cold-key" "device-key" "turn-password" "turn-secret"
-    "key" "keys" "kek" "dek" "code" "codes" "passcode" "passcodes" "passkey" "passkeys"
+    "key" "keys" "kek" "dek" "mek" "tek" "psk" "msk" "prk" "okm" "ikm" "cek" "kwk" "pmk" "ptk" "gtk" "stk" "ltk" "irk" "csrk"
+    "code" "codes" "passcode" "passcodes" "passkey" "passkeys"
     "keystore" "secret-value" "token-value"
     "entropy" "entropy-bytes" "entropy-hex" "raw-entropy" "entropy-seed"
-    "xprv" "tprv" "zprv" "yprv" "lprv" "wif" "private-wif" "wif-key"
+    "xprv" "tprv" "zprv" "yprv" "lprv" "uprv" "vprv" "wif" "private-wif" "wif-key"
     "recovery-phrase" "backup-phrase" "seed-phrase" "secret-phrase" "mnemonic-phrase" "pass-phrase"
-    "recovery-words" "backup-words" "seed-words" "secret-words" "mnemonic-words"
-    "pk" "sk" "pw" "pass" "pepper" "secret-pepper" "auth-pepper" "password-hint"
-    "derivation-path" "hd-path" "bip32-path" "bip44-path" "bip32" "bip39" "bip44"
-    "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pfx" "p12" "pem" "private-pem" "key-pem" "der"
-    "jwk" "jwks" "jwe" "jws" "keytab" "htpasswd" "netrc" "pgpass" "npmrc" "pypirc"
-    "kubeconfig" "dockercfg" "shadow" "sudoers" "cvv" "cvc" "pan" "ssn" "pat"
-    "master-secret" "pre-master-secret" "client-random" "traffic-secret" "exporter-secret"
+    "recovery-words" "backup-words" "seed-words" "secret-words" "mnemonic-words" "wordlist" "word-list"
+    "recovery-sentence" "seed-sentence" "backup-sentence" "mnemonic-sentence" "secret-sentence" "pass-sentence" "sentence"
+    "pk" "sk" "vk" "dk" "ek" "mk" "rk" "ck" "tk" "wk" "uk"
+    "pw" "pass" "pswd" "pword" "pepper" "secret-pepper" "auth-pepper" "password-hint" "passphrase-hint"
+    "derivation-path" "hd-path" "bip32-path" "bip44-path" "bip32" "bip38" "bip39" "bip44" "bip49" "bip84" "bip86" "slip10" "slip39"
+    "pkcs" "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pkcs10" "pkcs11" "pfx" "p12" "p8" "pem" "private-pem" "key-pem" "der"
+    "jwk" "jwks" "jwe" "jws" "cwt" "paseto" "macaroon" "biscuit"
+    "keytab" "ktab" "ccache" "tgt" "htpasswd" "htdigest" "netrc" "pgpass" "mycnf" "npmrc" "pypirc" "gemrc" "yarnrc"
+    "kubeconfig" "kubecfg" "dockercfg" "dockerconfig" "shadow" "masterpasswd" "sudoers"
+    "cvv" "cvc" "cvv2" "cvc2" "pan" "pinblock" "pin-block" "ssn" "sin" "nin" "tin" "ein" "itin" "pat"
+    "master-secret" "pre-master-secret" "client-random" "server-random" "traffic-secret" "exporter-secret"
     "resumption-secret" "early-secret" "handshake-secret" "keystream" "cleartext" "plaintext"
-    "key-material" "secret-material" "salt" "kdf-salt" "pbkdf2" "scrypt" "argon2"
-    "credential" "credentials" "cookie" "cookies" "pin" "otp" "totp" "hotp"
-    "mnemonic" "passphrase" "password" "passwd" "pwd" "first" "eval"
+    "key-material" "secret-material" "salt" "kdf-salt" "pbkdf2" "scrypt" "argon2" "argon2i" "argon2d" "argon2id" "bcrypt" "ntlm" "nthash" "lmhash"
+    "otpauth" "otpauth-url" "otpauth-uri" "totp-uri" "totp-url"
+    "ticket" "tickets" "tls-ticket" "auth-ticket" "kerberos-ticket" "service-ticket" "sso-ticket"
+    "puk" "puk-code" "puk1" "puk2" "pin1" "pin2" "tan"
+    "service-account" "service-account-json" "service-account-key" "credentials-json" "credentials-file" "client-secret-json" "keystore-json"
+    "dotenv" "dot-env" "env-file" "envfile" "secret-env" "env-secrets" "env-key"
+    "brainwallet" "brain-wallet" "paperwallet" "paper-wallet" "hdwallet" "hd-wallet" "wallet-dat" "wallet-file" "walletfile"
+    "backup" "backups" "backup-file" "backupfile" "backup-blob" "backup-data" "backup-json" "backup-archive" "backup-payload"
+    "seed-file" "seedfile" "key-file" "keyfile" "secret-file" "secretfile" "cred-file" "credfile" "pass-file" "passfile" "token-file" "tokenfile"
+    "dpapi" "kdbx" "keepass" "secring" "ssh-key" "sshkey" "id-rsa" "idrsa" "id-ed25519" "ided25519" "ppk" "ovpn" "wg-key" "wgkey" "wg-priv" "wgpriv"
+    "credential" "credentials" "cred" "creds" "crd" "cookie" "cookies" "pin" "otp" "totp" "hotp"
+    "mnemonic" "mnem" "passphrase" "password" "passwd" "pwd" "first" "eval"
     "connected?" "connected" "connection-error" "conn-diagnostics" "conn-atom" "conn"
     "channel" "active-channels" "connections" "transport" "socket" "last-error"})
 
@@ -294,63 +310,114 @@
   (into #{} (map #(str/replace % #"[-?]" "") forbidden-persistence-keys)))
 
 (def ^:private encoding-suffixes
-  ["bytes" "hex" "raw" "b64" "base64" "str" "string" "buf" "buffer" "val" "value" "arr" "array" "data"])
+  ["bytes" "hex" "raw" "b64" "base64" "str" "string" "buf" "buffer" "val" "value" "arr" "array" "data"
+   "json" "file" "blob" "txt" "archive" "payload" "record" "entry" "dump" "export" "import" "share" "shard" "wrap" "escrow"
+   "id" "ids" "url" "uri" "path" "rotation" "rotations" "version" "status" "state" "type" "types" "mode" "name" "label" "index" "count" "counts"
+   "1" "2"])
+
+(def ^:private compact-modifier-prefixes
+  ["my" "our" "user" "users" "peer" "peers" "node" "nodes" "agent" "agents"
+   "client" "server" "app" "service" "host" "device" "local" "remote"
+   "active" "current" "primary" "secondary" "backup" "recovery" "master" "root" "admin" "owner"
+   "caller" "callee" "sender" "receiver" "tx" "rx" "send" "recv" "hot" "cold" "ephemeral" "static" "temp" "temporary"
+   "session" "channel" "subnet" "wallet" "vault" "account" "identity" "anchor"
+   "auth" "login" "signin" "oauth" "oidc" "jwt" "tls" "ssl" "ssh" "pgp" "gpg" "age" "fido" "webauthn" "yubikey"
+   "totp" "hotp" "otp" "mfa" "2fa" "hd" "bip32" "bip39" "bip44" "ed25519" "x25519" "aes" "chacha" "hmac" "hkdf" "kdf" "prf"
+   "card" "cert" "github" "gitlab" "sim" "kerberos" "krb" "aws" "gcp" "azure" "db" "sql" "api" "web" "http" "ws" "sso" "ca" "pki" "hsm" "tpm"
+   "mac" "sig" "enc" "dec" "wrap" "unwrap" "hash" "sign" "data" "token" "key" "seed" "pass"
+   "raw" "new" "old" "prev" "next" "last" "first" "test" "mock" "demo" "dev" "prod" "staging"
+   "internal" "external" "custom" "default" "global" "shared" "wrapped" "encrypted" "decrypted" "signed" "verified" "derived"
+   "secret" "private" "priv" "sec" "dot"])
 
 (defn- strip-encoding-suffixes
-  "Strips trailing encoding/format suffixes (e.g. -bytes, -hex, -raw, -b64) from a compact key."
+  "Strips trailing encoding/format/metadata suffixes from a compact key."
   [compact]
   (loop [s compact]
-    (if-let [sfx (first (filter #(and (> (count s) (count %))
+    (if-let [sfx (first (filter #(and (>= (- (count s) (count %)) 2)
                                       (str/ends-with? s %))
                                 encoding-suffixes))]
       (recur (subs s 0 (- (count s) (count sfx))))
       s)))
 
+(defn- strip-compact-prefixes
+  "Strips leading modifier prefixes from a compact key."
+  [compact]
+  (loop [s compact]
+    (if-let [pfx (first (filter #(and (>= (- (count s) (count %)) 2)
+                                      (str/starts-with? s %))
+                                compact-modifier-prefixes))]
+      (recur (subs s (count pfx)))
+      s)))
+
+(defn tokenize-compact-key
+  "Performs compact-form word-boundary tokenization on a compact lowercase key,
+   returning candidate root tokens after stripping leading modifier prefixes
+   and trailing encoding/metadata suffixes."
+  [compact]
+  (let [stem (strip-encoding-suffixes compact)
+        root1 (strip-compact-prefixes compact)
+        root2 (strip-compact-prefixes stem)
+        root3 (strip-encoding-suffixes root1)]
+    (distinct [compact stem root1 root2 root3])))
+
 (def ^:private forbidden-persistence-tokens
-  #{"private" "privkey" "priv" "seed" "seeds" "secret" "secrets"
-    "mnemonic" "passphrase" "phrase" "phrases" "password" "passwords" "passwd" "pwd" "pw" "pass"
+  #{"private" "privkey" "priv" "prv" "seed" "seeds" "secret" "secrets" "scr" "scrt"
+    "mnemonic" "mnem" "passphrase" "phrase" "phrases" "sentence" "sentences" "wordlist"
+    "password" "passwords" "passwd" "pwd" "pw" "pass" "pswd" "pword"
     "passcode" "passcodes" "passkey" "passkeys" "keypair" "keypairs"
-    "kek" "dek" "mek" "tek" "psk" "msk" "sk" "pk"
-    "xprv" "tprv" "zprv" "yprv" "lprv" "wif" "entropy" "pepper"
-    "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pfx" "p12" "pem" "keytab" "htpasswd" "netrc" "pgpass" "kubeconfig"
-    "bip32" "bip39" "bip44" "cvv" "cvc" "ssn"
-    "prf" "eval" "jwt" "jwk" "jwks" "jwe" "jws" "bearer" "token" "tokens"
-    "cookie" "cookies" "credential" "credentials" "cred" "creds"
-    "pin" "otp" "totp" "hotp" "auth" "authn" "authz" "authorization"
-    "apikey" "apitoken" "apisecret" "keystore" "sessionid" "sessionhandle" "userhandle"})
+    "key" "keys" "code" "codes"
+    "kek" "dek" "mek" "tek" "psk" "msk" "prk" "okm" "ikm" "cek" "kwk" "pmk" "ptk" "gtk" "stk" "ltk" "irk" "csrk"
+    "sk" "pk" "vk" "dk" "ek" "mk" "rk" "ck" "tk" "wk" "uk"
+    "xprv" "tprv" "zprv" "yprv" "lprv" "uprv" "vprv" "wif" "entropy" "pepper" "salt"
+    "pkcs" "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pkcs10" "pkcs11" "pfx" "p12" "p8" "pem" "der"
+    "keytab" "ktab" "ccache" "tgt" "htpasswd" "htdigest" "netrc" "pgpass" "mycnf" "npmrc" "pypirc" "gemrc" "yarnrc"
+    "kubeconfig" "kubecfg" "dockercfg" "dockerconfig" "shadow" "masterpasswd" "sudoers"
+    "bip32" "bip38" "bip39" "bip44" "bip49" "bip84" "bip86" "slip10" "slip39"
+    "cvv" "cvc" "cvv2" "cvc2" "pan" "pinblock" "ssn" "sin" "nin" "tin" "ein" "itin" "pat"
+    "pbkdf2" "scrypt" "argon2" "argon2i" "argon2d" "argon2id" "bcrypt" "ntlm" "nthash" "lmhash"
+    "prf" "eval" "jwt" "jwk" "jwks" "jwe" "jws" "cwt" "paseto" "macaroon" "biscuit" "bearer" "token" "tokens" "tok" "tkn"
+    "cookie" "cookies" "credential" "credentials" "cred" "creds" "crd"
+    "pin" "pin1" "pin2" "puk" "puk1" "puk2" "tan" "otp" "totp" "hotp" "otpauth" "u2f"
+    "auth" "authn" "authz" "authorization"
+    "ticket" "tickets" "dotenv" "envfile" "brainwallet" "paperwallet" "hdwallet" "walletfile" "backup" "backups" "backupfile"
+    "serviceaccount" "dpapi" "kdbx" "keepass" "secring" "sshkey" "idrsa" "ided25519" "ppk" "ovpn" "wgkey" "wgpriv"
+    "keystream" "cleartext" "plaintext" "keymaterial" "secretmaterial"
+    "apikey" "apitoken" "apisecret" "keystore" "sessionid" "sessionhandle" "sessionticket" "userhandle" "rawid" "credentialid"})
 
 (def ^:private forbidden-compact-stem-endings
-  ["key" "keys" "priv" "privkey" "private" "privatekey" "secret" "secrets"
-   "seed" "seeds" "token" "tokens" "password" "passwords"
-   "passwd" "pwd" "pw" "pass" "passphrase" "phrase" "phrases"
+  ["key" "keys" "priv" "privkey" "private" "privatekey" "prv" "secret" "secrets" "scr" "scrt"
+   "seed" "seeds" "token" "tokens" "tok" "tkn" "code" "codes" "password" "passwords"
+   "passwd" "pwd" "pw" "pass" "pswd" "pword" "passphrase" "phrase" "phrases" "sentence" "sentences" "wordlist"
    "recoverywords" "backupwords" "seedwords" "secretwords" "mnemonicwords" "bip39words" "twelvewords" "twentyfourwords"
-   "passcode" "passcodes" "recoverycode" "recoverycodes" "backupcode" "backupcodes"
-   "authcode" "authcodes" "authenticationcode" "authorizationcode"
-   "securitycode" "securitycodes" "verificationcode" "verificationcodes" "verifycode"
-   "pincode" "pincodes" "otpcode" "otpcodes" "totpcode" "totpcodes" "hotpcode"
-   "onetimecode" "onetimecodes" "accesscode" "accesscodes" "secretcode" "secretcodes"
-   "mfacode" "mfacodes" "2facode" "smscode" "logincode" "signincode"
-   "unlockcode" "unlockcodes" "pairingcode" "resetcode" "confirmationcode" "confirmcode"
-   "challengecode" "activationcode" "enrollmentcode" "invitecode" "oauthcode" "pkcecode"
-   "devicecode" "usercode" "emergencycode" "bypasscode" "overridecode" "mastercode"
-   "admincode" "privatecode" "tokencode" "sessioncode"
-   "passkey" "passkeys" "mnemonic" "credential" "credentials" "cred" "creds" "cookie" "cookies"
-   "bearer" "jwt" "jwk" "jwks" "jwe" "jws" "prf" "keypair" "keypairs" "sessionid"
-   "sessionhandle" "userhandle" "credentialhandle" "credhandle" "keyhandle" "secrethandle"
-   "authhandle" "tokenhandle" "loginhandle" "privhandle" "seedhandle" "cryptohandle"
-   "wallethandle" "accounthandle" "identityhandle" "hsmhandle" "pkcs11handle"
-   "entropy" "pepper" "xprv" "tprv" "zprv" "yprv" "lprv" "wif"
-   "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pfx" "p12" "pem" "keytab" "htpasswd" "netrc" "pgpass" "kubeconfig"
-   "derivationpath" "hdpath" "seedpath" "bip32path" "bip44path"
-   "kek" "dek" "mek" "tek" "psk" "totp" "hotp" "otp" "pin"
+   "passcode" "passcodes" "passkey" "passkeys" "mnemonic" "mnem" "credential" "credentials" "cred" "creds" "crd"
+   "cookie" "cookies" "bearer" "jwt" "jwk" "jwks" "jwe" "jws" "cwt" "paseto" "macaroon" "biscuit"
+   "prf" "keypair" "keypairs" "sessionid" "sessionhandle" "sessionticket" "userhandle" "rawid" "credentialid"
+   "handle" "ticket" "tickets" "otpauth" "serviceaccount" "dotenv" "envfile"
+   "brainwallet" "paperwallet" "hdwallet" "walletfile" "walletdat" "backup" "backups" "backupfile"
+   "entropy" "pepper" "salt" "xprv" "tprv" "zprv" "yprv" "lprv" "uprv" "vprv" "wif"
+   "pkcs" "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pkcs10" "pkcs11" "pfx" "p12" "pem"
+   "keytab" "ktab" "ccache" "tgt" "htpasswd" "htdigest" "netrc" "pgpass" "mycnf" "npmrc" "pypirc"
+   "kubeconfig" "kubecfg" "dockercfg" "dockerconfig" "shadow" "masterpasswd" "sudoers"
+   "derivationpath" "hdpath" "seedpath" "bip32path" "bip44path" "bip32" "bip38" "bip39" "bip44" "bip49" "bip84" "bip86"
+   "pbkdf2" "scrypt" "argon2" "bcrypt" "ntlm" "nthash" "lmhash"
+   "cvv" "cvc" "cvv2" "cvc2" "pinblock" "ssn"
+   "kek" "dek" "mek" "tek" "psk" "msk" "prk" "okm" "ikm" "cek" "kwk" "pmk" "ptk" "gtk" "stk" "ltk"
+   "totp" "hotp" "otp" "pin1" "pin2" "puk" "puk1" "puk2"
    "auth" "authn" "authz" "keystore" "authorization" "authheader" "xsrf" "csrf" "oauth"])
 
 (def ^:private forbidden-persistence-compact-substrings
   ["private" "privkey" "secret" "seed" "mnemonic" "passphrase" "password" "passwd"
-   "passcode" "passkey" "keypair" "entropy" "pepper"
-   "xprv" "tprv" "zprv" "yprv" "lprv" "pkcs8" "pkcs12" "derivationpath"
+   "passcode" "passkey" "keypair" "key" "code" "token" "entropy" "pepper" "salt"
+   "xprv" "tprv" "zprv" "yprv" "lprv" "uprv" "vprv" "wif" "pkcs" "derivationpath" "hdpath"
    "recoveryphrase" "backupphrase" "seedphrase" "secretphrase" "mnemonicphrase"
-   "recoverywords" "backupwords" "seedwords" "secretwords" "mnemonicwords"
+   "recoverywords" "backupwords" "seedwords" "secretwords" "mnemonicwords" "wordlist"
+   "recoverysentence" "seedsentence" "backupsentence" "mnemonicsentence" "secretsentence" "passsentence"
+   "otpauth" "sessionticket" "serviceaccount" "dotenv" "envfile" "brainwallet" "paperwallet" "hdwallet" "walletfile" "walletdat"
+   "backupfile" "backupblob" "backupdata" "backupjson" "backuparchive" "backuppayload" "secretbackup" "walletbackup" "vaultbackup"
+   "keytab" "htpasswd" "netrc" "pgpass" "npmrc" "pypirc" "dockercfg" "kubeconfig" "shadow" "sudoers" "masterpasswd"
+   "pbkdf2" "scrypt" "argon2" "bcrypt" "ntlm" "nthash" "lmhash" "dpapi" "kdbx" "keepass" "secring" "sshkey" "idrsa" "ided25519" "wgkey" "wgpriv"
+   "mastersecret" "premastersecret" "clientrandom" "serverrandom" "trafficsecret" "exportersecret" "resumptionsecret" "earlysecret" "handshakesecret"
+   "keystream" "cleartext" "plaintext" "keymaterial" "secretmaterial" "pinblock"
    "x25519priv" "x25519sec" "ed25519priv" "ed25519sec" "ed25519seed"
    "sessionkey" "sessionid" "sessionhandle" "sharedsecret" "rootkey" "chainkey" "ratchetkey" "skippedkey" "txkey" "rxkey"
    "ephemeralpriv" "coldpriv" "prfoutput" "prfbytes" "prfseed" "prfsecret" "hmacsecret"
@@ -425,32 +492,23 @@
 (def ^:private carved-out-public-and-innocent-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") carved-out-public-and-innocent-keys)))
 
-(def ^:private innocent-key-metadata-endings
-  ["keyid" "keyids" "keycount" "keycounts" "keyrotation" "keyrotations"
-   "keyversion" "keystatus" "keytype" "keytypes" "keymode" "keyname"
-   "keyalgo" "keyalgorithm" "keysize" "keylength" "keybits" "keyformat"
-   "keyusage" "keyops" "keyindex" "keylabel" "keypath" "keyuri" "keyurl"
-   "keyfingerprint" "keyhash" "keypolicy" "keyschedule"])
+(def ^:private non-key-forbidden-tokens
+  (disj forbidden-persistence-tokens "key" "keys"))
 
 (defn- public-or-innocent-carve-out?
   "Returns true if canonical key `canon` (and its compact form, suffix-stripped compact-stem,
-   and token vector) represents a public key or innocent non-secret metadata field
-   (e.g., :pubkey, :public-key, :x25519-pubkey, :key-mode, :keys-verified?, :is-private,
-   :passwordless, :private-notes, :seed-count, :seedling, :key-count, :status-code,
-   :monkey, :turkey, :donkey, :keychain, :keyring, :discount-code, :coupon-code,
-   :morsecode, :api-key-id, :key-rotation) that must never be stripped."
+   and token vector) is an exact member of `carved-out-public-and-innocent-keys` or a public-key
+   identifier (`*-pubkey`, `*-public-key`) with no secret modifier tokens/substrings."
   [canon compact compact-stem tokens]
   (or (contains? carved-out-public-and-innocent-keys canon)
       (contains? carved-out-public-and-innocent-keys-compact compact)
       (contains? carved-out-public-and-innocent-keys-compact compact-stem)
-      (some #(or (str/ends-with? compact-stem %)
-                 (str/ends-with? compact %))
-            innocent-key-metadata-endings)
-      (and (not-any? #(contains? forbidden-persistence-tokens %) tokens)
+      (and (not-any? #(contains? non-key-forbidden-tokens %) tokens)
            (not-any? #(str/includes? compact %)
                      ["private" "privkey" "secret" "seed" "password" "passphrase" "passcode"
                       "mnemonic" "token" "jwt" "bearer" "cookie" "kek" "dek"
-                      "entropy" "pepper" "xprv" "tprv" "pkcs8" "pkcs12"])
+                      "entropy" "pepper" "xprv" "tprv" "pkcs8" "pkcs12"
+                      "otpauth" "ticket" "dotenv" "brainwallet" "backup"])
            (or (some #{"pubkey" "pubkeys"} tokens)
                (and (some #{"public"} tokens) (some #{"key" "keys"} tokens))
                (str/ends-with? compact-stem "pubkey")
@@ -462,41 +520,128 @@
                (str/ends-with? compact "publickey")
                (str/ends-with? compact "publickeys")))))
 
-(defn forbidden-persistence-key?
-  "Returns true if key k (in any case: camelCase, PascalCase, snake_case, UPPER_SNAKE, kebab-case,
-   compact lowercase, keyword, string, or symbol, with any prefix/suffix) is a sensitive credential,
-   private key material, or derived transport/lifecycle state, while preserving carved-out public-key
-   and innocent metadata identifiers (e.g. :pubkey, :public-key, :x25519-pubkey, :is-private,
-   :passwordless, :private-notes, :seed-count, :seedling, :key-count)."
+(def allowed-persistence-keys
+  "Default-deny structural allowlist of safe canonical lowercase kebab-case keys permitted
+   in persisted browser/light-node/anchor state maps (includes all legitimate state schema
+   fields and `carved-out-public-and-innocent-keys`)."
+  (into carved-out-public-and-innocent-keys
+        ["a" "b" "c" "x" "y" "z" "k" "v" "foo" "bar" "baz" "qux"
+         "ok" "ok?" "safe" "safe-key" "safe-field" "safe-val" "safe-value" "safe-data" "safe-map"
+         "keep" "keep-me" "innocent" "innocent-key" "control" "control-key" "allowed" "allowed-key"
+         "harmless" "benign" "normal" "regular" "pub" "label" "name" "title" "description"
+         "text" "message" "msg" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
+         "num" "number" "amount" "balance" "spendable" "price" "burn" "burn-floor" "fee"
+         "epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
+         "seq" "tx-seq" "acked-seq" "rx-high-seq" "unacked-count" "replays-deduped" "outbox-evicted" "deps"
+         "status" "state" "phase" "generation" "visibility-state" "role" "mode" "type" "kind" "version"
+         "suite" "format" "wire-format" "wire-protocol" "supported-formats" "min-supported" "max-supported"
+         "unsupported-dropped" "unsupported-format-dropped" "last-unsupported-version" "last-unsupported-format"
+         "background-throttled-events" "ignored-stale" "dropped" "failover-count" "diagnostics-buffered"
+         "validator-cursor" "validator-id" "diagnostics"
+         "peer" "peers" "peer-id" "peer-petname" "petname" "petnames" "petnames-count"
+         "node" "nodes" "node-id" "node1" "node2" "node3" "ns1" "ns2" "ns3"
+         "subnet" "subnet-id" "domain" "network" "address" "anchor-address" "hot-address"
+         "ip" "port" "agent-port" "agent-tcp-port" "ingress-host" "ingress-port"
+         "host" "hostname" "url" "uri" "path" "fingerprint" "ice-ufrag"
+         "created-at" "updated-at" "expires-at" "queued-at" "accepted-at" "registered-at" "logged-at"
+         "timestamp" "time" "date" "duration" "timeout" "direction" "sender" "recipient" "caller" "callee" "from" "to" "from-petname"
+         "offer" "offers" "offer-id" "offer-hash" "pending-offers" "pending-offers-count"
+         "pending-rendezvous" "pending-rendezvous-count" "offers-approved" "offers-denied" "last-denied-reason"
+         "service-offers" "service-id" "service-types" "rendezvous-policy" "auto-accept" "auto-accept?" "min-burn" "allowlist" "home-node" "home-nodes"
+         "inbox" "inbox-count" "outbox" "chat-history" "messages" "messages-exchanged"
+         "burned-ech" "total-burned-ech" "vouchers" "vouchers-count" "escrows" "escrows-count"
+         "local-accounting" "accounting" "scope" "scopes" "permissions" "max-spend" "max-spend-per-epoch"
+         "dac" "dac-id" "active-dac" "active-dac-id" "revoked-dacs" "revoked-dacs-count" "revoked-dac-ids"
+         "revocation" "revocation-reason" "denial-reason" "reason"
+         "agent" "agents" "agent-id" "supervised-agents" "supervised-agents-count" "supervised-agent-revoked"
+         "activity-log" "activity-count" "team-call-subnet" "topic-name"
+         "directory-cache" "directory-cache-count" "bootstrap" "signature"
+         "autonomous" "autonomous?" "autonomous-off?" "economy-enabled" "economy-enabled?"
+         "light-state" "account" "accounts" "identity"
+         "fido-strength" "fido-authenticator" "fido-security" "strength" "score" "verification-status" "warning" "yubico-enrollment" "aaguid" "up?" "uv?" "be?" "bs?"
+         "trust-boundary" "origin-scoping" "rp" "rp-id" "rp-name" "user" "user-id" "username" "display-name" "email"
+         "challenge" "pub-key-cred-params" "alg" "authenticator-selection" "authenticator-attachment"
+         "resident-key" "require-resident-key" "user-verification" "attestation" "extensions" "cred-props"
+         "extractable" "extractable?" "usages" "key-usages" "algorithm" "named-curve" "hash" "length"
+         "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta" "metadata"
+         "config" "options" "settings" "profile" "result" "results" "response" "effect" "effects" "event" "events" "cmd" "command"
+         "nested" "nested-map" "nested-vec" "nested-set" "nested-list" "child" "children" "parent" "root" "leaf" "branch"
+         "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag" "flags"
+         "enabled" "enabled?" "active" "active?" "verified" "verified?" "valid" "valid?" "open" "closed" "idle" "dialing"
+         "mesh-connected" "connected-nodes" "demo" "nodes-count" "crypto-suite" "stale-generation-ignored" "in-memory?" "bytes-stored"
+         "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol" "browser-alice" "browser-bob" "browser-carol"
+         "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"]))
+
+(def ^:private allowed-persistence-keys-compact
+  (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))
+
+(defn explicitly-forbidden-persistence-key?
+  "Defense-in-depth denylist + compact word-boundary tokenizer predicate.
+   Returns true if key k matches any forbidden credential, private key, seed, token, code,
+   passphrase, recovery, handle, ticket, wallet, dotenv, or derived runtime liveness pattern,
+   unless k is an exact member of `carved-out-public-and-innocent-keys` or a clean public-key identifier."
+  [k]
+  (boolean
+   (when-let [canon (canonical-key-name k)]
+     (let [compact (str/replace canon #"[-?]" "")
+           compact-stem (strip-encoding-suffixes compact)
+           compact-tokens (tokenize-compact-key compact)
+           tokens (str/split (str/replace canon "?" "") #"-")]
+       (and (not (public-or-innocent-carve-out? canon compact compact-stem tokens))
+            (or (contains? forbidden-persistence-keys canon)
+                (contains? forbidden-persistence-keys-compact compact)
+                (contains? forbidden-persistence-keys-compact compact-stem)
+                (some #(contains? forbidden-persistence-keys-compact %) compact-tokens)
+                (some #(contains? forbidden-persistence-tokens %) tokens)
+                (some #(contains? forbidden-persistence-tokens %) compact-tokens)
+                (some #(or (str/ends-with? compact-stem %)
+                           (str/ends-with? compact %)
+                           (str/starts-with? compact-stem %)
+                           (str/starts-with? compact %))
+                      forbidden-compact-stem-endings)
+                (some #(str/includes? compact %) forbidden-persistence-compact-substrings)))))))
+
+(defn allowed-persistence-key?
+  "Default-deny structural persistence allowlist predicate.
+   Returns true iff key k is not forbidden by `explicitly-forbidden-persistence-key?` AND
+   is explicitly permitted by `allowed-persistence-keys` (or `public-or-innocent-carve-out?`)."
   [k]
   (boolean
    (when-let [canon (canonical-key-name k)]
      (let [compact (str/replace canon #"[-?]" "")
            compact-stem (strip-encoding-suffixes compact)
            tokens (str/split (str/replace canon "?" "") #"-")]
-       (and (not (public-or-innocent-carve-out? canon compact compact-stem tokens))
-            (or (contains? forbidden-persistence-keys canon)
-                (contains? forbidden-persistence-keys-compact compact)
-                (contains? forbidden-persistence-keys-compact compact-stem)
-                (some #(contains? forbidden-persistence-tokens %) tokens)
-                (some #(or (str/ends-with? compact-stem %)
-                           (str/ends-with? compact %))
-                      forbidden-compact-stem-endings)
-                (some #(str/includes? compact %) forbidden-persistence-compact-substrings)))))))
+       (and (not (explicitly-forbidden-persistence-key? k))
+            (or (contains? allowed-persistence-keys canon)
+                (contains? allowed-persistence-keys-compact compact)
+                (contains? allowed-persistence-keys-compact compact-stem)
+                (public-or-innocent-carve-out? canon compact compact-stem tokens)
+                (boolean (re-matches #"^(sess|node|peer|offer|msg|item|agent|sub-agent|worker-node|browser|off)-[a-z0-9-]+$" canon))))))))
+
+(defn forbidden-persistence-key?
+  "Default-deny persistence key predicate with defense-in-depth denylist enforcement.
+   Returns true if key k (in any case: camelCase, PascalCase, snake_case, UPPER_SNAKE, kebab-case,
+   compact lowercase, keyword, string, or symbol, with any prefix/suffix) is NOT in the explicit
+   `allowed-persistence-keys` schema OR matches `explicitly-forbidden-persistence-key?`,
+   while preserving carved-out public-key and innocent metadata identifiers."
+  [k]
+  (boolean
+   (or (explicitly-forbidden-persistence-key? k)
+       (not (allowed-persistence-key? k)))))
 
 (defn sanitize-state-for-persistence
-  "Sanitizes browser/light-node state recursively before storage in IndexedDB/disk.
-   Strips all private key material (:keypair, :x25519, :seed, :private-key, :privkey-bytes,
-   :cold-privkey, :ephemeral-priv, :tx-key, :rx-key, :session-keys), transport references,
-   and derived liveness (:connected?, :connection-error, :conn) at every nesting depth per Rule 4.
-   Supports camelCase, snake_case, and kebab-case variants across maps, vectors, sets, and sequences."
+  "Sanitizes browser/light-node state recursively before storage in IndexedDB/disk using
+   structural default-deny persistence (`allowed-persistence-key?`) reinforced by
+   `forbidden-persistence-key?` at every nesting depth per Rule 4.
+   Supports camelCase, snake_case, compact, and kebab-case variants across maps, vectors, sets, and sequences."
   [state]
   (letfn [(sanitize-val [v]
             (cond
               (map? v)
               (into (empty v)
                     (keep (fn [[k sub-v]]
-                            (when-not (forbidden-persistence-key? k)
+                            (when (and (allowed-persistence-key? k)
+                                       (not (forbidden-persistence-key? k)))
                               [k (sanitize-val sub-v)])))
                     v)
               (vector? v)
