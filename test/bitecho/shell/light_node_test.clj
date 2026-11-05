@@ -1942,3 +1942,63 @@
       (is (true? (:use-turn-relay? dc-conn)))
       (is (false? (:use-turn-relay? explicit-off-conn))))))
 
+(deftest test-light-node-send-rejects-empty-payload-and-accepts-message-alias
+  (testing "H-1/A-3: send rejects empty payload with empty-payload error and accepts message and session-id aliases"
+    (let [alice-kp (crypto/generate-keypair)
+          bob-kp (crypto/generate-keypair)
+          alice-pub (basalt/bytes->hex (:public alice-kp))
+          bob-pub (basalt/bytes->hex (:public bob-kp))
+          st0 (light-core/init-light-state {:pubkey-hex alice-pub} {})
+          sess-id "91e4541f458367db92b629c77a07633d4110889590ea707f1c3f740d44eefb68"
+          tx-key (byte-array 32 (byte 7))
+          rx-key (byte-array 32 (byte 8))
+          st-open (assoc-in st0 [:sessions sess-id]
+                            {:session-id sess-id
+                             :peer bob-pub
+                             :state "open"
+                             :tx-key tx-key
+                             :rx-key rx-key
+                             :tx-seq 0
+                             :rx-high-seq 0
+                             :suite "suite-v1-chacha20poly1305"})
+          ;; 1. Missing text/payload_hex/message -> rejected as empty-payload
+          res-missing (light-core/handle-command st-open {"cmd" "send" "session_id" sess-id} (:private alice-kp))
+          ;; 2. Blank/empty text "" -> rejected as empty-payload
+          res-empty (light-core/handle-command st-open {"cmd" "send" "session_id" sess-id "text" ""} (:private alice-kp))
+          ;; 3. Valid "message" alias + "session-id" hyphen alias -> succeeds
+          res-msg (light-core/handle-command st-open {"cmd" "send" "session-id" sess-id "message" "hello axiom"} (:private alice-kp))]
+      (is (false? (get-in res-missing [:response "ok"])))
+      (is (= "empty-payload" (get-in res-missing [:response "error"])))
+      (is (empty? (:net-envelopes res-missing)))
+      (is (false? (get-in res-empty [:response "ok"])))
+      (is (= "empty-payload" (get-in res-empty [:response "error"])))
+      (is (empty? (:net-envelopes res-empty)))
+      (is (true? (get-in res-msg [:response "ok"])))
+      (is (= 11 (get-in res-msg [:response "bytes_sent"])))
+      (is (= 1 (count (:net-envelopes res-msg)))))))
+
+(deftest test-light-node-encode-or-send-failure-emits-counted-diagnose
+  (testing "H-1/A-3: transition-conn tracks :encode-failed and :send-failed with counted :diagnose and :consecutive_send_failures"
+    (let [conn-atom (atom (light-shell/init-conn-state))
+          diag-atom (atom [])
+          opts {:diagnostics-atom diag-atom}
+          _ (light-shell/apply-conn-event! conn-atom {:type :dial-started :generation 1} opts)
+          _ (light-shell/apply-conn-event! conn-atom {:type :dial-ok :generation 1 :validator-id :node1} opts)
+          _ (is (= 0 (:consecutive-send-failures @conn-atom 0)))
+          ;; 1. Encode failure increments :dropped and :consecutive-send-failures and emits :diagnose
+          after-enc-fail (light-shell/apply-conn-event! conn-atom {:type :encode-failed :error "encode-failed: tag null"} opts)
+          summary-1 (light-shell/conn-diagnostics-summary after-enc-fail)
+          ;; 2. Send failure increments :dropped and :consecutive-send-failures and transitions to :failed
+          after-send-fail (light-shell/apply-conn-event! conn-atom {:type :send-failed :error "send-failed: closed"} opts)
+          summary-2 (light-shell/conn-diagnostics-summary after-send-fail)]
+      (is (= 1 (:dropped after-enc-fail)))
+      (is (= 1 (:consecutive_send_failures summary-1)))
+      (is (= "encode-failed: tag null" (:last_error summary-1)))
+      (is (= :encode-failed (:reason (first @diag-atom))))
+      (is (= 2 (:dropped after-send-fail)))
+      (is (= 2 (:consecutive_send_failures summary-2)))
+      (is (= "failed" (:phase summary-2)))
+      (is (= "send-failed: closed" (:last_error summary-2)))
+      (is (= :send-failed (:reason (last @diag-atom)))))))
+
+

@@ -320,9 +320,62 @@
   "Default number of historical epochs to retain before pruning state."
   256)
 
+(def default-max-ancestor-sync-depth
+  "Default maximum number of notarized ancestors bundled in a :send-propose command."
+  16)
+
+(def default-max-propose-wire-bytes
+  "Default maximum encoded wire byte budget (32 KiB) for a :send-propose command."
+  32768)
+
+(defn- protected-ancestor-chain-hashes
+  "When state tracks :executed-finalized-blocks or :last-executed-finalized-epoch,
+   returns the set of block hashes along the ancestor chain from :head-hash,
+   :latest-finalized-block-hash, and any unexecuted :finalized-blocks back to
+   (and including) the root anchor in :executed-finalized-blocks.
+   Ensures unexecuted canonical ancestors are never orphaned by pruning during long stalls."
+  [state]
+  (if-not (or (contains? state :executed-finalized-blocks)
+              (contains? state :last-executed-finalized-epoch))
+    #{}
+    (let [blocks (or (:blocks state) {})
+          executed (or (:executed-finalized-blocks state) #{})
+          finalized (or (:finalized-blocks state) #{})
+          unexecuted-fin (set/difference finalized executed)
+          roots (into (cond-> #{}
+                        (:head-hash state) (conj (:head-hash state))
+                        (:latest-finalized-block-hash state) (conj (:latest-finalized-block-hash state)))
+                      unexecuted-fin)]
+      (reduce (fn [protected start-hash]
+                (loop [curr start-hash
+                       visited #{}
+                       acc protected]
+                  (cond
+                    (or (nil? curr)
+                        (= curr "genesis")
+                        (= curr "0000000000000000000000000000000000000000000000000000000000000000")
+                        (contains? visited curr))
+                    acc
+
+                    (contains? executed curr)
+                    (conj acc curr)
+
+                    (contains? acc curr)
+                    acc
+
+                    :else
+                    (if-let [b (get blocks curr)]
+                      (recur (:parent-hash b)
+                             (conj visited curr)
+                             (conj acc curr))
+                      acc))))
+              #{}
+              roots))))
+
 (defn prune-streamlet-state
   "Prunes Streamlet state beyond retention epoch threshold to bound memory.
-   Retains :head-hash and :latest-finalized-block-hash regardless of epoch.
+   Retains :head-hash, :latest-finalized-block-hash, and any unexecuted ancestor chain
+   back to the executed root regardless of epoch.
    Updates cumulative :pruned-notarized-count and :pruned-finalized-count."
   [state]
   (let [retention (or (get-in state [:config :streamlet-retention-epochs])
@@ -336,11 +389,13 @@
       (let [blocks (:blocks state)
             state-with-depths (reduce record-block-depth state (keys blocks))
             latest-finalized (:latest-finalized-block-hash state-with-depths)
+            protected-hashes (protected-ancestor-chain-hashes state-with-depths)
             expired-hashes (into #{}
                                  (keep (fn [[h b]]
                                          (when (and (< (long (or (:epoch b) 0)) cutoff)
                                                     (not= h head-hash)
-                                                    (not= h latest-finalized))
+                                                    (not= h latest-finalized)
+                                                    (not (contains? protected-hashes h)))
                                            h)))
                                  blocks)
             voted-epochs (into #{} (filter #(>= (long %) cutoff)) (get state-with-depths :voted-epochs #{}))]
@@ -591,6 +646,21 @@
             state
             sorted-ancestors)))
 
+(defn truncate-ancestors-to-wire-budget
+  "Truncates a newest-first vector of notarized ancestor entries to the longest contiguous prefix
+   whose encoded :send-propose wire representation does not exceed max-wire-bytes."
+  [base-propose-cmd ancestors max-wire-bytes]
+  (let [budget (long (or max-wire-bytes default-max-propose-wire-bytes))]
+    (loop [remaining ancestors
+           kept []]
+      (if (empty? remaining)
+        kept
+        (let [candidate (conj kept (first remaining))
+              encoded (fressian/encode-wire (assoc base-propose-cmd :ancestors candidate))]
+          (if (<= (fressian/count-bytes encoded) budget)
+            (recur (rest remaining) candidate)
+            kept))))))
+
 (defn- handle-tick-event
   "Handles a :tick event: advances epoch, elects proposer, and proposes if local node."
   [state]
@@ -623,12 +693,20 @@
                           update-head-hash
                           finalize-prefix)
                 targets (extract-targets state)
-                ancestor-depth (long (or (get-in state [:config :max-ancestor-sync-depth]) (:max-ancestor-sync-depth state) 32))
-                ancestors (extract-notarized-ancestors state (:parent-hash block) ancestor-depth)
+                ancestor-depth (long (or (get-in state [:config :max-ancestor-sync-depth])
+                                         (:max-ancestor-sync-depth state)
+                                         default-max-ancestor-sync-depth))
+                wire-budget (long (or (get-in state [:config :max-propose-wire-bytes])
+                                      (:max-propose-wire-bytes state)
+                                      default-max-propose-wire-bytes))
+                raw-ancestors (extract-notarized-ancestors state (:parent-hash block) ancestor-depth)
+                base-propose {:type :send-propose :targets targets :block block :ancestors []}
+                ancestors (truncate-ancestors-to-wire-budget base-propose raw-ancestors wire-budget)
+                propose-cmd (assoc base-propose :ancestors ancestors)
                 commands (if vote
-                           [{:type :send-propose :targets targets :block block :ancestors ancestors}
+                           [propose-cmd
                             {:type :send-vote :targets targets :vote vote}]
-                           [{:type :send-propose :targets targets :block block :ancestors ancestors}])]
+                           [propose-cmd])]
             {:state (prune-streamlet-state state) :commands commands})
           {:state (prune-streamlet-state state) :commands []})))))
 

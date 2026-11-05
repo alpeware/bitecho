@@ -78,6 +78,19 @@ Transport protocols supported via `--transport`:
 - `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
 - `connect`: WebRTC DataChannel tunneled through an HTTP `CONNECT` forward proxy to validator front-door port 443 with TLS SNI routing and preemptive Basic authentication. When `--proxy` is omitted, proxy URL defaults to standard environment variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`).
 
+### Cluster Operations & Verification Gates (`scripts/cluster.sh`)
+
+```bash
+# Run pre-deploy full-pipeline E2E wire & Streamlet finalization gate (< 60s)
+./scripts/cluster.sh verify-e2e
+
+# Audit live validator convergence, finalized epoch height, and max_finalization_lag (<= 10)
+./scripts/cluster.sh audit
+
+# Deploy validator cluster (runs pre-deploy verify-e2e gate, rolling restart, and post-deploy live E2E transfer + audit gate)
+./scripts/cluster.sh deploy
+```
+
 For complete protocol schemas, payload specifications, and parent agent integration examples, see [`skill/SKILL.md`](skill/SKILL.md).
 
 **Bitecho is the sovereign physics engine for the autonomous workforce.**

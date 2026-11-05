@@ -1044,9 +1044,13 @@
 (defn normalize-for-wire
   "Recursively pre-normalizes Clojure data structures for wire encoding:
    converts defrecords and maps into standard persistent maps,
-   and sequential collections/lazy seqs into persistent vectors."
+   sequential collections/lazy seqs into persistent vectors, and
+   JVM Byte/Short boxed primitives into Long so data.fressian can serialize them."
   [x]
   (cond
+    #?@(:clj [(or (instance? Byte x) (instance? Short x))
+              (long x)])
+
     (record? x)
     (reduce-kv (fn [m k v]
                  (assoc m (normalize-for-wire k) (normalize-for-wire v)))
@@ -1116,14 +1120,296 @@
 
        :else x)))
 
-(defn encode-wire
-  "Encodes val into wire bytes using Fressian.
-   Pre-normalizes Clojure records and lazy seqs into standard maps and vectors.
+(defn encode-wire-uncompressed
+  "Encodes val into uncompressed Fressian wire bytes.
+   Pre-normalizes Clojure records, lazy seqs, and JVM Byte/Short primitives.
    On JVM uses org.clojure.data.fressian; on CLJS uses the zero-dependency Fressian encoder."
   [val]
   (let [norm (normalize-for-wire val)]
     #?(:clj  (write-standard-fressian norm)
        :cljs (encode-canonical norm))))
+
+;; =============================================================================
+;; Pure-CLJC LZ4 Raw Block Codec & BTEC Wire Framing (H-2 / Seq 220)
+;; =============================================================================
+
+(def wire-compression-threshold-bytes
+  "Minimum uncompressed Fressian payload byte length (> 1 KiB) before attempting LZ4 compression."
+  1024)
+
+(def max-wire-decompressed-bytes
+  "Maximum allowed uncompressed payload size (1 MiB) when decoding a BTEC compressed frame."
+  1048576)
+
+(def btec-tag-lz4
+  "Algorithm selector byte for raw LZ4 block compression in a BTEC frame."
+  1)
+
+(defn- u8
+  ^long [ba ^long idx]
+  #?(:clj  (bit-and (long (aget ^bytes ba (int idx))) 0xff)
+     :cljs (aget ba idx)))
+
+(defn- aset-u8!
+  [ba ^long idx ^long v]
+  #?(:clj  (aset ^bytes ba (int idx) (unchecked-byte v))
+     :cljs (aset ba idx (bit-and v 0xff))))
+
+(defn- write-lz4-run-length
+  [w ^long len]
+  (loop [rem-len len]
+    (if (>= rem-len 255)
+      (do
+        (write-raw-byte w 255)
+        (recur (- rem-len 255)))
+      (write-raw-byte w rem-len))))
+
+(defn- lz4-hash4
+  ^long [ba ^long pos]
+  (let [v (bit-or (u8 ba pos)
+                  (bit-shift-left (u8 ba (+ pos 1)) 8)
+                  (bit-shift-left (u8 ba (+ pos 2)) 16)
+                  (bit-shift-left (u8 ba (+ pos 3)) 24))
+        prod #?(:clj  (unchecked-multiply-int (unchecked-int v) -1640531535)
+                :cljs (js/Math.imul v -1640531535))]
+    (bit-and (unsigned-bit-shift-right prod 20) 0xfff)))
+
+(defn lz4-compress-block
+  "Pure-CLJC raw LZ4 block compressor compatible with standard LZ4 block decoders
+   (including io.airlift.compress.lz4.Lz4Decompressor).
+   Enforces standard LZ4 block safety margins (MIN_MATCH=4, LAST_LITERAL_SIZE=5, MF_LIMIT=12)."
+  [input-bytes]
+  (let [in-len (count-bytes input-bytes)]
+    (if (zero? in-len)
+      #?(:clj (byte-array 0) :cljs (js/Uint8Array. 0))
+      (let [w (make-byte-writer)
+            match-limit (- in-len 5)
+            mf-limit (- in-len 12)
+            htable #?(:clj  (int-array 4096 -1)
+                      :cljs (let [a (js/Int32Array. 4096)] (.fill a -1) a))]
+        (loop [anchor 0
+               pos 0]
+          (if (> pos mf-limit)
+            ;; Emit final literal-only sequence from anchor..in-len
+            (let [lit-len (- in-len anchor)]
+              (write-raw-byte w (bit-shift-left (min lit-len 15) 4))
+              (when (>= lit-len 15)
+                (write-lz4-run-length w (- lit-len 15)))
+              (loop [i anchor]
+                (when (< i in-len)
+                  (write-raw-byte w (u8 input-bytes i))
+                  (recur (inc i))))
+              (get-result-bytes w))
+            (let [h (lz4-hash4 input-bytes pos)
+                  ref-pos (long (aget htable h))
+                  _ (aset htable h (int pos))
+                  offset (- pos ref-pos)
+                  match? (and (>= ref-pos 0)
+                              (pos? offset)
+                              (<= offset 65535)
+                              (= (u8 input-bytes ref-pos) (u8 input-bytes pos))
+                              (= (u8 input-bytes (+ ref-pos 1)) (u8 input-bytes (+ pos 1)))
+                              (= (u8 input-bytes (+ ref-pos 2)) (u8 input-bytes (+ pos 2)))
+                              (= (u8 input-bytes (+ ref-pos 3)) (u8 input-bytes (+ pos 3))))]
+              (if-not match?
+                (recur anchor (inc pos))
+                (let [mlen (loop [m 4]
+                             (if (and (< (+ pos m) match-limit)
+                                      (= (u8 input-bytes (+ ref-pos m))
+                                         (u8 input-bytes (+ pos m))))
+                               (recur (inc m))
+                               m))
+                      lit-len (- pos anchor)
+                      m-extra (- mlen 4)
+                      token (bit-or (bit-shift-left (min lit-len 15) 4)
+                                    (min m-extra 15))]
+                  (write-raw-byte w token)
+                  (when (>= lit-len 15)
+                    (write-lz4-run-length w (- lit-len 15)))
+                  (loop [i anchor]
+                    (when (< i pos)
+                      (write-raw-byte w (u8 input-bytes i))
+                      (recur (inc i))))
+                  (write-raw-byte w (bit-and offset 0xff))
+                  (write-raw-byte w (bit-and (unsigned-bit-shift-right offset 8) 0xff))
+                  (when (>= m-extra 15)
+                    (write-lz4-run-length w (- m-extra 15)))
+                  (let [next-pos (+ pos mlen)]
+                    (recur next-pos next-pos)))))))))))
+
+(defn lz4-decompress-block
+  "Pure-CLJC raw LZ4 block decompressor with strict bounds checking.
+   Throws ExceptionInfo with :reason :corrupt-compressed-frame on any malformed input."
+  ([compressed-bytes orig-len]
+   (lz4-decompress-block compressed-bytes 0 (count-bytes compressed-bytes) orig-len))
+  ([compressed-bytes start-idx end-idx orig-len]
+   (let [orig-len (long orig-len)
+         start-idx (long start-idx)
+         end-idx (long end-idx)
+         in-len (- end-idx start-idx)]
+     (cond
+       (or (neg? orig-len) (> orig-len max-wire-decompressed-bytes))
+       (throw (ex-info (str "BTEC decompressed size exceeds 1 MiB limit: " orig-len)
+                       {:reason :decompressed-size-exceeded :orig-len orig-len}))
+
+       (zero? orig-len)
+       (if (zero? in-len)
+         #?(:clj (byte-array 0) :cljs (js/Uint8Array. 0))
+         (throw (ex-info "Corrupt LZ4 block: non-empty input for zero-length output"
+                         {:reason :corrupt-compressed-frame})))
+
+       (<= in-len 0)
+       (throw (ex-info "Corrupt LZ4 block: empty input for non-zero output"
+                       {:reason :corrupt-compressed-frame}))
+
+       :else
+       (let [out #?(:clj (byte-array orig-len) :cljs (js/Uint8Array. orig-len))]
+         (loop [in-pos start-idx
+                out-pos 0]
+           (if (>= in-pos end-idx)
+             (if (= out-pos orig-len)
+               out
+               (throw (ex-info "Corrupt LZ4 block: unexpected end of stream"
+                               {:reason :corrupt-compressed-frame})))
+             (let [token (u8 compressed-bytes in-pos)
+                   in-pos-1 (inc in-pos)
+                   lit-base (unsigned-bit-shift-right token 4)
+                   [lit-len in-pos-2] (if (= lit-base 15)
+                                        (loop [acc 15
+                                               p in-pos-1]
+                                          (when (>= p end-idx)
+                                            (throw (ex-info "Corrupt LZ4 block: truncated literal length"
+                                                            {:reason :corrupt-compressed-frame})))
+                                          (let [b (u8 compressed-bytes p)
+                                                next-acc (+ acc b)]
+                                            (when (> next-acc orig-len)
+                                              (throw (ex-info "Corrupt LZ4 block: literal length overflow"
+                                                              {:reason :corrupt-compressed-frame})))
+                                            (if (= b 255)
+                                              (recur next-acc (inc p))
+                                              [next-acc (inc p)])))
+                                        [lit-base in-pos-1])
+                   lit-end-in (+ in-pos-2 lit-len)
+                   lit-end-out (+ out-pos lit-len)]
+               (when (or (> lit-end-in end-idx) (> lit-end-out orig-len))
+                 (throw (ex-info "Corrupt LZ4 block: literal copy out of bounds"
+                                 {:reason :corrupt-compressed-frame})))
+               (loop [i 0]
+                 (when (< i lit-len)
+                   (aset-u8! out (+ out-pos i) (u8 compressed-bytes (+ in-pos-2 i)))
+                   (recur (inc i))))
+               (if (= lit-end-in end-idx)
+                 (if (= lit-end-out orig-len)
+                   out
+                   (throw (ex-info "Corrupt LZ4 block: output size mismatch after final literals"
+                                   {:reason :corrupt-compressed-frame})))
+                 (do
+                   (when (> (+ lit-end-in 2) end-idx)
+                     (throw (ex-info "Corrupt LZ4 block: truncated match offset"
+                                     {:reason :corrupt-compressed-frame})))
+                   (let [offset (bit-or (u8 compressed-bytes lit-end-in)
+                                        (bit-shift-left (u8 compressed-bytes (inc lit-end-in)) 8))
+                         in-pos-3 (+ lit-end-in 2)]
+                     (when (or (<= offset 0) (> offset lit-end-out))
+                       (throw (ex-info "Corrupt LZ4 block: invalid match offset"
+                                       {:reason :corrupt-compressed-frame :offset offset})))
+                     (let [m-base (bit-and token 0x0f)
+                           [match-len in-pos-4] (if (= m-base 15)
+                                                  (loop [acc 19
+                                                         p in-pos-3]
+                                                    (when (>= p end-idx)
+                                                      (throw (ex-info "Corrupt LZ4 block: truncated match length"
+                                                                      {:reason :corrupt-compressed-frame})))
+                                                    (let [b (u8 compressed-bytes p)
+                                                          next-acc (+ acc b)]
+                                                      (when (> (+ lit-end-out next-acc) orig-len)
+                                                        (throw (ex-info "Corrupt LZ4 block: match length overflow"
+                                                                        {:reason :corrupt-compressed-frame})))
+                                                      (if (= b 255)
+                                                        (recur next-acc (inc p))
+                                                        [next-acc (inc p)])))
+                                                  [(+ m-base 4) in-pos-3])
+                           match-end-out (+ lit-end-out match-len)
+                           match-src (- lit-end-out offset)]
+                       (when (> match-end-out orig-len)
+                         (throw (ex-info "Corrupt LZ4 block: match copy overrun"
+                                         {:reason :corrupt-compressed-frame})))
+                       (loop [i 0]
+                         (when (< i match-len)
+                           (aset-u8! out (+ lit-end-out i) (u8 out (+ match-src i)))
+                           (recur (inc i))))
+                       (recur in-pos-4 match-end-out)))))))))))))
+
+(defn btec-compressed-frame?
+  "Returns true if ba is a byte array of length >= 4 starting with the 'BTEC' magic header (0x42 0x54 0x45 0x43)."
+  [ba]
+  (and (bytes? ba)
+       (>= (count-bytes ba) 4)
+       (= (u8 ba 0) 0x42)
+       (= (u8 ba 1) 0x54)
+       (= (u8 ba 2) 0x45)
+       (= (u8 ba 3) 0x43)))
+
+(defn- wrap-btec-lz4-frame
+  [compressed-bytes ^long orig-len]
+  (let [c-len (count-bytes compressed-bytes)
+        total-len (+ 9 c-len)
+        out #?(:clj (byte-array total-len) :cljs (js/Uint8Array. total-len))]
+    (aset-u8! out 0 0x42) ;; 'B'
+    (aset-u8! out 1 0x54) ;; 'T'
+    (aset-u8! out 2 0x45) ;; 'E'
+    (aset-u8! out 3 0x43) ;; 'C'
+    (aset-u8! out 4 btec-tag-lz4)
+    (aset-u8! out 5 (bit-and (unsigned-bit-shift-right orig-len 24) 0xff))
+    (aset-u8! out 6 (bit-and (unsigned-bit-shift-right orig-len 16) 0xff))
+    (aset-u8! out 7 (bit-and (unsigned-bit-shift-right orig-len 8) 0xff))
+    (aset-u8! out 8 (bit-and orig-len 0xff))
+    (loop [i 0]
+      (when (< i c-len)
+        (aset-u8! out (+ 9 i) (u8 compressed-bytes i))
+        (recur (inc i))))
+    out))
+
+(defn- unwrap-btec-frame
+  "Strictly validates and decompresses a BTEC-prefixed frame.
+   Fails closed by throwing ExceptionInfo on truncated header (< 9 bytes),
+   unknown algorithm tag (!= 0x01), > 1 MiB claimed size, or corrupt LZ4 stream."
+  [ba]
+  (let [total-len (count-bytes ba)]
+    (when (< total-len 9)
+      (throw (ex-info "Truncated BTEC compressed frame"
+                      {:reason :corrupt-compressed-frame :length total-len})))
+    (let [tag (u8 ba 4)]
+      (when (not= tag btec-tag-lz4)
+        (throw (ex-info (str "Unsupported BTEC compression tag: " tag)
+                        {:reason :unknown-compression-tag :tag tag})))
+      (let [b5 (u8 ba 5)
+            b6 (u8 ba 6)
+            b7 (u8 ba 7)
+            b8 (u8 ba 8)
+            orig-len (bit-or (bit-shift-left b5 24)
+                             (bit-shift-left b6 16)
+                             (bit-shift-left b7 8)
+                             b8)]
+        (when (or (neg? orig-len) (> orig-len max-wire-decompressed-bytes))
+          (throw (ex-info (str "BTEC decompressed size exceeds 1 MiB limit: " orig-len)
+                          {:reason :decompressed-size-exceeded :orig-len orig-len})))
+        (lz4-decompress-block ba 9 total-len orig-len)))))
+
+(defn encode-wire
+  "Encodes val into wire bytes using Fressian, applying synchronous LZ4 block compression
+   ('BTEC' + tag 0x01 + 4-byte BE original length) when the uncompressed Fressian payload
+   exceeds 1 KiB and the compressed frame is strictly smaller than the raw Fressian bytes."
+  [val]
+  (let [raw-bytes (encode-wire-uncompressed val)
+        raw-len (count-bytes raw-bytes)]
+    (if (> raw-len wire-compression-threshold-bytes)
+      (let [compressed (lz4-compress-block raw-bytes)
+            comp-len (count-bytes compressed)]
+        (if (< (+ 9 comp-len) raw-len)
+          (wrap-btec-lz4-frame compressed raw-len)
+          raw-bytes))
+      raw-bytes)))
 
 (def false-sentinel
   "Explicit namespaced sentinel to distinguish boolean false from decoding errors or nil."
@@ -1133,30 +1419,52 @@
   "Internal sentinel representing a decode error or failure."
   :bitecho.fressian/decode-error-sentinel-v1)
 
-(defn decode-wire
-  "Decodes wire bytes into Clojure persistent data structures.
-   Supports Fressian-encoded payloads and legacy Nippy payloads (on JVM).
-   Recursively normalizes collections and strips untrusted shell-boundary crypto tags.
-   Distinguishes boolean false and nil payloads from decoding failures using an internal sentinel."
+(defn- decode-fressian-or-nippy-bytes
+  [ba]
+  (let [sentinel decode-error-sentinel
+        raw #?(:clj
+               (if (nippy-payload? ba)
+                 (try (nippy/thaw ba)
+                      (catch Exception _
+                        (try (read-standard-fressian ba)
+                             (catch Exception _
+                               (try (decode ba) (catch Exception _ sentinel))))))
+                 (try (read-standard-fressian ba)
+                      (catch Exception _
+                        (try (decode ba)
+                             (catch Exception _
+                               (if (nippy-payload? ba)
+                                 (try (nippy/thaw ba) (catch Exception _ sentinel))
+                                 sentinel))))))
+               :cljs
+               (try (decode ba)
+                    (catch :default _ sentinel)))]
+    (if (identical? raw sentinel)
+      sentinel
+      (strip-untrusted-crypto-tags (normalize-decoded-wire raw)))))
+
+(defn decode-wire-strict
+  "Strictly decodes wire bytes, throwing ExceptionInfo with :reason on BTEC compression
+   framing violations (:unknown-compression-tag, :decompressed-size-exceeded, :corrupt-compressed-frame)
+   or returning nil if Fressian decode fails."
   [ba]
   (when (and (bytes? ba) (pos? (count-bytes ba)))
-    (let [sentinel decode-error-sentinel
-          raw #?(:clj
-                 (if (nippy-payload? ba)
-                   (try (nippy/thaw ba)
-                        (catch Exception _
-                          (try (read-standard-fressian ba)
-                               (catch Exception _
-                                 (try (decode ba) (catch Exception _ sentinel))))))
-                   (try (read-standard-fressian ba)
-                        (catch Exception _
-                          (try (decode ba)
-                               (catch Exception _
-                                 (if (nippy-payload? ba)
-                                   (try (nippy/thaw ba) (catch Exception _ sentinel))
-                                   sentinel))))))
-                 :cljs
-                 (try (decode ba)
-                      (catch :default _ sentinel)))]
-      (when-not (identical? raw sentinel)
-        (strip-untrusted-crypto-tags (normalize-decoded-wire raw))))))
+    (let [payload-bytes (if (btec-compressed-frame? ba)
+                          (unwrap-btec-frame ba)
+                          ba)
+          decoded (decode-fressian-or-nippy-bytes payload-bytes)]
+      (when-not (identical? decoded decode-error-sentinel)
+        decoded))))
+
+(defn decode-wire
+  "Decodes wire bytes into Clojure persistent data structures.
+   Dispatch order:
+   1. BTEC compressed frame check (len >= 4 and 'BTEC' magic) -> LZ4 decompress (tag 0x01 only;
+      fails closed returning nil on unknown tag, >1 MiB size, or corrupt stream).
+   2. Legacy Nippy payload check (on JVM).
+   3. Standard Fressian / portable Fressian decode -> normalize-decoded-wire -> strip-untrusted-crypto-tags."
+  [ba]
+  (try
+    (decode-wire-strict ba)
+    (catch #?(:clj Exception :cljs :default) _
+      nil)))

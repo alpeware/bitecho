@@ -337,7 +337,10 @@ cat <<EOF > dist/index.html
   <div class="grid">
     <!-- Anchor Identity & Hardware Key Card -->
     <div class="card">
-      <h2>Anchor Identity &amp; Key Mode</h2>
+      <h2>
+        <span>Anchor Identity &amp; Key Mode</span>
+        <span class="badge badge-warning" id="hardwareLockedBadge" style="display: none;">[ LOCKED — Tap Recover from YubiKey to Sign ]</span>
+      </h2>
       <div class="field">
         <div class="field-label">Bech32m Address (BIP-0350)</div>
         <div class="mono" id="anchorAddress">ech1...</div>
@@ -530,6 +533,11 @@ cat <<EOF > dist/index.html
 
         anchorAddrEl.textContent = ident.address || dash["anchor-address"] || dash.anchorAddress || "Not initialized";
         anchorPubEl.textContent = (ident["anchor-pubkey"] || dash["anchor-pubkey"] || dash.anchorPubkey || "").slice(0, 32) + "...";
+        const hwLockedBadge = document.getElementById("hardwareLockedBadge");
+        const isHwLocked = Boolean(ident["hardware-locked"] || ident.hardwareLocked || dash["hardware-locked"] || dash.hardwareLocked);
+        if (hwLockedBadge) {
+          hwLockedBadge.style.display = isHwLocked ? "inline-block" : "none";
+        }
         burnedEl.textContent = (acct["burned-ech"] ?? dash["total-burned"] ?? dash.totalBurned ?? 0) + " ECH";
         approvedEl.textContent = acct["offers-approved"] ?? dash["offers-approved"] ?? dash.offersApproved ?? 0;
         deniedEl.textContent = acct["offers-denied"] ?? dash["offers-denied"] ?? dash.offersDenied ?? 0;
@@ -824,6 +832,19 @@ cat <<EOF > dist/index.html
         globalThis.BitechoBrowser.initNode();
         const initialDash = globalThis.BitechoBrowser.initAnchor();
         updateUI(initialDash);
+        if (typeof globalThis.BitechoBrowser.loadStateFromIndexedDb === "function") {
+          Promise.resolve(globalThis.BitechoBrowser.loadStateFromIndexedDb()).then(function (restored) {
+            if (restored && restored.pubkey) {
+              writeLog("Restored persisted public identity from IndexedDB (tap Recover from YubiKey to unlock signing):", {
+                pubkey: restored.pubkey,
+                address: restored.address,
+                hardwareLocked: restored.hardwareLocked
+              });
+              updateUI(globalThis.BitechoBrowser.getAnchorDashboard());
+              renderChatAndSessions(globalThis.BitechoBrowser.getStatus());
+            }
+          }).catch(function () {});
+        }
         globalThis.BitechoBrowser.onStateChange(function (st) {
           renderChatAndSessions(st);
           updateUI(globalThis.BitechoBrowser.getAnchorDashboard());

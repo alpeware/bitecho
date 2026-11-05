@@ -272,3 +272,127 @@
                  h2 (fressian/bytes->hex (fressian/encode-canonical m2))
                  h3 (fressian/bytes->hex (fressian/encode-canonical m3))]
              (and (= h1 h2) (= h2 h3)))))
+
+#?(:clj
+   (defspec ^{:doc "Property: Vectors of JVM Byte and Short primitives (e.g. (vec byte-array) in transfer receipts) roundtrip cleanly through encode-wire and decode-wire without throwing."}
+     prop-encode-wire-byte-short-vector-roundtrip 50
+     (for-all [raw-bytes gen/bytes
+               raw-shorts (gen/vector (gen/choose -32768 32767) 0 16)]
+              (let [byte-vec (vec raw-bytes)
+                    short-vec (mapv short raw-shorts)
+                    envelope {:type :propose
+                              :payload [{:receipt-id "transfer:test"
+                                         :type :transfer
+                                         :payload-bytes byte-vec
+                                         :short-seq short-vec}]}
+                    wire (fressian/encode-wire envelope)
+                    decoded (fressian/decode-wire wire)]
+                (and (= (mapv long byte-vec) (get-in decoded [:payload 0 :payload-bytes]))
+                     (= (mapv long short-vec) (get-in decoded [:payload 0 :short-seq])))))))
+
+(def ^:private gen-lz4-adversarial-bytes
+  (gen/one-of
+   [(gen/return (fressian/utf8->bytes ""))
+    (gen/return (fressian/utf8->bytes "x"))
+    (gen/return (fressian/utf8->bytes "0123456789ab"))
+    (gen/return (fressian/utf8->bytes "0123456789abc"))
+    (gen/return (fressian/utf8->bytes "0123456789abcde"))
+    (gen/fmap (fn [n] (fressian/utf8->bytes (apply str (repeat n "A")))) (gen/choose 1 600))
+    (gen/fmap (fn [n] (fressian/utf8->bytes (apply str (repeat n "\u0000")))) (gen/choose 1 600))
+    (gen/fmap (fn [[pat n]] (fressian/utf8->bytes (apply str (repeat n pat))))
+              (gen/tuple (gen/not-empty gen/string-alphanumeric) (gen/choose 2 80)))
+    (gen/fmap (fn [bs]
+                #?(:clj (byte-array (map unchecked-byte bs))
+                   :cljs (js/Uint8Array. (clj->js (map #(bit-and % 0xFF) bs)))))
+              (gen/vector (gen/choose 0 255) 0 512))]))
+
+(defspec ^{:doc "Property: Pure-CLJC LZ4 block compressor and decompressor round-trip and cross-verify against JVM io.airlift.compress.lz4 reference across adversarial inputs."}
+  prop-lz4-block-codec-cross-reference-and-adversarial 100
+  (for-all [input-bytes gen-lz4-adversarial-bytes]
+           (let [orig-len (fressian/count-bytes input-bytes)
+                 cljc-compressed (fressian/lz4-compress-block input-bytes)
+                 cljc-roundtrip (fressian/lz4-decompress-block cljc-compressed orig-len)
+                 self-ok? (= (fressian/bytes->hex input-bytes)
+                             (fressian/bytes->hex cljc-roundtrip))]
+             #?(:clj
+                (let [ref-comp (io.airlift.compress.lz4.Lz4Compressor.)
+                      ref-decomp (io.airlift.compress.lz4.Lz4Decompressor.)
+                      ;; 1. CLJC compress -> JVM reference decompress
+                      ref-out (byte-array orig-len)
+                      ref-dlen (if (zero? orig-len)
+                                 0
+                                 (.decompress ref-decomp
+                                              ^bytes cljc-compressed 0 (alength ^bytes cljc-compressed)
+                                              ref-out 0 orig-len))
+                      ;; 2. JVM reference compress -> CLJC decompress
+                      max-clen (.maxCompressedLength ref-comp orig-len)
+                      ref-cbuf (byte-array max-clen)
+                      ref-clen (if (zero? orig-len)
+                                 0
+                                 (.compress ref-comp
+                                            ^bytes input-bytes 0 orig-len
+                                            ref-cbuf 0 max-clen))
+                      ref-cbytes (java.util.Arrays/copyOfRange ref-cbuf 0 ref-clen)
+                      cljc-from-ref (fressian/lz4-decompress-block ref-cbytes orig-len)]
+                  (and self-ok?
+                       (= orig-len ref-dlen)
+                       (= (fressian/bytes->hex input-bytes) (fressian/bytes->hex ref-out))
+                       (= (fressian/bytes->hex input-bytes) (fressian/bytes->hex cljc-from-ref))))
+                :cljs self-ok?))))
+
+(deftest test-wire-compression-btec-framing-and-fail-closed
+  (testing "Small payloads (<= 1 KiB) and incompressible payloads stay uncompressed; > 1 KiB compressible payloads use BTEC + 0x01 LZ4 framing"
+    (let [small {:type :vote :epoch 7 :voter "abc"}
+          small-wire (fressian/encode-wire small)
+          _ (is (not (fressian/btec-compressed-frame? small-wire)))
+          _ (is (= small (fressian/decode-wire small-wire)))
+          ;; 1-2 byte Fressian frame starting with 0x42 (Fressian INT_PACKED_2 tag) must NOT be treated as BTEC
+          packed-int-wire (fressian/hex->bytes "4201")
+          _ (is (not (fressian/btec-compressed-frame? packed-int-wire)))
+          _ (is (integer? (fressian/decode-wire packed-int-wire)))
+          ;; Compressible > 1 KiB map
+          large-map {:type :send-propose
+                     :epoch 42
+                     :ancestors (vec (repeat 20 {:proposer "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                                                 :parent-hash "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                                                 :payload [{:type :transfer :amount 5000 :seq 1}]}))}
+          uncomp-wire (fressian/encode-wire-uncompressed large-map)
+          comp-wire (fressian/encode-wire large-map)]
+      (is (> (fressian/count-bytes uncomp-wire) 1024))
+      (is (fressian/btec-compressed-frame? comp-wire))
+      (is (< (fressian/count-bytes comp-wire) (fressian/count-bytes uncomp-wire)))
+      (is (= large-map (fressian/decode-wire comp-wire)))
+      (is (= large-map (fressian/decode-wire uncomp-wire)))))
+
+  (testing "Fail-closed rejection of unknown compression tag, > 1 MiB decompressed size, and truncated/corrupt BTEC frames"
+    ;; 1. Unknown tag 0x02 (GZIP dropped / reserved) fails closed
+    (let [bad-tag-frame (fressian/concat-bytes
+                         (fressian/utf8->bytes "BTEC")
+                         (fressian/hex->bytes "020000010011223344"))]
+      (is (nil? (fressian/decode-wire bad-tag-frame)))
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                            #"Unsupported BTEC compression tag"
+                            (fressian/decode-wire-strict bad-tag-frame))))
+    ;; 2. Claimed orig-len > 1 MiB (0x00200000 = 2 MiB) fails closed
+    (let [bomb-frame (fressian/concat-bytes
+                      (fressian/utf8->bytes "BTEC")
+                      (fressian/hex->bytes "010020000000"))]
+      (is (nil? (fressian/decode-wire bomb-frame)))
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                            #"exceeds 1 MiB"
+                            (fressian/decode-wire-strict bomb-frame))))
+    ;; 3. Truncated BTEC header (< 9 bytes) fails closed
+    (let [trunc-frame (fressian/utf8->bytes "BTEC\u0001\u0000")]
+      (is (nil? (fressian/decode-wire trunc-frame)))
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                            #"Truncated BTEC"
+                            (fressian/decode-wire-strict trunc-frame))))
+    ;; 4. Corrupt LZ4 offset (offset > out-pos) fails closed
+    (let [corrupt-lz4 (fressian/concat-bytes
+                       (fressian/utf8->bytes "BTEC")
+                       (fressian/hex->bytes "01000000201041ff0000"))]
+      (is (nil? (fressian/decode-wire corrupt-lz4)))
+      (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                            #"Corrupt LZ4"
+                            (fressian/decode-wire-strict corrupt-lz4))))))
+

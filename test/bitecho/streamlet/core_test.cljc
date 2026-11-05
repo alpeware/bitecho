@@ -1400,5 +1400,133 @@
         (is (contains? (:finalized-blocks state2-finalized) h4))
         (is (= h4 (:latest-finalized-block-hash state2-finalized)))))))
 
+(defspec ^{:doc "Property (H-3): When consensus state tracks :executed-finalized-blocks, prune-streamlet-state never prunes unexecuted ancestors of :head-hash or :latest-finalized-block-hash back to the executed root, even during and after a > 256-epoch stall."}
+  prop-prune-streamlet-state-preserves-unexecuted-ancestor-chain 50
+  (prop/for-all [stall-epochs (gen/choose 260 360)
+                 sparse-count (gen/choose 2 6)]
+                (let [b1 (core/->Block 1 "genesis" [{:receipt-id "r-1"}] "v1")
+                      h1 (core/hash-block b1)
+                      b2 (core/->Block 2 h1 [{:receipt-id "r-2"}] "v2")
+                      h2 (core/hash-block b2)
+                      b3 (core/->Block 3 h2 [{:receipt-id "r-3"}] "v3")
+                      h3 (core/hash-block b3)
+                      step (max 5 (quot stall-epochs (inc sparse-count)))
+                      sparse-epochs (mapv #(+ 3 (* (inc %) step)) (range sparse-count))
+                      [blocks-map sparse-hashes last-parent]
+                      (reduce (fn [[bm hs parent] ep]
+                                (let [b (core/->Block ep parent [{:receipt-id (str "r-" ep)}] "v1")
+                                      h (core/hash-block b)]
+                                  [(assoc bm h b) (conj hs h) h]))
+                              [{h1 b1 h2 b2 h3 b3} [] h3]
+                              sparse-epochs)
+                      stall-end-epoch (+ 3 stall-epochs)
+                      state-during-stall {:epoch stall-end-epoch
+                                          :config {:streamlet-retention-epochs 256}
+                                          :blocks blocks-map
+                                          :notarized-blocks (into #{h1 h2 h3} sparse-hashes)
+                                          :finalized-blocks #{h1 h2}
+                                          :executed-finalized-blocks #{h1 h2}
+                                          :last-executed-finalized-epoch 2
+                                          :head-hash last-parent
+                                          :latest-finalized-block-hash h2}
+                      pruned-during (core/prune-streamlet-state state-during-stall)
+                      ;; Every unexecuted block h3 + sparse-hashes + executed root h2 must survive during stall
+                      all-survived-during? (every? #(contains? (:blocks pruned-during) %)
+                                                   (into [h2 h3] sparse-hashes))
+                      ;; Old executed block h1 (behind anchor h2 and < cutoff) IS pruned
+                      old-exec-pruned? (not (contains? (:blocks pruned-during) h1))
+                      ;; Now 3 consecutive blocks arrive after the stall to trigger finalization
+                      ep-a (inc stall-end-epoch)
+                      ep-b (+ 2 stall-end-epoch)
+                      ep-c (+ 3 stall-end-epoch)
+                      ba (core/->Block ep-a last-parent [{:receipt-id "r-a"}] "v1")
+                      ha (core/hash-block ba)
+                      bb (core/->Block ep-b ha [{:receipt-id "r-b"}] "v2")
+                      hb (core/hash-block bb)
+                      bc (core/->Block ep-c hb [{:receipt-id "r-c"}] "v3")
+                      hc (core/hash-block bc)
+                      state-recovered (-> pruned-during
+                                          (assoc :epoch ep-c
+                                                 :head-hash hc)
+                                          (update :blocks assoc ha ba hb bb hc bc)
+                                          (update :notarized-blocks conj ha hb hc)
+                                          core/finalize-prefix)]
+                  (and all-survived-during?
+                       old-exec-pruned?
+                       (= hb (:latest-finalized-block-hash state-recovered))
+                       (every? #(contains? (:finalized-blocks state-recovered) %)
+                               (into [h3 ha hb] sparse-hashes))))))
 
-
+(defspec ^{:doc "Property (H-2): :send-propose encoded wire size never exceeds :max-propose-wire-bytes (default 32 KiB) on realistic random receipt payloads, truncates ancestors newest-first contiguously without gaps, and enables slightly-behind receivers to ingest and vote."}
+  prop-propose-wire-budget-and-contiguous-ancestor-truncation 25
+  (prop/for-all [chain-len (gen/choose 6 24)
+                 receipts-per-block (gen/choose 2 6)
+                 wire-budget (gen/elements [8192 16384 32768])]
+                (let [{:keys [pairs peer-hexes peers-map]} (setup-test-nodes 3)
+                      make-realistic-receipt
+                      (fn [ep idx]
+                        (let [rk (crypto/generate-keypair)
+                              r-hex (core/bytes->hex (:public rk))
+                              sig-hex (core/bytes->hex (:private rk))
+                              payload-str (str "{:transfer {:sender \"" r-hex "\" :sig \"" sig-hex "\" :epoch " ep " :seq " idx "}}")]
+                          {:receipt-id (str "transfer:" r-hex ":" ep ":" idx)
+                           :type :transfer
+                           :sender r-hex
+                           :seq (inc idx)
+                           :amount (* 100 (inc idx))
+                           :payload-bytes (mapv long (fressian/utf8->bytes payload-str))}))
+                      built (reduce (fn [{:keys [parent-hash blocks notarized-blocks block-votes block-vote-proofs hashes]} ep]
+                                      (let [proposer-idx (mod ep 3)
+                                            proposer-hex (nth peer-hexes proposer-idx)
+                                            proposer-kp (nth pairs proposer-idx)
+                                            rcpts (mapv #(make-realistic-receipt ep %) (range receipts-per-block))
+                                            blk (core/sign-block (core/->Block ep parent-hash rcpts proposer-hex) (:private proposer-kp))
+                                            bh (core/hash-block blk)
+                                            qv (make-quorum-votes-for-block bh ep pairs peer-hexes)]
+                                        {:parent-hash bh
+                                         :blocks (assoc blocks bh blk)
+                                         :notarized-blocks (conj notarized-blocks bh)
+                                         :block-votes (assoc block-votes bh (:voter-set qv))
+                                         :block-vote-proofs (assoc block-vote-proofs bh (:vote-proofs qv))
+                                         :hashes (conj hashes bh)}))
+                                    {:parent-hash "genesis"
+                                     :blocks {}
+                                     :notarized-blocks #{}
+                                     :block-votes {}
+                                     :block-vote-proofs {}
+                                     :hashes []}
+                                    (range 1 (inc chain-len)))
+                      next-ep (inc chain-len)
+                      leader-idx (mod next-ep 3)
+                      leader-hex (nth peer-hexes leader-idx)
+                      leader-kp (nth pairs leader-idx)
+                      proposer-state (reduce core/record-block-depth
+                                             {:epoch chain-len
+                                              :node-pubkey leader-hex
+                                              :keypair leader-kp
+                                              :peers-map peers-map
+                                              :total-nodes 3
+                                              :config {:max-propose-wire-bytes wire-budget}
+                                              :blocks (:blocks built)
+                                              :notarized-blocks (:notarized-blocks built)
+                                              :block-votes (:block-votes built)
+                                              :block-vote-proofs (:block-vote-proofs built)
+                                              :head-hash (:parent-hash built)
+                                              :mempool (mapv #(make-realistic-receipt next-ep %) (range receipts-per-block))}
+                                             (:hashes built))
+                      tick-res (core/handle-streamlet-event proposer-state {:type :tick})
+                      propose-cmd (first (filter #(= :send-propose (:type %)) (:commands tick-res)))
+                      encoded-propose (fressian/encode-wire propose-cmd)
+                      encoded-size (fressian/count-bytes encoded-propose)
+                      ancestors (:ancestors propose-cmd)
+                      anc-hashes (mapv #(core/hash-block (:block %)) ancestors)
+                      ;; Contiguity check: first ancestor is (:parent-hash (:block propose-cmd)), each subsequent is parent of previous
+                      expected-links (mapv (fn [idx]
+                                             (if (zero? idx)
+                                               (:parent-hash (:block propose-cmd))
+                                               (:parent-hash (:block (nth ancestors (dec idx))))))
+                                           (range (count ancestors)))]
+                  (and (some? propose-cmd)
+                       (<= encoded-size wire-budget)
+                       (<= (count ancestors) 16)
+                       (= anc-hashes expected-links)))))

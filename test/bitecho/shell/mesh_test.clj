@@ -687,7 +687,24 @@
       (is (instance? bitecho.economy.account.AccountState (get-in rebound [:ledger pk-new-agent])))
       (is (= 1000000 (get-in rebound [:ledger pk-new-agent :balance])))
       (is (= 0 (get-in rebound [:ledger pk-new-agent :seq])))
-      (is (= [] (get-in rebound [:ledger pk-new-agent :deps]))))))
+      (is (= [] (get-in rebound [:ledger pk-new-agent :deps])))))
+
+  (testing "rebind-restored-state merges :protocol and :cluster :protocol overrides into :config"
+    (let [kp (crypto/generate-keypair)
+          id-map {:node-id :node-1
+                  :pubkey-hex (basalt/bytes->hex (:public kp))
+                  :privkey-hex (basalt/bytes->hex (:private kp))
+                  :keypair kp}
+          loaded-state {:epoch 100
+                        :config {:max-ancestor-sync-depth 32
+                                 :streamlet-retention-epochs 256}}
+          cfg {:node/id :node-1
+               :protocol {:max-ancestor-sync-depth 16}
+               :cluster {:protocol {:max-propose-wire-bytes 32768}}}
+          rebound (mesh/rebind-restored-state loaded-state cfg id-map)]
+      (is (= 16 (get-in rebound [:config :max-ancestor-sync-depth])))
+      (is (= 32768 (get-in rebound [:config :max-propose-wire-bytes])))
+      (is (= 256 (get-in rebound [:config :streamlet-retention-epochs]))))))
 
 (deftest test-peer-init-malformed-fingerprint-resilient
   (let [temp-dir (.toFile (Files/createTempDirectory "bitecho-malformed-peer-" (into-array FileAttribute [])))
@@ -1395,18 +1412,23 @@
                       min-fin (apply min fin-epochs)
                       max-fin (apply max fin-epochs)
                       expected-skew (- max-fin min-fin)
+                      expected-max-lag (apply max (mapv #(- (long (get-in % [1 :statusz :epoch]))
+                                                            (long (get-in % [1 :statusz :finalized_epoch])))
+                                                        snapshots))
+                      expected-finality-healthy? (and (<= expected-skew 2) (<= expected-max-lag 10))
                       max-failed (apply max (mapv #(get-in % [1 :statusz :failed_receipts]) snapshots))]
                   (and (boolean? (:converged? result))
                        (boolean? (:burn-digest-converged? result))
                        (boolean? (:window-burns-converged? result))
                        (= min-fin (:common-finalized-epoch result))
                        (= expected-skew (:finalized-epoch-skew result))
+                       (= expected-max-lag (get-in result [:soak-summary :max_finalization_lag]))
                        (= max-failed (get-in result [:soak-summary :max_failed_receipts]))
-                       (= (<= expected-skew 2) (get-in result [:soak-summary :finality_healthy?]))
+                       (= expected-finality-healthy? (get-in result [:soak-summary :finality_healthy?]))
                        (= (:converged? result)
                           (and (:window-burns-converged? result)
                                (:burn-digest-converged? result)
-                               (<= expected-skew 2)
+                               expected-finality-healthy?
                                (zero? max-failed)
                                (:accountz-converged? result)))))))
 
@@ -1512,6 +1534,17 @@
       (is (false? (:converged? res)))
       (is (= 3 (:finalized-epoch-skew res)))
       (is (false? (get-in res [:soak-summary :finality_healthy?])))))
+
+  (testing "evaluate-cluster-convergence detects cluster-wide finalization stall (max_finalization_lag > 10 despite skew = 0)"
+    (let [s1 {:statusz {:epoch 24400 :finalized_epoch 23631 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 23631 :window [[23631 100 0]]}}
+          s2 {:statusz {:epoch 24400 :finalized_epoch 23631 :burn_digest "d1" :failed_receipts 0}
+              :burnsz {:anchor-epoch 23631 :window [[23631 100 0]]}}
+          res (mesh/evaluate-cluster-convergence {"node1" s1 "node2" s2})]
+      (is (= 0 (:finalized-epoch-skew res)))
+      (is (= 769 (get-in res [:soak-summary :max_finalization_lag])))
+      (is (false? (get-in res [:soak-summary :finality_healthy?])))
+      (is (false? (:converged? res)))))
 
   (testing "evaluate-cluster-convergence detects failed receipts > 0"
     (let [s1 {:statusz {:finalized_epoch 10 :burn_digest "d1" :failed_receipts 2} ; failed = 2!

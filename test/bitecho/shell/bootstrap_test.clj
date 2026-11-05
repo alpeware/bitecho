@@ -15,8 +15,11 @@
     (is (contains? node :stop-ch))))
 
 (deftest test-cluster-ops-subcommand-inventory
-  (testing "scripts/cluster.sh declares audit subcommand in usage and dispatcher"
+  (testing "scripts/cluster.sh declares audit and verify-e2e subcommands, E2E deploy gates, and max_finalization_lag check"
     (let [script (slurp "scripts/cluster.sh")]
       (is (re-find #"audit\s+Audit /statusz" script))
       (is (re-find #"cmd_audit\(\)" script))
-      (is (re-find #"audit\)\s+cmd_audit" script)))))
+      (is (re-find #"audit\)\s+cmd_audit" script))
+      (is (re-find #"verify-e2e" script))
+      (is (re-find #"run_pre_deploy_e2e_gate" script))
+      (is (re-find #"Max Finalization Lag:" script)))))

@@ -1167,8 +1167,8 @@
    Supports :open (prefers open sessions) or :active (prefers non-closed sessions).
    Fails closed (returns nil) if multiple preferred sessions exist for the counterparty."
   [state cmd-map preference]
-  (let [raw-sid (or (get cmd-map "session_id") (get cmd-map "session")
-                    (:session_id cmd-map) (:session cmd-map))]
+  (let [raw-sid (or (get cmd-map "session_id") (get cmd-map "session-id") (get cmd-map "session")
+                    (:session_id cmd-map) (:session-id cmd-map) (:session cmd-map))]
     (if (and raw-sid (contains? (:sessions state) raw-sid))
       raw-sid
       (let [target (or raw-sid (get cmd-map "peer") (get cmd-map "callee")
@@ -1197,7 +1197,8 @@
 (defn- resolve-accept-session-id
   "Resolves an accept session id from cmd-map or caller identifier in pending-offers."
   [state cmd-map]
-  (let [raw-sid (or (get cmd-map "session_id") (:session_id cmd-map))]
+  (let [raw-sid (or (get cmd-map "session_id") (get cmd-map "session-id")
+                    (:session_id cmd-map) (:session-id cmd-map))]
     (if (and raw-sid (or (contains? (:pending-offers state) raw-sid)
                          (contains? (:sessions state) raw-sid)))
       raw-sid
@@ -1859,57 +1860,60 @@
     (if-not (and session (= "open" (:state session)))
       {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
       (let [pname (pubkey->petname state (:peer session))
-            text (or (get cmd-map "text") (:text cmd-map))
+            text (or (get cmd-map "text") (get cmd-map "message")
+                     (:text cmd-map) (:message cmd-map))
             payload-hex (or (get cmd-map "payload_hex") (get cmd-map "payload-hex")
                             (:payload_hex cmd-map) (:payload-hex cmd-map))
-            payload-bytes (cond (some? text) (fressian/utf8->bytes text)
+            payload-bytes (cond (some? text) (fressian/utf8->bytes (str text))
                                 (some? payload-hex) (basalt/hex->bytes payload-hex)
-                                :else empty-bytes)
-            burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) (if (get state :economy-enabled? true) 500 0)))
-            sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
-            seq-num (inc (:tx-seq session 0))
-            suite (or (:suite session) sealed/suite-v1-chacha20poly1305)
-            sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (fressian/utf8->bytes session-id) suite)
-            msg-payload {:protocol-version current-wire-version
-                         :wire-format current-wire-format
-                         :subnet-id sub-id
-                         :bitecho/type :sealed-message
-                         :session-id session-id
-                         :sender (:pubkey state)
-                         :recipient (:peer session)
-                         :epoch (long (or (:epoch session) (:epoch state) 0))
-                         :seq seq-num
-                         :suite suite
-                         :nonce (basalt/bytes->hex (:nonce sealed))
-                         :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
-            gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt sub-id)
-            max-outbox (long (or (:max-outbox-size state) 64))
-            curr-outbox (or (:outbox session) {})
-            curr-order (or (:outbox-order session) [])
-            next-order (conj curr-order seq-num)
-            next-outbox (assoc curr-outbox seq-num {:seq seq-num :msg-payload msg-payload :burn burn-amt :gossip-env gossip-env})
-            [final-outbox final-order overflow] (if (> (count next-order) max-outbox)
-                                                  (let [overflow (- (count next-order) max-outbox)
-                                                        evicted (subvec next-order 0 overflow)
-                                                        kept (subvec next-order overflow)]
-                                                    [(apply dissoc next-outbox evicted) kept overflow])
-                                                  [next-outbox next-order 0])
-            new-state (cond-> (-> state
-                                  (assoc-in [:sessions session-id :tx-seq] seq-num)
-                                  (assoc-in [:sessions session-id :outbox] final-outbox)
-                                  (assoc-in [:sessions session-id :outbox-order] final-order)
-                                  (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
-                        (pos? overflow)
-                        (update-in [:sessions session-id :outbox-evicted] (fnil + 0) overflow))]
-        {:state new-state
-         :response (cond-> {"ok" true
-                            "session_id" session-id
-                            "seq" seq-num
-                            "bytes_sent" (fressian/count-bytes payload-bytes)
-                            "burn" burn-amt}
-                     pname (assoc "peer_petname" pname))
-         :net-envelopes [gossip-env]
-         :stdout-events []}))))
+                                :else empty-bytes)]
+        (if (zero? (fressian/count-bytes payload-bytes))
+          {:state state :response {"ok" false "error" "empty-payload"} :net-envelopes [] :stdout-events []}
+          (let [burn-amt (long (or (get cmd-map "burn") (:burn cmd-map) (if (get state :economy-enabled? true) 500 0)))
+                sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
+                seq-num (inc (:tx-seq session 0))
+                suite (or (:suite session) sealed/suite-v1-chacha20poly1305)
+                sealed (sealed/seal-message (:tx-key session) seq-num payload-bytes (fressian/utf8->bytes session-id) suite)
+                msg-payload {:protocol-version current-wire-version
+                             :wire-format current-wire-format
+                             :subnet-id sub-id
+                             :bitecho/type :sealed-message
+                             :session-id session-id
+                             :sender (:pubkey state)
+                             :recipient (:peer session)
+                             :epoch (long (or (:epoch session) (:epoch state) 0))
+                             :seq seq-num
+                             :suite suite
+                             :nonce (basalt/bytes->hex (:nonce sealed))
+                             :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
+                gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt sub-id)
+                max-outbox (long (or (:max-outbox-size state) 64))
+                curr-outbox (or (:outbox session) {})
+                curr-order (or (:outbox-order session) [])
+                next-order (conj curr-order seq-num)
+                next-outbox (assoc curr-outbox seq-num {:seq seq-num :msg-payload msg-payload :burn burn-amt :gossip-env gossip-env})
+                [final-outbox final-order overflow] (if (> (count next-order) max-outbox)
+                                                      (let [overflow (- (count next-order) max-outbox)
+                                                            evicted (subvec next-order 0 overflow)
+                                                            kept (subvec next-order overflow)]
+                                                        [(apply dissoc next-outbox evicted) kept overflow])
+                                                      [next-outbox next-order 0])
+                new-state (cond-> (-> state
+                                      (assoc-in [:sessions session-id :tx-seq] seq-num)
+                                      (assoc-in [:sessions session-id :outbox] final-outbox)
+                                      (assoc-in [:sessions session-id :outbox-order] final-order)
+                                      (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
+                            (pos? overflow)
+                            (update-in [:sessions session-id :outbox-evicted] (fnil + 0) overflow))]
+            {:state new-state
+             :response (cond-> {"ok" true
+                                "session_id" session-id
+                                "seq" seq-num
+                                "bytes_sent" (fressian/count-bytes payload-bytes)
+                                "burn" burn-amt}
+                         pname (assoc "peer_petname" pname))
+             :net-envelopes [gossip-env]
+             :stdout-events []}))))))
 
 (defn- exec-inbox [state]
   (let [enriched-msgs (mapv (fn [m]
@@ -2158,7 +2162,7 @@
                              privkey-bytes
                              {:receiver receiver :amount amount :seq seq-num :deps deps}
                              burn-amt)
-                        deliver-payload (vec (fressian/utf8->bytes (pr-str {:transfer (into {} (:transfer res))})))
+                        deliver-payload (mapv long (fressian/utf8->bytes (pr-str {:transfer (into {} (:transfer res))})))
                         deliver-env (wrap-agent-event
                                      {:type :on-deliver
                                       :payload deliver-payload

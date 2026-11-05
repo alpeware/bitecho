@@ -462,6 +462,7 @@
       (if (or (= transport :tcp) (= transport :connect))
         (api/start-tcp! client-node remote-sdp callbacks)
         (api/start! client-node remote-sdp callbacks))
+      (api/set-max-message-size! client-node)
       (let [timeout-ms (long (or (:timeout-ms opts) 4000))]
         (try
           (deref snapshot-promise timeout-ms nil)
@@ -590,6 +591,7 @@
    :last-error nil
    :dropped 0
    :ignored-stale 0
+   :consecutive-send-failures 0
    :validator-id nil
    :validator-cursor 0
    :failover-count 0
@@ -660,6 +662,7 @@
                                   :validator-id (:validator-id event)
                                   :failover-count (+ (long (:failover-count conn 0)) failover-attempts)
                                   :dropped (+ (long (:dropped conn 0)) failed-drop-count)
+                                  :consecutive-send-failures 0
                                   :error nil)
                            (as-> c (reduce push-diagnostic c diag-effects)))]
           [new-conn effects])
@@ -705,6 +708,16 @@
                            (push-diagnostic diag-eff))]
           [new-conn effects])
 
+        :encode-failed
+        (let [err (or (:error event) "encode-failed")
+              diag-eff {:effect :diagnose :reason :encode-failed :error err}
+              new-conn (-> conn
+                           (assoc :last-error err
+                                  :dropped (inc (long (:dropped conn 0)))
+                                  :consecutive-send-failures (inc (long (:consecutive-send-failures conn 0))))
+                           (push-diagnostic diag-eff))]
+          [new-conn [diag-eff]])
+
         :send-failed
         (let [err (or (:error event) "send-failed")
               node-to-close (:node conn)
@@ -722,7 +735,8 @@
                                   :validator-cursor (inc (long (:validator-cursor conn 0)))
                                   :error err
                                   :last-error err
-                                  :dropped (inc (:dropped conn 0)))
+                                  :dropped (inc (:dropped conn 0))
+                                  :consecutive-send-failures (inc (long (:consecutive-send-failures conn 0))))
                            (push-diagnostic diag-eff))]
           [new-conn effects])
 
@@ -796,6 +810,7 @@
              :last_error (:last-error conn)
              :dropped (:dropped conn 0)
              :ignored_stale (:ignored-stale conn 0)
+             :consecutive_send_failures (:consecutive-send-failures conn 0)
              :validator_id (when-let [vid (:validator-id conn)] (name vid))
              :validator_cursor (:validator-cursor conn 0)
              :failover_count (:failover-count conn 0)
@@ -1035,9 +1050,12 @@
     (if (or (= transport :tcp) (= transport :connect))
       (try
         (api/start-tcp! client-node remote-sdp callbacks)
+        (api/set-max-message-size! client-node)
         (catch Exception _
           (deliver connected? :connect-failed)))
-      (api/start! client-node remote-sdp callbacks))
+      (do
+        (api/start! client-node remote-sdp callbacks)
+        (api/set-max-message-size! client-node)))
     (Thread/interrupted)
     (let [timeout-ms (long (or (:timeout-ms opts) 8000))
           res (try
@@ -1051,14 +1069,30 @@
         (do (try (api/close! client-node) (catch Exception _ nil))
             {:ok? false :error "listener-disabled"})
         :else
-        (let [send-fn (fn [env]
+        (let [cb-opts (cond-> {}
+                        (:diagnostics-atom opts) (assoc :diagnostics-atom (:diagnostics-atom opts))
+                        (:diagnose-fn opts) (assoc :diagnose-fn (:diagnose-fn opts)))
+              send-fn (fn [env]
                         (if-let [cid @channel-id]
-                          (try
-                            (let [payload (if (bytes? env) env (fressian/encode-wire env))]
-                              (api/send! client-node payload cid)
-                              true)
-                            (catch Exception _
-                              false))
+                          (let [payload (try
+                                          (if (bytes? env) env (fressian/encode-wire env))
+                                          (catch Throwable t
+                                            (let [err (str "encode-failed: " (or (.getMessage t) (.getSimpleName (class t))))]
+                                              (when-let [ca (:conn-atom opts)]
+                                                (apply-conn-event! ca {:type :encode-failed :error err} cb-opts)
+                                                (sync-conn-diagnostics! (:state-atom opts) ca))
+                                              nil)))]
+                            (if (nil? payload)
+                              false
+                              (try
+                                (api/send! client-node payload cid)
+                                true
+                                (catch Throwable t
+                                  (let [err (str "send-failed: " (or (.getMessage t) (.getSimpleName (class t))))]
+                                    (when-let [ca (:conn-atom opts)]
+                                      (apply-conn-event! ca {:type :send-failed :error err} cb-opts)
+                                      (sync-conn-diagnostics! (:state-atom opts) ca))
+                                    false)))))
                           false))]
           (reset! send-fn-atom send-fn)
           {:ok? true

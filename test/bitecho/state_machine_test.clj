@@ -4214,4 +4214,96 @@
       ;; 2. Never echoes back to sender: zero :send-gossip commands
       (is (empty? (filter #(= :send-gossip (:type %)) (:commands res)))))))
 
+(deftest test-stall-over-256-epochs-and-recover-executes-all-transfers
+  (testing "H-3: When consensus stalls for > 256 epochs (exceeding both 168 frozen-retention and 256 streamlet-retention), unexecuted ancestor blocks and the executed root anchor are preserved during the stall and execute cleanly upon recovery"
+    (let [kp1 (crypto/generate-keypair)
+          kp2 (crypto/generate-keypair)
+          kp3 (crypto/generate-keypair)
+          pub1 (basalt/bytes->hex (:public kp1))
+          pub2 (basalt/bytes->hex (:public kp2))
+          pub3 (basalt/bytes->hex (:public kp3))
+          cfg (assoc config/devnet-config
+                     :genesis-ledger {pub1 (account/map->AccountState {:balance 100000 :seq 0 :deps []})
+                                      pub2 (account/map->AccountState {:balance 100000 :seq 0 :deps []})
+                                      pub3 (account/map->AccountState {:balance 100000 :seq 0 :deps []})}
+                     :peers-map {pub1 (:public kp1) pub2 (:public kp2) pub3 (:public kp3)}
+                     :validators [pub1 pub2 pub3]
+                     :mesh-nodes [pub1 pub2 pub3])
+          s0 (assoc (sm/init-state [] pub1 (assoc cfg :keypair kp1))
+                    :peers-map (:peers-map cfg)
+                    :validators (:validators cfg)
+                    :node-private-key (:private kp1))
+          ;; Phase 1: Past epoch 256 (so genesis is pruned): epochs 301, 302, 303 finalize block 302
+          b301 (streamlet/sign-block (streamlet/->Block 301 "pruned-h300" [] pub1) (:private kp1))
+          h301 (streamlet/hash-block b301)
+          b302 (streamlet/sign-block (streamlet/->Block 302 h301 [] pub2) (:private kp2))
+          h302 (streamlet/hash-block b302)
+          b303 (streamlet/sign-block (streamlet/->Block 303 h302 [] pub3) (:private kp3))
+          h303 (streamlet/hash-block b303)
+          s-fin302 (-> s0
+                       (assoc :epoch 303
+                              :blocks {h301 b301 h302 b302 h303 b303}
+                              :notarized-blocks #{h301 h302 h303}
+                              :executed-finalized-blocks #{"pruned-h300"}
+                              :executed-finalized-blocks-order ["pruned-h300"]
+                              :last-executed-finalized-epoch 300
+                              :head-hash h303)
+                       streamlet/finalize-prefix
+                       sm/execute-finalized-blocks)
+          _ (is (= 302 (:last-executed-finalized-epoch s-fin302)))
+          _ (is (contains? (:executed-finalized-blocks s-fin302) h302))
+          ;; Phase 2: Stage a transfer receipt at epoch 310 (notarized in block b310 extending h303, not yet finalized)
+          tx (account/create-transfer (:private kp1) {:sender pub1 :receiver pub2 :amount 5000 :seq 1 :deps []})
+          tx-bytes (.getBytes (pr-str {:transfer (into {} tx)}) "UTF-8")
+          tx-receipt {:receipt-id (str "transfer:" (basalt/bytes->hex (crypto/sha256 tx-bytes)))
+                      :type :transfer
+                      :sender pub1
+                      :seq 1
+                      :amount 5000
+                      :payload-bytes (vec tx-bytes)}
+          b310 (streamlet/sign-block (streamlet/->Block 310 h303 [tx-receipt] pub1) (:private kp1))
+          h310 (streamlet/hash-block b310)
+          s-with-310 (-> s-fin302
+                         (assoc-in [:blocks h310] b310)
+                         (streamlet/record-block-depth h310)
+                         (update :notarized-blocks conj h310)
+                         (assoc :head-hash h310))
+          ;; Phase 3: Advance ticks across 270 epochs of consensus stall (exceeding both 168 frozen-retention and 256 streamlet-retention)
+          s-stalled (reduce (fn [st _]
+                              (:state (sm/handle-event st {:type :tick :rng (java.util.Random. 7)})))
+                            (assoc s-with-310 :epoch 310)
+                            (range 270))]
+      ;; During the stall (at epoch 580, > 256 epochs after h302 and h310):
+      ;; 1. Executed root anchor h302 must STILL be in :executed-finalized-blocks and :blocks
+      (is (contains? (:executed-finalized-blocks s-stalled) h302))
+      ;; 2. Unexecuted notarized ancestors h303 and h310 must STILL be in :blocks
+      (is (contains? (:blocks s-stalled) h303))
+      (is (contains? (:blocks s-stalled) h310))
+      ;; Phase 4: Recovery — 3 consecutive notarized blocks extending the current head-hash
+      (let [curr-ep (:epoch s-stalled)
+            curr-head (:head-hash s-stalled)
+            ep1 (inc curr-ep)
+            ep2 (+ 2 curr-ep)
+            ep3 (+ 3 curr-ep)
+            br1 (streamlet/sign-block (streamlet/->Block ep1 curr-head [] pub1) (:private kp1))
+            hr1 (streamlet/hash-block br1)
+            br2 (streamlet/sign-block (streamlet/->Block ep2 hr1 [] pub2) (:private kp2))
+            hr2 (streamlet/hash-block br2)
+            br3 (streamlet/sign-block (streamlet/->Block ep3 hr2 [] pub3) (:private kp3))
+            hr3 (streamlet/hash-block br3)
+            s-recovered (-> s-stalled
+                            (assoc :epoch ep3 :head-hash hr3)
+                            (update :blocks assoc hr1 br1 hr2 br2 hr3 br3)
+                            (streamlet/record-block-depth hr1)
+                            (streamlet/record-block-depth hr2)
+                            (streamlet/record-block-depth hr3)
+                            (update :notarized-blocks conj hr1 hr2 hr3)
+                            streamlet/finalize-prefix
+                            sm/execute-finalized-blocks)]
+        ;; Recovery executes the entire unexecuted chain including block 50's transfer!
+        (is (= ep2 (:last-executed-finalized-epoch s-recovered)))
+        (is (= 95000 (:balance (get-in s-recovered [:ledger pub1]))))
+        (is (= 105000 (:balance (get-in s-recovered [:ledger pub2]))))))))
+
+
 

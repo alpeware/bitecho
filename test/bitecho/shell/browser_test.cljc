@@ -816,3 +816,58 @@
            (is (true? (:ok r-send-ok-2)))
            (is (true? (:sent r-send-ok-2)))
            (is (= 2 (:seq r-send-ok-2))))))))
+
+#?(:cljs
+   (deftest browser-refresh-identity-continuity-and-no-private-key-persistence-test
+     (testing "H-5 & A-5: Browser refresh preserves public identity (pubkey & ech1 address) without Frankenstein keypair state and never persists private keys"
+       (reset! browser/*in-memory-idb-store* {})
+       (let [node1 (browser-main/init-node {:peer-id "refresh-node-1" :persist? true})
+             _dash1 (browser-main/init-anchor {:pubkey (get-in @node1 [:light-state :pubkey])})
+             status1 (js->clj (browser-main/get-status node1) :keywordize-keys true)
+             orig-pub (:pubkey status1)
+             orig-addr (get-in (js->clj (browser-main/get-anchor-dashboard) :keywordize-keys true)
+                               [:identity :address])
+             ;; Verify A-5: raw persisted state in IDB has zero private keys
+             raw-stored-bytes (get @browser/*in-memory-idb-store* "light-node-state")
+             decoded-stored (fressian/decode-wire raw-stored-bytes)]
+         (is (string? orig-pub))
+         (is (str/starts-with? (str orig-addr) "ech1"))
+         (is (nil? (:keypair decoded-stored)))
+         (is (nil? (:x25519 decoded-stored)))
+         (is (nil? (get-in decoded-stored [:light-state :private-key])))
+         ;; Simulate browser refresh: a new page load calls init-node + init-anchor, then restores from IndexedDB
+         (let [node2 (browser-main/init-node {:peer-id "refresh-node-2"})
+               _dash2 (browser-main/init-anchor)
+               _ (browser-main/restore-from-indexed-db! node2)
+               status2 (js->clj (browser-main/get-status node2) :keywordize-keys true)
+               dash2-after (js->clj (browser-main/get-anchor-dashboard) :keywordize-keys true)]
+           ;; Public identity (pubkey + ech1 address) must match original identity across refresh
+           (is (= orig-pub (:pubkey status2)))
+           (is (= orig-pub (get-in @node2 [:light-state :pubkey])))
+           (is (= orig-pub (get-in dash2-after [:identity :anchor-pubkey])))
+           (is (= orig-addr (get-in dash2-after [:identity :address])))
+           ;; No Frankenstein state: private-key is nil until hardware recovery
+           (is (nil? (get-in @node2 [:keypair :private-key])))
+           (is (true? (:hardwareLocked status2)))
+           ;; Signing operations fail closed with hardware-unlock-required until unlocked
+           (swap! node2 assoc-in [:conn :phase] :open)
+           (let [offer-locked (js->clj (browser-main/open-channel node2 "axiom" 10 100) :keywordize-keys true)]
+             (is (false? (:ok offer-locked)))
+             (is (= "hardware-unlock-required" (:error offer-locked))))
+           ;; Unlock via YubiKey seed recovery -> updates identity, unlocks signing, and persists new public identity
+           (let [hw-seed (fressian/hex->bytes "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")
+                 rec-res (js->clj (browser-main/recover-from-yubikey hw-seed) :keywordize-keys true)
+                 hw-pub (:public-hex rec-res)
+                 hw-addr (:address rec-res)
+                 ;; Simulate another browser refresh after hardware enrollment
+                 node3 (browser-main/init-node {:peer-id "refresh-node-3"})
+                 _ (browser-main/init-anchor)
+                 _ (browser-main/restore-from-indexed-db! node3)
+                 status3 (js->clj (browser-main/get-status node3) :keywordize-keys true)
+                 dash3 (js->clj (browser-main/get-anchor-dashboard) :keywordize-keys true)
+                 stored-after-hw (fressian/decode-wire (get @browser/*in-memory-idb-store* "light-node-state"))]
+             (is (true? (:ok rec-res)))
+             (is (= hw-pub (:pubkey status3)))
+             (is (= hw-addr (get-in dash3 [:identity :address])))
+             (is (nil? (:keypair stored-after-hw)))
+             (is (nil? (:x25519 stored-after-hw)))))))))

@@ -383,12 +383,32 @@ EDN_EOF
 # Subcommand: deploy
 # ------------------------------------------------------------------------------
 
+run_pre_deploy_e2e_gate() {
+  echo "--> Step 0/8: Running Pre-Deploy E2E Transfer & Finalization Gate (60s bound)..."
+  (cd "${ROOT_DIR}" && timeout 60s clojure \
+    -J--enable-native-access=ALL-UNNAMED \
+    -J--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+    -J--add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+    -Sdeps '{:paths ["src" "test"] :deps {org.clojure/test.check {:mvn/version "1.1.1"}}}' \
+    -M -e "
+    (require '[clojure.test :as t] '[bitecho.wire-negotiation-test :as wnt])
+    (let [res (t/test-vars [#'wnt/test-full-pipeline-browser-transfer-to-validator-finalization-wire-roundtrip])]
+      (when (pos? (+ (:fail res 0) (:error res 0)))
+        (System/exit 1)))")
+  echo "Pre-Deploy E2E Transfer Gate PASSED."
+}
+
 cmd_deploy() {
   local reset_state=false
+  local skip_e2e_gate=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reset-state)
         reset_state=true
+        shift
+        ;;
+      --skip-e2e-gate)
+        skip_e2e_gate=true
         shift
         ;;
       *)
@@ -399,6 +419,13 @@ cmd_deploy() {
   done
 
   echo "=== Deploying Bitecho Devnet to 3-Node Cluster ==="
+
+  if [[ "$skip_e2e_gate" != "true" ]]; then
+    if ! run_pre_deploy_e2e_gate; then
+      echo "Error: Pre-Deploy E2E Transfer Gate FAILED. Aborting deploy before touching any validator node." >&2
+      return 1
+    fi
+  fi
 
   # 1. Build local uberjar
   echo "--> Step 1/7: Building target/bitecho.jar locally..."
@@ -795,6 +822,18 @@ SERVICE_UNIT
     return 1
   fi
 
+  if [[ "$skip_e2e_gate" != "true" ]]; then
+    echo "--> Step 8/8: Running Post-Deploy Live E2E Transfer & Finality Confirmation Gate..."
+    if ! cmd_fund "${CUSTODY_PUB}" 1; then
+      echo "Error: Post-deploy live E2E transfer gate failed to finalize within timeout." >&2
+      return 1
+    fi
+    if ! cmd_audit; then
+      echo "Error: Post-deploy cluster convergence audit failed." >&2
+      return 1
+    fi
+  fi
+
   echo ""
   echo "================================================================================"
   echo "Bitecho Devnet deployment complete! Run './scripts/cluster.sh status' to inspect."
@@ -1046,6 +1085,7 @@ for n, d in data.items():
 
 all_ok = True
 fin_epochs = {}
+fin_lags = {}
 minted_vals = {}
 burn_digests = {}
 failed_rcpts = {}
@@ -1053,8 +1093,14 @@ failed_rcpts = {}
 for n in nodes:
     st = parsed.get(n, {})
     ep = st.get('epoch', 'N/A')
+    try:
+        ep_int = int(ep)
+    except Exception:
+        ep_int = 0
     fin_ep = int(st.get('finalized_epoch', 0))
     fin_epochs[n] = fin_ep
+    fin_lag = max(0, ep_int - fin_ep)
+    fin_lags[n] = fin_lag
     minted = int(st.get('minted', 0))
     minted_vals[n] = minted
     bdig = st.get('burn_digest', 'N/A')
@@ -1065,7 +1111,7 @@ for n in nodes:
     stale = st.get('conn_stale', '0')
     rss = data[n]['rss']
     
-    node_ok = (failed == 0)
+    node_ok = (failed == 0 and fin_lag <= 10)
     if not node_ok:
         all_ok = False
     
@@ -1074,6 +1120,7 @@ for n in nodes:
 min_fin = min(fin_epochs.values())
 max_fin = max(fin_epochs.values())
 skew = max_fin - min_fin
+max_fin_lag = max(fin_lags.values()) if fin_lags else 0
 minted_skew = max(minted_vals.values()) - min(minted_vals.values())
 
 node_windows = {}
@@ -1162,6 +1209,7 @@ treasury_sla_ok = (skew <= 2 and max(failed_rcpts.values()) == 0 and (minted_ske
 print('\n--- Convergence & Soak Assessment ---')
 print(f'Common Finalized Epoch: {min_fin}')
 print(f'Finalized Epoch Skew:   {skew} (healthy <= 2)')
+print(f'Max Finalization Lag:   {max_fin_lag} (healthy <= 10)')
 print(f'Minted Values / Skew:   {minted_vals} (skew={minted_skew})')
 print(f'Burn Digest Parity:     {\"PASSED\" if not digest_mismatch else \"FAILED\"}')
 print(f'Accountz Ledger Parity: {\"PASSED\" if not accountz_mismatch else \"FAILED\"}')
@@ -1170,7 +1218,7 @@ print(f'Failed Receipts Max:    {max(failed_rcpts.values())} (healthy == 0)')
 print(f'Treasury SLA Status:    {\"PASSED\" if treasury_sla_ok else \"FAILED\"} (configured_k_bps={k_bps_str}/5000, redundant_validators={len(nodes)}/3)')
 print(f'Wire Protocol Version:  {wire_ver_str} ({\"CONVERGED\" if wire_converged else \"DIVERGED\"})')
 
-if skew > 2 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch or not treasury_sla_ok or not wire_converged:
+if skew > 2 or max_fin_lag > 10 or digest_mismatch or mismatches or max(failed_rcpts.values()) > 0 or accountz_mismatch or not treasury_sla_ok or not wire_converged:
     print('\nVerdict: DIVERGENCE DETECTED')
     sys.exit(1)
 else:
@@ -1485,7 +1533,8 @@ Usage:
 
 Commands:
   init                                Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
-  deploy [--reset-state]              Build local uberjar, sync configs/keys/binaries, and restart bitecho services
+  deploy [--reset-state]              Build local uberjar, run pre/post-deploy E2E transfer gates, sync configs, and restart
+  verify-e2e                          Run pre-deploy E2E transfer & 3-epoch Streamlet finalization gate (60s bound)
   status                              Display live status table across all 3 cluster nodes
   audit                               Audit /statusz, /burnsz, /accountz, /connz, and memory convergence across all 3 nodes
   simulate [--agents N] [--messages M] [--burn B] Run light agent swarm simulator against Devnet
@@ -1520,6 +1569,9 @@ main() {
       ;;
     deploy)
       cmd_deploy "$@"
+      ;;
+    verify-e2e|verify_e2e)
+      run_pre_deploy_e2e_gate "$@"
       ;;
     status)
       cmd_status "$@"

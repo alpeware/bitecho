@@ -340,7 +340,7 @@
                      (let [p (:payload base-event)
                            p-bytes (cond
                                      (bytes? p) p
-                                     (sequential? p) (byte-array (map byte p))
+                                     (sequential? p) (byte-array (map unchecked-byte p))
                                      :else nil)]
                        (when p-bytes
                          (let [p-data (or (try (let [v (fressian/decode p-bytes)]
@@ -554,10 +554,15 @@
                                            m-with-acct))))
                                    loaded-ledger
                                    genesis-ledger)
-                        loaded-ledger)]
+                        loaded-ledger)
+        merged-config (merge (or (:config loaded-state) {})
+                             (get config :protocol {})
+                             (get cluster-cfg :protocol {})
+                             overrides)]
     (merge loaded-state
            overrides
-           {:node-pubkey pubkey-hex
+           {:config merged-config
+            :node-pubkey pubkey-hex
             :node-private-key privkey-bytes
             :keypair (:keypair identity)
             :last-executed-finalized-epoch (long (or (:last-executed-finalized-epoch loaded-state)
@@ -1096,6 +1101,7 @@
      :soak-summary {:max_failed_receipts 0
                     :total_conn_dropped 0
                     :total_conn_stale 0
+                    :max_finalization_lag 0
                     :finality_healthy? true}
      :converged? true}
     (let [parsed-snapshots
@@ -1108,6 +1114,8 @@
                              fin-epoch (long (or (:finalized_epoch st-map)
                                                  (get-in snap [:burnsz :anchor-epoch])
                                                  0))
+                             curr-epoch (long (or (:epoch st-map) fin-epoch))
+                             fin-lag (max 0 (- curr-epoch fin-epoch))
                              minted (long (or (:minted st-map) 0))
                              burn-digest (:burn_digest st-map)
                              failed-rcpts (long (or (:failed_receipts st-map) 0))
@@ -1122,6 +1130,7 @@
                                :accountz (:accountz snap)
                                :connz (:connz snap)
                                :fin-epoch fin-epoch
+                               :fin-lag fin-lag
                                :minted minted
                                :burn-digest burn-digest
                                :failed-rcpts failed-rcpts
@@ -1197,9 +1206,14 @@
           max-failed (if (seq (vals parsed-snapshots))
                        (apply max (map :failed-rcpts (vals parsed-snapshots)))
                        0)
+          max-fin-lag (if (seq (vals parsed-snapshots))
+                        (apply max (map :fin-lag (vals parsed-snapshots)))
+                        0)
+          max-allowed-lag (long (or (:max-finalization-lag opts) 10))
           total-dropped (reduce + 0 (map :conn-drop (vals parsed-snapshots)))
           total-stale (reduce + 0 (map :conn-stale (vals parsed-snapshots)))
-          finality-healthy? (<= fin-epoch-skew 2)
+          finality-healthy? (and (<= fin-epoch-skew 2)
+                                 (<= max-fin-lag max-allowed-lag))
 
           ;; Wire protocol version convergence check (rolling upgrade window <= 1)
           wire-versions (vec (keep (fn [[_ snap]]
@@ -1229,6 +1243,7 @@
           soak-summary {:max_failed_receipts max-failed
                         :total_conn_dropped total-dropped
                         :total_conn_stale total-stale
+                        :max_finalization_lag max-fin-lag
                         :finality_healthy? finality-healthy?}
 
           converged? (and window-burns-converged?
@@ -1643,6 +1658,7 @@
                                                    {:type :on-close :generation next-gen :node node :peer pid}))}]
           (try
             (api/start! node remote-sdp callbacks)
+            (api/set-max-message-size! node)
             (catch Exception e
               (apply-mesh-conn-event! peer-conns peer-hex
                                       {:type :dial-failed :generation next-gen :node node :peer pid :error (or (.getMessage e) "start-failed")})
@@ -1737,6 +1753,7 @@
      (let [conn-key (atom [:anon (System/identityHashCode agent-node)])
            init-gen (inc (long (reduce max 0 (map #(long (or (:generation %) 0)) (vals (or (when agent-conns (deref agent-conns)) {}))))))
            node-gen (atom init-gen)]
+       (try (api/set-max-message-size! agent-node) (catch Exception _ nil))
        (when agent-conns
          (apply-mesh-conn-event! agent-conns @conn-key
                                  {:type :accept-started :generation @node-gen :node agent-node :channel-id 0}))

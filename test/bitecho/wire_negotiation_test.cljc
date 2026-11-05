@@ -11,10 +11,17 @@
      directory descriptor suite binding, and mid-session suite switching rejection.
    - Live cross-runtime JVM <-> Node AEAD and wire envelope interop."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
+            [bitecho.economy.account :as account]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-node]
+            [bitecho.rendezvous.core :as rendezvous]
+            #?(:clj [bitecho.shell.mesh :as mesh])
+            [bitecho.sieve.core :as sieve]
+            [bitecho.state-machine :as sm]
+            [bitecho.streamlet.core :as streamlet]
             #?(:clj [taoensso.nippy :as nippy])
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
@@ -93,10 +100,12 @@
           dec-jvm-str (fressian/decode-wire jvm-str-fixture)
           dec-jvm-bytes (fressian/decode-wire jvm-bytes-fixture)]
       #?(:clj (do
-                (is (= (basalt/bytes->hex (fressian/encode-wire expected-str))
+                (is (= (basalt/bytes->hex (fressian/encode-wire-uncompressed expected-str))
                        (basalt/bytes->hex jvm-str-fixture)))
-                (is (= (basalt/bytes->hex (fressian/encode-wire (byte-array 66000 (byte 42))))
-                       (basalt/bytes->hex jvm-bytes-fixture)))))
+                (is (= (basalt/bytes->hex (fressian/encode-wire-uncompressed (byte-array 66000 (byte 42))))
+                       (basalt/bytes->hex jvm-bytes-fixture)))
+                (is (fressian/btec-compressed-frame? (fressian/encode-wire expected-str)))
+                (is (= expected-str (fressian/decode-wire (fressian/encode-wire expected-str))))))
       (is (= 66000 (count dec-jvm-str)))
       (is (= expected-str dec-jvm-str))
       (is (fressian/bytes? dec-jvm-bytes))
@@ -104,14 +113,20 @@
 
 #?(:clj
    (deftest test-wire-codec-jvm-data-fressian-chunk-tags
-     (testing "JVM org.clojure.data.fressian outputs chunk tags 0xCA (226) and 0xCE (216) on >65536 inputs"
+     (testing "JVM org.clojure.data.fressian outputs chunk tags 0xCA (226) and 0xCE (216) on >65536 inputs and encode-wire wraps with BTEC LZ4"
        (let [large-str (apply str (repeat 6600 "0123456789"))
              large-bytes (byte-array 66000 (byte 42))
+             raw-str (fressian/encode-wire-uncompressed large-str)
+             raw-bytes (fressian/encode-wire-uncompressed large-bytes)
              enc-str (fressian/encode-wire large-str)
              enc-bytes (fressian/encode-wire large-bytes)]
-         (is (= 226 (bit-and 0xFF (aget ^bytes enc-str 0))))
-         (is (= 216 (bit-and 0xFF (aget ^bytes enc-bytes 0))))
+         (is (= 226 (bit-and 0xFF (aget ^bytes raw-str 0))))
+         (is (= 216 (bit-and 0xFF (aget ^bytes raw-bytes 0))))
+         (is (fressian/btec-compressed-frame? enc-str))
+         (is (fressian/btec-compressed-frame? enc-bytes))
+         (is (= large-str (fressian/decode-wire raw-str)))
          (is (= large-str (fressian/decode-wire enc-str)))
+         (is (= 66000 (count (fressian/decode-wire raw-bytes))))
          (is (= 66000 (count (fressian/decode-wire enc-bytes))))))))
 
 (deftest test-wire-codec-chunked-string
@@ -557,3 +572,304 @@
              exit (.waitFor proc)]
          (is (zero? exit))
          (is (= pt-str node-out))))))
+
+;; =============================================================================
+;; 8. H-1 / A-1 / A-2 / A-7: Complete Envelope Inventory & Full-Pipeline E2E Wire Tests
+;; =============================================================================
+
+(defspec ^{:doc "H-1/A-2: Generative round-trip over all light-node outbound/inbound envelope types through encode-wire and decode-wire."}
+  prop-all-light-node-envelopes-wire-roundtrip
+  25
+  (for-all [amount (gen/choose 100 5000)
+            burn (gen/choose 100 1000)
+            price (gen/choose 5 50)
+            msg-text (gen/not-empty gen/string-alphanumeric)]
+           (let [alice-kp (crypto/generate-keypair)
+                 bob-kp (crypto/generate-keypair)
+                 val-kp (crypto/generate-keypair)
+                 alice-pub (basalt/bytes->hex (:public alice-kp))
+                 bob-pub (basalt/bytes->hex (:public bob-kp))
+                 val-pub (basalt/bytes->hex (:public val-kp))
+                 bootstrap {:network :devnet
+                            :nodes {:node1 {:pubkey val-pub :ip "127.0.0.1" :port 5000 :agent-port 5010}}}
+                 st-alice (-> (light-node/init-light-state {:pubkey-hex alice-pub} {:bootstrap bootstrap})
+                              (assoc :epoch 10
+                                     :account {:balance 1000000 :spendable 1000000 :seq 0 :deps []}))
+                 st-bob (-> (light-node/init-light-state {:pubkey-hex bob-pub} {:bootstrap bootstrap})
+                            (assoc :epoch 10
+                                   :account {:balance 1000000 :spendable 1000000 :seq 0 :deps []}))
+          ;; 1. register-home-set
+                 r-hs (light-node/handle-command st-alice {"cmd" "register-home-set" "price" price "burn" burn} (:private alice-kp))
+          ;; 2. offer + accept + send + close
+                 r-off (light-node/handle-command (:state r-hs) {"cmd" "offer" "callee" bob-pub "price" price "burn" burn} (:private alice-kp))
+                 sid (get-in r-off [:response "session_id"])
+                 off-gossip (first (:net-envelopes r-off))
+                 st-bob-with-off (:state (light-node/handle-wire-payload st-bob (fressian/decode-wire (fressian/encode-wire off-gossip)) (:private bob-kp)))
+                 r-acc (light-node/handle-command st-bob-with-off {"cmd" "accept" "session_id" sid} (:private bob-kp))
+                 acc-gossip (first (:net-envelopes r-acc))
+                 st-alice-open (:state (light-node/handle-wire-payload (:state r-off) (fressian/decode-wire (fressian/encode-wire acc-gossip)) (:private alice-kp)))
+                 r-send (light-node/handle-command st-alice-open {"cmd" "send" "session_id" sid "text" msg-text "burn" burn} (:private alice-kp))
+                 r-close (light-node/handle-command (:state r-send) {"cmd" "close" "session_id" sid} (:private alice-kp))
+          ;; 3. transfer
+                 r-tf (light-node/handle-command st-alice {"cmd" "transfer" "receiver" bob-pub "amount" amount "burn" burn} (:private alice-kp))
+          ;; 4. settle-intent, lock-intent, release-intent, refund-intent
+                 r-settle (light-node/handle-command st-alice {"cmd" "settle-intent" "receiver" bob-pub "amount" amount} (:private alice-kp))
+                 preimage "secret-preimage-123"
+                 deliv-hash (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes preimage)))
+                 r-lock (light-node/handle-command st-alice {"cmd" "lock-intent" "receiver" bob-pub "amount" amount
+                                                             "deliverable_hash" deliv-hash "expires_epoch" 50}
+                                                   (:private alice-kp))
+                 escrow-id (get-in r-lock [:response "escrow_id"])
+                 r-release (light-node/handle-command (:state r-lock) {"cmd" "release-intent" "escrow_id" escrow-id "preimage" preimage} (:private bob-kp))
+                 r-refund (light-node/handle-command (:state r-lock) {"cmd" "refund-intent" "escrow_id" escrow-id} (:private alice-kp))
+          ;; 5. submit-vouchers
+                 ack-v (rendezvous/create-delivery-ack (:private bob-kp) bob-pub :node1 10 "offer-hash-1" 1 price)
+                 st-with-v (assoc st-alice :vouchers [(into {} ack-v)])
+                 r-vouch (light-node/handle-command st-with-v {"cmd" "submit-vouchers"} (:private alice-kp))
+          ;; 6. rendezvous-offer + rendezvous-accept
+                 r-rv-off (light-node/handle-command st-alice {"cmd" "rendezvous-offer" "callee" bob-pub "burn" burn "topic" "chat"} (:private alice-kp))
+                 rv-off-env (first (:net-envelopes r-rv-off))
+                 st-bob-rv (:state (light-node/handle-wire-payload st-bob (fressian/decode-wire (fressian/encode-wire rv-off-env)) (:private bob-kp)))
+                 r-rv-acc (light-node/handle-command st-bob-rv {"cmd" "rendezvous-accept" "from" alice-pub} (:private bob-kp))
+          ;; 7. query-chain-state + chain-state-snapshot
+                 qcs-env (light-node/build-chain-state-query-envelope alice-pub (:private alice-kp) {:nonce "n-1" :epoch 10})
+                 snap-env (light-node/sign-chain-state-snapshot
+                           {:pubkey alice-pub :validator-pubkey val-pub :finalized-epoch 10
+                            :balance 900000 :spendable 900000 :seq 1 :deps ["d1"] :escrows [] :nonce "n-1"}
+                           (:private val-kp))
+                 all-envelopes (concat (:net-envelopes r-hs)
+                                       (:net-envelopes r-off)
+                                       (:net-envelopes r-acc)
+                                       (:net-envelopes r-send)
+                                       (:net-envelopes r-close)
+                                       (:net-envelopes r-tf)
+                                       (:net-envelopes r-settle)
+                                       (:net-envelopes r-lock)
+                                       (:net-envelopes r-release)
+                                       (:net-envelopes r-refund)
+                                       (:net-envelopes r-vouch)
+                                       (:net-envelopes r-rv-off)
+                                       (:net-envelopes r-rv-acc)
+                                       [qcs-env snap-env])]
+             (and (>= (count all-envelopes) 16)
+                  (every? (fn [env]
+                            (let [wire-bytes (fressian/encode-wire env)
+                                  decoded (fressian/decode-wire wire-bytes)]
+                              (and (fressian/bytes? wire-bytes)
+                                   (pos? (fressian/count-bytes wire-bytes))
+                                   (map? decoded))))
+                          all-envelopes)))))
+
+(defspec ^{:doc "H-1/A-2: Generative round-trip over all 12 validator outbound commands through encode-wire, decode-wire, and state-machine receive handlers."}
+  prop-all-validator-commands-wire-roundtrip
+  25
+  (for-all [ep (gen/choose 1 50)
+            amount (gen/choose 100 5000)]
+           (let [kp1 (crypto/generate-keypair)
+                 kp2 (crypto/generate-keypair)
+                 pub1 (basalt/bytes->hex (:public kp1))
+                 pub2 (basalt/bytes->hex (:public kp2))
+                 sieve-msg (sieve/wrap-message (fressian/utf8->bytes "gossip-msg") (:private kp1) (:public kp1) 100)
+                 tx (account/create-transfer (:private kp1) {:sender pub1 :receiver pub2 :amount amount :seq 1 :deps []})
+                 tx-bytes (fressian/utf8->bytes (pr-str {:transfer (into {} tx)}))
+                 tx-receipt {:receipt-id (str "transfer:" (basalt/bytes->hex (crypto/sha256 tx-bytes)))
+                             :type :transfer
+                             :sender pub1
+                             :seq 1
+                             :amount amount
+                             :payload-bytes (mapv long tx-bytes)}
+                 blk (streamlet/sign-block (streamlet/->Block ep "genesis" [tx-receipt] pub1) (:private kp1))
+                 bhash (streamlet/hash-block blk)
+                 vote (streamlet/->Vote bhash ep (basalt/bytes->hex (crypto/sign (:private kp1) (fressian/utf8->bytes bhash))))
+                 ack-v (rendezvous/create-delivery-ack (:private kp2) pub2 :node1 ep "offer-h" 1 10)
+                 commands [{:type :send-gossip :targets [pub2] :message sieve-msg}
+                           {:type :send-sieve-echo :targets [pub2] :message-id "m1" :sender pub1 :signature (fressian/utf8->bytes "sig")}
+                           {:type :send-contagion-ready :targets [pub2] :message-id "m1" :sender pub1 :signature (fressian/utf8->bytes "sig")}
+                           {:type :send-summary :target pub2 :summary ["m1" "m2"] :epoch ep}
+                           {:type :send-subscribe :targets [pub2] :roles {:murmur true :sieve true :contagion true}}
+                           {:type :send-push-view :target pub2 :view [pub1 pub2]}
+                           {:type :send-pull-request :target pub2 :missing-ids ["m1"]}
+                           {:type :send-propose :targets [pub2] :block blk :ancestors [] :notarized-votes {}}
+                           {:type :send-vote :targets [pub2] :vote vote}
+                           {:type :send-transcript-sig :targets [pub2] :epoch ep :digest "dig-1" :voter pub1 :signature "ab12"}
+                           {:type :send-voucher :target pub2 :voucher ack-v}
+                           {:type :forward-rendezvous-offer :target pub2 :offer {:offer-hash "oh1" :caller pub1 :callee pub2 :epoch ep}}]
+                 cfg (assoc config/devnet-config
+                            :peers-map {pub1 (:public kp1) pub2 (:public kp2)}
+                            :validators [pub1 pub2]
+                            :mesh-nodes [pub1 pub2])
+                 val-state (assoc (sm/init-state [] pub2 (assoc cfg :keypair kp2))
+                                  :keypair kp2
+                                  :peers-map (:peers-map cfg)
+                                  :validators (:validators cfg)
+                                  :node-private-key (:private kp2))]
+             (every? (fn [cmd]
+                       (let [wire-bytes (fressian/encode-wire cmd)
+                             decoded (fressian/decode-wire wire-bytes)
+                             recv-type (if (= (:type decoded) :forward-rendezvous-offer)
+                                         :receive-offer-header
+                                         (keyword (str "receive-" (subs (name (:type decoded)) 5))))
+                             recv-evt (-> decoded
+                                          (dissoc :targets :target)
+                                          (assoc :type recv-type :sender pub1))
+                             handled (sm/handle-event val-state recv-evt)]
+                         (and (fressian/bytes? wire-bytes)
+                              (map? decoded)
+                              (map? (:state handled)))))
+                     commands))))
+
+(deftest test-full-pipeline-browser-transfer-to-validator-finalization-wire-roundtrip
+  (testing "H-1/A-1/A-7: Full E2E transfer pipeline (light-node transfer -> encode-wire -> decode-wire -> validator staging -> 3-epoch Streamlet finalization -> chain-state-snapshot quorum sync)"
+    (let [alice-kp (crypto/generate-keypair)
+          bob-kp (crypto/generate-keypair)
+          v1-kp (crypto/generate-keypair)
+          v2-kp (crypto/generate-keypair)
+          v3-kp (crypto/generate-keypair)
+          alice-pub (basalt/bytes->hex (:public alice-kp))
+          bob-pub (basalt/bytes->hex (:public bob-kp))
+          v1-pub (basalt/bytes->hex (:public v1-kp))
+          v2-pub (basalt/bytes->hex (:public v2-kp))
+          v3-pub (basalt/bytes->hex (:public v3-kp))
+          validators (vec (sort [v1-pub v2-pub v3-pub]))
+          kp-by-pub {v1-pub v1-kp v2-pub v2-kp v3-pub v3-kp}
+          peers-map {v1-pub (:public v1-kp)
+                     v2-pub (:public v2-kp)
+                     v3-pub (:public v3-kp)}
+          genesis-ledger {alice-pub (account/map->AccountState {:balance 100000 :seq 0 :deps []})
+                          bob-pub (account/map->AccountState {:balance 0 :seq 0 :deps []})}
+          val-cfg (assoc config/devnet-config
+                         :genesis-ledger genesis-ledger
+                         :peers-map peers-map
+                         :validators validators
+                         :mesh-nodes validators)
+          init-val (fn [pub]
+                     (let [kp (get kp-by-pub pub)]
+                       (assoc (sm/init-state [] pub (assoc val-cfg :keypair kp))
+                              :keypair kp
+                              :peers-map peers-map
+                              :validators validators
+                              :node-private-key (:private kp))))
+          v-states0 {v1-pub (init-val v1-pub)
+                     v2-pub (init-val v2-pub)
+                     v3-pub (init-val v3-pub)}
+          bootstrap {:network :devnet
+                     :nodes {:node1 {:pubkey v1-pub :ip "127.0.0.1" :port 5000 :agent-port 5010}
+                             :node2 {:pubkey v2-pub :ip "127.0.0.1" :port 5002 :agent-port 5012}
+                             :node3 {:pubkey v3-pub :ip "127.0.0.1" :port 5004 :agent-port 5014}}}
+          alice-st0 (-> (light-node/init-light-state {:pubkey-hex alice-pub} {:bootstrap bootstrap})
+                        (assoc :account {:balance 100000 :spendable 100000 :seq 0 :deps []}))
+          ;; Step 1: Alice executes transfer command
+          tf-res (light-node/handle-command alice-st0
+                                            {"cmd" "transfer"
+                                             "receiver" bob-pub
+                                             "amount" 25000
+                                             "seq" 1
+                                             "burn" 500}
+                                            (:private alice-kp))
+          _ (is (true? (get-in tf-res [:response "ok"])))
+          _ (is (= 2 (count (:net-envelopes tf-res))))
+          ;; Step 2: Encode and decode every outbound light-node envelope via encode-wire / decode-wire
+          wire-envelopes (mapv (fn [env]
+                                 (let [wire-bytes (fressian/encode-wire env)
+                                       decoded (fressian/decode-wire wire-bytes)]
+                                   (is (fressian/bytes? wire-bytes))
+                                   (is (map? decoded))
+                                   #?(:clj (let [unwrapped (mesh/unwrap-authenticated-agent-event wire-bytes)]
+                                             (is (some? unwrapped))
+                                             unwrapped)
+                                      :cljs (assoc (:event decoded)
+                                                   :sender (:agent-pubkey decoded)
+                                                   :sender-pubkey-bytes (basalt/hex->bytes (:agent-pubkey decoded))))))
+                               (:net-envelopes tf-res))
+          ;; Step 3: Deliver both unwrapped events to all 3 validators
+          v-states-staged (into {}
+                                (map (fn [[vpub vst]]
+                                       [vpub (reduce (fn [st ev]
+                                                       (:state (sm/handle-event st ev)))
+                                                     vst
+                                                     wire-envelopes)]))
+                                v-states0)
+          _ (is (= 2 (count (:pending-receipts (get v-states-staged v1-pub)))))
+          ;; Step 4: Run 3 consecutive epochs of Streamlet consensus with encode-wire/decode-wire on every propose and vote
+          v-states-finalized
+          (reduce (fn [v-map ep]
+                    (let [leader (nth validators (mod ep (count validators)))
+                          leader-kp (get kp-by-pub leader)
+                          leader-st (get v-map leader)
+                          parent-hash (:head-hash leader-st)
+                          receipts (vec (:pending-receipts leader-st))
+                          blk (streamlet/sign-block (streamlet/->Block ep parent-hash receipts leader) (:private leader-kp))
+                          propose-cmd {:type :send-propose
+                                       :targets validators
+                                       :block blk
+                                       :ancestors (streamlet/extract-notarized-ancestors leader-st parent-hash 16)
+                                       :notarized-votes {}}
+                          ;; Wire round-trip the propose command!
+                          decoded-propose (fressian/decode-wire (fressian/encode-wire propose-cmd))
+                          propose-evt (-> decoded-propose
+                                          (dissoc :targets)
+                                          (assoc :type :receive-propose :sender leader))
+                          ;; Deliver propose to all validators and collect votes
+                          after-propose (into {}
+                                              (map (fn [[vpub vst]]
+                                                     (let [res (sm/handle-event (assoc vst :epoch ep) propose-evt)]
+                                                       [vpub res])))
+                                              v-map)
+                          votes (mapcat (fn [[vpub res]]
+                                          (keep (fn [cmd]
+                                                  (when (= :send-vote (:type cmd))
+                                                    ;; Wire round-trip each vote command!
+                                                    (let [dec-vote (fressian/decode-wire (fressian/encode-wire cmd))]
+                                                      {:type :receive-vote
+                                                       :sender vpub
+                                                       :vote (:vote dec-vote)})))
+                                                (:commands res)))
+                                        after-propose)]
+                      ;; Deliver all votes to all validators
+                      (into {}
+                            (map (fn [[vpub res]]
+                                   [vpub (reduce (fn [st v-evt]
+                                                   (:state (sm/handle-event st v-evt)))
+                                                 (:state res)
+                                                 votes)]))
+                            after-propose)))
+                  v-states-staged
+                  [1 2 3])]
+      ;; Step 5: Verify all 3 validators finalized epoch 2 and executed Alice's 25,000 ECH transfer!
+      (doseq [[_vpub vst] v-states-finalized]
+        (is (= 2 (:last-executed-finalized-epoch vst)))
+        ;; Alice: 100000 - 500 (gossip burn) - 25000 (transfer) = 74500
+        (is (= 74500 (:balance (get-in vst [:ledger alice-pub]))))
+        (is (= 1 (:seq (get-in vst [:ledger alice-pub]))))
+        ;; Bob: 0 + 25000 = 25000
+        (is (= 25000 (:balance (get-in vst [:ledger bob-pub])))))
+      ;; Step 6: Build signed :chain-state-snapshot from all 3 validators, wire-roundtrip, and verify light-node quorum sync
+      (let [wire-snaps (mapv (fn [vpub]
+                               (let [vst (get v-states-finalized vpub)
+                                     vkp (get kp-by-pub vpub)
+                                     acct (get-in vst [:ledger alice-pub])
+                                     snap (light-node/sign-chain-state-snapshot
+                                           {:pubkey alice-pub
+                                            :validator-pubkey vpub
+                                            :finalized-epoch (:last-executed-finalized-epoch vst)
+                                            :balance (:balance acct)
+                                            :spendable (:balance acct)
+                                            :seq (:seq acct)
+                                            :deps (:deps acct)
+                                            :escrows []
+                                            :nonce "sync-1"}
+                                           (:private vkp))]
+                                 (fressian/decode-wire (fressian/encode-wire snap))))
+                             validators)
+            quorum-res (light-node/verify-chain-state-quorum
+                        wire-snaps
+                        {:expected-pubkey alice-pub
+                         :expected-nonce "sync-1"
+                         :trusted-validators (set validators)
+                         :quorum-size 2})
+            _ (is (true? (:ok? quorum-res)))
+            alice-synced (light-node/apply-verified-chain-state-snapshot (:state tf-res) (:snapshot quorum-res))]
+        (is (= 74500 (get-in alice-synced [:account :balance])))
+        (is (= 74500 (get-in alice-synced [:account :spendable])))
+        (is (= 1 (get-in alice-synced [:account :seq])))))))
+

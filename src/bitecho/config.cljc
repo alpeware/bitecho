@@ -52,6 +52,10 @@
 
    ;; Sieve / Contagion signed control frames
    :require-signed-control-frames true
+   ;; Streamlet ancestor sync & propose wire budget (H-2)
+   :max-ancestor-sync-depth       16
+   :max-propose-wire-bytes        32768
+   :max-receipts-per-block        32
    ;; TURN relay configuration (host, port, credentials, force-relay)
    :turn-config                  nil})
 

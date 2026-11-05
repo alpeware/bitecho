@@ -89,7 +89,8 @@
     :else x))
 
 (defn- apply-hardware-identity!
-  "Applies a recovered hardware identity map to anchor-state-atom and active-node-atom."
+  "Applies a recovered hardware identity map to anchor-state-atom and active-node-atom,
+   and persists the sanitized public state to IndexedDB for refresh continuity (H-5, A-5)."
   [recovered]
   (when (and (map? recovered) (:public-hex recovered))
     (when @anchor-state-atom
@@ -110,7 +111,49 @@
                (-> node
                    (assoc :keypair {:public-key (:public-key recovered)
                                     :private-key (:private-key recovered)})
-                   (assoc-in [:light-state :pubkey] (:public-hex recovered))))))))
+                   (assoc-in [:light-state :pubkey] (:public-hex recovered)))))
+      (browser/persist-state! (browser/sanitize-state-for-persistence @@active-node-atom)))
+    (notify-ui-listeners!)))
+
+(defn apply-restored-state!
+  "Applies sanitized persisted state loaded from IndexedDB to node-atom and anchor-state-atom.
+   Preserves public identity (pubkey + ech1 address) across browser refresh without generating
+   a conflicting random keypair (avoiding Frankenstein state). Private key remains nil until
+   unlocked via hardware recovery (H-5, A-5)."
+  [node-atom loaded]
+  (when (and node-atom (map? loaded))
+    (let [saved-pub (or (get-in loaded [:light-state :pubkey])
+                        (:pubkey loaded))]
+      (when (and (string? saved-pub) (not (str/blank? saved-pub)))
+        (let [saved-addr (bech32m/pubkey->bech32m saved-pub "ech")
+              pub-bytes (basalt/hex->bytes saved-pub)]
+          (swap! node-atom
+                 (fn [curr]
+                   (let [curr-kp (:keypair curr)
+                         curr-pub (when (and curr-kp (:public-key curr-kp))
+                                    (fressian/bytes->hex (:public-key curr-kp)))
+                         same-pub? (= curr-pub saved-pub)]
+                     (-> curr
+                         (merge (dissoc loaded :conn :keypair :x25519 :active-channels))
+                         (assoc-in [:light-state :pubkey] saved-pub)
+                         (assoc :keypair (if same-pub?
+                                           curr-kp
+                                           {:public-key pub-bytes
+                                            :private-key nil}))
+                         (assoc :x25519 (when same-pub? (:x25519 curr)))))))
+          (if @anchor-state-atom
+            (swap! anchor-state-atom
+                   (fn [st]
+                     (-> st
+                         (assoc-in [:identity :anchor-pubkey] saved-pub)
+                         (assoc-in [:identity :address] saved-addr)
+                         (assoc :anchor-pubkey saved-pub)
+                         (assoc :anchor-address saved-addr)
+                         (assoc :hot-pubkey saved-pub)
+                         (dissoc :privkey-bytes))))
+            (reset! anchor-state-atom
+                    (anchor/init-anchor-state {:pubkey saved-pub} {})))
+          (notify-ui-listeners!))))))
 
 (defn init-anchor
   "Initializes or resets the global Human Anchor state atom."
@@ -382,10 +425,16 @@
            channels (:active-channels node)
            open-channels (into [] (keep (fn [[k dc]]
                                           (when (and dc (= (.-readyState dc) "open")) (name k)))
-                                        channels))]
+                                        channels))
+           pubkey-hex (or (get-in light-st [:pubkey])
+                          (when-let [kp (:keypair node)]
+                            (when (:public-key kp)
+                              (fressian/bytes->hex (:public-key kp)))))]
        (clj->js {:peerId (:peer-id node)
                  :subnetId (:subnet-id node)
-                 :pubkey (when-let [kp (:keypair node)] (fressian/bytes->hex (:public-key kp)))
+                 :pubkey pubkey-hex
+                 :address (when pubkey-hex (bech32m/pubkey->bech32m pubkey-hex "ech"))
+                 :hardwareLocked (nil? (get-in node [:keypair :private-key]))
                  :epoch (or (:epoch light-st) 0)
                  :balance (or (get-in light-st [:account :balance]) (:balance light-st) 0)
                  :spendable (or (get-in light-st [:account :spendable]) (:spendable light-st) 0)
@@ -582,32 +631,34 @@
              phase (get-in node [:conn :phase])]
          (if (and (empty? channels) (not= phase :open))
            (clj->js {:ok false :error "not-connected"})
-           (let [target-pub (resolve-peer-target node callee)
-                 privkey (:private-key (:keypair node))
-                 cmd-res (light-core/handle-command (:light-state node)
-                                                    {"cmd" "offer"
-                                                     "callee" target-pub
-                                                     "price" (or price 10)
-                                                     "burn" (or burn 500)}
-                                                    privkey)
-                 new-st (:state cmd-res)
-                 out-envs (:net-envelopes cmd-res)
-                 resp (:response cmd-res)
-                 cmd-ok? (boolean (get resp "ok" true))]
-             (swap! na (fn [curr]
-                         (-> curr
-                             (assoc :light-state new-st)
-                             (assoc :sessions (:sessions new-st)))))
-             (doseq [env out-envs]
-               (send-to-all-channels! na env))
-             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
-             (notify-ui-listeners!)
-             (clj->js (cond-> {:ok cmd-ok?
-                               :callee callee
-                               :sessionId (get resp "session_id")
-                               :envelopesSent (count out-envs)
-                               :response resp}
-                        (not cmd-ok?) (assoc :error (get resp "error")))))))))))
+           (if-not (:private-key (:keypair node))
+             (clj->js {:ok false :error "hardware-unlock-required"})
+             (let [target-pub (resolve-peer-target node callee)
+                   privkey (:private-key (:keypair node))
+                   cmd-res (light-core/handle-command (:light-state node)
+                                                      {"cmd" "offer"
+                                                       "callee" target-pub
+                                                       "price" (or price 10)
+                                                       "burn" (or burn 500)}
+                                                      privkey)
+                   new-st (:state cmd-res)
+                   out-envs (:net-envelopes cmd-res)
+                   resp (:response cmd-res)
+                   cmd-ok? (boolean (get resp "ok" true))]
+               (swap! na (fn [curr]
+                           (-> curr
+                               (assoc :light-state new-st)
+                               (assoc :sessions (:sessions new-st)))))
+               (doseq [env out-envs]
+                 (send-to-all-channels! na env))
+               (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+               (notify-ui-listeners!)
+               (clj->js (cond-> {:ok cmd-ok?
+                                 :callee callee
+                                 :sessionId (get resp "session_id")
+                                 :envelopesSent (count out-envs)
+                                 :response resp}
+                          (not cmd-ok?) (assoc :error (get resp "error"))))))))))))
 
 (defn accept-channel-offer
   "Accepts a pending session offer by session-id over the live mesh DataChannel."
@@ -615,26 +666,28 @@
   ([node-atom session-id]
    (let [na (or node-atom @active-node-atom)
          node @na
-         privkey (:private-key (:keypair node))
-         cmd-res (light-core/handle-command (:light-state node)
-                                            {"cmd" "accept" "session_id" session-id}
-                                            privkey)
-         new-st (:state cmd-res)
-         out-envs (:net-envelopes cmd-res)
-         resp (:response cmd-res)
-         cmd-ok? (boolean (get resp "ok" true))]
-     (swap! na (fn [curr]
-                 (-> curr
-                     (assoc :light-state new-st)
-                     (assoc :sessions (:sessions new-st)))))
-     (doseq [env out-envs]
-       (send-to-all-channels! na env))
-     (browser/persist-state! (browser/sanitize-state-for-persistence @na))
-     (notify-ui-listeners!)
-     (clj->js (cond-> {:ok cmd-ok?
-                       :sessionId session-id
-                       :response resp}
-                (not cmd-ok?) (assoc :error (get resp "error")))))))
+         privkey (:private-key (:keypair node))]
+     (if-not privkey
+       (clj->js {:ok false :error "hardware-unlock-required"})
+       (let [cmd-res (light-core/handle-command (:light-state node)
+                                                {"cmd" "accept" "session_id" session-id}
+                                                privkey)
+             new-st (:state cmd-res)
+             out-envs (:net-envelopes cmd-res)
+             resp (:response cmd-res)
+             cmd-ok? (boolean (get resp "ok" true))]
+         (swap! na (fn [curr]
+                     (-> curr
+                         (assoc :light-state new-st)
+                         (assoc :sessions (:sessions new-st)))))
+         (doseq [env out-envs]
+           (send-to-all-channels! na env))
+         (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+         (notify-ui-listeners!)
+         (clj->js (cond-> {:ok cmd-ok?
+                           :sessionId session-id
+                           :response resp}
+                    (not cmd-ok?) (assoc :error (get resp "error")))))))))
 
 (defn send-message
   "Sends a cryptographically sealed message to a peer over the live mesh DataChannel."
@@ -645,38 +698,40 @@
          target-pub (or (get (:petnames node) peer-id)
                         (get default-petnames peer-id)
                         peer-id)
-         privkey (:private-key (:keypair node))
-         cmd-res (light-core/handle-command (:light-state node)
-                                            {"cmd" "send"
-                                             "peer" target-pub
-                                             "text" (str text)
-                                             "message" (str text)}
-                                            privkey)
-         new-st (:state cmd-res)
-         out-envs (:net-envelopes cmd-res)
-         resp (:response cmd-res)
-         cmd-ok? (and (boolean (get resp "ok" true))
-                      (pos? (count out-envs)))]
-     (swap! na (fn [curr]
-                 (cond-> (-> curr
-                             (assoc :light-state new-st)
-                             (assoc :sessions (:sessions new-st)))
-                   cmd-ok?
-                   (update :chat-history conj {:timestamp (.toISOString (js/Date.))
-                                               :direction :outgoing
-                                               :peer peer-id
-                                               :text text
-                                               :status :sent}))))
-     (doseq [env out-envs]
-       (send-to-all-channels! na env))
-     (browser/persist-state! (browser/sanitize-state-for-persistence @na))
-     (notify-ui-listeners!)
-     (clj->js (cond-> {:ok cmd-ok?
-                       :peer peer-id
-                       :text text
-                       :envelopesSent (count out-envs)
-                       :response resp}
-                (not cmd-ok?) (assoc :error (or (get resp "error") "no-open-session-for-peer")))))))
+         privkey (:private-key (:keypair node))]
+     (if-not privkey
+       (clj->js {:ok false :error "hardware-unlock-required"})
+       (let [cmd-res (light-core/handle-command (:light-state node)
+                                                {"cmd" "send"
+                                                 "peer" target-pub
+                                                 "text" (str text)
+                                                 "message" (str text)}
+                                                privkey)
+             new-st (:state cmd-res)
+             out-envs (:net-envelopes cmd-res)
+             resp (:response cmd-res)
+             cmd-ok? (and (boolean (get resp "ok" true))
+                          (pos? (count out-envs)))]
+         (swap! na (fn [curr]
+                     (cond-> (-> curr
+                                 (assoc :light-state new-st)
+                                 (assoc :sessions (:sessions new-st)))
+                       cmd-ok?
+                       (update :chat-history conj {:timestamp (.toISOString (js/Date.))
+                                                   :direction :outgoing
+                                                   :peer peer-id
+                                                   :text text
+                                                   :status :sent}))))
+         (doseq [env out-envs]
+           (send-to-all-channels! na env))
+         (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+         (notify-ui-listeners!)
+         (clj->js (cond-> {:ok cmd-ok?
+                           :peer peer-id
+                           :text text
+                           :envelopesSent (count out-envs)
+                           :response resp}
+                    (not cmd-ok?) (assoc :error (or (get resp "error") "no-open-session-for-peer")))))))))
 
 (defn get-chat-history
   "Returns the vector of chat messages exchanged with peers."
@@ -736,20 +791,32 @@
                (reject (js/Error. (str (or (:error err) err))))
                (resolve (clj->js (redact-for-js (or res {:ok true})))))))))))))
 
+(defn restore-from-indexed-db!
+  "Loads persisted sanitized state from IndexedDB and applies it to node-atom and anchor-state-atom.
+   Invokes optional callback (cb [err restored-map])."
+  ([] (restore-from-indexed-db! @active-node-atom nil))
+  ([node-atom] (restore-from-indexed-db! node-atom nil))
+  ([node-atom cb]
+   (let [na (or node-atom @active-node-atom)]
+     (browser/load-persisted-state
+      (fn [err loaded]
+        (when (and (nil? err) na (map? loaded))
+          (apply-restored-state! na loaded))
+        (when cb
+          (cb err loaded)))))))
+
 (defn load-state-from-indexed-db
-  "Loads persisted sanitized state from IndexedDB. Returns a Promise."
+  "Loads persisted sanitized state from IndexedDB and restores public identity continuity. Returns a Promise."
   ([] (load-state-from-indexed-db @active-node-atom))
   ([node-atom]
    (js/Promise.
     (fn [resolve reject]
-      (browser/load-persisted-state
+      (restore-from-indexed-db!
+       node-atom
        (fn [err loaded]
          (if err
            (reject (js/Error. (str err)))
-           (do
-             (when (and node-atom loaded)
-               (swap! node-atom merge (dissoc loaded :conn :keypair :x25519)))
-             (resolve (clj->js (redact-for-js (or loaded {}))))))))))))
+           (resolve (clj->js (redact-for-js (or loaded {})))))))))))
 
 (defn connect
   "Initiates dialing transition on the node's connection state and executes effects.
@@ -1049,6 +1116,7 @@
        :handleVisibilityChange handle-visibility-change!
        :saveStateToIndexedDB save-state-to-indexed-db
        :loadStateFromIndexedDB load-state-from-indexed-db
+       :restoreFromIndexedDB restore-from-indexed-db!
        :createOffer create-offer
        :acceptOffer accept-offer
        :sendSealedMessage send-sealed-message

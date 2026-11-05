@@ -614,7 +614,7 @@
          "c=IN IP4 " ip "\r\n"
          "a=setup:passive\r\n"
          "a=mid:0\r\n"
-         "a=max-message-size:100000\r\n"
+         "a=max-message-size:262144\r\n"
          "a=sctp-port:5000\r\n"
          "a=fingerprint:sha-256 " fp "\r\n"
          "a=ice-ufrag:" ufrag "\r\n"

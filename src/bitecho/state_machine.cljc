@@ -38,7 +38,7 @@
   (cond
     (nil? x) empty-bytes
     (fressian/bytes? x) x
-    (sequential? x) #?(:clj (byte-array (map byte x))
+    (sequential? x) #?(:clj (byte-array (map unchecked-byte x))
                        :cljs (js/Uint8Array. (clj->js x)))
     :else empty-bytes))
 
@@ -647,18 +647,31 @@
               blocks (or (:blocks state) {})
               eb (or (:executed-finalized-blocks state) #{})
               ord (or (:executed-finalized-blocks-order state) [])
-              filtered-set (into #{}
+              referenced-parents (into #{} (keep :parent-hash) (vals blocks))
+              latest-exec-anchor (or (last ord)
+                                     (when (contains? eb (:latest-finalized-block-hash state))
+                                       (:latest-finalized-block-hash state))
+                                     (first eb))
+              protected-anchors (cond-> (into #{} (filter referenced-parents) eb)
+                                  (and latest-exec-anchor (contains? eb latest-exec-anchor))
+                                  (conj latest-exec-anchor)
+                                  (and (:latest-finalized-block-hash state)
+                                       (contains? eb (:latest-finalized-block-hash state)))
+                                  (conj (:latest-finalized-block-hash state)))
+              filtered-set (into protected-anchors
                                  (filter (fn [h]
-                                           (if-let [b (get blocks h)]
-                                             (>= (long (or (:epoch b) 0)) cutoff)
-                                             false))
+                                           (or (contains? protected-anchors h)
+                                               (if-let [b (get blocks h)]
+                                                 (>= (long (or (:epoch b) 0)) cutoff)
+                                                 false)))
                                          eb))
               filtered-ord (filterv #(contains? filtered-set %) ord)]
           (if (> (count filtered-ord) max-tracked)
             (let [overflow (- (count filtered-ord) max-tracked)
-                  evicted (subvec filtered-ord 0 overflow)
-                  kept (subvec filtered-ord overflow)]
-              [(reduce disj filtered-set evicted) kept])
+                  evicted (into #{} (remove protected-anchors) (subvec filtered-ord 0 overflow))
+                  kept-set (reduce disj filtered-set evicted)
+                  kept-ord (filterv #(contains? kept-set %) filtered-ord)]
+              [kept-set kept-ord])
             [filtered-set filtered-ord]))
         escrow-horizon (long (or (:max-escrow-horizon cfg) 168))
         escrow-cutoff (- new-epoch escrow-horizon)
@@ -743,6 +756,9 @@
   (if (consensus-mode? state)
     (let [ancestor-rids (collect-ancestor-receipt-ids state)
           exec-rids (or (:executed-receipt-ids state) #{})
+          max-rcpts (long (or (get-in state [:config :max-receipts-per-block])
+                              (:max-receipts-per-block state)
+                              32))
           filtered-receipts (->> (or (:pending-receipts state) [])
                                  (remove (fn [r]
                                            (let [rid (:receipt-id r)]
@@ -762,6 +778,7 @@
                                                9)
                                              (long (or (:seq r) 0))
                                              (str (:receipt-id r))]))
+                                 (take max-rcpts)
                                  vec)
           should-set-mempool? (or (seq filtered-receipts)
                                   (empty? (:mempool state))
@@ -1885,7 +1902,7 @@
                                                               :sender sender
                                                               :seq (:seq transfer)
                                                               :amount (:amount transfer)
-                                                              :payload-bytes (vec payload-bytes)})]
+                                                              :payload-bytes (mapv long payload-bytes)})]
                              (if (:ok? staged) (:state staged) state))
                            state)]
         {:state state-staged
