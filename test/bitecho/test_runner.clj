@@ -19,6 +19,7 @@
             [bitecho.shell.agent-sim-test]
             [bitecho.shell.agent-test]
             [bitecho.shell.bootstrap-test]
+            [bitecho.shell.browser-test]
             [bitecho.shell.core-test]
             [bitecho.shell.discovery-test]
             [bitecho.shell.light-node-test]

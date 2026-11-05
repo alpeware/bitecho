@@ -31,6 +31,7 @@
                        :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
                                     org.clojure/test.check {:mvn/version "1.1.1"}}
                        :main-opts ["-m" "bitecho.cljs-runner"]}
+           :build-browser {:extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}}
            :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.01.19"}
                                  org.clojure/test.check {:mvn/version "1.1.1"}}
                   :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "dev/bitecho/simulator"]}

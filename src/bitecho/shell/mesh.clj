@@ -114,10 +114,11 @@
     :else x))
 
 (defn agent-event-signing-bytes
-  "Serializes agent public key and event map into deterministic byte array for Ed25519 signing."
+  "Serializes agent public key and event map into deterministic byte array for Ed25519 signing.
+   Uses v2 canonical Fressian signing bytes."
   [agent-pubkey-hex event]
   (let [clean (dissoc event :sender :sender-pubkey-bytes :rng)]
-    (.getBytes (pr-str [agent-pubkey-hex (canonicalize-for-signing clean)]) StandardCharsets/UTF_8)))
+    (crypto/canonical-signing-bytes [(or agent-pubkey-hex "") (canonicalize-for-signing clean)])))
 
 (def current-wire-version
   "Current Bitecho mesh wire protocol envelope version."

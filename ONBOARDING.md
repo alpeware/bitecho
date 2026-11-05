@@ -139,5 +139,58 @@ Bitecho distinguishes between real-time peer communication and finalized economi
 | **Escrow Take** | Protocol Settlement Burn | 50 bps ($\tau = 0.5\%$) permanently burned on release |
 | **Consensus** | Streamlet BFT (3 Nodes) | 3-chain notarization finality, 2-of-3 quorum |
 | **Directory** | Dual-signed PoP + Attestation | Decentralized key continuity, zero authority custody |
-| **Channels** | X25519 Sealed Sessions | ChaCha20-Poly1305, SACK anti-replay, 64-entry window |
+| **Channels** | X25519 Sealed Sessions | ChaCha20-Poly1305 / AES-256-GCM, SACK anti-replay, 64-entry window |
 | **Wire Protocol** | Rolling-Upgrade Policy | Versioned envelopes, 1-step rolling window, fail-closed diagnostics |
+| **Browser Node** | Single-Authority State Machine | Rule 4 generation-tagged reducer, zero derived runtime keys in IDB, honest visibility throttling |
+
+---
+
+## 6. Browser Node & Web App Operation
+
+Bitecho light nodes can run directly inside modern web browsers using pure ClojureScript compiled to a reproducible static JavaScript bundle without requiring backend node daemons or native runtimes.
+
+### Browser Environment Requirements
+- **Secure Context**: WebRTC (`RTCPeerConnection`, `RTCDataChannel`) and WebCrypto APIs require a Secure Context (`https://` or `http://localhost`).
+- **Storage**: IndexedDB for persistent identity, petnames, and finalized account caches.
+- **CORS Support**: Static bootstrap descriptors (`/devnet/bootstrap.txt`) and directory attestations are served with permissive CORS headers (`Access-Control-Allow-Origin: *`), enabling third-party web apps to connect seamlessly.
+
+### Quick Start: Running the Browser Node
+Open `dist/index.html` in a web browser (served over local HTTPS/HTTP) or visit the hosted web app at `https://bitecho.org/app/`.
+
+The browser bundle initializes a global API on `globalThis.BitechoBrowser`:
+
+```javascript
+// Check node version
+console.log(BitechoBrowser.version);
+
+// Initialize node state
+const node = BitechoBrowser.initNode({ peerId: "browser-agent-1" });
+
+// Inspect status and visibility state
+const status = BitechoBrowser.getStatus();
+console.log(status);
+
+// Run browser-only subnet simulation (3 peers, sealed channels, burn accounting)
+const demoResult = BitechoBrowser.runSubnetDemo();
+console.log("Subnet Demo:", demoResult);
+```
+
+### Reproducible Bundle Build Verification
+The browser bundle is built with 100% byte-for-byte reproducibility using `scripts/build-browser-bundle.sh`:
+
+```bash
+# Build bundle and verify deterministic output
+./scripts/build-browser-bundle.sh
+```
+
+This generates:
+- `dist/bitecho-browser.js`: Deterministic compiled JavaScript bundle.
+- `dist/bitecho-browser.js.sri`: Subresource Integrity (SRI) hashes (SHA-384 and SHA-256).
+- `dist/index.html`: Web interface embedding the bundle with SRI integrity checks.
+
+### Tab Visibility & Background Throttling Semantics
+Web browsers throttle timers ($\ge 1000\text{ms}$) and suspend WebRTC packet processing when tabs are inactive or hidden.
+- **Foreground Mode**: The node operates at full speed with real-time rendezvous polling and low-latency message exchange.
+- **Background Mode**: The node automatically transitions into low-power mode, pausing high-frequency loops and counting deferred operations in the `:background-throttled-events` diagnostic counter.
+- **Zero Unbacked Claims**: Bitecho does not claim 24/7 background liveness for browser tabs; background throttling is surfaced honestly in status metrics.
+

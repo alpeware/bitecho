@@ -1128,25 +1128,27 @@
 (defn decode-wire
   "Decodes wire bytes into Clojure persistent data structures.
    Supports Fressian-encoded payloads and legacy Nippy payloads (on JVM).
-   Recursively normalizes collections and strips untrusted shell-boundary crypto tags."
+   Recursively normalizes collections and strips untrusted shell-boundary crypto tags.
+   Distinguishes boolean false and nil payloads from decoding failures using an internal sentinel."
   [ba]
   (when (and (bytes? ba) (pos? (count-bytes ba)))
-    #?(:clj
-       (let [decoded (if (nippy-payload? ba)
-                       (try (nippy/thaw ba)
-                            (catch Exception _
-                              (try (read-standard-fressian ba)
-                                   (catch Exception _ (decode ba)))))
-                       (try (read-standard-fressian ba)
-                            (catch Exception _
-                              (try (decode ba)
-                                   (catch Exception _
-                                     (when (nippy-payload? ba)
-                                       (try (nippy/thaw ba) (catch Exception _ nil))))))))]
-         (when decoded
-           (strip-untrusted-crypto-tags (normalize-decoded-wire decoded))))
-       :cljs
-       (let [decoded (try (decode ba)
-                          (catch :default _ nil))]
-         (when decoded
-           (strip-untrusted-crypto-tags (normalize-decoded-wire decoded)))))))
+    (let [sentinel ::decode-error
+          raw #?(:clj
+                 (if (nippy-payload? ba)
+                   (try (nippy/thaw ba)
+                        (catch Exception _
+                          (try (read-standard-fressian ba)
+                               (catch Exception _
+                                 (try (decode ba) (catch Exception _ sentinel))))))
+                   (try (read-standard-fressian ba)
+                        (catch Exception _
+                          (try (decode ba)
+                               (catch Exception _
+                                 (if (nippy-payload? ba)
+                                   (try (nippy/thaw ba) (catch Exception _ sentinel))
+                                   sentinel))))))
+                 :cljs
+                 (try (decode ba)
+                      (catch :default _ sentinel)))]
+      (when-not (identical? raw sentinel)
+        (strip-untrusted-crypto-tags (normalize-decoded-wire raw))))))

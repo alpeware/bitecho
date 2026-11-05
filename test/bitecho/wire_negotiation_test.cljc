@@ -61,7 +61,58 @@
       (is (= (:vec dec) [1 2 3 "four" :five]))
       (is (= (:set dec) #{:a :b :c}))
       (is (= (get-in dec [:nested :inner-map :x]) 10))
-      (is (= (get-in dec [:nested :inner-map :y]) [20 30])))))
+      (is (= (get-in dec [:nested :inner-map :y]) [20 30]))
+      ;; Standalone boolean false and nil payloads (closing decode-wire false-sentinel)
+      (is (= false (fressian/decode-wire (fressian/encode-wire false))))
+      (is (= nil (fressian/decode-wire (fressian/encode-wire nil)))))))
+
+(deftest test-wire-codec-compact-chunked-fixtures
+  (testing "deterministic chunked string and bytes golden fixtures decode across JVM and CLJS"
+    ;; 1. Compact multi-chunk string & byte fixtures
+    (let [chunked-str-fixture (fressian/hex->bytes "e2024142db43")
+          chunked-bytes-fixture (fressian/hex->bytes "d8024142d143")
+          dec-str (fressian/decode-wire chunked-str-fixture)
+          dec-bytes (fressian/decode-wire chunked-bytes-fixture)]
+      (is (= "ABC" dec-str))
+      (is (fressian/bytes? dec-bytes))
+      (is (= "414243" (basalt/bytes->hex dec-bytes))))
+    ;; 2. Full 66,000-byte JVM org.clojure/data.fressian wire-exact chunked fixtures:
+    ;;    - String (66,000 'A's): e2 69 00 00 (STRING_CHUNK len=65536) + 65536*'A' + e3 51 d0 (STRING len=464) + 464*'A'
+    ;;    - Bytes  (66,000 0x2a): d8 68 ff ff (BYTES_CHUNK  len=65535) + 65535*0x2a + d9 51 d1 (BYTES  len=465) + 465*0x2a
+    (let [expected-str (apply str (repeat 66000 "A"))
+          jvm-str-fixture (fressian/concat-bytes
+                           (fressian/hex->bytes "e2690000")
+                           (fressian/utf8->bytes (apply str (repeat 65536 "A")))
+                           (fressian/hex->bytes "e351d0")
+                           (fressian/utf8->bytes (apply str (repeat 464 "A"))))
+          jvm-bytes-fixture (fressian/concat-bytes
+                             (fressian/hex->bytes "d868ffff")
+                             (fressian/utf8->bytes (apply str (repeat 65535 "*")))
+                             (fressian/hex->bytes "d951d1")
+                             (fressian/utf8->bytes (apply str (repeat 465 "*"))))
+          dec-jvm-str (fressian/decode-wire jvm-str-fixture)
+          dec-jvm-bytes (fressian/decode-wire jvm-bytes-fixture)]
+      #?(:clj (do
+                (is (= (basalt/bytes->hex (fressian/encode-wire expected-str))
+                       (basalt/bytes->hex jvm-str-fixture)))
+                (is (= (basalt/bytes->hex (fressian/encode-wire (byte-array 66000 (byte 42))))
+                       (basalt/bytes->hex jvm-bytes-fixture)))))
+      (is (= 66000 (count dec-jvm-str)))
+      (is (= expected-str dec-jvm-str))
+      (is (fressian/bytes? dec-jvm-bytes))
+      (is (= 66000 (fressian/count-bytes dec-jvm-bytes))))))
+
+#?(:clj
+   (deftest test-wire-codec-jvm-data-fressian-chunk-tags
+     (testing "JVM org.clojure.data.fressian outputs chunk tags 0xCA (226) and 0xCE (216) on >65536 inputs"
+       (let [large-str (apply str (repeat 6600 "0123456789"))
+             large-bytes (byte-array 66000 (byte 42))
+             enc-str (fressian/encode-wire large-str)
+             enc-bytes (fressian/encode-wire large-bytes)]
+         (is (= 226 (bit-and 0xFF (aget ^bytes enc-str 0))))
+         (is (= 216 (bit-and 0xFF (aget ^bytes enc-bytes 0))))
+         (is (= large-str (fressian/decode-wire enc-str)))
+         (is (= 66000 (count (fressian/decode-wire enc-bytes))))))))
 
 (deftest test-wire-codec-chunked-string
   (testing "encode-wire and decode-wire handle large strings (> 65536 code points) chunking cleanly"
@@ -413,8 +464,62 @@
       (is (nil? (sealed/open-message key seq-num (:ciphertext sealed-chacha) aad "suite-v1-aes256gcm" "suite-v1-aes256gcm"))))))
 
 ;; =============================================================================
-;; 6. Live Subprocess Interop (JVM <-> Node.js)
+;; 7. Pure-CLJS Browser Cryptographic Fallbacks (Step 10A)
 ;; =============================================================================
+
+(deftest test-pure-browser-crypto-primitives
+  (testing "Pure browser cryptographic fallbacks pass RFC vectors and cross-verify with standard implementations"
+    ;; 1. HMAC-SHA256
+    (let [k (fressian/utf8->bytes "secret-key")
+          d (fressian/utf8->bytes "hello world")
+          hmac-res (sealed/pure-hmac-sha256 k d)]
+      (is (= "095d5a21fe6d0646db223fdf3de6436bb8dfb2fab0b51677ecf6441fcf5f2a67"
+             (basalt/bytes->hex hmac-res))))
+
+    ;; 2. X25519 RFC 7748 §6.1 Alice/Bob test vector
+    (let [alice-priv (fressian/hex->bytes "77076d0a7318a57d3c16c17251525302a50f354c0307c2cb071e649b5c328559")
+          bob-pub (fressian/hex->bytes "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+          shared-secret (sealed/pure-x25519-shared-secret alice-priv bob-pub)]
+      (is (= "61897f186837199212de3506429b0e74b202b5336b3ee24851147eea9742f211"
+             (basalt/bytes->hex shared-secret))))
+
+    ;; 3. AES-256-GCM pure seal / open roundtrip, tamper resistance, and cross-compatibility
+    (let [key (fressian/hex->bytes "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+          nonce (fressian/hex->bytes "000000000000000000000001")
+          pt (fressian/utf8->bytes "browser aes-256-gcm payload")
+          aad (fressian/utf8->bytes "browser-aad")
+          pure-ct (sealed/pure-aes-gcm-seal key nonce pt aad)
+          std-ct (sealed/aes-gcm-seal key nonce pt aad)]
+      ;; Both implementations produce identical 16-byte authenticated ciphertext
+      (is (= (basalt/bytes->hex std-ct) (basalt/bytes->hex pure-ct)))
+      ;; Decrypt pure-ct with standard open
+      (is (= "browser aes-256-gcm payload" (fressian/bytes->utf8 (sealed/aes-gcm-open key nonce pure-ct aad))))
+      ;; Decrypt std-ct with pure open
+      (is (= "browser aes-256-gcm payload" (fressian/bytes->utf8 (sealed/pure-aes-gcm-open key nonce std-ct aad))))
+      ;; Tampered ciphertext fails closed
+      (let [tampered (fressian/concat-bytes pure-ct)]
+        #?(:clj (aset ^bytes tampered 0 (unchecked-byte (bit-xor (aget ^bytes tampered 0) 1)))
+           :cljs (aset tampered 0 (bit-xor (aget tampered 0) 1)))
+        (is (nil? (sealed/pure-aes-gcm-open key nonce tampered aad)))))
+
+    ;; 4. ChaCha20-Poly1305 pure seal / open roundtrip, tamper resistance, and cross-compatibility
+    (let [key (fressian/hex->bytes "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+          nonce (fressian/hex->bytes "000000000000000000000002")
+          pt (fressian/utf8->bytes "browser chacha20-poly1305 payload")
+          aad (fressian/utf8->bytes "browser-aad-chacha")
+          pure-ct (sealed/pure-chacha-poly-seal key nonce pt aad)
+          std-ct (sealed/chacha-poly-seal key nonce pt aad)]
+      ;; Both implementations produce identical authenticated ciphertext
+      (is (= (basalt/bytes->hex std-ct) (basalt/bytes->hex pure-ct)))
+      ;; Decrypt pure-ct with standard open
+      (is (= "browser chacha20-poly1305 payload" (fressian/bytes->utf8 (sealed/chacha-poly-open key nonce pure-ct aad))))
+      ;; Decrypt std-ct with pure open
+      (is (= "browser chacha20-poly1305 payload" (fressian/bytes->utf8 (sealed/pure-chacha-poly-open key nonce std-ct aad))))
+      ;; Tampered ciphertext fails closed
+      (let [tampered (fressian/concat-bytes pure-ct)]
+        #?(:clj (aset ^bytes tampered 0 (unchecked-byte (bit-xor (aget ^bytes tampered 0) 1)))
+           :cljs (aset tampered 0 (bit-xor (aget tampered 0) 1)))
+        (is (nil? (sealed/pure-chacha-poly-open key nonce tampered aad)))))))
 
 #?(:clj
    (deftest test-live-node-jvm-interop

@@ -474,6 +474,49 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
      - Any in-flight stripping or alteration of advertised suites causes signature verification failure, dropping the handshake fail-closed.
    - **Strict Mid-Session Suite Mismatch Rejection**: `open-message` takes `session-suite` and `frame-suite` (6-arity). If a frame attempts mid-session suite substitution (`not= session-suite frame-suite`), decryption fails closed immediately, returning `nil` without leaking plaintext.
 
+### R. CLJS Browser Node Architecture (Milestone 10)
+
+1. **Rule 4 Single-Authority Shell Lifecycle State Machine (`bitecho.shell.browser`)**:
+   - **Single Generation-Tagged Connection Map**: The browser node models all connection and session state in a single map atom governed by pure reducer `(transition-conn conn event) -> [new-conn effects]`. Connection liveness (`:connected?`, `:connection-error`) is never split across competing atoms or persisted to storage.
+   - **Monotonic Generations & Stale Callback Ignorance**: Every dial/reconnect attempt increments `:generation`. Asynchronous events (WebRTC `ondatachannel`, `onmessage`, `onerror`, `onclose`, ICE state transitions, timers) carry the generation of the originating attempt. Events tagged with stale generations (`gen < current`) are strictly ignored and emit counted `:diagnose` effects with `:reason :stale-generation-event`.
+   - **Pure Reducer Transition Table**:
+     - `{:type :dial :peer-id ... :wire-format ... :generation ...}`: transitions from `:disconnected` / `:dialing` to `:connecting` if generation is valid; returns `:open-datachannel` effect.
+     - `{:type :channel-open :peer-id ... :channel ... :generation ...}`: transitions to `:connected`, recording active channel.
+     - `{:type :channel-close :peer-id ... :generation ...}`: transitions to `:disconnected`, clearing channel and emitting `:diagnose` effect.
+     - `{:type :channel-error :peer-id ... :error ... :generation ...}`: transitions to `:disconnected`, recording `:last-error` and emitting `:diagnose` effect.
+     - `{:type :inbound-frame :bytes ... :generation ...}`: decodes wire bytes; validates wire format against `supported-wire-formats` (`"fressian-v1"` and `"legacy-nippy"`). Unsupported formats (e.g. `"transit-json"`) increment `:unsupported-format-dropped`, record `:last-unsupported-format`, and emit `:diagnose {:reason :unsupported-wire-format}`.
+     - `{:type :send-frame :payload ...}`: if connected, emits `:send-wire-frame` effect; if disconnected, drops payload, increments `:dropped-sends`, and emits `:diagnose {:reason :send-while-disconnected}`.
+     - `{:type :visibility-change :state :hidden|:visible}`: updates `:visibility-state`; when hidden, incoming non-essential background events increment `:background-throttled-events`.
+   - **Zero Silent Failures (Rule 5)**: Every dropped frame, rejected wire format, failed dial, and stale callback produces a counted diagnostic entry in state and an emitted `:diagnose` effect surfaced in `status` / `connz`.
+
+2. **WebRTC DataChannel Transport Interop & Mock Adapter**:
+   - Browser boundary binds to native browser `window.RTCPeerConnection` and `window.RTCDataChannel` APIs under secure contexts (HTTPS).
+   - Pluggable `RTCAdapter` abstraction enables seamless property and unit testing on both JVM and Node/CLJS without headless browser dependencies, while running identically against real browser `RTCPeerConnection` in production.
+   - Standard WebRTC ICE candidate gathering and SDP exchange (offer/answer) signaled over Bitecho mesh rendezvous or HTTPS bootstrap endpoints.
+
+3. **IndexedDB State Persistence & Sanitization (Rule 4 Boundary)**:
+   - State persistence is handled via IndexedDB (with pure in-memory atom fallback in non-browser or test environments).
+   - **Strict Persistence Sanitization (`sanitize-state-for-persistence`)**: To enforce Rule 4, all derived runtime liveness and transient session secrets are stripped before committing to disk:
+     - Ephemeral session private keys (`:ephemeral-priv`, `:ephemeral-private-key`) are erased.
+     - Runtime connection flags (`:connected?`, `:connection-error`, `:channel`, `:peer-connection`) are stripped.
+     - Diagnostic counters, persistent identity public keys, petnames, and finalized account caches are retained.
+   - On node startup / thaw, connection state initializes strictly in `:disconnected` phase at generation 0 or 1, requiring an explicit fresh handshake.
+
+4. **Honest Background-Tab Visibility Throttling Semantics**:
+   - Web browsers (Chrome, Firefox, Safari) aggressively throttle timers (to >= 1000ms) and suspend WebRTC processing in backgrounded/hidden tabs.
+   - Bitecho browser nodes do **not** claim always-on infrastructure liveness.
+   - The shell hooks `document.addEventListener("visibilitychange", ...)`:
+     - Foreground (`:visible`): full-speed timer loops, responsive SACK handling, and low-latency rendezvous polling.
+     - Background (`:hidden`): enters throttled low-power mode, pauses non-critical heartbeat bursts, and counts deferred or throttled processing cycles in `:background-throttled-events`.
+     - Health diagnostics report `:visibility-state` and `:background-throttled-events` honestly in status output.
+
+5. **Reproducible Static Bundle, SRI Hashing & CORS Architecture**:
+   - **Reproducible Build Script (`scripts/build-browser-bundle.sh`)**: Compiles ClojureScript to `dist/bitecho-browser.js` with deterministic namespace optimization, verifies byte-for-byte reproducibility against successive runs, and computes SHA-384 and SHA-256 Subresource Integrity (SRI) hashes into `dist/bitecho-browser.js.sri`.
+   - **Public Interface (`globalThis.BitechoBrowser`)**: Exposes `initNode`, `getStatus`, `connect`, `createOffer`, `acceptOffer`, `sendSealedMessage`, `runSubnetDemo`, and `version`.
+   - **Cross-Origin Resource Sharing (CORS)**: `clj-web` static content handler serves permissive CORS headers (`Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, HEAD, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, Authorization`) and `204 No Content` for preflight `OPTIONS` requests, allowing browser nodes hosted on any origin or `localhost` to fetch bootstrap descriptors and directory attestations.
+   - **Secure Context Requirement**: Browser APIs (`SubtleCrypto`, `RTCPeerConnection`) require a Secure Context (`https://` or `http://localhost`).
+
+
 
 
 

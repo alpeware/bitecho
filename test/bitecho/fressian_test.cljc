@@ -175,16 +175,16 @@
           ;; v1 legacy signature
           v1-bytes (crypto/legacy-pr-str-signing-bytes payload)
           sig-v1 (crypto/sign (:private kp) v1-bytes)]
-      ;; Both v2 and v1 verify successfully with fallback enabled
+      ;; By default (Step 10A sunset), v2 passes and v1 legacy signature is rejected
       (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v2)))
-      (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v1)))
-      ;; When fallback is disabled via dynamic binding, v1 is rejected and v2 passes
-      (binding [crypto/*allow-legacy-v1-signing-fallback* false]
+      (is (false? (crypto/verify-with-fallback (:public kp) payload sig-v1)))
+      ;; When fallback is enabled via dynamic binding, v1 passes
+      (binding [crypto/*allow-legacy-v1-signing-fallback* true]
         (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v2)))
-        (is (false? (crypto/verify-with-fallback (:public kp) payload sig-v1))))
-      ;; When fallback is disabled via 4-arity options map, v1 is rejected and v2 passes
-      (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v2 {:allow-v1-fallback? false})))
-      (is (false? (crypto/verify-with-fallback (:public kp) payload sig-v1 {:allow-v1-fallback? false})))
+        (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v1))))
+      ;; When fallback is enabled via 4-arity options map, v1 passes
+      (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v2 {:allow-v1-fallback? true})))
+      (is (true? (crypto/verify-with-fallback (:public kp) payload sig-v1 {:allow-v1-fallback? true})))
       ;; Tampered payload fails closed
       (is (false? (crypto/verify-with-fallback (:public kp) (assoc payload :price 999) sig-v2)))
       (is (false? (crypto/verify-with-fallback (:public kp) (assoc payload :price 999) sig-v1))))))

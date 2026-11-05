@@ -3,7 +3,6 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
-            [bitecho.fressian :as fressian]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
@@ -47,7 +46,7 @@
                              :amount 50
                              :seq 6
                              :deps ["hash1" "hash2"]}
-          payload-bytes (fressian/utf8->bytes (pr-str (into (sorted-map) unsigned-transfer)))
+          payload-bytes (crypto/canonical-signing-bytes (into (sorted-map) unsigned-transfer))
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature (vec signature)))]
       (is (true? (account/validate-transfer state transfer)))))
@@ -64,7 +63,7 @@
                              :amount 50
                              :seq 7
                              :deps ["hash1" "hash2"]}
-          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
+          payload-bytes (crypto/canonical-signing-bytes unsigned-transfer)
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -81,7 +80,7 @@
                              :amount 50
                              :seq 5
                              :deps ["hash1" "hash2"]}
-          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
+          payload-bytes (crypto/canonical-signing-bytes unsigned-transfer)
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -98,7 +97,7 @@
                              :amount 50
                              :seq 6
                              :deps ["hash1" "hash3"]}
-          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
+          payload-bytes (crypto/canonical-signing-bytes unsigned-transfer)
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -115,7 +114,7 @@
                              :amount 150
                              :seq 6
                              :deps ["hash1" "hash2"]}
-          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
+          payload-bytes (crypto/canonical-signing-bytes unsigned-transfer)
           signature (crypto/sign privkey payload-bytes)
           transfer (account/map->Transfer (assoc unsigned-transfer :signature signature))]
       (is (false? (account/validate-transfer state transfer)))))
@@ -132,7 +131,7 @@
                              :amount 50
                              :seq 6
                              :deps ["hash1" "hash2"]}
-          payload-bytes (fressian/utf8->bytes (pr-str unsigned-transfer))
+          payload-bytes (crypto/canonical-signing-bytes unsigned-transfer)
           signature (crypto/sign privkey payload-bytes)
           tampered-transfer (account/map->Transfer (assoc unsigned-transfer :amount 60 :signature signature))]
       (is (false? (account/validate-transfer state tampered-transfer)))))

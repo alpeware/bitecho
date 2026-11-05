@@ -3,6 +3,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.fressian :as fressian]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.mesh :as mesh]
             [bitecho.sieve.core :as sieve]
@@ -38,7 +39,7 @@
   (let [unsigned (assoc transfer-opts :sender sender-pub-hex)
         signed-transfer (account/create-transfer sender-priv-bytes unsigned)
         transfer-map (into {} signed-transfer)
-        payload-bytes (.getBytes ^String (pr-str {:transfer transfer-map}) StandardCharsets/UTF_8)
+        payload-bytes (fressian/encode-canonical {:transfer transfer-map})
         envelope (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount)
         thash (account/transfer-hash signed-transfer)]
     {:envelope envelope

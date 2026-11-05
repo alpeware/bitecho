@@ -8,6 +8,7 @@
             [bitecho.fressian-test]
             [bitecho.murmur.core-test]
             [bitecho.rendezvous.core-test]
+            [bitecho.shell.browser-test]
             [bitecho.state-machine-portability-test]
             [bitecho.streamlet.core-test]
             [bitecho.wire-negotiation-test]
@@ -40,6 +41,7 @@
              'bitecho.economy.burn-test
              'bitecho.economy.account-test
              'bitecho.economy.treasury-test
+             'bitecho.shell.browser-test
              'bitecho.state-machine-portability-test
              'bitecho.wire-negotiation-test))
 

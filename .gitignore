@@ -27,3 +27,6 @@ snapshot*.edn
 snapshot*.bin
 *.pid
 *.log
+
+# Compiled browser JS bundle (SRI hash and index.html are tracked)
+/dist/bitecho-browser.js

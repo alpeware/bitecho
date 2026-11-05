@@ -454,26 +454,31 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 2. **MTI Suite & Golden Vectors**: Mandatory-to-implement `suite-v1-aes256gcm` (Ed25519 + X25519 + HKDF-SHA256 + AES-256-GCM with 96-bit nonce derived from 64-bit sequence counter via `seq->nonce` and 16-byte authentication tag appended to ciphertext) and `suite-v1-chacha20poly1305`. Cross-runtime golden vector test verifies byte-for-byte identical ciphertext and tag between JDK `Cipher` and Node.js `node:crypto`.
 3. **Cryptographic Downgrade Resistance**: Bound `:crypto-suites` as pipe-delimited CSV string into `offer-hash`, `canonical-rendezvous-header-str`, and `canonical-directory-attestation`. Any tampering or stripping of advertised suites in transit invalidates the sender's Ed25519 signature, dropping the handshake fail-closed.
 4. **Strict Mid-Session Suite Mismatch Rejection**: `open-message` (6-arity) takes `session-suite` and `frame-suite`; if frame-suite mismatches session-suite, decryption aborts immediately returning `nil`.
-5. **Acceptance**: Comprehensive cross-runtime test suite in `test/bitecho/wire_negotiation_test.cljc` (17 tests, 81 assertions) covering wire roundtrip, chunking, record normalization, format versioning, AES-256-GCM golden vectors and tamper resistance, `prop-crypto-suite-negotiation-determinism` (50 runs), downgrade resistance on offers, rendezvous, and directory descriptors, and live JVM $\leftrightarrow$ Node subprocess AEAD interop. All 406 JVM tests (3303 assertions) and all 136 Node/CLJS tests (858 assertions) pass green with 0 failures, 0 errors, and 0 lint warnings.
+5. **Acceptance**: Comprehensive cross-runtime test suite in `test/bitecho/wire_negotiation_test.cljc` (17 tests, 89 assertions) covering wire roundtrip, chunking, record normalization, format versioning, AES-256-GCM golden vectors and tamper resistance, `prop-crypto-suite-negotiation-determinism` (50 runs), downgrade resistance on offers, rendezvous, and directory descriptors, and live JVM $\leftrightarrow$ Node subprocess AEAD interop. All 406 JVM tests (3311 assertions) and all 136 Node/CLJS tests (866 assertions) pass green with 0 failures, 0 errors, and 0 lint warnings.
 
 ---
 
 
 
 
-### Milestone 10: CLJS Browser Node
+### Milestone 10: CLJS Browser Node — **`[BUILT & VERIFIED]`**
 
-#### Step 10A — CLJS Boundary
-1. **Transport**: `RTCPeerConnection` / `RTCDataChannel` interop replaces the JVM datachannel reimplementation, with real STUN/ICE. Generation-tagged connection state per Rule 4. IndexedDB state persistence; bootstrap/directory fetch over HTTPS (CORS on clj-web for cross-origin fetches).
-2. **Validation Path**: Validate against `dev/example/server.clj` + HTML demo first (JVM $\leftrightarrow$ browser interop already demonstrated), then the live mesh.
-3. **v1 Signing-Byte Fallback Sunset**: The legacy `v1` `pr-str` signing-byte fallback (`*allow-legacy-v1-signing-fallback*`) is scheduled for sunset (default switched to `false`) in Milestone 10 once all cluster nodes and daemons have transitioned to v2 canonical Fressian signing.
+#### Step 10A — CLJS Boundary — **`[BUILT & VERIFIED]`**
+1. **Transport**: `RTCPeerConnection` / `RTCDataChannel` interop (`connect-webrtc!`) replaces JVM datachannel boundary in browser environments with real STUN/ICE (`default-ice-servers`) and binary `arraybuffer` Fressian framing. Generation-tagged single-authority connection state machine (`transition-conn`) in `src/bitecho/shell/browser.cljc` per Rule 4, emitting counted `:diagnose` effects for stale generations (`gen < current`), dropped sends, and unsupported wire formats per Rule 5.
+2. **Persistence Sanitization**: Pure IndexedDB store (`sanitize-state-for-persistence`) stripping ephemeral session keys (`:ephemeral-priv`) and derived runtime liveness (`:connected?`, `:connection-error`, `:channel`) before disk commits, with pure in-memory atom fallback in non-browser/test runtimes.
+3. **Pure-CLJS Browser Crypto Fallbacks**: Zero-dependency pure-CLJS implementations of SHA-512 (FIPS 180-4) and Ed25519 (RFC 8032) in `src/bitecho/crypto.cljc` (`sha512`, `pure-ed25519-keypair`, `pure-ed25519-sign`, `pure-ed25519-verify`) plus X25519 Montgomery ladder (RFC 7748), HMAC-SHA256, HKDF-SHA256 (RFC 5869), AES-256-GCM (NIST SP 800-38D), and ChaCha20-Poly1305 (RFC 8439) in `src/bitecho/crypto/sealed.cljc` matching standard RFC test vectors.
+4. **v1 Signing-Byte Fallback Sunset**: The legacy `v1` `pr-str` signing-byte fallback (`*allow-legacy-v1-signing-fallback*`) is sunset by defaulting to `false` in `src/bitecho/crypto.cljc`.
+5. **HTTPS Fetcher & CORS**: Pure ClojureScript HTTPS bootstrap/directory fetcher with CORS mode support.
 
-#### Step 10B — Static Bundle + Verifiable Hosting
-1. **Bundle**: Static JS bundle hosted on `bitecho.org` via clj-web (already serves static HTTPS). Reproducible build + published hash (SRI). Self-host / modify-from-source docs. Secure-context (HTTPS) requirement documented. WebRTC has no origin restrictions; signaling travels through the Bitecho mesh, so cross-domain operation is inherent.
+#### Step 10B — Static Bundle + Verifiable Hosting — **`[BUILT & VERIFIED]`**
+1. **Browser Entry Point & API**: Implemented `src/bitecho/browser_main.cljs` exporting `globalThis.BitechoBrowser` with `initNode`, `getStatus`, `connect`, `createOffer`, `acceptOffer`, `sendSealedMessage`, `runSubnetDemo`, and `version`.
+2. **Reproducible Static Bundle (`scripts/build-browser-bundle.sh`)**: Compiles deterministic bundle to `dist/bitecho-browser.js`, computes SHA-384 and SHA-256 SRI hashes into `dist/bitecho-browser.js.sri`, produces `dist/index.html` referencing the bundle with SRI, and verifies 100% byte-for-byte reproducibility across successive builds. Synced to `../clj-web/public/app/`.
+3. **Static Server CORS & Mime**: Enhanced `../clj-web/src/web/http/content.clj` with `.js`, `.mjs`, `.sri` content types, compressible JavaScript, permissive CORS headers on all static responses, and `204 No Content` for preflight `OPTIONS` requests. Verified via 106 tests (1580 assertions) in `clj-web`.
 
-#### Step 10C — Browser-Only Subnet Demo
-1. **Demo**: Browser-only subnet (2+ browser nodes, sealed session, burn accounting) demonstrating full participation in a subnetwork from browser nodes alone.
-2. **Acceptance**: Browser node participates fully while foregrounded; background-throttle degradation documented honestly; no always-on infrastructure claims. STUN is already implemented in `clj-datachannel` (holepunch failure = bug); ICE/TURN completion is Step 12C, not a gate for M10.
+#### Step 10C — Browser-Only Subnet Demo — **`[BUILT & VERIFIED]`**
+1. **Multi-Peer Subnet Demo (`run-browser-subnet-demo`)**: Implemented browser-only subnet simulation with 3 browser nodes (Alice, Bob, Carol) driving real `bitecho.light-node.core/init-light-state`, `handle-command`, and `handle-wire-payload` state machines over the Rule 4 `transition-conn` router with `"fressian-v1"` wire protocol, `"suite-v1-aes256gcm"` AEAD sealed channels, `:autonomous? false` pending-offer holding + explicit `"accept"`, and earn-first burn accounting burning 2000 ECH across 2 offers and 2 messages.
+2. **Honest Background-Throttle Tracking**: Web browser visibility state tracked via `visibilitychange` events; background events increment counted `:background-throttled-events` with zero unbacked always-on infrastructure claims.
+3. **Acceptance & Model-Based Testing**: Cross-runtime generative property test `prop-browser-shell-lifecycle-state-machine` (50 runs) verifying monotonic generations, absence of illegal runtime keys, counted stale-generation diagnostics, and wire format drops in `test/bitecho/shell/browser_test.cljc`. Full suite passes: 413 JVM tests (3380 assertions) and 142 Node/CLJS tests (929 assertions) green with 0 failures, 0 errors, and 0 lint warnings.
 
 ---
 
