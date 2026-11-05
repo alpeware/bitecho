@@ -68,10 +68,6 @@
     (when @active-node-atom
       (cb (get-status @active-node-atom)))))
 
-(def redacted-js-keys
-  "Canonical forbidden keys aliased from bitecho.shell.browser."
-  browser/forbidden-persistence-keys)
-
 (def redacted-js-key?
   "Canonical forbidden key predicate aliased from bitecho.shell.browser."
   browser/forbidden-persistence-key?)

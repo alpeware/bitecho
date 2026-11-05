@@ -338,314 +338,157 @@
       (is (= #{{:id :a} {:id :b}} (:nested-set sanitized)))
       (is (= [{:id :c}] (vec (:nested-list sanitized))))))
 
-  (testing "Structural default-deny persistence (allowed-persistence-key?) + canonicalize-then-match denylist across 100% independently-enumerated forbidden-persistence-keys (431) + 115+ disjoint secret stems, 10 casings (incl. compact & prefixed/suffixed), and 3 key types + 100% independently-enumerated public/innocent carve-outs (331) & schema allowlist (791) + R8-M1/M2/L3/L4/L5 + R9-M1/L1/L3 probes"
-    (let [independent-forbidden-stems
+  (testing "Allowlist-only persistence (allowed-persistence-key?) strips all known secret/ephemeral keys and unlisted keys while preserving the complete state schema (R9-M1, R9-L1, R9-L3)"
+    (let [known-secret-and-ephemeral-stems
           ["private" "private-key" "private-key-bytes" "private-key-hex"
-           "privkey" "privkey-bytes" "privkey-hex" "prv"
+           "privkey" "privkey-bytes" "privkey-hex"
            "seed" "seed-bytes" "seed-hex" "backup-seed" "backup-seed-bytes" "backup-seed-hex"
-           "secret" "secret-key" "secret-key-bytes" "secret-key-hex" "shared-secret" "shared-secret-bytes"
-           "scr" "scrt"
-           "root-key" "chain-key" "send-chain-key" "recv-chain-key"
-           "skipped-keys" "session-key" "session-keys" "session-key-bytes" "session-id" "session-handle"
-           "session-ticket" "ratchet-key"
-           "ephemeral-private" "ephemeral-private-key" "ephemeral-priv" "ephemeral-privkey" "ephemeral-secret"
-           "caller-x25519-priv" "callee-x25519-priv"
-           "x25519" "x25519-priv" "x25519-privkey" "x25519-private" "x25519-private-key"
-           "x25519-privkey-bytes" "x25519-private-key-bytes" "x25519-secret" "x25519-secret-key"
-           "ed25519-priv" "ed25519-privkey" "ed25519-private" "ed25519-private-key"
-           "ed25519-privkey-bytes" "ed25519-private-key-bytes" "ed25519-seed" "ed25519-secret"
-           "cold-privkey" "cold-private-key" "cold-seed" "keypair" "tx-key" "rx-key"
-           "prf" "prf-output" "prf-bytes" "prf-seed" "prf-secret" "hmac-secret"
-           "raw-id" "raw-id-bytes" "user-handle" "user-handle-bytes" "credential-id" "credential-id-bytes"
-           "attestation-object" "client-data-json"
-           "api-key" "apikey" "api-key-hex" "api-key-bytes" "api-token" "api-secret"
-           "jwt" "jwt-token" "access-token" "refresh-token" "session-token" "auth-token"
-           "bearer-token" "id-token" "csrf-token" "xsrf-token" "oauth-token" "token" "tokens" "tok" "tkn"
-           "bearer" "authorization" "auth-header" "auth-secret" "auth-key" "auth"
-           "client-secret" "server-secret" "app-secret" "webhook-secret" "signing-secret" "session-secret"
-           "signing-key" "signing-privkey" "signing-private-key" "encryption-key" "decryption-key"
-           "master-key" "master-seed" "hmac-key" "symmetric-key" "sym-key" "aes-key" "chacha-key"
-           "wrapping-key" "unwrapping-key" "derived-key" "hkdf-key" "kdf-key" "mac-key" "backup-key"
-           "recovery-key" "recovery-seed" "recovery-code" "identity-key" "identity-seed" "node-key" "host-key"
-           "peer-key" "hot-key" "cold-key" "device-key" "turn-password" "turn-secret"
-           "key" "keys" "kek" "dek" "mek" "tek" "psk" "msk" "prk" "okm" "ikm" "cek" "kwk" "pmk" "ptk" "gtk" "stk" "ltk" "irk" "csrk"
-           "code" "codes" "passcode" "passcodes" "passkey" "passkeys"
-           "keystore" "secret-value" "token-value"
-           "entropy" "entropy-bytes" "entropy-hex" "raw-entropy" "entropy-seed"
-           "xprv" "tprv" "zprv" "yprv" "lprv" "uprv" "vprv" "wif" "private-wif" "wif-key"
-           "recovery-phrase" "backup-phrase" "seed-phrase" "secret-phrase" "mnemonic-phrase" "pass-phrase"
-           "recovery-words" "backup-words" "seed-words" "secret-words" "mnemonic-words" "wordlist" "word-list"
-           "recovery-sentence" "seed-sentence" "backup-sentence" "mnemonic-sentence" "secret-sentence" "pass-sentence" "sentence"
-           "pk" "sk" "dk" "ek" "mk" "rk" "ck" "tk" "wk" "uk"
-           "pw" "pass" "pswd" "pword" "pepper" "secret-pepper" "auth-pepper" "password-hint" "passphrase-hint"
-           "derivation-path" "hd-path" "bip32-path" "bip44-path" "bip32" "bip38" "bip39" "bip44" "bip49" "bip84" "bip86" "slip10" "slip39"
-           "pkcs" "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pkcs10" "pkcs11" "pfx" "p12" "p8" "pem" "private-pem" "key-pem" "der"
-           "jwk" "jwks" "jwe" "jws" "cwt" "paseto" "macaroon" "biscuit"
-           "keytab" "ktab" "ccache" "tgt" "htpasswd" "htdigest" "netrc" "pgpass" "mycnf" "npmrc" "pypirc" "gemrc" "yarnrc"
-           "kubeconfig" "kubecfg" "dockercfg" "dockerconfig" "shadow" "masterpasswd" "sudoers"
-           "cvv" "cvc" "cvv2" "cvc2" "pan" "pinblock" "pin-block" "ssn" "sin" "nin" "tin" "ein" "itin" "pat"
-           "master-secret" "pre-master-secret" "client-random" "server-random" "traffic-secret" "exporter-secret"
-           "resumption-secret" "early-secret" "handshake-secret" "keystream" "cleartext" "plaintext"
-           "key-material" "secret-material" "salt" "kdf-salt" "pbkdf2" "scrypt" "argon2" "argon2i" "argon2d" "argon2id" "bcrypt" "ntlm" "nthash" "lmhash"
-           "otpauth" "otpauth-url" "otpauth-uri" "totp-uri" "totp-url"
-           "ticket" "tickets" "tls-ticket" "auth-ticket" "kerberos-ticket" "service-ticket" "sso-ticket"
-           "puk" "puk-code" "puk1" "puk2" "pin1" "pin2" "tan"
-           "service-account" "service-account-json" "service-account-key" "credentials-json" "credentials-file" "client-secret-json" "keystore-json"
-           "dotenv" "dot-env" "env-file" "envfile" "secret-env" "env-secrets" "env-key"
-           "brainwallet" "brain-wallet" "paperwallet" "paper-wallet" "hdwallet" "hd-wallet" "wallet-dat" "wallet-file" "walletfile"
-           "backup" "backups" "backup-file" "backupfile" "backup-blob" "backup-data" "backup-json" "backup-archive" "backup-payload"
-           "seed-file" "seedfile" "key-file" "keyfile" "secret-file" "secretfile" "cred-file" "credfile" "pass-file" "passfile" "token-file" "tokenfile"
-           "dpapi" "kdbx" "keepass" "secring" "ssh-key" "sshkey" "id-rsa" "idrsa" "id-ed25519" "ided25519" "ppk" "ovpn" "wg-key" "wgkey" "wg-priv" "wgpriv"
-           "credential" "credentials" "cred" "creds" "crd" "cookie" "cookies" "pin" "otp" "totp" "hotp"
-           "mnemonic" "mnem" "passphrase" "password" "passwd" "pwd" "first" "eval"
+           "secret" "secret-key" "shared-secret" "shared-secret-bytes"
+           "session-key" "session-keys" "session-id"
+           "ephemeral-priv" "ephemeral-privkey" "caller-x25519-priv" "callee-x25519-priv"
+           "x25519" "x25519-priv" "x25519-privkey" "x25519-private-key"
+           "cold-privkey" "cold-private-key" "keypair" "tx-key" "rx-key" "tx" "rx"
+           "prf" "prf-output" "user-handle" "raw-id" "credential-id"
+           "ice-pwd" "pwd" "password" "passphrase" "mnemonic" "first" "eval"
            "connected?" "connected" "connection-error" "conn-diagnostics" "conn-atom" "conn"
            "channel" "active-channels" "connections" "transport" "socket" "last-error"]
-          independent-secret-stems ["refresh-code" "email-code" "backup-code" "verification-code" "auth-code" "security-code"
-                                    "pin-code" "otp-code" "totp-code" "one-time-code"
-                                    "access-code" "secret-code" "mfa-code" "unlock-code" "pairing-code"
-                                    "exchange-code" "grant-code" "claim-code" "redeem-code" "redemption-code"
-                                    "transfer-code" "withdrawal-code" "payment-code" "transaction-code" "tx-code"
-                                    "approval-code" "release-code" "escrow-code" "voucher-code" "magic-code"
-                                    "link-code" "temp-code" "reauth-code" "stepup-code" "second-factor-code" "client-code" "server-code"
-                                    "key-backup" "key-wrap" "key-escrow" "key-share" "key-shard"
-                                    "key-export" "key-import" "key-dump" "key-blob" "key-buffer"
-                                    "key-payload" "key-record" "key-entry" "key-secret" "key-seed"
-                                    "private-key-id" "secret-key-id" "passkey-id" "privkey-id" "seed-key-id" "token-key-id" "auth-key-id"
-                                    "passkey-rotation" "private-key-rotation" "secret-key-rotation" "privkey-rotation" "session-key-rotation" "master-key-rotation"
-                                    "private-key-path" "secret-key-path" "passkey-path" "privkey-path" "seed-key-path"
-                                    "private-key-version" "secret-key-version" "passkey-version" "privkey-version"
-                                    "private-key-name" "secret-key-name" "passkey-name"
-                                    "wallet-key" "vault-key" "storage-key" "channel-key"
-                                    "sub-key" "data-key" "user-key" "account-key" "app-key" "service-key"
-                                    "master-kek" "data-dek" "wrap-kek"
-                                    "local-passcode" "admin-passcode" "device-passcode"
-                                    "login-secret" "vault-seed" "refresh-cookie" "bearer-jwt"
-                                    "oauth-cred" "totp-pin" "session-auth"
-                                    "ephemeral-key" "sender-key" "receiver-key" "header-key"
-                                    "credential-handle" "auth-handle" "secret-handle" "key-handle" "token-handle"
-                                    "master-xprv" "hd-tprv" "wallet-wif"
-                                    "login-phrase" "security-phrase" "twelve-words" "twenty-four-words"
-                                    "hash-pepper" "key-derivation-path" "seed-path" "wallet-pkcs8" "cert-pkcs12"
-                                    "user-otpauth-url" "totp-otpauth-uri" "tls-session-ticket" "sim-puk" "user-puk-code"
-                                    "gcp-service-account-json" "app-dotenv" "local-env-file" "user-brainwallet" "btc-paperwallet"
-                                    "seed-recovery-sentence" "encrypted-backup-file" "master-wordlist"
-                                    "user-pk" "peer-sk" "login-pw" "admin-pass" "card-cvv" "user-ssn" "github-pat" "kerberos-tgt"
-                                    "keybackup" "keywrap" "keyescrow" "refreshcode" "emailcode" "privatekeyid" "secretkeyid" "passkeyrotation"]
-          stems (vec (distinct (concat independent-forbidden-stems
-                                       independent-secret-stems
-                                       (for [s ["private-key" "privkey" "seed" "secret-key" "session-key"
-                                                "api-key" "access-token" "session-token" "signing-key"
-                                                "x25519-privkey" "ed25519-privkey" "prf-output" "user-handle"
-                                                "recovery-code" "refresh-code" "email-code" "session-id" "session-handle" "session-ticket"
-                                                "wallet-key" "key-backup" "key-file" "key-wrap" "key-escrow"
-                                                "private-key-id" "secret-key-id" "passkey-rotation"
-                                                "otpauth-url" "puk" "service-account-json" "dotenv" "env-file"
-                                                "brainwallet" "recovery-sentence" "backup-file"
-                                                "passcode" "kek" "dek" "entropy" "xprv" "tprv" "wif"
-                                                "recovery-phrase" "backup-phrase" "recovery-words"
-                                                "pk" "sk" "pw" "pass" "pepper" "derivation-path" "pkcs8" "pkcs12"]
-                                             sfx ["-bytes" "-hex" "-raw" "-b64"]]
-                                         (str s sfx)))))
           to-camel (fn [s]
                      (let [parts (str/split s #"-")]
                        (apply str (first parts) (map str/capitalize (rest parts)))))
           to-pascal (fn [s]
                       (apply str (map str/capitalize (str/split s #"-"))))
-          to-title-snake (fn [s]
-                           (str/join "_" (map str/capitalize (str/split s #"-"))))
           casings (fn [s]
                     [s
                      (str/replace s "-" "_")
                      (to-camel s)
                      (to-pascal s)
                      (str/upper-case (str/replace s "-" "_"))
-                     (str/upper-case s)
-                     (str/replace s "-" "")
-                     (str/upper-case (str/replace s "-" ""))
-                     (str/replace s "-" ".")
-                     (to-title-snake s)])
-          all-forbidden-keys (vec (distinct (for [stem stems
+                     (str/replace s "-" "")])
+          all-forbidden-keys (vec (distinct (for [stem known-secret-and-ephemeral-stems
                                                   cased (casings stem)
                                                   k [cased (keyword cased) (symbol cased)]]
                                               k)))
-          independent-carve-out-stems
-          ["pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
-           "pubkey-hex" "public-key-hex" "pubkey-bytes" "public-key-bytes"
-           "x25519-pubkey" "x25519-public-key" "ed25519-pubkey" "ed25519-public-key"
-           "ed25519" "xpub" "ypub" "zpub" "tpub" "vpub" "upub" "vk" "verification-key"
-           "peer-pubkey" "agent-pubkey" "hot-pubkey" "anchor-pubkey" "authority-pubkey"
-           "directory-pubkey" "trusted-directory-pubkey" "caller-pubkey" "callee-pubkey"
-           "treasury-pubkey" "custody-pubkey" "alice-pubkey" "bob-pubkey" "carol-pubkey"
-           "validator-pubkey" "node-pubkey" "sender-pubkey" "recipient-pubkey" "remote-pubkey"
-           "local-pubkey" "target-pubkey" "signer-pubkey" "owner-pubkey" "issuer-pubkey"
-           "subject-pubkey" "delegate-pubkey" "ephemeral-pubkey" "caller-x25519-pub" "callee-x25519-pub"
-           "caller-x25519" "callee-x25519" "coordinator-pubkey" "expected-agent-pubkey" "expected-pubkey"
-           "prev-pubkey" "sender-pubkey-bytes" "key-protection"
-           "ephemeral-pub" "caller-ephemeral-pub" "callee-ephemeral-pub" "spki" "cose-key" "cose-pubkey"
-           "key-mode" "keys-verified?" "keys-verified" "key-count" "keys-count"
-           "key-type" "key-types" "key-id" "key-ids" "api-key-id" "api-key-ids"
-           "session-key-id" "signing-key-id" "encryption-key-id" "master-key-id" "public-key-id"
-           "key-rotation" "key-rotations" "key-rotation-epoch" "key-rotation-interval" "key-rotation-period"
-           "key-schedule" "key-policy" "key-ceremony" "key-holder" "key-owner" "key-age" "key-ttl" "key-epoch"
-           "key-algorithm" "key-algo" "key-metadata"
-           "key-length" "key-size" "key-bits" "key-format" "key-usage" "key-usages" "key-ops"
-           "key-version" "key-index" "key-name" "key-label" "key-path" "key-uri" "key-url"
-           "key-status" "key-state" "key-created-at" "key-expires-at" "key-expired?" "key-rotated-at"
-           "key-fingerprint" "key-hash" "primary-key" "foreign-key" "sort-key" "partition-key"
-           "routing-key" "cache-key" "lookup-key" "safe-key" "innocent-key" "control-key" "allowed-key"
-           "resident-key" "require-resident-key" "pub-key-cred-params" "cred-props"
-           "cred-protect" "credential-protection-policy" "allow-credentials" "backup-available?"
-           "authenticator-selection" "authenticator-attachment" "authenticator-type"
-           "keychain" "keychains" "keyring" "keyrings" "keyboard" "keyboards" "keypad" "keypads"
-           "keycode" "keycodes"
-           "key-code" "key-codes" "keydown" "keyup" "keypress" "keystroke" "keystrokes"
-           "keybinding" "keybindings" "keymap" "keyword" "keywords" "keyframe" "keyframes"
-           "keynote" "keystone" "keyhole"
-           "monkey" "monkeys" "turkey" "turkeys" "donkey" "donkeys" "hockey" "jockey" "whiskey" "turnkey"
-           "is-private" "private-notes" "private-mode" "private-browsing"
-           "private-channel?" "private-group?" "privacy" "privacy-policy" "privacy-mode"
-           "passwordless" "password-required?" "password-policy" "password-strength"
-           "password-updated-at" "password-reset-sent?"
-           "seed-count" "seed-nodes" "seed-peers" "seed-url" "seed-urls" "seed-list"
-           "seed-epoch" "seedling" "seedlings" "seeded?" "is-seeded"
-           "token-count" "tokens-count" "token-supply" "token-balance" "token-symbol"
-           "token-decimals" "token-name" "token-type" "tokenomics" "tokenize" "tokenizer" "tokenized"
-           "status-code" "error-code" "country-code" "postal-code" "zip-code" "area-code"
-           "language-code" "lang-code" "currency-code" "http-code" "response-code"
-           "exit-code" "return-code" "reason-code" "color-code" "qr-code" "bar-code" "barcode"
-           "op-code" "opcode" "byte-code" "bytecode" "hash-code" "hashcode" "char-code" "charcode"
-           "discount-code" "coupon-code" "promo-code" "promotion-code" "referral-code" "product-code" "tracking-code"
-           "morse-code" "morsecode" "short-code" "shortcode" "time-code" "timecode" "micro-code" "microcode" "pseudo-code" "pseudocode"
-           "source-code" "code-version" "code-hash" "code-size" "code-path" "code-line" "code-block"
-           "codebase" "codec" "codecs" "coder" "encoder" "decoder" "encode" "decode" "unicode"
-           "author" "authors" "authored" "authority" "authorities" "authorized?" "is-authorized"
-           "authenticated?" "is-authenticated" "auth-mode" "auth-method" "auth-type"
-           "auth-status" "auth-provider" "auth-level" "auth-retries" "auth-count"
-           "sessions" "session-count" "sessions-count" "session-state" "session-status"
-           "session-role" "session-epoch" "session-timeout" "session-duration"
-           "session-created-at" "session-expires-at" "session-active?" "is-session-active"
-           "channel-count" "channels-count" "channel-id" "channel-name" "channel-type"
-           "channel-state" "channel-status" "channel-capacity" "channel-balance"
-           "first-name" "first-seen" "first-epoch" "first-block" "first-item" "first-index" "first-page"
-           "eval-count" "evaluate" "evaluation" "evaluator"
-           "pin-count" "pinned" "pinned?" "is-pinned"
-           "ice-creds"]
-          independent-allowed-stems
-          ["a" "b" "c" "x" "y" "z" "k" "v" "foo" "bar" "baz" "qux"
-           "ok" "ok?" "safe" "safe-field" "safe-val" "safe-value" "safe-data" "safe-map"
-           "keep" "keep-me" "innocent" "control" "allowed"
-           "harmless" "benign" "normal" "regular" "pub" "label" "name" "title" "description"
-           "text" "message" "msg" "memo" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
-           "num" "number" "amount" "burn-amount" "balance" "spendable" "price" "burn" "burn-floor" "fee"
-           "epoch" "epoch-initialized?" "created-epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
-           "seq" "tx-seq" "acked-seq" "rx-high-seq" "contiguous-rx-seq" "transfer-seq" "intent-seq" "voucher-seqs"
-           "unacked-count" "replays-deduped" "outbox-evicted" "outbox-order" "deps"
-           "replay-window" "highest-seq" "seen" "window-size"
-           "status" "state" "phase" "generation" "visibility-state" "role" "mode" "type" "kind" "version" "protocol-version"
-           "suite" "crypto-suite" "crypto-suites" "format" "wire-format" "wire-protocol" "wire-version-diagnostics"
-           "supported-formats" "min-supported" "max-supported"
-           "unsupported-dropped" "unsupported-format-dropped" "last-unsupported-version" "last-unsupported-format"
-           "background-throttled-events" "ignored-stale" "dropped" "failover-count" "diagnostics-buffered"
-           "validator-cursor" "validator-id" "diagnostics"
-           "peer" "peers" "peer-id" "peer-petname" "petname" "petnames" "petnames-count"
-           "node" "nodes" "node-id" "nodes-count" "node1" "node2" "node3" "ns1" "ns2" "ns3"
-           "subnet" "subnet-id" "domain" "network" "address" "anchor-address" "hot-address"
-           "ip" "port" "agent-port" "agent-tcp-port" "ingress-host" "ingress-port"
-           "host" "hostname" "url" "uri" "path" "fingerprint" "ice-ufrag"
-           "created-at" "updated-at" "expires-at" "queued-at" "accepted-at" "registered-at" "logged-at"
-           "timestamp" "time" "date" "duration" "timeout" "direction" "sender" "recipient" "payer" "receiver"
-           "caller" "callee" "from" "to" "from-petname"
-           "offer" "offers" "offer-id" "offer-hash" "pending-offers" "pending-offers-count"
-           "outbound-rendezvous" "pending-rendezvous" "pending-rendezvous-count" "pending-rendezvous-accepts"
-           "offers-approved" "offers-denied" "last-denied-reason"
-           "service-offers" "service-id" "service-types" "rendezvous-policy" "auto-accept" "auto-accept?" "min-burn"
-           "allowlist" "home-node" "home-nodes" "home-set"
-           "inbox" "inbox-count" "outbox" "chat-history" "messages" "messages-exchanged" "messages-received" "last-message"
-           "msg-payload" "gossip-env" "message-id" "payload" "payload-hex" "frame-type" "nonce" "ciphertext" "sealed-frame"
-           "burned-ech" "total-burned-ech" "alice-burned" "bob-burned" "vouchers" "vouchers-count" "voucher-id"
-           "escrows" "escrows-count" "escrow-id" "deliverable-hash" "last-transfer-hash"
-           "settled-epoch" "net-amount" "settlement-mode" "take-amount" "take-burned"
-           "refund-amount" "refund-reason" "payer-signature" "preimage" "deliverable"
-           "release-submitted" "refund-submitted" "settled-escrow-ids" "settled-escrow-order" "canonical-escrows"
-           "payer-petname" "receiver-petname" "recipient-petname" "caller-petname" "callee-petname"
-           "chain-state-snapshots" "max-outbox-size" "ufrag" "spent" "delivery-ack" "header"
-           "initial-text" "topic" "cumulative-debit" "selected-suite" "ack-seq" "seen-seqs"
-           "receipt-id" "nickname" "mailbox" "pop-signature" "directory-signature" "rotation-signature"
-           "responsive?" "latency-ms" "price-max" "subnets" "dac-001"
-           "local-accounting" "accounting" "scope" "scopes" "permissions" "max-spend" "max-spend-per-epoch"
-           "dac" "dac-id" "dac-spend" "active-dac" "active-dac-id" "revoked-dacs" "revoked-dacs-count" "revoked-dac-ids"
-           "revocation" "revocation-reason" "denial-reason" "reason"
-           "agent" "agents" "agent-id" "supervised-agents" "supervised-agents-count" "supervised-agent-revoked"
-           "activity-log" "activity-count" "team-call-subnet" "topic-name" "ai-inference"
-           "directory-cache" "directory-cache-count" "bootstrap" "signature"
-           "domain-a" "domain-a-verified?" "domain-b" "domain-b-verified?"
-           "advertisement-verified?" "inter-subnet-routed?" "subnet-mismatch-dropped" "unroutable-dropped"
-           "autonomous" "autonomous?" "autonomous-off?" "economy-enabled" "economy-enabled?"
-           "light-state" "account" "accounts" "identity" "recovery-source"
-           "fido-strength" "fido-authenticator" "fido-security" "strength" "score" "verification-status"
-           "warning" "yubico-enrollment" "aaguid" "up?" "uv?" "be?" "bs?" "at?" "ed?" "flags" "sign-count"
-           "rp-id-hash-hex" "strength-hint" "fmt" "att-stmt"
-           "vendor" "user-verification-details" "attestation-types" "certification-level"
-           "trust-boundary" "origin-scoping" "rp" "rp-id" "rp-name" "user" "user-id" "username" "display-name" "email"
-           "challenge" "alg"
-           "user-verification" "attestation" "extensions"
-           "extractable" "extractable?" "usages" "algorithm" "named-curve" "hash" "length"
-           "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta" "metadata"
-           "config" "options" "settings" "profile" "result" "results" "response" "effect" "effects" "event" "events" "cmd" "command"
-           "nested" "nested-map" "nested-vec" "nested-set" "nested-list" "child" "children" "parent" "root" "leaf" "branch"
-           "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag"
-           "enabled" "enabled?" "active" "active?" "verified" "verified?" "valid" "valid?" "open" "closed" "idle" "dialing"
-           "mesh-connected" "connected-nodes" "demo" "stale-generation-ignored" "in-memory?" "bytes-stored"
-           "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol"
-           "peer-alice" "peer-bob" "peer-carol" "node-alice" "node-bob" "node-carol"
-           "browser-alice" "browser-bob" "browser-carol" "rt-node" "browser-test" "browser-guard-test" "test-peer" "test-subnet" "global"
-           "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"]
-          all-carve-out-keys (vec (distinct (for [stem independent-carve-out-stems
-                                                  cased (casings stem)
-                                                  k [cased (keyword cased) (symbol cased)]]
-                                              k)))
-          unlisted-default-deny-keys [:kennwort :mot-de-passe :contrasena :cle-privee :wachtwoord
-                                      :passw0rd :s3cr3t :unlisted-custom-credential]
-          prefixes ["sess-" "node-" "peer-" "offer-" "msg-" "item-" "agent-" "sub-agent-" "worker-node-" "browser-" "off-"]
-          foreign-stems ["kennwort" "passw0rd" "mot-de-passe" "contrasena" "cle-privee" "wachtwoord" "s3cr3t" "geheimnis" "parola" "haslo"]
-          prefixed-foreign-keys (vec (for [p prefixes
-                                           f foreign-stems
-                                           c (casings (str p f))
-                                           k [c (keyword c) (symbol c)]]
-                                       k))
-          pubkey-foreign-keys (vec (for [f foreign-stems
-                                         sfx ["-pubkey" "-public-key" "-pubkeys" "-public-keys"]
-                                         c (casings (str f sfx))
-                                         k [c (keyword c) (symbol c)]]
-                                     k))
+          unlisted-keys [:kennwort :mot-de-passe :contrasena :cle-privee :wachtwoord
+                         :passw0rd :s3cr3t :unlisted-custom-credential
+                         :sess-kennwort :kennwort-pubkey]
+          independent-allowed-schema
+          #{"pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
+            "pubkey-hex" "public-key-hex" "pubkey-bytes" "public-key-bytes"
+            "x25519-pubkey" "x25519-public-key" "ed25519-pubkey" "ed25519-public-key"
+            "ed25519" "xpub" "ypub" "zpub" "tpub" "vpub" "upub" "vk" "verification-key"
+            "peer-pubkey" "agent-pubkey" "hot-pubkey" "anchor-pubkey" "authority-pubkey"
+            "directory-pubkey" "trusted-directory-pubkey" "caller-pubkey" "callee-pubkey"
+            "treasury-pubkey" "custody-pubkey" "alice-pubkey" "bob-pubkey" "carol-pubkey"
+            "validator-pubkey" "node-pubkey" "sender-pubkey" "recipient-pubkey" "remote-pubkey"
+            "local-pubkey" "target-pubkey" "signer-pubkey" "owner-pubkey" "issuer-pubkey"
+            "subject-pubkey" "delegate-pubkey" "ephemeral-pubkey" "caller-x25519-pub" "callee-x25519-pub"
+            "caller-x25519" "callee-x25519" "coordinator-pubkey" "expected-agent-pubkey" "expected-pubkey"
+            "prev-pubkey" "sender-pubkey-bytes" "key-protection"
+            "ephemeral-pub" "caller-ephemeral-pub" "callee-ephemeral-pub" "spki" "cose-key" "cose-pubkey"
+            "key-mode" "keys-verified?" "keys-verified" "key-count" "keys-count"
+            "key-type" "key-types" "key-id" "key-ids" "api-key-id" "api-key-ids"
+            "session-key-id" "signing-key-id" "encryption-key-id" "master-key-id" "public-key-id"
+            "key-rotation" "key-rotations" "key-rotation-epoch" "key-rotation-interval" "key-rotation-period"
+            "key-schedule" "key-policy" "key-ceremony" "key-holder" "key-owner" "key-age" "key-ttl" "key-epoch"
+            "key-algorithm" "key-algo" "key-metadata"
+            "key-length" "key-size" "key-bits" "key-format" "key-usage" "key-usages" "key-ops"
+            "key-version" "key-index" "key-name" "key-label" "key-path" "key-uri" "key-url"
+            "key-status" "key-state" "key-created-at" "key-expires-at" "key-expired?" "key-rotated-at"
+            "key-fingerprint" "key-hash" "primary-key" "foreign-key" "sort-key" "partition-key"
+            "routing-key" "cache-key" "lookup-key" "safe-key" "innocent-key" "control-key" "allowed-key"
+            "resident-key" "require-resident-key" "pub-key-cred-params" "cred-props"
+            "cred-protect" "credential-protection-policy" "allow-credentials" "backup-available?"
+            "authenticator-selection" "authenticator-attachment" "authenticator-type"
+            "sessions" "session-count" "sessions-count" "session-state" "session-status"
+            "session-role" "session-epoch" "session-timeout" "session-duration"
+            "session-created-at" "session-expires-at" "session-active?" "is-session-active"
+            "channel-count" "channels-count" "channel-id" "channel-name" "channel-type"
+            "channel-state" "channel-status" "channel-capacity" "channel-balance"
+            "ice-creds"
+            "a" "b" "c" "x" "y" "z" "k" "v" "foo" "bar" "baz" "qux"
+            "ok" "ok?" "safe" "safe-field" "safe-val" "safe-value" "safe-data" "safe-map"
+            "keep" "keep-me" "innocent" "control" "allowed"
+            "harmless" "benign" "normal" "regular" "pub" "label" "name" "title" "description"
+            "text" "message" "msg" "memo" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
+            "num" "number" "amount" "burn-amount" "balance" "spendable" "price" "burn" "burn-floor" "fee"
+            "epoch" "epoch-initialized?" "created-epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
+            "seq" "tx-seq" "acked-seq" "rx-high-seq" "contiguous-rx-seq" "transfer-seq" "intent-seq" "voucher-seqs"
+            "unacked-count" "replays-deduped" "outbox-evicted" "outbox-order" "deps"
+            "replay-window" "highest-seq" "seen" "window-size"
+            "status" "state" "phase" "generation" "visibility-state" "role" "mode" "type" "kind" "version" "protocol-version"
+            "suite" "crypto-suite" "crypto-suites" "format" "wire-format" "wire-protocol" "wire-version-diagnostics"
+            "supported-formats" "min-supported" "max-supported"
+            "unsupported-dropped" "unsupported-format-dropped" "last-unsupported-version" "last-unsupported-format"
+            "background-throttled-events" "ignored-stale" "dropped" "failover-count" "diagnostics-buffered"
+            "validator-cursor" "validator-id" "diagnostics"
+            "peer" "peers" "peer-id" "peer-petname" "petname" "petnames" "petnames-count"
+            "node" "nodes" "node-id" "nodes-count" "node1" "node2" "node3" "ns1" "ns2" "ns3"
+            "subnet" "subnet-id" "domain" "network" "address" "anchor-address" "hot-address"
+            "ip" "port" "agent-port" "agent-tcp-port" "ingress-host" "ingress-port"
+            "host" "hostname" "url" "uri" "path" "fingerprint" "ice-ufrag"
+            "created-at" "updated-at" "expires-at" "queued-at" "accepted-at" "registered-at" "logged-at"
+            "timestamp" "time" "date" "duration" "timeout" "direction" "sender" "recipient" "payer" "receiver"
+            "caller" "callee" "from" "to" "from-petname"
+            "offer" "offers" "offer-id" "offer-hash" "pending-offers" "pending-offers-count"
+            "outbound-rendezvous" "pending-rendezvous" "pending-rendezvous-count" "pending-rendezvous-accepts"
+            "offers-approved" "offers-denied" "last-denied-reason"
+            "service-offers" "service-id" "service-types" "rendezvous-policy" "auto-accept" "auto-accept?" "min-burn"
+            "allowlist" "home-node" "home-nodes" "home-set"
+            "inbox" "inbox-count" "outbox" "chat-history" "messages" "messages-exchanged" "messages-received" "last-message"
+            "msg-payload" "gossip-env" "message-id" "payload" "payload-hex" "frame-type" "nonce" "ciphertext" "sealed-frame"
+            "burned-ech" "total-burned-ech" "alice-burned" "bob-burned" "vouchers" "vouchers-count" "voucher-id"
+            "escrows" "escrows-count" "escrow-id" "deliverable-hash" "last-transfer-hash"
+            "settled-epoch" "net-amount" "settlement-mode" "take-amount" "take-burned"
+            "refund-amount" "refund-reason" "payer-signature" "preimage" "deliverable"
+            "release-submitted" "refund-submitted" "settled-escrow-ids" "settled-escrow-order" "canonical-escrows"
+            "payer-petname" "receiver-petname" "recipient-petname" "caller-petname" "callee-petname"
+            "chain-state-snapshots" "max-outbox-size" "ufrag" "spent" "delivery-ack" "header"
+            "initial-text" "topic" "cumulative-debit" "selected-suite" "ack-seq" "seen-seqs"
+            "receipt-id" "nickname" "mailbox" "pop-signature" "directory-signature" "rotation-signature"
+            "responsive?" "latency-ms" "price-max" "subnets" "dac-001"
+            "local-accounting" "accounting" "scope" "scopes" "permissions" "max-spend" "max-spend-per-epoch"
+            "dac" "dac-id" "dac-spend" "active-dac" "active-dac-id" "revoked-dacs" "revoked-dacs-count" "revoked-dac-ids"
+            "revocation" "revocation-reason" "denial-reason" "reason"
+            "agent" "agents" "agent-id" "supervised-agents" "supervised-agents-count" "supervised-agent-revoked"
+            "activity-log" "activity-count" "team-call-subnet" "topic-name" "ai-inference"
+            "directory-cache" "directory-cache-count" "bootstrap" "signature"
+            "domain-a" "domain-a-verified?" "domain-b" "domain-b-verified?"
+            "advertisement-verified?" "inter-subnet-routed?" "subnet-mismatch-dropped" "unroutable-dropped"
+            "autonomous" "autonomous?" "autonomous-off?" "economy-enabled" "economy-enabled?"
+            "light-state" "account" "accounts" "identity" "recovery-source"
+            "fido-strength" "fido-authenticator" "fido-security" "strength" "score" "verification-status"
+            "warning" "yubico-enrollment" "aaguid" "up?" "uv?" "be?" "bs?" "at?" "ed?" "flags" "sign-count"
+            "rp-id-hash-hex" "strength-hint" "fmt" "att-stmt"
+            "vendor" "user-verification-details" "attestation-types" "certification-level"
+            "trust-boundary" "origin-scoping" "rp" "rp-id" "rp-name" "user" "user-id" "username" "display-name" "email"
+            "challenge" "alg"
+            "user-verification" "attestation" "extensions"
+            "extractable" "extractable?" "usages" "algorithm" "named-curve" "hash" "length"
+            "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta" "metadata"
+            "config" "options" "settings" "profile" "result" "results" "response" "effect" "effects" "event" "events" "cmd" "command"
+            "nested" "nested-map" "nested-vec" "nested-set" "nested-list" "child" "children" "parent" "root" "leaf" "branch"
+            "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag"
+            "enabled" "enabled?" "active" "active?" "verified" "verified?" "valid" "valid?" "open" "closed" "idle" "dialing"
+            "mesh-connected" "connected-nodes" "demo" "stale-generation-ignored" "in-memory?" "bytes-stored"
+            "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol"
+            "peer-alice" "peer-bob" "peer-carol" "node-alice" "node-bob" "node-carol"
+            "browser-alice" "browser-bob" "browser-carol" "rt-node" "browser-test" "browser-guard-test" "test-peer" "test-subnet" "global"
+            "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
-                                 (map (fn [k] [k "UNLISTED"]) unlisted-default-deny-keys)
-                                 (map (fn [k] [k "PREFIXED-FOREIGN"]) prefixed-foreign-keys)
-                                 (map (fn [k] [k "PUBKEY-FOREIGN"]) pubkey-foreign-keys)
-                                 (map (fn [k] [k "PUBLIC-OK"]) all-carve-out-keys)))
+                                 (map (fn [k] [k "UNLISTED"]) unlisted-keys)
+                                 (map (fn [k] [k "SCHEMA-OK"]) independent-allowed-schema)))
           sanitized (browser/sanitize-state-for-persistence test-map)
-          survivors (remove (set all-carve-out-keys) (keys sanitized))
-          denylist-misses (remove browser/explicitly-forbidden-persistence-key? all-forbidden-keys)
-          false-positives (remove #(contains? sanitized %) all-carve-out-keys)]
-      (is (= (set independent-forbidden-stems) browser/forbidden-persistence-keys))
-      (is (= (set independent-carve-out-stems) browser/carved-out-public-and-innocent-keys))
-      (is (= (into (set independent-carve-out-stems) independent-allowed-stems) browser/allowed-persistence-keys))
+          survivors (remove independent-allowed-schema (keys sanitized))
+          false-positives (remove #(contains? sanitized %) independent-allowed-schema)]
+      (is (= independent-allowed-schema browser/allowed-persistence-keys))
       (is (every? #(and (browser/allowed-persistence-key? %)
-                        (not (browser/explicitly-forbidden-persistence-key? %))
                         (not (browser/forbidden-persistence-key? %)))
                   browser/allowed-persistence-keys))
-      (is (every? (set stems) browser/forbidden-persistence-keys))
-      (is (not-any? browser/forbidden-persistence-keys independent-secret-stems))
-      (is (>= (count all-forbidden-keys) 16800))
-      (is (= 3300 (count prefixed-foreign-keys)))
-      (is (= 1200 (count pubkey-foreign-keys)))
-      (is (empty? denylist-misses) (str "Denylist misses found: " (pr-str (take 10 denylist-misses))))
-      (is (every? #(false? (browser/allowed-persistence-key? %)) unlisted-default-deny-keys))
-      (is (every? #(false? (browser/allowed-persistence-key? %)) prefixed-foreign-keys))
-      (is (every? #(false? (browser/allowed-persistence-key? %)) pubkey-foreign-keys))
-      (is (empty? survivors) (str "Forbidden survivors found: " (pr-str (take 10 survivors))))
-      (is (empty? false-positives) (str "Carve-out false positives found: " (pr-str (take 10 false-positives))))
+      (is (every? #(false? (browser/allowed-persistence-key? %)) all-forbidden-keys))
+      (is (every? #(false? (browser/allowed-persistence-key? %)) unlisted-keys))
+      (is (empty? survivors))
+      (is (empty? false-positives))
       ;; R9-L1: 2-tuple [string int] branch requires first element to satisfy allowed-persistence-key?
       (is (false? (browser/allowed-persistence-key? ["kennwort" 5])))
       (is (false? (browser/allowed-persistence-key? ["passw0rd" 5])))
@@ -854,20 +697,7 @@
                            :x25519-pubkey "PUB-X25519-OK"
                            :x25519Pubkey "PUB-X25519-CAMEL-OK"
                            :public-key "PUB-ED25519-OK"
-                           :is-private false
-                           :passwordless true
-                           :private-notes "NOTE-OK"
-                           :seed-count 3
-                           :seedling "SEEDLING-OK"
                            :key-count 2
-                           :monkey "MONKEY-OK"
-                           :turkey "TURKEY-OK"
-                           :donkey "DONKEY-OK"
-                           :keychain "KEYCHAIN-OK"
-                           :keyring "KEYRING-OK"
-                           :discount-code "DISC-OK"
-                           :coupon-code "COUPON-OK"
-                           :morsecode "MORSE-OK"
                            :api-key-id "API-KEY-ID-OK"
                            :key-rotation "ROTATION-OK"
                            :privateKeyBytes "LEAK-1"
@@ -929,20 +759,7 @@
               :x25519-pubkey "PUB-X25519-OK"
               :x25519Pubkey "PUB-X25519-CAMEL-OK"
               :public-key "PUB-ED25519-OK"
-              :is-private false
-              :passwordless true
-              :private-notes "NOTE-OK"
-              :seed-count 3
-              :seedling "SEEDLING-OK"
               :key-count 2
-              :monkey "MONKEY-OK"
-              :turkey "TURKEY-OK"
-              :donkey "DONKEY-OK"
-              :keychain "KEYCHAIN-OK"
-              :keyring "KEYRING-OK"
-              :discount-code "DISC-OK"
-              :coupon-code "COUPON-OK"
-              :morsecode "MORSE-OK"
               :api-key-id "API-KEY-ID-OK"
               :key-rotation "ROTATION-OK"
               :nested {:x25519-pubkey "NESTED-PUB-OK"
