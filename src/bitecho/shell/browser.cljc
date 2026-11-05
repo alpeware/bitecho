@@ -255,6 +255,7 @@
     "skipped-keys" "session-key" "session-keys" "session-key-bytes" "session-id" "session-handle"
     "session-ticket" "ratchet-key"
     "ephemeral-private" "ephemeral-private-key" "ephemeral-priv" "ephemeral-privkey" "ephemeral-secret"
+    "caller-x25519-priv" "callee-x25519-priv"
     "x25519" "x25519-priv" "x25519-privkey" "x25519-private" "x25519-private-key"
     "x25519-privkey-bytes" "x25519-private-key-bytes" "x25519-secret" "x25519-secret-key"
     "ed25519-priv" "ed25519-privkey" "ed25519-private" "ed25519-private-key"
@@ -281,7 +282,7 @@
     "recovery-phrase" "backup-phrase" "seed-phrase" "secret-phrase" "mnemonic-phrase" "pass-phrase"
     "recovery-words" "backup-words" "seed-words" "secret-words" "mnemonic-words" "wordlist" "word-list"
     "recovery-sentence" "seed-sentence" "backup-sentence" "mnemonic-sentence" "secret-sentence" "pass-sentence" "sentence"
-    "pk" "sk" "vk" "dk" "ek" "mk" "rk" "ck" "tk" "wk" "uk"
+    "pk" "sk" "dk" "ek" "mk" "rk" "ck" "tk" "wk" "uk"
     "pw" "pass" "pswd" "pword" "pepper" "secret-pepper" "auth-pepper" "password-hint" "passphrase-hint"
     "derivation-path" "hd-path" "bip32-path" "bip44-path" "bip32" "bip38" "bip39" "bip44" "bip49" "bip84" "bip86" "slip10" "slip39"
     "pkcs" "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pkcs10" "pkcs11" "pfx" "p12" "p8" "pem" "private-pem" "key-pem" "der"
@@ -367,7 +368,7 @@
     "passcode" "passcodes" "passkey" "passkeys" "keypair" "keypairs"
     "key" "keys" "code" "codes"
     "kek" "dek" "mek" "tek" "psk" "msk" "prk" "okm" "ikm" "cek" "kwk" "pmk" "ptk" "gtk" "stk" "ltk" "irk" "csrk"
-    "sk" "pk" "vk" "dk" "ek" "mk" "rk" "ck" "tk" "wk" "uk"
+    "sk" "pk" "dk" "ek" "mk" "rk" "ck" "tk" "wk" "uk"
     "xprv" "tprv" "zprv" "yprv" "lprv" "uprv" "vprv" "wif" "entropy" "pepper" "salt"
     "pkcs" "pkcs8" "pkcs12" "pkcs1" "pkcs7" "pkcs10" "pkcs11" "pfx" "p12" "p8" "pem" "der"
     "keytab" "ktab" "ccache" "tgt" "htpasswd" "htdigest" "netrc" "pgpass" "mycnf" "npmrc" "pypirc" "gemrc" "yarnrc"
@@ -443,18 +444,28 @@
   #{"pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
     "pubkey-hex" "public-key-hex" "pubkey-bytes" "public-key-bytes"
     "x25519-pubkey" "x25519-public-key" "ed25519-pubkey" "ed25519-public-key"
+    "ed25519" "xpub" "ypub" "zpub" "tpub" "vpub" "upub" "vk" "verification-key"
+    "peer-pubkey" "agent-pubkey" "hot-pubkey" "anchor-pubkey" "authority-pubkey"
+    "directory-pubkey" "trusted-directory-pubkey" "caller-pubkey" "callee-pubkey"
+    "treasury-pubkey" "custody-pubkey" "alice-pubkey" "bob-pubkey" "carol-pubkey"
+    "validator-pubkey" "node-pubkey" "sender-pubkey" "recipient-pubkey" "remote-pubkey"
+    "local-pubkey" "target-pubkey" "signer-pubkey" "owner-pubkey" "issuer-pubkey"
+    "subject-pubkey" "delegate-pubkey" "ephemeral-pubkey" "caller-x25519-pub" "callee-x25519-pub"
     "ephemeral-pub" "caller-ephemeral-pub" "callee-ephemeral-pub" "spki" "cose-key" "cose-pubkey"
     "key-mode" "keys-verified?" "keys-verified" "key-count" "keys-count"
     "key-type" "key-types" "key-id" "key-ids" "api-key-id" "api-key-ids"
     "session-key-id" "signing-key-id" "encryption-key-id" "master-key-id" "public-key-id"
     "key-rotation" "key-rotations" "key-rotation-epoch" "key-rotation-interval" "key-rotation-period"
     "key-schedule" "key-policy" "key-ceremony" "key-holder" "key-owner" "key-age" "key-ttl" "key-epoch"
-    "key-algorithm" "key-algo"
-    "key-length" "key-size" "key-bits" "key-format" "key-usage" "key-ops"
+    "key-algorithm" "key-algo" "key-metadata"
+    "key-length" "key-size" "key-bits" "key-format" "key-usage" "key-usages" "key-ops"
     "key-version" "key-index" "key-name" "key-label" "key-path" "key-uri" "key-url"
     "key-status" "key-state" "key-created-at" "key-expires-at" "key-expired?" "key-rotated-at"
     "key-fingerprint" "key-hash" "primary-key" "foreign-key" "sort-key" "partition-key"
-    "routing-key" "cache-key" "lookup-key"
+    "routing-key" "cache-key" "lookup-key" "safe-key" "innocent-key" "control-key" "allowed-key"
+    "resident-key" "require-resident-key" "pub-key-cred-params" "cred-props"
+    "cred-protect" "credential-protection-policy" "allow-credentials" "backup-available?"
+    "authenticator-selection" "authenticator-attachment"
     "keychain" "keychains" "keyring" "keyrings" "keyboard" "keyboards" "keypad" "keypads"
     "keycode" "keycodes"
     "key-code" "key-codes" "keydown" "keyup" "keypress" "keystroke" "keystrokes"
@@ -487,89 +498,94 @@
     "channel-state" "channel-status" "channel-capacity" "channel-balance"
     "first-name" "first-seen" "first-epoch" "first-block" "first-item" "first-index" "first-page"
     "eval-count" "evaluate" "evaluation" "evaluator"
-    "pin-count" "pinned" "pinned?" "is-pinned"})
+    "pin-count" "pinned" "pinned?" "is-pinned"
+    "ice-creds"})
 
 (def ^:private carved-out-public-and-innocent-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") carved-out-public-and-innocent-keys)))
 
-(def ^:private non-key-forbidden-tokens
-  (disj forbidden-persistence-tokens "key" "keys"))
-
 (defn- public-or-innocent-carve-out?
-  "Returns true if canonical key `canon` (and its compact form, suffix-stripped compact-stem,
-   and token vector) is an exact member of `carved-out-public-and-innocent-keys` or a public-key
-   identifier (`*-pubkey`, `*-public-key`) with no secret modifier tokens/substrings."
-  [canon compact compact-stem tokens]
+  "Returns true if canonical key `canon` (or its compact form) is an exact member of
+   `carved-out-public-and-innocent-keys`."
+  [canon compact]
   (or (contains? carved-out-public-and-innocent-keys canon)
-      (contains? carved-out-public-and-innocent-keys-compact compact)
-      (contains? carved-out-public-and-innocent-keys-compact compact-stem)
-      (and (not-any? #(contains? non-key-forbidden-tokens %) tokens)
-           (not-any? #(str/includes? compact %)
-                     ["private" "privkey" "secret" "seed" "password" "passphrase" "passcode"
-                      "mnemonic" "token" "jwt" "bearer" "cookie" "kek" "dek"
-                      "entropy" "pepper" "xprv" "tprv" "pkcs8" "pkcs12"
-                      "otpauth" "ticket" "dotenv" "brainwallet" "backup"])
-           (or (some #{"pubkey" "pubkeys"} tokens)
-               (and (some #{"public"} tokens) (some #{"key" "keys"} tokens))
-               (str/ends-with? compact-stem "pubkey")
-               (str/ends-with? compact-stem "pubkeys")
-               (str/ends-with? compact-stem "publickey")
-               (str/ends-with? compact-stem "publickeys")
-               (str/ends-with? compact "pubkey")
-               (str/ends-with? compact "pubkeys")
-               (str/ends-with? compact "publickey")
-               (str/ends-with? compact "publickeys")))))
+      (contains? carved-out-public-and-innocent-keys-compact compact)))
 
 (def allowed-persistence-keys
   "Default-deny structural allowlist of safe canonical lowercase kebab-case keys permitted
    in persisted browser/light-node/anchor state maps (includes all legitimate state schema
-   fields and `carved-out-public-and-innocent-keys`)."
+   fields and `carved-out-public-and-innocent-keys`).
+   Intentional drops during persistence sanitization (and how they are re-derived on reload):
+   - Ephemeral/session/identity secrets (:keypair, :x25519, :private-key, :privkey-bytes,
+     :cold-privkey, :seed, :session-keys, :tx-key, :rx-key, :shared-secret, :ephemeral-priv,
+     :caller-x25519-priv, :callee-x25519-priv, :ice-pwd): never persisted to IndexedDB/disk;
+     identity keys are recovered via WebAuthn/YubiKey assertion or generated fresh in memory,
+     and session/transport secrets are re-negotiated via X25519 ECDH / ICE on reconnect.
+   - Derived runtime liveness & live handles (:conn, :conn-atom, :active-channels, :channel,
+     :transport, :connected?, :connection-error, :last-error, :conn-diagnostics): never
+     persisted per AGENTS.md Rule 4; re-initialized from `initial-conn-state` on reload.
+   - Redundant inner :session-id field inside `:sessions {sid record}`: stripped by the
+     credential denylist while the canonical 64-char SHA-256 `sid` outer map key is preserved."
   (into carved-out-public-and-innocent-keys
         ["a" "b" "c" "x" "y" "z" "k" "v" "foo" "bar" "baz" "qux"
-         "ok" "ok?" "safe" "safe-key" "safe-field" "safe-val" "safe-value" "safe-data" "safe-map"
-         "keep" "keep-me" "innocent" "innocent-key" "control" "control-key" "allowed" "allowed-key"
+         "ok" "ok?" "safe" "safe-field" "safe-val" "safe-value" "safe-data" "safe-map"
+         "keep" "keep-me" "innocent" "control" "allowed"
          "harmless" "benign" "normal" "regular" "pub" "label" "name" "title" "description"
-         "text" "message" "msg" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
-         "num" "number" "amount" "balance" "spendable" "price" "burn" "burn-floor" "fee"
-         "epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
-         "seq" "tx-seq" "acked-seq" "rx-high-seq" "unacked-count" "replays-deduped" "outbox-evicted" "deps"
-         "status" "state" "phase" "generation" "visibility-state" "role" "mode" "type" "kind" "version"
-         "suite" "format" "wire-format" "wire-protocol" "supported-formats" "min-supported" "max-supported"
+         "text" "message" "msg" "memo" "note" "notes" "comment" "summary" "count" "total" "index" "idx"
+         "num" "number" "amount" "burn-amount" "balance" "spendable" "price" "burn" "burn-floor" "fee"
+         "epoch" "epoch-initialized?" "created-epoch" "issued-epoch" "expires-epoch" "finalized-epoch" "revoked-epoch"
+         "seq" "tx-seq" "acked-seq" "rx-high-seq" "contiguous-rx-seq" "transfer-seq" "intent-seq" "voucher-seqs"
+         "unacked-count" "replays-deduped" "outbox-evicted" "outbox-order" "deps"
+         "replay-window" "highest-seq" "seen" "window-size"
+         "status" "state" "phase" "generation" "visibility-state" "role" "mode" "type" "kind" "version" "protocol-version"
+         "suite" "crypto-suite" "crypto-suites" "format" "wire-format" "wire-protocol" "wire-version-diagnostics"
+         "supported-formats" "min-supported" "max-supported"
          "unsupported-dropped" "unsupported-format-dropped" "last-unsupported-version" "last-unsupported-format"
          "background-throttled-events" "ignored-stale" "dropped" "failover-count" "diagnostics-buffered"
          "validator-cursor" "validator-id" "diagnostics"
          "peer" "peers" "peer-id" "peer-petname" "petname" "petnames" "petnames-count"
-         "node" "nodes" "node-id" "node1" "node2" "node3" "ns1" "ns2" "ns3"
+         "node" "nodes" "node-id" "nodes-count" "node1" "node2" "node3" "ns1" "ns2" "ns3"
          "subnet" "subnet-id" "domain" "network" "address" "anchor-address" "hot-address"
          "ip" "port" "agent-port" "agent-tcp-port" "ingress-host" "ingress-port"
          "host" "hostname" "url" "uri" "path" "fingerprint" "ice-ufrag"
          "created-at" "updated-at" "expires-at" "queued-at" "accepted-at" "registered-at" "logged-at"
-         "timestamp" "time" "date" "duration" "timeout" "direction" "sender" "recipient" "caller" "callee" "from" "to" "from-petname"
+         "timestamp" "time" "date" "duration" "timeout" "direction" "sender" "recipient" "payer" "receiver"
+         "caller" "callee" "from" "to" "from-petname"
          "offer" "offers" "offer-id" "offer-hash" "pending-offers" "pending-offers-count"
-         "pending-rendezvous" "pending-rendezvous-count" "offers-approved" "offers-denied" "last-denied-reason"
-         "service-offers" "service-id" "service-types" "rendezvous-policy" "auto-accept" "auto-accept?" "min-burn" "allowlist" "home-node" "home-nodes"
-         "inbox" "inbox-count" "outbox" "chat-history" "messages" "messages-exchanged"
-         "burned-ech" "total-burned-ech" "vouchers" "vouchers-count" "escrows" "escrows-count"
+         "outbound-rendezvous" "pending-rendezvous" "pending-rendezvous-count" "pending-rendezvous-accepts"
+         "offers-approved" "offers-denied" "last-denied-reason"
+         "service-offers" "service-id" "service-types" "rendezvous-policy" "auto-accept" "auto-accept?" "min-burn"
+         "allowlist" "home-node" "home-nodes" "home-set"
+         "inbox" "inbox-count" "outbox" "chat-history" "messages" "messages-exchanged" "messages-received" "last-message"
+         "msg-payload" "gossip-env" "message-id" "payload" "payload-hex" "frame-type" "nonce" "ciphertext" "sealed-frame"
+         "burned-ech" "total-burned-ech" "alice-burned" "bob-burned" "vouchers" "vouchers-count" "voucher-id"
+         "escrows" "escrows-count" "escrow-id" "deliverable-hash" "last-transfer-hash"
          "local-accounting" "accounting" "scope" "scopes" "permissions" "max-spend" "max-spend-per-epoch"
-         "dac" "dac-id" "active-dac" "active-dac-id" "revoked-dacs" "revoked-dacs-count" "revoked-dac-ids"
+         "dac" "dac-id" "dac-spend" "active-dac" "active-dac-id" "revoked-dacs" "revoked-dacs-count" "revoked-dac-ids"
          "revocation" "revocation-reason" "denial-reason" "reason"
          "agent" "agents" "agent-id" "supervised-agents" "supervised-agents-count" "supervised-agent-revoked"
-         "activity-log" "activity-count" "team-call-subnet" "topic-name"
+         "activity-log" "activity-count" "team-call-subnet" "topic-name" "ai-inference"
          "directory-cache" "directory-cache-count" "bootstrap" "signature"
+         "domain-a" "domain-a-verified?" "domain-b" "domain-b-verified?"
+         "advertisement-verified?" "inter-subnet-routed?" "subnet-mismatch-dropped" "unroutable-dropped"
          "autonomous" "autonomous?" "autonomous-off?" "economy-enabled" "economy-enabled?"
-         "light-state" "account" "accounts" "identity"
-         "fido-strength" "fido-authenticator" "fido-security" "strength" "score" "verification-status" "warning" "yubico-enrollment" "aaguid" "up?" "uv?" "be?" "bs?"
+         "light-state" "account" "accounts" "identity" "recovery-source"
+         "fido-strength" "fido-authenticator" "fido-security" "strength" "score" "verification-status"
+         "warning" "yubico-enrollment" "aaguid" "up?" "uv?" "be?" "bs?" "at?" "ed?" "flags" "sign-count"
+         "rp-id-hash-hex" "strength-hint" "fmt" "att-stmt"
          "trust-boundary" "origin-scoping" "rp" "rp-id" "rp-name" "user" "user-id" "username" "display-name" "email"
-         "challenge" "pub-key-cred-params" "alg" "authenticator-selection" "authenticator-attachment"
-         "resident-key" "require-resident-key" "user-verification" "attestation" "extensions" "cred-props"
-         "extractable" "extractable?" "usages" "key-usages" "algorithm" "named-curve" "hash" "length"
+         "challenge" "alg"
+         "user-verification" "attestation" "extensions"
+         "extractable" "extractable?" "usages" "algorithm" "named-curve" "hash" "length"
          "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta" "metadata"
          "config" "options" "settings" "profile" "result" "results" "response" "effect" "effects" "event" "events" "cmd" "command"
          "nested" "nested-map" "nested-vec" "nested-set" "nested-list" "child" "children" "parent" "root" "leaf" "branch"
-         "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag" "flags"
+         "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag"
          "enabled" "enabled?" "active" "active?" "verified" "verified?" "valid" "valid?" "open" "closed" "idle" "dialing"
-         "mesh-connected" "connected-nodes" "demo" "nodes-count" "crypto-suite" "stale-generation-ignored" "in-memory?" "bytes-stored"
-         "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol" "browser-alice" "browser-bob" "browser-carol"
+         "mesh-connected" "connected-nodes" "demo" "stale-generation-ignored" "in-memory?" "bytes-stored"
+         "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol"
+         "peer-alice" "peer-bob" "peer-carol" "node-alice" "node-bob" "node-carol"
+         "browser-alice" "browser-bob" "browser-carol" "rt-node" "browser-test" "browser-guard-test" "test-peer" "test-subnet" "global"
          "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"]))
 
 (def ^:private allowed-persistence-keys-compact
@@ -579,7 +595,7 @@
   "Defense-in-depth denylist + compact word-boundary tokenizer predicate.
    Returns true if key k matches any forbidden credential, private key, seed, token, code,
    passphrase, recovery, handle, ticket, wallet, dotenv, or derived runtime liveness pattern,
-   unless k is an exact member of `carved-out-public-and-innocent-keys` or a clean public-key identifier."
+   unless k is an exact member of `carved-out-public-and-innocent-keys`."
   [k]
   (boolean
    (when-let [canon (canonical-key-name k)]
@@ -587,7 +603,7 @@
            compact-stem (strip-encoding-suffixes compact)
            compact-tokens (tokenize-compact-key compact)
            tokens (str/split (str/replace canon "?" "") #"-")]
-       (and (not (public-or-innocent-carve-out? canon compact compact-stem tokens))
+       (and (not (public-or-innocent-carve-out? canon compact))
             (or (contains? forbidden-persistence-keys canon)
                 (contains? forbidden-persistence-keys-compact compact)
                 (contains? forbidden-persistence-keys-compact compact-stem)
@@ -604,19 +620,29 @@
 (defn allowed-persistence-key?
   "Default-deny structural persistence allowlist predicate.
    Returns true iff key k is not forbidden by `explicitly-forbidden-persistence-key?` AND
-   is explicitly permitted by `allowed-persistence-keys` (or `public-or-innocent-carve-out?`)."
+   is either:
+   - an integer sequence key (e.g. outbox `{seq-num record}`),
+   - a 2-tuple `[home-node epoch]` key (e.g. `:voucher-seqs` `{[\"node1\" 5] seq}`),
+   - a hex-encoded SHA-256 (64-char) or Ed25519 SPKI (88-char) identifier key (e.g. session-id, escrow-id, pubkey), or
+   - an exact member of `allowed-persistence-keys` / `carved-out-public-and-innocent-keys`."
   [k]
-  (boolean
-   (when-let [canon (canonical-key-name k)]
-     (let [compact (str/replace canon #"[-?]" "")
-           compact-stem (strip-encoding-suffixes compact)
-           tokens (str/split (str/replace canon "?" "") #"-")]
-       (and (not (explicitly-forbidden-persistence-key? k))
-            (or (contains? allowed-persistence-keys canon)
-                (contains? allowed-persistence-keys-compact compact)
-                (contains? allowed-persistence-keys-compact compact-stem)
-                (public-or-innocent-carve-out? canon compact compact-stem tokens)
-                (boolean (re-matches #"^(sess|node|peer|offer|msg|item|agent|sub-agent|worker-node|browser|off)-[a-z0-9-]+$" canon))))))))
+  (cond
+    (integer? k) true
+    (and (vector? k)
+         (= 2 (count k))
+         (string? (first k))
+         (integer? (second k))
+         (not (explicitly-forbidden-persistence-key? (first k)))) true
+    (and (string? k)
+         (boolean (re-matches #"^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{88})$" k))) true
+    :else
+    (boolean
+     (when-let [canon (canonical-key-name k)]
+       (let [compact (str/replace canon #"[-?]" "")]
+         (and (not (explicitly-forbidden-persistence-key? k))
+              (or (contains? allowed-persistence-keys canon)
+                  (contains? allowed-persistence-keys-compact compact)
+                  (public-or-innocent-carve-out? canon compact))))))))
 
 (defn forbidden-persistence-key?
   "Default-deny persistence key predicate with defense-in-depth denylist enforcement.
