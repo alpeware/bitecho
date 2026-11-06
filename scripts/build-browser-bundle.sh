@@ -606,6 +606,7 @@ cat <<EOF > dist/index.html
                 writeLog("Approve offer failed: " + ((res && res.error) || "error"), res);
                 return;
               }
+              selectedSessionId = id;
               writeLog("Human Anchor approved offer: " + id);
               updateUI(res.dashboard);
               renderChatAndSessions(globalThis.BitechoBrowser.getStatus());
@@ -664,6 +665,25 @@ cat <<EOF > dist/index.html
       }
 
       let selectedSessionId = null;
+      const knownOpenSessionIds = new Set();
+      let lastRenderedChatJson = null;
+
+      function syncPeerControlsForSelection(rawSessions, pubkeyToPetname) {
+        if (!selectedSessionId || !rawSessions || !rawSessions[selectedSessionId]) return;
+        const s = rawSessions[selectedSessionId];
+        const peerHex = s.peer || s.peerId || "peer";
+        const peerLabel = s.peer_petname || s["peer-petname"] || pubkeyToPetname[peerHex] || (peerHex.slice(0, 14) + "...");
+        const peerHandle = pubkeyToPetname[peerHex] || peerHex;
+        if (targetPeerInput && document.activeElement !== targetPeerInput) {
+          targetPeerInput.value = peerHandle;
+        }
+        if (activePeerLabel) {
+          activePeerLabel.textContent = "Peer: " + peerLabel + " (" + selectedSessionId.slice(0, 8) + ")";
+        }
+        if (chatInput) {
+          chatInput.placeholder = "Type sealed message to " + peerLabel + "...";
+        }
+      }
 
       function renderChatAndSessions(status) {
         if (!status) return;
@@ -716,16 +736,27 @@ cat <<EOF > dist/index.html
               return Object.assign({ sessionId: entry[0] }, entry[1]);
             });
 
-        // Auto-select newest OPEN session if current selection is absent or not open
+        // Auto-select any newly opened session, or fallback when current selection is absent
         const openEntries = sessEntries.filter(function (s) {
           return String(s.state || s.status || "open").toUpperCase() === "OPEN";
         });
+        let newlyOpenedId = null;
+        openEntries.forEach(function (s) {
+          if (s.sessionId && !knownOpenSessionIds.has(s.sessionId)) {
+            knownOpenSessionIds.add(s.sessionId);
+            newlyOpenedId = s.sessionId;
+          }
+        });
+        if (newlyOpenedId) {
+          selectedSessionId = newlyOpenedId;
+        }
         if (selectedSessionId && !rawSessions[selectedSessionId]) {
           selectedSessionId = null;
         }
         if (!selectedSessionId && openEntries.length > 0) {
           selectedSessionId = openEntries[openEntries.length - 1].sessionId;
         }
+        syncPeerControlsForSelection(rawSessions, pubkeyToPetname);
 
         if (sessionsCountBadge) {
           sessionsCountBadge.textContent = openEntries.length + " Open / " + sessEntries.length + " Total";
@@ -766,11 +797,7 @@ cat <<EOF > dist/index.html
                   return;
                 }
                 selectedSessionId = s.sessionId;
-                const peerHandle = pubkeyToPetname[peerHex] || peerHex;
-                if (targetPeerInput) targetPeerInput.value = peerHandle;
-                if (activePeerLabel) {
-                  activePeerLabel.textContent = "Peer: " + peerLabel + " (" + (s.sessionId ? s.sessionId.slice(0, 8) : "") + ")";
-                }
+                syncPeerControlsForSelection(rawSessions, pubkeyToPetname);
                 renderChatAndSessions(globalThis.BitechoBrowser.getStatus());
               };
               const closeBtn = item.querySelector("button[data-close-session]");
@@ -793,35 +820,43 @@ cat <<EOF > dist/index.html
         // 3. Chat History Thread
         if (chatMessages) {
           const history = status.chatHistory || [];
-          if (history.length === 0) {
-            chatMessages.innerHTML = "<div style='color: var(--text-muted); text-align: center; margin-top: 40px; font-style: italic;'>" +
-              (status.meshConnected ? "Channel ready. Send a sealed message to Axiom." : "Connect to devnet mesh and open a sealed channel to message Axiom.") +
-              "</div>";
-          } else {
-            chatMessages.innerHTML = "";
-            history.forEach(function (msg) {
-              const msgDiv = document.createElement("div");
-              const isOutgoing = msg.direction === "outgoing";
-              msgDiv.style.cssText = "display: flex; flex-direction: column; margin-bottom: 8px; align-items: " + (isOutgoing ? "flex-end" : "flex-start") + ";";
+          const chatJson = JSON.stringify({ h: history, c: Boolean(status.meshConnected) });
+          if (chatJson !== lastRenderedChatJson) {
+            lastRenderedChatJson = chatJson;
+            if (history.length === 0) {
+              chatMessages.innerHTML = "<div style='color: var(--text-muted); text-align: center; margin-top: 40px; font-style: italic;'>" +
+                (status.meshConnected ? "Channel ready. Send a sealed message to peer." : "Connect to devnet mesh and open a sealed channel to message peer.") +
+                "</div>";
+            } else {
+              chatMessages.innerHTML = "";
+              history.forEach(function (msg) {
+                const msgDiv = document.createElement("div");
+                const isOutgoing = msg.direction === "outgoing";
+                msgDiv.style.cssText = "display: flex; flex-direction: column; margin-bottom: 8px; align-items: " + (isOutgoing ? "flex-end" : "flex-start") + ";";
 
-              const bubble = document.createElement("div");
-              bubble.style.cssText = "max-width: 80%; padding: 8px 12px; border-radius: 6px; font-size: 0.8rem; word-break: break-word; " +
-                (isOutgoing ? "background: #312e81; color: #e0e7ff; border: 1px solid #4338ca;" : "background: #064e3b; color: #d1fae5; border: 1px solid #047857;");
+                const bubble = document.createElement("div");
+                bubble.style.cssText = "max-width: 80%; padding: 8px 12px; border-radius: 6px; font-size: 0.8rem; word-break: break-word; " +
+                  (isOutgoing ? "background: #312e81; color: #e0e7ff; border: 1px solid #4338ca;" : "background: #064e3b; color: #d1fae5; border: 1px solid #047857;");
 
-              const header = document.createElement("div");
-              header.style.cssText = "font-size: 0.68rem; opacity: 0.75; margin-bottom: 2px; display: flex; justify-content: space-between; gap: 8px;";
-              const timeStr = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : "";
-              header.innerHTML = "<span>" + (isOutgoing ? "You" : (msg.peer || "Peer")) + "</span><span>" + timeStr + "</span>";
+                const header = document.createElement("div");
+                header.style.cssText = "font-size: 0.68rem; opacity: 0.75; margin-bottom: 2px; display: flex; justify-content: space-between; gap: 8px;";
+                const timeStr = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : "";
+                const sidTag = msg.sessionId ? " (" + String(msg.sessionId).slice(0, 6) + ")" : "";
+                const senderLabel = isOutgoing
+                  ? ("You → " + (msg.peer || "Peer") + sidTag)
+                  : ((msg.peer || "Peer") + sidTag);
+                header.innerHTML = "<span>" + senderLabel + "</span><span>" + timeStr + "</span>";
 
-              const body = document.createElement("div");
-              body.textContent = msg.text || "";
+                const body = document.createElement("div");
+                body.textContent = msg.text || "";
 
-              bubble.appendChild(header);
-              bubble.appendChild(body);
-              msgDiv.appendChild(bubble);
-              chatMessages.appendChild(msgDiv);
-            });
-            chatMessages.scrollTop = chatMessages.scrollHeight;
+                bubble.appendChild(header);
+                bubble.appendChild(body);
+                msgDiv.appendChild(bubble);
+                chatMessages.appendChild(msgDiv);
+              });
+              chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
           }
         }
       }

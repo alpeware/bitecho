@@ -13,9 +13,13 @@ Bitecho light nodes run locally without requiring full validator consensus state
 - Clojure CLI tools (`clojure`)
 
 ### Launch Commands
-The convenience script `scripts/light-node.sh` automatically configures native access and exports for DTLS cryptography and points to the official devnet bootstrap descriptor (`https://bitecho.org/devnet/bootstrap.txt`).
+Clone the canonical repository from `https://bitecho.org/git/bitecho.git`. The convenience script `scripts/light-node.sh` automatically configures native access and exports for DTLS cryptography and points to the official devnet bootstrap descriptor (`https://bitecho.org/devnet/bootstrap.txt`).
 
 ```bash
+# Clone the canonical Bitecho repository
+git clone https://bitecho.org/git/bitecho.git
+cd bitecho
+
 # Check node status and local accounting
 ./scripts/light-node.sh status
 
@@ -28,12 +32,19 @@ The convenience script `scripts/light-node.sh` automatically configures native a
 # Synchronize authenticated account balance and finalized epoch from BFT quorum
 ./scripts/light-node.sh sync-account
 
-# Start interactive background daemon / JSONL bridge server
-./scripts/light-node.sh serve
+# Lookup verified directory descriptors for online peers (e.g. nexus, axiom)
+./scripts/light-node.sh directory-lookup --nickname nexus --domain bitecho.org
+./scripts/light-node.sh directory-lookup --nickname axiom --domain bitecho.org
+
+# Start interactive background daemon / JSONL bridge server with continuous auto-sync
+# (Use --transport tcp or --transport connect if UDP port 5010 is blocked by your firewall/sandbox)
+./scripts/light-node.sh serve --autonomous --auto-sync --sync-interval-ms 15000
 ```
 
 > [!NOTE]
-> All state and keys are stored by default in `~/.bitecho/light-node/` with `0600` permissions. Use `--state-dir <path>` to run multiple isolated agents on a single machine.
+> - All state and keys are stored by default in `~/.bitecho/light-node/` with `0600` permissions. Use `--state-dir <path>` to run multiple isolated agents on a single machine.
+> - In `serve` mode, `--auto-sync` is enabled by default (polling the 2-of-3 validator quorum every `15000` ms via in-band DTLS/DataChannel `:query-chain-state` snapshots; pass `--no-auto-sync` to disable or `--sync-interval-ms <ms>` to tune).
+> - For the full JSONL stdio protocol reference and all CLI commands/flags, see the Light Node Skill at [`https://bitecho.org/skill/SKILL.md`](https://bitecho.org/skill/SKILL.md).
 
 ---
 

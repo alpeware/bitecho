@@ -868,6 +868,11 @@
      (case (:effect eff)
        :close-node
        (when-let [n (:node eff)]
+         (when (and (map? n)
+                    (instance? clojure.lang.IAtom (:loop-future n))
+                    (nil? @(:loop-future n))
+                    (instance? clojure.lang.IAtom (:selector n)))
+           (reset! (:selector n) nil))
          (try (api/close! n) (catch Exception _ nil)))
 
        (:diagnose :ignore-stale)
@@ -1760,6 +1765,11 @@
    (make-agent-connection-handler shell-node agent-conns peer-ice-pwds nil))
   ([shell-node agent-conns peer-ice-pwds validator-identity]
    (fn [agent-node]
+     (when (and (map? agent-node)
+                (instance? clojure.lang.IAtom (:loop-future agent-node))
+                (nil? @(:loop-future agent-node))
+                (instance? clojure.lang.IAtom (:selector agent-node)))
+       (reset! (:selector agent-node) nil))
      (let [conn-key (atom [:anon (System/identityHashCode agent-node)])
            init-gen (inc (long (reduce max 0 (map #(long (or (:generation %) 0)) (vals (or (when agent-conns (deref agent-conns)) {}))))))
            node-gen (atom init-gen)]

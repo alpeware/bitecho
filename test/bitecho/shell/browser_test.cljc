@@ -940,6 +940,7 @@
                (is (true? (:ok send-by-sid)))
                (is (= 1 (:envelopesSent send-by-sid))))
              ;; 5. Incoming sealed message populates :peer in :chat-history from :from_petname / :from
+             ;;    and duplicate gossip delivery across multiple validators is deduplicated in :chat-history
              (let [peer-st1 (:state (light-core/handle-wire-payload (:state peer-off-cmd) accept-env peer-priv))
                    peer-msg-cmd (light-core/handle-command peer-st1
                                                            {"cmd" "send" "session_id" sid-open "text" "welcome from nexus"}
@@ -949,7 +950,21 @@
                (let [last-chat (last (:chat-history @node))]
                  (is (= :incoming (:direction last-chat)))
                  (is (= "welcome from nexus" (:text last-chat)))
-                 (is (= "nexus" (:peer last-chat)))))
+                 (is (= "nexus" (:peer last-chat)))
+                 (is (= sid-open (:sessionId last-chat)))
+                 (is (= 1 (:seq last-chat))))
+               (let [peer-msg2-cmd (light-core/handle-command (:state peer-msg-cmd)
+                                                              {"cmd" "send" "session_id" sid-open "text" "deduped-msg"}
+                                                              peer-priv)
+                     msg2-env (last (:net-envelopes peer-msg2-cmd))
+                     count-before (count (:chat-history @node))]
+                 (browser-main/handle-inbound-wire-envelope! node msg2-env)
+                 (browser-main/handle-inbound-wire-envelope! node msg2-env)
+                 (is (= (inc count-before) (count (:chat-history @node))))
+                 (let [last-chat (last (:chat-history @node))]
+                   (is (= "deduped-msg" (:text last-chat)))
+                   (is (= sid-open (:sessionId last-chat)))
+                   (is (= 2 (:seq last-chat))))))
              ;; 6. Browser refresh (apply-restored-state!) prunes ghost sessions whose keys were stripped during persistence
              (let [sanitized (browser/sanitize-state-for-persistence @node)
                    node-reloaded (browser-main/init-node {:peer-id "browser-test"})]
@@ -958,4 +973,38 @@
                (is (nil? (get-in sanitized [:light-state :sessions sid-open :tx-key])))
                (browser-main/apply-restored-state! node-reloaded sanitized)
                (is (empty? (get-in @node-reloaded [:light-state :sessions])))
-               (is (empty? (:sessions @node-reloaded))))))))))
+               (is (empty? (:sessions @node-reloaded)))
+               ;; 7. Restored sequential :chat-history / :inbox are coerced to persistent vectors so new messages append at end
+               (browser-main/apply-restored-state!
+                node-reloaded
+                (-> sanitized
+                    (assoc :chat-history (list {:text "first"} {:text "second"}))
+                    (assoc-in [:light-state :inbox] (list {:text "in-1"}))
+                    (assoc-in [:light-state :pending-offers sid-open]
+                              {:caller peer-pub :callee my-pub :price 10 :burn 500 :epoch 12})))
+               (is (vector? (:chat-history @node-reloaded)))
+               (is (vector? (get-in @node-reloaded [:light-state :inbox])))
+               (is (= ["first" "second"] (mapv :text (:chat-history @node-reloaded))))
+               ;; 8. get-anchor-dashboard syncs live :pending-offers from active-node-atom even if anchor-state-atom was re-initialized
+               (browser-main/init-anchor {:pubkey my-pub})
+               (let [dash-synced (js->clj (browser-main/get-anchor-dashboard) :keywordize-keys true)
+                     pending-ids (set (map :offer-id (:pending-offers dash-synced)))]
+                 (is (contains? pending-ids sid-open))))
+             ;; 9. send-message with explicit session-id resolves :peer from the session's actual counterparty petname
+             ;;    even if the caller passed a stale target peer handle ("axiom") from the input field
+             (let [send-mismatch (js->clj (browser-main/send-message node "axiom" "sent on nexus session" sid-open) :keywordize-keys true)
+                   last-chat (last (:chat-history @node))]
+               (is (true? (:ok send-mismatch)))
+               (is (= "nexus" (:peer send-mismatch)))
+               (is (= "nexus" (:peer last-chat)))
+               (is (= sid-open (:sessionId last-chat))))))))))
+
+(deftest sanitize-state-sequential-to-vector-test
+  (testing "sanitize-state-for-persistence converts sequential/list collections into persistent vectors so conj/into appends"
+    (let [input {:chat-history (list {:text "m1" :secret-key "drop"} {:text "m2"})
+                 :light-state {:inbox (map identity [{:text "i1"} {:text "i2"}])}}
+          sanitized (browser/sanitize-state-for-persistence input)]
+      (is (vector? (:chat-history sanitized)))
+      (is (vector? (get-in sanitized [:light-state :inbox])))
+      (is (= ["m1" "m2" "m3"]
+             (mapv :text (conj (:chat-history sanitized) {:text "m3"})))))))

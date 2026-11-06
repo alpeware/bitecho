@@ -85,7 +85,7 @@
           x)
     (vector? x) (mapv redact-for-js x)
     (set? x) (into #{} (map redact-for-js x))
-    (seq? x) (map redact-for-js x)
+    (seq? x) (mapv redact-for-js x)
     :else x))
 
 (declare send-to-all-channels! send-chain-state-query!)
@@ -168,6 +168,8 @@
                                (dissoc :conn :keypair :x25519 :active-channels)
                                (update :sessions prune-ghost-sessions)
                                (update-in [:light-state :sessions] prune-ghost-sessions)
+                               (update :chat-history #(vec (or % [])))
+                               (update-in [:light-state :inbox] #(vec (or % [])))
                                (assoc-in [:light-state :max-epoch-skew]
                                          (or (get-in loaded [:light-state :max-epoch-skew]) 15)))]
           (swap! node-atom
@@ -225,7 +227,7 @@
      (clj->js (redact-for-js (anchor/anchor-dashboard-view st))))))
 
 (defn get-anchor-dashboard
-  "Returns the Human Anchor dashboard view as a JavaScript object, syncing live balance and burn metrics from active-node-atom."
+  "Returns the Human Anchor dashboard view as a JavaScript object, syncing live balance, burn metrics, and pending offers from active-node-atom."
   []
   (when-not @anchor-state-atom
     (init-anchor nil))
@@ -234,15 +236,34 @@
           light-st (:light-state node)
           pub (or (:anchor-pubkey @anchor-state-atom) (:pubkey light-st))
           light-bal (or (get-in light-st [:account :balance]) (:balance light-st))
-          light-burned (or (get-in light-st [:local-accounting :burned-ech]) (:burned-ech node))]
-      (when (or (and pub (number? light-bal)) (number? light-burned))
-        (swap! anchor-state-atom
-               (fn [st]
-                 (cond-> st
-                   (and pub (number? light-bal))
-                   (assoc-in [:accounts pub :balance] light-bal)
-                   (number? light-burned)
-                   (assoc-in [:local-accounting :burned-ech] light-burned)))))))
+          light-burned (or (get-in light-st [:local-accounting :burned-ech]) (:burned-ech node))
+          pending-offers (or (:pending-offers light-st) {})
+          open-sessions (or (:sessions light-st) {})]
+      (swap! anchor-state-atom
+             (fn [st]
+               (let [existing-ids (set (keep #(or (:offer-id %) (:session-id %)) (:pending-offers st)))
+                     st1 (cond-> st
+                           (and pub (number? light-bal))
+                           (assoc-in [:accounts pub :balance] light-bal)
+                           (number? light-burned)
+                           (assoc-in [:local-accounting :burned-ech] light-burned))]
+                 (reduce-kv
+                  (fn [acc sid offer]
+                    (if (or (contains? existing-ids sid)
+                            (contains? open-sessions sid))
+                      acc
+                      (anchor/queue-incoming-offer
+                       acc
+                       {:offer-id sid
+                        :session-id sid
+                        :peer-id (:caller offer)
+                        :caller-pubkey (:caller offer)
+                        :callee-pubkey (:callee offer)
+                        :price (or (:price offer) 10)
+                        :burn (or (:burn offer) 100)
+                        :epoch (or (:epoch offer) 0)})))
+                  st1
+                  pending-offers))))))
   (let [hw-locked? (if-let [na @active-node-atom]
                      (nil? (get-in @na [:keypair :private-key]))
                      (nil? (:privkey-bytes @anchor-state-atom)))
@@ -551,31 +572,48 @@
           privkey (:private-key (:keypair node))
           st (:light-state node)
           prev-offers (or (:pending-offers st) {})
+          prev-inbox (vec (get-in st [:inbox] []))
           res (light-core/handle-wire-payload st env privkey)
           new-st (:state res)
+          curr-inbox (vec (get-in new-st [:inbox] []))
+          new-msgs (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
           curr-offers (or (:pending-offers new-st) {})]
       (swap! node-atom (fn [curr]
-                         (let [prev-inbox (get-in curr [:light-state :inbox] [])
-                               curr-inbox (get-in new-st [:inbox] [])
-                               new-msgs (subvec curr-inbox (count prev-inbox))]
-                           (-> curr
-                               (assoc :light-state new-st)
-                               (assoc :sessions (:sessions new-st))
-                               (update :chat-history (fn [hist]
-                                                       (let [pnames (or (:petnames curr) (:petnames new-st) default-petnames)]
-                                                         (into (or hist [])
-                                                               (map (fn [m]
-                                                                      (let [sender-hex (or (:sender m) (:from m) (:peer-id m))
-                                                                            pname (some (fn [[k v]]
-                                                                                          (when (= v sender-hex)
-                                                                                            (if (keyword? k) (name k) (str k))))
-                                                                                        pnames)]
-                                                                        {:timestamp (.toISOString (js/Date.))
-                                                                         :direction :incoming
-                                                                         :peer (or (:from_petname m) (:from-petname m) pname sender-hex "peer")
-                                                                         :text (or (:text m) (:message m) (str m))
-                                                                         :status :received})))
-                                                               new-msgs))))))))
+                         (-> curr
+                             (assoc :light-state (update new-st :inbox #(vec (or % []))))
+                             (assoc :sessions (:sessions new-st))
+                             (update :chat-history
+                                     (fn [hist]
+                                       (let [base-hist (vec (or hist []))
+                                             seen-keys (into #{}
+                                                             (keep (fn [e]
+                                                                     (when (and (= (:direction e) :incoming)
+                                                                                (:sessionId e)
+                                                                                (:seq e))
+                                                                       [(:sessionId e) (:seq e)])))
+                                                             base-hist)
+                                             pnames (or (:petnames curr) (:petnames new-st) default-petnames)]
+                                         (reduce
+                                          (fn [acc m]
+                                            (let [sid (or (:session-id m) (:session_id m))
+                                                  m-seq (:seq m)
+                                                  sender-hex (or (:sender m) (:from m) (:peer-id m))
+                                                  pname (some (fn [[k v]]
+                                                                (when (= v sender-hex)
+                                                                  (if (keyword? k) (name k) (str k))))
+                                                              pnames)
+                                                  entry (cond-> {:timestamp (.toISOString (js/Date.))
+                                                                 :direction :incoming
+                                                                 :peer (or (:from_petname m) (:from-petname m) pname sender-hex "peer")
+                                                                 :text (or (:text m) (:message m) (str m))
+                                                                 :status :received}
+                                                          sid (assoc :sessionId sid)
+                                                          (some? m-seq) (assoc :seq m-seq))]
+                                              (if (and sid (some? m-seq) (contains? seen-keys [sid m-seq]))
+                                                acc
+                                                (conj acc entry))))
+                                          base-hist
+                                          new-msgs)))))))
       ;; Surface any new live incoming channel offers into the Human Anchor queue
       (doseq [[sid offer] curr-offers]
         (when-not (contains? prev-offers sid)
@@ -607,6 +645,8 @@
               q-env (light-core/build-chain-state-query-envelope pubkey privkey {:nonce nonce})]
           (try (.send dc (fressian/encode-wire q-env)) (catch :default _ nil)))))))
 
+(defonce ^:private keepalive-timers-atom (atom {}))
+
 (defn- on-validator-channel-open!
   "Handles validator DataChannel open: records channel, registers home set, queries chain state, and starts keepalive."
   [node-atom nid dc conn-atom]
@@ -623,11 +663,19 @@
         (try (.send dc (fressian/encode-wire env)) (catch :default _ nil)))))
   ;; Query chain state from validator so 2-of-3 BFT quorum syncs epoch and account
   (send-chain-state-query! node-atom dc)
-  ;; Keepalive + epoch/balance sync every 5s
-  (js/setInterval (fn []
-                    (when (and dc (= (.-readyState dc) "open"))
-                      (send-chain-state-query! node-atom dc)))
-                  5000)
+  ;; Keepalive + epoch/balance sync every 5s (clear any previous interval for nid first)
+  (when-let [old-timer (get @keepalive-timers-atom nid)]
+    (try (js/clearInterval old-timer) (catch :default _ nil)))
+  (let [timer-id (js/setInterval (fn []
+                                   (if (and dc (= (.-readyState dc) "open"))
+                                     (send-chain-state-query! node-atom dc)
+                                     (do
+                                       (when-let [tid (get @keepalive-timers-atom nid)]
+                                         (try (js/clearInterval tid) (catch :default _ nil))
+                                         (swap! keepalive-timers-atom dissoc nid))
+                                       (notify-ui-listeners!))))
+                                 5000)]
+    (swap! keepalive-timers-atom assoc nid timer-id))
   (notify-ui-listeners!))
 
 (defn connect-mesh
@@ -638,6 +686,13 @@
      (clj->js {:ok false :error "untrusted-bootstrap-descriptor"})
      (let [node-atom (or @active-node-atom (init-node nil))
            _opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
+           _ (doseq [[_nid tid] @keepalive-timers-atom]
+               (try (js/clearInterval tid) (catch :default _ nil)))
+           _ (reset! keepalive-timers-atom {})
+           _ (doseq [[_nid old-dc] (:active-channels @node-atom)]
+               (when old-dc
+                 (try (.close old-dc) (catch :default _ nil))))
+           _ (swap! node-atom assoc :active-channels {})
            node1 (get default-bootstrap-nodes :node1)
            sdp1 (browser/format-validator-sdp-answer node1)
            target-url (str "rtc://" (:ip node1) ":" (:agent-port node1))
@@ -817,11 +872,20 @@
                           (get default-petnames peer-id)
                           peer-id))
          resolved-sid (resolve-best-open-session-id sessions target-pub (or explicit-session-id (when direct-sess peer-id)))
+         resolved-sess (when resolved-sid (get sessions resolved-sid))
+         actual-peer-pub (or (:peer resolved-sess) target-pub)
+         pnames (or (:petnames node) (get-in node [:light-state :petnames]) default-petnames)
+         resolved-peer-label (or (some (fn [[k v]]
+                                         (when (= v actual-peer-pub)
+                                           (if (keyword? k) (name k) (str k))))
+                                       pnames)
+                                 (when (and (not direct-sess) (not explicit-session-id)) peer-id)
+                                 actual-peer-pub)
          privkey (:private-key (:keypair node))]
      (if-not privkey
        (clj->js {:ok false :error "hardware-unlock-required"})
        (let [cmd-map (cond-> {"cmd" "send"
-                              "peer" target-pub
+                              "peer" actual-peer-pub
                               "text" (str text)
                               "message" (str text)}
                        resolved-sid (assoc "session_id" resolved-sid))
@@ -838,18 +902,21 @@
                                  (assoc :light-state new-st)
                                  (assoc :sessions (:sessions new-st)))
                        cmd-ok?
-                       (update :chat-history conj {:timestamp (.toISOString (js/Date.))
-                                                   :direction :outgoing
-                                                   :peer peer-id
-                                                   :sessionId resolved-sid
-                                                   :text text
-                                                   :status :sent}))))
+                       (update :chat-history
+                               (fn [h]
+                                 (conj (vec (or h []))
+                                       {:timestamp (.toISOString (js/Date.))
+                                        :direction :outgoing
+                                        :peer resolved-peer-label
+                                        :sessionId resolved-sid
+                                        :text text
+                                        :status :sent}))))))
          (doseq [env out-envs]
            (send-to-all-channels! na env))
          (browser/persist-state! (browser/sanitize-state-for-persistence @na))
          (notify-ui-listeners!)
          (clj->js (cond-> {:ok cmd-ok?
-                           :peer peer-id
+                           :peer resolved-peer-label
                            :sessionId resolved-sid
                            :text text
                            :envelopesSent (count out-envs)

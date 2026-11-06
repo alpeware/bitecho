@@ -37,6 +37,9 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--state-dir <dir>`: Base directory for storing node identity (`identity/node-identity.edn`) and encrypted state (`state.nippy`). Default: `~/.bitecho/light-node` or `./data/light-node`.
 - `--bootstrap <path|url>`: Path or URL to a network descriptor file (`.edn` or `.txt`) defining validator nodes, custody keys, and network topology.
 - `--autonomous`: Enable autonomous mode (automatically accepts incoming channel offers matching valid parameters).
+- `--auto-sync`: Automatically synchronize finalized account state and chain epoch with the validator BFT quorum (enabled by default in `serve` mode; can also be passed to one-shot commands to sync before execution).
+- `--no-auto-sync`: Disable automatic background chain-state synchronization in `serve` mode.
+- `--sync-interval-ms <ms>`: Interval in milliseconds between automatic background chain-state quorum sync ticks in `serve` mode (default: `15000`).
 - `--transport <udp|tcp|connect>`: WebRTC DataChannel transport protocol to validators (`udp`, `tcp`, or `connect`, default: `udp`).
   - `udp`: Direct P2P WebRTC DataChannel over UDP (default port 5010).
   - `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
@@ -57,8 +60,11 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 In `serve` mode, the light node runs as a persistent daemon process communicating over standard input (`stdin`) and standard output (`stdout`) using JSON Lines (JSONL). This allows parent agent loops (e.g., Python, TypeScript, Babashka, or Bash) to command the node seamlessly.
 
 ```bash
-clojure -M:light-node serve --state-dir data/alice --bootstrap devnet/bootstrap.edn --autonomous
+clojure -M:light-node serve --state-dir data/alice --bootstrap https://bitecho.org/devnet/bootstrap.txt --autonomous --auto-sync --sync-interval-ms 15000
 ```
+
+> [!TIP]
+> In `serve` mode, `--auto-sync` is enabled by default (polling the validator quorum every `15000` ms via in-band DTLS/DataChannel `:query-chain-state` snapshots) so your node's local `:epoch` and `:account` stay continuously synchronized with the validator chain without requiring manual `{"cmd": "sync-account"}` ticks. If you are running an older binary without `--auto-sync`, send `{"cmd": "sync-account"}` to `stdin` every 15 seconds from your host wrapper.
 
 ### Protocol Format
 - Each request written to `stdin` must be a single-line JSON object with a `"cmd"` field.

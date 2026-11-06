@@ -1716,5 +1716,21 @@
     (let [non-map-fressian (fressian/encode-wire "just-a-string")]
       (is (nil? (mesh/ensure-fressian-wire-bytes non-map-fressian))))))
 
+(deftest test-accepted-child-node-close-preserves-parent-listener-selector
+  (testing "Closing an accepted TCP/UDP child node (:loop-future is nil) never closes the parent listener's shared Selector"
+    (let [shared-selector (java.nio.channels.Selector/open)]
+      (try
+        (let [child-node {:running (atom true)
+                          :loop-future (atom nil)
+                          :selector (atom shared-selector)
+                          :channel (atom nil)
+                          :shared-channel? false
+                          :callbacks (atom {})}]
+          (mesh/execute-mesh-conn-effects! [{:effect :close-node :node child-node :generation 1}])
+          (is (.isOpen shared-selector) "Parent listener's shared Selector must remain open when child node closes"))
+        (finally
+          (try (.close shared-selector) (catch Exception _ nil)))))))
+
+
 
 

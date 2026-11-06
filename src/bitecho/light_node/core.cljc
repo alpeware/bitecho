@@ -2040,14 +2040,16 @@
                                (get acct "finalized_epoch")
                                (:epoch state)
                                0))
-              new-state (assoc state
-                               :account {:balance bal
-                                         :spendable spendable
-                                         :seq seq-num
-                                         :deps deps
-                                         :finalized-epoch fin-ep}
-                               :transfer-seq seq-num
-                               :last-transfer-hash (last deps))]
+              new-state (cond-> (assoc state
+                                       :account {:balance bal
+                                                 :spendable spendable
+                                                 :seq seq-num
+                                                 :deps deps
+                                                 :finalized-epoch fin-ep}
+                                       :transfer-seq seq-num
+                                       :last-transfer-hash (last deps)
+                                       :epoch (max (long (or (:epoch state) 0)) fin-ep))
+                          (pos? fin-ep) (assoc :epoch-initialized? true))]
           {:state new-state
            :response {"ok" true
                       "pubkey" (:pubkey state)

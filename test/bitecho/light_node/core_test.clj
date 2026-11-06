@@ -3041,6 +3041,25 @@
                    (some? unwrapped)
                    (= 1 (:protocol-version unwrapped))))))
 
+(deftest test-sync-account-updates-top-level-epoch
+  (testing "sync-account with finalized_epoch updates top-level :epoch and :epoch-initialized?"
+    (let [node (test-identity)
+          st0 (light-core/init-light-state (:identity node) {})
+          res (light-core/handle-command st0
+                                         {"cmd" "sync-account"
+                                          "balance" 95000
+                                          "spendable" 95000
+                                          "seq" 1
+                                          "deps" []
+                                          "finalized_epoch" 1850}
+                                         (:privkey-bytes node))
+          st1 (:state res)]
+      (is (true? (get-in res [:response "ok"])))
+      (is (= 1850 (get-in st1 [:account :finalized-epoch])))
+      (is (= 1850 (:epoch st1)))
+      (is (true? (:epoch-initialized? st1))))))
+
+
 
 
 

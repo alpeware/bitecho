@@ -1254,6 +1254,7 @@
                   "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"
                   "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"
                   "--subnet-id"
+                  "--auto-sync" "--no-auto-sync" "--sync-interval-ms"
                   "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
@@ -1320,6 +1321,11 @@
       (is (= "foo/bar" (:state-dir (light-shell/parse-light-node-args ["status" "--state-dir" "foo/bar"]))))
       (is (= "boot.edn" (:bootstrap (light-shell/parse-light-node-args ["status" "--bootstrap" "boot.edn"]))))
       (is (true? (:autonomous? (light-shell/parse-light-node-args ["serve" "--autonomous"]))))
+      (is (true? (:auto-sync? (light-shell/parse-light-node-args ["serve"]))))
+      (is (= 15000 (:sync-interval-ms (light-shell/parse-light-node-args ["serve"]))))
+      (is (false? (:auto-sync? (light-shell/parse-light-node-args ["serve" "--no-auto-sync"]))))
+      (is (true? (:auto-sync? (light-shell/parse-light-node-args ["status" "--auto-sync"]))))
+      (is (= 5000 (:sync-interval-ms (light-shell/parse-light-node-args ["serve" "--sync-interval-ms" "5000"]))))
       (is (= :tcp (:transport (light-shell/parse-light-node-args ["status" "--transport" "tcp"]))))
       (is (= "http://proxy.internal:8080" (:proxy (light-shell/parse-light-node-args ["status" "--proxy" "http://proxy.internal:8080"]))))
       (is (= 5000 (:timeout-ms (light-shell/parse-light-node-args ["status" "--timeout-ms" "5000"]))))

@@ -255,6 +255,10 @@
         state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
         bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
         autonomous? (some #{"--autonomous"} clean-args)
+        no-auto-sync? (boolean (some #{"--no-auto-sync"} clean-args))
+        explicit-auto-sync? (boolean (some #{"--auto-sync"} clean-args))
+        auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
+        sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
         transport-str (extract-flag-value clean-args "--transport" "udp")
         transport (case (str/lower-case transport-str)
                     "tcp" :tcp
@@ -282,10 +286,12 @@
              :state-dir state-dir
              :bootstrap bootstrap-path
              :autonomous? (boolean autonomous?)
+             :auto-sync? (boolean auto-sync?)
              :transport transport
              :cmd-map (let [m (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))]
                         (cond-> m
                           subnet-id (assoc "subnet_id" subnet-id)))}
+      sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
       subnet-id (assoc :subnet-id subnet-id)
       timeout-ms (assoc :timeout-ms timeout-ms)
       proxy-url (assoc :proxy proxy-url)
@@ -1239,6 +1245,21 @@
             (when-let [resp (:response res)]
               (emit-json-line! out-writer resp))))))))
 
+(defn run-auto-sync-tick!
+  "Executes a single non-blocking background chain-state quorum sync tick.
+   Updates state-atom and persists to state-file when sync succeeds."
+  [state-atom bootstrap identity state-file conn-opts]
+  (try
+    (let [pubkey (or (:pubkey-hex identity) (:pubkey identity))
+          privkey (:privkey-bytes identity)
+          sync-opts (assoc (or conn-opts {}) :identity identity)
+          res (maybe-sync-account-state! state-atom bootstrap pubkey privkey sync-opts)]
+      (when (and (:ok? res) state-file)
+        (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))
+      res)
+    (catch Exception e
+      {:ok? false :error (or (.getMessage e) "auto-sync-tick-failed")})))
+
 (defn run-serve!
   "Runs the light node in continuous JSONL serve mode reading STDIN and writing STDOUT."
   [opts]
@@ -1247,14 +1268,15 @@
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
-        initial-state (or (when loaded-state
-                            (cond-> loaded-state
-                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
-                              (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
-                              (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
-                          (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
-                                                                         :autonomous? (boolean (:autonomous? opts false))}
-                                                                  (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+        base-state (or (when loaded-state
+                         (cond-> loaded-state
+                           (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
+                           (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
+                           (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
+                       (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
+                                                                      :autonomous? (boolean (:autonomous? opts false))}
+                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+        initial-state (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
         state-atom (atom initial-state)
         conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
@@ -1300,6 +1322,21 @@
                          :async-reconnect? true)
         _ (reset! conn-opts-atom conn-opts)
         conn-res (reconnect-fn)
+        auto-sync-running? (atom (boolean (:auto-sync? opts true)))
+        sync-interval-ms (max 1000 (long (or (:sync-interval-ms opts) 15000)))
+        _ (when @auto-sync-running?
+            (doto (Thread.
+                   ^Runnable
+                   (fn []
+                     (while @auto-sync-running?
+                       (run-auto-sync-tick! state-atom bootstrap identity state-file conn-opts)
+                       (try
+                         (Thread/sleep sync-interval-ms)
+                         (catch InterruptedException _
+                           (reset! auto-sync-running? false))))))
+              (.setDaemon true)
+              (.setName "bitecho-light-node-auto-sync")
+              (.start)))
         ctx {:state-atom state-atom
              :conn-atom conn-atom
              :out-writer out-writer
@@ -1314,13 +1351,16 @@
       (emit-json-line! out-writer {"event" "connection-failed"
                                    "connected" false
                                    "error" (:error conn-res)}))
-    (binding [*out* *err*]
-      (let [reader (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
-        (loop []
-          (when-let [line (.readLine reader)]
-            (when-not (str/blank? line)
-              (handle-serve-line! line ctx))
-            (recur)))))))
+    (try
+      (binding [*out* *err*]
+        (let [reader (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
+          (loop []
+            (when-let [line (.readLine reader)]
+              (when-not (str/blank? line)
+                (handle-serve-line! line ctx))
+              (recur)))))
+      (finally
+        (reset! auto-sync-running? false)))))
 
 (defn run-one-shot!
   "Executes a single one-shot light-node command and outputs JSON response."
@@ -1330,14 +1370,15 @@
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
-        initial-state (or (when loaded-state
-                            (cond-> loaded-state
-                              (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
-                              (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
-                              (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
-                          (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
-                                                                         :autonomous? (boolean (:autonomous? opts false))}
-                                                                  (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+        base-state (or (when loaded-state
+                         (cond-> loaded-state
+                           (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
+                           (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
+                           (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
+                       (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
+                                                                      :autonomous? (boolean (:autonomous? opts false))}
+                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+        initial-state (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
         state-atom (atom initial-state)
         raw-cmd-map (:cmd-map opts)
         verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
@@ -1351,7 +1392,8 @@
                     (cond-> raw-cmd-map
                       desc (assoc "descriptor" desc)))
                   raw-cmd-map)
-        sync-wanted? (or (and (= verb "sync-account") (nil? (get cmd-map "balance")) (nil? (get cmd-map "snapshots")) (nil? (get cmd-map "snapshot")))
+        sync-wanted? (or (boolean (:auto-sync? opts))
+                         (and (= verb "sync-account") (nil? (get cmd-map "balance")) (nil? (get cmd-map "snapshots")) (nil? (get cmd-map "snapshot")))
                          (and (= verb "account") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map)))
                          (and (= verb "escrows") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map))))
         sync-opts (assoc opts :identity identity)

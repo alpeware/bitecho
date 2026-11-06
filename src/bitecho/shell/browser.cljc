@@ -413,7 +413,7 @@
               (set? v)
               (into #{} (map sanitize-val v))
               (seq? v)
-              (map sanitize-val v)
+              (mapv sanitize-val v)
               :else v))]
     (when (map? state)
       (sanitize-val state))))
