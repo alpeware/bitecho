@@ -3,6 +3,8 @@
   (:require [bitecho.anchor-webauthn-test]
             [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
+            [bitecho.core.data-test]
+            [bitecho.core.subnet-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
             [bitecho.economy.treasury-test]
@@ -47,6 +49,8 @@
              'bitecho.shell.browser-test
              'bitecho.state-machine-portability-test
              'bitecho.wire-negotiation-test
-             'bitecho.fractal-federation-test))
+             'bitecho.fractal-federation-test
+             'bitecho.core.data-test
+             'bitecho.core.subnet-test))
 
 (set! *main-cli-fn* -main)

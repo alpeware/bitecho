@@ -3,6 +3,8 @@
   (:require [bitecho.anchor-webauthn-test]
             [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
+            [bitecho.core.data-test]
+            [bitecho.core.subnet-test]
             [bitecho.crypto-test]
             [bitecho.crypto.sealed-test]
             [bitecho.demo.angels-test]

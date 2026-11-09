@@ -5,6 +5,7 @@
    Portable across Clojure (JVM) and ClojureScript (Node/Browser)."
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.subnet :as core-subnet]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.economy.bundle :as bundle]
@@ -3792,21 +3793,29 @@
         {:mux new-mux
          :net-envelopes []
          :stdout-events [diag-event]})
-      (let [res (handle-wire-payload instance envelope privkey-bytes)
-            old-mismatch (or (get-in instance [:diagnostics :subnet-mismatch-dropped])
-                             (:subnet-mismatch-dropped instance)
-                             0)
-            new-mismatch (or (get-in (:state res) [:diagnostics :subnet-mismatch-dropped])
-                             (:subnet-mismatch-dropped (:state res))
-                             0)
-            delta (max 0 (- (long new-mismatch) (long old-mismatch)))
-            new-mux (-> mux
-                        (assoc-in [:subnets sub-id] (:state res))
-                        (cond-> (pos? delta)
-                          (update-in [:diagnostics :subnet-mismatch-dropped] (fnil + 0) delta)))]
-        {:mux new-mux
-         :net-envelopes (or (:net-envelopes res) [])
-         :stdout-events (or (:stdout-events res) [])}))))
+      (if (:bitecho.subnet/unified? instance)
+        (let [sub-event (or (:event envelope) envelope)
+              res (core-subnet/reduce-subnet instance sub-event)
+              new-mux (assoc-in mux [:subnets sub-id] (:state res))]
+          {:mux new-mux
+           :effects (or (:effects res) [])
+           :net-envelopes []
+           :stdout-events []})
+        (let [res (handle-wire-payload instance envelope privkey-bytes)
+              old-mismatch (or (get-in instance [:diagnostics :subnet-mismatch-dropped])
+                               (:subnet-mismatch-dropped instance)
+                               0)
+              new-mismatch (or (get-in (:state res) [:diagnostics :subnet-mismatch-dropped])
+                               (:subnet-mismatch-dropped (:state res))
+                               0)
+              delta (max 0 (- (long new-mismatch) (long old-mismatch)))
+              new-mux (-> mux
+                          (assoc-in [:subnets sub-id] (:state res))
+                          (cond-> (pos? delta)
+                            (update-in [:diagnostics :subnet-mismatch-dropped] (fnil + 0) delta)))]
+          {:mux new-mux
+           :net-envelopes (or (:net-envelopes res) [])
+           :stdout-events (or (:stdout-events res) [])})))))
 
 (defn dispatch-multiplexed-command
   "Dispatches a command map to a specific subnet instance in the multiplexer.
