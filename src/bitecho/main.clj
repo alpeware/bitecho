@@ -244,7 +244,11 @@
       (cmd-fund-agent rest-args)
 
       "light-node"
-      (light-node/run-light-node-cli! rest-args)
+      (let [res (light-node/run-light-node-cli! rest-args)]
+        (when (and (= "wait-event" (first rest-args))
+                   (map? res)
+                   (false? (:ok? res)))
+          (System/exit 1)))
 
       "sign-directory-pop"
       (cmd-sign-directory-pop rest-args)

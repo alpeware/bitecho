@@ -1236,7 +1236,7 @@
   (testing "Bidirectional CLI verbs and flags inventory between skill/SKILL.md and parse-light-node-args"
     (let [skill-md (slurp "skill/SKILL.md")
           documented-flags (set (re-seq #"--[a-z][a-z-]*" skill-md))
-          verbs ["serve" "identity" "status" "discover" "register-home-set"
+          verbs ["serve" "wait-event" "identity" "status" "discover" "register-home-set"
                  "offer" "accept" "send" "inbox" "close" "transfer"
                  "account" "sync-account" "settle-intent" "submit-vouchers"
                  "petname-set" "petname-list" "petname-remove" "petname-resolve"
@@ -1255,6 +1255,8 @@
                   "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"
                   "--subnet-id"
                   "--auto-sync" "--no-auto-sync" "--sync-interval-ms"
+                  "--auto-register-home-set" "--no-auto-register-home-set"
+                  "--cmd-file" "--events-out" "--min-seq" "--after-ts"
                   "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
@@ -1264,6 +1266,7 @@
       ;; Handled by parser:
       ;; Verbs
       (is (= :serve (:mode (light-shell/parse-light-node-args ["serve"]))))
+      (is (= :wait-event (:mode (light-shell/parse-light-node-args ["wait-event"]))))
       (is (= {"cmd" "identity"} (:cmd-map (light-shell/parse-light-node-args ["identity"]))))
       (is (= {"cmd" "status"} (:cmd-map (light-shell/parse-light-node-args ["status"]))))
       (is (= {"cmd" "discover"} (:cmd-map (light-shell/parse-light-node-args ["discover"]))))
@@ -1326,6 +1329,15 @@
       (is (false? (:auto-sync? (light-shell/parse-light-node-args ["serve" "--no-auto-sync"]))))
       (is (true? (:auto-sync? (light-shell/parse-light-node-args ["status" "--auto-sync"]))))
       (is (= 5000 (:sync-interval-ms (light-shell/parse-light-node-args ["serve" "--sync-interval-ms" "5000"]))))
+      (is (false? (:auto-register-home-set? (light-shell/parse-light-node-args ["serve"]))))
+      (is (true? (:auto-register-home-set? (light-shell/parse-light-node-args ["serve" "--autonomous"]))))
+      (is (false? (:auto-register-home-set? (light-shell/parse-light-node-args ["serve" "--autonomous" "--no-auto-register-home-set"]))))
+      (is (true? (:auto-register-home-set? (light-shell/parse-light-node-args ["serve" "--auto-register-home-set"]))))
+      (is (= "/tmp/cmd.jsonl" (:cmd-file (light-shell/parse-light-node-args ["serve" "--cmd-file" "/tmp/cmd.jsonl"]))))
+      (is (= "/tmp/ev.jsonl" (:events-out (light-shell/parse-light-node-args ["serve" "--events-out" "/tmp/ev.jsonl"]))))
+      (is (= 258 (:min-seq (light-shell/parse-light-node-args ["wait-event" "--session-id" "s1" "--min-seq" "258"]))))
+      (is (= "s1" (:session-id (light-shell/parse-light-node-args ["wait-event" "--session-id" "s1" "--min-seq" "258"]))))
+      (is (= 1700000000000 (:after-ts (light-shell/parse-light-node-args ["wait-event" "--after-ts" "1700000000000"]))))
       (is (= :tcp (:transport (light-shell/parse-light-node-args ["status" "--transport" "tcp"]))))
       (is (= "http://proxy.internal:8080" (:proxy (light-shell/parse-light-node-args ["status" "--proxy" "http://proxy.internal:8080"]))))
       (is (= 5000 (:timeout-ms (light-shell/parse-light-node-args ["status" "--timeout-ms" "5000"]))))
@@ -2006,5 +2018,178 @@
       (is (= "failed" (:phase summary-2)))
       (is (= "send-failed: closed" (:last_error summary-2)))
       (is (= :send-failed (:reason (last @diag-atom)))))))
+
+;; -----------------------------------------------------------------------------
+;; Step U0 (Milestone 13A/13B): Self-Sufficient Daemon, Auto-Sync Events & wait-event
+;; -----------------------------------------------------------------------------
+
+(defspec ^{:doc "Property: Step U0 wait-event filter invariants across incoming and status events"}
+  prop-step-u0-wait-event-filter-invariants 50
+  (prop/for-all [ev-type (gen/elements ["message-received" "offer-received" "channel-opened"
+                                        "session-established" "p2p-connected" "broadcast-received"
+                                        "ready" "auto-sync" "connection-failed"])
+                 sid (gen/elements ["sess-a" "sess-b" "sess-c"])
+                 target-sid (gen/one-of [(gen/return nil) (gen/elements ["sess-a" "sess-b"])])
+                 seq-num (gen/choose 1 500)
+                 min-seq (gen/one-of [(gen/return nil) (gen/choose 1 500)])
+                 ts (gen/choose 1000 5000)
+                 after-ts (gen/one-of [(gen/return nil) (gen/choose 1000 5000)])]
+                (let [evt {"event" ev-type
+                           "session_id" sid
+                           "seq" seq-num
+                           "timestamp_ms" ts}
+                      opts (cond-> {}
+                             target-sid (assoc :session-id target-sid)
+                             min-seq (assoc :min-seq min-seq)
+                             after-ts (assoc :after-ts after-ts))
+                      matched? (light-shell/event-matches-wait-filter? evt opts)
+                      waitable? (contains? #{"message-received" "offer-received" "channel-opened"
+                                             "session-established" "rendezvous-header-received"
+                                             "rendezvous-reveal-received" "p2p-connected" "broadcast-received"}
+                                           ev-type)
+                      sid-ok? (or (nil? target-sid) (= sid target-sid))
+                      seq-ok? (or (nil? min-seq) (>= seq-num min-seq))
+                      ts-ok? (or (nil? after-ts) (> ts after-ts))]
+                  (= matched? (and waitable? sid-ok? seq-ok? ts-ok?)))))
+
+(deftest test-step-u0-auto-sync-stdout-event-and-home-set-renewal
+  (testing "Step U0: run-auto-sync-tick! emits structured stdout auto-sync event (ok/error), diagnoses failures, and renews register-home-set"
+    (let [temp-dir (Files/createTempDirectory "bitecho-test-u0-sync" (into-array FileAttribute []))
+          state-file (str (.resolve temp-dir "state.nippy"))
+          id (light-shell/load-or-create-light-identity! (str temp-dir))
+          pubkey (:pubkey-hex id)
+          val-kp1 (crypto/generate-keypair)
+          val-kp2 (crypto/generate-keypair)
+          val-kp3 (crypto/generate-keypair)
+          v1-pub (basalt/bytes->hex (:public val-kp1))
+          v2-pub (basalt/bytes->hex (:public val-kp2))
+          v3-pub (basalt/bytes->hex (:public val-kp3))
+          bootstrap {:network "devnet"
+                     :nodes {:node1 {:node-id "node1" :pubkey v1-pub :ip "127.0.0.1" :agent-port 5010}
+                             :node2 {:node-id "node2" :pubkey v2-pub :ip "127.0.0.1" :agent-port 5011}
+                             :node3 {:node-id "node3" :pubkey v3-pub :ip "127.0.0.1" :agent-port 5012}}}
+          st0 (light-core/init-light-state id {:bootstrap bootstrap :autonomous? true})
+          state-atom (atom st0)
+          conn-atom (atom (light-shell/init-conn-state))
+          sent-envs (atom [])
+          emitted-events (atom [])
+          diag-atom (atom [])
+          _ (light-shell/apply-conn-event! conn-atom {:type :dial-started :generation 1})
+          _ (light-shell/apply-conn-event! conn-atom {:type :dial-ok
+                                                      :generation 1
+                                                      :validator-id :node1
+                                                      :send-fn (fn [env] (swap! sent-envs conj env) true)})
+          make-snap (fn [v-kp v-pub]
+                      (light-core/sign-chain-state-snapshot
+                       {:pubkey pubkey
+                        :balance 85000
+                        :spendable 84500
+                        :seq 2
+                        :deps []
+                        :finalized-epoch 420
+                        :escrows []
+                        :validator-pubkey v-pub}
+                       (:private v-kp)))
+          conn-opts-ok {:state-atom state-atom
+                        :conn-atom conn-atom
+                        :diagnostics-atom diag-atom
+                        :event-out (fn [ev] (swap! emitted-events conj ev))
+                        :auto-register-home-set? true
+                        :home-set-price 10
+                        :inband-snapshot-fetcher (fn [_] [(make-snap val-kp1 v1-pub)
+                                                          (make-snap val-kp2 v2-pub)
+                                                          (make-snap val-kp3 v3-pub)])}
+          res-ok (light-shell/run-auto-sync-tick! state-atom bootstrap id state-file conn-opts-ok)
+          ev-ok (first @emitted-events)]
+      (try
+        (is (:ok? res-ok))
+        (is (= "auto-sync" (get ev-ok "event")))
+        (is (true? (get ev-ok "ok")))
+        (is (= 420 (get ev-ok "finalized_epoch")))
+        (is (= 85000 (get ev-ok "balance")))
+        (is (= 84500 (get ev-ok "spendable")))
+        (is (true? (get ev-ok "synced")))
+        ;; Verify auto-register-home-set dispatched over open validator channel
+        (is (pos? (count @sent-envs)))
+        (is (= :register-home-set (get-in (last @sent-envs) [:event :type])))
+        (is (= ["node1" "node2" "node3"] (sort (map :node-id (:home-set @state-atom)))))
+        ;; 2. Failure tick emits structured {"event":"auto-sync","ok":false,...} and records counted :diagnose (Rule 5)
+        (reset! emitted-events [])
+        (let [conn-opts-fail (assoc conn-opts-ok
+                                    :inband-snapshot-fetcher (fn [_] [(make-snap val-kp1 v1-pub)]))
+              res-fail (light-shell/run-auto-sync-tick! state-atom bootstrap id state-file conn-opts-fail)
+              ev-fail (first @emitted-events)]
+          (is (false? (:ok? res-fail)))
+          (is (= "auto-sync" (get ev-fail "event")))
+          (is (false? (get ev-fail "ok")))
+          (is (false? (get ev-fail "synced")))
+          (is (= "insufficient-validator-quorum" (get ev-fail "error")))
+          (is (some #(= :auto-sync-failed (:reason %)) @diag-atom)))
+        (finally
+          (doseq [f (reverse (file-seq (.toFile temp-dir)))]
+            (.delete f)))))))
+
+(deftest test-step-u0-events-out-cmd-file-and-wait-event
+  (testing "Step U0: --events-out appends timestamped JSONL, wait-event catches historical & live events or times out, and cmd-file tailer processes appended lines"
+    (let [temp-dir (Files/createTempDirectory "bitecho-test-u0-io" (into-array FileAttribute []))
+          events-path (str (.resolve temp-dir "events.jsonl"))
+          cmd-path (str (.resolve temp-dir "cmd.jsonl"))]
+      (try
+        ;; 1. Pre-existing event in events.jsonl caught immediately via --session-id + --min-seq (zero turn-gap miss!)
+        (light-shell/append-event-jsonl! events-path {"event" "ready" "connected" true})
+        (light-shell/append-event-jsonl! events-path {"event" "message-received" "session_id" "s-1" "seq" 10 "text" "early"})
+        (light-shell/append-event-jsonl! events-path {"event" "message-received" "session_id" "s-1" "seq" 11 "text" "target"})
+        (let [sw (StringWriter.)
+              pw (PrintWriter. sw true)
+              res (light-shell/run-wait-event! {:state-dir (str temp-dir)
+                                                :events-out events-path
+                                                :session-id "s-1"
+                                                :min-seq 11
+                                                :timeout-ms 500
+                                                :out-writer pw})]
+          (is (:ok? res))
+          (is (= 11 (get-in res [:event "seq"])))
+          (is (= "target" (get (json/read-str (str/trim (str sw))) "text"))))
+
+        ;; 2. Async live arrival while wait-event blocks at EOF (no --min-seq / --after-ts)
+        (let [sw (StringWriter.)
+              pw (PrintWriter. sw true)
+              fut (future
+                    (Thread/sleep 80)
+                    (light-shell/append-event-jsonl! events-path {"event" "auto-sync" "ok" true "finalized_epoch" 500})
+                    (Thread/sleep 40)
+                    (light-shell/append-event-jsonl! events-path {"event" "offer-received" "session_id" "s-new" "from" "peer1"}))
+              res (light-shell/run-wait-event! {:state-dir (str temp-dir)
+                                                :events-out events-path
+                                                :timeout-ms 1500
+                                                :out-writer pw})]
+          @fut
+          (is (:ok? res))
+          (is (= "offer-received" (get-in res [:event "event"])))
+          (is (= "s-new" (get (json/read-str (str/trim (str sw))) "session_id"))))
+
+        ;; 3. Timeout returns {:ok? false :error "timeout"} cleanly
+        (let [sw (StringWriter.)
+              pw (PrintWriter. sw true)
+              res (light-shell/run-wait-event! {:state-dir (str temp-dir)
+                                                :events-out events-path
+                                                :session-id "s-1"
+                                                :min-seq 999
+                                                :timeout-ms 120
+                                                :out-writer pw})]
+          (is (false? (:ok? res)))
+          (is (= "timeout" (:error res)))
+          (is (= "timeout" (get (json/read-str (str/trim (str sw))) "error"))))
+
+        ;; 4. Incremental cmd-file reader skips pre-existing offset and drains newly appended commands
+        (spit cmd-path "{\"cmd\":\"stale\"}\n")
+        (let [init-off (.length (io/file cmd-path))
+              _ (spit cmd-path "{\"cmd\":\"status\"}\n{\"cmd\":\"inbox\"}\n" :append true)
+              {:keys [lines next-offset]} (light-shell/read-new-cmd-file-lines! cmd-path init-off)]
+          (is (= ["{\"cmd\":\"status\"}" "{\"cmd\":\"inbox\"}"] lines))
+          (is (= (.length (io/file cmd-path)) next-offset)))
+        (finally
+          (doseq [f (reverse (file-seq (.toFile temp-dir)))]
+            (.delete f)))))))
 
 

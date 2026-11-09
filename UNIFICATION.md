@@ -176,3 +176,49 @@ Pointers resolve uniquely by `(subnet, path)`. To prevent competing authorities 
 6. **Phase 4 M2 & M3:** Cross-platform `.cljc` `clj-datachannel` + Node.js light-node bundle (`UDP` + `TCP/HTTP CONNECT`) and local UPnP + delegated `nexus.ingress.bitecho.org:443` `HTTP CONNECT` ingress.
 7. **Subnet #4 (Phase 4 M4):** `chat/simon-nexus-axiom` 3-way zero-burn private broadcast & 1:1 chat over P2P ICE (+mDNS on LAN legs and Nexus sealed relay for `Browser ↔ Axiom`).
 8. **Phase 4 M5 & M12:** Mobile Browser UI + RC-4 wake identity guard (M5), followed by fractal-up child-subnet Merkle state-root anchoring (M12).
+
+---
+
+## Appendix A: Decision & Gap Resolution Ledger (`D1` & `G1–G17`)
+
+| ID | Topic | Ratified Resolution (`seqs 264–281` $\leftrightarrow$ `seqs 157–159`) |
+| :--- | :--- | :--- |
+| **D1** | Infra Pointer ordering (`:leader-election` vs `:streamlet-bft`) | **Option B (`:leader-election`)** with clock-free monotonic `:pointer/leader-term` fencing (`[(:pointer/leader-term 0) :pointer/seq]`). Single-operator `ns1..ns3` requires crash-fault ordering, not BFT; flipping to `:streamlet-bft` remains a 1-line policy change. |
+| **G1** | Sequencing vs. Phase 4 (`M1–M5`) | Front-load `M1a/b` (`Step U0`), then `Phase A -> Phase B -> Phase C -> Phase D -> M2/M3 -> Subnet #4 (M4) -> M5 -> M12`. |
+| **G2** | Infra threat model | Covered by **D1** above. |
+| **G3** | Validator chain-state boundary | Internal chain ledger (`accounts`, `escrows`, `settled-tuples`, `burn-history`, Streamlet block tree) stays in `bitecho.state-machine`; unification stops at the chain boundary. |
+| **G4** | Pointer proof semantics, ACL, & tombstones | (a) `:self` valid strictly where `:subnet/path-acl` binds that key to that path; `:pop` carries `:prev-pubkey` / `:rotation-sig` rotation continuity. (b) Policy-versioned `:subnet/path-acl` (including `"bootstrap"` $\rightarrow$ subnet/cluster key) makes `(subnet, path)` resolution unambiguous. (c) `:pointer/target nil` is a valid tombstone unpinning old Blobs while allowing re-creation at higher `seq`. |
+| **G5** | Gate-policy governance | Pin genesis policy CID in explicit `:subnet/genesis-policy-cid` (keeping `:subnet/id` human-readable); updates to `"subnet/policy"` require Cold Root Key or $k$-of-$n$ `:trust-anchors` quorum (never hot leader alone). |
+| **G6** | Blob eviction & `1 GB e2-micro` RAM | Pin Blobs referenced by live Pointers; evict unpinned LRU; cap hot in-memory bytes (`128 MiB`) and emit pure counted `:fetch-blob` cache-miss effects fulfilled by `bitecho.shell.blob-fs` disk store (`blobs/<2-char>/<cid>`) or peer pull (`3x` `:eager-push` across `ns1..ns3`). |
+| **G7** | Clock skew & Pointer expiry | `5 min` (`300,000 ms`) default skew tolerance; `15 min` TTL (`60,000 ms` tolerance) + immediate post-finalization tombstone Pointer for `acme/challenge/<token>`. |
+| **G8** | DNS liveness filtering | Preserve `2s` heartbeat / `6s` dead-peer timeout + `60s` DNS TTL + fail-safe all-configured-IPs fallback when healthy-set is empty. |
+| **G9** | Validator `:economy :none` clarity | Applies strictly to internal consensus wire messages; the Validator Core still enforces and settles the Global Mesh's `$ECHO` accounts. |
+| **G10** | Constrained policy axes | Reject invalid `(gate, economy, replication)` combinations fail-closed at subnet creation with a counted `:diagnose` effect. |
+| **G11** | Primitives vs. shells | Three data/network primitives (`Blob`, `Pointer`, `Subnet`) + boundary I/O shells (`dns`, `http`, `smtp`, `acme`, `upnp`, `datachannel`, `blob-fs`). |
+| **G12** | Blob read access control | Store is `CID -> bytes`; shells enforce the referencing Pointer's `:subnet/gate` before serving. |
+| **G12b** | Streamlet block Blob availability | Consensus block validation requires referenced payload Blobs to be inline or locally present before voting. |
+| **G13** | `clj-web` repository strategy | Leave `clj-web` GitHub mirror frozen as-is; port needed codecs/shells into `bitecho`; stop publishing `clj-web.git` on `bitecho.org` in Phase D. |
+| **G14** | Multi-subnet multiplexer generality | Verified general at `light_node/core.cljc:3755`; wire `reduce-subnet` directly into `init-multi-subnet-multiplexer` with generative + integration tests in Phase A. |
+| **G15** | Testnet cutover safety | Snapshot pre-cutover state; cut over `ns1..ns3` one node at a time keeping authoritative DNS live. |
+| **G16** | `ns1..ns3` vs. `node1..node3` (6 VMs $\rightarrow$ 3 VMs) | Cut over `ns1..ns3` in-place first (zero `.org` TLD glue changes, `node1..node3` undisturbed); optional validator co-location onto `ns1..ns3` post-Phase-D if RSS headroom permits. |
+| **G17** | Port `:443` passthrough multiplexer | Reuse `web.http.server/ingress-stream?` + `handle-passthrough-connection!` (with bounded `<= 1024`-byte / short-timeout initial peek), adding `HTTP CONNECT` and `setWantClientAuth(true)` mTLS. |
+
+---
+
+## Appendix B: Original Architecture Proposal (Simon, 2026-11-08)
+
+> Unifying `clj-web` and `bitecho` around three orthogonal axes—Membership (Permissioned vs. Permissionless), Incentives (Economy vs. Zero-Economy), and Data (Content-Addressed vs. Authority-Signed)—reveals that `clj-web` and `bitecho` were never two separate systems. They are two hardcoded configurations of the exact same distributed runtime.
+>
+> Right now, the codebase duplicates concepts across layers: `clj-web` has its own UDP `:5000` cluster mesh, Bully leader election, `.eml` replication, and static file cache, while `bitecho` has Streamlet BFT, Contagion gossip, Directory descriptors, bootstrap files, and session outboxes. By extracting universal, fractal primitives, we collapse `clj-web` into `bitecho` as edge ingress protocols and run the exact same state machine at every level of nesting:
+>
+> 1. **The Data Plane (`Blob` & `Pointer` in Canonical Fressian):**
+>    - **Immutable Content (`Blob`):** $\langle \text{cid}: \text{SHA256}(\text{bytes}), \text{media-type}, \text{bytes} \rangle$. Unifies static web assets (HTTP `ETag` = SHA-256), inbound SMTP `<sha256>.eml` messages, escrow deliverable preimages, and gossip/block payloads.
+>    - **Mutable State (`Pointer`):** $\langle \text{authority-pubkey}, \text{subnet-id}, \text{topic/path}, \text{seq/epoch}, \text{expires}, \text{target-cid}, \text{proof}, \text{sig} \rangle$. Unifies Directories (`dir/<nickname>`), Bootstrap descriptors (`bootstrap`), ACME challenges & TLS bundles (`acme/challenge/<token>`, `tls/current-cert`), DNS zone records & subdomain delegations (`dns/A/nexus.ingress`), DACs (`dac/<agent>`), and Home-Set registrations (`homeset/<pubkey>`).
+> 2. **The Network Plane (Generalized `Subnet` Descriptor):**
+>    - Every network at every scale—Global Bitecho Mesh, Streamlet Validator Core, `bitecho.org/infra` (`ns1..ns3`), `chat/simon-nexus-axiom` 3-way private broadcast, and Private mTLS HTTPS Admin/Ingress—is a configuration map of `:gate`, `:economy`, and `:replication` over `init-multi-subnet-multiplexer`.
+> 3. **Collapsing `clj-web` into `bitecho` as Protocol Shells:**
+>    - Pure codecs move to `src/bitecho/core/protocol/{dns,smtp,acme}.cljc`; side-effecting boundaries move to `src/bitecho/shell/{http,dns,smtp,acme,upnp}.clj`; `web.cluster.mesh` and standalone `web.cluster.protocol` are retired in favor of the `bitecho.org/infra` subnet.
+> 4. **Arbitrary Fractal Nesting (Up & Down):**
+>    - **Fractal Down:** Every node can serve signed bootstrap Pointers for child subnets over HTTPS, DNS TXT, mDNS, or parent DataChannels—spawning `chat/simon-nexus-axiom` as a zero-burn DAC-gated subnet with zero custom server logic.
+>    - **Fractal Up:** A child subnet's epoch state root is simply a Blob containing the Merkle root of its active Pointers, signed as a Pointer by the child subnet's authority/quorum and anchored into the parent subnet.
+

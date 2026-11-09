@@ -14,9 +14,10 @@
             [clojure.string :as str]
             [datachannel.api :as api]
             [taoensso.nippy :as nippy])
-  (:import [java.io BufferedReader InputStreamReader PrintWriter]
+  (:import [java.io BufferedReader InputStreamReader PrintWriter RandomAccessFile]
            [java.net URI]
            [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
+           [java.nio.charset StandardCharsets]
            [java.nio.file Files StandardCopyOption]
            [java.nio.file.attribute PosixFilePermissions]
            [java.time Duration]))
@@ -250,15 +251,26 @@
   (let [clean-args (if (= (first args) "light-node") (vec (rest args)) (vec args))
         verb (first clean-args)
         serve? (= verb "serve")
+        wait-event? (= verb "wait-event")
         default-state-dir (str (System/getProperty "user.home") "/.bitecho/light-node")
         default-bootstrap "https://bitecho.org/devnet/bootstrap.txt"
         state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
         bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
-        autonomous? (some #{"--autonomous"} clean-args)
+        autonomous? (boolean (some #{"--autonomous"} clean-args))
         no-auto-sync? (boolean (some #{"--no-auto-sync"} clean-args))
         explicit-auto-sync? (boolean (some #{"--auto-sync"} clean-args))
         auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
         sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
+        no-auto-reg? (boolean (some #{"--no-auto-register-home-set"} clean-args))
+        explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
+        auto-register-home-set? (and (not no-auto-reg?) (or explicit-auto-reg? (and serve? autonomous?)))
+        home-set-price (extract-long-flag clean-args "--price" (when auto-register-home-set? 10))
+        cmd-file (extract-flag-value clean-args "--cmd-file" nil)
+        events-out (extract-flag-value clean-args "--events-out" nil)
+        wait-session-id (or (extract-flag-value clean-args "--session-id" nil)
+                            (extract-flag-value clean-args "--session" nil))
+        min-seq (extract-long-flag clean-args "--min-seq" nil)
+        after-ts (extract-long-flag clean-args "--after-ts" nil)
         transport-str (extract-flag-value clean-args "--transport" "udp")
         transport (case (str/lower-case transport-str)
                     "tcp" :tcp
@@ -281,17 +293,27 @@
                          :password turn-password
                          :realm turn-realm
                          :force-relay? turn-force-relay?}))]
-    (cond-> {:mode (if serve? :serve :one-shot)
+    (cond-> {:mode (cond
+                     serve? :serve
+                     wait-event? :wait-event
+                     :else :one-shot)
              :verb verb
              :state-dir state-dir
              :bootstrap bootstrap-path
-             :autonomous? (boolean autonomous?)
+             :autonomous? autonomous?
              :auto-sync? (boolean auto-sync?)
+             :auto-register-home-set? (boolean auto-register-home-set?)
              :transport transport
-             :cmd-map (let [m (when-not serve? (build-one-shot-cmd-map verb (rest clean-args)))]
+             :cmd-map (let [m (when-not (or serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
                         (cond-> m
                           subnet-id (assoc "subnet_id" subnet-id)))}
       sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
+      home-set-price (assoc :home-set-price home-set-price)
+      cmd-file (assoc :cmd-file cmd-file)
+      events-out (assoc :events-out events-out)
+      wait-session-id (assoc :session-id wait-session-id)
+      min-seq (assoc :min-seq min-seq)
+      after-ts (assoc :after-ts after-ts)
       subnet-id (assoc :subnet-id subnet-id)
       timeout-ms (assoc :timeout-ms timeout-ms)
       proxy-url (assoc :proxy proxy-url)
@@ -755,6 +777,14 @@
                            (push-diagnostic diag-eff))]
           [new-conn [diag-eff]])
 
+        :auto-sync-failed
+        (let [err (or (:error event) "auto-sync-failed")
+              diag-eff {:effect :diagnose :reason :auto-sync-failed :error err}
+              new-conn (-> conn
+                           (assoc :last-error err)
+                           (push-diagnostic diag-eff))]
+          [new-conn [diag-eff]])
+
         :shutdown
         (let [node-to-close (:node conn)
               effects (if node-to-close
@@ -1146,19 +1176,144 @@
                :failed-nodes failed-nodes})))))))
 
 ;; -----------------------------------------------------------------------------
-;; CLI Runner (Serve & One-Shot Modes)
+;; CLI Runner (Serve, Wait-Event & One-Shot Modes)
 ;; -----------------------------------------------------------------------------
 
+(defonce ^:private events-out-write-lock (Object.))
+
+(def waitable-event-types
+  "Set of incoming asynchronous event types eligible to wake `wait-event`."
+  #{"message-received" "offer-received" "channel-opened" "session-established"
+    "rendezvous-header-received" "rendezvous-reveal-received"
+    "p2p-connected" "broadcast-received"})
+
+(defn event-matches-wait-filter?
+  "Pure predicate checking whether an emitted JSON event map satisfies a `wait-event` filter."
+  [evt opts]
+  (if-not (map? evt)
+    false
+    (let [ev-type (or (get evt "event") (some-> (:event evt) name))
+          waitable? (contains? waitable-event-types ev-type)
+          target-sid (:session-id opts)
+          ev-sid (or (get evt "session_id") (get evt "session-id") (:session-id evt) (:session_id evt))
+          min-seq (:min-seq opts)
+          raw-seq (or (get evt "seq") (:seq evt))
+          ev-seq (when (some? raw-seq)
+                   (try (Long/parseLong (str raw-seq)) (catch Exception _ nil)))
+          after-ts (:after-ts opts)
+          raw-ts (or (get evt "timestamp_ms") (:timestamp-ms evt) (:timestamp_ms evt))
+          ev-ts (if (some? raw-ts)
+                  (try (Long/parseLong (str raw-ts)) (catch Exception _ 0))
+                  0)
+          sid-ok? (or (nil? target-sid) (= (str ev-sid) (str target-sid)))
+          seq-ok? (or (nil? min-seq)
+                      (and (some? ev-seq) (>= (long ev-seq) (long min-seq))))
+          ts-ok? (or (nil? after-ts) (> (long ev-ts) (long after-ts)))]
+      (boolean (and waitable? sid-ok? seq-ok? ts-ok?)))))
+
+(defn append-event-jsonl!
+  "Appends a single JSON object line to events-out-path with a monotonic timestamp_ms field."
+  [events-out-path data]
+  (when (and (some? events-out-path) (not (str/blank? (str events-out-path))) (map? data))
+    (locking events-out-write-lock
+      (let [f (io/file events-out-path)
+            parent (.getParentFile f)
+            _ (when parent (.mkdirs parent))
+            enriched (if (or (contains? data "timestamp_ms") (contains? data :timestamp-ms))
+                       data
+                       (assoc data "timestamp_ms" (System/currentTimeMillis)))]
+        (spit f (str (json/write-str enriched) "\n") :append true)))))
+
 (defn- emit-json-line!
-  "Writes a data object as a JSON line to the dedicated print writer."
-  [^PrintWriter writer data]
-  (.println writer ^String (json/write-str data))
-  (.flush writer))
+  "Writes a data object as a JSON line to the dedicated print writer, and optionally mirrors to events-out-path."
+  ([^PrintWriter writer data]
+   (emit-json-line! writer data nil))
+  ([^PrintWriter writer data events-out-path]
+   (.println writer ^String (json/write-str data))
+   (.flush writer)
+   (when events-out-path
+     (try (append-event-jsonl! events-out-path data) (catch Exception _ nil)))))
+
+(defn read-new-cmd-file-lines!
+  "Reads newly appended complete UTF-8 lines from cmd-file-path starting at byte offset.
+   Returns {:lines [...] :next-offset <long>}."
+  [cmd-file-path ^long offset]
+  (let [f (io/file cmd-file-path)]
+    (if-not (.exists f)
+      {:lines [] :next-offset offset}
+      (let [len (.length f)
+            safe-off (if (< len offset) 0 offset)]
+        (if (<= len safe-off)
+          {:lines [] :next-offset safe-off}
+          (with-open [raf (RandomAccessFile. f "r")]
+            (.seek raf safe-off)
+            (let [rem (int (- len safe-off))
+                  buf (byte-array rem)
+                  read-n (.read raf buf 0 rem)]
+              (if (<= read-n 0)
+                {:lines [] :next-offset safe-off}
+                (let [last-nl (loop [idx (dec read-n)]
+                                (cond
+                                  (neg? idx) -1
+                                  (= (aget buf idx) (byte 10)) idx
+                                  :else (recur (dec idx))))]
+                  (if (neg? last-nl)
+                    {:lines [] :next-offset safe-off}
+                    (let [consumed (inc last-nl)
+                          text (String. buf 0 consumed StandardCharsets/UTF_8)
+                          lines (->> (str/split-lines text)
+                                     (map str/trim)
+                                     (remove str/blank?)
+                                     vec)]
+                      {:lines lines
+                       :next-offset (+ safe-off consumed)})))))))))))
+
+(defn run-wait-event!
+  "Blocks until a matching incoming event appears in --events-out (or <state-dir>/events.jsonl),
+   writes the matched event JSON line to STDOUT, and returns {:ok? true :event evt}.
+   When --min-seq or --after-ts is specified, scans existing lines first so between-turn arrivals are never missed.
+   Returns {:ok? false :error \"timeout\"} on timeout."
+  [opts]
+  (let [state-dir (or (:state-dir opts) (str (System/getProperty "user.home") "/.bitecho/light-node"))
+        events-path (or (:events-out opts) (str (io/file state-dir "events.jsonl")))
+        timeout-ms (long (or (:timeout-ms opts) 300000))
+        poll-ms (long (or (:poll-ms opts) 50))
+        out-writer (or (:out-writer opts) (PrintWriter. System/out true))
+        scan-from-start? (or (some? (:min-seq opts)) (some? (:after-ts opts)))
+        f (io/file events-path)
+        initial-offset (if (and (not scan-from-start?) (.exists f))
+                         (.length f)
+                         0)
+        deadline (+ (System/currentTimeMillis) (max 1 timeout-ms))]
+    (loop [offset initial-offset]
+      (let [{:keys [lines next-offset]} (read-new-cmd-file-lines! events-path offset)
+            matched (some (fn [line]
+                            (let [parsed (try (json/read-str line) (catch Exception _ nil))]
+                              (when (event-matches-wait-filter? parsed opts)
+                                parsed)))
+                          lines)]
+        (cond
+          matched
+          (do
+            (emit-json-line! out-writer matched)
+            {:ok? true :event matched})
+
+          (>= (System/currentTimeMillis) deadline)
+          (let [err-resp {"ok" false "error" "timeout"}]
+            (emit-json-line! out-writer err-resp)
+            {:ok? false :error "timeout"})
+
+          :else
+          (do
+            (try (Thread/sleep (min poll-ms (max 1 (- deadline (System/currentTimeMillis)))))
+                 (catch InterruptedException _ nil))
+            (recur next-offset)))))))
 
 (defn handle-serve-line!
-  "Processes a single STDIN JSON line in serve mode, handling network retries if required."
+  "Processes a single STDIN or --cmd-file JSON line in serve mode, handling network retries if required."
   [line ctx]
-  (let [{:keys [state-atom conn-atom out-writer state-file identity bootstrap conn-opts]} ctx
+  (let [{:keys [state-atom conn-atom out-writer events-out state-file identity bootstrap conn-opts]} ctx
+        emit! (fn [payload] (emit-json-line! out-writer payload events-out))
         cmd-map (try (json/read-str line) (catch Exception _ nil))
         verb (when (map? cmd-map) (get cmd-map "cmd"))
         sync-wanted? (or (and (= verb "sync-account") (nil? (get cmd-map "balance")) (nil? (get cmd-map "snapshots")) (nil? (get cmd-map "snapshot")))
@@ -1169,7 +1324,7 @@
                    (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts))]
     (if (and sync-res (false? (:ok? sync-res)))
       (let [err-resp {"ok" false "error" (:error sync-res)}]
-        (emit-json-line! out-writer err-resp)
+        (emit! err-resp)
         err-resp)
       (let [effective-line (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
                                     (not (contains? cmd-map "descriptor"))
@@ -1199,7 +1354,7 @@
                 (sync-conn-diagnostics! state-atom conn-atom)
                 (save-light-state! state-file @state-atom)
                 (when-let [resp (:response res)]
-                  (emit-json-line! out-writer resp)))
+                  (emit! resp)))
               (do
                 (when conn-atom
                   (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
@@ -1223,48 +1378,94 @@
                             (sync-conn-diagnostics! state-atom conn-atom)
                             (save-light-state! state-file @state-atom)
                             (when-let [resp (:response res)]
-                              (emit-json-line! out-writer resp)))
+                              (emit! resp)))
                           (let [err "send-failed"]
                             (when conn-atom
                               (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
                             (when state-atom
                               (swap! state-atom assoc :connected? false :connection-error err))
                             (sync-conn-diagnostics! state-atom conn-atom)
-                            (emit-json-line! out-writer {"ok" false "error" err})))))
+                            (emit! {"ok" false "error" err})))))
                     (let [err (or (:error reconn) "listener-disabled")]
                       (when conn-atom
                         (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
                       (when state-atom
                         (swap! state-atom assoc :connected? false :connection-error err))
                       (sync-conn-diagnostics! state-atom conn-atom)
-                      (emit-json-line! out-writer {"ok" false "error" err})))))))
+                      (emit! {"ok" false "error" err})))))))
           (do
             (reset! state-atom (:state res))
             (sync-conn-diagnostics! state-atom conn-atom)
             (save-light-state! state-file @state-atom)
             (when-let [resp (:response res)]
-              (emit-json-line! out-writer resp))))))))
+              (emit! resp))))))))
 
 (defn run-auto-sync-tick!
   "Executes a single non-blocking background chain-state quorum sync tick.
-   Updates state-atom and persists to state-file when sync succeeds."
+   Updates state-atom, persists to state-file when sync succeeds, emits a structured
+   `auto-sync` JSONL event, diagnoses failures loudly (Rule 5), and optionally renews
+   `register-home-set` when `:auto-register-home-set?` is enabled."
   [state-atom bootstrap identity state-file conn-opts]
-  (try
-    (let [pubkey (or (:pubkey-hex identity) (:pubkey identity))
-          privkey (:privkey-bytes identity)
-          sync-opts (assoc (or conn-opts {}) :identity identity)
-          res (maybe-sync-account-state! state-atom bootstrap pubkey privkey sync-opts)]
-      (when (and (:ok? res) state-file)
-        (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))
-      res)
-    (catch Exception e
-      {:ok? false :error (or (.getMessage e) "auto-sync-tick-failed")})))
+  (let [pubkey (or (:pubkey-hex identity) (:pubkey identity))
+        privkey (:privkey-bytes identity)
+        conn-atom (:conn-atom conn-opts)
+        event-out (:event-out conn-opts)
+        sync-opts (assoc (or conn-opts {}) :identity identity)
+        res (try
+              (maybe-sync-account-state! state-atom bootstrap pubkey privkey sync-opts)
+              (catch Exception e
+                {:ok? false :error (or (.getMessage e) "auto-sync-tick-failed")}))]
+    (if (:ok? res)
+      (let [_ (when (:auto-register-home-set? conn-opts)
+                (let [price (long (or (:home-set-price conn-opts) 10))
+                      hs-res (light-core/handle-command @state-atom {"cmd" "register-home-set" "price" price} privkey)
+                      replay-envs (light-core/build-unacked-replay-envelopes @state-atom privkey)
+                      envs (into (vec replay-envs) (:net-envelopes hs-res))]
+                  (when (seq envs)
+                    (let [live? (and conn-atom (connection-live? @conn-atom @state-atom))
+                          sent? (if live?
+                                  (send-all-envelopes! (:send-fn @conn-atom) envs)
+                                  (when-let [rfn (:reconnect-fn conn-opts)]
+                                    (let [reconn (rfn)]
+                                      (and (:ok? reconn)
+                                           (send-all-envelopes! (:send-fn reconn) envs)))))]
+                      (if sent?
+                        (reset! state-atom (assoc (:state hs-res) :connected? true :connection-error nil))
+                        (when conn-atom
+                          (apply-conn-event! conn-atom {:type :send-failed :error "auto-register-home-set-send-failed"} conn-opts)
+                          (sync-conn-diagnostics! state-atom conn-atom)))))))
+            _ (when state-file
+                (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))
+            st @state-atom
+            fin-ep (long (or (get-in st [:account :finalized-epoch]) (:epoch st) 0))
+            bal (long (or (get-in st [:account :balance]) 0))
+            spend (long (or (get-in st [:account :spendable]) bal 0))]
+        (when event-out
+          (event-out {"event" "auto-sync"
+                      "ok" true
+                      "finalized_epoch" fin-ep
+                      "balance" bal
+                      "spendable" spend
+                      "synced" true}))
+        res)
+      (let [err (str (or (:error res) "auto-sync-tick-failed"))]
+        (when conn-atom
+          (apply-conn-event! conn-atom {:type :auto-sync-failed :error err} conn-opts)
+          (sync-conn-diagnostics! state-atom conn-atom))
+        (when event-out
+          (event-out {"event" "auto-sync"
+                      "ok" false
+                      "synced" false
+                      "error" err}))
+        res))))
 
 (defn run-serve!
-  "Runs the light node in continuous JSONL serve mode reading STDIN and writing STDOUT."
+  "Runs the light node in continuous JSONL serve mode reading STDIN (and optional --cmd-file) and writing STDOUT (and optional --events-out)."
   [opts]
   (let [state-dir (:state-dir opts)
         state-file (str (io/file state-dir "state.nippy"))
+        events-out (:events-out opts)
+        cmd-file (:cmd-file opts)
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
@@ -1280,7 +1481,8 @@
         state-atom (atom initial-state)
         conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
-        event-out (fn [ev] (emit-json-line! out-writer ev))
+        event-out (fn [ev] (emit-json-line! out-writer ev events-out))
+        serve-cmd-lock (Object.)
         conn-opts-atom (atom nil)
         reconnect-fn (fn []
                        (when conn-atom
@@ -1322,45 +1524,76 @@
                          :async-reconnect? true)
         _ (reset! conn-opts-atom conn-opts)
         conn-res (reconnect-fn)
-        auto-sync-running? (atom (boolean (:auto-sync? opts true)))
+        daemon-running? (atom true)
+        auto-sync-enabled? (boolean (:auto-sync? opts true))
         sync-interval-ms (max 1000 (long (or (:sync-interval-ms opts) 15000)))
-        _ (when @auto-sync-running?
+        ctx {:state-atom state-atom
+             :conn-atom conn-atom
+             :out-writer out-writer
+             :events-out events-out
+             :state-file state-file
+             :identity identity
+             :bootstrap bootstrap
+             :conn-opts conn-opts}
+        _ (when auto-sync-enabled?
             (doto (Thread.
                    ^Runnable
                    (fn []
-                     (while @auto-sync-running?
+                     (while @daemon-running?
                        (run-auto-sync-tick! state-atom bootstrap identity state-file conn-opts)
                        (try
                          (Thread/sleep sync-interval-ms)
                          (catch InterruptedException _
-                           (reset! auto-sync-running? false))))))
+                           (reset! daemon-running? false))))))
               (.setDaemon true)
               (.setName "bitecho-light-node-auto-sync")
               (.start)))
-        ctx {:state-atom state-atom
-             :conn-atom conn-atom
-             :out-writer out-writer
-             :state-file state-file
-             :identity identity
-             :bootstrap bootstrap
-             :conn-opts conn-opts}]
+        _ (when (and cmd-file (not (str/blank? (str cmd-file))))
+            (let [cf (io/file cmd-file)
+                  _ (when-let [p (.getParentFile cf)] (.mkdirs p))
+                  _ (when-not (.exists cf) (spit cf ""))
+                  start-offset (.length cf)]
+              (doto (Thread.
+                     ^Runnable
+                     (fn []
+                       (loop [offset start-offset]
+                         (when @daemon-running?
+                           (let [{:keys [lines next-offset]} (try
+                                                               (read-new-cmd-file-lines! cmd-file offset)
+                                                               (catch Exception _
+                                                                 {:lines [] :next-offset offset}))]
+                             (doseq [line lines]
+                               (locking serve-cmd-lock
+                                 (binding [*out* *err*]
+                                   (handle-serve-line! line ctx))))
+                             (try
+                               (Thread/sleep 50)
+                               (catch InterruptedException _
+                                 (reset! daemon-running? false)))
+                             (recur next-offset))))))
+                (.setDaemon true)
+                (.setName "bitecho-light-node-cmd-file")
+                (.start))))]
     (if (:ok? conn-res)
       (emit-json-line! out-writer {"event" "ready"
                                    "connected" true
-                                   "transport" (name (or (:transport opts) :udp))})
+                                   "transport" (name (or (:transport opts) :udp))}
+                       events-out)
       (emit-json-line! out-writer {"event" "connection-failed"
                                    "connected" false
-                                   "error" (:error conn-res)}))
+                                   "error" (:error conn-res)}
+                       events-out))
     (try
       (binding [*out* *err*]
         (let [reader (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
           (loop []
             (when-let [line (.readLine reader)]
               (when-not (str/blank? line)
-                (handle-serve-line! line ctx))
+                (locking serve-cmd-lock
+                  (handle-serve-line! line ctx)))
               (recur)))))
       (finally
-        (reset! auto-sync-running? false)))))
+        (reset! daemon-running? false)))))
 
 (defn run-one-shot!
   "Executes a single one-shot light-node command and outputs JSON response."
@@ -1436,4 +1669,5 @@
   (let [parsed (parse-light-node-args args)]
     (case (:mode parsed)
       :serve (run-serve! parsed)
+      :wait-event (run-wait-event! parsed)
       :one-shot (run-one-shot! parsed))))

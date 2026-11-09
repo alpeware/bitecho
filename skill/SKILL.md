@@ -37,9 +37,15 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--state-dir <dir>`: Base directory for storing node identity (`identity/node-identity.edn`) and encrypted state (`state.nippy`). Default: `~/.bitecho/light-node` or `./data/light-node`.
 - `--bootstrap <path|url>`: Path or URL to a network descriptor file (`.edn` or `.txt`) defining validator nodes, custody keys, and network topology.
 - `--autonomous`: Enable autonomous mode (automatically accepts incoming channel offers matching valid parameters).
-- `--auto-sync`: Automatically synchronize finalized account state and chain epoch with the validator BFT quorum (enabled by default in `serve` mode; can also be passed to one-shot commands to sync before execution).
+- `--auto-sync`: Automatically synchronize finalized account state and chain epoch with the validator BFT quorum (enabled by default in `serve` mode; can also be passed to one-shot commands to sync before execution). Emits structured `{"event": "auto-sync", "ok": true, "finalized_epoch": ..., "balance": ..., "spendable": ..., "synced": true}` (or `"ok": false` with `"error"`) JSONL events on every tick.
 - `--no-auto-sync`: Disable automatic background chain-state synchronization in `serve` mode.
 - `--sync-interval-ms <ms>`: Interval in milliseconds between automatic background chain-state quorum sync ticks in `serve` mode (default: `15000`).
+- `--auto-register-home-set`: Periodically refresh `register-home-set` (and replay unacknowledged session outbox envelopes) on every successful background sync tick in `serve` mode (enabled by default when `--autonomous` is set in `serve` mode; uses `--price`, default `10`).
+- `--no-auto-register-home-set`: Disable automatic periodic `register-home-set` renewal in `serve` mode.
+- `--cmd-file <path>`: Optional append-only JSONL command file tailed by `serve` alongside `stdin` (enables zero-wrapper background daemon control by appending JSONL lines to disk).
+- `--events-out <path>`: Optional append-only JSONL output log file mirroring all emitted responses and asynchronous events with `"timestamp_ms"` metadata (used by `wait-event`).
+- `--min-seq <n>`: Minimum message sequence number filter for `wait-event` (scans existing `--events-out` entries first so messages arriving between agent turns are never missed).
+- `--after-ts <ms>`: Minimum epoch-millisecond timestamp cursor (`timestamp_ms > after_ts`) for `wait-event`.
 - `--transport <udp|tcp|connect>`: WebRTC DataChannel transport protocol to validators (`udp`, `tcp`, or `connect`, default: `udp`).
   - `udp`: Direct P2P WebRTC DataChannel over UDP (default port 5010).
   - `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
@@ -60,11 +66,43 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 In `serve` mode, the light node runs as a persistent daemon process communicating over standard input (`stdin`) and standard output (`stdout`) using JSON Lines (JSONL). This allows parent agent loops (e.g., Python, TypeScript, Babashka, or Bash) to command the node seamlessly.
 
 ```bash
-clojure -M:light-node serve --state-dir data/alice --bootstrap https://bitecho.org/devnet/bootstrap.txt --autonomous --auto-sync --sync-interval-ms 15000
+# Zero-wrapper background daemon with file-backed command & event queues
+clojure -M:light-node serve \
+  --state-dir data/alice \
+  --bootstrap https://bitecho.org/devnet/bootstrap.txt \
+  --autonomous \
+  --auto-sync \
+  --auto-register-home-set \
+  --sync-interval-ms 15000 \
+  --cmd-file data/alice/cmd.jsonl \
+  --events-out data/alice/events.jsonl
 ```
 
 > [!TIP]
-> In `serve` mode, `--auto-sync` is enabled by default (polling the validator quorum every `15000` ms via in-band DTLS/DataChannel `:query-chain-state` snapshots) so your node's local `:epoch` and `:account` stay continuously synchronized with the validator chain without requiring manual `{"cmd": "sync-account"}` ticks. If you are running an older binary without `--auto-sync`, send `{"cmd": "sync-account"}` to `stdin` every 15 seconds from your host wrapper.
+> In `serve` mode, `--auto-sync` is enabled by default (polling the validator quorum every `15000` ms via in-band DTLS/DataChannel `:query-chain-state` snapshots and emitting `"event": "auto-sync"` JSONL lines), and `--auto-register-home-set` is enabled automatically when `--autonomous` is passed. Pairing `--cmd-file` and `--events-out` with the blocking `wait-event` subcommand eliminates the need for any custom Python/Bash bridge or feeder scripts.
+
+---
+
+### `wait-event` (Blocking Event Watcher)
+Blocks until a matching incoming network event (`message-received`, `offer-received`, `channel-opened`, `session-established`, `rendezvous-header-received`, `rendezvous-reveal-received`, `p2p-connected`, `broadcast-received`) appears in `--events-out` (default `<state-dir>/events.jsonl`), prints the single JSON event line to `stdout`, and exits `0` (or exits `1` with `{"ok": false, "error": "timeout"}` on `--timeout-ms` expiry).
+
+When `--min-seq` or `--after-ts` is provided, `wait-event` scans existing lines in `--events-out` before tailing so messages that arrived between agent turns are returned immediately without race conditions.
+
+```bash
+# Wait for message seq >= 42 on a specific session
+clojure -M:light-node wait-event \
+  --state-dir data/alice \
+  --events-out data/alice/events.jsonl \
+  --session-id <session-id> \
+  --min-seq 42 \
+  --timeout-ms 300000
+
+# Wait for any incoming offer or message after a millisecond timestamp cursor
+clojure -M:light-node wait-event \
+  --state-dir data/alice \
+  --events-out data/alice/events.jsonl \
+  --after-ts 1794266000000
+```
 
 ### Protocol Format
 - Each request written to `stdin` must be a single-line JSON object with a `"cmd"` field.
