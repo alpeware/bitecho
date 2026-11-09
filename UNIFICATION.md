@@ -1,0 +1,178 @@
+# Bitecho Unification — Blob, Pointer, Subnet, Shells
+
+**Design v1.0 — Ratified by Sociocratic Consent (`seqs 264–281` $\leftrightarrow$ `seqs 157–159`, 2026-11-09)**  
+**Authors:** Simon (Original Architecture Proposal), Axiom, & Nexus  
+**Status:** Ratified (Zero Paramount Objections). Refactoring-first sequence approved on testnet.
+
+---
+
+## 1. Goal and Scope
+
+Collapse `clj-web` into `bitecho` as edge ingress protocols so that every network at every scale — the global mesh, the validator core, the `ns1..ns3` infrastructure cluster, the 3-way private chat, and private admin/agent ingresses — is an instance of a single distributed runtime: a **Subnet** (policy) replicated via **Pointers** (authority-signed mutable references) to **Blobs** (content-addressed immutable data), served through **protocol shells** (`DNS` / `HTTP` / `SMTP` / `DataChannel`).
+
+### In Scope
+- `bitecho.core.data`: Pure Sans-IO `.cljc` content-addressed `Blob` store (pinning + bounded hot LRU + pure `:fetch-blob` cache-miss effects) and `Pointer` sign/verify/table reducer (including path-prefix ACLs, rotation continuity, leader-term fencing, and tombstones).
+- `bitecho.core.subnet`: Unified pure Sans-IO `.cljc` `Subnet` policy validator and `reduce-subnet` reducer (Gate + Economy + Replication, including `:gossip-crdt`, `:streamlet-bft`, and `:leader-election`), wired into `init-multi-subnet-multiplexer`.
+- `bitecho.core.protocol.{dns,smtp,acme}`: Pure Sans-IO protocol codecs ported from `clj-web`.
+- `bitecho.shell.{dns,http,smtp,acme,upnp,blob-fs}`: Side-effecting edge ingress/storage shells over Subnet state.
+- Retirement of `web.cluster.mesh` and `web.cluster.protocol` as a separate cluster control plane (porting the pure Bully reducer into `bitecho.core.subnet` as the `:leader-election` engine).
+- Node-at-a-time migration of the live `ns1..ns3` testnet cluster onto the `bitecho.org/infra` subnet while keeping authoritative DNS live.
+
+### Out of Scope (Explicit Boundary — Gap G3)
+- **Validator Chain Internal Ledger State:** Account balances, escrows, settled voucher tuples, burn history, and Streamlet vote/block trees remain governed by `bitecho.state-machine` ordered by Streamlet BFT. They are *not* decomposed into individual mutable Pointers. Unification governs descriptors, infrastructure/edge state, private/child subnets, and M12 child-subnet state-root anchors submitted to the parent chain.
+- **Wire Format & Crypto Suites:** Unchanged. `Blob` and `Pointer` serialize in Canonical Fressian (`bitecho.fressian`, portable zero-dependency `.cljc`) and use existing negotiated suites (`suite-v1-aes256gcm`, `suite-v1-chacha20poly1305`).
+
+---
+
+## 2. Three Axes, Three Data Primitives, and Protocol Shells
+
+### 2.1 Policy Axes (Constrained Orthogonality — Gap G10)
+
+| Axis | Values | Responsibility |
+| :--- | :--- | :--- |
+| **Membership (`:subnet/gate`)** | `:permissionless` vs. `:permissioned` (`:open`, `:allowlist`, `:dac`, `:mtls-cert`, `:min-stake`) | Who may join, read Blobs, and publish Pointers |
+| **Incentives (`:subnet/economy`)** | `:none` vs. `:burn-only` vs. `:full-settlement` | Whether events burn `$ECHO` and whether protocol take/settlement applies |
+| **Replication (`:subnet/replication`)** | Pointers: `:gossip-crdt` \| `:streamlet-bft` \| `:leader-election`; Blobs: `:eager-push` \| `:pull-on-demand` | How Pointers are ordered and how Blobs are distributed |
+
+Invalid axis combinations are rejected fail-closed at subnet creation with a counted `:diagnose` effect (Rule 5):
+- `:streamlet-bft` and `:leader-election` require `:gate/mode :permissioned` (a known member/validator set).
+- `:gate/admission :min-stake` requires `:economy/mode` in `#{:burn-only :full-settlement}`.
+- `:economy/mode :full-settlement` requires a settlement anchor (validator core or parent subnet).
+
+### 2.2 Data Primitives vs. I/O Shells (Gap G11)
+
+| Layer | Primitive | Shape | Verification |
+| :--- | :--- | :--- | :--- |
+| **Data** | **Blob** | Immutable bytes named by lowercase SHA-256 hex CID | Self-verifying (`sha256(bytes) == cid`), zero authority |
+| **Data** | **Pointer** | Authority-signed mutable reference `(subnet, path) -> target-cid` (or `nil` tombstone) | Path-prefix ACL + authority Ed25519 sig + monotonic `seq` (+ `leader-term` where applicable) + typed proof |
+| **Network** | **Subnet** | `(policy, state)` pair driven by `reduce-subnet` | Gate $\rightarrow$ Economy $\rightarrow$ Replication dispatch |
+| **Boundary** | **Shells** | `dns`, `http`, `smtp`, `acme`, `upnp`, `datachannel`, `blob-fs` | Translate external protocols/disk I/O to pure Subnet events & fulfill pure effects |
+
+---
+
+## 3. `Blob` Schema, Pinning, and Pure/Disk Split (`bitecho.core.data`)
+
+```clojure
+{:blob/cid        "a3f9..."                  ; lowercase SHA-256 hex of :blob/bytes
+ :blob/media-type "application/octet-stream" ; e.g. "text/html", "message/rfc822", "application/fressian"
+ :blob/bytes      #bytes[...]}               ; byte[] on JVM, Uint8Array on JS
+```
+
+1. **Idempotence & Integrity:** `put-blob` computes `sha256(:blob/bytes)` and verifies it matches `:blob/cid` (dropping mismatches with a counted `:diagnose` effect). Inserting an already-present CID is a no-op.
+2. **Pinning & Hot LRU Eviction (Gap G6):**
+   - Every Blob referenced by at least one live (non-expired, non-tombstoned, current-seq) Pointer has a positive pin refcount and is **pinned** (never evicted from logical subnet availability).
+   - Unpinned Blobs are evicted in deterministic LRU order when unpinned byte usage exceeds `:max-unpinned-bytes`.
+   - To fit comfortably within a `1 GB` `e2-micro` JVM heap, `bitecho.core.data` maintains metadata/pin counts for all Blobs and caps hot in-memory `:blob/bytes` at `:max-hot-bytes` (default `128 MiB`).
+3. **Pure Cache-Miss Effect (Rule 2 & Rule 5):**
+   - `bitecho.core.data` never holds impure read-through callbacks. When a read targets a CID whose bytes are not in hot RAM, the reducer emits a counted `{:effect :fetch-blob :cid cid :subnet subnet-id :pinned? pinned?}` effect.
+   - The boundary shell fulfills `:fetch-blob` from local disk (`bitecho.shell.blob-fs`, stored at `blobs/<2-char>/<cid>` and supporting direct `File`/byte-range streaming in `bitecho.shell.http` for large assets/Git packfiles) or by pulling from a subnet peer, re-entering via `put-blob`. If neither disk nor peers hold a pinned CID, the shell records a counted `:dangling-pointer` `:diagnose` effect.
+4. **Access Control & Consensus Availability (Gaps G12 & G12b):**
+   - The Blob store is dumb (`CID -> bytes`); shells enforce the referencing Pointer's `:subnet/gate` before serving any Blob.
+   - Where Streamlet blocks reference payload Blobs by CID, Streamlet block validation requires referenced Blobs to be inline or locally present before voting (preventing unavailable-Blob DoS).
+
+---
+
+## 4. `Pointer` Schema, Path-Prefix ACL, Proofs, Fencing, and Tombstones (`bitecho.core.data`)
+
+```clojure
+;; Signed over Canonical Fressian encoding of the Pointer map WITHOUT :pointer/sig
+{:pointer/authority   "302a3005..."       ; Ed25519 SPKI hex of signing authority
+ :pointer/subnet      "bitecho.org/infra" ; target subnet ID
+ :pointer/path        "dir/axiom"         ; logical path within subnet
+ :pointer/seq         42                  ; strictly increasing per (subnet, path)
+ :pointer/leader-term 7                   ; optional monotonic election term (required for :leader paths)
+ :pointer/expires     1794220800000       ; epoch ms, or nil (no expiry)
+ :pointer/target      "a3f9..."           ; Blob CID, or nil for explicit tombstone
+ :pointer/proof       {:proof/type :pop ...}
+ :pointer/sig         "b7c1..."}          ; Ed25519 signature by :pointer/authority
+```
+
+### 4.1 Canonical Lookup Key & Policy-Versioned Path-Prefix ACL (Gap G4b)
+Pointers resolve uniquely by `(subnet, path)`. To prevent competing authorities from overwriting each other on the same path, every Subnet policy includes a versioned `:subnet/path-acl` vector mapping path patterns to authorized principals:
+
+| Path Pattern | Authorized Principal Rule | Typical Proof Type |
+| :--- | :--- | :--- |
+| `"subnet/policy"` | Subnet `:gate/governance` (Cold Root Key or `k-of-n` `:trust-anchors` quorum) | `:self` (cold root) or `:quorum` |
+| `"bootstrap"` | Subnet/Cluster authority key or validator quorum | `:self` or `:quorum` |
+| `"dir/<nickname>"` | Trusted `:directory-authority` pubkey | `:pop` |
+| `"dns/<type>/<name>"` | Trusted `:domain-authority` pubkey (or `:leader` for `_acme-challenge`) | `:zone` or `:self` |
+| `"acme/challenge/<token>"` | Active elected subnet `:leader` (verified in member allowlist) | `:acme-key-auth` |
+| `"tls/current-cert"` | Active elected subnet `:leader` (verified in member allowlist) | `:cert` |
+| `"mail/<rcpt>/<ts>-<cid>"` | Any admitted `:trust-anchors` infra node receiving inbound SMTP | `:self` |
+| `"dac/<agent-pubkey>"` | Cold Anchor pubkey | `:dac` |
+| `"homeset/<pubkey>"` | `<pubkey>` itself (admitted member) | `:home-set` / `:self` |
+| `"head/<pubkey>/<topic>"` | `<pubkey>` itself (admitted member) | `:self` |
+
+### 4.2 Proof Verifiers (Gap G4a)
+1. **`:self`**: Valid **only** when `:subnet/path-acl` binds `:pointer/path` directly to `:pointer/authority` (e.g., `head/<pubkey>/*`, `homeset/<pubkey>`, `mail/*` by an allowlisted infra node, or single-key `bootstrap`/`dns/*`). Avoids redundant double-signing while running path-specific payload schema validation.
+2. **`:pop`**: Outer Pointer signed by `:directory-authority`; `:pointer/proof` carries `{:proof/type :pop :agent-pubkey <hex> :pop-sig <hex> :prev-pubkey <opt> :rotation-sig <opt>}` proving agent PoP over `(authority, subnet, path, target-cid)` plus optional key-rotation continuity.
+3. **`:quorum`**: `{:proof/type :quorum :signatures {<member-pubkey> <sig-hex> ...}}` meeting threshold $k$-of-$n$ over `:gate/trust-anchors`.
+4. **`:acme-key-auth`**: `{:proof/type :acme-key-auth :token <str> :key-auth <str>}` matching ACME account thumbprint.
+5. **`:cert`**: `{:proof/type :cert :fingerprint <sha256-colon-hex>}` matching the encrypted PKCS#8 cert bundle Blob.
+6. **`:zone`**: `{:proof/type :zone :serial <uint32>}` enforcing monotonic SOA/zone serial progression.
+7. **`:dac`**: `{:proof/type :dac :agent-pubkey <hex> :capabilities [...]}` delegated by Cold Anchor key.
+8. **`:home-set`**: `{:proof/type :home-set :candidates [...]}` validating candidate descriptors.
+
+### 4.3 Leader-Term Fencing (Decision D1), Tombstones (Gap G4c), & Expiry Skew (Gap G7)
+- **Clock-Free Leader Fencing:** Pointers authorized by `:leader` (`acme/*`, `tls/*`) carry integer `:pointer/leader-term` from the `:leader-election` state. Supersession compares `[(:pointer/leader-term 0) :pointer/seq]` lexicographically, fencing off stale split-brain ex-leaders without wall-clock dependence.
+- **Tombstones:** `:pointer/target nil` is a first-class tombstone. Applying a valid higher-`(leader-term, seq)` tombstone removes the active target, unpins the prior Blob CID, and retains the tombstone `(leader-term, seq)` so replayed older Pointers are rejected while future re-creations at higher `seq` succeed cleanly.
+- **Expiry Skew:** Enforced as `now-ms < (:pointer/expires + skew-tolerance-ms)` (`300,000 ms` / 5 min default; `60,000 ms` on `15 min`-TTL `acme/challenge/*` Pointers, which are also explicitly tombstoned immediately upon ACME order finalization).
+
+---
+
+## 5. `Subnet` Policy, Governance, and Reducer (`bitecho.core.subnet`)
+
+```clojure
+{:subnet/id                 "bitecho.org/infra" ; human-readable subnet identifier
+ :subnet/parent-id          "global"            ; nil for root
+ :subnet/genesis-policy-cid "e4b8..."           ; immutable CID of genesis policy Blob (Gap G5)
+ :subnet/gate               {:gate/mode          :permissioned
+                             :gate/admission     :allowlist
+                             :gate/trust-anchors #{...}
+                             :gate/governance    {:governance/type :cold-key-or-quorum
+                                                  :cold-pubkey     "302a..."
+                                                  :threshold       2}}
+ :subnet/path-acl           [...]
+ :subnet/economy            {:economy/mode                :none
+                             :economy/burn-floor          0
+                             :economy/settlement-take-bps 0}
+ :subnet/replication        {:replication/pointers :leader-election ; :gossip-crdt | :streamlet-bft | :leader-election
+                             :replication/blobs    :eager-push}}    ; :eager-push | :pull-on-demand
+```
+
+- **Gate Governance (Gap G5):** Every subnet pins `:subnet/genesis-policy-cid` on join. Policy updates at `"subnet/policy"` must satisfy `:gate/governance` (Cold Domain Root Key or 2-of-3 `:trust-anchors` quorum for `bitecho.org/infra`; Cold YubiKey Anchor key for `chat/simon-nexus-axiom`) — never a single hot elected leader.
+- **Decision D1 Confirmed (`:leader-election` for `bitecho.org/infra`):** `ns1..ns3` are operated by a single party, so crash-fault `:leader-election` (relocating `web.cluster.protocol`'s pure Bully + `2s`/`6s` liveness reducer into `bitecho.core.subnet`) orders leader Pointers with zero BFT epoch overhead while keeping Streamlet BFT for the Validator Core.
+
+---
+
+## 6. Five Canonical Subnet Instances
+
+| # | Instance | `:subnet/id` | `:gate` | `:economy` | `:replication` |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1** | **Global Mesh** | `"global"` | `:permissionless` (`:open` light, `:min-stake` full) | `:full-settlement` (`100` floor, `50` bps) | Pointers `:gossip-crdt`; Blobs `:pull-on-demand` |
+| **2** | **Validator Core** | `"validator-core"` | `:permissioned` (validator allowlist) | `:none` on consensus wire msgs (settles Global ledger — Gap G9) | `:streamlet-bft` |
+| **3** | **Infra Cluster** | `"bitecho.org/infra"` | `:permissioned` (`ns1..ns3` allowlist) | `:none` (`0` burn) | Pointers `:leader-election` (D1); Blobs `:eager-push` |
+| **4** | **3-Way Private Chat** | `"chat/simon-nexus-axiom"` | `:permissioned` (`:dac` by Simon's YubiKey anchor) | `:none` (`0` burn) | Pointers `:gossip-crdt`; Blobs `:eager-push` |
+| **5** | **Private HTTPS Admin/Ingress** | `<target-subnet>` | `:permissioned` (`:mtls-cert` wrapping node Ed25519 key / DAC) | `:none` (`0` burn) | HTTP `GET`/`PUT`/`CONNECT` translated to Subnet ops |
+
+---
+
+## 7. Protocol Shells & Host Infrastructure Notes (Gaps G8, G13, G15–G17)
+
+1. **DNS Liveness & Fail-Safe Fallback (Gap G8):** `bitecho.shell.dns` filters multi-`A`/`AAAA` records using the subnet connection manager's `2s` heartbeat / `6s` timeout liveness table (`TTL = 60s`), preserving `clj-web`'s fail-safe fallback (returning all configured static node IPs if the healthy set is transiently empty).
+2. **Port `:443` Passthrough Multiplexer & Bounded Peek (Gap G17):** `bitecho.shell.http` ports `web.http.server/ingress-stream?` + `handle-passthrough-connection!` (with a strict bounded `<= 1024`-byte / short-timeout initial peek on virtual threads), multiplexing `RFC 4571 DTLS`, `RFC 4571 STUN`, `TLS SNI *.ingress.<domain>`, `HTTP CONNECT`, and `SSLParameters.setWantClientAuth(true)` mTLS on port `:443`.
+3. **Repository Lifecycle (Gap G13):** `clj-web` remains frozen as-is on its GitHub mirror; needed codecs and shells port into `bitecho`, and `bitecho.org` stops publishing `clj-web.git` in Phase D.
+4. **6-VM $\rightarrow$ 3-VM Cutover Safety (Gaps G15 & G16):** Today `ns1..ns3` (`34.19.71.246`, `34.56.253.255`, `136.108.244.159` — `.org` TLD registrar glue IPs) and `node1..node3` (`35.212.129.138`, `35.206.120.143`, `35.211.71.139` — validators) are 6 separate `e2-micro` VMs. Phase C backs up state and cuts over `ns1..ns3` one node at a time in-place (preserving registrar glue IPs and keeping DNS live throughout) while leaving `node1..node3` untouched; co-locating validators onto `ns1..ns3` is an optional post-Phase-D optimization if RSS headroom permits.
+
+---
+
+## 8. Ratified Execution Sequence
+
+1. **Step U0 (Phase 4 M1a/b Front-Load):** `auto-sync` stdout JSONL event, `--auto-register-home-set`, additive `--cmd-file` / `--events-out`, and `wait-event` CLI verb for zero-wrapper agent daemon observability during Phases A–D.
+2. **Phase A — Pure Core Extraction (`bitecho.core.data` + `bitecho.core.subnet`):** Exact schemas, `test.check` generative invariants, `reduce-subnet` wired into `init-multi-subnet-multiplexer`, and thin adapters wrapping existing directory/bootstrap/DAC/home-set sign/verify functions with zero behavior regression.
+3. **Phase B — Protocol Codecs & Edge Shells (`bitecho.core.protocol.*` + `bitecho.shell.*`):** Port DNS, HTTP/HTTPS (+mTLS, +CONNECT, +`:443` multiplexer), SMTP, ACME, UPnP, and `blob-fs` into `bitecho`, verified against a local `bitecho.org/infra` subnet instance.
+4. **Phase C — `ns1..ns3` Live Infra Subnet Cutover:** Snapshot backup, state migration script, and one-node-at-a-time cutover of `ns1..ns3` keeping authoritative DNS live.
+5. **Phase D — Cleanup:** Retire legacy cluster adapters and stop publishing `clj-web.git` on `bitecho.org`.
+6. **Phase 4 M2 & M3:** Cross-platform `.cljc` `clj-datachannel` + Node.js light-node bundle (`UDP` + `TCP/HTTP CONNECT`) and local UPnP + delegated `nexus.ingress.bitecho.org:443` `HTTP CONNECT` ingress.
+7. **Subnet #4 (Phase 4 M4):** `chat/simon-nexus-axiom` 3-way zero-burn private broadcast & 1:1 chat over P2P ICE (+mDNS on LAN legs and Nexus sealed relay for `Browser ↔ Axiom`).
+8. **Phase 4 M5 & M12:** Mobile Browser UI + RC-4 wake identity guard (M5), followed by fractal-up child-subnet Merkle state-root anchoring (M12).
