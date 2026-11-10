@@ -1379,6 +1379,75 @@
         (finally
           (delete-dir-recursive! tmp-dir))))))
 
+(deftest test-phase-d-blob-content-type-and-cold-hydration
+  (testing "Phase D: Cold-pinned placeholder hydration preserves :blob/media-type, and serve-subnet-request falls back to content-type-for-file when :blob/media-type is absent or application/octet-stream"
+    (let [tmp-dir (make-temp-dir! "phase-d-ct-")
+          content-root (io/file tmp-dir "public")
+          state-dir (io/file tmp-dir "state")]
+      (try
+        (.mkdirs content-root)
+        (spit (io/file content-root "index.md") "# Bitecho Phase D\n")
+        (spit (io/file content-root "ONBOARDING.md") "# Onboarding\n")
+        (let [id (infra/load-or-create-infra-peer-identity! state-dir :ns1)
+              pol (infra/default-infra-policy {:subnet-id "bitecho.org/infra"
+                                               :trust-anchors #{(:pubkey-hex id)}})
+              cfg {:node/id :ns1
+                   :domain "bitecho.org"
+                   :state-dir (.getAbsolutePath state-dir)
+                   :http {:content-root (.getAbsolutePath content-root)}}
+              ;; 1. Run migrate-clj-web-state! in a transient runtime (just like `bitecho migrate-infra`)
+              rt1 (infra/start-subnet-runtime! {:state-dir state-dir
+                                                :policy pol
+                                                :node-id :ns1
+                                                :default-sender (:pubkey-hex id)
+                                                :node-privkey (:privkey-bytes id)})]
+          (infra/migrate-clj-web-state! rt1 cfg)
+          ;; Also publish a Blob with explicit "application/octet-stream" media-type at "web/raw-doc.md"
+          (let [oct-blob (data/make-blob "# Fallback Markdown\n" "application/octet-stream")]
+            (infra/publish-blob-and-pointer! rt1 {:blob oct-blob
+                                                  :path "web/raw-doc.md"
+                                                  :seq 1
+                                                  :authority-pubkey (:pubkey-hex id)
+                                                  :authority-privkey (:privkey-bytes id)}))
+          (infra/stop-subnet-runtime! rt1)
+
+          ;; 2. Start a fresh runtime from disk (cold-pinned placeholders in subnet-pointers.fressian)
+          (let [rt2 (infra/start-subnet-runtime! {:state-dir state-dir
+                                                  :policy pol
+                                                  :node-id :ns1
+                                                  :default-sender (:pubkey-hex id)
+                                                  :node-privkey (:privkey-bytes id)})
+                serve-fn @#'http-shell/serve-subnet-request]
+            (try
+              (let [res-root (serve-fn cfg (:shell-atom rt2) rt2
+                                       {:request/method :GET
+                                        :request/uri {:path "/"}
+                                        :request/headers {}}
+                                       (System/currentTimeMillis))
+                    res-onb (serve-fn cfg (:shell-atom rt2) rt2
+                                      {:request/method :GET
+                                       :request/uri {:path "/ONBOARDING.md"}
+                                       :request/headers {}}
+                                      (System/currentTimeMillis))
+                    res-fallback (serve-fn cfg (:shell-atom rt2) rt2
+                                           {:request/method :GET
+                                            :request/uri {:path "/raw-doc.md"}
+                                            :request/headers {}}
+                                           (System/currentTimeMillis))]
+                (is (= 200 (:response/status res-root)))
+                (is (= "text/markdown; charset=utf-8" (get-in res-root [:response/headers "Content-Type"]))
+                    "Root / (web/index.md) hydrated from disk after restart returns text/markdown; charset=utf-8")
+                (is (= 200 (:response/status res-onb)))
+                (is (= "text/markdown; charset=utf-8" (get-in res-onb [:response/headers "Content-Type"]))
+                    "/ONBOARDING.md hydrated from disk after restart returns text/markdown; charset=utf-8")
+                (is (= 200 (:response/status res-fallback)))
+                (is (= "text/markdown; charset=utf-8" (get-in res-fallback [:response/headers "Content-Type"]))
+                    "Blob with :blob/media-type application/octet-stream falls back to content-type-for-file on pointer path"))
+              (finally
+                (infra/stop-subnet-runtime! rt2)))))
+        (finally
+          (delete-dir-recursive! tmp-dir))))))
+
 (deftest test-fc2-dtls-mismatch-socket-regression
   (testing "F-C2: DTLS fingerprint mismatch over UDP triggers :on-error -> counted :peer-dtls-error diagnostic"
     (let [tmp-dir (make-temp-dir! "fc2-dtls-")]

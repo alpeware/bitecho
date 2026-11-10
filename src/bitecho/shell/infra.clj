@@ -959,30 +959,21 @@
                                     callbacks {:on-open
                                                (fn [evt]
                                                  (if-let [ch-id (:channel-id evt)]
-                                                   ;; Passive side receives remote-initiated channel open events
                                                    (let [lbl (str (:label evt))]
                                                      (cond
                                                        (= lbl "heartbeat") (reset! hb-id ch-id)
-                                                       :else (do
-                                                               (reset! ctrl-id ch-id)
-                                                               (submit-event! rt {:type :peer-connected :peer-id pid :now-ms (System/currentTimeMillis)})
-                                                               (future
-                                                                 (try
-                                                                   (Thread/sleep 30)
-                                                                   (push-anti-entropy-snapshot-to-peer! rt #(send-to-conn! conn-entry %))
-                                                                   (catch Exception _ nil))))))
-                                                   ;; SCTP association established -> active side creates channels
-                                                   (when active?
-                                                     (let [cid (api/create-data-channel! dc-node "control" {:ordered true})
-                                                           hid (api/create-data-channel! dc-node "heartbeat" {:ordered false :max-retransmits 0})]
-                                                       (reset! ctrl-id cid)
-                                                       (reset! hb-id hid)
-                                                       (submit-event! rt {:type :peer-connected :peer-id pid :now-ms (System/currentTimeMillis)})
-                                                       (future
-                                                         (try
-                                                           (Thread/sleep 30)
-                                                           (push-anti-entropy-snapshot-to-peer! rt #(send-to-conn! conn-entry %))
-                                                           (catch Exception _ nil)))))))
+                                                       (nil? @ctrl-id) (reset! ctrl-id ch-id)))
+                                                   ;; SCTP association established -> both active & passive sides register control/heartbeat channels
+                                                   (let [cid (api/create-data-channel! dc-node "control" {:ordered true})
+                                                         hid (api/create-data-channel! dc-node "heartbeat" {:ordered false :max-retransmits 0})]
+                                                     (reset! ctrl-id cid)
+                                                     (reset! hb-id hid)
+                                                     (submit-event! rt {:type :peer-connected :peer-id pid :now-ms (System/currentTimeMillis)})
+                                                     (future
+                                                       (try
+                                                         (Thread/sleep 30)
+                                                         (push-anti-entropy-snapshot-to-peer! rt #(send-to-conn! conn-entry %))
+                                                         (catch Exception _ nil))))))
                                                :on-message
                                                (fn [evt]
                                                  (try

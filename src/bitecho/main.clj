@@ -177,7 +177,9 @@
     (let [cfg (edn/read-string (slurp f))
           node-id (or (:node/id cfg) (:node-id cfg) :node-1)
           state-dir (or (:state-dir cfg) "data")
-          id-data (identity/load-or-create-node-identity! state-dir node-id)]
+          id-data (if (.exists (io/file state-dir "cluster" "node-identity.edn"))
+                    (infra/load-or-create-infra-peer-identity! state-dir node-id)
+                    (identity/load-or-create-node-identity! state-dir node-id))]
       (println (str "Node: " (name node-id)))
       (println (str "State directory: " state-dir))
       (println (str "Ed25519 Pubkey: " (:pubkey-hex id-data)))

@@ -38,6 +38,7 @@ Commands:
   snapshot                       Snapshot /var/lib/clj-web & /etc/clj-web from ns1..ns3 with SHA-256 verification
   provision-secret               Provision shared 32-byte /etc/clj-web/tls-secret.key (0600) across ns1..ns3 (F-B2)
   cutover <ns3|ns2|ns1|rolling>  Build bitecho.jar, migrate state, and cut over node(s) one at a time with rollback guard
+  retire-clj-web                 Phase D: remove public clj-web.git on ns1..ns3 and roll updated bitecho.jar across ns3 -> ns2 -> ns1
   rollback <ns1|ns2|ns3|all>     Immediately roll back node(s) to clj-web.service
   audit                          Audit authoritative DNS (:53), HTTP (:80), HTTPS (:443), SMTP (:25), and node1..node3 health
 EOF
@@ -89,6 +90,14 @@ verify_node_health() {
   hsz="$(curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/healthz" || true)"
   if [[ "${hsz}" != "ok" ]]; then
     echo "  [FAIL] ${node} HTTPS :443 /healthz returned '${hsz}'" >&2
+    return 1
+  fi
+
+  # 2b. HTTPS :443 / landing page Content-Type must be text/markdown; charset=utf-8 (never application/octet-stream)
+  local root_ct
+  root_ct="$(curl -fsSI --max-time 8 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/" | tr -d '\r' | awk 'tolower($1)=="content-type:" {sub(/^[^:]+:[[:space:]]*/, ""); print tolower($0)}' | head -n 1)"
+  if [[ "${root_ct}" != "text/markdown; charset=utf-8" ]]; then
+    echo "  [FAIL] ${node} HTTPS :443 / Content-Type returned '${root_ct}' (expected 'text/markdown; charset=utf-8')" >&2
     return 1
   fi
 
@@ -382,6 +391,48 @@ CFG_EOF
   cmd_audit
 }
 
+cmd_retire_clj_web() {
+  assert_preconditions
+  echo "--> Building target/bitecho.jar locally for Phase D..."
+  (cd "${ROOT_DIR}" && clojure -T:build uber)
+
+  for node in ns3 ns2 ns1; do
+    local ip="${NODE_IPS[$node]}"
+    echo "=== Phase D on ${node} (${ip}): retiring clj-web.git & rolling bitecho.jar ==="
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/target/bitecho.jar" "${SSH_USER}@${ip}:/opt/bitecho-infra/bitecho.jar"
+
+    ssh_ns "$node" bash -s << 'REMOTE_RETIRE'
+set -euo pipefail
+sudo rm -rf /var/www/clj-web/public/git/clj-web.git
+for doc in /var/www/clj-web/public/index.md /var/www/clj-web/public/llms.txt /var/www/clj-web/public/git/index.md; do
+  if [[ -f "$doc" ]]; then
+    sudo sed -i '/clj-web\.git/d' "$doc"
+  fi
+done
+sudo /opt/jdk-25/bin/java -Xms64m -Xmx256m \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho-infra/bitecho.jar migrate-infra /etc/bitecho-infra/config.edn
+sudo chown -R cljweb:cljweb /var/lib/clj-web
+sudo systemctl restart bitecho-infra.service
+REMOTE_RETIRE
+
+    sleep 3
+    verify_node_health "$node"
+    local cljweb_status
+    cljweb_status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/git/clj-web.git/info/refs" || true)"
+    if [[ "${cljweb_status}" != "404" ]]; then
+      echo "FATAL: ${node} still serves /git/clj-web.git/info/refs (HTTP ${cljweb_status})" >&2
+      exit 1
+    fi
+    echo "  [OK] ${node} retired /git/clj-web.git (HTTP 404 verified)"
+  done
+
+  cmd_audit
+}
+
 cmd_audit() {
   assert_preconditions
   echo "=== Auditing Infra Edge Cluster (ns1..ns3) ==="
@@ -403,6 +454,9 @@ case "${1:-}" in
   cutover)
     shift
     cmd_cutover "$@"
+    ;;
+  retire-clj-web)
+    cmd_retire_clj_web
     ;;
   rollback)
     shift

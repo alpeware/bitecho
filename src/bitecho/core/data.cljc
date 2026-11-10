@@ -161,8 +161,18 @@
                 :effects []}
                (let [pins (long (or (:pins existing) 0))
                      was-present? (some? existing)
+                     prev-mt (:media-type existing)
+                     resolved-mt (if (and (some? media-type)
+                                          (not (str/blank? media-type))
+                                          (not= media-type "application/octet-stream"))
+                                   media-type
+                                   (if (and (some? prev-mt)
+                                            (not (str/blank? prev-mt))
+                                            (not= prev-mt "application/octet-stream"))
+                                     prev-mt
+                                     (or media-type prev-mt "application/octet-stream")))
                      entry {:cid norm-cid
-                            :media-type (or (:media-type existing) media-type)
+                            :media-type resolved-mt
                             :bytes bs
                             :size sz
                             :pins pins

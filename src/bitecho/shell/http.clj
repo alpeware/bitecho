@@ -642,7 +642,15 @@
               ;; Found!
               (let [blob (:blob resolved)
                     cid (:blob/cid blob)
-                    ct (or (:blob/media-type blob) "application/octet-stream")
+                    raw-ct (:blob/media-type blob)
+                    fallback-name (or (get-in resolved [:pointer :pointer/path])
+                                      (when-let [^File df (:file resolved)] (.getName df))
+                                      (get-in req [:request/uri :path]))
+                    ct (if (and (string? raw-ct)
+                                (not (str/blank? raw-ct))
+                                (not= raw-ct "application/octet-stream"))
+                         raw-ct
+                         (content-type-for-file fallback-name))
                     ^bytes raw-bs (:blob/bytes blob)
                     ^File disk-file (:file resolved)
                     total-size (long (if (and disk-file (.exists disk-file))
@@ -757,10 +765,12 @@
                 sdf (SimpleDateFormat. "yyyy-MM")
                 month-key (.format sdf (Date. now-ms))
                 egress (get-in @limiter-atom [:egress-by-month month-key] 0)
-                body (format "role=%s leader=%s term=%s egress_bytes=%d\n"
+                body (format "role=%s leader=%s term=%s epoch=%s healthy=%d egress_bytes=%d\n"
                              (name (or (:role st) :standalone))
                              (str (or (:leader-id st) :none))
                              (str (or (:term st) 0))
+                             (str (or (:epoch st) :none))
+                             (count (or (:healthy-nodes st) #{}))
                              (long egress))]
             (send-response exchange
                            {:response/status 200

@@ -17,6 +17,7 @@ pom.xml.asc
 
 # Cluster and node credentials / environments
 .ssh/
+.backups/
 .cluster.env
 cluster.edn
 devnet/

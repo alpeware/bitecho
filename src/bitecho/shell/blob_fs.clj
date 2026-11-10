@@ -81,13 +81,19 @@
                   (atomic-move! tmp dest)
                   (finally
                     (when (.exists tmp) (.delete tmp))))))
-            (when-not (.exists mdest)
-              (let [mtmp (File/createTempFile "meta-" ".tmp" parent)]
-                (try
-                  (spit mtmp (pr-str {:media-type media-type :size (alength ^bytes bs)}))
-                  (atomic-move! mtmp mdest)
-                  (finally
-                    (when (.exists mtmp) (.delete mtmp))))))
+            (let [existing-meta (when (.exists mdest)
+                                  (try (edn/read-string (slurp mdest)) (catch Exception _ nil)))
+                  existing-mt (:media-type existing-meta)
+                  should-write-meta? (or (not (.exists mdest))
+                                         (and (= existing-mt "application/octet-stream")
+                                              (not= media-type "application/octet-stream")))]
+              (when should-write-meta?
+                (let [mtmp (File/createTempFile "meta-" ".tmp" parent)]
+                  (try
+                    (spit mtmp (pr-str {:media-type media-type :size (alength ^bytes bs)}))
+                    (atomic-move! mtmp mdest)
+                    (finally
+                      (when (.exists mtmp) (.delete mtmp)))))))
             {:ok? true :cid ncid :file dest :effects []}))))))
 
 (defn read-blob-meta
