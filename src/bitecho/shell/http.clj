@@ -947,11 +947,47 @@
     (.submit vthread-executor ^Runnable (fn [] (pipe-stream! client-in backend-out backend-sock client-sock cleanup)))
     (.submit vthread-executor ^Runnable (fn [] (pipe-stream! backend-in client-out client-sock backend-sock cleanup)))))
 
+(defn- resolve-connect-backend
+  "Purely resolves an `HTTP CONNECT` request (`{:host <lowercase-host> :port <int>}`) against
+   `connect-targets` (set/vector of `\"host:port\"` strings or map of `{\"host:port\" {:host ... :port ...}}`),
+   optional `connect-routes` map, and `ingress-target`.
+   When an allowlisted external ingress hostname (e.g. `nexus.ingress.bitecho.org:443` or
+   `<bech32m>.ingress.bitecho.org:443`) is requested and `ingress-target` is present, routes directly
+   to `ingress-target` (the local RFC 4571 DTLS-over-TCP listener) instead of looping back to `:443`."
+  [conn-req connect-targets connect-routes ingress-target]
+  (let [h (str/lower-case (str (:host conn-req)))
+        p (int (:port conn-req))
+        target-key (str h ":" p)
+        routes-map (into {}
+                         (concat
+                          (when (map? connect-targets)
+                            (for [[k v] connect-targets]
+                              [(str/lower-case (str k)) v]))
+                          (when (map? connect-routes)
+                            (for [[k v] connect-routes]
+                              [(str/lower-case (str k)) v]))))
+        allowed-keys (if (map? connect-targets)
+                       (set (keys routes-map))
+                       (into (set (keys routes-map))
+                             (map #(str/lower-case (str %)) (or connect-targets #{}))))
+        wildcard-ingress? (some #(and (str/starts-with? % "*.")
+                                      (str/ends-with? target-key (subs % 1)))
+                                allowed-keys)
+        allowed? (or (contains? allowed-keys target-key)
+                     (boolean wildcard-ingress?))]
+    (when allowed?
+      (or (get routes-map target-key)
+          (if (and (map? ingress-target)
+                   (or (not (contains? #{"127.0.0.1" "localhost" "::1"} h))
+                       (= p 443)))
+            ingress-target
+            {:host h :port p})))))
+
 (defn- handle-passthrough-connection!
   "Classifies initial `<= 1024` peeked bytes on port `:443` and splices to `HTTP CONNECT` target,
    `:ingress-target`, or internal `HttpsServer`."
   [^Socket client-sock ctx]
-  (let [{:keys [domain internal-https-port ingress-target connect-targets peek-timeout-ms
+  (let [{:keys [domain internal-https-port ingress-target connect-targets connect-routes peek-timeout-ms
                 forwarded-ips-atom shell-atom ^ExecutorService vthread-executor]} ctx]
     (try
       (let [[^bytes buf n] (peek-initial-bytes client-sock (long (or peek-timeout-ms 2000)))]
@@ -961,16 +997,15 @@
           (if-let [conn-req (dns-proto/parse-http-connect-request buf n)]
             ;; 1. Explicit HTTP CONNECT tunnel (strictly allowlisted, never open proxy!)
             (let [target-key (str (:host conn-req) ":" (:port conn-req))
-                  allowed? (contains? (set (map str/lower-case (or connect-targets #{})))
-                                      (str/lower-case target-key))]
-              (if-not allowed?
+                  backend-target (resolve-connect-backend conn-req connect-targets connect-routes ingress-target)]
+              (if-not backend-target
                 (do
                   (infra/apply-shell-event! shell-atom {:type :drop :reason :http-connect-denied :detail target-key})
                   (with-open [out (.getOutputStream client-sock)]
                     (.write out (.getBytes "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n" StandardCharsets/UTF_8))
                     (.flush out))
                   (try (.close client-sock) (catch Exception _ nil)))
-                (let [backend-sock (Socket. ^String (:host conn-req) (int (:port conn-req)))
+                (let [backend-sock (Socket. ^String (:host backend-target) (int (:port backend-target)))
                       client-out (.getOutputStream client-sock)
                       backend-out (.getOutputStream backend-sock)
                       hdr-end (or (find-header-end-idx buf n) n)]
@@ -1040,6 +1075,7 @@
                              :internal-https-port internal-https-port
                              :ingress-target (get-in config [:http :ingress-target])
                              :connect-targets (get-in config [:http :connect-targets])
+                             :connect-routes (get-in config [:http :connect-routes])
                              :peek-timeout-ms (get-in config [:http :peek-timeout-ms] 2000)
                              :forwarded-ips-atom forwarded-ips-atom
                              :shell-atom shell-atom

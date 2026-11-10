@@ -1245,6 +1245,7 @@
                  "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"
                  "lock-intent" "release-intent" "refund-intent" "escrows"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
+                  "--ingress-tcp-port"
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
                   "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"
@@ -1339,6 +1340,7 @@
       (is (= "s1" (:session-id (light-shell/parse-light-node-args ["wait-event" "--session-id" "s1" "--min-seq" "258"]))))
       (is (= 1700000000000 (:after-ts (light-shell/parse-light-node-args ["wait-event" "--after-ts" "1700000000000"]))))
       (is (= :tcp (:transport (light-shell/parse-light-node-args ["status" "--transport" "tcp"]))))
+      (is (= 5011 (:ingress-tcp-port (light-shell/parse-light-node-args ["serve" "--ingress-tcp-port" "5011"]))))
       (is (= "http://proxy.internal:8080" (:proxy (light-shell/parse-light-node-args ["status" "--proxy" "http://proxy.internal:8080"]))))
       (is (= 5000 (:timeout-ms (light-shell/parse-light-node-args ["status" "--timeout-ms" "5000"]))))
       (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["offer" "--callee" "deadbeef"]) [:cmd-map "callee"])))
@@ -2353,6 +2355,58 @@
               (is (= :register-home-set (get-in rx-tcp [:event :type])))
               (is (= 20 (get-in rx-tcp [:event :price])))
               (is (= [{:latency-ms 10 :node-id "node1" :price 20 :responsive? true}] (:home-set reloaded-st))))
+
+            ;; 4. Step 15C: start-ingress-tcp-listener! (--ingress-tcp-port) answers :query-chain-state and handles direct peer session envelopes
+            (let [hub-dir (str (.resolve temp-dir "hub-node"))
+                  hub-id (light-shell/load-or-create-light-identity! hub-dir)
+                  hub-port (let [ss (java.net.ServerSocket. 0)]
+                             (try (.getLocalPort ss) (finally (.close ss))))
+                  hub-desc {:network :devnet
+                            :treasury-pubkey (:pubkey-hex hub-id)
+                            :custody-pubkey (:pubkey-hex hub-id)
+                            :nodes {:nexus {:node-id :nexus
+                                            :ip "127.0.0.1"
+                                            :port hub-port
+                                            :agent-port hub-port
+                                            :agent-tcp-port hub-port
+                                            :pubkey (:pubkey-hex hub-id)
+                                            :fingerprint (:fingerprint hub-id)
+                                            :ice-ufrag (:ufrag (:ice-creds hub-id))
+                                            :ice-pwd (:pwd (:ice-creds hub-id))}}}
+                  hub-bootstrap-file (str (.resolve temp-dir "hub-bootstrap.edn"))
+                  _ (spit hub-bootstrap-file (pr-str hub-desc))
+                  hub-events (atom [])
+                  hub-state (atom (-> (light-core/init-light-state hub-id {:bootstrap hub-desc :autonomous? true})
+                                      (assoc-in [:account :balance] 4200)
+                                      (assoc-in [:account :spendable] 4200)
+                                      (assoc-in [:account :finalized-epoch] 77)
+                                      (assoc :epoch 77)))
+                  hub-listener (light-shell/start-ingress-tcp-listener!
+                                hub-id
+                                {:ingress-tcp-port hub-port
+                                 :state-atom hub-state
+                                 :event-out #(swap! hub-events conj %)})]
+              (try
+                (let [sync-out (run-node-cli "sync-account"
+                                             "--transport" "tcp"
+                                             "--state-dir" state-dir
+                                             "--bootstrap" hub-bootstrap-file)
+                      sync-json (json/read-str sync-out)
+                      offer-out (run-node-cli "offer"
+                                              "--callee" (:pubkey-hex hub-id)
+                                              "--price" "10"
+                                              "--burn" "500"
+                                              "--transport" "tcp"
+                                              "--state-dir" state-dir
+                                              "--bootstrap" hub-bootstrap-file)
+                      offer-json (json/read-str offer-out)]
+                  (is (= true (get sync-json "ok")))
+                  (is (= 4200 (get sync-json "balance")))
+                  (is (= true (get offer-json "ok")))
+                  (is (some #(= "channel-opened" (get % "event")) @hub-events)
+                      "Hub passive ingress TCP listener auto-accepted incoming offer over RFC 4571 DTLS-over-TCP"))
+                (finally
+                  ((:stop! hub-listener)))))
             (finally
               (try (api/close! srv-udp) (catch Exception _ nil))
               (try (api/close! srv-tcp) (catch Exception _ nil)))))

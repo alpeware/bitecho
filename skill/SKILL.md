@@ -51,6 +51,7 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
   - `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
   - `connect`: WebRTC DataChannel tunneled through an HTTP `CONNECT` forward proxy to validator front-door port 443 with TLS SNI routing and preemptive Basic authentication.
 - `--proxy <url>`: HTTP CONNECT proxy URL (e.g., `http://user:pass@proxy.corp.internal:8080`). If omitted when using `--transport connect`, the node checks environment variables in order: `HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`.
+- `--ingress-tcp-port <port>`: Local RFC 4571 DTLS-over-TCP DataChannel passive listener port in `serve` mode for direct `HTTP CONNECT` ingress tunneling (e.g., `5011` behind `nexus.ingress.bitecho.org:443`).
 - `--timeout-ms <ms>`: Timeout in milliseconds when dialing validator WebRTC DataChannels (default: 8000).
 - `--subnet-id <id>`: Subnet identifier for multi-subnet isolation and routing (default: `global`).
 - `--turn-server <host:port>`: TURN relay server host and port (e.g., `turn.example.com:3478`).

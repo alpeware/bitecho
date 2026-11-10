@@ -39,6 +39,7 @@ Commands:
   provision-secret               Provision shared 32-byte /etc/clj-web/tls-secret.key (0600) across ns1..ns3 (F-B2)
   cutover <ns3|ns2|ns1|rolling>  Build bitecho.jar, migrate state, and cut over node(s) one at a time with rollback guard
   retire-clj-web                 Phase D: remove public clj-web.git on ns1..ns3 and roll updated bitecho.jar across ns3 -> ns2 -> ns1
+  publish-git                    Sign 'verified' release tags and sync bare git repos (bitecho, clj-datachannel, clj-fressian) to ns1..ns3
   rollback <ns1|ns2|ns3|all>     Immediately roll back node(s) to clj-web.service
   audit                          Audit authoritative DNS (:53), HTTP (:80), HTTPS (:443), SMTP (:25), and node1..node3 health
 EOF
@@ -354,7 +355,9 @@ REMOTE_ID
        :ttl-seconds 60
        :ns-ttl-seconds 3600
        :hostmaster "hostmaster.${DOMAIN}"
-       :subdomains #{"@" "www" "docs" "mvn" "ingress" "node1.ingress" "node2.ingress" "node3.ingress"}}
+       :subdomains #{"@" "www" "docs" "mvn" "ingress" "node1.ingress" "node2.ingress" "node3.ingress"}
+       :delegated-ingress {"nexus.ingress" {:ns "ns1.nexus.ingress.${DOMAIN}" :ip4 "136.62.15.220" :ttl 60}
+                           "ech1nve6n673sekkmdqeak479h57uaxgsnwgddppfasw8gn0qn9ann7qxhy2sq.ingress" {:ns "ns1.nexus.ingress.${DOMAIN}" :ip4 "136.62.15.220" :ttl 60}}}
  :http {:enabled? true
         :bind-ip "0.0.0.0"
         :http-port 80
@@ -438,6 +441,55 @@ REMOTE_RETIRE
   cmd_audit
 }
 
+cmd_publish_git() {
+  assert_preconditions
+  local stage_dir
+  stage_dir="$(mktemp -d /tmp/bitecho-publish-git-XXXXXX)"
+  trap 'rm -rf "${stage_dir}"' RETURN
+
+  echo "=== Publishing Canonical Bare Git Repositories (bitecho, clj-datachannel, clj-fressian) ==="
+  for repo in bitecho clj-datachannel clj-fressian; do
+    local src_repo="${ROOT_DIR}/../${repo}"
+    local bare_repo="${stage_dir}/${repo}.git"
+    if [[ ! -d "${src_repo}/.git" ]]; then
+      echo "FATAL: Source repository not found at ${src_repo}" >&2
+      exit 1
+    fi
+    local def_branch
+    def_branch="$(git -C "${src_repo}" symbolic-ref --short HEAD 2>/dev/null || git -C "${src_repo}" branch --show-current 2>/dev/null || echo "main")"
+    if [[ -z "${def_branch}" ]]; then def_branch="main"; fi
+
+    git -C "${src_repo}" \
+      -c gpg.format=ssh \
+      -c user.signingkey="${SSH_KEY}.pub" \
+      -c user.name="Bitecho Release" \
+      -c user.email="release@${DOMAIN}" \
+      tag -s -f verified HEAD -m "Verified snapshot of ${repo} on ${DOMAIN}"
+
+    git clone --bare --quiet "${src_repo}" "${bare_repo}"
+    git --git-dir="${bare_repo}" symbolic-ref HEAD "refs/heads/${def_branch}"
+    rm -rf "${bare_repo}/objects/info/commit-graphs" "${bare_repo}/objects/info/commit-graph"
+    git --git-dir="${bare_repo}" repack -a -d -q
+    git --git-dir="${bare_repo}" update-server-info
+    git --git-dir="${bare_repo}" fsck --full >/dev/null
+    local head_sha
+    head_sha="$(git --git-dir="${bare_repo}" rev-parse HEAD)"
+    local tag_sha
+    tag_sha="$(git --git-dir="${bare_repo}" rev-parse verified)"
+    echo "  [OK] ${repo}.git: ${def_branch} @ ${head_sha} (verified tag ${tag_sha})"
+  done
+
+  for node in "${NODES[@]}"; do
+    local ip="${NODE_IPS[$node]}"
+    echo "--> Syncing bare git repositories to ${node} (${ip})..."
+    for repo in bitecho clj-datachannel clj-fressian; do
+      rsync -az --delete -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        "${stage_dir}/${repo}.git/" "${SSH_USER}@${ip}:/var/www/clj-web/public/git/${repo}.git/"
+    done
+  done
+  echo "=== Canonical Git Repositories Published to ns1..ns3 ==="
+}
+
 cmd_audit() {
   assert_preconditions
   echo "=== Auditing Infra Edge Cluster (ns1..ns3) ==="
@@ -462,6 +514,9 @@ case "${1:-}" in
     ;;
   retire-clj-web)
     cmd_retire_clj_web
+    ;;
+  publish-git)
+    cmd_publish_git
     ;;
   rollback)
     shift

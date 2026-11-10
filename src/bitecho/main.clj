@@ -13,6 +13,7 @@
             [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
             [bitecho.shell.smtp :as smtp-shell]
+            [bitecho.shell.upnp :as upnp]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -121,7 +122,30 @@
                    (http-shell/start-http-servers! cfg tls-mgr runtime))
         smtp-srv (when (get-in cfg [:smtp :enabled?] false)
                    (smtp-shell/start-smtp-server! cfg tls-mgr runtime))
-        acme-mgr (when (get-in cfg [:acme :enabled?] false)
+        upnp-cfg (:upnp cfg)
+        upnp-res (when (:enabled? upnp-cfg)
+                   (let [map-opts (merge {:dns-udp-port (:udp-port dns-srv)
+                                          :dns-tcp-port (:tcp-port dns-srv)
+                                          :http-port (:http-port http-srv)
+                                          :https-port (:https-port http-srv)
+                                          :domain (:domain cfg)}
+                                         upnp-cfg)
+                         m-res (upnp/ensure-ingress-port-mappings! map-opts)]
+                     (doseq [eff (:effects m-res)]
+                       (infra/apply-shell-event! (:shell-atom runtime)
+                                                 (assoc eff :type :diagnose)))
+                     (if (and (:ok? m-res) (get upnp-cfg :verify-reachability? true))
+                       (let [gate-res (upnp/verify-external-reachability!
+                                       (merge map-opts
+                                              {:external-ip (:external-ip m-res)}))]
+                         (doseq [eff (:effects gate-res)]
+                           (infra/apply-shell-event! (:shell-atom runtime)
+                                                     (assoc eff :type :diagnose)))
+                         (assoc m-res :reachability gate-res :ok? (boolean (:ok? gate-res))))
+                       m-res)))
+        acme-gate-ok? (or (not (:enabled? upnp-cfg))
+                          (boolean (:ok? upnp-res)))
+        acme-mgr (when (and (get-in cfg [:acme :enabled?] false) acme-gate-ok?)
                    (acme-shell/start-acme-loop! cfg runtime tls-mgr))]
     {:node-id node-id
      :pubkey pubkey
@@ -133,9 +157,12 @@
      :dns dns-srv
      :http http-srv
      :smtp smtp-srv
+     :upnp upnp-res
      :acme acme-mgr
      :stop! (fn []
               (when acme-mgr (acme-shell/stop-acme-loop! acme-mgr))
+              (when (and upnp-res (:gateway upnp-res))
+                (upnp/teardown-ingress-port-mappings! (:gateway upnp-res) (:mappings upnp-res) upnp-cfg))
               (when smtp-srv (smtp-shell/stop-smtp-server! smtp-srv))
               (when http-srv (http-shell/stop-http-servers! http-srv))
               (when dns-srv (dns-shell/stop-dns-server! dns-srv))

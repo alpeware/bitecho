@@ -764,6 +764,85 @@
            :answers []
            :authority [(make-soa-record config now-ms)])))
 
+(defn- candidate-zone-suffixes
+  "Returns candidate zone suffixes of `relative` ordered from most-specific to least-specific
+   (e.g. `\"_acme-challenge.nexus.ingress\"` -> `[\"_acme-challenge.nexus.ingress\" \"nexus.ingress\" \"ingress\"]`)."
+  [relative]
+  (when (and (string? relative) (not (str/blank? relative)) (not= relative "@"))
+    (let [parts (vec (str/split relative #"\."))]
+      (mapv (fn [idx] (str/join "." (subvec parts idx)))
+            (range (count parts))))))
+
+(defn- lookup-delegated-subzone
+  "Checks whether `subzone` is a delegated child zone in `[:dns :delegated-ingress]` or via a
+   dynamic `dns/NS/<subzone>` Subnet Pointer in `state`."
+  [config state domain subzone default-ttl now-ms]
+  (let [cfg-map (get-in config [:dns :delegated-ingress])
+        cfg-entry (or (get cfg-map subzone)
+                      (when (map? cfg-map)
+                        (some (fn [[k v]]
+                                (when (= (str/lower-case (name k)) subzone) v))
+                              cfg-map)))
+        ptr-entry (when (and (nil? cfg-entry) (:bitecho.subnet/unified? state))
+                    (lookup-subnet-blob-value state (str "dns/NS/" subzone) now-ms))
+        del-val (or cfg-entry ptr-entry)]
+    (when del-val
+      (let [zone-fqdn (str subzone "." domain)
+            raw-ns (cond
+                     (and (map? del-val) (string? (:ns del-val))) (:ns del-val)
+                     (and (map? del-val) (string? (:rdata del-val))) (:rdata del-val)
+                     (and (map? del-val) (seq (:records del-val))) (first (:records del-val))
+                     (and (vector? del-val) (seq del-val)) (first del-val)
+                     (string? del-val) del-val
+                     :else (str "ns1." zone-fqdn))
+            ns-host (strip-trailing-dot (str/lower-case (str raw-ns)))
+            ns-rel (when (str/ends-with? ns-host (str "." domain))
+                     (subs ns-host 0 (- (count ns-host) (inc (count domain)))))
+            ip4 (or (when (map? del-val)
+                      (or (:ip4 del-val)
+                          (:glue-ip4 del-val)
+                          (get (:glue del-val) ns-host)))
+                    (when ns-rel
+                      (some-> (resolve-subnet-dns-records state ns-host ns-rel :A default-ttl now-ms)
+                              first
+                              :rdata)))
+            ttl (long (or (when (map? del-val) (:ttl del-val)) default-ttl 60))]
+        {:subzone subzone
+         :zone-fqdn zone-fqdn
+         :ns-host ns-host
+         :ip4 ip4
+         :ttl ttl}))))
+
+(defn- resolve-delegated-zone
+  "Resolves queries targeting a delegated child zone (e.g. `nexus.ingress.bitecho.org` or
+   `<bech32m>.ingress.bitecho.org`) per RFC 1035 §4.3.2:
+   - Direct `:A`/`:ANY` queries for the in-bailiwick glue nameserver (`ns1.<subzone>.<domain>`)
+     return the glue `:A` record in `:answers`.
+   - All other queries at or beneath `<subzone>.<domain>` (including `_acme-challenge.<subzone>.<domain>`)
+     return a non-authoritative referral (`:aa? false`, `:answers []`, `:authority [NS]`, `:additional [glue A]`)."
+  [base-response qname qname-clean relative qtype config state domain default-ttl now-ms]
+  (when-let [delegation (some #(lookup-delegated-subzone config state domain % default-ttl now-ms)
+                              (candidate-zone-suffixes relative))]
+    (let [{:keys [zone-fqdn ns-host ip4 ttl]} delegation
+          ns-rr {:name zone-fqdn :type :NS :class :IN :ttl ttl :rdata ns-host}
+          glue-rrs (if (and (string? ip4) (not (str/blank? ip4)))
+                     [{:name ns-host :type :A :class :IN :ttl ttl :rdata ip4}]
+                     [])]
+      (if (and (= qname-clean ns-host)
+               (contains? #{:A :ANY} qtype)
+               (seq glue-rrs))
+        (assoc base-response
+               :rcode :noerror
+               :answers [(assoc (first glue-rrs) :name qname)]
+               :authority [ns-rr]
+               :additional [])
+        (assoc base-response
+               :aa? false
+               :rcode :noerror
+               :answers []
+               :authority [ns-rr]
+               :additional glue-rrs)))))
+
 (defn resolve-query
   "Pure authoritative DNS query resolver over `config` and `subnet-or-cluster-state`.
    - Never performs open recursion (`:ra? false`).
@@ -793,11 +872,22 @@
              qname (or (:qname q) "")
              qname-clean (strip-trailing-dot (str/lower-case (or (:qname-lower q) qname)))
              domain (strip-trailing-dot (str/lower-case (or (:domain config) "")))
+             extra-domains (set (map #(strip-trailing-dot (str/lower-case (str %)))
+                                     (get-in config [:dns :extra-domains])))
+             matched-domain (cond
+                              (or (= qname-clean domain)
+                                  (str/ends-with? qname-clean (str "." domain)))
+                              domain
+                              :else
+                              (some (fn [ed]
+                                      (when (or (= qname-clean ed)
+                                                (str/ends-with? qname-clean (str "." ed)))
+                                        ed))
+                                    extra-domains))
              qtype (or (:qtype q) :A)
              query-id (:id query-pkt)
              default-ttl (get-in config [:dns :ttl-seconds] 60)]
-         (if-not (or (= qname-clean domain)
-                     (str/ends-with? qname-clean (str "." domain)))
+         (if-not matched-domain
            {:id query-id
             :qr? true
             :opcode (or (:opcode query-pkt) 0)
@@ -810,9 +900,9 @@
             :answers []
             :authority []
             :additional []}
-           (let [relative (if (= qname-clean domain)
+           (let [relative (if (= qname-clean matched-domain)
                             "@"
-                            (subs qname-clean 0 (- (count qname-clean) (inc (count domain)))))
+                            (subs qname-clean 0 (- (count qname-clean) (inc (count matched-domain)))))
                  base-response {:id query-id
                                 :qr? true
                                 :opcode (or (:opcode query-pkt) 0)
@@ -822,11 +912,17 @@
                                 :ra? false
                                 :questions questions
                                 :additional []}
-                 dyn-answers (or (resolve-subnet-dns-records st qname relative qtype default-ttl now-ms)
-                                 (when (not= qtype :CNAME)
-                                   (resolve-subnet-dns-records st qname relative :CNAME default-ttl now-ms)))]
+                 delegated-resp (resolve-delegated-zone base-response qname qname-clean relative qtype config st matched-domain default-ttl now-ms)
+                 dyn-answers (when-not delegated-resp
+                               (or (resolve-subnet-dns-records st qname relative qtype default-ttl now-ms)
+                                   (when (not= qtype :CNAME)
+                                     (resolve-subnet-dns-records st qname relative :CNAME default-ttl now-ms))))]
              (cond
-               ;; 1. Explicit dynamic Subnet Pointer match takes precedence (e.g. dns/A/nexus.ingress)
+               ;; 1. Delegated child zone referral / glue (M3 Step 15B: *.ingress.bitecho.org NS + glue A)
+               (some? delegated-resp)
+               delegated-resp
+
+               ;; 1b. Explicit dynamic Subnet Pointer match (e.g. dns/A/nexus.ingress when not NS-delegated)
                (seq dyn-answers)
                (assoc base-response
                       :rcode :noerror

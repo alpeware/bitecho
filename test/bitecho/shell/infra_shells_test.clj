@@ -443,7 +443,8 @@
                        :https-port 0
                        :cache-max-file-bytes 16 ;; forces index-blob (>16B) onto zero-heap blob-fs File streaming!
                        :ingress-target {:host "127.0.0.1" :port echo-port}
-                       :connect-targets #{(str "127.0.0.1:" echo-port)}
+                       :connect-targets #{(str "127.0.0.1:" echo-port)
+                                          "nexus.ingress.bitecho.org:443"}
                        :host-subnets {"admin.bitecho.org" mtls-rt}}}
                tls-mgr
                pub-rt)]
@@ -511,6 +512,23 @@
                 (let [ebuf (byte-array 64)
                       en (.read in ebuf)]
                   (is (= "ping-over-connect" (String. ebuf 0 en StandardCharsets/UTF_8)))))))
+          ;; 4b. M3 Step 15C: HTTP CONNECT nexus.ingress.bitecho.org:443 bridges directly to :ingress-target (without looping back to :443)
+          (with-open [s (Socket. "127.0.0.1" (int https-port))]
+            (.setSoTimeout s 3000)
+            (let [out (.getOutputStream s)
+                  in (.getInputStream s)
+                  req "CONNECT nexus.ingress.bitecho.org:443 HTTP/1.1\r\nHost: nexus.ingress.bitecho.org:443\r\n\r\n"]
+              (.write out (.getBytes req StandardCharsets/UTF_8))
+              (.flush out)
+              (let [hdr-buf (byte-array 128)
+                    hn (.read in hdr-buf)
+                    hdr-str (String. hdr-buf 0 hn StandardCharsets/UTF_8)]
+                (is (str/starts-with? hdr-str "HTTP/1.1 200"))
+                (.write out (.getBytes "dtls-over-tcp-via-nexus-ingress" StandardCharsets/UTF_8))
+                (.flush out)
+                (let [ebuf (byte-array 64)
+                      en (.read in ebuf)]
+                  (is (= "dtls-over-tcp-via-nexus-ingress" (String. ebuf 0 en StandardCharsets/UTF_8)))))))
           (with-open [s (Socket. "127.0.0.1" (int https-port))]
             (.setSoTimeout s 3000)
             (let [out (.getOutputStream s)
@@ -831,11 +849,45 @@
 ;; 8. `bitecho.shell.upnp` SSDP + SOAP `WANIPConnection` & Timeout Diagnostics
 ;; =============================================================================
 
+(defspec ^{:doc "Property (M3 Step 15A): Pure UPnP external IP classifier distinguishes public IPv4 from RFC1918/CGNAT/loopback/link-local and builds canonical ingress port mappings"}
+  prop-upnp-external-ip-classification-and-mapping-plan 50
+  (prop/for-all [b (gen/choose 0 255)
+                 c (gen/choose 0 255)
+                 d (gen/choose 1 254)
+                 dns-port (gen/choose 1024 65535)
+                 http-port (gen/choose 1024 65535)
+                 https-port (gen/choose 1024 65535)]
+                (let [pub-ip (str "136.62." c "." d)
+                      priv-10 (str "10." b "." c "." d)
+                      priv-192 (str "192.168." c "." d)
+                      cgnat-ip (str "100." (+ 64 (mod b 64)) "." c "." d)
+                      loop-ip (str "127.0." c "." d)
+                      plan (upnp/build-ingress-port-mappings {:internal-client "192.168.86.36"
+                                                              :dns-udp-port dns-port
+                                                              :dns-tcp-port dns-port
+                                                              :http-port http-port
+                                                              :https-port https-port})]
+                  (and (upnp/public-ipv4? pub-ip)
+                       (= :public (upnp/classify-external-ip pub-ip))
+                       (not (upnp/public-ipv4? priv-10))
+                       (= :private (upnp/classify-external-ip priv-10))
+                       (= :private (upnp/classify-external-ip priv-192))
+                       (not (upnp/public-ipv4? cgnat-ip))
+                       (= :cgnat (upnp/classify-external-ip cgnat-ip))
+                       (= :loopback (upnp/classify-external-ip loop-ip))
+                       (= 4 (count plan))
+                       (= #{["UDP" 53 dns-port]
+                            ["TCP" 53 dns-port]
+                            ["TCP" 80 http-port]
+                            ["TCP" 443 https-port]}
+                          (set (map (juxt :protocol :external-port :internal-port) plan)))))))
+
 (deftest test-upnp-shell-ssdp-soap-and-timeout-diagnostics
-  (testing "bitecho.shell.upnp discovers local mock IGD gateway via SSDP, executes GetExternalIPAddress / AddPortMapping / DeletePortMapping SOAP actions, and emits counted :diagnose on timeout"
+  (testing "bitecho.shell.upnp discovers local mock IGD gateway via SSDP, executes GetExternalIPAddress / AddPortMapping (including 725 OnlyPermanentLeasesSupported retry with lease=0) / DeletePortMapping, supports manual fallback, and enforces pre-flight external reachability gate"
     (let [soap-http (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
           soap-port (.getPort (.getAddress soap-http))
           mapped-ports (atom [])
+          reject-nonzero-lease? (atom false)
           ssdp-sock (DatagramSocket. (InetSocketAddress. "127.0.0.1" 0))
           ssdp-port (.getLocalPort ssdp-sock)]
       (.createContext soap-http "/rootDesc.xml"
@@ -854,7 +906,14 @@
                         (handle [_ ex]
                           (let [soap-action (or (.getFirst (.getRequestHeaders ex) "SOAPAction") "")
                                 req-body (slurp (.getRequestBody ex) :encoding "UTF-8")
+                                non-zero-lease-rejected? (and @reject-nonzero-lease?
+                                                              (str/includes? soap-action "AddPortMapping")
+                                                              (not (str/includes? req-body "<NewLeaseDuration>0</NewLeaseDuration>")))
+                                status (if non-zero-lease-rejected? 500 200)
                                 resp-xml (cond
+                                           non-zero-lease-rejected?
+                                           "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><faultstring>UPnPError</faultstring><detail><UPnPError><errorCode>725</errorCode><errorDescription>OnlyPermanentLeasesSupported</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"
+
                                            (str/includes? soap-action "GetExternalIPAddress")
                                            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetExternalIPAddressResponse xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewExternalIPAddress>203.0.113.42</NewExternalIPAddress></u:GetExternalIPAddressResponse></s:Body></s:Envelope>"
 
@@ -869,7 +928,7 @@
                                            :else
                                            "<Fault/>")
                                 b (.getBytes resp-xml StandardCharsets/UTF_8)]
-                            (.sendResponseHeaders ex 200 (alength b))
+                            (.sendResponseHeaders ex status (alength b))
                             (with-open [os (.getResponseBody ex)] (.write os b))))))
       (.start soap-http)
       (.start (Thread/ofVirtual)
@@ -891,6 +950,7 @@
                                             :timeout-ms 1500})
               gw (:gateway disc)
               ext-ip (upnp/get-external-ip! gw {:timeout-ms 1500})
+              _ (reset! reject-nonzero-lease? true)
               add-res (upnp/add-port-mapping! gw {:external-port 8443
                                                   :internal-client "192.168.86.36"
                                                   :internal-port 8443
@@ -903,15 +963,51 @@
               dead-port (.getLocalPort dead-sock)
               timeout-res (upnp/discover-gateway! {:ssdp-host "127.0.0.1"
                                                    :ssdp-port dead-port
-                                                   :timeout-ms 120})]
+                                                   :timeout-ms 120})
+              ;; Manual port-forward fallback when UPnP fails
+              fallback-res (upnp/ensure-ingress-port-mappings!
+                            {:ssdp-host "127.0.0.1"
+                             :ssdp-port dead-port
+                             :timeout-ms 100
+                             :manual-port-forward? true
+                             :manual-external-ip "136.62.15.220"
+                             :internal-client "192.168.86.36"
+                             :dns-udp-port 15353
+                             :http-port 18080
+                             :https-port 18443})
+              ;; Pre-flight external reachability gate: pass vs fail
+              gate-ok (upnp/verify-external-reachability!
+                       {:external-ip "127.0.0.1"
+                        :ports [{:protocol "UDP" :port 53}
+                                {:protocol "TCP" :port 80}
+                                {:protocol "TCP" :port 443}]
+                        :probe-fn (fn [_ip _proto _port _opts] {:ok? true})})
+              gate-fail (upnp/verify-external-reachability!
+                         {:external-ip "127.0.0.1"
+                          :ports [{:protocol "UDP" :port 53}
+                                  {:protocol "TCP" :port 80}
+                                  {:protocol "TCP" :port 443}]
+                          :probe-fn (fn [_ip _proto port _opts]
+                                      (if (= port 443)
+                                        {:ok? false :error :connect-timeout}
+                                        {:ok? true}))})]
           (.close dead-sock)
           (is (:ok? disc))
           (is (= "203.0.113.42" (:external-ip ext-ip)))
-          (is (:ok? add-res))
+          (is (:ok? add-res) "Automatically retried AddPortMapping with NewLeaseDuration=0 after 725 fault")
           (is (:ok? del-res))
           (is (empty? @mapped-ports))
           (is (false? (:ok? timeout-res)))
-          (is (= :diagnose (:effect (first (:effects timeout-res))))))
+          (is (= :diagnose (:effect (first (:effects timeout-res)))))
+          (is (:ok? fallback-res))
+          (is (= :manual-fallback (:mode fallback-res)))
+          (is (= "136.62.15.220" (:external-ip fallback-res)))
+          (is (some #(= :upnp-manual-fallback (:reason %)) (:effects fallback-res)))
+          (is (:ok? gate-ok))
+          (is (false? (:ok? gate-fail)))
+          (is (= :external-reachability-gate-failed (:error gate-fail)))
+          (is (= [443] (mapv :port (:failed-ports gate-fail))))
+          (is (some #(= :external-reachability-gate-failed (:reason %)) (:effects gate-fail))))
         (finally
           (try (.close ssdp-sock) (catch Exception _ nil))
           (try (.stop soap-http 0) (catch Exception _ nil)))))))
@@ -937,7 +1033,7 @@
           (is (str/includes? main-src (str "bitecho " subcmd))
               (str "print-usage must document CLI subcommand: " subcmd)))
         (let [ops-src (slurp "scripts/infra_cluster.sh")]
-          (doseq [verb ["snapshot" "provision-secret" "cutover" "rollback" "audit"]]
+          (doseq [verb ["snapshot" "provision-secret" "cutover" "rollback" "audit" "retire-clj-web" "publish-git"]]
             (is (str/includes? ops-src (str "  " verb))
                 (str "infra_cluster.sh usage must document verb: " verb))
             (is (str/includes? ops-src (str verb ")"))

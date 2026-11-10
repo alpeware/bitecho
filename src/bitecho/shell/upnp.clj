@@ -5,10 +5,11 @@
    - Thin bounded-timeout UDP (`239.255.255.250:1900` default) & HTTP SOAP boundary shell
      (`discover-gateway!`, `get-external-ip!`, `add-port-mapping!`, `delete-port-mapping!`)
      emitting counted `:diagnose` effects on timeout, CGNAT, or SOAP faults (Rule 5)."
-  (:require [clojure.string :as str]
+  (:require [bitecho.core.protocol.dns :as dns-proto]
+            [clojure.string :as str]
             [clojure.xml :as xml])
   (:import [java.io ByteArrayInputStream]
-           [java.net DatagramPacket DatagramSocket InetSocketAddress SocketTimeoutException URI]
+           [java.net DatagramPacket DatagramSocket InetSocketAddress Socket SocketTimeoutException URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
            [java.time Duration]))
@@ -145,6 +146,64 @@
            first))
     (catch Exception _ nil)))
 
+(defn classify-external-ip
+  "Purely classifies an IPv4 string returned by UPnP `GetExternalIPAddress`:
+   `:public`, `:private` (RFC 1918), `:cgnat` (RFC 6598 `100.64.0.0/10`), `:loopback`, `:link-local`, or `:invalid`."
+  [ip-str]
+  (if-let [octets (dns-proto/parse-ipv4 ip-str)]
+    (let [[a b _c _d] octets]
+      (cond
+        (or (zero? a) (>= a 224)) :invalid
+        (= a 127) :loopback
+        (= a 10) :private
+        (and (= a 172) (<= 16 b 31)) :private
+        (and (= a 192) (= b 168)) :private
+        (and (= a 169) (= b 254)) :link-local
+        (and (= a 100) (<= 64 b 127)) :cgnat
+        :else :public))
+    :invalid))
+
+(defn public-ipv4?
+  "Returns true iff `ip-str` is a routable public IPv4 address."
+  [ip-str]
+  (= :public (classify-external-ip ip-str)))
+
+(defn build-ingress-port-mappings
+  "Purely constructs the canonical ingress port-mapping plan (`UDP 53`, `TCP 53`, `TCP 80`, `TCP 443`)
+   for a local 1-node `bitecho infra-node` instance."
+  [{:keys [internal-client dns-udp-port dns-tcp-port http-port https-port lease-seconds description-prefix]}]
+  (let [client (or internal-client "127.0.0.1")
+        lease (int (or lease-seconds 0))
+        prefix (or description-prefix "bitecho-ingress")
+        u53 (int (or dns-udp-port 53))
+        t53 (int (or dns-tcp-port dns-udp-port 53))
+        h80 (int (or http-port 80))
+        h443 (int (or https-port 443))]
+    [{:protocol "UDP"
+      :external-port 53
+      :internal-port u53
+      :internal-client client
+      :lease-seconds lease
+      :description (str prefix "-dns-udp")}
+     {:protocol "TCP"
+      :external-port 53
+      :internal-port t53
+      :internal-client client
+      :lease-seconds lease
+      :description (str prefix "-dns-tcp")}
+     {:protocol "TCP"
+      :external-port 80
+      :internal-port h80
+      :internal-client client
+      :lease-seconds lease
+      :description (str prefix "-http")}
+     {:protocol "TCP"
+      :external-port 443
+      :internal-port h443
+      :internal-client client
+      :lease-seconds lease
+      :description (str prefix "-https")}]))
+
 ;; =============================================================================
 ;; 2. Bounded-Timeout UDP SSDP & HTTP SOAP Boundary Shell
 ;; =============================================================================
@@ -262,20 +321,30 @@
           :effects [{:effect :diagnose :reason :upnp-missing-external-ip}]})))))
 
 (defn add-port-mapping!
-  "Executes `AddPortMapping` on `gateway`."
+  "Executes `AddPortMapping` on `gateway`. Automatically retries once with `NewLeaseDuration=0`
+   (permanent lease) if the router rejects a non-zero lease duration (e.g. `725 OnlyPermanentLeasesSupported`)."
   [gateway {:keys [remote-host external-port protocol internal-port internal-client description lease-seconds] :as opts}]
-  (execute-soap-action!
-   gateway
-   "AddPortMapping"
-   [["NewRemoteHost" (or remote-host "")]
-    ["NewExternalPort" (int external-port)]
-    ["NewProtocol" (str/upper-case (or protocol "TCP"))]
-    ["NewInternalPort" (int (or internal-port external-port))]
-    ["NewInternalClient" (str internal-client)]
-    ["NewEnabled" "1"]
-    ["NewPortMappingDescription" (or description "bitecho")]
-    ["NewLeaseDuration" (int (or lease-seconds 3600))]]
-   opts))
+  (let [lease (int (if (some? lease-seconds) lease-seconds 3600))
+        attempt! (fn [dur]
+                   (execute-soap-action!
+                    gateway
+                    "AddPortMapping"
+                    [["NewRemoteHost" (or remote-host "")]
+                     ["NewExternalPort" (int external-port)]
+                     ["NewProtocol" (str/upper-case (or protocol "TCP"))]
+                     ["NewInternalPort" (int (or internal-port external-port))]
+                     ["NewInternalClient" (str internal-client)]
+                     ["NewEnabled" "1"]
+                     ["NewPortMappingDescription" (or description "bitecho")]
+                     ["NewLeaseDuration" (int dur)]]
+                    opts))
+        res (attempt! lease)]
+    (if (or (:ok? res) (zero? lease))
+      res
+      (let [retry-res (attempt! 0)]
+        (if (:ok? retry-res)
+          (assoc retry-res :retried-permanent-lease? true)
+          res)))))
 
 (defn delete-port-mapping!
   "Executes `DeletePortMapping` on `gateway`."
@@ -287,3 +356,117 @@
     ["NewExternalPort" (int external-port)]
     ["NewProtocol" (str/upper-case (or protocol "TCP"))]]
    opts))
+
+(defn ensure-ingress-port-mappings!
+  "Discovers a UPnP gateway, queries the external IP, and maps all configured ingress ports
+   (`UDP 53`, `TCP 53`, `TCP 80`, `TCP 443`).
+   Supports best-effort UPnP with explicit `:manual-port-forward? true` + `:manual-external-ip`
+   fallback when the router lacks UPnP (emitting a counted `:diagnose` effect per Rule 5)."
+  [opts]
+  (let [mappings (or (:mappings opts) (build-ingress-port-mappings opts))
+        disc (discover-gateway! opts)]
+    (if (:ok? disc)
+      (let [gw (:gateway disc)
+            ext-res (get-external-ip! gw opts)
+            ext-ip (or (:external-ip ext-res) (:manual-external-ip opts))
+            ip-class (classify-external-ip ext-ip)
+            map-results (mapv #(assoc (add-port-mapping! gw (merge opts %))
+                                      :mapping %)
+                              mappings)
+            failed (filterv #(not (:ok? %)) map-results)]
+        (if (and (empty? failed) (string? ext-ip) (not (str/blank? ext-ip)))
+          {:ok? true
+           :mode :upnp
+           :gateway gw
+           :external-ip ext-ip
+           :ip-classification ip-class
+           :mappings mappings
+           :effects (if (= :cgnat ip-class)
+                      [{:effect :diagnose :reason :upnp-cgnat-detected :external-ip ext-ip}]
+                      [])}
+          (if (and (:manual-port-forward? opts) (string? (:manual-external-ip opts)))
+            {:ok? true
+             :mode :manual-fallback
+             :external-ip (:manual-external-ip opts)
+             :mappings mappings
+             :effects [{:effect :diagnose
+                        :reason :upnp-manual-fallback
+                        :external-ip (:manual-external-ip opts)}]}
+            {:ok? false
+             :error :upnp-port-mapping-failed
+             :failed-mappings failed
+             :effects (into (vec (:effects ext-res))
+                            (mapcat :effects failed))})))
+      (if (and (:manual-port-forward? opts) (string? (:manual-external-ip opts)))
+        {:ok? true
+         :mode :manual-fallback
+         :external-ip (:manual-external-ip opts)
+         :mappings mappings
+         :effects (conj (vec (:effects disc))
+                        {:effect :diagnose
+                         :reason :upnp-manual-fallback
+                         :external-ip (:manual-external-ip opts)})}
+        disc))))
+
+(defn teardown-ingress-port-mappings!
+  "Deletes previously registered UPnP port mappings on `gateway`."
+  [gateway mappings opts]
+  (when gateway
+    (mapv #(delete-port-mapping! gateway (merge opts %)) mappings)))
+
+(defn default-reachability-probe!
+  "Probes external reachability of `ip:port` over `protocol` (`\"TCP\"` socket connect or
+   `\"UDP\"` RFC 1035 DNS query/response)."
+  [ip protocol port {:keys [timeout-ms domain]}]
+  (let [t-ms (int (or timeout-ms 2500))
+        proto (str/upper-case (or protocol "TCP"))]
+    (try
+      (if (= proto "UDP")
+        (with-open [sock (DatagramSocket.)]
+          (.setSoTimeout sock t-ms)
+          (let [qname (or domain "bitecho.org")
+                q-bytes (dns-proto/encode-packet {:id 0x4242 :rd? false :questions [{:qname qname :qtype :SOA :qclass :IN}]})
+                pkt (DatagramPacket. q-bytes (alength q-bytes) (InetSocketAddress. ^String ip (int port)))
+                _ (.send sock pkt)
+                rbuf (byte-array 512)
+                rpkt (DatagramPacket. rbuf (alength rbuf))
+                _ (.receive sock rpkt)
+                resp (dns-proto/decode-packet (java.util.Arrays/copyOf rbuf (.getLength rpkt)))]
+            (if (= 0x4242 (:id resp))
+              {:ok? true}
+              {:ok? false :error :invalid-dns-response})))
+        (with-open [sock (Socket.)]
+          (.connect sock (InetSocketAddress. ^String ip (int port)) t-ms)
+          {:ok? true}))
+      (catch Exception e
+        {:ok? false :error (or (.getMessage e) "unreachable")}))))
+
+(defn verify-external-reachability!
+  "Pre-flight external reachability gate (M3 Step 15A): verifies that mapped external ports
+   (`UDP 53`, `TCP 80`, `TCP 443`) are reachable on `:external-ip` before attempting ACME
+   challenge validation. Emits a counted `:diagnose` effect when any port fails."
+  [{:keys [external-ip ports probe-fn timeout-ms domain]}]
+  (let [probe (or probe-fn default-reachability-probe!)
+        req-ports (or ports
+                      [{:protocol "UDP" :port 53}
+                       {:protocol "TCP" :port 80}
+                       {:protocol "TCP" :port 443}])
+        results (mapv (fn [{:keys [protocol port] :as p}]
+                        (let [r (probe external-ip protocol port {:timeout-ms timeout-ms :domain domain})]
+                          (assoc p :ok? (boolean (:ok? r)) :error (:error r))))
+                      req-ports)
+        failed (filterv #(not (:ok? %)) results)]
+    (if (empty? failed)
+      {:ok? true
+       :external-ip external-ip
+       :results results
+       :effects []}
+      {:ok? false
+       :error :external-reachability-gate-failed
+       :external-ip external-ip
+       :failed-ports failed
+       :results results
+       :effects [{:effect :diagnose
+                  :reason :external-reachability-gate-failed
+                  :external-ip external-ip
+                  :failed-ports (mapv #(select-keys % [:protocol :port :error]) failed)}]})))

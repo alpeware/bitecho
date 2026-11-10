@@ -169,6 +169,94 @@
       (is (= :refused (:rcode refused-resp)))
       (is (false? (:ra? refused-resp))))))
 
+(defspec ^{:doc "Property (M3 Step 15B): Delegated *.ingress.<domain> zones return RFC 1035 non-authoritative NS + glue A referrals for all child queries and direct A answers for the glue host"}
+  prop-dns-delegated-ingress-referral 50
+  (prop/for-all [agent-label gen-label
+                 child-label (gen/elements [nil "_acme-challenge" "sub" "ech1test"])
+                 qtype (gen/elements [:A :AAAA :TXT :NS :CAA])
+                 glue-ip gen-ipv4
+                 ttl (gen/choose 30 600)]
+                (let [domain "bitecho.org"
+                      subzone (str (str/lower-case agent-label) ".ingress")
+                      zone-fqdn (str subzone "." domain)
+                      ns-host (str "ns1." zone-fqdn)
+                      cfg {:domain domain
+                           :dns {:ttl-seconds ttl
+                                 :delegated-ingress {subzone {:ns ns-host
+                                                              :ip4 glue-ip
+                                                              :ttl ttl}}}
+                           :cluster {:nodes {:ns1 {:ip4 "34.19.71.246"}}}}
+                      target-qname (if child-label
+                                     (str child-label "." zone-fqdn)
+                                     zone-fqdn)
+                      ref-resp (dns/resolve-query cfg {} {:id 77 :rd? true :questions [{:qname target-qname :qtype qtype :qclass :IN}]} 2000)
+                      glue-resp (dns/resolve-query cfg {} {:id 78 :rd? true :questions [{:qname ns-host :qtype :A :qclass :IN}]} 2000)]
+                  (and (= :noerror (:rcode ref-resp))
+                       (false? (:aa? ref-resp))
+                       (empty? (:answers ref-resp))
+                       (= [{:name zone-fqdn :type :NS :class :IN :ttl ttl :rdata ns-host}]
+                          (:authority ref-resp))
+                       (= [{:name ns-host :type :A :class :IN :ttl ttl :rdata glue-ip}]
+                          (:additional ref-resp))
+                       (= :noerror (:rcode glue-resp))
+                       (= [{:name ns-host :type :A :class :IN :ttl ttl :rdata glue-ip}]
+                          (:answers glue-resp))))))
+
+(deftest test-dns-delegated-ingress-subnet-pointers
+  (testing "M3 Step 15B: Subnet Pointers dns/NS/nexus.ingress and dns/NS/<bech32m>.ingress emit NS + glue A referrals for zone and _acme-challenge queries"
+    (let [domain-kp (crypto/generate-keypair)
+          domain-pub (basalt/bytes->hex (:public domain-kp))
+          bech-sub "ech1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqc9778c.ingress"
+          policy {:subnet/id "bitecho.org/infra"
+                  :subnet/parent-id "global"
+                  :subnet/gate {:gate/mode :permissioned
+                                :gate/admission :allowlist
+                                :gate/trust-anchors #{domain-pub}}
+                  :subnet/path-acl [{:pattern "dns/*" :principal {:type :pubkey :pubkey domain-pub}}]
+                  :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                  :subnet/replication {:replication/pointers :leader-election
+                                       :replication/blobs :eager-push}}
+          inst0 (:instance (subnet/init-subnet-instance policy {:node-id :ns1 :all-nodes #{:ns1} :now-ms 1000}))
+          ns-blob (data/make-blob (fressian/encode-canonical {:ns "ns1.nexus.ingress.bitecho.org"
+                                                              :ip4 "136.62.15.220"
+                                                              :ttl 60})
+                                  "application/fressian")
+          bech-blob (data/make-blob (fressian/encode-canonical {:ns (str "ns1." bech-sub ".bitecho.org")
+                                                                :ip4 "136.62.15.220"
+                                                                :ttl 60})
+                                    "application/fressian")
+          inst1 (:state (subnet/reduce-subnet inst0 {:type :put-blob :sender domain-pub :blob ns-blob :now-ms 1100}))
+          inst2 (:state (subnet/reduce-subnet inst1 {:type :put-blob :sender domain-pub :blob bech-blob :now-ms 1110}))
+          ptr1 (data/sign-pointer (:private domain-kp)
+                                  {:pointer/authority domain-pub
+                                   :pointer/subnet "bitecho.org/infra"
+                                   :pointer/path "dns/NS/nexus.ingress"
+                                   :pointer/seq 1
+                                   :pointer/target (:blob/cid ns-blob)
+                                   :pointer/proof {:proof/type :zone :serial 1}})
+          ptr2 (data/sign-pointer (:private domain-kp)
+                                  {:pointer/authority domain-pub
+                                   :pointer/subnet "bitecho.org/infra"
+                                   :pointer/path (str "dns/NS/" bech-sub)
+                                   :pointer/seq 1
+                                   :pointer/target (:blob/cid bech-blob)
+                                   :pointer/proof {:proof/type :zone :serial 2}})
+          inst3 (:state (subnet/reduce-subnet inst2 {:type :publish-pointer :sender domain-pub :pointer ptr1 :now-ms 1150}))
+          inst4 (:state (subnet/reduce-subnet inst3 {:type :publish-pointer :sender domain-pub :pointer ptr2 :now-ms 1160}))
+          cfg {:domain "bitecho.org"
+               :dns {:ttl-seconds 60}
+               :cluster {:nodes {:ns1 {:ip4 "34.19.71.246"}}}}
+          r-nexus-a (dns/resolve-query cfg inst4 {:id 21 :rd? true :questions [{:qname "nexus.ingress.bitecho.org" :qtype :A :qclass :IN}]} 2000)
+          r-nexus-acme (dns/resolve-query cfg inst4 {:id 22 :rd? true :questions [{:qname "_acme-challenge.nexus.ingress.bitecho.org" :qtype :TXT :qclass :IN}]} 2000)
+          r-bech-a (dns/resolve-query cfg inst4 {:id 23 :rd? true :questions [{:qname (str bech-sub ".bitecho.org") :qtype :A :qclass :IN}]} 2000)]
+      (is (false? (:aa? r-nexus-a)))
+      (is (empty? (:answers r-nexus-a)))
+      (is (= "ns1.nexus.ingress.bitecho.org" (get-in r-nexus-a [:authority 0 :rdata])))
+      (is (= "136.62.15.220" (get-in r-nexus-a [:additional 0 :rdata])))
+      (is (false? (:aa? r-nexus-acme)))
+      (is (= "ns1.nexus.ingress.bitecho.org" (get-in r-nexus-acme [:authority 0 :rdata])))
+      (is (= "136.62.15.220" (get-in r-bech-a [:additional 0 :rdata]))))))
+
 (deftest test-port-443-stream-classifier-and-rate-limiter
   (testing "Gap G17: pure port :443 classifier distinguishes RFC 4571 DTLS, RFC 4571 STUN, HTTP CONNECT, *.ingress SNI, and standard HTTPS"
     (let [dtls-frame #?(:clj (byte-array (map unchecked-byte [0x00 0x20 0x16 0xFE 0xFD 0x00]))

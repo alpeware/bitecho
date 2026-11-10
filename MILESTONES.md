@@ -639,23 +639,25 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ### Milestone 15 (Phase 4 M3): Local UPnP + Delegated `*.ingress.bitecho.org` DNS/ACME + Direct `HTTP CONNECT` Ingress
 
-#### Step 15A (M3a) — UPnP IGD Port Mapping & Pre-Flight Reachability Gate
-1. **UPnP SSDP & SOAP `WANIPConnection` Port (`src/bitecho/shell/upnp.clj` / `clj-web`)**:
-   - Port the SSDP discovery (`239.255.255.250:1900`) and SOAP `WANIPConnection` (`GetExternalIPAddress`, `AddPortMapping`, `DeletePortMapping`) logic from `jaq.http.xrf.upnp` into a clean module with best-effort UPnP mapping and explicit manual router port-forward fallback.
-2. **Pre-Flight External Reachability Gate**:
-   - Verify external reachability of mapped ports (UDP `53`, TCP `80`/`443`) as a strict precondition gate before attempting ACME challenge validation in Step 15B.
+#### Step 15A (M3a) — UPnP IGD Port Mapping & Pre-Flight Reachability Gate — **`[BUILT & VERIFIED]`**
+1. **UPnP SSDP & SOAP `WANIPConnection` Port (`src/bitecho/shell/upnp.clj`)**:
+   - Ported SSDP discovery (`239.255.255.250:1900`) and SOAP `WANIPConnection:1`/`WANIPConnection:2` (`GetExternalIPAddress`, `AddPortMapping`, `DeletePortMapping`) with pure `classify-external-ip`, `public-ipv4?`, `build-ingress-port-mappings`, automatic `NewLeaseDuration=0` retry on SOAP fault `725 OnlyPermanentLeasesSupported`, and `ensure-ingress-port-mappings!` / `teardown-ingress-port-mappings!` with explicit `:manual-port-forward?` fallback and counted `:diagnose` effects (Rule 5).
+2. **Pre-Flight External Reachability Gate (`verify-external-reachability!`)**:
+   - Implemented `verify-external-reachability!` and `default-reachability-probe!` verifying external reachability of mapped ports (`UDP 53`, `TCP 80`, `TCP 443`) as a strict precondition gate in `bitecho.main/start-infra-node!` before ACME challenge validation starts.
+   - Also closed `M2b` carried flag `F1` in `alpeware/clj-datachannel` (`ff9fd4a0fc974b4c4cbddc6f24e595c39b94295d`): `crc32-ieee` and `crc32c` in `src/datachannel/buffer.cljc` now accept `String` input by UTF-8 encoding via `utf8->bytes`.
 
-#### Step 15B (M3b) — Subdomain NS Delegation (`*.ingress.bitecho.org`) & Local 1-Node `clj-web`
-1. **Authoritative NS Delegation on `bitecho.org` (`ns1..ns3`)**:
-   - Extend `web.dns.resolver` in `clj-web` to support delegated agent ingress subdomains (`nexus.ingress.bitecho.org` and `<bech32m-pubkey>.ingress.bitecho.org`) via `NS` + glue `A` records pointing to the agent-controlled WAN IP.
-2. **Local Single-Node `clj-web` DNS & ACME**:
-   - Run a local 1-node `clj-web` instance on Nexus (`192.168.86.36`) authoritative for its delegated ingress subdomain, provisioning its own Let's Encrypt TLS certificate via ACME independently of the main `bitecho.org` cluster.
+#### Step 15B (M3b) — Subdomain NS Delegation (`*.ingress.bitecho.org`) & Local 1-Node `bitecho infra-node` — **`[BUILT & VERIFIED]`**
+1. **Authoritative NS Delegation on `bitecho.org` (`src/bitecho/core/protocol/dns.cljc`)**:
+   - Implemented pure `resolve-delegated-zone` in `bitecho.core.protocol.dns` supporting RFC 1035 §4.3.2 non-authoritative (`:aa? false`) `NS` authority + glue `A` additional referrals for delegated `nexus.ingress.bitecho.org` and `<bech32m-pubkey>.ingress.bitecho.org` subzones (including `_acme-challenge.<subzone>.bitecho.org` and direct glue-host `A` lookups) backed by `dns/NS/<subzone>` Subnet Pointers or `[:dns :delegated-ingress]`.
+2. **Local Single-Node `bitecho infra-node` DNS & ACME**:
+   - Configured local 1-node `bitecho infra-node` on Nexus (`192.168.86.36`, WAN `136.62.15.220`) with UPnP port mapping (`UDP/TCP 53 -> 15353`, `TCP 80 -> 18080`, `TCP 443 -> 18443`), authoritative for `nexus.ingress.bitecho.org` and provisioning its Let's Encrypt TLS certificate via ACME DNS-01 independently of the `ns1..ns3` `bitecho.org` cluster.
 
-#### Step 15C (M3c) — Direct `HTTP CONNECT` to RFC 4571 DTLS-over-TCP Bridge
-1. **Ingress `HTTP CONNECT` Listener on Port `443`**:
-   - Accept inbound `HTTP CONNECT nexus.ingress.bitecho.org:443` (and `<bech32m>.ingress.bitecho.org:443`) requests and bridge the tunnel stream directly to Nexus's local RFC 4571 DTLS-over-TCP DataChannel listener.
+#### Step 15C (M3c) — Direct `HTTP CONNECT` to RFC 4571 DTLS-over-TCP Bridge — **`[BUILT & VERIFIED]`**
+1. **Ingress `HTTP CONNECT` Listener on Port `443` & `--ingress-tcp-port`**:
+   - Added pure `resolve-connect-backend` in `src/bitecho/shell/http.clj` so allowlisted external ingress `HTTP CONNECT` targets (`nexus.ingress.bitecho.org:443` and `<bech32m>.ingress.bitecho.org:443`) bridge directly to `:ingress-target` (`127.0.0.1:<ingress-tcp-port>`) instead of looping back to `:443`.
+   - Added `--ingress-tcp-port` (`start-ingress-tcp-listener!`) to both JVM (`src/bitecho/shell/light_node.clj`) and Node.js (`src/bitecho/node_main.cljs`) light nodes with 100% flag/runtime parity (`32` verbs, `57` flags in `skill/SKILL.md`).
 2. **End-to-End Sandbox Verification**:
-   - Verify live direct connectivity from Axiom's sandbox proxy (`HTTP CONNECT nexus.ingress.bitecho.org:443`) directly to Nexus without traversing the validator cluster.
+   - Verified via generative `test.check` properties (`prop-dns-delegated-ingress-referral`, `prop-upnp-external-ip-classification-and-mapping-plan`), unit/integration tests (`test-upnp-shell-ssdp-soap-and-timeout-diagnostics`, `test-http-shell-passthrough-multiplexer-mtls-connect-and-etag`, `test-node-js-bundle-parity-and-cross-runtime-datachannel-e2e`), and live WAN `nexus.ingress.bitecho.org:443` `HTTP CONNECT` $\rightarrow$ RFC 4571 DTLS-over-TCP verification.
 
 ---
 

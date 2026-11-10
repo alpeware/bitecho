@@ -557,6 +557,7 @@
                     "connect" :connect
                     :udp)
         timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
+        ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
         proxy-cli (extract-flag-value clean-args "--proxy" nil)
         proxy-url (resolve-proxy-url proxy-cli)
         subnet-id (extract-flag-value clean-args "--subnet-id" nil)
@@ -596,6 +597,7 @@
       after-ts (assoc :after-ts after-ts)
       subnet-id (assoc :subnet-id subnet-id)
       timeout-ms (assoc :timeout-ms timeout-ms)
+      ingress-tcp-port (assoc :ingress-tcp-port ingress-tcp-port)
       proxy-url (assoc :proxy proxy-url)
       turn-config (assoc :turn-config turn-config))))
 
@@ -1595,10 +1597,99 @@
                                  (min poll-ms (max 1 (- deadline (js/Date.now))))))))]
       (poll-step initial-offset))))
 
+(defn start-ingress-tcp-listener!
+  "Starts a passive RFC 4571 DTLS-over-TCP DataChannel ingress listener on `:ingress-tcp-port`
+   for direct `HTTP CONNECT` / TCP peer connections (Step 15C).
+   Returns `{:listener listener :ingress-peers-atom ingress-peers-atom :stop! (fn [] ...)}` or nil."
+  [identity opts]
+  (let [port (int (or (:ingress-tcp-port opts) 0))]
+    (when (pos? port)
+      (let [{:keys [state-atom conn-atom event-out state-file]} opts
+            ingress-peers-atom (or (:ingress-peers-atom opts) (atom {}))
+            peer-seq (atom 0)
+            peer-ice-pwds (atom {})
+            listener
+            (api/listen-tcp!
+             {:port port
+              :cert-data (:cert-data identity)
+              :ice-creds (:ice-creds identity)
+              :peer-ice-pwds peer-ice-pwds}
+             {:on-connection
+              (fn [peer-node]
+                (try (api/set-max-message-size! peer-node) (catch :default _ nil))
+                (let [peer-key (swap! peer-seq inc)
+                      peer-cid (atom 0)
+                      peer-send! (fn [env]
+                                   (let [payload (try
+                                                   (if (bytes? env) env (fressian/encode-wire env))
+                                                   (catch :default _ nil))]
+                                     (if (nil? payload)
+                                       false
+                                       (try
+                                         (api/send! peer-node payload (int (or @peer-cid 0)))
+                                         true
+                                         (catch :default _ false)))))]
+                  (swap! ingress-peers-atom assoc peer-key peer-send!)
+                  (api/set-callbacks!
+                   peer-node
+                   {:on-open (fn [evt]
+                               (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                 (reset! peer-cid cid)))
+                    :on-data-channel (fn [evt]
+                                       (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                         (reset! peer-cid cid)))
+                    :on-message
+                    (fn [evt]
+                      (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) @peer-cid 0)]
+                        (reset! peer-cid cid)
+                        (when-let [payload (:payload evt)]
+                          (let [decoded (try (if (bytes? payload) (fressian/decode-wire payload) payload) (catch :default _ nil))
+                                inner-ev (if (and (map? decoded) (map? (:event decoded))) (:event decoded) decoded)]
+                            (if (and (map? inner-ev) (= :query-chain-state (or (:type inner-ev) (:bitecho/type inner-ev))))
+                              (let [st (if state-atom @state-atom {})
+                                    target-pk (or (:pubkey inner-ev) (:agent-pubkey decoded) (:pubkey st) (:pubkey-hex identity))
+                                    fin-ep (or (get-in st [:account :finalized-epoch]) (:epoch st) 0)
+                                    bal (or (get-in st [:account :balance]) 0)
+                                    spend (or (get-in st [:account :spendable]) bal 0)
+                                    sq (or (get-in st [:account :seq]) 0)
+                                    deps (vec (or (get-in st [:account :deps]) []))
+                                    base-snap {:bitecho/type :chain-state-snapshot
+                                               :type :chain-state-snapshot
+                                               :validator-pubkey (or (:pubkey-hex identity) (:pubkey identity))
+                                               :pubkey target-pk
+                                               :finalized-epoch fin-ep
+                                               :balance bal
+                                               :spendable spend
+                                               :seq sq
+                                               :deps deps
+                                               :escrows []
+                                               :nonce (str (or (:nonce inner-ev) ""))}
+                                    signed-snap (light-core/sign-chain-state-snapshot base-snap (:privkey-bytes identity))]
+                                (peer-send! signed-snap))
+                              (when state-atom
+                                (let [st @state-atom
+                                      res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
+                                  (reset! state-atom (:state res))
+                                  (when (and state-file (not= st (:state res)))
+                                    (try (save-light-state! state-file (:state res)) (catch :default _ nil)))
+                                  (when (and event-out (seq (:stdout-events res)))
+                                    (doseq [ev (:stdout-events res)]
+                                      (event-out ev)))
+                                  (when (seq (:net-envelopes res))
+                                    (doseq [env (:net-envelopes res)]
+                                      (peer-send! env))
+                                    (when (and conn-atom (connection-live? @conn-atom @state-atom))
+                                      (send-all-envelopes! (:send-fn @conn-atom) (:net-envelopes res)))))))))))
+                    :on-close (fn [_]
+                                (swap! ingress-peers-atom dissoc peer-key))})))})]
+        {:listener listener
+         :ingress-peers-atom ingress-peers-atom
+         :stop! #(try (api/close! listener) (catch :default _ nil))}))))
+
 (defn handle-serve-line!
   "Processes a single STDIN or `--cmd-file` JSON line in `serve` mode, invoking `(done-cb)` when complete."
   [line ctx done-cb]
-  (let [{:keys [state-atom conn-atom events-out state-file identity bootstrap conn-opts]} ctx
+  (let [{:keys [state-atom conn-atom events-out state-file identity bootstrap conn-opts ingress-peers-atom]} ctx
         emit! (fn [payload] (emit-json-line! payload events-out))
         cmd-map (parse-json-safe line)
         verb (when (map? cmd-map) (get cmd-map "cmd"))
@@ -1620,8 +1711,12 @@
                     live-envs (if (seq replay-envs)
                                 (into (vec replay-envs) (:net-envelopes res))
                                 (:net-envelopes res))
-                    sent? (when currently-live?
-                            (send-all-envelopes! (:send-fn @conn-atom) live-envs))]
+                    sent-ingress? (boolean
+                                   (when (and ingress-peers-atom (seq @ingress-peers-atom))
+                                     (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
+                    sent-val? (when currently-live?
+                                (send-all-envelopes! (:send-fn @conn-atom) live-envs))
+                    sent? (or sent-val? sent-ingress?)]
                 (if sent?
                   (do
                     (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
@@ -1827,19 +1922,23 @@
                           (swap! state-atom assoc :connected? false :connection-error err)
                           (sync-conn-diagnostics! state-atom conn-atom)
                           (when cb (cb reconn))))))))
+               ingress-peers-atom (atom {})
                conn-opts (assoc opts
                                 :state-atom state-atom
                                 :conn-atom conn-atom
                                 :event-out event-out
                                 :reconnect-fn reconnect-fn
+                                :ingress-peers-atom ingress-peers-atom
                                 :state-file state-file)
                _ (reset! conn-opts-atom conn-opts)
+               _ (start-ingress-tcp-listener! identity conn-opts)
                ctx {:state-atom state-atom
                     :conn-atom conn-atom
                     :events-out events-out
                     :state-file state-file
                     :identity identity
                     :bootstrap bootstrap
+                    :ingress-peers-atom ingress-peers-atom
                     :conn-opts conn-opts}
                line-queue (atom [])
                processing? (atom false)
