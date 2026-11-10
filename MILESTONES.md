@@ -608,6 +608,14 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ### Milestone 14 (Phase 4 M2): Cross-Platform `.cljc` `clj-datachannel` & Pure Node.js Light Node
 
+#### Step 14.0 (M2 Step 0) — Standalone Pure-CLJC `alpeware/clj-fressian` Codec & Layered LZ4 (`BTEC`) Extraction — **`[BUILT & VERIFIED]`**
+1. **Standalone Zero-Dependency `.cljc` Codec (`alpeware/clj-fressian`)**:
+   - Extracted the `.cljc` Fressian codec (`fressian.core`) and layered LZ4 (`BTEC`) wire envelope (`fressian.lz4`) into a standalone repository (`https://github.com/alpeware/clj-fressian.git` & `https://bitecho.org/git/clj-fressian.git`) so both `bitecho` and `clj-datachannel` can depend on `alpeware/clj-fressian` with zero circular dependencies.
+   - Re-implemented standard priority-cached + struct-cached Fressian (`write`, `read`, `decode`, `tagged-object`, `cached`, `UUID`, `inst`, `URI`, `regex`, `bigint`, `bigdec`, `char`, `ratio`, `record`, `double` `0.0`/`1.0`/IEEE-754, `float`, chunked `65535`-byte arrays and `65536`-byte CESU-8 strings, closed/open lists, `RESET_CACHES`, and Adler32 `FOOTER` generation/validation) in 100% pure `.cljc` alongside deterministic `encode-canonical`, dropping `org.clojure/data.fressian` from production `:deps`.
+   - Kept `org.clojure/data.fressian` strictly in `:test` aliases to prove bidirectional byte-for-byte compatibility via `test.check` generative cross-tests (`prop-bidirectional-reference-data-fressian-compat`).
+2. **Bitecho Facade & Dependency Switch (`deps.edn`, `src/bitecho/fressian.cljc`)**:
+   - Replaced `org.clojure/data.fressian` in `bitecho/deps.edn` production `:deps` with `alpeware/clj-fressian` (keeping `org.clojure/data.fressian` in `:test` `:extra-deps` only), and refactored `src/bitecho/fressian.cljc` into a clean facade delegating core serialization and `BTEC` LZ4 framing to `fressian.core` and `fressian.lz4` while preserving Bitecho's `strip-untrusted-crypto-tags`, canonical signing-byte helpers, and legacy Nippy rolling-upgrade fallback.
+
 #### Step 14A (M2a) — `.cljc` Port of `clj-datachannel` Sans-IO Core & Cross-Platform `state.fressian` Persistence
 1. **Portable Sans-IO `clj-datachannel` Core**:
    - Port the pure state-machine namespaces in `clj-datachannel` (`core`, `sctp`, `chunks`, `dcep`, `packetize`, `reassemble`, `sdp`, `stun`, `turn`, `tcp` RFC 4571 framing, `handlers`) from `.clj` to `.cljc` using a portable byte/buffer abstraction (`byte[]`/`ByteBuffer` on JVM, `Uint8Array`/`Buffer` on Node.js).

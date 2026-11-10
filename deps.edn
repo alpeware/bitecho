@@ -2,8 +2,9 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}
         org.clojure/core.async {:mvn/version "1.9.829-alpha2"}
         org.clojure/data.json {:mvn/version "2.5.1"}
-        org.clojure/data.fressian {:mvn/version "1.1.0"}
         com.taoensso/nippy {:mvn/version "3.6.0"}
+        alpeware/clj-fressian {:git/url "https://bitecho.org/git/clj-fressian.git"
+                               :git/sha "0c62510fb20a0ea23594f3c1a6e8e52ef02cc1e3"}
         alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
                                   :git/sha "cf590af55cebb7e387a567bba7f301695d7cc384"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
@@ -21,7 +22,8 @@
                                  "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"
                                  "-Dclojure.core.async.pool-size=32"]}
            :test {:extra-paths ["test"]
-                  :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}
+                  :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
+                               org.clojure/data.fressian {:mvn/version "1.1.0"}}
                   :main-opts ["-m" "bitecho.test-runner"]
                   :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"
                              "--enable-native-access=ALL-UNNAMED"
