@@ -432,10 +432,9 @@
                        :error (:error res)
                        :effects (:effects res)}
                       (let [valid-ptr (:pointer res)
-                            is-policy-update? (and (= "subnet/policy" (:pointer/path valid-ptr))
-                                                   (some? (:pointer/target valid-ptr)))
+                            is-policy-path? (= "subnet/policy" (:pointer/path valid-ptr))
                             inst2 (assoc inst1 :data (:state res))]
-                        (if-not is-policy-update?
+                        (if-not is-policy-path?
                           (let [ptr-rep (get-in policy [:subnet/replication :replication/pointers])
                                 rep-eff {:effect :replicate-pointer
                                          :engine ptr-rep
@@ -444,37 +443,43 @@
                             {:state inst2
                              :applied? true
                              :effects (conj (vec (:effects res)) rep-eff)})
-                          ;; Decode and validate updated subnet policy from target Blob!
-                          (let [blob-read (data/get-blob (get-in inst2 [:data :blobs])
-                                                         (:pointer/target valid-ptr)
-                                                         {:subnet sid :now-ms now-ms})]
-                            (if-not (:hit? blob-read)
-                              {:state (assoc-in inst2 [:data :blobs] (:store blob-read))
+                          ;; "subnet/policy" cannot be tombstoned and must have its target Blob present & valid BEFORE recording Pointer!
+                          (if (nil? (:pointer/target valid-ptr))
+                            (let [diag {:effect :diagnose :reason :invalid-policy-update :subnet sid}]
+                              {:state (update-in inst1 [:diagnostics :policy-rejected] (fnil inc 0))
                                :applied? false
-                               :error :missing-policy-blob
-                               :effects (:effects blob-read)}
-                              (let [decoded (try (fressian/decode-wire (get-in blob-read [:blob :blob/bytes]))
-                                                 (catch #?(:clj Exception :cljs :default) _ nil))
-                                    merged-pol (when (map? decoded)
-                                                 (cond-> decoded
-                                                   (:subnet/genesis-policy-cid policy)
-                                                   (dissoc :subnet/genesis-policy-cid)))
-                                    v-pol (validate-subnet-policy merged-pol)]
-                                (if-not (and (:ok? v-pol) (= sid (:subnet/id merged-pol)))
-                                  (let [diag {:effect :diagnose :reason :invalid-policy-update :subnet sid}]
-                                    {:state (update-in inst1 [:diagnostics :policy-rejected] (fnil inc 0))
-                                     :applied? false
-                                     :error :invalid-policy-update
-                                     :effects [diag]})
-                                  (let [new-anchors (set (map normalize-hex (get-in merged-pol [:subnet/gate :gate/trust-anchors] #{})))
-                                        final-pol (cond-> merged-pol
-                                                    (:subnet/genesis-policy-cid policy)
-                                                    (assoc :subnet/genesis-policy-cid (:subnet/genesis-policy-cid policy)))]
-                                    {:state (-> inst2
-                                                (assoc :policy final-pol)
-                                                (update :admitted-members into new-anchors))
-                                     :applied? true
-                                     :effects [{:effect :policy-updated :subnet sid :seq (:pointer/seq valid-ptr)}]})))))))))
+                               :error :invalid-policy-update
+                               :effects [diag]})
+                            (let [blob-read (data/get-blob (get-in inst1 [:data :blobs])
+                                                           (:pointer/target valid-ptr)
+                                                           {:subnet sid :now-ms now-ms})]
+                              (if-not (:hit? blob-read)
+                                {:state (assoc-in inst1 [:data :blobs] (:store blob-read))
+                                 :applied? false
+                                 :error :missing-policy-blob
+                                 :effects (:effects blob-read)}
+                                (let [decoded (try (fressian/decode-wire (get-in blob-read [:blob :blob/bytes]))
+                                                   (catch #?(:clj Exception :cljs :default) _ nil))
+                                      merged-pol (when (map? decoded)
+                                                   (cond-> decoded
+                                                     (:subnet/genesis-policy-cid policy)
+                                                     (dissoc :subnet/genesis-policy-cid)))
+                                      v-pol (validate-subnet-policy merged-pol)]
+                                  (if-not (and (:ok? v-pol) (= sid (:subnet/id merged-pol)))
+                                    (let [diag {:effect :diagnose :reason :invalid-policy-update :subnet sid}]
+                                      {:state (update-in inst1 [:diagnostics :policy-rejected] (fnil inc 0))
+                                       :applied? false
+                                       :error :invalid-policy-update
+                                       :effects [diag]})
+                                    (let [new-anchors (set (map normalize-hex (get-in merged-pol [:subnet/gate :gate/trust-anchors] #{})))
+                                          final-pol (cond-> merged-pol
+                                                      (:subnet/genesis-policy-cid policy)
+                                                      (assoc :subnet/genesis-policy-cid (:subnet/genesis-policy-cid policy)))]
+                                      {:state (-> inst2
+                                                  (assoc :policy final-pol)
+                                                  (update :admitted-members into new-anchors))
+                                       :applied? true
+                                       :effects [{:effect :policy-updated :subnet sid :seq (:pointer/seq valid-ptr)}]}))))))))))
 
                   (let [diag {:effect :diagnose :reason :unknown-subnet-event :subnet sid :event-type etype}]
                     {:state inst1 :applied? false :error :unknown-subnet-event :effects [diag]}))))))))))

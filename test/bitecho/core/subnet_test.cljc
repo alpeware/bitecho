@@ -277,3 +277,75 @@
       (is (= 3 (count (get-in v-hs [:home-set :candidates]))))
       (is (nil? forged-dir) "Forged agent PoP must be rejected by sign-directory-pointer")
       (is (data/has-blob? (get-in routed [:mux :subnets "chat/team" :data :blobs]) (:blob/cid msg-blob))))))
+
+(deftest test-b1-missing-policy-blob-does-not-consume-seq-or-dangle-pointer
+  (testing "B1 regression: publishing subnet/policy Pointer before its target Blob leaves pointer table & seq untouched so retry at same seq succeeds after put-blob"
+    (let [ns1-kp (crypto/generate-keypair)
+          ns2-kp (crypto/generate-keypair)
+          ns3-kp (crypto/generate-keypair)
+          new-member-kp (crypto/generate-keypair)
+          ns1-pub (basalt/bytes->hex (:public ns1-kp))
+          ns2-pub (basalt/bytes->hex (:public ns2-kp))
+          ns3-pub (basalt/bytes->hex (:public ns3-kp))
+          new-pub (basalt/bytes->hex (:public new-member-kp))
+          base-policy {:subnet/id "bitecho.org/infra"
+                       :subnet/parent-id "global"
+                       :subnet/gate {:gate/mode :permissioned
+                                     :gate/admission :allowlist
+                                     :gate/trust-anchors #{ns1-pub ns2-pub ns3-pub}
+                                     :gate/governance {:governance/type :quorum
+                                                       :threshold 2}}
+                       :subnet/path-acl [{:pattern "subnet/policy" :principal {:type :governance}}]
+                       :subnet/economy {:economy/mode :none :burn-floor 0 :settlement-take-bps 0}
+                       :subnet/replication {:replication/pointers :leader-election
+                                            :replication/blobs :eager-push}}
+          gen-cid (subnet/policy-cid base-policy)
+          init-res (subnet/init-subnet-instance (assoc base-policy :subnet/genesis-policy-cid gen-cid) {:now-ms 1000})
+          inst0 (:instance init-res)
+          next-policy (assoc-in base-policy [:subnet/gate :gate/trust-anchors] #{ns1-pub ns2-pub ns3-pub new-pub})
+          next-blob (data/make-blob (fressian/encode-canonical next-policy) "application/fressian")
+          q-proof (data/create-quorum-proof [{:pubkey ns1-pub :privkey (:private ns1-kp)}
+                                             {:pubkey ns2-pub :privkey (:private ns2-kp)}]
+                                            "bitecho.org/infra" "subnet/policy" 1 (:blob/cid next-blob))
+          policy-ptr (data/sign-pointer (:private ns1-kp)
+                                        {:pointer/authority ns1-pub
+                                         :pointer/subnet "bitecho.org/infra"
+                                         :pointer/path "subnet/policy"
+                                         :pointer/seq 1
+                                         :pointer/target (:blob/cid next-blob)
+                                         :pointer/proof q-proof})
+          ;; 1. Publish valid quorum-signed subnet/policy Pointer BEFORE its target Blob is present
+          res-missing (subnet/reduce-subnet inst0 {:type :publish-pointer :sender ns1-pub :pointer policy-ptr :now-ms 1100})
+          inst-after-miss (:state res-missing)
+          ;; 2. Tombstone (:pointer/target nil) on subnet/policy is also rejected without consuming seq
+          tomb-proof (data/create-quorum-proof [{:pubkey ns1-pub :privkey (:private ns1-kp)}
+                                                {:pubkey ns2-pub :privkey (:private ns2-kp)}]
+                                               "bitecho.org/infra" "subnet/policy" 1 nil)
+          tomb-ptr (data/sign-pointer (:private ns1-kp)
+                                      {:pointer/authority ns1-pub
+                                       :pointer/subnet "bitecho.org/infra"
+                                       :pointer/path "subnet/policy"
+                                       :pointer/seq 1
+                                       :pointer/target nil
+                                       :pointer/proof tomb-proof})
+          res-tomb (subnet/reduce-subnet inst-after-miss {:type :publish-pointer :sender ns1-pub :pointer tomb-ptr :now-ms 1150})
+          ;; 3. Deliver target Blob via :put-blob, then re-publish the EXACT SAME Pointer at seq = 1
+          res-put (subnet/reduce-subnet (:state res-tomb) {:type :put-blob :sender ns1-pub :blob next-blob :now-ms 1200})
+          res-retry (subnet/reduce-subnet (:state res-put) {:type :publish-pointer :sender ns1-pub :pointer policy-ptr :now-ms 1250})]
+      (is (false? (:applied? res-missing)))
+      (is (= :missing-policy-blob (:error res-missing)))
+      (is (= :fetch-blob (:effect (first (:effects res-missing)))))
+      (is (= (:blob/cid next-blob) (:cid (first (:effects res-missing)))))
+      (is (= 1 (get-in inst-after-miss [:data :blobs :diagnostics :cache-misses])))
+      (is (nil? (data/resolve-pointer (:data inst-after-miss) "bitecho.org/infra" "subnet/policy"))
+          "Missing policy Blob must never leave a dangling Pointer in the pointer table")
+      (is (false? (data/blob-pinned? (get-in inst-after-miss [:data :blobs]) (:blob/cid next-blob))))
+      (is (= (:policy inst0) (:policy inst-after-miss)))
+      (is (false? (:applied? res-tomb)))
+      (is (= :invalid-policy-update (:error res-tomb)))
+      (is (:applied? res-put))
+      (is (:applied? res-retry) "Re-publishing the same Pointer at seq 1 after put-blob must succeed")
+      (is (= (:blob/cid next-blob)
+             (:pointer/target (data/resolve-pointer (get-in res-retry [:state :data]) "bitecho.org/infra" "subnet/policy"))))
+      (is (data/blob-pinned? (get-in res-retry [:state :data :blobs]) (:blob/cid next-blob)))
+      (is (contains? (get-in res-retry [:state :policy :subnet/gate :gate/trust-anchors]) new-pub)))))
