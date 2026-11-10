@@ -471,6 +471,20 @@
           (when (pos? slen)
             [(max 0 (- total-size slen)) (dec total-size)]))))))
 
+(def default-extension-media-types
+  "Complete set of default extension-derived MIME types returned by `content-type-for-file`."
+  #{"application/gzip"
+    "text/markdown; charset=utf-8"
+    "application/javascript; charset=utf-8"
+    "text/html; charset=utf-8"
+    "text/css; charset=utf-8"
+    "application/json; charset=utf-8"
+    "application/xml; charset=utf-8"
+    "text/plain; charset=utf-8"
+    "application/x-shellscript; charset=utf-8"
+    "application/java-archive"
+    "application/octet-stream"})
+
 (defn- content-type-for-file
   [name-str]
   (let [l (str/lower-case (or name-str ""))]
@@ -647,17 +661,10 @@
                                       (when-let [^File df (:file resolved)] (.getName df))
                                       (get-in req [:request/uri :path]))
                     path-ct (content-type-for-file fallback-name)
-                    default-ext-cts #{"text/html; charset=utf-8"
-                                      "text/markdown; charset=utf-8"
-                                      "application/json; charset=utf-8"
-                                      "application/javascript; charset=utf-8"
-                                      "text/css; charset=utf-8"
-                                      "text/plain; charset=utf-8"
-                                      "application/octet-stream"}
                     ct (cond
                          (and (string? raw-ct)
                               (not (str/blank? raw-ct))
-                              (not (contains? default-ext-cts raw-ct)))
+                              (not (contains? default-extension-media-types raw-ct)))
                          raw-ct
 
                          (not= path-ct "application/octet-stream")

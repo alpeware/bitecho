@@ -20,7 +20,16 @@
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
                :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
-            [clojure.test.check.properties :as prop]))
+            [clojure.test.check.properties :as prop]
+            [datachannel.buffer :as dc-buf]
+            [datachannel.core :as dc-core]
+            [datachannel.dcep :as dc-dcep]
+            [datachannel.dtls :as dc-dtls]
+            [datachannel.sctp :as dc-sctp]
+            [datachannel.sdp :as dc-sdp]
+            [datachannel.stun :as dc-stun]
+            [datachannel.tcp :as dc-tcp]
+            [datachannel.turn :as dc-turn]))
 
 (defn- make-peer [i]
   (let [kp (crypto/generate-keypair)
@@ -421,3 +430,76 @@
         (is (false? (:ok? res)))
         (is (= :missing-seal-fn (:error res)))
         (is (= :seal-and-emit-missing-seal-fn (get-in res [:diagnose :reason])))))))
+
+(defspec ^{:doc "Property: M2a state.fressian encode-light-state / decode-light-state round-trips cleanly across JVM and CLJS while stripping sensitive/transient keys."}
+  prop-light-state-fressian-persistence-roundtrip 30
+  (prop/for-all [epoch (gen/choose 1 10000)
+                 bal (gen/choose 0 1000000)
+                 burned (gen/choose 0 50000)
+                 autonomous? gen/boolean
+                 session-id (gen/fmap #(str "sess-" %) (gen/choose 1 9999))]
+                (let [kp (crypto/generate-keypair)
+                      pub-hex (basalt/bytes->hex (:public kp))
+                      base-st (-> (light-core/init-light-state {:pubkey-hex pub-hex
+                                                                :fingerprint "AA:BB:CC"}
+                                                               {:epoch epoch
+                                                                :autonomous? autonomous?})
+                                  (assoc :account {:balance bal :spendable bal :seq 3 :finalized-epoch epoch})
+                                  (assoc-in [:local-accounting :burned-ech] burned)
+                                  (assoc-in [:sessions session-id] {:session-id session-id
+                                                                    :peer pub-hex
+                                                                    :state :established
+                                                                    :ephemeral-priv (:private kp)})
+                                  (assoc :connected? true
+                                         :connection-error "transient-err"
+                                         :conn-diagnostics {:phase :live :generation 4}))
+                      encoded (light-core/encode-light-state base-st)
+                      decoded (light-core/decode-light-state encoded)]
+                  (and (= pub-hex (:pubkey decoded))
+                       (= epoch (:epoch decoded))
+                       (= autonomous? (:autonomous? decoded))
+                       (= bal (get-in decoded [:account :balance]))
+                       (= burned (get-in decoded [:local-accounting :burned-ech]))
+                       (= :established (get-in decoded [:sessions session-id :state]))
+                       (nil? (get-in decoded [:sessions session-id :ephemeral-priv]))
+                       (not (contains? decoded :connected?))
+                       (not (contains? decoded :connection-error))
+                       (not (contains? decoded :conn-diagnostics))))))
+
+(deftest m2a-datachannel-cljc-portability-test
+  (testing "M2a: clj-datachannel .cljc Sans-IO core and IDtlsEngine run identically on JVM and Node.js inside Bitecho"
+    (let [fp-b "FF:EE:DD:CC:BB:AA:00:99:88:77:66:55:44:33:22:11:FF:EE:DD:CC:BB:AA:00:99:88:77:66:55:44:33:22:11"
+          mock-engine (reify dc-dtls/IDtlsEngine
+                        (begin-handshake! [_] nil)
+                        (handshake-finished? [_] true)
+                        (handshake-step [_ _] {:status :finished :finished? true :packets [] :app-data dc-buf/empty-bytes})
+                        (wrap-app-data [_ plain] {:status :ok :bytes (dc-buf/to-bytes plain)})
+                        (unwrap-packet [_ net] {:status :ok :bytes (dc-buf/to-bytes net)})
+                        (peer-fingerprint [_] fp-b))
+          conn (dc-core/create-connection {:ice-ufrag "u1"
+                                           :ice-pwd "p1234567890123456789012"
+                                           :remote-fingerprint fp-b
+                                           :dtls/engine mock-engine}
+                                          true)
+          cand (dc-sdp/format-candidate {:foundation "1" :component 1 :transport "UDP" :ip "127.0.0.1" :port 5010 :type "host"})
+          parsed-cand (dc-sdp/parse-candidate cand)
+          dcep-bytes (dc-dcep/encode-message {:type :open :label "bitecho" :protocol "fressian-v1" :ordered true})
+          dcep-msg (dc-dcep/decode-message dcep-bytes)
+          sctp-buf (dc-buf/allocate-buffer 256)
+          _ (dc-sctp/encode-packet {:src-port 5000 :dst-port 5000 :verification-tag 42
+                                    :chunks [{:type :cookie-ack}]}
+                                   sctp-buf {:zero-checksum? false})
+          _ (dc-buf/buf-flip! sctp-buf)
+          decoded-sctp (dc-sctp/decode-packet sctp-buf)
+          stun-req (dc-stun/make-binding-request "u1" "u2" "secretPassword1234567890")
+          turn-tc (dc-turn/init-turn-client {:username "u" :password "p"})
+          framed (dc-tcp/encode-rfc4571-frame (dc-buf/utf8->bytes "hello-rfc4571"))
+          deframed (dc-tcp/decode-rfc4571-stream dc-buf/empty-bytes framed)]
+      (is (true? (dc-dtls/verify-peer-fingerprint mock-engine fp-b)))
+      (is (= "u1" (:ice-ufrag conn)))
+      (is (= 5010 (:port parsed-cand)))
+      (is (= "bitecho" (:label dcep-msg)))
+      (is (= 42 (:verification-tag decoded-sctp)))
+      (is (pos? (dc-buf/buf-remaining stun-req)))
+      (is (= :idle (:state turn-tc)))
+      (is (= "hello-rfc4571" (dc-buf/bytes->utf8 (first (:frames deframed))))))))

@@ -616,13 +616,14 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 2. **Bitecho Facade & Dependency Switch (`deps.edn`, `src/bitecho/fressian.cljc`)**:
    - Replaced `org.clojure/data.fressian` in `bitecho/deps.edn` production `:deps` with `alpeware/clj-fressian` (keeping `org.clojure/data.fressian` in `:test` `:extra-deps` only), and refactored `src/bitecho/fressian.cljc` into a clean facade delegating core serialization and `BTEC` LZ4 framing to `fressian.core` and `fressian.lz4` while preserving Bitecho's `strip-untrusted-crypto-tags`, canonical signing-byte helpers, and legacy Nippy rolling-upgrade fallback.
 
-#### Step 14A (M2a) — `.cljc` Port of `clj-datachannel` Sans-IO Core & Cross-Platform `state.fressian` Persistence
-1. **Portable Sans-IO `clj-datachannel` Core**:
-   - Port the pure state-machine namespaces in `clj-datachannel` (`core`, `sctp`, `chunks`, `dcep`, `packetize`, `reassemble`, `sdp`, `stun`, `turn`, `tcp` RFC 4571 framing, `handlers`) from `.clj` to `.cljc` using a portable byte/buffer abstraction (`byte[]`/`ByteBuffer` on JVM, `Uint8Array`/`Buffer` on Node.js).
-2. **`IDtlsEngine` Protocol Extraction**:
-   - Decouple `datachannel.core` and `datachannel.handlers` from `javax.net.ssl.SSLEngine` via a pure-friendly `IDtlsEngine` boundary protocol (`handshake-step`, `wrap-app-data`, `unwrap-packet`, `peer-fingerprint`).
+#### Step 14A (M2a) — `.cljc` Port of `clj-datachannel` Sans-IO Core & Cross-Platform `state.fressian` Persistence — **`[BUILT & VERIFIED]`**
+1. **Portable Sans-IO `clj-datachannel` Core (`a6a3238f1499dce28ca930d18ed34d5173d61e50`)**:
+   - Ported all 12 pure state-machine and codec namespaces in `clj-datachannel` (`core`, `sctp`, `chunks`, `dcep`, `packetize`, `reassemble`, `sdp`, `stun`, `turn`, `tcp` RFC 4571 framing & HTTP CONNECT codec, `dtls`, `handlers`) from `.clj` to `.cljc` backed by the new cross-platform `datachannel.buffer` (`IBinaryBuffer` extended to `java.nio.ByteBuffer` on JVM and `JsBinaryBuffer` over `Uint8Array`/`DataView` on Node.js, plus portable IEEE CRC32, Castagnoli CRC32C, HMAC-SHA1/SHA256, MD5, Base64, and socket address normalization).
+2. **`IDtlsEngine` Protocol Extraction (`src/datachannel/dtls.cljc`)**:
+   - Decoupled `datachannel.core` and `datachannel.handlers` from `javax.net.ssl.SSLEngine` via the cross-platform `IDtlsEngine` protocol (`begin-handshake!`, `handshake-finished?`, `handshake-step`, `wrap-app-data`, `unwrap-packet`, `peer-fingerprint`), with `SSLEngine` extending `IDtlsEngine` on the JVM and pure/Node engines implementing `IDtlsEngine` across JVM and CLJS.
 3. **Cross-Platform Light-Node State Persistence (`state.fressian`)**:
-   - Add cross-platform state persistence using `bitecho.fressian` (already zero-dependency `.cljc`) writing `state.fressian` on both JVM and Node.js while retaining transparent fallback read support for legacy `state.nippy` on the JVM.
+   - Added pure cross-platform `strip-sensitive-keys`, `encode-light-state`, and `decode-light-state` in `src/bitecho/light_node/core.cljc` using `bitecho.fressian`, and updated `src/bitecho/shell/light_node.clj` (`save-light-state!`, `load-light-state!`, `run-serve!`, `run-one-shot!`) to persist `state.fressian` by default while transparently migrating legacy `state.nippy` files on read.
+   - Also closed carried review flag `R2` (`default-extension-media-types` in `src/bitecho/shell/http.clj` enumerating all 11 MIME types produced by `content-type-for-file`).
 
 #### Step 14B (M2b) — Node.js DTLS Spike/Engine, UDP + TCP/`HTTP CONNECT` Boundary, & Standalone Bundle
 1. **Node.js DTLS 1.2 Decision Spike & Implementation**:

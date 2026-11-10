@@ -2192,4 +2192,39 @@
           (doseq [f (reverse (file-seq (.toFile temp-dir)))]
             (.delete f)))))))
 
+(deftest test-m2a-state-fressian-and-legacy-nippy-migration
+  (testing "M2a: state.fressian is written by default and legacy state.nippy is transparently migrated on load"
+    (let [temp-dir (Files/createTempDirectory "bitecho-m2a-state-" (into-array FileAttribute []))
+          state-dir (str temp-dir)
+          fressian-file (str (io/file state-dir "state.fressian"))
+          nippy-file (str (io/file state-dir "state.nippy"))
+          identity (light-shell/load-or-create-light-identity! state-dir)
+          st0 (-> (light-core/init-light-state identity {:epoch 77 :autonomous? false})
+                  (assoc-in [:local-accounting :burned-ech] 1500)
+                  (assoc :connected? true :connection-error "should-be-stripped"))]
+      (try
+        ;; 1. Write legacy Nippy bytes directly to state.nippy
+        (Files/write (.toPath (io/file nippy-file))
+                     ^bytes (nippy/freeze (light-shell/strip-sensitive-keys st0))
+                     (into-array java.nio.file.OpenOption []))
+        ;; 2. Loading state.fressian transparently falls back to legacy state.nippy
+        (let [migrated (light-shell/load-light-state! fressian-file)]
+          (is (some? migrated))
+          (is (= 77 (:epoch migrated)))
+          (is (= 1500 (get-in migrated [:local-accounting :burned-ech])))
+          (is (not (contains? migrated :connected?))))
+        ;; 3. Saving to state.fressian writes canonical Fressian bytes (non-NPY header)
+        (light-shell/save-light-state! fressian-file (assoc st0 :epoch 88))
+        (is (.exists (io/file fressian-file)))
+        (let [raw-bytes (Files/readAllBytes (.toPath (io/file fressian-file)))
+              reloaded (light-shell/load-light-state! fressian-file)]
+          (is (not (and (= 78 (aget raw-bytes 0))
+                        (= 80 (aget raw-bytes 1))
+                        (= 89 (aget raw-bytes 2)))))
+          (is (= 88 (:epoch reloaded)))
+          (is (= 88 (:epoch (light-core/decode-light-state raw-bytes)))))
+        (finally
+          (doseq [f (reverse (file-seq (.toFile temp-dir)))]
+            (.delete f)))))))
+
 

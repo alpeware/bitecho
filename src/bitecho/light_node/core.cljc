@@ -56,6 +56,27 @@
   [payload-bytes]
   (fressian/decode-wire payload-bytes))
 
+(defn strip-sensitive-keys
+  "Pure helper to remove ephemeral private keys from session state prior to persistence,
+   and dissoc transient runtime connection liveness keys so persisted state never includes them."
+  [state]
+  (let [clean-sessions (into {} (for [[sid s] (:sessions state)]
+                                  [sid (dissoc s :ephemeral-priv)]))]
+    (-> state
+        (assoc :sessions clean-sessions)
+        (dissoc :connected? :connection-error :conn-diagnostics))))
+
+(defn encode-light-state
+  "Serializes sanitized light-node state into cross-platform Fressian bytes (`state.fressian`)."
+  [state]
+  (fressian/encode-wire-uncompressed (strip-sensitive-keys state)))
+
+(defn decode-light-state
+  "Deserializes light-node state from Fressian bytes (`state.fressian`) across JVM and Node.js."
+  [state-bytes]
+  (when (and state-bytes (pos? (fressian/count-bytes state-bytes)))
+    (fressian/decode-wire state-bytes)))
+
 ;; -----------------------------------------------------------------------------
 ;; Wire Protocol Versioning & Rolling Upgrade Compatibility (FLAG B & Step 9B)
 ;; -----------------------------------------------------------------------------

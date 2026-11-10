@@ -1470,7 +1470,21 @@
               (finally
                 (infra/stop-subnet-runtime! rt2)))))
         (finally
-          (delete-dir-recursive! tmp-dir))))))
+          (delete-dir-recursive! tmp-dir))))
+    (testing "R2: default-extension-media-types enumerates all 11 MIME outputs of content-type-for-file"
+      (is (= 11 (count http-shell/default-extension-media-types)))
+      (doseq [expected ["application/gzip"
+                        "text/markdown; charset=utf-8"
+                        "application/javascript; charset=utf-8"
+                        "text/html; charset=utf-8"
+                        "text/css; charset=utf-8"
+                        "application/json; charset=utf-8"
+                        "application/xml; charset=utf-8"
+                        "text/plain; charset=utf-8"
+                        "application/x-shellscript; charset=utf-8"
+                        "application/java-archive"
+                        "application/octet-stream"]]
+        (is (contains? http-shell/default-extension-media-types expected))))))
 
 (deftest test-fc2-dtls-mismatch-socket-regression
   (testing "F-C2: DTLS fingerprint mismatch over UDP triggers :on-error -> counted :peer-dtls-error diagnostic"

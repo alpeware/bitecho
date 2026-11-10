@@ -28,13 +28,9 @@
 
 (defn strip-sensitive-keys
   "Pure helper to remove ephemeral private keys from session state prior to persistence,
-   and dissoc transient runtime connection liveness keys so state.nippy never persists them."
+   and dissoc transient runtime connection liveness keys so state.fressian never persists them."
   [state]
-  (let [clean-sessions (into {} (for [[sid s] (:sessions state)]
-                                  [sid (dissoc s :ephemeral-priv)]))]
-    (-> state
-        (assoc :sessions clean-sessions)
-        (dissoc :connected? :connection-error :conn-diagnostics))))
+  (light-core/strip-sensitive-keys state))
 
 (defn- extract-flag-value
   "Extracts the value following a flag from an argument vector."
@@ -325,41 +321,77 @@
 
 (defonce ^:private light-state-save-lock (Object.))
 
+(defn- write-state-bytes-atomic!
+  [^java.io.File target-file ^bytes encoded-bytes]
+  (let [dir (or (.getParentFile target-file) (io/file "."))
+        _ (.mkdirs dir)
+        tmp-file (java.io.File/createTempFile "light-state-" ".tmp" dir)]
+    (try
+      (Files/write (.toPath tmp-file) encoded-bytes (into-array java.nio.file.OpenOption []))
+      (try
+        (Files/setPosixFilePermissions (.toPath tmp-file) (PosixFilePermissions/fromString "rw-------"))
+        (catch UnsupportedOperationException _ nil))
+      (try
+        (Files/move (.toPath tmp-file) (.toPath target-file)
+                    (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                                          StandardCopyOption/REPLACE_EXISTING]))
+        (catch Exception _
+          (Files/move (.toPath tmp-file) (.toPath target-file)
+                      (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+      true
+      (finally
+        (when (.exists tmp-file)
+          (try (.delete tmp-file) (catch Exception _ nil)))))))
+
 (defn save-light-state!
-  "Persists sanitized light-node state via Nippy with atomic move and 0600 permissions."
+  "Persists sanitized light-node state via cross-platform Fressian (`state.fressian`)
+   with atomic move and 0600 permissions."
   [state-file state]
   (when (and (some? state-file) (not (str/blank? (str state-file))))
     (locking light-state-save-lock
       (let [f (io/file state-file)
             dir (or (.getParentFile f) (io/file "."))
-            _ (.mkdirs dir)
-            tmp-file (java.io.File/createTempFile "light-state-" ".tmp" dir)]
-        (try
-          (let [clean-state (strip-sensitive-keys state)
-                frozen (nippy/freeze clean-state)]
-            (Files/write (.toPath tmp-file) ^bytes frozen (into-array java.nio.file.OpenOption []))
-            (try
-              (Files/setPosixFilePermissions (.toPath tmp-file) (PosixFilePermissions/fromString "rw-------"))
-              (catch UnsupportedOperationException _ nil))
-            (try
-              (Files/move (.toPath tmp-file) (.toPath f)
-                          (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
-                                                                StandardCopyOption/REPLACE_EXISTING]))
-              (catch Exception _
-                (Files/move (.toPath tmp-file) (.toPath f)
-                            (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
-            true)
-          (finally
-            (when (.exists tmp-file)
-              (try (.delete tmp-file) (catch Exception _ nil)))))))))
+            encoded (light-core/encode-light-state state)]
+        (write-state-bytes-atomic! f encoded)
+        (cond
+          (= (.getName f) "state.nippy")
+          (write-state-bytes-atomic! (io/file dir "state.fressian") encoded)
+
+          (and (= (.getName f) "state.fressian")
+               (.exists (io/file dir "state.nippy")))
+          (write-state-bytes-atomic! (io/file dir "state.nippy") encoded))
+        true))))
+
+(defn- nippy-bytes?
+  [^bytes b]
+  (and b
+       (>= (alength b) 4)
+       (= 78 (aget b 0))
+       (= 80 (aget b 1))
+       (= 89 (aget b 2))))
 
 (defn load-light-state!
-  "Loads persisted light-node state via Nippy, or nil if file does not exist."
+  "Loads persisted light-node state from `state.fressian` (or transparently migrates legacy
+   `state.nippy` bytes on JVM), returning nil if no state file exists."
   [state-file]
-  (let [f (io/file state-file)]
-    (when (.exists f)
-      (let [b (Files/readAllBytes (.toPath f))]
-        (nippy/thaw b)))))
+  (when (and (some? state-file) (not (str/blank? (str state-file))))
+    (let [f (io/file state-file)
+          dir (or (.getParentFile f) (io/file "."))
+          eff-file (cond
+                     (.exists f) f
+                     (and (= (.getName f) "state.fressian")
+                          (.exists (io/file dir "state.nippy")))
+                     (io/file dir "state.nippy")
+                     (and (= (.getName f) "state.nippy")
+                          (.exists (io/file dir "state.fressian")))
+                     (io/file dir "state.fressian")
+                     :else nil)]
+      (when (and eff-file (.exists eff-file))
+        (let [b (Files/readAllBytes (.toPath eff-file))]
+          (when (pos? (alength b))
+            (if (nippy-bytes? b)
+              (nippy/thaw b)
+              (light-core/decode-light-state b))))))))
 
 (defn load-or-create-light-identity!
   "Loads or creates persistent light-node identity in state-dir.
@@ -1463,7 +1495,7 @@
   "Runs the light node in continuous JSONL serve mode reading STDIN (and optional --cmd-file) and writing STDOUT (and optional --events-out)."
   [opts]
   (let [state-dir (:state-dir opts)
-        state-file (str (io/file state-dir "state.nippy"))
+        state-file (str (io/file state-dir "state.fressian"))
         events-out (:events-out opts)
         cmd-file (:cmd-file opts)
         identity (load-or-create-light-identity! state-dir)
@@ -1599,7 +1631,7 @@
   "Executes a single one-shot light-node command and outputs JSON response."
   [opts]
   (let [state-dir (:state-dir opts)
-        state-file (str (io/file state-dir "state.nippy"))
+        state-file (str (io/file state-dir "state.fressian"))
         identity (load-or-create-light-identity! state-dir)
         bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
         loaded-state (load-light-state! state-file)
