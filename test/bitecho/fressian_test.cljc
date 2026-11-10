@@ -362,7 +362,12 @@
       (is (fressian/btec-compressed-frame? comp-wire))
       (is (< (fressian/count-bytes comp-wire) (fressian/count-bytes uncomp-wire)))
       (is (= large-map (fressian/decode-wire comp-wire)))
-      (is (= large-map (fressian/decode-wire uncomp-wire)))))
+      (is (= large-map (fressian/decode-wire uncomp-wire)))
+      #?(:clj
+         (let [bigint-map {:type :bigint-check :val 123N :huge -999999999999999999999999999999N}
+               bigint-wire (fressian/encode-wire bigint-map)]
+           (is (= bigint-map (fressian/decode-wire bigint-wire)))
+           (is (= bigint-map (fressian/decode (fressian/encode-canonical bigint-map))))))))
 
   (testing "Fail-closed rejection of unknown compression tag, > 1 MiB decompressed size, and truncated/corrupt BTEC frames"
     ;; 1. Unknown tag 0x02 (GZIP dropped / reserved) fails closed

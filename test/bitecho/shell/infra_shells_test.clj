@@ -1404,9 +1404,16 @@
                                                 :node-privkey (:privkey-bytes id)})]
           (infra/migrate-clj-web-state! rt1 cfg)
           ;; Also publish a Blob with explicit "application/octet-stream" media-type at "web/raw-doc.md"
-          (let [oct-blob (data/make-blob "# Fallback Markdown\n" "application/octet-stream")]
+          ;; and a custom stored media-type ("application/vnd.bitecho+json") at "web/custom.json" (L-F1)
+          (let [oct-blob (data/make-blob "# Fallback Markdown\n" "application/octet-stream")
+                custom-blob (data/make-blob "{\"custom\":true}\n" "application/vnd.bitecho+json")]
             (infra/publish-blob-and-pointer! rt1 {:blob oct-blob
                                                   :path "web/raw-doc.md"
+                                                  :seq 1
+                                                  :authority-pubkey (:pubkey-hex id)
+                                                  :authority-privkey (:privkey-bytes id)})
+            (infra/publish-blob-and-pointer! rt1 {:blob custom-blob
+                                                  :path "web/custom.json"
                                                   :seq 1
                                                   :authority-pubkey (:pubkey-hex id)
                                                   :authority-privkey (:privkey-bytes id)}))
@@ -1439,7 +1446,12 @@
                                            {:request/method :GET
                                             :request/uri {:path "/raw-doc.md"}
                                             :request/headers {}}
-                                           (System/currentTimeMillis))]
+                                           (System/currentTimeMillis))
+                    res-custom (serve-fn cfg (:shell-atom rt2) rt2
+                                         {:request/method :GET
+                                          :request/uri {:path "/custom.json"}
+                                          :request/headers {}}
+                                         (System/currentTimeMillis))]
                 (is (= 200 (:response/status res-root)))
                 (is (= "text/markdown; charset=utf-8" (get-in res-root [:response/headers "Content-Type"]))
                     "Root / (web/index.md) hydrated from disk after restart returns text/markdown; charset=utf-8")
@@ -1451,7 +1463,10 @@
                     "/ONBOARDING.md hydrated from disk after restart returns text/markdown; charset=utf-8")
                 (is (= 200 (:response/status res-fallback)))
                 (is (= "text/markdown; charset=utf-8" (get-in res-fallback [:response/headers "Content-Type"]))
-                    "Blob with :blob/media-type application/octet-stream falls back to content-type-for-file on pointer path"))
+                    "Blob with :blob/media-type application/octet-stream falls back to content-type-for-file on pointer path")
+                (is (= 200 (:response/status res-custom)))
+                (is (= "application/vnd.bitecho+json" (get-in res-custom [:response/headers "Content-Type"]))
+                    "L-F1: Custom stored :blob/media-type is preserved on paths with known extensions"))
               (finally
                 (infra/stop-subnet-runtime! rt2)))))
         (finally
