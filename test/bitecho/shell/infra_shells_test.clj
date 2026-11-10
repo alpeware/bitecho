@@ -1473,6 +1473,8 @@
           (delete-dir-recursive! tmp-dir))))
     (testing "R2 & M2a-3: default-extension-media-types and content-type-for-file are derived from extension->media-type without drift"
       (is (= 11 (count http-shell/default-extension-media-types)))
+      (is (= (into #{"application/octet-stream"} (map second http-shell/extension->media-type))
+             http-shell/default-extension-media-types))
       (doseq [[ext expected-mt] http-shell/extension->media-type]
         (let [actual (http-shell/content-type-for-file (str "sample-file" ext))]
           (is (= expected-mt actual))
@@ -1480,19 +1482,7 @@
       (is (= "text/plain; charset=utf-8" (http-shell/content-type-for-file "HEAD")))
       (is (contains? http-shell/default-extension-media-types (http-shell/content-type-for-file "HEAD")))
       (is (= "application/octet-stream" (http-shell/content-type-for-file "unknown.bin")))
-      (is (contains? http-shell/default-extension-media-types (http-shell/content-type-for-file "unknown.bin")))
-      (doseq [expected ["application/gzip"
-                        "text/markdown; charset=utf-8"
-                        "application/javascript; charset=utf-8"
-                        "text/html; charset=utf-8"
-                        "text/css; charset=utf-8"
-                        "application/json; charset=utf-8"
-                        "application/xml; charset=utf-8"
-                        "text/plain; charset=utf-8"
-                        "text/x-shellscript; charset=utf-8"
-                        "application/java-archive"
-                        "application/octet-stream"]]
-        (is (contains? http-shell/default-extension-media-types expected))))))
+      (is (contains? http-shell/default-extension-media-types (http-shell/content-type-for-file "unknown.bin"))))))
 
 (deftest test-fc2-dtls-mismatch-socket-regression
   (testing "F-C2: DTLS fingerprint mismatch over UDP triggers :on-error -> counted :peer-dtls-error diagnostic"

@@ -36,9 +36,9 @@ fi
 
 normalize_bundle() {
   local bundle_file="$1"
-  python3 -c "
-import re
-path = '$bundle_file'
+  python3 - "$bundle_file" <<'PY'
+import re, sys, zlib
+path = sys.argv[1]
 with open(path, 'r', encoding='utf-8') as f:
     content = f.read()
 
@@ -46,9 +46,9 @@ dyn_map = {}
 def repl_dyn(m):
     orig = m.group(0)
     if orig not in dyn_map:
-        dyn_map[orig] = f'\$dyn_{len(dyn_map) + 1}'
+        dyn_map[orig] = f'$dyn_{len(dyn_map) + 1}'
     return dyn_map[orig]
-content = re.sub(r'\\\$dyn_[0-9]+', repl_dyn, content)
+content = re.sub(r'\$dyn_[0-9]+', repl_dyn, content)
 
 gen_map = {}
 def repl_gen(m):
@@ -57,11 +57,25 @@ def repl_gen(m):
     if orig not in gen_map:
         gen_map[orig] = f'{prefix}{len(gen_map) + 1}'
     return gen_map[orig]
-content = re.sub(r'(map__|p__|vec__|seq__|first__|G__|t_cljs\\\$core|meta)[0-9]+', repl_gen, content)
+content = re.sub(r'(map__|p__|vec__|seq__|first__|G__|t_(?:[A-Za-z0-9_]+\$)+(?!dyn_)[A-Za-z_]+|meta)[0-9]+', repl_gen, content)
+
+def repl_sym_hash(m):
+    ws = m.group(1)
+    sym = m.group(2)
+    h = zlib.crc32(sym.encode('utf-8'))
+    if h >= 0x80000000:
+        h -= 0x100000000
+    return f'new cljs.core.Symbol(null,{ws}"{sym}","{sym}",{h},null)'
+
+content = re.sub(
+    r'new cljs\.core\.Symbol\(null,(\s*)"((?:map__|p__|vec__|seq__|first__|G__|t_(?:[A-Za-z0-9_]+\$)+(?!dyn_)[A-Za-z_]+|meta)[0-9]+)","\2",-?[0-9]+,null\)',
+    repl_sym_hash,
+    content
+)
 
 with open(path, 'w', encoding='utf-8') as f:
     f.write(content)
-"
+PY
 }
 
 normalize_bundle "dist/bitecho-light-node.cjs"
@@ -100,7 +114,7 @@ fi
 TMP_STATE_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_STATE_DIR}"' EXIT
 
-SMOKE_OUT=$("${NODE_BIN}" "dist/bitecho-light-node.cjs" identity --state-dir "${TMP_STATE_DIR}" --bootstrap "devnet/bootstrap.txt")
+SMOKE_OUT=$("${NODE_BIN}" "dist/bitecho-light-node.cjs" identity --state-dir "${TMP_STATE_DIR}")
 echo "Smoke check output: ${SMOKE_OUT}"
 if [[ "${SMOKE_OUT}" != *'"ok":true'* || "${SMOKE_OUT}" != *'"pubkey":'* ]]; then
   echo "ERROR: Smoke check failed for dist/bitecho-light-node.cjs!" >&2
