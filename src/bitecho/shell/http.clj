@@ -12,6 +12,7 @@
      `206 Partial Content`, gzip compression, and zero-heap `FileChannel` streaming via `bitecho.shell.blob-fs` (Gap G6).
    - Hot-reloadable X.509 TLS manager integrated with `\"tls/current-cert\"` follower replication."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.protocol.acme :as acme-proto]
             [bitecho.core.protocol.dns :as dns-proto]
             [bitecho.core.subnet :as subnet]
             [bitecho.fressian :as fressian]
@@ -66,6 +67,24 @@
        {:certificate cert
         :certificates [cert]
         :private-key priv-key
+        :expires-at (.getTime (.getNotAfter cert))
+        :self-signed? true}))))
+
+(defn generate-ed25519-client-cert
+  "Generates a self-signed Ed25519 X.509 client certificate whose `SubjectPublicKeyInfo` is an exact
+   44-byte (`88`-hex) Bitecho Ed25519 public key (UNIFICATION.md §6 Instance #5 mTLS + DAC)."
+  ([common-name] (generate-ed25519-client-cert common-name 30))
+  ([common-name validity-days]
+   (let [c (sun.security.tools.keytool.CertAndKeyGen. "Ed25519" "Ed25519")
+         validity-secs (* (long (or validity-days 30)) 86400)]
+     (.generate c 255)
+     (let [cert (.getSelfCertificate c (sun.security.x509.X500Name. (str "CN=" common-name)) validity-secs)
+           priv-key (.getPrivateKey c)
+           spki-hex (str/lower-case (basalt/bytes->hex (.getEncoded (.getPublicKey cert))))]
+       {:certificate cert
+        :certificates [cert]
+        :private-key priv-key
+        :pubkey-hex spki-hex
         :expires-at (.getTime (.getNotAfter cert))
         :self-signed? true}))))
 
@@ -327,12 +346,19 @@
                               [(keyword "header" (str/lower-case k)) (vec v)]))
                        (.getRequestHeaders exchange))
          host-hdr (first (get headers :header/host))
-         host (if host-hdr (str/lower-case (first (str/split host-hdr #":"))) "localhost")]
+         host (if host-hdr (str/lower-case (first (str/split host-hdr #":"))) "localhost")
+         dac-hdr (first (get headers :header/x-bitecho-dac))
+         parsed-dac (when (and (string? dac-hdr) (not (str/blank? dac-hdr)))
+                      (try
+                        (let [d (fressian/decode-wire (acme-proto/base64url-decode (str/trim dac-hdr)))]
+                          (when (map? d) d))
+                        (catch Exception _ nil)))]
      {:request/method method
       :request/uri {:scheme scheme :host host :path path :query query}
       :request/headers headers
       :request/remote-ip remote-ip
       :request/mtls-pubkey (extract-mtls-client-pubkey exchange)
+      :request/dac parsed-dac
       :request/exchange exchange})))
 
 (defn send-response
@@ -445,6 +471,83 @@
           (when (pos? slen)
             [(max 0 (- total-size slen)) (dec total-size)]))))))
 
+(defn- content-type-for-file
+  [name-str]
+  (let [l (str/lower-case (or name-str ""))]
+    (cond
+      (or (str/ends-with? l ".tar.gz") (str/ends-with? l ".tgz")) "application/gzip"
+      (str/ends-with? l ".md") "text/markdown; charset=utf-8"
+      (or (str/ends-with? l ".js") (str/ends-with? l ".mjs")) "application/javascript; charset=utf-8"
+      (or (str/ends-with? l ".html") (str/ends-with? l ".htm")) "text/html; charset=utf-8"
+      (str/ends-with? l ".css") "text/css; charset=utf-8"
+      (str/ends-with? l ".json") "application/json; charset=utf-8"
+      (or (str/ends-with? l ".xml") (str/ends-with? l ".pom")) "application/xml; charset=utf-8"
+      (or (str/ends-with? l ".clj") (str/ends-with? l ".cljc") (str/ends-with? l ".cljs")
+          (str/ends-with? l ".edn") (str/ends-with? l ".txt") (str/ends-with? l ".sha1")
+          (str/ends-with? l ".sha256") (str/ends-with? l ".sri") (= l "head")) "text/plain; charset=utf-8"
+      (str/ends-with? l ".sh") "text/x-shellscript; charset=utf-8"
+      (str/ends-with? l ".jar") "application/java-archive"
+      :else "application/octet-stream")))
+
+(defn- sha256-file-hex
+  [^File f]
+  (let [md (java.security.MessageDigest/getInstance "SHA-256")
+        buf (byte-array 65536)]
+    (with-open [is (io/input-stream f)]
+      (loop []
+        (let [n (.read is buf)]
+          (when (pos? n)
+            (.update md buf 0 n)
+            (recur)))))
+    (str/lower-case (basalt/bytes->hex (.digest md)))))
+
+(defn- resolve-safe-content-root
+  "Safely resolves `req-path` under `content-root` (blocking `\\u0000`, `..`, dotfiles, and canonical
+   symlink escapes). Used for zero-copy static/git-pack fallback during Phase C `ns1..ns3` cutover."
+  [content-root req-path]
+  (try
+    (let [raw (or req-path "/")]
+      (if (str/includes? raw "\u0000")
+        {:ok? false :error :forbidden}
+        (let [decoded (try (java.net.URLDecoder/decode raw StandardCharsets/UTF_8) (catch Exception _ nil))]
+          (if (or (nil? decoded) (str/includes? decoded "\u0000"))
+            {:ok? false :error :forbidden}
+            (let [segs (remove str/blank? (str/split (first (str/split decoded #"\?")) #"[/\\]"))]
+              (if (some #(or (= % "..") (and (str/starts-with? % ".") (not= % "."))) segs)
+                {:ok? false :error :forbidden}
+                (let [root-f (io/file content-root)]
+                  (if-not (.exists root-f)
+                    {:ok? false :error :not-found}
+                    (let [root-p (.toRealPath (.toPath root-f) (into-array java.nio.file.LinkOption []))
+                          cand-p (.normalize (.resolve root-p (str/join File/separator segs)))]
+                      (if-not (.startsWith cand-p root-p)
+                        {:ok? false :error :forbidden}
+                        (let [cand-f (.toFile cand-p)]
+                          (if-not (.exists cand-f)
+                            {:ok? false :error :not-found}
+                            (let [real-p (.toRealPath cand-p (into-array java.nio.file.LinkOption []))]
+                              (if-not (.startsWith real-p root-p)
+                                {:ok? false :error :forbidden}
+                                (let [^File rf (.toFile real-p)
+                                      target-f (cond
+                                                 (not (.isDirectory rf)) rf
+                                                 (.exists (io/file rf "index.html")) (io/file rf "index.html")
+                                                 (.exists (io/file rf "index.md")) (io/file rf "index.md")
+                                                 :else nil)]
+                                  (if-not target-f
+                                    {:ok? false :error :not-found}
+                                    (let [cid (sha256-file-hex target-f)
+                                          ct (content-type-for-file (.getName target-f))
+                                          bs (when (<= (.length target-f) 2097152)
+                                               (Files/readAllBytes (.toPath target-f)))]
+                                      {:ok? true
+                                       :file target-f
+                                       :blob {:blob/cid cid
+                                              :blob/media-type ct
+                                              :blob/bytes bs}})))))))))))))))))
+    (catch Exception _
+      {:ok? false :error :not-found})))
+
 (defn- sanitize-web-subpath
   [raw-path]
   (when-not (str/includes? (or raw-path "") "\u0000")
@@ -456,25 +559,30 @@
             (str/join "/" segs)))))))
 
 (defn- resolve-web-blob!
-  [rt req-path now-ms]
+  [config rt req-path now-ms]
   (if-let [subpath (sanitize-web-subpath req-path)]
-    (if (str/blank? subpath)
-      (let [r1 (infra/resolve-path-blob! rt "web/index.html" now-ms)]
-        (if (:ok? r1)
-          r1
-          (infra/resolve-path-blob! rt "web/index.md" now-ms)))
-      (let [r-direct (infra/resolve-path-blob! rt (str "web/" subpath) now-ms)]
-        (if (:ok? r-direct)
-          r-direct
-          (let [r-idx (infra/resolve-path-blob! rt (str "web/" subpath "/index.html") now-ms)]
-            (if (:ok? r-idx)
-              r-idx
-              (infra/resolve-path-blob! rt (str "web/" subpath "/index.md") now-ms))))))
+    (let [ptr-res (if (str/blank? subpath)
+                    (let [r1 (infra/resolve-path-blob! rt "web/index.html" now-ms)]
+                      (if (:ok? r1)
+                        r1
+                        (infra/resolve-path-blob! rt "web/index.md" now-ms)))
+                    (let [r-direct (infra/resolve-path-blob! rt (str "web/" subpath) now-ms)]
+                      (if (:ok? r-direct)
+                        r-direct
+                        (let [r-idx (infra/resolve-path-blob! rt (str "web/" subpath "/index.html") now-ms)]
+                          (if (:ok? r-idx)
+                            r-idx
+                            (infra/resolve-path-blob! rt (str "web/" subpath "/index.md") now-ms))))))]
+      (if (:ok? ptr-res)
+        ptr-res
+        (if-let [content-root (get-in config [:http :content-root])]
+          (resolve-safe-content-root content-root req-path)
+          ptr-res)))
     {:ok? false :error :forbidden}))
 
 (defn- serve-subnet-request
-  "Evaluates target Subnet `:subnet/gate` (Gap G12) and serves Pointer -> Blob with `ETag: \"<cid>\"`,
-   `304`, `206`, gzip, and Tier-2 zero-heap `blob-fs` file streaming (Gap G6)."
+  "Evaluates target Subnet `:subnet/gate` (Gap G12 & `F-B1`) and serves Pointer -> Blob with `ETag: \"<cid>\"`,
+   `304`, `206`, gzip, and Tier-2 zero-heap `blob-fs` / `content-root` file streaming (Gap G6)."
   [config shell-atom rt req now-ms]
   (let [method (:request/method req)]
     (cond
@@ -482,7 +590,7 @@
       {:response/status 204
        :response/headers {"Access-Control-Allow-Origin" "*"
                           "Access-Control-Allow-Methods" "GET, HEAD, OPTIONS"
-                          "Access-Control-Allow-Headers" "Content-Type, Range, If-None-Match"}
+                          "Access-Control-Allow-Headers" "Content-Type, Range, If-None-Match, X-Bitecho-DAC"}
        :response/body nil}
 
       (not (or (= method :GET) (= method :HEAD)))
@@ -494,17 +602,30 @@
       :else
       (let [inst @(:subnet-atom rt)
             policy (:policy inst)
-            adm (subnet/check-gate-admission policy inst {:type :http-read
-                                                          :mtls-client-pubkey (:request/mtls-pubkey req)
-                                                          :sender (:request/mtls-pubkey req)
-                                                          :now-ms now-ms})]
+            gate (:subnet/gate policy)
+            admission (:gate/admission gate)
+            ;; Public web subnets (:open or cluster-write :allowlist without :gate/private-read?) allow public GET/HEAD;
+            ;; :mtls-cert, :dac, :min-stake, or :gate/private-read? subnets strictly enforce check-gate-admission!
+            requires-read-auth? (or (contains? #{:mtls-cert :dac :min-stake} admission)
+                                    (true? (:gate/private-read? gate)))
+            adm (if-not requires-read-auth?
+                  {:admitted? true}
+                  (subnet/check-gate-admission policy inst
+                                               (cond-> {:type :http-read
+                                                        :mtls-client-pubkey (:request/mtls-pubkey req)
+                                                        ;; Require TLS client-cert possession (:mtls-pubkey) as sender so X-Bitecho-DAC cannot be replayed as a bearer header!
+                                                        :sender (:request/mtls-pubkey req)
+                                                        :now-ms now-ms}
+                                                 (:request/dac req) (assoc :dac (:request/dac req))
+                                                 (some? (infra/current-runtime-epoch rt))
+                                                 (assoc :epoch (infra/current-runtime-epoch rt)))))]
         (if-not (:admitted? adm)
           (do
             (infra/apply-shell-event! shell-atom {:type :drop :reason :http-subnet-gate-denied :detail (:error adm)})
             {:response/status 403
              :response/headers {"Content-Type" "text/plain; charset=utf-8"}
              :response/body "Forbidden: Subnet Gate Denied\n"})
-          (let [resolved (resolve-web-blob! rt (get-in req [:request/uri :path]) now-ms)]
+          (let [resolved (resolve-web-blob! config rt (get-in req [:request/uri :path]) now-ms)]
             (case (:error resolved)
               :forbidden
               (do

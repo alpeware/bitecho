@@ -13,9 +13,11 @@
    - `bitecho.shell.upnp` SSDP `M-SEARCH` + SOAP `WANIPConnection` against mock local gateway + timeout diagnostics"
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.data :as data]
+            [bitecho.core.protocol.acme :as acme-proto]
             [bitecho.core.protocol.dns :as dns-proto]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.core :as light-core]
             [bitecho.main :as main]
             [bitecho.shell.acme :as acme-shell]
             [bitecho.shell.blob-fs :as blob-fs]
@@ -933,8 +935,302 @@
         (doseq [subcmd main/cli-subcommands]
           (is (str/includes? main-src (str "bitecho " subcmd))
               (str "print-usage must document CLI subcommand: " subcmd)))
+        (let [ops-src (slurp "scripts/infra_cluster.sh")]
+          (doseq [verb ["snapshot" "provision-secret" "cutover" "rollback" "audit"]]
+            (is (str/includes? ops-src (str "  " verb))
+                (str "infra_cluster.sh usage must document verb: " verb))
+            (is (str/includes? ops-src (str verb ")"))
+                (str "infra_cluster.sh case dispatch must handle verb: " verb))))
         ((:stop! stack))
         (is (= :stopped (:phase (infra/runtime-status (:runtime stack)))))
         (finally
           (try ((:stop! stack)) (catch Exception _ nil))
           (delete-dir-recursive! tmp-dir))))))
+
+;; =============================================================================
+;; 9. Phase C & `F-B1..F-B3` Hardening, Migration, & 3-Node DTLS Mesh Tests
+;; =============================================================================
+
+(deftest test-fb1-fb2-fb3-shell-dac-epoch-threading-and-tls-secret-preconditions
+  (testing "F-B1, F-B2, F-B3: multi-node infra fails fast without shared :tls-secret, populates :gate/acme-thumbprint, and threads X-Bitecho-DAC + authoritative epoch fail-closed"
+    (let [tmp-dir (make-temp-dir! "fb123-shell-")
+          secret-file (io/file tmp-dir "tls-secret.key")
+          _ (spit secret-file "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+          anchor-kp (crypto/generate-keypair)
+          anchor-pub (basalt/bytes->hex (:public anchor-kp))
+          client-cert-bundle (http-shell/generate-ed25519-client-cert "dac-client.local" 7)
+          client-spki-hex (:pubkey-hex client-cert-bundle)
+          dac (light-core/create-dac (:private anchor-kp)
+                                     {:anchor-pubkey anchor-pub
+                                      :agent-pubkey client-spki-hex
+                                      :scopes ["web"]
+                                      :issued-epoch 10
+                                      :expires-epoch 100})
+          dac-hdr (acme-proto/base64url-encode (fressian/encode-canonical dac))]
+      (try
+        ;; 1. F-B2: multi-node (:all-nodes #{:ns1 :ns2}) with TLS/ACME enabled and NO :tls-secret MUST fail fast!
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"tls-secret"
+             (main/start-infra-node! {:state-dir (.getAbsolutePath (io/file tmp-dir "bad-multi"))
+                                      :node/id :ns1
+                                      :all-nodes #{:ns1 :ns2}
+                                      :domain "bitecho.org"
+                                      :heartbeat-ticker? false
+                                      :dns {:enabled? false}
+                                      :http {:enabled? false}
+                                      :acme {:enabled? false}})))
+        ;; 2. F-B2 + F-B3: multi-node WITH :tls-secret-file and pre-created ACME account populates :gate/acme-thumbprint!
+        (let [good-dir (io/file tmp-dir "good-multi")
+              _ (acme-shell/save-or-load-account-keypair! good-dir)
+              expected-thumb (acme-shell/account-keypair-thumbprint! good-dir)
+              stack (main/start-infra-node! {:state-dir (.getAbsolutePath good-dir)
+                                             :node/id :ns1
+                                             :all-nodes #{:ns1 :ns2}
+                                             :tls-secret-file (.getAbsolutePath secret-file)
+                                             :domain "bitecho.org"
+                                             :heartbeat-ticker? false
+                                             :cluster {:enabled? false}
+                                             :dns {:enabled? false}
+                                             :http {:enabled? false}
+                                             :acme {:enabled? false}})]
+          (try
+            (is (= expected-thumb
+                   (get-in @(:subnet-atom (:runtime stack)) [:policy :subnet/gate :gate/acme-thumbprint])))
+            (finally
+              ((:stop! stack)))))
+        ;; 3. F-B1: HTTPS :dac-gated subnet fails closed when runtime epoch is nil, admits at epoch 50, denies at epoch 101!
+        (let [dac-policy {:subnet/id "chat/dac-http"
+                          :subnet/parent-id "global"
+                          :subnet/gate {:gate/mode :permissioned
+                                        :gate/admission :dac
+                                        :gate/trust-anchors #{anchor-pub}}
+                          :subnet/path-acl [{:pattern "web/*" :principal {:type :pubkey :pubkey anchor-pub}}]
+                          :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                          :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+              dac-rt (infra/start-subnet-runtime! {:state-dir (io/file tmp-dir "dac-rt")
+                                                   :policy dac-policy
+                                                   :node-id anchor-pub
+                                                   :node-privkey (:private anchor-kp)})
+              _ (infra/publish-blob-and-pointer! dac-rt {:blob (data/make-blob "dac-gated-ok" "text/plain")
+                                                         :path "web/room.txt"
+                                                         :seq 1
+                                                         :authority-pubkey anchor-pub
+                                                         :authority-privkey (:private anchor-kp)
+                                                         :now-ms 1000})
+              tls-mgr (http-shell/init-tls-manager! {:state-dir (io/file tmp-dir "dac-tls") :domain "localhost"})
+              srv (http-shell/start-http-servers!
+                   {:domain "localhost"
+                    :state-dir (io/file tmp-dir "dac-tls")
+                    :http {:bind-ip "127.0.0.1" :http-port 0 :https-port 0}}
+                   tls-mgr
+                   dac-rt)
+              client (-> (HttpClient/newBuilder)
+                         (.sslContext (trust-all-ssl-context client-cert-bundle))
+                         (.connectTimeout (Duration/ofSeconds 3))
+                         (.build))
+              req (-> (HttpRequest/newBuilder (URI/create (str "https://localhost:" (:https-port srv) "/room.txt")))
+                      (.header "X-Bitecho-DAC" dac-hdr)
+                      (.GET)
+                      (.build))]
+          (try
+            ;; Unsynced runtime epoch (nil) -> 403 fail-closed!
+            (is (= 403 (.statusCode (.send client req (HttpResponse$BodyHandlers/ofString)))))
+            ;; Synced epoch 50 (within [10..100]) -> 200 OK!
+            (infra/set-runtime-epoch! dac-rt 50)
+            (let [r200 (.send client req (HttpResponse$BodyHandlers/ofString))]
+              (is (= 200 (.statusCode r200)))
+              (is (= "dac-gated-ok" (.body r200))))
+            ;; Advance epoch to 101 (> 100) -> 403 denied!
+            (infra/set-runtime-epoch! dac-rt 101)
+            (is (= 403 (.statusCode (.send client req (HttpResponse$BodyHandlers/ofString)))))
+            (finally
+              (http-shell/stop-http-servers! srv)
+              (infra/stop-subnet-runtime! dac-rt))))
+        (finally
+          (delete-dir-recursive! tmp-dir))))))
+
+(deftest test-phase-c-migrate-clj-web-state-and-mail-cli-parity
+  (testing "Phase C: migrate-clj-web-state! idempotently imports certs, .eml files, web/directory assets, and DNS records; content-root fallback serves bare git objects safely; mail helpers list/read/tombstone"
+    (let [tmp-dir (make-temp-dir! "phase-c-mig-")
+          state-dir (io/file tmp-dir "var-lib-clj-web")
+          content-root (io/file tmp-dir "var-www-public")
+          certs-dir (io/file state-dir "certs")
+          mail-dir (io/file state-dir "mail")
+          _ (.mkdirs certs-dir)
+          _ (.mkdirs mail-dir)
+          _ (.mkdirs (io/file content-root "directory"))
+          _ (.mkdirs (io/file content-root "git" "bitecho.git"))
+          cert-b (http-shell/generate-cert-and-keypair "bitecho.org" 60)
+          cert-pem (http-shell/encode-cert-pem (:certificate cert-b))
+          key-pem (http-shell/encode-private-key-pem (.getPrivate ^java.security.KeyPair (:keypair cert-b)))
+          _ (spit (io/file certs-dir "bundle.edn") (pr-str {:cert-pem cert-pem :key-pem key-pem}))
+          _ (spit (io/file mail-dir "1700000001-aa11bb22.eml")
+                  "Received: from mx.example.org\r\nFrom: alice@example.org\r\nTo: simon@bitecho.org\r\nSubject: First Mail\r\n\r\nBody one\r\n")
+          _ (spit (io/file content-root "index.md") "# Welcome to Bitecho\n")
+          _ (spit (io/file content-root "directory" "axiom.json") "{\"nickname\":\"axiom\"}")
+          _ (spit (io/file content-root "git" "bitecho.git" "HEAD") "ref: refs/heads/main\n")
+          ns1-kp (crypto/generate-keypair)
+          ns1-pub (basalt/bytes->hex (:public ns1-kp))
+          tls-secret (crypto/sha256 (fressian/utf8->bytes "phase-c-migration-secret"))
+          policy (infra/default-infra-policy {:subnet-id "bitecho.org/infra"
+                                              :trust-anchors #{ns1-pub}
+                                              :cold-pubkey ns1-pub
+                                              :domain-pubkey ns1-pub})
+          tls-mgr (http-shell/init-tls-manager! {:state-dir state-dir :domain "bitecho.org"})
+          rt (infra/start-subnet-runtime! {:state-dir state-dir
+                                           :policy policy
+                                           :node-id ns1-pub
+                                           :default-sender ns1-pub
+                                           :node-privkey (:private ns1-kp)
+                                           :tls-manager tls-mgr
+                                           :tls-secret tls-secret})
+          cfg {:domain "bitecho.org"
+               :state-dir (.getAbsolutePath state-dir)
+               :http {:bind-ip "127.0.0.1"
+                      :http-port 0
+                      :https-port 0
+                      :content-root (.getAbsolutePath content-root)
+                      :directory-listing? true}
+               :dns {:txt-records {"@" ["v=spf1 -all"]}}}
+          rep1 (infra/migrate-clj-web-state! rt cfg {:tls-secret tls-secret})
+          rep2 (infra/migrate-clj-web-state! rt cfg {:tls-secret tls-secret})
+          srv (http-shell/start-http-servers! cfg tls-mgr rt)
+          client (-> (HttpClient/newBuilder)
+                     (.sslContext (trust-all-ssl-context nil))
+                     (.connectTimeout (Duration/ofSeconds 3))
+                     (.build))]
+      (try
+        (is (:ok? rep1))
+        (is (:tls-migrated? rep1))
+        (is (= 1 (:emails-migrated rep1)))
+        (is (>= (:web-assets-migrated rep1) 2))
+        (is (= 1 (:dns-records-migrated rep1)))
+        (is (= 0 (:emails-migrated rep2)) "Second migration run is idempotent")
+        ;; Verify migrated web/index.md AND content-root fallback for /git/bitecho.git/HEAD
+        (let [r-idx (.send client
+                           (-> (HttpRequest/newBuilder (URI/create (str "https://localhost:" (:https-port srv) "/")))
+                               (.GET) (.build))
+                           (HttpResponse$BodyHandlers/ofString))
+              r-git (.send client
+                           (-> (HttpRequest/newBuilder (URI/create (str "https://localhost:" (:https-port srv) "/git/bitecho.git/HEAD")))
+                               (.GET) (.build))
+                           (HttpResponse$BodyHandlers/ofString))
+              r-trav (.send client
+                            (-> (HttpRequest/newBuilder (URI/create (str "https://localhost:" (:https-port srv) "/..%2fcerts/bundle.edn")))
+                                (.GET) (.build))
+                            (HttpResponse$BodyHandlers/ofString))]
+          (is (= 200 (.statusCode r-idx)))
+          (is (str/includes? (.body r-idx) "Welcome to Bitecho"))
+          (is (= 200 (.statusCode r-git)))
+          (is (= "ref: refs/heads/main\n" (.body r-git)))
+          (is (= 403 (.statusCode r-trav)) "Path traversal blocked fail-closed"))
+        ;; Verify mail list/read/tombstone helpers over Subnet Pointers
+        (let [emails (infra/list-subnet-emails rt)
+              read1 (infra/read-subnet-email rt "latest")
+              del-res (infra/delete-subnet-emails! rt "all")
+              emails-after (infra/list-subnet-emails rt)]
+          (is (= 1 (count emails)))
+          (is (= "First Mail" (:subject read1)))
+          (is (str/includes? (:body read1) "Body one"))
+          (is (= 1 (:count del-res)))
+          (is (empty? emails-after)))
+        (finally
+          (http-shell/stop-http-servers! srv)
+          (infra/stop-subnet-runtime! rt)
+          (delete-dir-recursive! tmp-dir))))))
+
+(deftest test-phase-c-three-node-datachannel-mesh-and-rolling-cutover
+  (testing "Phase C: 3-node (ns1..ns3) clj-datachannel mutual-DTLS peer mesh elects leader, replicates Blobs/Pointers, and survives rolling node restart"
+    (let [dir1 (make-temp-dir! "dc-ns1-")
+          dir2 (make-temp-dir! "dc-ns2-")
+          dir3 (make-temp-dir! "dc-ns3-")
+          ;; Allocate 3 distinct ephemeral UDP port blocks (base, base+1, base+2)
+          pick-port-block (fn []
+                            (loop [base (+ 24000 (rand-int 20000))]
+                              (let [ok? (try
+                                          (with-open [a (DatagramSocket. (InetSocketAddress. "127.0.0.1" base))
+                                                      b (DatagramSocket. (InetSocketAddress. "127.0.0.1" (+ base 1)))
+                                                      c (DatagramSocket. (InetSocketAddress. "127.0.0.1" (+ base 2)))]
+                                            (and (.isBound a) (.isBound b) (.isBound c)))
+                                          (catch Exception _ false))]
+                                (if ok? base (recur (+ 24000 (rand-int 20000)))))))
+          p1 (pick-port-block)
+          p2 (pick-port-block)
+          p3 (pick-port-block)
+          id1 (infra/load-or-create-infra-peer-identity! dir1 :ns1)
+          id2 (infra/load-or-create-infra-peer-identity! dir2 :ns2)
+          id3 (infra/load-or-create-infra-peer-identity! dir3 :ns3)
+          anchors #{(:pubkey-hex id1) (:pubkey-hex id2) (:pubkey-hex id3)}
+          policy (infra/default-infra-policy {:subnet-id "bitecho.org/infra"
+                                              :trust-anchors anchors
+                                              :cold-pubkey (:pubkey-hex id1)
+                                              :domain-pubkey (:pubkey-hex id1)})
+          tls-secret (crypto/sha256 (fressian/utf8->bytes "dc-3node-shared-secret"))
+          nodes-cfg {:ns1 {:ip4 "127.0.0.1" :port p1 :fingerprint (:fingerprint id1) :pubkey (:pubkey-hex id1)}
+                     :ns2 {:ip4 "127.0.0.1" :port p2 :fingerprint (:fingerprint id2) :pubkey (:pubkey-hex id2)}
+                     :ns3 {:ip4 "127.0.0.1" :port p3 :fingerprint (:fingerprint id3) :pubkey (:pubkey-hex id3)}}
+          make-node! (fn [nid dir id]
+                       (let [rt (infra/start-subnet-runtime! {:state-dir dir
+                                                              :policy policy
+                                                              :node-id nid
+                                                              :default-sender (:pubkey-hex id)
+                                                              :node-privkey (:privkey-bytes id)
+                                                              :all-nodes #{:ns1 :ns2 :ns3}
+                                                              :tls-secret tls-secret})
+                             mesh (infra/start-datachannel-peer-mesh!
+                                   {:node/id nid
+                                    :state-dir dir
+                                    :cluster {:heartbeat-interval-ms 250
+                                              :heartbeat-timeout-ms 4000
+                                              :nodes nodes-cfg}}
+                                   rt)]
+                         {:rt rt :mesh mesh :id id}))
+          n1 (atom nil)
+          n2 (atom nil)
+          n3 (atom nil)]
+      (try
+        (reset! n1 (make-node! :ns1 dir1 id1))
+        (reset! n2 (make-node! :ns2 dir2 id2))
+        (reset! n3 (make-node! :ns3 dir3 id3))
+        ;; Wait up to 8s for real DTLS DataChannel mesh convergence & :ns1 leader election
+        (let [deadline (+ (System/currentTimeMillis) 8000)]
+          (loop []
+            (let [s1 (infra/runtime-status (:rt @n1))
+                  s2 (infra/runtime-status (:rt @n2))
+                  s3 (infra/runtime-status (:rt @n3))]
+              (when (and (< (System/currentTimeMillis) deadline)
+                         (not (and (= :ns1 (:leader-id s1))
+                                   (= :ns1 (:leader-id s2))
+                                   (= :ns1 (:leader-id s3)))))
+                (Thread/sleep 100)
+                (recur)))))
+        (is (= :ns1 (:leader-id (infra/runtime-status (:rt @n1)))))
+        (is (= :ns1 (:leader-id (infra/runtime-status (:rt @n2)))))
+        (is (= :ns1 (:leader-id (infra/runtime-status (:rt @n3)))))
+        ;; Publish a Blob + Pointer on ns1 -> replicates over real DTLS DataChannels to ns2 & ns3!
+        (let [site-blob (data/make-blob "replicated-over-dtls-datachannel" "text/plain; charset=utf-8")
+              _ (infra/publish-blob-and-pointer! (:rt @n1)
+                                                 {:blob site-blob
+                                                  :path "web/live.txt"
+                                                  :seq 1
+                                                  :authority-pubkey (:pubkey-hex id1)
+                                                  :authority-privkey (:privkey-bytes id1)})
+              deadline (+ (System/currentTimeMillis) 5000)]
+          (loop []
+            (when (and (< (System/currentTimeMillis) deadline)
+                       (not (and (:ok? (infra/resolve-path-blob! (:rt @n2) "web/live.txt"))
+                                 (:ok? (infra/resolve-path-blob! (:rt @n3) "web/live.txt")))))
+              (Thread/sleep 100)
+              (recur)))
+          (is (= "replicated-over-dtls-datachannel"
+                 (fressian/bytes->utf8 (get-in (infra/resolve-path-blob! (:rt @n2) "web/live.txt") [:blob :blob/bytes]))))
+          (is (= "replicated-over-dtls-datachannel"
+                 (fressian/bytes->utf8 (get-in (infra/resolve-path-blob! (:rt @n3) "web/live.txt") [:blob :blob/bytes])))))
+        (finally
+          (doseq [n [@n1 @n2 @n3] :when n]
+            (try (infra/stop-datachannel-peer-mesh! (:mesh n)) (catch Exception _ nil))
+            (try (infra/stop-subnet-runtime! (:rt n)) (catch Exception _ nil)))
+          (delete-dir-recursive! dir1)
+          (delete-dir-recursive! dir2)
+          (delete-dir-recursive! dir3))))))

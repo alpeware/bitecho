@@ -22,6 +22,11 @@
   cli-subcommands
   ["run"
    "infra-node"
+   "migrate-infra"
+   "print-fingerprint"
+   "list-mail"
+   "read-mail"
+   "delete-mail"
    "print-identity"
    "gen-keypair"
    "validate-config"
@@ -38,6 +43,11 @@
   (println "Usage:")
   (println "  bitecho run <config.edn>")
   (println "  bitecho infra-node <config.edn>")
+  (println "  bitecho migrate-infra <config.edn>")
+  (println "  bitecho print-fingerprint <config.edn>")
+  (println "  bitecho list-mail <config.edn>")
+  (println "  bitecho read-mail <config.edn> [id|latest]")
+  (println "  bitecho delete-mail <config.edn> [id|latest|all]")
   (println "  bitecho print-identity <config.edn>")
   (println "  bitecho gen-keypair [output-file.edn]")
   (println "  bitecho validate-config <config.edn>")
@@ -47,45 +57,72 @@
   (println "  bitecho sign-directory-pop <dir-identity-dir-or-file> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]")
   (println "  bitecho demo-angels"))
 
-(defn start-infra-node!
-  "Starts a unified `\"bitecho.org/infra\"` edge node stack (`infra` Subnet runtime + `tls-manager`
-   + optional `dns`, `http`, `smtp`, and `acme` boundary shells) from `cfg`."
-  [cfg]
+(defn- build-infra-runtime-from-config!
+  [cfg tls-mgr require-secret?]
   (let [state-dir (or (:state-dir cfg) "data/infra")
         node-id (or (:node/id cfg) (:node-id cfg) :ns1)
-        ident (identity/load-or-create-node-identity! state-dir node-id)
+        ident (infra/load-or-create-infra-peer-identity! state-dir node-id)
         pub-hex (:pubkey-hex ident)
-        priv-bytes (or (get-in ident [:keypair :private])
-                       (basalt/hex->bytes (:privkey-hex ident)))
-        anchors (or (not-empty (set (:trust-anchors cfg))) #{pub-hex})
+        priv-bytes (:privkey-bytes ident)
+        nodes-map (get-in cfg [:cluster :nodes] {})
+        peer-pubs (keep (fn [[_ v]] (:pubkey v)) nodes-map)
+        anchors (set (concat [pub-hex] (:trust-anchors cfg) peer-pubs))
+        all-nodes (or (:all-nodes cfg)
+                      (when (seq nodes-map) (set (keys nodes-map)))
+                      #{node-id})
+        acme-enabled? (boolean (get-in cfg [:acme :enabled?] false))
+        acme-thumb (acme-shell/account-keypair-thumbprint! state-dir acme-enabled?)
         policy (or (:policy cfg)
                    (infra/default-infra-policy {:subnet-id (or (:subnet-id cfg) "bitecho.org/infra")
                                                 :trust-anchors anchors
                                                 :cold-pubkey (or (:cold-pubkey cfg) pub-hex)
-                                                :domain-pubkey (or (:domain-pubkey cfg) pub-hex)}))
-        tls-mgr (http-shell/init-tls-manager! {:state-dir state-dir
-                                               :domain (or (:domain cfg) "localhost")})
+                                                :domain-pubkey (or (:domain-pubkey cfg) pub-hex)
+                                                :acme-thumbprint acme-thumb}))
         rt (infra/start-subnet-runtime! {:state-dir state-dir
                                          :policy policy
                                          :node-id node-id
                                          :default-sender pub-hex
                                          :node-privkey priv-bytes
-                                         :all-nodes (or (:all-nodes cfg) #{node-id})
+                                         :all-nodes all-nodes
                                          :heartbeat-ticker? (boolean (get cfg :heartbeat-ticker? true))
                                          :tls-manager tls-mgr
-                                         :tls-secret (or (:tls-secret cfg) priv-bytes)})
-        dns-srv (when (get-in cfg [:dns :enabled?] true)
-                  (dns-shell/start-dns-server! cfg rt))
-        http-srv (when (get-in cfg [:http :enabled?] true)
-                   (http-shell/start-http-servers! cfg tls-mgr rt))
-        smtp-srv (when (get-in cfg [:smtp :enabled?] false)
-                   (smtp-shell/start-smtp-server! cfg tls-mgr rt))
-        acme-mgr (when (get-in cfg [:acme :enabled?] false)
-                   (acme-shell/start-acme-loop! cfg rt tls-mgr))]
+                                         :tls-secret (:tls-secret cfg)
+                                         :tls-secret-file (:tls-secret-file cfg)
+                                         :require-tls-secret? require-secret?
+                                         :initial-epoch (:initial-epoch cfg)})]
     {:node-id node-id
      :pubkey pub-hex
      :identity ident
-     :runtime rt
+     :all-nodes all-nodes
+     :runtime rt}))
+
+(defn start-infra-node!
+  "Starts a unified `\"bitecho.org/infra\"` edge node stack (`infra` Subnet runtime + `tls-manager`
+   + optional 3-node `clj-datachannel` peer mesh, `dns`, `http`, `smtp`, and `acme` shells) from `cfg`.
+   Fails fast (`F-B2`) on multi-node configs lacking an explicit shared `:tls-secret` / `:tls-secret-file`."
+  [cfg]
+  (let [state-dir (or (:state-dir cfg) "data/infra")
+        tls-mgr (http-shell/init-tls-manager! {:state-dir state-dir
+                                               :domain (or (:domain cfg) "localhost")})
+        {:keys [node-id pubkey identity all-nodes runtime]}
+        (build-infra-runtime-from-config! cfg tls-mgr true)
+        peer-mesh (when (and (get-in cfg [:cluster :enabled?] true)
+                             (> (count (get-in cfg [:cluster :nodes] {})) 1))
+                    (infra/start-datachannel-peer-mesh! cfg runtime))
+        dns-srv (when (get-in cfg [:dns :enabled?] true)
+                  (dns-shell/start-dns-server! cfg runtime))
+        http-srv (when (get-in cfg [:http :enabled?] true)
+                   (http-shell/start-http-servers! cfg tls-mgr runtime))
+        smtp-srv (when (get-in cfg [:smtp :enabled?] false)
+                   (smtp-shell/start-smtp-server! cfg tls-mgr runtime))
+        acme-mgr (when (get-in cfg [:acme :enabled?] false)
+                   (acme-shell/start-acme-loop! cfg runtime tls-mgr))]
+    {:node-id node-id
+     :pubkey pubkey
+     :all-nodes all-nodes
+     :identity identity
+     :runtime runtime
+     :peer-mesh peer-mesh
      :tls-manager tls-mgr
      :dns dns-srv
      :http http-srv
@@ -96,7 +133,8 @@
               (when smtp-srv (smtp-shell/stop-smtp-server! smtp-srv))
               (when http-srv (http-shell/stop-http-servers! http-srv))
               (when dns-srv (dns-shell/stop-dns-server! dns-srv))
-              (infra/stop-subnet-runtime! rt))}))
+              (when peer-mesh (infra/stop-datachannel-peer-mesh! peer-mesh))
+              (infra/stop-subnet-runtime! runtime))}))
 
 (defn- cmd-run
   "Runs a Bitecho mesh node given a config EDN file."
@@ -307,6 +345,83 @@
         (locking lock
           (.wait lock))))))
 
+(defn- load-edn-config-or-exit
+  [config-file]
+  (let [f (io/file config-file)]
+    (when-not (.exists f)
+      (binding [*out* *err*]
+        (println (str "Error: config file not found: " config-file)))
+      (System/exit 1))
+    (edn/read-string (slurp f))))
+
+(defn- cmd-migrate-infra
+  "Migrates pre-cutover `clj-web` disk state into `bitecho.org/infra` Blobs + Pointers."
+  [config-file]
+  (let [cfg (assoc (load-edn-config-or-exit config-file) :heartbeat-ticker? false)
+        {:keys [runtime]} (build-infra-runtime-from-config! cfg nil false)]
+    (try
+      (let [rep (infra/migrate-clj-web-state! runtime cfg)]
+        (println (json/write-str rep)))
+      (finally
+        (infra/stop-subnet-runtime! runtime)))))
+
+(defn- cmd-print-fingerprint
+  "Prints DTLS SHA-256 fingerprint and Ed25519 pubkey for an infra node config."
+  [config-file]
+  (let [cfg (load-edn-config-or-exit config-file)
+        state-dir (or (:state-dir cfg) "data/infra")
+        node-id (or (:node/id cfg) (:node-id cfg) :ns1)
+        ident (infra/load-or-create-infra-peer-identity! state-dir node-id)]
+    (println (str "Node: " (name node-id)))
+    (println (str "State directory: " state-dir))
+    (println (str "Ed25519 Pubkey: " (:pubkey-hex ident)))
+    (println (str "SHA-256 Fingerprint: " (:fingerprint ident)))))
+
+(defn- cmd-list-mail
+  "Lists active `mail/*` Pointers in an infra node's Subnet store."
+  [config-file]
+  (let [cfg (assoc (load-edn-config-or-exit config-file) :heartbeat-ticker? false)
+        {:keys [runtime]} (build-infra-runtime-from-config! cfg nil false)]
+    (try
+      (let [emails (infra/list-subnet-emails runtime)]
+        (println (str "Found " (count emails) " emails:"))
+        (doseq [m emails]
+          (println (format "  [%s] From: %s | To: %s | Subject: %s"
+                           (:id m) (:from m) (:to m) (:subject m)))))
+      (finally
+        (infra/stop-subnet-runtime! runtime)))))
+
+(defn- cmd-read-mail
+  "Reads a specific or `latest` email from an infra node's Subnet store."
+  [config-file target]
+  (let [cfg (assoc (load-edn-config-or-exit config-file) :heartbeat-ticker? false)
+        {:keys [runtime]} (build-infra-runtime-from-config! cfg nil false)]
+    (try
+      (if-let [m (infra/read-subnet-email runtime target)]
+        (do
+          (println "============================================================")
+          (println (str "ID:      " (:id m)))
+          (println (str "From:    " (:from m)))
+          (println (str "To:      " (:to m)))
+          (println (str "Subject: " (:subject m)))
+          (println "------------------------------------------------------------")
+          (println (:body m))
+          (println "============================================================"))
+        (println (str "Email not found: " (or target "latest"))))
+      (finally
+        (infra/stop-subnet-runtime! runtime)))))
+
+(defn- cmd-delete-mail
+  "Tombstones (`:pointer/target nil`) matching `mail/*` Pointers in an infra node's Subnet store."
+  [config-file target]
+  (let [cfg (assoc (load-edn-config-or-exit config-file) :heartbeat-ticker? false)
+        {:keys [runtime]} (build-infra-runtime-from-config! cfg nil false)]
+    (try
+      (let [res (infra/delete-subnet-emails! runtime target)]
+        (println (str "Deleted " (:count res) " email(s): " (str/join ", " (:deleted res)))))
+      (finally
+        (infra/stop-subnet-runtime! runtime)))))
+
 (defn -main
   "Main CLI entrypoint."
   [& args]
@@ -320,6 +435,31 @@
       "infra-node"
       (if (first rest-args)
         (cmd-infra-node (first rest-args))
+        (do (print-usage) (System/exit 1)))
+
+      "migrate-infra"
+      (if (first rest-args)
+        (cmd-migrate-infra (first rest-args))
+        (do (print-usage) (System/exit 1)))
+
+      "print-fingerprint"
+      (if (first rest-args)
+        (cmd-print-fingerprint (first rest-args))
+        (do (print-usage) (System/exit 1)))
+
+      "list-mail"
+      (if (first rest-args)
+        (cmd-list-mail (first rest-args))
+        (do (print-usage) (System/exit 1)))
+
+      "read-mail"
+      (if (first rest-args)
+        (cmd-read-mail (first rest-args) (second rest-args))
+        (do (print-usage) (System/exit 1)))
+
+      "delete-mail"
+      (if (first rest-args)
+        (cmd-delete-mail (first rest-args) (second rest-args))
         (do (print-usage) (System/exit 1)))
 
       "print-identity"

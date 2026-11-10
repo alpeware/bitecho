@@ -115,6 +115,25 @@
                     (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING]))
         {:private-key priv :public-key pub :keypair kp}))))
 
+(defn account-keypair-thumbprint!
+  "Loads (or creates if `create?` is true, default true) the ACME EC P-256 account keypair
+   under `<state-dir>/acme/` and returns its RFC 7638 JWK SHA-256 Base64URL thumbprint."
+  ([state-dir]
+   (account-keypair-thumbprint! state-dir false))
+  ([state-dir create?]
+   (let [pub-file (io/file state-dir "acme" "account-pub.pem")]
+     (cond
+       (.exists pub-file)
+       (let [pub (parse-public-key-pem (slurp pub-file))]
+         (acme-proto/jwk->thumbprint (ec-public-key->jwk pub)))
+
+       create?
+       (let [{:keys [public-key]} (save-or-load-account-keypair! state-dir)]
+         (acme-proto/jwk->thumbprint (ec-public-key->jwk public-key)))
+
+       :else
+       nil))))
+
 ;; =============================================================================
 ;; 2. ACME v2 HTTP Client & Issuance Orchestrator (with Gap G7 Tombstone)
 ;; =============================================================================

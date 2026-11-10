@@ -184,7 +184,7 @@
           chat-init (subnet/init-subnet-instance chat-policy {:now-ms 2000})
           msg-blob (data/make-blob (fressian/utf8->bytes "Hello 3-way zero-burn subnet!") "application/octet-stream")
           chat-r1 (subnet/reduce-subnet (:instance chat-init)
-                                        {:type :put-blob :sender nexus-pub :dac dac :blob msg-blob :now-ms 2100})
+                                        {:type :put-blob :sender nexus-pub :dac dac :epoch 50 :blob msg-blob :now-ms 2100})
           head-ptr (data/sign-pointer (:private nexus-hot-kp)
                                       {:pointer/authority nexus-pub
                                        :pointer/subnet "chat/simon-nexus-axiom"
@@ -193,7 +193,7 @@
                                        :pointer/target (:blob/cid msg-blob)
                                        :pointer/proof {:proof/type :self}})
           chat-r2 (subnet/reduce-subnet (:state chat-r1)
-                                        {:type :publish-pointer :sender nexus-pub :dac dac :pointer head-ptr :now-ms 2200})]
+                                        {:type :publish-pointer :sender nexus-pub :dac dac :epoch 50 :pointer head-ptr :now-ms 2200})]
       (is (false? (:ok? bad-init)))
       (is (:ok? good-init))
       (is (false? (:applied? res-evil)) "Hot leader alone must never mutate subnet/policy")
@@ -417,3 +417,64 @@
       (is (= :diagnose (:effect (first (:effects r-expired-blob)))))
       (is (false? (:applied? r-expired-ptr)))
       (is (= :invalid-or-missing-dac (:error r-expired-ptr))))))
+
+(deftest test-fb1-fb4-dac-nil-epoch-fail-closed-and-proof-target-blob-gate
+  (testing "F-B1 & F-B4: DAC verification fails closed when :epoch is nil, and :cert/:acme-key-auth/:dac Pointers require target Blob present before apply-pointer"
+    (let [anchor-kp (crypto/generate-keypair)
+          agent-kp (crypto/generate-keypair)
+          leader-kp (crypto/generate-keypair)
+          anchor-pub (basalt/bytes->hex (:public anchor-kp))
+          agent-pub (basalt/bytes->hex (:public agent-kp))
+          leader-pub (basalt/bytes->hex (:public leader-kp))
+          ;; 1. F-B1: valid DAC without :epoch (nil) MUST fail closed!
+          dac (light-core/create-dac (:private anchor-kp)
+                                     {:anchor-pubkey anchor-pub
+                                      :agent-pubkey agent-pub
+                                      :scopes ["chat"]
+                                      :issued-epoch 1
+                                      :expires-epoch 100})
+          dac-policy {:subnet/id "chat/fb1-nil-epoch"
+                      :subnet/parent-id "global"
+                      :subnet/gate {:gate/mode :permissioned
+                                    :gate/admission :dac
+                                    :gate/trust-anchors #{anchor-pub}}
+                      :subnet/path-acl [{:pattern "head/<pubkey>/*" :principal {:type :self-path-owner}}]
+                      :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                      :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          dac-inst (:instance (subnet/init-subnet-instance dac-policy {:now-ms 1000}))
+          msg-blob (data/make-blob (fressian/utf8->bytes "nil-epoch-attempt") "application/octet-stream")
+          nil-epoch-res (subnet/reduce-subnet dac-inst {:type :put-blob :sender agent-pub :dac dac :blob msg-blob :now-ms 1100})
+          ;; 2. F-B4: publishing :cert Pointer BEFORE its target Blob is present emits :fetch-blob without consuming seq or dangling Pointer!
+          infra-policy {:subnet/id "bitecho.org/infra"
+                        :subnet/parent-id "global"
+                        :subnet/gate {:gate/mode :permissioned
+                                      :gate/admission :allowlist
+                                      :gate/trust-anchors #{leader-pub}}
+                        :subnet/path-acl [{:pattern "tls/*" :principal {:type :leader}}]
+                        :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                        :subnet/replication {:replication/pointers :leader-election :replication/blobs :eager-push}}
+          infra-inst (:instance (subnet/init-subnet-instance infra-policy {:node-id leader-pub
+                                                                           :all-nodes #{leader-pub}
+                                                                           :now-ms 1000}))
+          cert-der (fressian/utf8->bytes "leaf-der-for-fb4")
+          cert-fp (basalt/bytes->hex (crypto/sha256 cert-der))
+          cert-blob (data/make-blob (fressian/encode-canonical {:cert-der cert-der}) "application/fressian")
+          cert-ptr (data/sign-pointer (:private leader-kp)
+                                      {:pointer/authority leader-pub
+                                       :pointer/subnet "bitecho.org/infra"
+                                       :pointer/path "tls/current-cert"
+                                       :pointer/leader-term 1
+                                       :pointer/seq 1
+                                       :pointer/target (:blob/cid cert-blob)
+                                       :pointer/proof {:proof/type :cert :fingerprint cert-fp}})
+          miss-res (subnet/reduce-subnet infra-inst {:type :publish-pointer :sender leader-pub :pointer cert-ptr :now-ms 1200})
+          put-res (subnet/reduce-subnet (:state miss-res) {:type :put-blob :sender leader-pub :blob cert-blob :now-ms 1250})
+          ok-res (subnet/reduce-subnet (:state put-res) {:type :publish-pointer :sender leader-pub :pointer cert-ptr :now-ms 1300})]
+      (is (false? (:applied? nil-epoch-res)) "F-B1: nil :epoch on DAC event must fail closed")
+      (is (= :invalid-or-missing-dac (:error nil-epoch-res)))
+      (is (= :diagnose (:effect (first (:effects nil-epoch-res)))))
+      (is (false? (:applied? miss-res)) "F-B4: :cert Pointer without target Blob must not apply prematurely")
+      (is (= :missing-target-blob (:error miss-res)))
+      (is (= :fetch-blob (:effect (first (:effects miss-res)))))
+      (is (nil? (data/resolve-pointer (get-in miss-res [:state :data]) "bitecho.org/infra" "tls/current-cert")))
+      (is (:applied? ok-res) "Retrying same :cert Pointer at seq 1 after put-blob succeeds semantically"))))
