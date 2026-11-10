@@ -15,12 +15,14 @@
             [bitecho.sieve.core :as sieve]
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
+            #?(:cljs [bitecho.node-main :as node-main])
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
                :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [datachannel.api :as dc-api]
             [datachannel.buffer :as dc-buf]
             [datachannel.core :as dc-core]
             [datachannel.dcep :as dc-dcep]
@@ -503,3 +505,52 @@
       (is (pos? (dc-buf/buf-remaining stun-req)))
       (is (= :idle (:state turn-tc)))
       (is (= "hello-rfc4571" (dc-buf/bytes->utf8 (first (:frames deframed))))))))
+
+(deftest m2b-real-dtls-engine-and-node-main-lifecycle-test
+  (testing "M2b: Real DTLS 1.2 IDtlsEngine handshake + AEAD roundtrip + datachannel.api node creation + Node.js light-node CLI/lifecycle"
+    (let [cert-a (dc-dtls/generate-cert)
+          cert-b (dc-dtls/generate-cert)
+          ctx-a (dc-dtls/create-ssl-context (:cert cert-a) (:key cert-a))
+          ctx-b (dc-dtls/create-ssl-context (:cert cert-b) (:key cert-b))
+          eng-a (dc-dtls/create-engine ctx-a true)
+          eng-b (dc-dtls/create-engine ctx-b false)]
+      (dc-dtls/begin-handshake! eng-a)
+      (dc-dtls/begin-handshake! eng-b)
+      (loop [step 0
+             to-b (:packets (dc-dtls/handshake-step eng-a nil))
+             to-a []]
+        (when (and (< step 24)
+                   (or (seq to-b) (seq to-a)
+                       (not (and (dc-dtls/handshake-finished? eng-a)
+                                 (dc-dtls/handshake-finished? eng-b)))))
+          (let [out-b (mapcat #(:packets (dc-dtls/handshake-step eng-b %))
+                              (if (seq to-b) to-b [nil]))
+                out-a (mapcat #(:packets (dc-dtls/handshake-step eng-a %))
+                              (if (seq out-b) out-b (if (seq to-a) to-a [nil])))]
+            (recur (inc step) (vec out-a) []))))
+      (is (true? (dc-dtls/handshake-finished? eng-a)))
+      (is (true? (dc-dtls/handshake-finished? eng-b)))
+      (is (true? (dc-dtls/verify-peer-fingerprint eng-a (:fingerprint cert-b))))
+      (is (true? (dc-dtls/verify-peer-fingerprint eng-b (:fingerprint cert-a))))
+      (let [plain (dc-buf/utf8->bytes "m2b-dtls-payload")
+            wrapped (:bytes (dc-dtls/wrap-app-data eng-a plain))
+            unwrapped (:bytes (dc-dtls/unwrap-packet eng-b wrapped))
+            node (dc-api/create-node {:port 0 :cert-data cert-a :setup "active"})]
+        (is (= "m2b-dtls-payload" (dc-buf/bytes->utf8 unwrapped)))
+        (is (string? (get-in node [:cert-data :fingerprint])))
+        (dc-api/close! node)))
+    #?(:cljs
+       (let [c0 (node-main/init-conn-state)
+             [c1 eff1] (node-main/transition-conn c0 {:type :dial-started})
+             [c2 _] (node-main/transition-conn c1 {:type :dial-ok :generation 1 :validator-id :ns1})
+             [c3 eff3] (node-main/transition-conn c2 {:type :on-close :generation 0})
+             parsed-serve (node-main/parse-light-node-args ["serve" "--autonomous" "--transport" "connect" "--proxy" "http://127.0.0.1:8888"])
+             parsed-send (node-main/parse-light-node-args ["send" "--session-id" "s-1" "--text" "hi" "--burn" "500"])]
+         (is (empty? eff1))
+         (is (= :open (:phase c2)))
+         (is (= 1 (:ignored-stale c3)))
+         (is (= :ignore-stale (:effect (first eff3))))
+         (is (= :serve (:mode parsed-serve)))
+         (is (= :connect (:transport parsed-serve)))
+         (is (= "http://127.0.0.1:8888" (:proxy parsed-serve)))
+         (is (= {"cmd" "send" "session_id" "s-1" "text" "hi" "burn" 500} (:cmd-map parsed-send)))))))

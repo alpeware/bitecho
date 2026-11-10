@@ -1471,8 +1471,16 @@
                 (infra/stop-subnet-runtime! rt2)))))
         (finally
           (delete-dir-recursive! tmp-dir))))
-    (testing "R2: default-extension-media-types enumerates all 11 MIME outputs of content-type-for-file"
+    (testing "R2 & M2a-3: default-extension-media-types and content-type-for-file are derived from extension->media-type without drift"
       (is (= 11 (count http-shell/default-extension-media-types)))
+      (doseq [[ext expected-mt] http-shell/extension->media-type]
+        (let [actual (http-shell/content-type-for-file (str "sample-file" ext))]
+          (is (= expected-mt actual))
+          (is (contains? http-shell/default-extension-media-types actual))))
+      (is (= "text/plain; charset=utf-8" (http-shell/content-type-for-file "HEAD")))
+      (is (contains? http-shell/default-extension-media-types (http-shell/content-type-for-file "HEAD")))
+      (is (= "application/octet-stream" (http-shell/content-type-for-file "unknown.bin")))
+      (is (contains? http-shell/default-extension-media-types (http-shell/content-type-for-file "unknown.bin")))
       (doseq [expected ["application/gzip"
                         "text/markdown; charset=utf-8"
                         "application/javascript; charset=utf-8"
@@ -1481,7 +1489,7 @@
                         "application/json; charset=utf-8"
                         "application/xml; charset=utf-8"
                         "text/plain; charset=utf-8"
-                        "application/x-shellscript; charset=utf-8"
+                        "text/x-shellscript; charset=utf-8"
                         "application/java-archive"
                         "application/octet-stream"]]
         (is (contains? http-shell/default-extension-media-types expected))))))

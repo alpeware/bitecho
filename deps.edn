@@ -6,7 +6,7 @@
         alpeware/clj-fressian {:git/url "https://bitecho.org/git/clj-fressian.git"
                                :git/sha "4c56c12c8f94efed4324c8f0a4ed340337bdbc54"}
         alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
-                                  :git/sha "a6a3238f1499dce28ca930d18ed34d5173d61e50"}}
+                                  :git/sha "875abffdd9cc0a7991dada3d082379a4ce418af0"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]

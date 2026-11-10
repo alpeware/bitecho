@@ -57,8 +57,13 @@
   (fressian/decode-wire payload-bytes))
 
 (defn strip-sensitive-keys
-  "Pure helper to remove ephemeral private keys from session state prior to persistence,
-   and dissoc transient runtime connection liveness keys so persisted state never includes them."
+  "Pure helper to remove single-use ECDH `:ephemeral-priv` keys from session state prior to persistence,
+   and dissoc transient runtime connection liveness keys (`:connected?`, `:connection-error`, `:conn-diagnostics`)
+   so persisted state never includes them.
+   NOTE (`M2a-1` Trust Boundary): Active session symmetric `:tx-key` and `:rx-key` are intentionally retained
+   inside `state.fressian` (enforced `0600` POSIX permissions alongside `<state-dir>/identity/node-identity.edn`)
+   so stateless one-shot CLI invocations (`send`, `inbox`, `close`) can encrypt and decrypt ongoing session
+   messages across process invocations without re-running the X25519 handshake."
   [state]
   (let [clean-sessions (into {} (for [[sid s] (:sessions state)]
                                   [sid (dissoc s :ephemeral-priv)]))]
@@ -193,7 +198,8 @@
                                :message (assoc sieve-msg :message-id message-id)}]
               (wrap-agent-event agent-event pub-hex sender-priv-bytes)))))
 
-(defn- build-home-set-envelope
+(defn build-home-set-envelope
+  "Builds a signed `:register-home-set` agent envelope across JVM and ClojureScript."
   ([agent-pub-hex agent-priv-bytes candidates price epoch]
    (build-home-set-envelope agent-pub-hex agent-priv-bytes candidates price epoch nil nil))
   ([agent-pub-hex agent-priv-bytes candidates price epoch ice-ufrag ice-pwd]

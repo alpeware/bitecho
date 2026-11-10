@@ -27,8 +27,10 @@
 ;; -----------------------------------------------------------------------------
 
 (defn strip-sensitive-keys
-  "Pure helper to remove ephemeral private keys from session state prior to persistence,
-   and dissoc transient runtime connection liveness keys so state.fressian never persists them."
+  "Pure helper to remove single-use ECDH `:ephemeral-priv` keys from session state prior to persistence,
+   and dissoc transient runtime connection liveness keys so `state.fressian` never persists them.
+   Active session `:tx-key` and `:rx-key` are retained under the `0600` POSIX permission boundary of
+   `state.fressian` (matching `identity/node-identity.edn`) to support one-shot CLI session resumption (`M2a-1`)."
   [state]
   (light-core/strip-sensitive-keys state))
 
@@ -345,21 +347,14 @@
 
 (defn save-light-state!
   "Persists sanitized light-node state via cross-platform Fressian (`state.fressian`)
-   with atomic move and 0600 permissions."
+   with atomic move and 0600 permissions (`M2a-2`: writes strictly to `state-file` without
+   dual-writing Fressian bytes into legacy `state.nippy`)."
   [state-file state]
   (when (and (some? state-file) (not (str/blank? (str state-file))))
     (locking light-state-save-lock
       (let [f (io/file state-file)
-            dir (or (.getParentFile f) (io/file "."))
             encoded (light-core/encode-light-state state)]
         (write-state-bytes-atomic! f encoded)
-        (cond
-          (= (.getName f) "state.nippy")
-          (write-state-bytes-atomic! (io/file dir "state.fressian") encoded)
-
-          (and (= (.getName f) "state.fressian")
-               (.exists (io/file dir "state.nippy")))
-          (write-state-bytes-atomic! (io/file dir "state.nippy") encoded))
         true))))
 
 (defn- nippy-bytes?

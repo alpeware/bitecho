@@ -471,37 +471,47 @@
           (when (pos? slen)
             [(max 0 (- total-size slen)) (dec total-size)]))))))
 
+(def extension->media-type
+  "Canonical ordered extension-to-MIME-type table (`R2` & `M2a-3`).
+   Both `content-type-for-file` and `default-extension-media-types` are derived from this table."
+  [[".tar.gz" "application/gzip"]
+   [".tgz" "application/gzip"]
+   [".md" "text/markdown; charset=utf-8"]
+   [".js" "application/javascript; charset=utf-8"]
+   [".mjs" "application/javascript; charset=utf-8"]
+   [".cjs" "application/javascript; charset=utf-8"]
+   [".html" "text/html; charset=utf-8"]
+   [".htm" "text/html; charset=utf-8"]
+   [".css" "text/css; charset=utf-8"]
+   [".json" "application/json; charset=utf-8"]
+   [".xml" "application/xml; charset=utf-8"]
+   [".pom" "application/xml; charset=utf-8"]
+   [".clj" "text/plain; charset=utf-8"]
+   [".cljc" "text/plain; charset=utf-8"]
+   [".cljs" "text/plain; charset=utf-8"]
+   [".edn" "text/plain; charset=utf-8"]
+   [".txt" "text/plain; charset=utf-8"]
+   [".sha1" "text/plain; charset=utf-8"]
+   [".sha256" "text/plain; charset=utf-8"]
+   [".sri" "text/plain; charset=utf-8"]
+   [".sh" "text/x-shellscript; charset=utf-8"]
+   [".jar" "application/java-archive"]])
+
 (def default-extension-media-types
   "Complete set of default extension-derived MIME types returned by `content-type-for-file`."
-  #{"application/gzip"
-    "text/markdown; charset=utf-8"
-    "application/javascript; charset=utf-8"
-    "text/html; charset=utf-8"
-    "text/css; charset=utf-8"
-    "application/json; charset=utf-8"
-    "application/xml; charset=utf-8"
-    "text/plain; charset=utf-8"
-    "application/x-shellscript; charset=utf-8"
-    "application/java-archive"
-    "application/octet-stream"})
+  (conj (set (map second extension->media-type))
+        "application/octet-stream"))
 
-(defn- content-type-for-file
+(defn content-type-for-file
+  "Resolves the default extension-based MIME type for `name-str` from `extension->media-type`."
   [name-str]
   (let [l (str/lower-case (or name-str ""))]
-    (cond
-      (or (str/ends-with? l ".tar.gz") (str/ends-with? l ".tgz")) "application/gzip"
-      (str/ends-with? l ".md") "text/markdown; charset=utf-8"
-      (or (str/ends-with? l ".js") (str/ends-with? l ".mjs")) "application/javascript; charset=utf-8"
-      (or (str/ends-with? l ".html") (str/ends-with? l ".htm")) "text/html; charset=utf-8"
-      (str/ends-with? l ".css") "text/css; charset=utf-8"
-      (str/ends-with? l ".json") "application/json; charset=utf-8"
-      (or (str/ends-with? l ".xml") (str/ends-with? l ".pom")) "application/xml; charset=utf-8"
-      (or (str/ends-with? l ".clj") (str/ends-with? l ".cljc") (str/ends-with? l ".cljs")
-          (str/ends-with? l ".edn") (str/ends-with? l ".txt") (str/ends-with? l ".sha1")
-          (str/ends-with? l ".sha256") (str/ends-with? l ".sri") (= l "head")) "text/plain; charset=utf-8"
-      (str/ends-with? l ".sh") "text/x-shellscript; charset=utf-8"
-      (str/ends-with? l ".jar") "application/java-archive"
-      :else "application/octet-stream")))
+    (if (= l "head")
+      "text/plain; charset=utf-8"
+      (or (some (fn [[ext mt]]
+                  (when (str/ends-with? l ext) mt))
+                extension->media-type)
+          "application/octet-stream"))))
 
 (defn- sha256-file-hex
   [^File f]

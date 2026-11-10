@@ -625,13 +625,15 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
    - Added pure cross-platform `strip-sensitive-keys`, `encode-light-state`, and `decode-light-state` in `src/bitecho/light_node/core.cljc` using `bitecho.fressian`, and updated `src/bitecho/shell/light_node.clj` (`save-light-state!`, `load-light-state!`, `run-serve!`, `run-one-shot!`) to persist `state.fressian` by default while transparently migrating legacy `state.nippy` files on read.
    - Also closed carried review flag `R2` (`default-extension-media-types` in `src/bitecho/shell/http.clj` enumerating all 11 MIME types produced by `content-type-for-file`).
 
-#### Step 14B (M2b) — Node.js DTLS Spike/Engine, UDP + TCP/`HTTP CONNECT` Boundary, & Standalone Bundle
-1. **Node.js DTLS 1.2 Decision Spike & Implementation**:
-   - Execute a focused spike comparing a pure-CLJS/JS DTLS 1.2 record + `ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` handshake engine (backed by built-in `node:crypto` ECDH, ECDSA, SHA-256 HMAC PRF, and AES-128-GCM primitives with zero native C++ addons) against minimal alternatives, implementing `IDtlsEngine` for Node.js.
-2. **Mandatory Dual Transport Boundary (`UDP` + `TCP / HTTP CONNECT`)**:
-   - Implement the Node.js `datachannel.api` boundary supporting both `node:dgram` (UDP) and `node:net` (RFC 4571 length-prefixed DTLS-over-TCP plus outbound `HTTP CONNECT` proxy tunneling via `--proxy` / `HTTPS_PROXY`), ensuring firewall-restricted sandbox agents without UDP operate natively on the Node.js light node.
-3. **Single-File Node.js Light-Node Bundle (`dist/bitecho-light-node.cjs`)**:
-   - Compile a standalone Node.js CLI bundle (`node dist/bitecho-light-node.cjs`) with 100% CLI flag and JSONL wire parity with `clojure -M:light-node`, verified by cross-runtime JVM $\leftrightarrow$ Node.js E2E tests and published to `https://bitecho.org/dist/bitecho-light-node.cjs`.
+#### Step 14B (M2b) — Node.js DTLS Spike/Engine, UDP + TCP/`HTTP CONNECT` Boundary, & Standalone Bundle — **`[BUILT & VERIFIED]`**
+1. **Pure `node:crypto` DTLS 1.2 `IDtlsEngine` (`clj-datachannel` `875abffdd9cc0a7991dada3d082379a4ce418af0`)**:
+   - Implemented a 100% pure Node.js (`node:crypto`) DTLS 1.2 (`0xFEFD`) record + handshake `IDtlsEngine` (`NodeDtlsEngine` in `src/datachannel/dtls.cljc`) supporting `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (`0xC02B`), `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (`0xC02F`), `ExtendedMasterSecret` (`0x0017`, RFC 7627), mutual X.509 certificate authentication (RSA PKCS#1 v1.5, RSA-PSS, ECDSA SHA-256), self-signed ECDSA P-256 X.509 v3 DER certificate generation, AES-128-GCM AEAD record encryption/decryption, handshake fragment reassembly, out-of-order `msg_seq` buffering, and flight retransmission with zero native C++ addons and zero external npm dependencies.
+   - Added portable raw `sha1-bytes` and `sha256-bytes` in `src/datachannel/buffer.cljc` (`M2a-4`).
+2. **Mandatory Dual Transport Boundary (`UDP` + `TCP / HTTP CONNECT` in `src/datachannel/api.cljc`)**:
+   - Ported `datachannel.api` to `.cljc`, implementing the Node.js transport boundary over `node:dgram` (`start!`, `listen!`) and `node:net` (`start-tcp!`, `listen-tcp!`, supporting RFC 4571 length-prefixed DTLS-over-TCP and outbound `HTTP CONNECT` proxy tunneling via `--proxy` / `HTTPS_PROXY`).
+3. **Single-File Node.js Light-Node Bundle (`dist/bitecho-light-node.cjs` & `src/bitecho/node_main.cljs`)**:
+   - Implemented `src/bitecho/node_main.cljs` and `scripts/build-node-light-node.sh` compiling a deterministic single-file CommonJS bundle (`dist/bitecho-light-node.cjs` + `dist/bitecho-light-node.cjs.sha256`) with 100% CLI verb/flag, JSONL `serve`/`wait-event`/`one-shot`, `state.fressian`, and `node-identity.edn` parity with the JVM light node, verified by live cross-runtime Node.js $\leftrightarrow$ JVM WebRTC DataChannel E2E tests over both `UDP` and RFC 4571 `TCP`.
+   - Also closed `M2a` carried review flags `M2a-1` (`0600` trust boundary documentation for session `:tx-key`/`:rx-key` in `strip-sensitive-keys`), `M2a-2` (removed dual-write of Fressian bytes into `state.nippy` on save), and `M2a-3` (`extension->media-type` single-source table driving both `content-type-for-file` and `default-extension-media-types` in `src/bitecho/shell/http.clj`).
 
 ---
 

@@ -909,7 +909,7 @@
   (testing "Saved state with autonomous? false gets autonomous? true when loaded with --autonomous"
     (let [temp-dir (Files/createTempDirectory "bitecho-test-auto" (into-array FileAttribute []))
           state-dir (str temp-dir)
-          state-file (str (io/file state-dir "state.nippy"))
+          state-file (str (io/file state-dir "state.fressian"))
           identity (light-shell/load-or-create-light-identity! state-dir)
           descriptor {:network :devnet
                       :treasury-pubkey (:pubkey-hex identity)
@@ -2213,16 +2213,149 @@
           (is (= 77 (:epoch migrated)))
           (is (= 1500 (get-in migrated [:local-accounting :burned-ech])))
           (is (not (contains? migrated :connected?))))
-        ;; 3. Saving to state.fressian writes canonical Fressian bytes (non-NPY header)
+        ;; 3. Saving to state.fressian writes canonical Fressian bytes (non-NPY header) and does NOT overwrite legacy state.nippy (M2a-2)
         (light-shell/save-light-state! fressian-file (assoc st0 :epoch 88))
         (is (.exists (io/file fressian-file)))
         (let [raw-bytes (Files/readAllBytes (.toPath (io/file fressian-file)))
+              nippy-bytes (Files/readAllBytes (.toPath (io/file nippy-file)))
               reloaded (light-shell/load-light-state! fressian-file)]
           (is (not (and (= 78 (aget raw-bytes 0))
                         (= 80 (aget raw-bytes 1))
                         (= 89 (aget raw-bytes 2)))))
+          (is (and (= 78 (aget nippy-bytes 0))
+                   (= 80 (aget nippy-bytes 1))
+                   (= 89 (aget nippy-bytes 2)))
+              "M2a-2: legacy state.nippy retains original NPY header rather than being overwritten with Fressian bytes")
           (is (= 88 (:epoch reloaded)))
           (is (= 88 (:epoch (light-core/decode-light-state raw-bytes)))))
+        (finally
+          (doseq [f (reverse (file-seq (.toFile temp-dir)))]
+            (.delete f)))))))
+
+(deftest test-m2b-node-light-node-bundle-and-cross-runtime-e2e
+  (testing "M2b: dist/bitecho-light-node.cjs CLI flag parity, node-identity.edn + state.fressian cross-runtime interoperability, and live Node.js <-> JVM DataChannel E2E over UDP and TCP"
+    (let [bundle-file (io/file "dist/bitecho-light-node.cjs")
+          sha-file (io/file "dist/bitecho-light-node.cjs.sha256")
+          node-main-src (slurp "src/bitecho/node_main.cljs")
+          skill-md (slurp "skill/SKILL.md")
+          documented-flags (set (re-seq #"--[a-z][a-z-]*" skill-md))
+          node-flags (set (re-seq #"--[a-z][a-z-]*" node-main-src))
+          node-bin (or (System/getenv "NODE_BIN")
+                       (let [local-node (io/file (System/getProperty "user.home") ".local/bin/node")]
+                         (if (.canExecute local-node)
+                           (.getAbsolutePath local-node)
+                           "node")))
+          temp-dir (Files/createTempDirectory "bitecho-m2b-e2e-" (into-array FileAttribute []))
+          state-dir (str temp-dir)]
+      (is (.exists bundle-file) "dist/bitecho-light-node.cjs must exist")
+      (is (.exists sha-file) "dist/bitecho-light-node.cjs.sha256 must exist")
+      (doseq [fl documented-flags]
+        (is (contains? node-flags fl) (str "M2b Node.js CLI supports flag: " fl)))
+      (try
+        (let [udp-port (with-open [ds (java.net.DatagramSocket. 0)] (.getLocalPort ds))
+              tcp-port (with-open [ss (java.net.ServerSocket. 0)] (.getLocalPort ss))
+              udp-msg-p (promise)
+              tcp-msg-p (promise)
+              srv-udp (api/listen!
+                       {:port udp-port}
+                       {:on-connection
+                        (fn [child-node]
+                          (api/set-callbacks!
+                           child-node
+                           {:on-open (fn [_] nil)
+                            :on-message (fn [evt]
+                                          (deliver udp-msg-p (light-core/thaw-payload (:payload evt))))}))})
+              srv-tcp (api/listen-tcp!
+                       {:port tcp-port :host "127.0.0.1"}
+                       {:on-connection
+                        (fn [child-node]
+                          (api/set-callbacks!
+                           child-node
+                           {:on-open (fn [_] nil)
+                            :on-message (fn [evt]
+                                          (deliver tcp-msg-p (light-core/thaw-payload (:payload evt))))}))})
+              udp-creds (:ice-creds srv-udp)
+              udp-fp (get-in srv-udp [:cert-data :fingerprint])
+              tcp-creds (:ice-creds srv-tcp)
+              tcp-fp (get-in srv-tcp [:cert-data :fingerprint])
+              val-kp (crypto/generate-keypair)
+              val-pub (basalt/bytes->hex (:public val-kp))
+              udp-bootstrap-file (str (io/file state-dir "bootstrap-udp.edn"))
+              tcp-bootstrap-file (str (io/file state-dir "bootstrap-tcp.edn"))
+              run-node-cli (fn [& cli-args]
+                             (let [pb (ProcessBuilder. ^java.util.List (into [node-bin (.getAbsolutePath bundle-file)] cli-args))
+                                   proc (.start pb)
+                                   out (slurp (.getInputStream proc))
+                                   _ (.waitFor proc)]
+                               (str/trim out)))]
+          (try
+            (spit udp-bootstrap-file
+                  (pr-str {:network :devnet
+                           :treasury-pubkey val-pub
+                           :custody-pubkey val-pub
+                           :nodes {:node1 {:node-id :node1
+                                           :ip "127.0.0.1"
+                                           :port udp-port
+                                           :agent-port udp-port
+                                           :pubkey val-pub
+                                           :fingerprint udp-fp
+                                           :ice-ufrag (:ufrag udp-creds)
+                                           :ice-pwd (:pwd udp-creds)}}}))
+            (spit tcp-bootstrap-file
+                  (pr-str {:network :devnet
+                           :treasury-pubkey val-pub
+                           :custody-pubkey val-pub
+                           :nodes {:node1 {:node-id :node1
+                                           :ip "127.0.0.1"
+                                           :port tcp-port
+                                           :agent-port tcp-port
+                                           :agent-tcp-port tcp-port
+                                           :pubkey val-pub
+                                           :fingerprint tcp-fp
+                                           :ice-ufrag (:ufrag tcp-creds)
+                                           :ice-pwd (:pwd tcp-creds)}}}))
+            ;; 1. Node.js light node mints identity + state.fressian; JVM loads both cleanly
+            (let [id-out (run-node-cli "identity" "--state-dir" state-dir "--bootstrap" udp-bootstrap-file)
+                  id-json (json/read-str id-out)
+                  jvm-id (light-shell/load-or-create-light-identity! state-dir)
+                  jvm-st (light-shell/load-light-state! (str (io/file state-dir "state.fressian")))]
+              (is (= true (get id-json "ok")))
+              (is (= (get id-json "pubkey") (:pubkey-hex jvm-id)))
+              (is (= (get id-json "fingerprint") (:fingerprint jvm-id)))
+              (is (= (:pubkey-hex jvm-id) (:pubkey jvm-st))))
+
+            ;; 2. Live E2E over UDP (Node.js DTLS 1.2 + DataChannel -> JVM SSLEngine listener)
+            (let [udp-out (run-node-cli "register-home-set"
+                                        "--nodes" "node1"
+                                        "--price" "15"
+                                        "--transport" "udp"
+                                        "--state-dir" state-dir
+                                        "--bootstrap" udp-bootstrap-file)
+                  udp-json (json/read-str udp-out)
+                  rx-udp (deref udp-msg-p 5000 :timeout)]
+              (is (= true (get udp-json "ok")))
+              (is (map? rx-udp))
+              (is (= :register-home-set (get-in rx-udp [:event :type])))
+              (is (= 15 (get-in rx-udp [:event :price]))))
+
+            ;; 3. Live E2E over RFC 4571 TCP (Node.js DTLS 1.2 + DataChannel -> JVM SSLEngine TCP listener)
+            (let [tcp-out (run-node-cli "register-home-set"
+                                        "--nodes" "node1"
+                                        "--price" "20"
+                                        "--transport" "tcp"
+                                        "--state-dir" state-dir
+                                        "--bootstrap" tcp-bootstrap-file)
+                  tcp-json (json/read-str tcp-out)
+                  rx-tcp (deref tcp-msg-p 5000 :timeout)
+                  reloaded-st (light-shell/load-light-state! (str (io/file state-dir "state.fressian")))]
+              (is (= true (get tcp-json "ok")))
+              (is (map? rx-tcp))
+              (is (= :register-home-set (get-in rx-tcp [:event :type])))
+              (is (= 20 (get-in rx-tcp [:event :price])))
+              (is (= [{:latency-ms 10 :node-id "node1" :price 20 :responsive? true}] (:home-set reloaded-st))))
+            (finally
+              (try (api/close! srv-udp) (catch Exception _ nil))
+              (try (api/close! srv-tcp) (catch Exception _ nil)))))
         (finally
           (doseq [f (reverse (file-seq (.toFile temp-dir)))]
             (.delete f)))))))
