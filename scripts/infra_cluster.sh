@@ -54,6 +54,10 @@ assert_preconditions() {
     echo "FATAL: SSH key not found at ${SSH_KEY}" >&2
     exit 1
   fi
+  if [[ ! -s "${ROOT_DIR}/devnet/bootstrap.txt" ]]; then
+    echo "FATAL: Validator bootstrap descriptor not found at ${ROOT_DIR}/devnet/bootstrap.txt" >&2
+    exit 1
+  fi
 }
 
 ssh_ns() {
@@ -290,10 +294,12 @@ cmd_cutover() {
 
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
-    echo "--> Uploading bitecho.jar and reading identity on ${node} (${ip})..."
+    echo "--> Uploading bitecho.jar, validator bootstrap.txt, and reading identity on ${node} (${ip})..."
     ssh_ns "$node" "sudo mkdir -p /opt/bitecho-infra /etc/bitecho-infra && sudo chown ${SSH_USER}:${SSH_USER} /opt/bitecho-infra /etc/bitecho-infra"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/target/bitecho.jar" "${SSH_USER}@${ip}:/opt/bitecho-infra/bitecho.jar"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/devnet/bootstrap.txt" "${SSH_USER}@${ip}:/etc/bitecho-infra/bootstrap.txt"
 
     local id_out
     id_out="$(ssh_ns "$node" bash -s << REMOTE_ID
@@ -327,9 +333,7 @@ REMOTE_ID
  :state-dir "/var/lib/clj-web"
  :tls-secret-file "/etc/clj-web/tls-secret.key"
  :cold-pubkey "${cold_pubkey}"
- :validator-urls ["http://35.212.129.138:8080/statusz"
-                  "http://35.206.120.143:8080/statusz"
-                  "http://35.211.71.139:8080/statusz"]
+ :validator-bootstrap "/etc/bitecho-infra/bootstrap.txt"
  :acme {:enabled? true
         :directory-url "https://acme-v02.api.letsencrypt.org/directory"
         :contact-email "mailto:admin@${DOMAIN}"

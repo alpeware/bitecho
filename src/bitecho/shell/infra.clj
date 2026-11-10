@@ -16,19 +16,19 @@
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.core :as light-core]
             [bitecho.shell.blob-fs :as blob-fs]
+            [bitecho.shell.discovery :as discovery]
             [bitecho.shell.identity :as identity]
+            [bitecho.shell.light-node :as light-node]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datachannel.api :as api])
   (:import [java.io File]
-           [java.net URI]
-           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
            [java.nio.file CopyOption Files OpenOption StandardCopyOption]
            [java.security SecureRandom]
-           [java.time Duration]
            [java.util.concurrent Executors ScheduledExecutorService TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong]
            [javax.crypto Cipher]
@@ -331,67 +331,113 @@
   (when-let [a (:epoch-atom rt)]
     (reset! a (when (some? epoch) (long epoch)))))
 
-(defn- fetch-validator-epoch-http
-  [url]
-  (try
-    (let [client (-> (HttpClient/newBuilder)
-                     (.connectTimeout (Duration/ofMillis 1500))
-                     (.build))
-          req (-> (HttpRequest/newBuilder (URI/create (str url)))
-                  (.timeout (Duration/ofMillis 1500))
-                  (.GET)
-                  (.build))
-          resp (.send client req (HttpResponse$BodyHandlers/ofString))]
-      (when (= 200 (.statusCode resp))
-        (let [body (str/trim (.body resp))]
-          (or (when-let [[_ n] (re-find #"(?i)(?:finalized[_-]?epoch|epoch)[=:\"\s]+(\d+)" body)]
-                (Long/parseLong n))
-              (let [d (try (edn/read-string body) (catch Exception _ nil))]
-                (when (map? d)
-                  (or (:finalized-epoch d) (:epoch d))))))))
-    (catch Exception _ nil)))
+(declare load-or-create-infra-peer-identity!)
+
+(defn- resolve-validator-bootstrap
+  [bootstrap-or-source]
+  (cond
+    (and (map? bootstrap-or-source) (seq (:nodes bootstrap-or-source)))
+    bootstrap-or-source
+
+    (and (string? bootstrap-or-source) (not (str/blank? bootstrap-or-source)))
+    (try
+      (discovery/load-bootstrap-descriptor! bootstrap-or-source)
+      (catch Exception _ nil))
+
+    :else nil))
 
 (defn sync-runtime-epoch-from-validators!
-  "Queries `validator-urls` (using optional `fetcher-fn` `(fn [url] epoch-or-nil)` for deterministic tests),
-   verifies strict BFT majority (`> n/2`) agreement on a non-regressive integer epoch, and updates `rt` (`F-C4`).
-   Emits counted `:diagnose` on quorum disagreement or regressive epoch."
-  ([rt validator-urls]
-   (sync-runtime-epoch-from-validators! rt validator-urls fetch-validator-epoch-http))
-  ([rt validator-urls fetcher-fn]
-   (let [urls (vec validator-urls)
-         total (count urls)]
-     (if (zero? total)
-       {:ok? false :error :no-validators}
-       (let [quorum (inc (quot total 2))
-             f (if (map? fetcher-fn) #(get fetcher-fn %) fetcher-fn)
-             epochs (keep (fn [u]
-                            (let [v (try (f u) (catch Exception _ nil))]
-                              (when (integer? v) (long v))))
-                          urls)
-             freqs (frequencies epochs)
-             agreed (->> freqs
-                         (filter (fn [[_ cnt]] (>= cnt quorum)))
-                         (map first)
-                         sort
-                         last)
-             cur-ep (current-runtime-epoch rt)]
-         (cond
-           (nil? agreed)
+  "Queries the validator cluster's authenticated `:5010` agent channel using the signed
+   `:query-chain-state` -> `:chain-state-snapshot` Fressian protocol message pair (`F-C4` / `B2`).
+   Verifies each validator's Ed25519 signature, freshness `:nonce`, trusted validator membership,
+   and `2f+1` (`>= ceil(2n/3)`) BFT quorum agreement via `light-core/verify-chain-state-quorum`,
+   extracting the quorum-attested `:finalized-epoch` (`:last-executed-finalized-epoch` on validators)
+   for DAC expiry enforcement.
+   Accepts optional `snapshot-fetcher-fn` `(fn [pubkey nonce] snapshots)` (or 1-arity `(fn [pubkey] snapshots)`)
+   for deterministic socket-free unit tests.
+   Fails closed (`nil` before first quorum; monotonic thereafter) and emits counted `:diagnose` events
+   on `:5010` unreachability, signature/quorum failure, or regressive `:finalized-epoch`."
+  ([rt validator-bootstrap]
+   (sync-runtime-epoch-from-validators! rt validator-bootstrap nil))
+  ([rt validator-bootstrap snapshot-fetcher-fn]
+   (let [bootstrap (resolve-validator-bootstrap validator-bootstrap)
+         nodes (vals (:nodes bootstrap))
+         trusted (set (keep :pubkey nodes))]
+     (if (empty? trusted)
+       (do
+         (apply-shell-event! (:shell-atom rt)
+                             {:type :diagnose :reason :validator-epoch-quorum-failed :detail "empty-bootstrap-nodes"})
+         {:ok? false :error :validator-epoch-quorum-failed :detail "empty-bootstrap-nodes"})
+       (let [pubkey (or (:pubkey-hex (:peer-identity rt))
+                        (:default-sender rt))
+             privkey (or (:privkey-bytes (:peer-identity rt))
+                         (:node-privkey rt))
+             nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
+             snaps (if snapshot-fetcher-fn
+                     (try
+                       (vec (or (try (snapshot-fetcher-fn pubkey nonce)
+                                     (catch clojure.lang.ArityException _
+                                       (snapshot-fetcher-fn pubkey)))
+                                []))
+                       (catch Exception _ []))
+                     (let [ident (or (:peer-identity rt)
+                                     (when (:state-dir rt)
+                                       (try
+                                         (load-or-create-infra-peer-identity! (:state-dir rt) (or (:node-id rt) :ns1))
+                                         (catch Exception _ nil))))]
+                       (if-not (and ident (:cert-data ident) pubkey privkey)
+                         []
+                         (->> nodes
+                              (pmap (fn [node]
+                                      (try
+                                        (light-node/query-validator-chain-state!
+                                         ident node pubkey privkey {:nonce nonce :timeout-ms 2500})
+                                        (catch Exception _ nil))))
+                              (filterv some?)))))
+             q-res (if (empty? snaps)
+                     {:ok? false :error "no-inband-snapshots-returned"}
+                     (light-core/verify-chain-state-quorum
+                      snaps
+                      {:expected-pubkey pubkey
+                       :expected-nonce nonce
+                       :trusted-validators trusted
+                       :min-finalized-epoch 0
+                       :max-epoch-skew 2}))]
+         (if-not (:ok? q-res)
            (do
              (apply-shell-event! (:shell-atom rt)
-                                 {:type :diagnose :reason :validator-epoch-quorum-failed :responses (count epochs)})
-             {:ok? false :error :validator-epoch-quorum-failed})
-
-           (and (integer? cur-ep) (< (long agreed) (long cur-ep)))
-           (do
-             (apply-shell-event! (:shell-atom rt)
-                                 {:type :diagnose :reason :validator-epoch-regressive :current cur-ep :proposed agreed})
-             {:ok? false :error :validator-epoch-regressive})
-
-           :else
-           (do
-             (set-runtime-epoch! rt agreed)
-             {:ok? true :epoch agreed})))))))
+                                 {:type :diagnose
+                                  :reason :validator-epoch-quorum-failed
+                                  :detail (:error q-res)
+                                  :responses (count snaps)})
+             {:ok? false :error :validator-epoch-quorum-failed :detail (:error q-res)})
+           (let [quorum-threshold (max 1 (long (Math/ceil (/ (* 2.0 (count trusted)) 3.0))))
+                 agreed-validators (set (:validators q-res))
+                 sorted-eps (->> snaps
+                                 (filter #(contains? agreed-validators
+                                                     (or (:validator-pubkey %) (get % "validator_pubkey"))))
+                                 (keep #(or (:finalized-epoch %) (get % "finalized_epoch")))
+                                 (map long)
+                                 sort
+                                 vec)
+                 agreed (if (seq sorted-eps)
+                          (nth sorted-eps (max 0 (- (count sorted-eps) quorum-threshold)))
+                          (long (or (get-in q-res [:snapshot :finalized-epoch]) 0)))
+                 cur-ep (current-runtime-epoch rt)]
+             (if (and (integer? cur-ep) (< (long agreed) (long cur-ep)))
+               (do
+                 (apply-shell-event! (:shell-atom rt)
+                                     {:type :diagnose
+                                      :reason :validator-epoch-regressive
+                                      :current cur-ep
+                                      :proposed agreed})
+                 {:ok? false :error :validator-epoch-regressive :current cur-ep :proposed agreed})
+               (do
+                 (set-runtime-epoch! rt agreed)
+                 {:ok? true
+                  :epoch agreed
+                  :quorum-count (:quorum-count q-res)
+                  :validators (:validators q-res)})))))))))
 
 (defn- active-peer-sender
   [rt]
@@ -685,14 +731,17 @@
                 default-sender (or (:default-sender opts)
                                    (when (string? (:node-id opts)) (:node-id opts))
                                    (first (get-in (:policy opts) [:subnet/gate :gate/trust-anchors])))
-                validator-urls (vec (or (:validator-urls opts) []))
-                ticker (when (or (:heartbeat-ticker? opts) (seq validator-urls))
+                validator-bootstrap (:validator-bootstrap opts)
+                poll-ms (long (or (:validator-poll-interval-ms opts) 10000))
+                last-poll-atom (atom 0)
+                ticker (when (or (:heartbeat-ticker? opts) (some? validator-bootstrap))
                          (Executors/newSingleThreadScheduledExecutor))
                 rt {:shell-atom shell-atom
                     :subnet-atom subnet-atom
                     :epoch-atom (atom (:initial-epoch opts))
                     :epoch-fn (:epoch-fn opts)
-                    :validator-urls validator-urls
+                    :peer-identity (:peer-identity opts)
+                    :validator-bootstrap validator-bootstrap
                     :state-dir state-dir
                     :node-id (:node-id opts)
                     :node-privkey (:node-privkey opts)
@@ -705,8 +754,10 @@
                     :on-fetch-blob (:on-fetch-blob opts)
                     :on-fetch-blob-atom (atom nil)
                     :ticker ticker}]
-            (when (seq validator-urls)
-              (try (sync-runtime-epoch-from-validators! rt validator-urls) (catch Exception _ nil)))
+            (when (some? validator-bootstrap)
+              (reset! last-poll-atom (System/currentTimeMillis))
+              (try (sync-runtime-epoch-from-validators! rt validator-bootstrap (:inband-snapshot-fetcher opts))
+                   (catch Exception _ nil)))
             (when ticker
               (let [hb-ms (long (get-in inst0 [:leader-election :heartbeat-interval-ms] 2000))]
                 (.scheduleAtFixedRate ^ScheduledExecutorService ticker
@@ -714,8 +765,12 @@
                                                   (try
                                                     (when (:heartbeat-ticker? opts)
                                                       (tick-runtime! rt))
-                                                    (when (seq validator-urls)
-                                                      (sync-runtime-epoch-from-validators! rt validator-urls))
+                                                    (when (some? validator-bootstrap)
+                                                      (let [now (System/currentTimeMillis)]
+                                                        (when (>= (- now @last-poll-atom) poll-ms)
+                                                          (reset! last-poll-atom now)
+                                                          (sync-runtime-epoch-from-validators!
+                                                           rt validator-bootstrap (:inband-snapshot-fetcher opts)))))
                                                     (catch Exception _ nil)))
                                       hb-ms hb-ms TimeUnit/MILLISECONDS)))
             (apply-shell-event! shell-atom {:type :started :generation gen :resources {:ticker ticker}})
@@ -769,12 +824,13 @@
      :keypair {:public pub-bs :private priv-bs}}))
 
 (defn load-or-create-infra-peer-identity!
-  "Loads or creates the persistent Ed25519 + DTLS identity for an infra node (`F-C1`):
-   - If `<state-dir>/cluster/node-identity.edn` exists AND contains `:pubkey-hex` / `:privkey-hex`,
-     cryptographically validates and preserves that exact Ed25519 keypair (persisting it into
-     `<state-dir>/identity/` so no fresh keypair is ever generated over it), alongside its DTLS cert/fingerprint.
-   - If `<state-dir>/cluster/node-identity.edn` exists with only `clj-web` DTLS keys (`:cert-pem`/`:key-pem`),
-     preserves its exact DTLS cert/fingerprint alongside the persistent `<state-dir>/identity/` Ed25519 keypair."
+  "Loads or creates the persistent Ed25519 + DTLS identity for an infra node (`F-C1` / `B1`):
+   - Production `clj-web` `<state-dir>/cluster/node-identity.edn` files contain `{:cert-pem, :key-pem, :fingerprint, :ice-creds}`
+     and no Ed25519 keypair. On first cutover load, preserves the exact `clj-web` DTLS certificate, private key,
+     SHA-256 `:fingerprint`, and `:ice-creds` while minting a fresh Bitecho Ed25519 identity once into
+     `<state-dir>/identity/node-identity.edn` and returning that stable Ed25519 identity across all subsequent reloads.
+   - If `<state-dir>/cluster/node-identity.edn` also contains `:pubkey-hex` / `:privkey-hex`, cryptographically
+     validates (`crypto/sign` + `crypto/verify` probe, failing closed on corruption/mismatch) and uses that Ed25519 keypair."
   [state-dir node-id]
   (let [legacy-file (io/file state-dir "cluster" "node-identity.edn")]
     (if-not (.exists legacy-file)
@@ -786,23 +842,26 @@
             cert (identity/parse-cert-pem (:cert-pem d))
             k (identity/parse-private-key-pem (:key-pem d))
             fp (identity/normalize-fingerprint (:fingerprint d))
+            ice-creds (:ice-creds d)
             has-legacy-ed? (or (contains? d :pubkey-hex) (contains? d :privkey-hex))]
         (when (or (nil? cert) (nil? k))
           (throw (ex-info "Corrupt DTLS certificate/key in legacy node-identity.edn"
                           {:file (.getAbsolutePath legacy-file)})))
         (if has-legacy-ed?
           (let [ed (validate-legacy-ed25519-pair! (:pubkey-hex d) (:privkey-hex d) (.getAbsolutePath legacy-file))]
-            (merge ed
-                   {:node-id node-id
-                    :fingerprint fp
-                    :cert-data {:cert cert :key k :fingerprint fp}}))
+            (cond-> (merge ed
+                           {:node-id node-id
+                            :fingerprint fp
+                            :cert-data {:cert cert :key k :fingerprint fp}})
+              ice-creds (assoc :ice-creds ice-creds)))
           (let [base-id (identity/load-or-create-node-identity! state-dir node-id)
                 priv-bytes (or (get-in base-id [:keypair :private])
                                (basalt/hex->bytes (:privkey-hex base-id)))]
-            (assoc base-id
-                   :privkey-bytes priv-bytes
-                   :fingerprint fp
-                   :cert-data {:cert cert :key k :fingerprint fp})))))))
+            (cond-> (assoc base-id
+                           :privkey-bytes priv-bytes
+                           :fingerprint fp
+                           :cert-data {:cert cert :key k :fingerprint fp})
+              ice-creds (assoc :ice-creds ice-creds))))))))
 
 (defn- push-anti-entropy-snapshot-to-peer!
   [rt send-one!]

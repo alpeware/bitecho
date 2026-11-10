@@ -85,9 +85,12 @@
                                          :node-id node-id
                                          :default-sender pub-hex
                                          :node-privkey priv-bytes
+                                         :peer-identity ident
                                          :all-nodes all-nodes
                                          :heartbeat-ticker? (boolean (get cfg :heartbeat-ticker? true))
-                                         :validator-urls (:validator-urls cfg)
+                                         :validator-bootstrap (:validator-bootstrap cfg)
+                                         :validator-poll-interval-ms (:validator-poll-interval-ms cfg)
+                                         :inband-snapshot-fetcher (:inband-snapshot-fetcher cfg)
                                          :tls-manager tls-mgr
                                          :tls-secret (:tls-secret cfg)
                                          :tls-secret-file (:tls-secret-file cfg)
