@@ -349,3 +349,71 @@
              (:pointer/target (data/resolve-pointer (get-in res-retry [:state :data]) "bitecho.org/infra" "subnet/policy"))))
       (is (data/blob-pinned? (get-in res-retry [:state :data :blobs]) (:blob/cid next-blob)))
       (is (contains? (get-in res-retry [:state :policy :subnet/gate :gate/trust-anchors]) new-pub)))))
+
+(deftest test-f3-f4-dac-per-event-expiry-and-gate-admission-enum
+  (testing "F3 & F4: validate-subnet-policy enforces :gate/admission enum and DAC-admitted keys are never permanently cached past :expires-epoch"
+    (let [anchor-kp (crypto/generate-keypair)
+          agent-kp (crypto/generate-keypair)
+          anchor-pub (basalt/bytes->hex (:public anchor-kp))
+          agent-pub (basalt/bytes->hex (:public agent-kp))
+          base-policy {:subnet/id "chat/dac-expiry-test"
+                       :subnet/parent-id "global"
+                       :subnet/gate {:gate/mode :permissioned
+                                     :gate/admission :dac
+                                     :gate/trust-anchors #{anchor-pub}
+                                     :gate/governance {:governance/type :cold-key
+                                                       :cold-pubkey anchor-pub}}
+                       :subnet/path-acl [{:pattern "head/<pubkey>/*" :principal {:type :self-path-owner}}]
+                       :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                       :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          ;; F4: bogus :gate/admission or :permissioned + :open must fail closed with counted :diagnose
+          bad-adm-res (subnet/validate-subnet-policy (assoc-in base-policy [:subnet/gate :gate/admission] :magic-pass))
+          perm-open-res (subnet/validate-subnet-policy (assoc-in base-policy [:subnet/gate :gate/admission] :open))
+          ;; F3: DAC valid for epochs [5..10]
+          dac (light-core/create-dac (:private anchor-kp)
+                                     {:anchor-pubkey anchor-pub
+                                      :agent-pubkey agent-pub
+                                      :scopes ["chat"]
+                                      :issued-epoch 5
+                                      :expires-epoch 10})
+          inst0 (:instance (subnet/init-subnet-instance base-policy {:now-ms 1000}))
+          b1 (data/make-blob (fressian/utf8->bytes "msg-at-epoch-7") "application/octet-stream")
+          b2 (data/make-blob (fressian/utf8->bytes "msg-at-epoch-11") "application/octet-stream")
+          ptr1 (data/sign-pointer (:private agent-kp)
+                                  {:pointer/authority agent-pub
+                                   :pointer/subnet "chat/dac-expiry-test"
+                                   :pointer/path (str "head/" agent-pub "/chat")
+                                   :pointer/seq 1
+                                   :pointer/target (:blob/cid b1)
+                                   :pointer/proof {:proof/type :self}})
+          ptr2 (data/sign-pointer (:private agent-kp)
+                                  {:pointer/authority agent-pub
+                                   :pointer/subnet "chat/dac-expiry-test"
+                                   :pointer/path (str "head/" agent-pub "/chat")
+                                   :pointer/seq 2
+                                   :pointer/target (:blob/cid b2)
+                                   :pointer/proof {:proof/type :self}})
+          ;; Epoch 7 (within DAC window): put-blob and :self-path-owner publish-pointer succeed
+          r-put-ok (subnet/reduce-subnet inst0 {:type :put-blob :sender agent-pub :dac dac :epoch 7 :blob b1 :now-ms 1100})
+          r-ptr-ok (subnet/reduce-subnet (:state r-put-ok) {:type :publish-pointer :sender agent-pub :dac dac :epoch 7 :pointer ptr1 :now-ms 1150})
+          ;; Without DAC at epoch 8: rejected even after prior admission!
+          r-no-dac (subnet/reduce-subnet (:state r-ptr-ok) {:type :put-blob :sender agent-pub :epoch 8 :blob b2 :now-ms 1200})
+          ;; Epoch 11 (after DAC expires-epoch 10): rejected fail-closed with counted :diagnose!
+          r-expired-blob (subnet/reduce-subnet (:state r-ptr-ok) {:type :put-blob :sender agent-pub :dac dac :epoch 11 :blob b2 :now-ms 1300})
+          r-expired-ptr (subnet/reduce-subnet (:state r-ptr-ok) {:type :publish-pointer :sender agent-pub :dac dac :epoch 11 :pointer ptr2 :now-ms 1350})]
+      (is (false? (:ok? bad-adm-res)))
+      (is (= :invalid-gate-admission (:error bad-adm-res)))
+      (is (= :diagnose (:effect (first (:effects bad-adm-res)))))
+      (is (false? (:ok? perm-open-res)))
+      (is (= :diagnose (:effect (first (:effects perm-open-res)))))
+      (is (:applied? r-put-ok))
+      (is (:applied? r-ptr-ok))
+      (is (not (contains? (get-in r-ptr-ok [:state :admitted-members]) agent-pub))
+          "DAC-admitted hot key must not be permanently cached in :admitted-members")
+      (is (false? (:applied? r-no-dac)))
+      (is (= :invalid-or-missing-dac (:error r-no-dac)))
+      (is (false? (:applied? r-expired-blob)))
+      (is (= :invalid-or-missing-dac (:error r-expired-blob)))
+      (is (= :diagnose (:effect (first (:effects r-expired-blob)))))
+      (is (false? (:applied? r-expired-ptr)))
+      (is (= :invalid-or-missing-dac (:error r-expired-ptr))))))

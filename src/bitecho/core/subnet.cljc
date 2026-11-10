@@ -65,6 +65,16 @@
          :error :invalid-gate-mode
          :effects [{:effect :diagnose :reason :invalid-gate-mode :subnet sid}]}
 
+        (not (contains? #{:open :allowlist :dac :mtls-cert :min-stake} admission))
+        {:ok? false
+         :error :invalid-gate-admission
+         :effects [{:effect :diagnose :reason :invalid-gate-admission :subnet sid}]}
+
+        (and (= gate-mode :permissioned) (= admission :open))
+        {:ok? false
+         :error :permissioned-cannot-use-open-admission
+         :effects [{:effect :diagnose :reason :permissioned-cannot-use-open-admission :subnet sid}]}
+
         (not (contains? #{:none :burn-only :full-settlement} econ-mode))
         {:ok? false
          :error :invalid-economy-mode
@@ -166,17 +176,20 @@
 
 (defn step-leader-election
   "Pure reducer advancing leader-election state on `:tick`, `:heartbeat`, `:peer-connected`, or `:peer-disconnected`.
-   Maintains clock-free monotonic `:term` across leader elections and peer heartbeats."
+   Maintains clock-free monotonic `:term` across leader elections and peer heartbeats, converging to the
+   peer's `:term` when adopting an already-elected leader rather than leapfrogging terms."
   [le-state event now-ms]
   (let [t (long (or now-ms 0))
         etype (:type event)
+        local-term (long (:term le-state 0))
+        remote-term (if (= etype :heartbeat) (long (or (:term event) 0)) 0)
+        remote-leader (when (= etype :heartbeat) (:leader-id event))
+        base-term (max local-term remote-term)
         st1 (case etype
               :heartbeat
-              (let [from (:from event)
-                    remote-term (long (or (:term event) 0))]
-                (cond-> le-state
-                  from (assoc-in [:peers from] {:last-seen-ms t :connected? true})
-                  (> remote-term (long (:term le-state 0))) (assoc :term remote-term)))
+              (let [from (:from event)]
+                (cond-> (assoc le-state :term base-term)
+                  from (assoc-in [:peers from] {:last-seen-ms t :connected? true})))
 
               :peer-connected
               (let [pid (:peer-id event)]
@@ -194,10 +207,13 @@
         prev-leader (:leader-id st1)
         leader (elect-leader healthy (count (:all-nodes st1)))
         leader-changed? (and (some? leader) (not= leader prev-leader))
+        adopted-remote-term? (and (= etype :heartbeat)
+                                  (> remote-term local-term)
+                                  (or (nil? remote-leader) (= remote-leader leader)))
         new-role (if (and leader (= leader (:node-id st1))) :leader :follower)
-        new-term (if leader-changed?
-                   (inc (long (:term st1 0)))
-                   (long (:term st1 0)))
+        new-term (if (and leader-changed? (not adopted-remote-term?))
+                   (inc base-term)
+                   base-term)
         effects (cond-> []
                   leader-changed?
                   (conj {:effect :leader-elected :leader-id leader :term new-term})
@@ -281,7 +297,6 @@
 
         :dac
         (if (and sender (or (contains? anchors sender)
-                            (contains? (:admitted-members state #{}) sender)
                             (verify-dac-credential (:dac event) sender anchors (:epoch event))))
           {:admitted? true :member sender}
           {:admitted? false :error :invalid-or-missing-dac})
@@ -331,19 +346,26 @@
                                    :policy-rejected 0}}})))))
 
 (defn- pointer-verify-ctx
-  [instance now-ms]
+  [instance admitted-member now-ms]
   (let [policy (:policy instance)
         le (:leader-election instance)
-        anchors (set (map normalize-hex (get-in policy [:subnet/gate :gate/trust-anchors] #{})))]
-    {:subnet (:subnet/id policy)
-     :path-acl (or (:subnet/path-acl policy) [])
-     :trust-anchors anchors
-     :admitted-members (:admitted-members instance anchors)
-     :governance (get-in policy [:subnet/gate :gate/governance])
-     :leader-pubkeys anchors
-     :current-leader (when le (:leader-id le))
-     :min-leader-term (when le (:term le))
-     :now-ms now-ms}))
+        anchors (set (map normalize-hex (get-in policy [:subnet/gate :gate/trust-anchors] #{})))
+        event-admitted (cond-> (set (:admitted-members instance anchors))
+                         admitted-member (conj admitted-member))]
+    (cond-> {:subnet (:subnet/id policy)
+             :path-acl (or (:subnet/path-acl policy) [])
+             :trust-anchors anchors
+             :admitted-members event-admitted
+             :governance (get-in policy [:subnet/gate :gate/governance])
+             :leader-pubkeys anchors
+             :current-leader (when le (:leader-id le))
+             :min-leader-term (when le (:term le))
+             :blobs (get-in instance [:data :blobs])
+             :now-ms now-ms}
+      (get-in policy [:subnet/gate :gate/acme-thumbprint])
+      (assoc :acme-thumbprint (get-in policy [:subnet/gate :gate/acme-thumbprint]))
+      (get-in policy [:subnet/gate :gate/allowed-dac-capabilities])
+      (assoc :allowed-dac-capabilities (get-in policy [:subnet/gate :gate/allowed-dac-capabilities])))))
 
 (defn reduce-subnet
   "Pure Sans-IO unified Subnet reducer (`Gate -> Economy -> Replication`):
@@ -396,7 +418,6 @@
                  :effects [diag]})
               (let [admitted-member (:member adm)
                     inst1 (cond-> instance
-                            admitted-member (update :admitted-members (fnil conj #{}) admitted-member)
                             (and (not= econ-mode :none) (pos? provided-burn))
                             (update :burned-ech (fnil + 0) provided-burn))]
                 (case etype
@@ -424,7 +445,7 @@
 
                   :publish-pointer
                   (let [ptr (:pointer event)
-                        ctx (pointer-verify-ctx inst1 now-ms)
+                        ctx (pointer-verify-ctx inst1 admitted-member now-ms)
                         res (data/apply-pointer (:data inst1) ptr ctx)]
                     (if-not (:applied? res)
                       {:state (assoc inst1 :data (:state res))

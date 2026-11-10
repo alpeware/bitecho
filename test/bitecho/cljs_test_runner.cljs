@@ -4,6 +4,7 @@
             [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
             [bitecho.core.data-test]
+            [bitecho.core.protocol-test]
             [bitecho.core.subnet-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
@@ -51,6 +52,7 @@
              'bitecho.wire-negotiation-test
              'bitecho.fractal-federation-test
              'bitecho.core.data-test
+             'bitecho.core.protocol-test
              'bitecho.core.subnet-test))
 
 (set! *main-cli-fn* -main)

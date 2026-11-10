@@ -4,14 +4,32 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.demo.angels :as angels]
             [bitecho.light-node.core :as light-core]
+            [bitecho.shell.acme :as acme-shell]
             [bitecho.shell.agent-sim :as agent-sim]
+            [bitecho.shell.dns :as dns-shell]
+            [bitecho.shell.http :as http-shell]
             [bitecho.shell.identity :as identity]
+            [bitecho.shell.infra :as infra]
             [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
+            [bitecho.shell.smtp :as smtp-shell]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]))
+
+(def ^{:doc "Canonical top-level CLI subcommands exposed by `bitecho.main`."}
+  cli-subcommands
+  ["run"
+   "infra-node"
+   "print-identity"
+   "gen-keypair"
+   "validate-config"
+   "simulate-agents"
+   "fund-agent"
+   "light-node"
+   "sign-directory-pop"
+   "demo-angels"])
 
 (defn- print-usage
   "Prints CLI usage guide."
@@ -19,6 +37,7 @@
   (println "Bitecho Node CLI")
   (println "Usage:")
   (println "  bitecho run <config.edn>")
+  (println "  bitecho infra-node <config.edn>")
   (println "  bitecho print-identity <config.edn>")
   (println "  bitecho gen-keypair [output-file.edn]")
   (println "  bitecho validate-config <config.edn>")
@@ -27,6 +46,57 @@
   (println "  bitecho light-node <serve|verb> [options]")
   (println "  bitecho sign-directory-pop <dir-identity-dir-or-file> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]")
   (println "  bitecho demo-angels"))
+
+(defn start-infra-node!
+  "Starts a unified `\"bitecho.org/infra\"` edge node stack (`infra` Subnet runtime + `tls-manager`
+   + optional `dns`, `http`, `smtp`, and `acme` boundary shells) from `cfg`."
+  [cfg]
+  (let [state-dir (or (:state-dir cfg) "data/infra")
+        node-id (or (:node/id cfg) (:node-id cfg) :ns1)
+        ident (identity/load-or-create-node-identity! state-dir node-id)
+        pub-hex (:pubkey-hex ident)
+        priv-bytes (or (get-in ident [:keypair :private])
+                       (basalt/hex->bytes (:privkey-hex ident)))
+        anchors (or (not-empty (set (:trust-anchors cfg))) #{pub-hex})
+        policy (or (:policy cfg)
+                   (infra/default-infra-policy {:subnet-id (or (:subnet-id cfg) "bitecho.org/infra")
+                                                :trust-anchors anchors
+                                                :cold-pubkey (or (:cold-pubkey cfg) pub-hex)
+                                                :domain-pubkey (or (:domain-pubkey cfg) pub-hex)}))
+        tls-mgr (http-shell/init-tls-manager! {:state-dir state-dir
+                                               :domain (or (:domain cfg) "localhost")})
+        rt (infra/start-subnet-runtime! {:state-dir state-dir
+                                         :policy policy
+                                         :node-id node-id
+                                         :default-sender pub-hex
+                                         :node-privkey priv-bytes
+                                         :all-nodes (or (:all-nodes cfg) #{node-id})
+                                         :heartbeat-ticker? (boolean (get cfg :heartbeat-ticker? true))
+                                         :tls-manager tls-mgr
+                                         :tls-secret (or (:tls-secret cfg) priv-bytes)})
+        dns-srv (when (get-in cfg [:dns :enabled?] true)
+                  (dns-shell/start-dns-server! cfg rt))
+        http-srv (when (get-in cfg [:http :enabled?] true)
+                   (http-shell/start-http-servers! cfg tls-mgr rt))
+        smtp-srv (when (get-in cfg [:smtp :enabled?] false)
+                   (smtp-shell/start-smtp-server! cfg tls-mgr rt))
+        acme-mgr (when (get-in cfg [:acme :enabled?] false)
+                   (acme-shell/start-acme-loop! cfg rt tls-mgr))]
+    {:node-id node-id
+     :pubkey pub-hex
+     :identity ident
+     :runtime rt
+     :tls-manager tls-mgr
+     :dns dns-srv
+     :http http-srv
+     :smtp smtp-srv
+     :acme acme-mgr
+     :stop! (fn []
+              (when acme-mgr (acme-shell/stop-acme-loop! acme-mgr))
+              (when smtp-srv (smtp-shell/stop-smtp-server! smtp-srv))
+              (when http-srv (http-shell/stop-http-servers! http-srv))
+              (when dns-srv (dns-shell/stop-dns-server! dns-srv))
+              (infra/stop-subnet-runtime! rt))}))
 
 (defn- cmd-run
   "Runs a Bitecho mesh node given a config EDN file."
@@ -214,6 +284,29 @@
         (println (str "Error running demo-angels: " (.getMessage e))))
       (System/exit 1))))
 
+(defn- cmd-infra-node
+  "Runs a unified Bitecho edge/infra node stack given a config EDN file."
+  [config-file]
+  (let [f (io/file config-file)]
+    (when-not (.exists f)
+      (binding [*out* *err*]
+        (println (str "Error: config file not found: " config-file)))
+      (System/exit 1))
+    (let [cfg (edn/read-string (slurp f))
+          stack (start-infra-node! cfg)]
+      (println (format "Bitecho infra-node started: id=%s pubkey=%s dns=:%s https=:%s"
+                       (name (:node-id stack))
+                       (:pubkey stack)
+                       (str (or (get-in stack [:dns :udp-port]) "off"))
+                       (str (or (get-in stack [:http :https-port]) "off"))))
+      (.addShutdownHook (Runtime/getRuntime)
+                        (Thread. ^Runnable (fn []
+                                             (println "Shutting down Bitecho infra-node...")
+                                             ((:stop! stack)))))
+      (let [lock (Object.)]
+        (locking lock
+          (.wait lock))))))
+
 (defn -main
   "Main CLI entrypoint."
   [& args]
@@ -222,6 +315,11 @@
       "run"
       (if (first rest-args)
         (cmd-run (first rest-args))
+        (do (print-usage) (System/exit 1)))
+
+      "infra-node"
+      (if (first rest-args)
+        (cmd-infra-node (first rest-args))
         (do (print-usage) (System/exit 1)))
 
       "print-identity"

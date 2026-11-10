@@ -312,3 +312,112 @@
       (is (:ok? (data/verify-pointer p-boot global-ctx)))
       (is (false? (:ok? (data/verify-pointer p-acme infra-ctx))) "ACME challenge 90s past expiry exceeds 60s tolerance")
       (is (:ok? (data/verify-pointer p-dir-skew global-ctx)) "Directory pointer 90s past expiry within 5m tolerance"))))
+
+(deftest test-f2-semantic-proof-verifiers
+  (testing "F2: :cert, :acme-key-auth, and :dac proof verifiers enforce semantic checks against context and target Blobs"
+    (let [leader-kp (crypto/generate-keypair)
+          anchor-kp (crypto/generate-keypair)
+          agent-kp (crypto/generate-keypair)
+          leader-pub (basalt/bytes->hex (:public leader-kp))
+          anchor-pub (basalt/bytes->hex (:public anchor-kp))
+          agent-pub (basalt/bytes->hex (:public agent-kp))
+          ;; 1. Semantic :cert fingerprint verification against PEM leaf certificate DER in target Blob
+          fake-cert-der (fressian/utf8->bytes "mock-x509-leaf-der-bytes-for-semantic-fingerprint-test")
+          cert-fp (basalt/bytes->hex (crypto/sha256 fake-cert-der))
+          wrong-fp (apply str (repeat 64 "a"))
+          cert-pem (str "-----BEGIN CERTIFICATE-----\n"
+                        "bW9jay14NTA5LWxlYWYtZGVyLWJ5dGVzLWZvci1zZW1hbnRpYy1maW5nZXJwcmludC10ZXN0\n"
+                        "-----END CERTIFICATE-----\n")
+          cert-blob (data/make-blob (fressian/encode-canonical {:cert-pem cert-pem}) "application/fressian")
+          blobs-with-cert (:store (data/put-blob (data/init-blob-store) cert-blob 1000))
+          valid-cert-ptr (data/sign-pointer (:private leader-kp)
+                                            {:pointer/authority leader-pub
+                                             :pointer/subnet "bitecho.org/infra"
+                                             :pointer/path "tls/current-cert"
+                                             :pointer/leader-term 1
+                                             :pointer/seq 1
+                                             :pointer/target (:blob/cid cert-blob)
+                                             :pointer/proof {:proof/type :cert :fingerprint cert-fp}})
+          bad-cert-ptr (data/sign-pointer (:private leader-kp)
+                                          {:pointer/authority leader-pub
+                                           :pointer/subnet "bitecho.org/infra"
+                                           :pointer/path "tls/current-cert"
+                                           :pointer/leader-term 1
+                                           :pointer/seq 2
+                                           :pointer/target (:blob/cid cert-blob)
+                                           :pointer/proof {:proof/type :cert :fingerprint wrong-fp}})
+          ;; 2. Semantic :acme-key-auth verification against path token, :acme-thumbprint, and target Blob
+          acme-blob (data/make-blob (fressian/utf8->bytes "tok42.expected-thumb") "application/octet-stream")
+          blobs-all (:store (data/put-blob blobs-with-cert acme-blob 1001))
+          valid-acme-ptr (data/sign-pointer (:private leader-kp)
+                                            {:pointer/authority leader-pub
+                                             :pointer/subnet "bitecho.org/infra"
+                                             :pointer/path "acme/challenge/tok42"
+                                             :pointer/leader-term 1
+                                             :pointer/seq 1
+                                             :pointer/target (:blob/cid acme-blob)
+                                             :pointer/proof {:proof/type :acme-key-auth
+                                                             :token "tok42"
+                                                             :key-auth "tok42.expected-thumb"}})
+          wrong-thumb-acme-ptr (data/sign-pointer (:private leader-kp)
+                                                  {:pointer/authority leader-pub
+                                                   :pointer/subnet "bitecho.org/infra"
+                                                   :pointer/path "acme/challenge/tok42"
+                                                   :pointer/leader-term 1
+                                                   :pointer/seq 2
+                                                   :pointer/target (:blob/cid acme-blob)
+                                                   :pointer/proof {:proof/type :acme-key-auth
+                                                                   :token "tok42"
+                                                                   :key-auth "tok42.wrong-thumb"}})
+          wrong-path-acme-ptr (data/sign-pointer (:private leader-kp)
+                                                 {:pointer/authority leader-pub
+                                                  :pointer/subnet "bitecho.org/infra"
+                                                  :pointer/path "acme/challenge/other-tok"
+                                                  :pointer/leader-term 1
+                                                  :pointer/seq 3
+                                                  :pointer/target (:blob/cid acme-blob)
+                                                  :pointer/proof {:proof/type :acme-key-auth
+                                                                  :token "tok42"
+                                                                  :key-auth "tok42.expected-thumb"}})
+          ;; 3. Semantic :dac capability subset & path-agent binding verification
+          dac-blob (data/make-blob (fressian/encode-canonical {:agent-pubkey agent-pub
+                                                               :scopes ["send" "offer"]})
+                                   "application/fressian")
+          blobs-with-dac (:store (data/put-blob blobs-all dac-blob 1002))
+          valid-dac-ptr (data/sign-pointer (:private anchor-kp)
+                                           {:pointer/authority anchor-pub
+                                            :pointer/subnet "global"
+                                            :pointer/path (str "dac/" agent-pub)
+                                            :pointer/seq 1
+                                            :pointer/target (:blob/cid dac-blob)
+                                            :pointer/proof {:proof/type :dac
+                                                            :agent-pubkey agent-pub
+                                                            :capabilities ["send"]}})
+          escalated-dac-ptr (data/sign-pointer (:private anchor-kp)
+                                               {:pointer/authority anchor-pub
+                                                :pointer/subnet "global"
+                                                :pointer/path (str "dac/" agent-pub)
+                                                :pointer/seq 2
+                                                :pointer/target (:blob/cid dac-blob)
+                                                :pointer/proof {:proof/type :dac
+                                                                :agent-pubkey agent-pub
+                                                                :capabilities ["send" "admin-root"]}})
+          infra-ctx {:subnet "bitecho.org/infra"
+                     :path-acl [{:pattern "tls/*" :principal {:type :leader}}
+                                {:pattern "acme/challenge/*" :principal {:type :leader}}]
+                     :leader-pubkeys #{leader-pub}
+                     :acme-thumbprint "expected-thumb"
+                     :blobs blobs-with-dac
+                     :now-ms 5000}
+          dac-ctx {:subnet "global"
+                   :path-acl [{:pattern "dac/*" :principal {:type :pubkey :pubkey anchor-pub}}]
+                   :allowed-dac-capabilities #{"send" "offer" "relay"}
+                   :blobs blobs-with-dac
+                   :now-ms 5000}]
+      (is (:ok? (data/verify-pointer valid-cert-ptr infra-ctx)))
+      (is (= :cert-fingerprint-mismatch (:error (data/verify-pointer bad-cert-ptr infra-ctx))))
+      (is (:ok? (data/verify-pointer valid-acme-ptr infra-ctx)))
+      (is (= :invalid-acme-proof (:error (data/verify-pointer wrong-thumb-acme-ptr infra-ctx))))
+      (is (= :invalid-acme-proof (:error (data/verify-pointer wrong-path-acme-ptr infra-ctx))))
+      (is (:ok? (data/verify-pointer valid-dac-ptr dac-ctx)))
+      (is (= :dac-capability-escalation (:error (data/verify-pointer escalated-dac-ptr dac-ctx)))))))

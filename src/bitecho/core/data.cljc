@@ -10,6 +10,7 @@
    100% pure `.cljc` portable across Clojure (JVM) and ClojureScript (Node/Browser)."
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.protocol.acme :as acme]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [clojure.string :as str]))
@@ -535,17 +536,66 @@
             {:ok? false :error :insufficient-quorum-signatures}))
 
         :acme-key-auth
-        (if (and (string? (:token proof))
-                 (not (str/blank? (:token proof)))
-                 (string? (:key-auth proof))
-                 (str/starts-with? (:key-auth proof) (str (:token proof) ".")))
-          {:ok? true}
-          {:ok? false :error :invalid-acme-proof})
+        (let [tok (:token proof)
+              ka (:key-auth proof)
+              path (str (:pointer/path pointer))
+              expected-tok (when (str/starts-with? path "acme/challenge/")
+                             (subs path (count "acme/challenge/")))
+              expected-thumb (:acme-thumbprint ctx)
+              blob-entry (when (and target (:blobs ctx))
+                           (get-in (:blobs ctx) [:entries target]))
+              blob-bs (when blob-entry (:bytes blob-entry))
+              blob-ka (when (bytes? blob-bs)
+                        (if (= "application/fressian" (:media-type blob-entry))
+                          (let [d (try (fressian/decode-wire blob-bs)
+                                       (catch #?(:clj Exception :cljs :default) _ nil))]
+                            (when (map? d) (:key-auth d)))
+                          (str/trim (fressian/bytes->utf8 blob-bs))))]
+          (if (and (string? tok)
+                   (not (str/blank? tok))
+                   (or (nil? expected-tok) (= tok expected-tok))
+                   (string? ka)
+                   (str/starts-with? ka (str tok "."))
+                   (> (count ka) (inc (count tok)))
+                   (or (nil? expected-thumb) (= ka (str tok "." expected-thumb)))
+                   (or (nil? blob-ka) (= ka blob-ka)))
+            {:ok? true}
+            {:ok? false :error :invalid-acme-proof}))
 
         :cert
-        (if (and (string? (:fingerprint proof)) (not (str/blank? (:fingerprint proof))))
-          {:ok? true}
-          {:ok? false :error :invalid-cert-proof})
+        (let [raw-fp (:fingerprint proof)
+              norm-fp (when (string? raw-fp)
+                        (-> raw-fp
+                            str/trim
+                            str/lower-case
+                            (str/replace #"^sha-?256:" "")
+                            (str/replace ":" "")
+                            str/trim))]
+          (if-not (and norm-fp (re-matches #"[0-9a-f]{64}" norm-fp))
+            {:ok? false :error :invalid-cert-proof}
+            (let [blob-entry (when (and target (:blobs ctx))
+                               (get-in (:blobs ctx) [:entries target]))
+                  blob-bs (when blob-entry (:bytes blob-entry))]
+              (if-not (bytes? blob-bs)
+                {:ok? true}
+                (let [decoded (when (= "application/fressian" (:media-type blob-entry))
+                                (try (fressian/decode-wire blob-bs)
+                                     (catch #?(:clj Exception :cljs :default) _ nil)))
+                      cert-der (cond
+                                 (and (map? decoded) (bytes? (:cert-der decoded)))
+                                 (:cert-der decoded)
+
+                                 (and (map? decoded) (string? (:cert-pem decoded)))
+                                 (acme/extract-first-pem-cert-der (:cert-pem decoded))
+
+                                 :else
+                                 (or (acme/extract-first-pem-cert-der (fressian/bytes->utf8 blob-bs))
+                                     blob-bs))
+                      actual-fp (when (bytes? cert-der)
+                                  (str/lower-case (basalt/bytes->hex (crypto/sha256 cert-der))))]
+                  (if (= norm-fp actual-fp)
+                    {:ok? true}
+                    {:ok? false :error :cert-fingerprint-mismatch}))))))
 
         :zone
         (if (and (integer? (:serial proof)) (not (neg? (long (:serial proof)))))
@@ -553,11 +603,40 @@
           {:ok? false :error :invalid-zone-proof})
 
         :dac
-        (if (and (string? (:agent-pubkey proof))
-                 (sequential? (:capabilities proof))
-                 (seq (:capabilities proof)))
-          {:ok? true}
-          {:ok? false :error :invalid-dac-proof})
+        (let [agent-pub (normalize-hex (:agent-pubkey proof))
+              caps (:capabilities proof)
+              path (str (:pointer/path pointer))
+              path-owner (when (str/starts-with? path "dac/")
+                           (let [s (subs path 4)]
+                             (when (>= (count s) 64) (normalize-hex s))))
+              norm-cap (fn [c] (str/lower-case (str/trim (if (keyword? c) (name c) (str c)))))
+              proof-caps (when (and (sequential? caps) (seq caps))
+                           (set (map norm-cap caps)))
+              ctx-allowed (when (seq (:allowed-dac-capabilities ctx))
+                            (set (map norm-cap (:allowed-dac-capabilities ctx))))
+              blob-entry (when (and target (:blobs ctx))
+                           (get-in (:blobs ctx) [:entries target]))
+              blob-bs (when blob-entry (:bytes blob-entry))
+              decoded (when (and (bytes? blob-bs) (= "application/fressian" (:media-type blob-entry)))
+                        (try (fressian/decode-wire blob-bs)
+                             (catch #?(:clj Exception :cljs :default) _ nil)))
+              blob-scopes (when (and (map? decoded) (seq (:scopes decoded)))
+                            (set (map norm-cap (:scopes decoded))))
+              blob-agent (when (and (map? decoded) (string? (:agent-pubkey decoded)))
+                           (normalize-hex (:agent-pubkey decoded)))]
+          (cond
+            (or (nil? agent-pub)
+                (nil? proof-caps)
+                (and path-owner (not= path-owner agent-pub))
+                (and blob-agent (not= blob-agent agent-pub)))
+            {:ok? false :error :invalid-dac-proof}
+
+            (or (and ctx-allowed (not (every? ctx-allowed proof-caps)))
+                (and blob-scopes (not (every? blob-scopes proof-caps))))
+            {:ok? false :error :dac-capability-escalation}
+
+            :else
+            {:ok? true}))
 
         :home-set
         (if (and (sequential? (:candidates proof)) (seq (:candidates proof)))
@@ -650,7 +729,9 @@
    - Strictly newer -> replaces previous entry, unpins old target Blob CID (if any), and pins new target CID
      (or leaves unpinned when `:pointer/target` is `nil` tombstone)."
   [state pointer ctx]
-  (let [v-res (verify-pointer pointer ctx)]
+  (let [full-ctx (cond-> (or ctx {})
+                   (nil? (:blobs ctx)) (assoc :blobs (:blobs state)))
+        v-res (verify-pointer pointer full-ctx)]
     (if-not (:ok? v-res)
       (let [err (:error v-res)
             diag {:effect :diagnose
