@@ -83,8 +83,10 @@
                     (when (.exists tmp) (.delete tmp))))))
             (let [existing-meta (when (.exists mdest)
                                   (try (edn/read-string (slurp mdest)) (catch Exception _ nil)))
-                  existing-mt (:media-type existing-meta)
+                  existing-mt (when (map? existing-meta) (:media-type existing-meta))
                   should-write-meta? (or (not (.exists mdest))
+                                         (not (map? existing-meta))
+                                         (str/blank? existing-mt)
                                          (and (= existing-mt "application/octet-stream")
                                               (not= media-type "application/octet-stream")))]
               (when should-write-meta?

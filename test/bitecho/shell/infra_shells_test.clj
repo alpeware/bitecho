@@ -1387,6 +1387,7 @@
       (try
         (.mkdirs content-root)
         (spit (io/file content-root "index.md") "# Bitecho Phase D\n")
+        (spit (io/file content-root "llms.txt") "# Bitecho Phase D\n")
         (spit (io/file content-root "ONBOARDING.md") "# Onboarding\n")
         (let [id (infra/load-or-create-infra-peer-identity! state-dir :ns1)
               pol (infra/default-infra-policy {:subnet-id "bitecho.org/infra"
@@ -1424,6 +1425,11 @@
                                         :request/uri {:path "/"}
                                         :request/headers {}}
                                        (System/currentTimeMillis))
+                    res-llms (serve-fn cfg (:shell-atom rt2) rt2
+                                       {:request/method :GET
+                                        :request/uri {:path "/llms.txt"}
+                                        :request/headers {}}
+                                       (System/currentTimeMillis))
                     res-onb (serve-fn cfg (:shell-atom rt2) rt2
                                       {:request/method :GET
                                        :request/uri {:path "/ONBOARDING.md"}
@@ -1437,6 +1443,9 @@
                 (is (= 200 (:response/status res-root)))
                 (is (= "text/markdown; charset=utf-8" (get-in res-root [:response/headers "Content-Type"]))
                     "Root / (web/index.md) hydrated from disk after restart returns text/markdown; charset=utf-8")
+                (is (= 200 (:response/status res-llms)))
+                (is (= "text/plain; charset=utf-8" (get-in res-llms [:response/headers "Content-Type"]))
+                    "/llms.txt sharing CID with index.md returns text/plain; charset=utf-8")
                 (is (= 200 (:response/status res-onb)))
                 (is (= "text/markdown; charset=utf-8" (get-in res-onb [:response/headers "Content-Type"]))
                     "/ONBOARDING.md hydrated from disk after restart returns text/markdown; charset=utf-8")

@@ -150,27 +150,28 @@
              {:ok? false :error :blob-cid-mismatch :store st' :effects [diag]})
            (let [existing (get-in store [:entries norm-cid])
                  sz (fressian/count-bytes bs)
-                 next-seq (inc (long (:access-seq store 0)))]
+                 next-seq (inc (long (:access-seq store 0)))
+                 prev-mt (:media-type existing)
+                 resolved-mt (if (and (some? media-type)
+                                      (not (str/blank? media-type))
+                                      (not= media-type "application/octet-stream"))
+                               media-type
+                               (if (and (some? prev-mt)
+                                        (not (str/blank? prev-mt))
+                                        (not= prev-mt "application/octet-stream"))
+                                 prev-mt
+                                 (or media-type prev-mt "application/octet-stream")))]
              (if (and existing (some? (:bytes existing)))
-               ;; Already present and hot -> idempotent touch
+               ;; Already present and hot -> idempotent touch (upgrading octet-stream media-type per L-D1)
                {:ok? true
                 :cid norm-cid
                 :store (-> store
                            (assoc :access-seq next-seq)
-                           (assoc-in [:entries norm-cid :last-access] next-seq))
+                           (assoc-in [:entries norm-cid :last-access] next-seq)
+                           (assoc-in [:entries norm-cid :media-type] resolved-mt))
                 :effects []}
                (let [pins (long (or (:pins existing) 0))
                      was-present? (some? existing)
-                     prev-mt (:media-type existing)
-                     resolved-mt (if (and (some? media-type)
-                                          (not (str/blank? media-type))
-                                          (not= media-type "application/octet-stream"))
-                                   media-type
-                                   (if (and (some? prev-mt)
-                                            (not (str/blank? prev-mt))
-                                            (not= prev-mt "application/octet-stream"))
-                                     prev-mt
-                                     (or media-type prev-mt "application/octet-stream")))
                      entry {:cid norm-cid
                             :media-type resolved-mt
                             :bytes bs

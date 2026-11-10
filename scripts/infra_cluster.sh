@@ -419,7 +419,12 @@ sudo chown -R cljweb:cljweb /var/lib/clj-web
 sudo systemctl restart bitecho-infra.service
 REMOTE_RETIRE
 
-    sleep 3
+    for _ in {1..20}; do
+      if curl -fsS --max-time 2 "http://${ip}:80/healthz" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
     verify_node_health "$node"
     local cljweb_status
     cljweb_status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/git/clj-web.git/info/refs" || true)"

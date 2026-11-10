@@ -646,11 +646,16 @@
                     fallback-name (or (get-in resolved [:pointer :pointer/path])
                                       (when-let [^File df (:file resolved)] (.getName df))
                                       (get-in req [:request/uri :path]))
-                    ct (if (and (string? raw-ct)
-                                (not (str/blank? raw-ct))
-                                (not= raw-ct "application/octet-stream"))
+                    path-ct (content-type-for-file fallback-name)
+                    ct (cond
+                         (not= path-ct "application/octet-stream")
+                         path-ct
+
+                         (and (string? raw-ct) (not (str/blank? raw-ct)))
                          raw-ct
-                         (content-type-for-file fallback-name))
+
+                         :else
+                         "application/octet-stream")
                     ^bytes raw-bs (:blob/bytes blob)
                     ^File disk-file (:file resolved)
                     total-size (long (if (and disk-file (.exists disk-file))
