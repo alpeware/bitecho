@@ -33,6 +33,7 @@
             [bitecho.shell.persistence-test]
             [bitecho.sieve.core-test]
             [bitecho.simulator-config-test]
+            [bitecho.simulator-test]
             [bitecho.state-machine-fuzz-test]
             [bitecho.state-machine-portability-test]
             [bitecho.state-machine-test]

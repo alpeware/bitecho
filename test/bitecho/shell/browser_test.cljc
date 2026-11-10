@@ -452,6 +452,11 @@
             "agent" "agents" "agent-id" "supervised-agents" "supervised-agents-count" "supervised-agent-revoked"
             "activity-log" "activity-count" "team-call-subnet" "topic-name" "ai-inference"
             "directory-cache" "directory-cache-count" "bootstrap" "signature"
+            "trusted-dac-anchors" "broadcast-seq" "broadcast-seen" "broadcast-inbox" "broadcast?"
+            "p2p-relayed" "broadcast-duplicates-dropped" "broadcast-rejected" "msg-id"
+            "p2p" "zero-burn?" "zero-burn" "candidates" "local-candidates" "remote-candidates"
+            "local-transport" "remote-transport" "local-ice-ufrag" "remote-ice-ufrag"
+            "local-fingerprint" "remote-fingerprint" "dtls-fingerprint"
             "domain-a" "domain-a-verified?" "domain-b" "domain-b-verified?"
             "advertisement-verified?" "inter-subnet-routed?" "subnet-mismatch-dropped" "unroutable-dropped"
             "autonomous" "autonomous?" "autonomous-off?" "economy-enabled" "economy-enabled?"
@@ -638,8 +643,8 @@
                                     (collect-keys populated-light)
                                     (collect-keys base-anchor)
                                     (collect-keys base-conn)))))
-        ;; All 35 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
-        (is (= 35 (count (keys base-light))))
+        ;; All 39 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
+        (is (= 39 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)

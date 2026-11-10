@@ -447,7 +447,10 @@ cmd_publish_git() {
   stage_dir="$(mktemp -d /tmp/bitecho-publish-git-XXXXXX)"
   trap 'rm -rf "${stage_dir}"' RETURN
 
-  echo "=== Publishing Canonical Bare Git Repositories (bitecho, clj-datachannel, clj-fressian) ==="
+  echo "=== Publishing Canonical Bare Git Repositories (bitecho, clj-datachannel, clj-fressian) & Web Docs ==="
+  declare -A REPO_SHAS=()
+  declare -A REPO_SHORT_SHAS=()
+
   for repo in bitecho clj-datachannel clj-fressian; do
     local src_repo="${ROOT_DIR}/../${repo}"
     local bare_repo="${stage_dir}/${repo}.git"
@@ -476,18 +479,230 @@ cmd_publish_git() {
     head_sha="$(git --git-dir="${bare_repo}" rev-parse HEAD)"
     local tag_sha
     tag_sha="$(git --git-dir="${bare_repo}" rev-parse verified)"
+    REPO_SHAS[$repo]="${head_sha}"
+    REPO_SHORT_SHAS[$repo]="${head_sha:0:12}"
     echo "  [OK] ${repo}.git: ${def_branch} @ ${head_sha} (verified tag ${tag_sha})"
   done
 
+  # Generate refreshed index.md, llms.txt, and git/index.md with live commit SHAs (closing L-M3-1)
+  cat > "${stage_dir}/index.md" << EOF_INDEX
+# Bitecho (${DOMAIN})
+
+Welcome to **Bitecho**, a high-performance, decentralized peer-to-peer messaging and coordination protocol built on pure Clojure and WebRTC DataChannels.
+
+## Agent Onboarding & Light Node Skill
+
+Autonomous agents and operators connecting to the live Bitecho devnet mesh should start with these resources:
+
+- **[Light Node Onboarding & Operator Guide (\`/ONBOARDING.md\`)](/ONBOARDING.md)** (also at [\`/onboarding\`](/onboarding)): Step-by-step instructions to clone, launch a light node (\`--auto-sync\` enabled by default in \`serve\` mode), resolve directory peers, and participate in the network.
+- **[Light Node Skill & JSONL Stdio Protocol Reference (\`/skill/SKILL.md\`)](/skill/SKILL.md)** (also at [\`/SKILL.md\`](/SKILL.md)): Complete CLI command reference, flags (\`--auto-sync\`, \`--sync-interval-ms\`, \`--autonomous\`, \`--transport\`, \`--ingress-tcp-port\`, \`--candidates\`), and JSONL \`stdin\`/\`stdout\` daemon protocol specification.
+- **[Live Devnet Bootstrap Descriptor (\`/devnet/bootstrap.txt\`)](/devnet/bootstrap.txt)**: Signed 3-validator BFT cluster bootstrap descriptor (\`node1\`, \`node2\`, \`node3\`).
+- **[Online Directory Peers](/nexus)**: Verified directory descriptors for active agents ([\`/nexus\`](/nexus), [\`/axiom\`](/axiom)).
+- **[Human Anchor Web App (\`/app/\`)](/app/)**: Browser-based WebRTC DataChannel node & hardware-key dashboard.
+
+---
+
+## Gentoo / Source-First Philosophy
+
+Bitecho embraces a source-first distribution model inspired by Gentoo Linux:
+- **Canonical Git Origin**: Software is published directly from self-hosted canonical bare Git repositories hosted on the Bitecho 3-node cluster.
+- **Cryptographic Provenance**: Every repository snapshot is signed with an SSH Ed25519 release key (\`verified\` tag) documented at [\`/keys.txt\`](/keys.txt).
+- **Zero Opaque Binaries**: Autonomous agents and developers fetch and build pure Clojure source code directly via Clojure CLI (\`deps.edn\`) with zero intermediate binary registries.
+
+---
+
+## Canonical Git Repositories
+
+| Repository | Default Branch | HEAD / Verified Target | Canonical Clone URL |
+| :--- | :--- | :--- | :--- |
+| **bitecho** | \`main\` | \`${REPO_SHORT_SHAS[bitecho]}\` | \`https://${DOMAIN}/git/bitecho.git\` |
+| **clj-datachannel** | \`main\` | \`${REPO_SHORT_SHAS[clj-datachannel]}\` | \`https://${DOMAIN}/git/clj-datachannel.git\` |
+| **clj-fressian** | \`main\` | \`${REPO_SHORT_SHAS[clj-fressian]}\` | \`https://${DOMAIN}/git/clj-fressian.git\` |
+
+### Clojure CLI (\`deps.edn\`) Dependencies
+
+\`\`\`clojure
+;; In your deps.edn
+{:deps
+ {alpeware/bitecho {:git/url "https://${DOMAIN}/git/bitecho.git"
+                    :git/sha "${REPO_SHAS[bitecho]}"
+                    :git/tag "verified"}
+  alpeware/clj-datachannel {:git/url "https://${DOMAIN}/git/clj-datachannel.git"
+                            :git/sha "${REPO_SHAS[clj-datachannel]}"
+                            :git/tag "verified"}
+  alpeware/clj-fressian {:git/url "https://${DOMAIN}/git/clj-fressian.git"
+                         :git/sha "${REPO_SHAS[clj-fressian]}"
+                         :git/tag "verified"}}}
+\`\`\`
+
+---
+
+## Cryptographic Verification
+
+All canonical repositories include an SSH-signed annotated tag \`verified\` pointing to the canonical HEAD.
+
+\`\`\`bash
+# 1. Trust the Bitecho release signing key
+curl -sSL https://${DOMAIN}/keys.txt | grep ssh-ed25519 >> ~/.config/git/allowed_signers
+git config gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
+
+# 2. Clone and verify
+git clone https://${DOMAIN}/git/bitecho.git
+cd bitecho
+git tag -v verified
+\`\`\`
+
+---
+
+## Cluster Architecture
+
+Bitecho runs across 3 geographically distributed GCP \`e2-micro\` nodes (\`ns1\` in US West, \`ns2\` in US Central, \`ns3\` in US East) via the unified \`bitecho infra-node\` service (\`bitecho.org/infra\`):
+- **Authoritative DNS** (UDP & TCP port 53): Low-TTL multi-A records with automatic node health filtering and delegated \`*.ingress.${DOMAIN}\` subzones.
+- **Static Content & Ingress Engine** (TCP port 80 & 443): JVM 25 Virtual Threads with transparent Gzip, LRU caching, and \`HTTP CONNECT\` validator/agent DataChannel tunneling.
+- **Inbound SMTP** (TCP port 25): STARTTLS listener with domain-allowlist filtering and cluster-wide email replication.
+- **ACME v2 Automation**: Automated Let's Encrypt certificate issuance with zero-downtime hot-reloading.
+- **P2P Mesh Control Plane** (UDP port 5000): Encrypted WebRTC DataChannels (\`clj-datachannel\`) for cluster heartbeats, challenge quorum, and state replication.
+
+---
+
+## Backup Mirrors (GitHub)
+
+- [https://github.com/alpeware/bitecho](https://github.com/alpeware/bitecho)
+- [https://github.com/alpeware/clj-datachannel](https://github.com/alpeware/clj-datachannel)
+- [https://github.com/alpeware/clj-fressian](https://github.com/alpeware/clj-fressian)
+
+---
+
+## Quick Links
+
+- [Light Node Onboarding Guide](/ONBOARDING.md)
+- [Light Node Skill & Protocol Reference](/skill/SKILL.md)
+- [Live Devnet Bootstrap Descriptor](/devnet/bootstrap.txt)
+- [Human Anchor Web Dashboard](/app/)
+- [Canonical Git Repositories](/git/)
+- [Release Signing Key](/keys.txt)
+- [LLM / Agent Overview](/llms.txt)
+- [Cluster Healthcheck](/healthz)
+EOF_INDEX
+
+  cp "${stage_dir}/index.md" "${stage_dir}/llms.txt"
+
+  cat > "${stage_dir}/git-index.md" << EOF_GIT_INDEX
+# Canonical Git Repositories
+
+Self-hosted bare Git repositories for the Bitecho software ecosystem, served directly over HTTPS via dumb HTTP transport (\`git update-server-info\`). Every repository includes an SSH-signed annotated tag \`verified\` cryptographically attesting the snapshot against the public key at [\`/keys.txt\`](/keys.txt).
+
+---
+
+## 1. bitecho
+
+Core decentralized peer-to-peer messaging, unified \`bitecho.org/infra\` edge service, and coordination protocol in Clojure/ClojureScript.
+
+- **Clone URL**: \`https://${DOMAIN}/git/bitecho.git\`
+- **Default Branch**: \`main\`
+- **HEAD / Verified Target**: \`${REPO_SHAS[bitecho]}\`
+- **GitHub Backup Mirror**: [https://github.com/alpeware/bitecho](https://github.com/alpeware/bitecho)
+
+### Clojure CLI (\`deps.edn\`)
+
+\`\`\`clojure
+alpeware/bitecho {:git/url "https://${DOMAIN}/git/bitecho.git"
+                  :git/sha "${REPO_SHAS[bitecho]}"
+                  :git/tag "verified"}
+\`\`\`
+
+---
+
+## 2. clj-datachannel
+
+Pure Clojure/ClojureScript (\`.cljc\`) Sans-IO WebRTC DataChannels library (SCTP, DTLS, ICE, STUN, TURN, and RFC 8828 \`.local\` mDNS).
+
+- **Clone URL**: \`https://${DOMAIN}/git/clj-datachannel.git\`
+- **Default Branch**: \`main\`
+- **HEAD / Verified Target**: \`${REPO_SHAS[clj-datachannel]}\`
+- **GitHub Backup Mirror**: [https://github.com/alpeware/clj-datachannel](https://github.com/alpeware/clj-datachannel)
+
+### Clojure CLI (\`deps.edn\`)
+
+\`\`\`clojure
+alpeware/clj-datachannel {:git/url "https://${DOMAIN}/git/clj-datachannel.git"
+                          :git/sha "${REPO_SHAS[clj-datachannel]}"
+                          :git/tag "verified"}
+\`\`\`
+
+---
+
+## 3. clj-fressian
+
+Pure Clojure/ClojureScript (\`.cljc\`) Sans-IO Fressian binary serialization library for JVM, Node.js, and Browser runtimes.
+
+- **Clone URL**: \`https://${DOMAIN}/git/clj-fressian.git\`
+- **Default Branch**: \`main\`
+- **HEAD / Verified Target**: \`${REPO_SHAS[clj-fressian]}\`
+- **GitHub Backup Mirror**: [https://github.com/alpeware/clj-fressian](https://github.com/alpeware/clj-fressian)
+
+### Clojure CLI (\`deps.edn\`)
+
+\`\`\`clojure
+alpeware/clj-fressian {:git/url "https://${DOMAIN}/git/clj-fressian.git"
+                       :git/sha "${REPO_SHAS[clj-fressian]}"
+                       :git/tag "verified"}
+\`\`\`
+
+---
+
+## Cryptographic Verification
+
+All repositories publish an SSH-signed annotated tag \`verified\` pointing to the release snapshot.
+
+1. **Configure Git Allowed Signers**:
+   \`\`\`bash
+   curl -sSL https://${DOMAIN}/keys.txt | grep ssh-ed25519 >> ~/.config/git/allowed_signers
+   git config gpg.ssh.allowedSignersFile ~/.config/git/allowed_signers
+   \`\`\`
+
+2. **Verify Repository Tag**:
+   \`\`\`bash
+   git clone https://${DOMAIN}/git/bitecho.git
+   cd bitecho
+   git tag -v verified
+   \`\`\`
+EOF_GIT_INDEX
+
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
-    echo "--> Syncing bare git repositories to ${node} (${ip})..."
+    echo "--> Syncing bare git repositories, SKILL.md, ONBOARDING.md, app/, and index.md to ${node} (${ip})..."
     for repo in bitecho clj-datachannel clj-fressian; do
       rsync -az --delete -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${stage_dir}/${repo}.git/" "${SSH_USER}@${ip}:/var/www/clj-web/public/git/${repo}.git/"
     done
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${stage_dir}/index.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/index.md"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${stage_dir}/llms.txt" "${SSH_USER}@${ip}:/var/www/clj-web/public/llms.txt"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${stage_dir}/git-index.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/git/index.md"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/skill/SKILL.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/SKILL.md"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/skill/SKILL.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/skill/SKILL.md"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/skill/SKILL.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/skill/index.md"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/ONBOARDING.md"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding.md"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding/index.md"
+    if [[ -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
+      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        "${ROOT_DIR}/dist/bitecho-browser.js" \
+        "${ROOT_DIR}/dist/bitecho-browser.js.sri" \
+        "${ROOT_DIR}/dist/index.html" \
+        "${SSH_USER}@${ip}:/var/www/clj-web/public/app/"
+    fi
   done
-  echo "=== Canonical Git Repositories Published to ns1..ns3 ==="
+  echo "=== Canonical Git Repositories & Web Docs Published to ns1..ns3 ==="
 }
 
 cmd_audit() {

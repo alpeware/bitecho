@@ -6,7 +6,7 @@
         alpeware/clj-fressian {:git/url "https://bitecho.org/git/clj-fressian.git"
                                :git/sha "4c56c12c8f94efed4324c8f0a4ed340337bdbc54"}
         alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
-                                  :git/sha "ff9fd4a0fc974b4c4cbddc6f24e595c39b94295d"}}
+                                  :git/sha "5e701d950c8e4c006824d420aa34ed150dd03456"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]
@@ -21,7 +21,7 @@
                                  "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                                  "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"
                                  "-Dclojure.core.async.pool-size=32"]}
-           :test {:extra-paths ["test"]
+           :test {:extra-paths ["test" "dev"]
                   :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
                                org.clojure/data.fressian {:mvn/version "1.1.0"}}
                   :main-opts ["-m" "bitecho.test-runner"]

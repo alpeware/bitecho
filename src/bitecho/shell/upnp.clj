@@ -233,14 +233,21 @@
               resp-body (.body resp)]
           (if (<= 200 status 299)
             {:ok? true :status status :body resp-body :effects []}
-            (let [fault (or (parse-xml-tag-text resp-body "errorDescription")
+            (let [fault-code (parse-xml-tag-text resp-body "errorCode")
+                  fault (or (parse-xml-tag-text resp-body "errorDescription")
                             (parse-xml-tag-text resp-body "faultstring")
                             (str "HTTP " status))]
               {:ok? false
                :error :upnp-soap-fault
                :status status
+               :fault-code fault-code
                :fault fault
-               :effects [{:effect :diagnose :reason :upnp-soap-fault :action action :fault fault}]})))
+               :body resp-body
+               :effects [{:effect :diagnose
+                          :reason :upnp-soap-fault
+                          :action action
+                          :fault-code fault-code
+                          :fault fault}]})))
         (catch Exception e
           {:ok? false
            :error :upnp-io-error
@@ -320,9 +327,19 @@
           :error :missing-external-ip
           :effects [{:effect :diagnose :reason :upnp-missing-external-ip}]})))))
 
+(defn- only-permanent-leases-fault?
+  "Returns true iff a failed `AddPortMapping` response indicates UPnP fault `725` (`OnlyPermanentLeasesSupported`)."
+  [{:keys [error fault-code fault body]}]
+  (and (= :upnp-soap-fault error)
+       (or (= "725" (some-> fault-code str str/trim))
+           (some-> fault str str/lower-case (str/includes? "725"))
+           (some-> fault str str/lower-case (str/includes? "onlypermanentleasessupported"))
+           (some-> body str str/lower-case (str/includes? "onlypermanentleasessupported")))))
+
 (defn add-port-mapping!
   "Executes `AddPortMapping` on `gateway`. Automatically retries once with `NewLeaseDuration=0`
-   (permanent lease) if the router rejects a non-zero lease duration (e.g. `725 OnlyPermanentLeasesSupported`)."
+   (permanent lease) iff the router rejects a non-zero lease duration with UPnP fault `725`
+   (`OnlyPermanentLeasesSupported`)."
   [gateway {:keys [remote-host external-port protocol internal-port internal-client description lease-seconds] :as opts}]
   (let [lease (int (if (some? lease-seconds) lease-seconds 3600))
         attempt! (fn [dur]
@@ -339,7 +356,7 @@
                      ["NewLeaseDuration" (int dur)]]
                     opts))
         res (attempt! lease)]
-    (if (or (:ok? res) (zero? lease))
+    (if (or (:ok? res) (zero? lease) (not (only-permanent-leases-fault? res)))
       res
       (let [retry-res (attempt! 0)]
         (if (:ok? retry-res)
@@ -443,27 +460,38 @@
 
 (defn verify-external-reachability!
   "Pre-flight external reachability gate (M3 Step 15A): verifies that mapped external ports
-   (`UDP 53`, `TCP 80`, `TCP 443`) are reachable on `:external-ip` before attempting ACME
+   (`UDP 53`, `TCP 53`, `TCP 80`, `TCP 443`) are reachable on `:external-ip` before attempting ACME
    challenge validation. Emits a counted `:diagnose` effect when any port fails."
   [{:keys [external-ip ports probe-fn timeout-ms domain]}]
   (let [probe (or probe-fn default-reachability-probe!)
         req-ports (or ports
                       [{:protocol "UDP" :port 53}
+                       {:protocol "TCP" :port 53}
                        {:protocol "TCP" :port 80}
                        {:protocol "TCP" :port 443}])
         results (mapv (fn [{:keys [protocol port] :as p}]
                         (let [r (probe external-ip protocol port {:timeout-ms timeout-ms :domain domain})]
                           (assoc p :ok? (boolean (:ok? r)) :error (:error r))))
                       req-ports)
+        dns-udp-ok? (boolean (:ok? (first (filter #(and (= "UDP" (str/upper-case (str (:protocol %))))
+                                                        (= 53 (int (:port %))))
+                                                  results))))
+        dns-tcp-ok? (boolean (:ok? (first (filter #(and (= "TCP" (str/upper-case (str (:protocol %))))
+                                                        (= 53 (int (:port %))))
+                                                  results))))
         failed (filterv #(not (:ok? %)) results)]
     (if (empty? failed)
       {:ok? true
        :external-ip external-ip
+       :dns-udp-ok? dns-udp-ok?
+       :dns-tcp-ok? dns-tcp-ok?
        :results results
        :effects []}
       {:ok? false
        :error :external-reachability-gate-failed
        :external-ip external-ip
+       :dns-udp-ok? dns-udp-ok?
+       :dns-tcp-ok? dns-tcp-ok?
        :failed-ports failed
        :results results
        :effects [{:effect :diagnose

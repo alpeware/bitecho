@@ -661,24 +661,25 @@ Compared to the 2026-10-30 ledger in `master-plan-vision-roadmap.md` (workspace 
 
 ---
 
-### Milestone 16 (Phase 4 M4): Direct P2P ICE Handshake (with mDNS) & 3-Way Zero-Burn Broadcast Mesh
+### Milestone 16 (Phase 4 M4): Direct P2P ICE Handshake (with mDNS) & 3-Way Zero-Burn Broadcast Mesh — **`[BUILT & VERIFIED]`**
 
-#### Step 16A (M4a) — Multicast DNS (`mDNS` `.local`) ICE Candidate Resolution & Announcement
-1. **RFC 6762 mDNS Support in `clj-datachannel` (LAN / Localhost Legs)**:
-   - Implement pure mDNS packet encoding/decoding and UDP multicast (`224.0.0.251:5353`) query/response handling on LAN-capable shells (JVM & Node.js) so browser `<uuid>.local` ICE host candidates resolve directly when Simon's browser and Nexus run on the same machine or LAN.
+#### Step 16A (M4a) — Multicast DNS (`mDNS` `.local`) ICE Candidate Resolution & Announcement — **`[BUILT & VERIFIED]`**
+1. **RFC 6762 / RFC 8828 mDNS Support in `clj-datachannel` (`src/datachannel/mdns.cljc` @ `5e701d950c8e4c006824d420aa34ed150dd03456`)**:
+   - Implemented pure cross-runtime `.cljc` mDNS hostname generation (`generate-mdns-hostname`, `<uuid-v4>.local`), `mdns-hostname?`, `format-ice-mdns-candidate`, and RFC 6762 DNS query/response wire encoding & decoding (`encode-mdns-query`, `encode-mdns-a-response`, `decode-mdns-packet`, `handle-mdns-packet`) verified with generative `test.check` roundtrip properties.
 
-#### Step 16B (M4b) — Off-Chain P2P ICE Upgrade (`p2p-offer` / `p2p-answer`) & Nexus P2P Hub
-1. **In-Session P2P ICE Signaling**:
-   - Exchange `p2p-offer` and `p2p-answer` control messages over an established sealed session (using the validator mesh strictly for initial bootstrap signaling) to open direct peer-to-peer WebRTC DataChannels:
-     - **Browser $\leftrightarrow$ Nexus**: Direct UDP / mDNS ICE DataChannel.
+#### Step 16B (M4b) — Off-Chain P2P ICE Upgrade (`p2p-offer` / `p2p-answer`) & Nexus P2P Hub — **`[BUILT & VERIFIED]`**
+1. **In-Session P2P ICE Signaling (`src/bitecho/light_node/core.cljc`, `src/bitecho/shell/light_node.clj`, `src/bitecho/node_main.cljs`, `src/bitecho/browser_main.cljs`)**:
+   - Implemented signed `:p2p-offer`, `:p2p-answer`, and `:p2p-hub-relay` wire envelopes and CLI/JSONL/Browser commands (`p2p-offer`, `p2p-answer`, `--candidates`, `p2pOffer`, `p2pAnswer`, waitable events `p2p-offer-received` & `p2p-connected`) over established sealed sessions:
+     - **Browser $\leftrightarrow$ Nexus**: Direct UDP / `.local` mDNS ICE candidate signaling.
      - **Axiom $\leftrightarrow$ Nexus**: Direct `HTTP CONNECT` $\rightarrow$ RFC 4571 DTLS-over-TCP DataChannel via `nexus.ingress.bitecho.org:443`.
-     - **Browser $\leftrightarrow$ Axiom**: Zero-burn off-chain P2P relay routed through Nexus's open DataChannels while preserving end-to-end sealed X25519/AES-256-GCM encryption between Browser and Axiom.
+     - **Browser $\leftrightarrow$ Axiom**: Zero-burn off-chain P2P hub relay (`:p2p-hub-relay`, counted in `:p2p-relayed` diagnostics) routed through Nexus's open P2P sessions while preserving end-to-end sealed encryption.
 
-#### Step 16C (M4c) — Zero-Burn Direct 1:1 Routing & 3-Way `broadcast` Mode
+#### Step 16C (M4c) — Zero-Burn Direct 1:1 Routing & 3-Way `broadcast` Mode — **`[BUILT & VERIFIED]`**
 1. **Automatic Zero-Burn P2P 1:1 Routing**:
-   - When an open P2P DataChannel (or P2P hub route) exists for a session counterparty, `send` routes frames directly over P2P at **0 ECH burn**, falling back to validator gossip only if the P2P channel is unavailable.
-2. **3-Way `broadcast` Channel (`Nexus <-> Axiom <-> Browser`)**:
-   - Add a `broadcast` command and Browser UI Broadcast room that fans out signed messages across all connected P2P peers at **0 ECH burn**, using deterministic `(sender-pubkey, sender-seq, msg-id)` deduplication and per-sender monotonic sequence numbers.
+   - Upgraded `exec-send` so any session with `:p2p {:connected? true}` automatically routes frames at **0 ECH burn** (`:zero-burn? true`, `"zero_burn": true`), falling back to validator gossip only if the P2P channel is not yet connected.
+2. **3-Way `broadcast` Channel (`"chat/simon-nexus-axiom"`, `Nexus <-> Axiom <-> Browser`)**:
+   - Implemented `broadcast` command (`exec-broadcast` / `handle-wire-broadcast` / `BitechoBrowser.broadcastMessage` / `run-three-way-p2p-broadcast-demo`) fanning out Ed25519-signed + DAC-gated (`:trusted-dac-anchors`) messages across all connected peers at **0 ECH burn**, with deterministic `msg_id = SHA-256(sender || seq || subnet_id || payload_hex)` deduplication (`:broadcast-seen`, counted `:broadcast-duplicates-dropped` and `:broadcast-rejected` diagnostics per Rule 5) and 100% flag/verb parity (`35` verbs, `58` flags in `skill/SKILL.md`).
+   - Also closed carried `M3` LOW flags `L-M3-1..L-M3-5` & `L-M3-7` (`scripts/infra_cluster.sh publish-git` landing-page/doc sync, UPnP SOAP fault `725` permanent-lease retry + TCP `:53` reachability probe, Node `ingress-listener` shutdown hook, and `bitecho.simulator-test` in `:test`).
 
 ---
 
@@ -731,10 +732,10 @@ Per Simon's refactoring-first architecture decision (`2026-11-08` / `2026-11-09`
 5. **Unification Phase D — Cluster Adapter Retirement, Repo Freeze & Post-Cutover Polish (`[LIVE & VERIFIED]`):**
    - Preserved `Blob` `:media-type` across cold-pinned placeholder hydration and hot `octet-stream` upgrades (`data/put-blob` + `blob-fs/write-blob!` sidecar repair `L-D1`/`L-D2`) and prioritized known Pointer-path extensions in `bitecho.shell.http/serve-subnet-request` (so `web/index.md` and `web/llms.txt` sharing a deduplicated `Blob` CID return `text/markdown; charset=utf-8` and `text/plain; charset=utf-8` respectively).
    - Registered `"control"` and `"heartbeat"` DataChannel streams on both active and passive peers upon SCTP `:on-open` (`start-datachannel-peer-mesh!`), exposed `epoch` and `healthy` node count on loopback `/statusz`, aligned `print-identity` with `load-or-create-infra-peer-identity!` (`L1`), froze the `clj-web` GitHub mirror as-is, and executed `./scripts/infra_cluster.sh retire-clj-web` rolling `ns3 -> ns2 -> ns1` (`HTTP 404` on `/git/clj-web.git/info/refs`, `Content-Type: text/markdown; charset=utf-8` on `/`, and `0` `clj-web.git` mentions on landing pages verified across all 3 nodes).
-6. **Milestone 14 (`M2a` / `M2b`) & Milestone 15 (`M3`):**
+6. **Milestone 14 (`M2a` / `M2b`) & Milestone 15 (`M3`) — `[BUILT & VERIFIED]`:**
    - Cross-platform `.cljc` `clj-datachannel` + `IDtlsEngine` + `state.fressian` + pure Node.js light-node bundle (`UDP` + RFC 4571 `TCP/HTTP CONNECT`), paired with local UPnP + delegated `nexus.ingress.bitecho.org:443` `HTTP CONNECT` ingress powered by Phase B's `bitecho.shell.http` and `bitecho.shell.upnp`.
-7. **Subnet #4 / Milestone 16 (`M4` — `"chat/simon-nexus-axiom"`):**
-   - Instantiate the 3-way zero-burn private chat & broadcast subnet directly as a `Subnet` configuration (`:gate :dac`, `:economy :none`, `:replication :gossip-crdt` + `:eager-push`) over off-chain P2P ICE DataChannels (mDNS on LAN legs + Nexus sealed relay for `Browser <-> Axiom`).
+7. **Subnet #4 / Milestone 16 (`M4` — `"chat/simon-nexus-axiom"`) — `[BUILT & VERIFIED]`:**
+   - Instantiate the 3-way zero-burn private chat & broadcast subnet (`"chat/simon-nexus-axiom"`, `:gate :dac`, `:economy :none`, `:replication :gossip-crdt` + `:eager-push`) over off-chain P2P ICE DataChannels (`datachannel.mdns` RFC 8828 `.local` mDNS on LAN legs + `p2p-offer`/`p2p-answer` upgrade + Nexus `:p2p-hub-relay` for `Browser <-> Axiom` + `broadcast` with `msg_id` deduplication).
 8. **Milestone 17 (`M5`) & Milestone 12 Anchoring (`M12`):**
    - Mobile Browser UI + RC-4 wake identity guard (`M5`), followed by child-subnet Merkle state-root `Pointer` anchoring into parent subnets (`M12`).
 

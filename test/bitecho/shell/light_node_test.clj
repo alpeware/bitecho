@@ -1243,6 +1243,7 @@
                  "dac-attach" "dac-revoke" "directory-verify"
                  "directory-register" "directory-lookup"
                  "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"
+                 "p2p-offer" "p2p-answer" "broadcast"
                  "lock-intent" "release-intent" "refund-intent" "escrows"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--ingress-tcp-port"
@@ -1254,7 +1255,7 @@
                   "--offer-hash" "--from"
                   "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"
                   "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"
-                  "--subnet-id"
+                  "--subnet-id" "--candidates"
                   "--auto-sync" "--no-auto-sync" "--sync-interval-ms"
                   "--auto-register-home-set" "--no-auto-register-home-set"
                   "--cmd-file" "--events-out" "--min-seq" "--after-ts"
@@ -1298,6 +1299,11 @@
       (is (= "escrows" (get-in (light-shell/parse-light-node-args ["escrows"]) [:cmd-map "cmd"])))
       (is (= "directory-register" (get-in (light-shell/parse-light-node-args ["directory-register"]) [:cmd-map "cmd"])))
       (is (= "directory-lookup" (get-in (light-shell/parse-light-node-args ["directory-lookup"]) [:cmd-map "cmd"])))
+      (is (= "p2p-offer" (get-in (light-shell/parse-light-node-args ["p2p-offer" "--session-id" "s1"]) [:cmd-map "cmd"])))
+      (is (= "p2p-answer" (get-in (light-shell/parse-light-node-args ["p2p-answer" "--session-id" "s1"]) [:cmd-map "cmd"])))
+      (is (= "broadcast" (get-in (light-shell/parse-light-node-args ["broadcast" "--text" "hi"]) [:cmd-map "cmd"])))
+      (is (= ["c1" "c2"] (get-in (light-shell/parse-light-node-args ["p2p-offer" "--session-id" "s1" "--candidates" "c1,c2"]) [:cmd-map "candidates"])))
+      (is (= "chat/simon-nexus-axiom" (get-in (light-shell/parse-light-node-args ["broadcast" "--subnet-id" "chat/simon-nexus-axiom" "--text" "hi"]) [:cmd-map "subnet_id"])))
       ;; Flags (all 42 flags tested end-to-end)
       (is (= "alice" (get-in (light-shell/parse-light-node-args ["directory-register" "--nickname" "alice"]) [:cmd-map "nickname"])))
       (is (= "bitecho.org" (get-in (light-shell/parse-light-node-args ["directory-register" "--domain" "bitecho.org"]) [:cmd-map "domain"])))
@@ -2028,7 +2034,7 @@
 (defspec ^{:doc "Property: Step U0 wait-event filter invariants across incoming and status events"}
   prop-step-u0-wait-event-filter-invariants 50
   (prop/for-all [ev-type (gen/elements ["message-received" "offer-received" "channel-opened"
-                                        "session-established" "p2p-connected" "broadcast-received"
+                                        "session-established" "p2p-offer-received" "p2p-connected" "broadcast-received"
                                         "ready" "auto-sync" "connection-failed"])
                  sid (gen/elements ["sess-a" "sess-b" "sess-c"])
                  target-sid (gen/one-of [(gen/return nil) (gen/elements ["sess-a" "sess-b"])])
@@ -2047,7 +2053,8 @@
                       matched? (light-shell/event-matches-wait-filter? evt opts)
                       waitable? (contains? #{"message-received" "offer-received" "channel-opened"
                                              "session-established" "rendezvous-header-received"
-                                             "rendezvous-reveal-received" "p2p-connected" "broadcast-received"}
+                                             "rendezvous-reveal-received" "p2p-offer-received"
+                                             "p2p-connected" "broadcast-received"}
                                            ev-type)
                       sid-ok? (or (nil? target-sid) (= sid target-sid))
                       seq-ok? (or (nil? min-seq) (>= seq-num min-seq))

@@ -975,18 +975,12 @@
                              :dns-udp-port 15353
                              :http-port 18080
                              :https-port 18443})
-              ;; Pre-flight external reachability gate: pass vs fail
+              ;; Pre-flight external reachability gate: pass vs fail (including default TCP 53 + :dns-tcp-ok?)
               gate-ok (upnp/verify-external-reachability!
                        {:external-ip "127.0.0.1"
-                        :ports [{:protocol "UDP" :port 53}
-                                {:protocol "TCP" :port 80}
-                                {:protocol "TCP" :port 443}]
                         :probe-fn (fn [_ip _proto _port _opts] {:ok? true})})
               gate-fail (upnp/verify-external-reachability!
                          {:external-ip "127.0.0.1"
-                          :ports [{:protocol "UDP" :port 53}
-                                  {:protocol "TCP" :port 80}
-                                  {:protocol "TCP" :port 443}]
                           :probe-fn (fn [_ip _proto port _opts]
                                       (if (= port 443)
                                         {:ok? false :error :connect-timeout}
@@ -995,6 +989,7 @@
           (is (:ok? disc))
           (is (= "203.0.113.42" (:external-ip ext-ip)))
           (is (:ok? add-res) "Automatically retried AddPortMapping with NewLeaseDuration=0 after 725 fault")
+          (is (true? (:retried-permanent-lease? add-res)))
           (is (:ok? del-res))
           (is (empty? @mapped-ports))
           (is (false? (:ok? timeout-res)))
@@ -1004,6 +999,8 @@
           (is (= "136.62.15.220" (:external-ip fallback-res)))
           (is (some #(= :upnp-manual-fallback (:reason %)) (:effects fallback-res)))
           (is (:ok? gate-ok))
+          (is (true? (:dns-udp-ok? gate-ok)))
+          (is (true? (:dns-tcp-ok? gate-ok)))
           (is (false? (:ok? gate-fail)))
           (is (= :external-reachability-gate-failed (:error gate-fail)))
           (is (= [443] (mapv :port (:failed-ports gate-fail))))

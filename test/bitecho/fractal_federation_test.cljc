@@ -230,3 +230,188 @@
       (is (= :missing-expected-authority-pubkey (:error (light-core/verify-federated-domain-bootstrap "test.bitecho.local" signed 20 nil))))
       (is (= :authority-pubkey-mismatch (:error (light-core/verify-bootstrap-descriptor other-pub signed 20))))
       (is (= :authority-pubkey-mismatch (:error (light-core/verify-federated-domain-bootstrap "test.bitecho.local" signed 20 other-pub)))))))
+
+;; -----------------------------------------------------------------------------
+;; Milestone 16 (Phase 4 M4): P2P ICE Handshake, Hub Relay, & 3-Way Broadcast
+;; -----------------------------------------------------------------------------
+
+(defspec ^{:doc "Generative property test verifying in-session p2p-offer/p2p-answer negotiation, automatic 0-ECH burn 1:1 P2P routing, and opaque Nexus hub relay."}
+  prop-p2p-offer-answer-and-zero-burn-1to1-routing 30
+  (for-all [msg-text (gen/not-empty gen/string-ascii)
+            mdns-uuid (gen/not-empty gen/string-alphanumeric)]
+           (let [kp-browser (crypto/generate-keypair)
+                 kp-nexus (crypto/generate-keypair)
+                 kp-axiom (crypto/generate-keypair)
+                 pub-browser (basalt/bytes->hex (:public kp-browser))
+                 pub-nexus (basalt/bytes->hex (:public kp-nexus))
+                 pub-axiom (basalt/bytes->hex (:public kp-axiom))
+                 browser-0 (light-core/init-light-state {:pubkey-hex pub-browser} {:epoch 10})
+                 nexus-0 (light-core/init-light-state {:pubkey-hex pub-nexus} {:epoch 10})
+                 axiom-0 (light-core/init-light-state {:pubkey-hex pub-axiom} {:epoch 10})
+                 ;; 1. Establish Browser <-> Axiom E2E sealed session
+                 off-res (light-core/handle-command browser-0
+                                                    {"cmd" "offer" "callee" pub-axiom "price" 10 "burn" 500}
+                                                    (:private kp-browser))
+                 sid (get-in off-res [:response "session_id"])
+                 axiom-1 (reduce (fn [st env]
+                                   (:state (light-core/handle-wire-payload st env (:private kp-axiom))))
+                                 axiom-0
+                                 (:net-envelopes off-res))
+                 acc-res (light-core/handle-command axiom-1
+                                                    {"cmd" "accept" "session_id" sid}
+                                                    (:private kp-axiom))
+                 browser-1 (reduce (fn [st env]
+                                     (:state (light-core/handle-wire-payload st env (:private kp-browser))))
+                                   (:state off-res)
+                                   (:net-envelopes acc-res))
+                 burned-before-p2p (get-in browser-1 [:local-accounting :burned-ech] 0)
+                 ;; 2. Negotiate p2p-offer -> p2p-answer with mDNS & HTTP CONNECT candidates
+                 mdns-cand (str (str/lower-case mdns-uuid) ".local:54321")
+                 p2p-off (light-core/handle-command browser-1
+                                                    {"cmd" "p2p-offer"
+                                                     "session_id" sid
+                                                     "transport" "mdns"
+                                                     "candidates" [mdns-cand]
+                                                     "ice_ufrag" "ufragB"
+                                                     "ice_pwd" "pwdBrowser12345678901234"}
+                                                    (:private kp-browser))
+                 axiom-2-res (reduce (fn [acc env]
+                                       (let [r (light-core/handle-wire-payload (:state acc) env (:private kp-axiom))]
+                                         {:state (:state r)
+                                          :stdout-events (into (:stdout-events acc) (:stdout-events r))}))
+                                     {:state (:state acc-res) :stdout-events []}
+                                     (:net-envelopes p2p-off))
+                 p2p-ans (light-core/handle-command (:state axiom-2-res)
+                                                    {"cmd" "p2p-answer"
+                                                     "session_id" sid
+                                                     "transport" "connect"
+                                                     "candidates" ["nexus.ingress.bitecho.org:443"]
+                                                     "ice_ufrag" "ufragA"
+                                                     "ice_pwd" "pwdAxiom1234567890123456"}
+                                                    (:private kp-axiom))
+                 browser-2-res (reduce (fn [acc env]
+                                         (let [r (light-core/handle-wire-payload (:state acc) env (:private kp-browser))]
+                                           {:state (:state r)
+                                            :stdout-events (into (:stdout-events acc) (:stdout-events r))}))
+                                       {:state (:state p2p-off) :stdout-events []}
+                                       (:net-envelopes p2p-ans))
+                 browser-2 (:state browser-2-res)
+                 axiom-2 (:state p2p-ans)
+                 ;; 3. Send 1:1 message over P2P at 0 ECH burn, routed via Nexus opaque hub relay
+                 send-res (light-core/handle-command browser-2
+                                                     {"cmd" "send" "session_id" sid "text" msg-text}
+                                                     (:private kp-browser))
+                 burned-after-p2p (get-in (:state send-res) [:local-accounting :burned-ech] 0)
+                 relay-env (light-core/build-p2p-hub-relay-envelope
+                            pub-browser
+                            (:private kp-browser)
+                            {:target-pubkey pub-axiom
+                             :session-id sid
+                             :sealed-envelope (first (:net-envelopes send-res))})
+                 nexus-relay-res (light-core/handle-wire-payload nexus-0 relay-env (:private kp-nexus))
+                 axiom-final (reduce (fn [st env]
+                                       (:state (light-core/handle-wire-payload st env (:private kp-axiom))))
+                                     axiom-2
+                                     (:net-envelopes nexus-relay-res))]
+             (and (true? (get-in browser-2 [:sessions sid :p2p :connected?]))
+                  (true? (get-in axiom-2 [:sessions sid :p2p :connected?]))
+                  (some #(= "p2p-connected" (get % "event")) (:stdout-events browser-2-res))
+                  (= 0 (get-in send-res [:response "burn"]))
+                  (true? (get-in send-res [:response "p2p"]))
+                  (= burned-before-p2p burned-after-p2p)
+                  (= 1 (get-in (:state nexus-relay-res) [:diagnostics :p2p-relayed]))
+                  (empty? (:sessions (:state nexus-relay-res)))
+                  (= 1 (count (:inbox axiom-final)))
+                  (= msg-text (:text (first (:inbox axiom-final))))))))
+
+(defspec ^{:doc "Generative property test verifying 3-way zero-burn broadcast deduplication by (sender-pubkey, sender-seq, msg-id) and DAC admission in chat/simon-nexus-axiom."}
+  prop-three-way-broadcast-dedup-and-dac-gate 30
+  (for-all [msg-1 (gen/not-empty gen/string-ascii)
+            msg-2 (gen/not-empty gen/string-ascii)]
+           (let [kp-anchor (crypto/generate-keypair)
+                 pub-anchor (basalt/bytes->hex (:public kp-anchor))
+                 kp-simon (crypto/generate-keypair)
+                 kp-nexus (crypto/generate-keypair)
+                 kp-axiom (crypto/generate-keypair)
+                 kp-intruder (crypto/generate-keypair)
+                 pub-simon (basalt/bytes->hex (:public kp-simon))
+                 pub-nexus (basalt/bytes->hex (:public kp-nexus))
+                 pub-axiom (basalt/bytes->hex (:public kp-axiom))
+                 pub-intruder (basalt/bytes->hex (:public kp-intruder))
+                 subnet-id light-core/simon-nexus-axiom-subnet-id
+                 dac-simon (light-core/create-dac (:private kp-anchor)
+                                                  {:anchor-pubkey pub-anchor
+                                                   :agent-pubkey pub-simon
+                                                   :issued-epoch 0
+                                                   :expires-epoch 1000
+                                                   :max-spend-per-epoch 0
+                                                   :scopes ["broadcast" "gossip" "offer"]})
+                 simon-0 (-> (light-core/init-light-state {:pubkey-hex pub-simon}
+                                                          {:subnet-id subnet-id
+                                                           :economy-enabled? false
+                                                           :burn-floor 0
+                                                           :epoch 10
+                                                           :trusted-dac-anchors #{pub-anchor}})
+                             (assoc :dac dac-simon))
+                 nexus-0 (light-core/init-light-state {:pubkey-hex pub-nexus}
+                                                      {:subnet-id subnet-id
+                                                       :economy-enabled? false
+                                                       :burn-floor 0
+                                                       :epoch 10
+                                                       :trusted-dac-anchors #{pub-anchor}})
+                 axiom-0 (light-core/init-light-state {:pubkey-hex pub-axiom}
+                                                      {:subnet-id subnet-id
+                                                       :economy-enabled? false
+                                                       :burn-floor 0
+                                                       :epoch 10
+                                                       :trusted-dac-anchors #{pub-anchor}})
+                 intruder-0 (light-core/init-light-state {:pubkey-hex pub-intruder}
+                                                         {:subnet-id subnet-id
+                                                          :economy-enabled? false
+                                                          :burn-floor 0
+                                                          :epoch 10
+                                                          :trusted-dac-anchors #{pub-anchor}})
+                 ;; 1. Simon broadcasts msg-1 and msg-2
+                 b1 (light-core/handle-command simon-0
+                                               {"cmd" "broadcast" "text" msg-1 "subnet_id" subnet-id}
+                                               (:private kp-simon))
+                 b2 (light-core/handle-command (:state b1)
+                                               {"cmd" "broadcast" "text" msg-2 "subnet_id" subnet-id}
+                                               (:private kp-simon))
+                 env-1 (first (:net-envelopes b1))
+                 env-2 (first (:net-envelopes b2))
+                 ;; 2. Deliver env-1 twice + env-2 to Nexus and Axiom
+                 nexus-r1 (light-core/handle-wire-payload nexus-0 env-1 (:private kp-nexus))
+                 nexus-r1-dup (light-core/handle-wire-payload (:state nexus-r1) env-1 (:private kp-nexus))
+                 nexus-r2 (light-core/handle-wire-payload (:state nexus-r1-dup) env-2 (:private kp-nexus))
+                 axiom-r1 (light-core/handle-wire-payload axiom-0 env-1 (:private kp-axiom))
+                 axiom-r2 (light-core/handle-wire-payload (:state axiom-r1) env-2 (:private kp-axiom))
+                 ;; 3. Intruder without valid DAC attempts broadcast on DAC-gated subnet
+                 b-bad (light-core/handle-command intruder-0
+                                                  {"cmd" "broadcast" "text" "spoof" "subnet_id" subnet-id}
+                                                  (:private kp-intruder))
+                 nexus-r-bad (light-core/handle-wire-payload (:state nexus-r2)
+                                                             (first (:net-envelopes b-bad))
+                                                             (:private kp-nexus))]
+             (and (= 1 (get-in b1 [:response "seq"]))
+                  (= 2 (get-in b2 [:response "seq"]))
+                  (= 0 (get-in b1 [:response "burn"]))
+                  (= 0 (get-in (:state b2) [:local-accounting :burned-ech] 0))
+                  (= 2 (count (:broadcast-inbox (:state nexus-r2))))
+                  (= 2 (count (:broadcast-inbox (:state axiom-r2))))
+                  (= 1 (get-in (:state nexus-r1-dup) [:diagnostics :broadcast-duplicates-dropped]))
+                  (= [msg-1 msg-2] (mapv :text (:broadcast-inbox (:state nexus-r2))))
+                  (= [msg-1 msg-2] (mapv :text (:broadcast-inbox (:state axiom-r2))))
+                  (= "broadcast-received" (get (first (:stdout-events nexus-r1)) "event"))
+                  (= 1 (get-in (:state nexus-r-bad) [:diagnostics :broadcast-rejected]))
+                  (= 2 (count (:broadcast-inbox (:state nexus-r-bad))))))))
+
+(deftest test-three-way-p2p-broadcast-demo
+  (testing "Milestone 16 3-way zero-burn P2P & broadcast demo (Browser <-> Nexus <-> Axiom)"
+    (let [res (light-core/run-three-way-p2p-broadcast-demo)]
+      (is (true? (:ok? res)))
+      (is (true? (:verified? res)))
+      (is (= "chat/simon-nexus-axiom" (:subnet-id res)))
+      (is (= 0 (:total-ech-burned res)))
+      (is (= 3 (:broadcast-count res)))
+      (is (= 1 (:duplicates-dropped res))))))

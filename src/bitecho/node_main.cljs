@@ -507,6 +507,30 @@
                                           nick (assoc "nickname" nick)
                                           dom (assoc "domain" dom)
                                           dir-pk (assoc "directory_pubkey" dir-pk)))
+                   "p2p-offer" (let [sid (or (extract-flag-value args "--session-id" nil)
+                                             (extract-flag-value args "--session" nil))
+                                     cands (extract-flag-value args "--candidates" nil)
+                                     tr (extract-flag-value args "--transport" nil)
+                                     m {"cmd" "p2p-offer"}]
+                                 (cond-> m
+                                   sid (assoc "session_id" sid)
+                                   cands (assoc "candidates" (vec (remove str/blank? (map str/trim (str/split cands #",")))))
+                                   tr (assoc "transport" tr)))
+                   "p2p-answer" (let [sid (or (extract-flag-value args "--session-id" nil)
+                                              (extract-flag-value args "--session" nil))
+                                      cands (extract-flag-value args "--candidates" nil)
+                                      tr (extract-flag-value args "--transport" nil)
+                                      m {"cmd" "p2p-answer"}]
+                                  (cond-> m
+                                    sid (assoc "session_id" sid)
+                                    cands (assoc "candidates" (vec (remove str/blank? (map str/trim (str/split cands #",")))))
+                                    tr (assoc "transport" tr)))
+                   "broadcast" (let [t (extract-flag-value args "--text" nil)
+                                     sub (extract-flag-value args "--subnet-id" nil)
+                                     m {"cmd" "broadcast"}]
+                                 (cond-> m
+                                   t (assoc "text" t)
+                                   sub (assoc "subnet_id" sub)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -1480,7 +1504,7 @@
   "Set of incoming asynchronous event types eligible to wake `wait-event`."
   #{"message-received" "offer-received" "channel-opened" "session-established"
     "rendezvous-header-received" "rendezvous-reveal-received"
-    "p2p-connected" "broadcast-received"})
+    "p2p-offer-received" "p2p-connected" "broadcast-received"})
 
 (defn event-matches-wait-filter?
   "Pure predicate checking whether an emitted JSON event map satisfies a `wait-event` filter."
@@ -1931,7 +1955,13 @@
                                 :ingress-peers-atom ingress-peers-atom
                                 :state-file state-file)
                _ (reset! conn-opts-atom conn-opts)
-               _ (start-ingress-tcp-listener! identity conn-opts)
+               ingress-listener (start-ingress-tcp-listener! identity conn-opts)
+               stop-ingress! (fn []
+                               (when-let [stop-fn (:stop! ingress-listener)]
+                                 (try (stop-fn) (catch :default _ nil))))
+               _ (.on js/process "exit" (fn [_] (stop-ingress!)))
+               _ (.on js/process "SIGINT" (fn [] (stop-ingress!) (.exit js/process 0)))
+               _ (.on js/process "SIGTERM" (fn [] (stop-ingress!) (.exit js/process 0)))
                ctx {:state-atom state-atom
                     :conn-atom conn-atom
                     :events-out events-out

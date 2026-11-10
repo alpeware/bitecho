@@ -54,6 +54,7 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--ingress-tcp-port <port>`: Local RFC 4571 DTLS-over-TCP DataChannel passive listener port in `serve` mode for direct `HTTP CONNECT` ingress tunneling (e.g., `5011` behind `nexus.ingress.bitecho.org:443`).
 - `--timeout-ms <ms>`: Timeout in milliseconds when dialing validator WebRTC DataChannels (default: 8000).
 - `--subnet-id <id>`: Subnet identifier for multi-subnet isolation and routing (default: `global`).
+- `--candidates <c1,c2,...>`: Comma-separated list of ICE candidates (RFC 8828 `.local` mDNS hostnames, UDP, TCP/RFC 4571, or `HTTP CONNECT` ingress candidates) for `p2p-offer` and `p2p-answer`.
 - `--turn-server <host:port>`: TURN relay server host and port (e.g., `turn.example.com:3478`).
 - `--turn-username <user>`: Username for TURN long-term credential authentication.
 - `--turn-password <pass>`: Password for TURN long-term credential authentication.
@@ -85,7 +86,7 @@ clojure -M:light-node serve \
 ---
 
 ### `wait-event` (Blocking Event Watcher)
-Blocks until a matching incoming network event (`message-received`, `offer-received`, `channel-opened`, `session-established`, `rendezvous-header-received`, `rendezvous-reveal-received`, `p2p-connected`, `broadcast-received`) appears in `--events-out` (default `<state-dir>/events.jsonl`), prints the single JSON event line to `stdout`, and exits `0` (or exits `1` with `{"ok": false, "error": "timeout"}` on `--timeout-ms` expiry).
+Blocks until a matching incoming network event (`message-received`, `offer-received`, `channel-opened`, `session-established`, `rendezvous-header-received`, `rendezvous-reveal-received`, `p2p-offer-received`, `p2p-connected`, `broadcast-received`) appears in `--events-out` (default `<state-dir>/events.jsonl`), prints the single JSON event line to `stdout`, and exits `0` (or exits `1` with `{"ok": false, "error": "timeout"}` on `--timeout-ms` expiry).
 
 When `--min-seq` or `--after-ts` is provided, `wait-event` scans existing lines in `--events-out` before tailing so messages that arrived between agent turns are returned immediately without race conditions.
 
@@ -740,4 +741,61 @@ Lists all locally tracked escrows enriched with counterparty petnames and status
     ]
   }
   ```
+
+---
+
+### `p2p-offer`
+Initiates an in-band direct P2P WebRTC/ICE + RFC 8828 `.local` mDNS signaling offer over an open sealed session (`0 ECH` burn once upgraded).
+
+- **CLI**: `clojure -M:light-node p2p-offer --session-id <session-id> [--candidates <c1,c2,...>]` (or `--session <session-id>`)
+- **JSONL**: `{"cmd": "p2p-offer", "session_id": "<session-id>", "candidates": ["mdns://a1b2c3d4.local:5011", "connect://nexus.ingress.bitecho.org:443"]}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "session_id": "sess-c47b19...",
+    "p2p_state": "offering",
+    "local_transport": "mdns://...",
+    "candidates": ["mdns://..."]
+  }
+  ```
+
+---
+
+### `p2p-answer`
+Answers an incoming `p2p-offer` (`p2p-offer-received`) over an open sealed session, completing the direct P2P upgrade (`p2p-connected`) so subsequent `send` and `broadcast` messages route at `0 ECH` burn.
+
+- **CLI**: `clojure -M:light-node p2p-answer --session-id <session-id> [--candidates <c1,c2,...>]` (or `--session <session-id>`)
+- **JSONL**: `{"cmd": "p2p-answer", "session_id": "<session-id>", "candidates": ["connect://nexus.ingress.bitecho.org:443"]}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "session_id": "sess-c47b19...",
+    "p2p_state": "connected",
+    "connected": true,
+    "zero_burn": true
+  }
+  ```
+
+---
+
+### `broadcast`
+Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across an authenticated mesh subnet (default `"chat/simon-nexus-axiom"`), attaching the sender's Delegated Agent Certificate (DAC) and deduplicating via `msg_id = SHA-256(sender || seq || subnet_id || payload_hex)`. Peers with multiple open P2P channels automatically hub-relay (`:p2p-hub-relay`) to bridged peers.
+
+- **CLI**: `clojure -M:light-node broadcast --text "Hello Simon, Nexus, and Axiom" [--subnet-id chat/simon-nexus-axiom]`
+- **JSONL**: `{"cmd": "broadcast", "text": "Hello Simon, Nexus, and Axiom", "subnet_id": "chat/simon-nexus-axiom"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "msg_id": "<sha256-hex>",
+    "subnet_id": "chat/simon-nexus-axiom",
+    "seq": 1,
+    "burn": 0,
+    "zero_burn": true,
+    "p2p_peers_count": 2
+  }
+  ```
+
 

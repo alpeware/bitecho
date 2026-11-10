@@ -545,6 +545,7 @@
                  :connectedNodes open-channels
                  :sessions (redact-for-js (or (:sessions light-st) {}))
                  :pendingOffers (redact-for-js (or (:pending-offers light-st) {}))
+                 :broadcastInbox (redact-for-js (or (:broadcast-inbox light-st) []))
                  :chatHistory (or (:chat-history node) [])
                  :petnames (or (:petnames node) default-petnames)
                  :diagnostics {:phase (name (or (:phase diag) :idle))
@@ -573,10 +574,13 @@
           st (:light-state node)
           prev-offers (or (:pending-offers st) {})
           prev-inbox (vec (get-in st [:inbox] []))
+          prev-bcasts (vec (get-in st [:broadcast-inbox] []))
           res (light-core/handle-wire-payload st env privkey)
           new-st (:state res)
           curr-inbox (vec (get-in new-st [:inbox] []))
-          new-msgs (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
+          curr-bcasts (vec (get-in new-st [:broadcast-inbox] []))
+          new-msgs (into (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
+                         (subvec curr-bcasts (min (count prev-bcasts) (count curr-bcasts))))
           curr-offers (or (:pending-offers new-st) {})]
       (swap! node-atom (fn [curr]
                          (-> curr
@@ -1250,6 +1254,145 @@
   [& _args]
   (clj->js (light-core/run-two-domain-federation-demo)))
 
+(defn run-three-way-p2p-broadcast-demo
+  "Runs the Milestone 16 (M4) three-way direct P2P ICE + mDNS handshake and zero-burn broadcast demo."
+  [& _args]
+  (clj->js (light-core/run-three-way-p2p-broadcast-demo)))
+
+(defn p2p-offer
+  "Initiates a direct P2P ICE + mDNS offer over an existing sealed session."
+  ([session-id] (p2p-offer @active-node-atom session-id nil))
+  ([arg1 arg2]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (p2p-offer arg1 arg2 nil)
+     (p2p-offer @active-node-atom arg1 arg2)))
+  ([node-atom session-id opts]
+   (let [na (or node-atom @active-node-atom)]
+     (if-not na
+       (clj->js {:ok false :error "no-active-node"})
+       (let [node @na
+             privkey (:private-key (:keypair node))
+             opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
+             candidates (or (:candidates opts-map) [])]
+         (if-not privkey
+           (clj->js {:ok false :error "hardware-unlock-required"})
+           (let [cmd-res (light-core/handle-command (:light-state node)
+                                                    (cond-> {"cmd" "p2p-offer"
+                                                             "session_id" (str session-id)}
+                                                      (seq candidates) (assoc "candidates" candidates))
+                                                    privkey)
+                 new-st (:state cmd-res)
+                 out-envs (:net-envelopes cmd-res)
+                 resp (:response cmd-res)
+                 cmd-ok? (boolean (get resp "ok" true))]
+             (swap! na (fn [curr]
+                         (-> curr
+                             (assoc :light-state new-st)
+                             (assoc :sessions (:sessions new-st)))))
+             (doseq [env out-envs]
+               (send-to-all-channels! na env))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+             (notify-ui-listeners!)
+             (clj->js (cond-> {:ok cmd-ok?
+                               :sessionId (str session-id)
+                               :envelopesSent (count out-envs)
+                               :response resp}
+                        (not cmd-ok?) (assoc :error (get resp "error")))))))))))
+
+(defn p2p-answer
+  "Answers a pending direct P2P ICE + mDNS offer over an existing sealed session."
+  ([session-id] (p2p-answer @active-node-atom session-id nil))
+  ([arg1 arg2]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (p2p-answer arg1 arg2 nil)
+     (p2p-answer @active-node-atom arg1 arg2)))
+  ([node-atom session-id opts]
+   (let [na (or node-atom @active-node-atom)]
+     (if-not na
+       (clj->js {:ok false :error "no-active-node"})
+       (let [node @na
+             privkey (:private-key (:keypair node))
+             opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
+             candidates (or (:candidates opts-map) [])]
+         (if-not privkey
+           (clj->js {:ok false :error "hardware-unlock-required"})
+           (let [cmd-res (light-core/handle-command (:light-state node)
+                                                    (cond-> {"cmd" "p2p-answer"
+                                                             "session_id" (str session-id)}
+                                                      (seq candidates) (assoc "candidates" candidates))
+                                                    privkey)
+                 new-st (:state cmd-res)
+                 out-envs (:net-envelopes cmd-res)
+                 resp (:response cmd-res)
+                 cmd-ok? (boolean (get resp "ok" true))]
+             (swap! na (fn [curr]
+                         (-> curr
+                             (assoc :light-state new-st)
+                             (assoc :sessions (:sessions new-st)))))
+             (doseq [env out-envs]
+               (send-to-all-channels! na env))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+             (notify-ui-listeners!)
+             (clj->js (cond-> {:ok cmd-ok?
+                               :sessionId (str session-id)
+                               :envelopesSent (count out-envs)
+                               :response resp}
+                        (not cmd-ok?) (assoc :error (get resp "error")))))))))))
+
+(defn broadcast-message
+  "Broadcasts a zero-burn message across the 3-way mesh subnet (default 'chat/simon-nexus-axiom')."
+  ([text] (broadcast-message @active-node-atom text light-core/simon-nexus-axiom-subnet-id))
+  ([arg1 arg2]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (broadcast-message arg1 arg2 light-core/simon-nexus-axiom-subnet-id)
+     (broadcast-message @active-node-atom arg1 arg2)))
+  ([node-atom text subnet-id]
+   (let [na (or node-atom @active-node-atom)]
+     (if-not na
+       (clj->js {:ok false :error "no-active-node"})
+       (let [node @na
+             privkey (:private-key (:keypair node))
+             eff-subnet (or subnet-id light-core/simon-nexus-axiom-subnet-id)]
+         (if-not privkey
+           (clj->js {:ok false :error "hardware-unlock-required"})
+           (let [cmd-res (light-core/handle-command (:light-state node)
+                                                    {"cmd" "broadcast"
+                                                     "text" (str text)
+                                                     "message" (str text)
+                                                     "subnet_id" (str eff-subnet)}
+                                                    privkey)
+                 new-st (:state cmd-res)
+                 out-envs (:net-envelopes cmd-res)
+                 resp (:response cmd-res)
+                 cmd-ok? (boolean (get resp "ok" true))]
+             (swap! na (fn [curr]
+                         (cond-> (-> curr
+                                     (assoc :light-state new-st)
+                                     (assoc :sessions (:sessions new-st)))
+                           cmd-ok?
+                           (update :chat-history
+                                   (fn [h]
+                                     (conj (vec (or h []))
+                                           {:timestamp (.toISOString (js/Date.))
+                                            :direction :outgoing
+                                            :peer eff-subnet
+                                            :sessionId eff-subnet
+                                            :text (str text)
+                                            :status :sent}))))))
+             (doseq [env out-envs]
+               (send-to-all-channels! na env))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+             (notify-ui-listeners!)
+             (clj->js (cond-> {:ok cmd-ok?
+                               :subnetId eff-subnet
+                               :text (str text)
+                               :envelopesSent (count out-envs)
+                               :response resp}
+                        (not cmd-ok?) (assoc :error (get resp "error")))))))))))
+
 (defn queue-offer
   "Queues a simulated incoming offer on the active Human Anchor state atom.
    Returns the updated dashboard view as a JavaScript object."
@@ -1314,6 +1457,9 @@
        :connectMesh connect-mesh
        :openChannel open-channel
        :acceptChannelOffer accept-channel-offer
+       :p2pOffer p2p-offer
+       :p2pAnswer p2p-answer
+       :broadcastMessage broadcast-message
        :sendMessage send-message
        :closeSession close-session
        :getChatHistory get-chat-history
@@ -1332,6 +1478,7 @@
        :runSubnetDemo run-subnet-demo
        :runZeroBurnSubnetDemo run-zero-burn-subnet-demo
        :runFederationDemo run-federation-demo
+       :runThreeWayP2pBroadcastDemo run-three-way-p2p-broadcast-demo
        :initAnchor init-anchor
        :getAnchorDashboard get-anchor-dashboard
        :registerYubiKey register-yubikey
@@ -1347,7 +1494,7 @@
        :encodeBech32m encode-bech32m-cmd
        :decodeBech32m decode-bech32m-cmd
        :runAnchorEndToEndDemo run-anchor-end-to-end-demo
-       :version "1.0.0-m12"})
+       :version "1.0.0-m16"})
 
 (when (exists? js/globalThis)
   (set! (.-BitechoBrowser js/globalThis) api))

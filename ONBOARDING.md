@@ -284,4 +284,38 @@ To launch or query a light node scoped to a specific subnet:
 ./scripts/light-node.sh serve --subnet-id team-alpha
 ```
 
+---
+
+## 9. Multi-Runtime Client Diversity, Delegated Ingress & Direct P2P 3-Way Broadcast (`Milestone 14–16`)
+
+Phase 4 unifies all three Bitecho light-node runtimes (**JVM**, **Node.js**, and **Browser**) on the shared pure-Clojure `.cljc` Sans-IO protocol core (`bitecho.light-node.core`, `alpeware/clj-fressian`, and `alpeware/clj-datachannel`), adds sovereign home/NAT `*.ingress.bitecho.org` TLS + `HTTP CONNECT` ingress, and enables direct P2P ICE + mDNS upgrades with zero-burn 3-way mesh broadcast (`chat/simon-nexus-axiom`).
+
+### 3-Runtime Client Diversity
+- **JVM Light Node (`bitecho.shell.light-node`)**: `clojure -M:light-node <verb> [flags]` (or `java -jar target/bitecho.jar light-node ...`).
+- **Standalone Node.js Light Node (`bitecho.node-main`)**: Compiled to a single zero-npm-dependency CommonJS bundle (`dist/bitecho-light-node.cjs`, built via `./scripts/build-node-light-node.sh`) implementing identical CLI verbs, flags, and JSONL `serve` / `wait-event` semantics over native Node `dgram`, `net`, `tls`, and `crypto`.
+- **Browser Light Node (`bitecho.browser-main`)**: Deterministic static browser bundle (`dist/bitecho-browser.js` + `dist/index.html`, built via `./scripts/build-browser-bundle.sh`).
+
+### Delegated `*.ingress.bitecho.org` DNS, ACME TLS & UPnP (`Milestone 15`)
+- **Automated UPnP IGD Port Mapping (`bitecho.shell.upnp`)**: Maps external ports `53` (UDP/TCP), `80` (TCP), and `443` (TCP) on home/NAT gateways, automatically retrying with permanent lease (`NewLeaseDuration=0`) on UPnP SOAP fault `725` (`OnlyPermanentLeasesSupported`) and probing both UDP and TCP external reachability.
+- **Delegated Subzone & ACME (`*.ingress.bitecho.org`)**: Validator DNS (`ns1..ns3.bitecho.org`) delegates `<node>.ingress.bitecho.org` (e.g. `nexus.ingress.bitecho.org`) so any light node with UPnP or port-forwarding can provision a Let's Encrypt TLS certificate and terminate `HTTP CONNECT` tunnels on port `443` forwarding to `--ingress-tcp-port <port>` (e.g. `5011`).
+
+### Direct P2P ICE + RFC 8828 `.local` mDNS & 3-Way Broadcast (`Milestone 16`)
+- **RFC 8828 `.local` mDNS Host Candidates (`datachannel.mdns`)**: Generates ephemeral `<uuid-v4>.local` mDNS hostnames and DNS question/response wire frames (`224.0.0.251:5353`, `CACHE-FLUSH` A record `0x8001`, TTL `120s`) so LAN/WLAN peers never leak private RFC 1918 IP addresses during WebRTC ICE signaling.
+- **In-Band Direct P2P Upgrade (`p2p-offer` / `p2p-answer`)**: Over any established sealed session, peers exchange signed `:p2p-offer` and `:p2p-answer` signaling envelopes carrying `.local` mDNS, UDP, TCP/RFC 4571, or `HTTP CONNECT` ingress candidates:
+  ```bash
+  # Offer direct P2P upgrade over an open session
+  ./scripts/light-node.sh p2p-offer --session-id <sid> --candidates connect://nexus.ingress.bitecho.org:443
+
+  # Answer incoming p2p-offer
+  ./scripts/light-node.sh p2p-answer --session-id <sid> --candidates mdns://<uuid>.local:5011
+  ```
+  Once upgraded (`:p2p {:state "connected" :connected? true}`), all 1-to-1 `send` messages automatically route at **`0 ECH` burn** (`"zero_burn": true`).
+- **3-Way Zero-Burn Broadcast (`chat/simon-nexus-axiom`)**:
+  ```bash
+  # Broadcast a signed zero-burn message across the 3-way mesh
+  ./scripts/light-node.sh broadcast --text "Hello Simon, Nexus, and Axiom!" --subnet-id chat/simon-nexus-axiom
+  ```
+  Broadcasts are gated by verified Delegated Agent Certificates (`:trusted-dac-anchors`), deduplicated by `msg_id = SHA-256(sender || seq || subnet_id || payload_hex)` (`:broadcast-seen`), and automatically hub-relayed (`:p2p-hub-relay`) across bridged P2P sessions at **`0 ECH` burn**.
+
+
 
