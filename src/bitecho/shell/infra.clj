@@ -23,9 +23,12 @@
             [clojure.string :as str]
             [datachannel.api :as api])
   (:import [java.io File]
+           [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
            [java.nio.file CopyOption Files OpenOption StandardCopyOption]
            [java.security SecureRandom]
+           [java.time Duration]
            [java.util.concurrent Executors ScheduledExecutorService TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong]
            [javax.crypto Cipher]
@@ -232,32 +235,39 @@
 
 (defn default-infra-policy
   "Constructs the canonical `\"bitecho.org/infra\"` Subnet policy map (UNIFICATION.md §6 Instance #3)
-   with `:subnet/genesis-policy-cid` pinned and optional `:acme-thumbprint` (`F-B3`)."
+   with `:subnet/genesis-policy-cid` pinned and optional `:acme-thumbprint` (`F-B3`).
+   Never elevates a hot node key to `:cold-pubkey` when `:cold-pubkey` is nil (`F-C3`)."
   [{:keys [subnet-id trust-anchors cold-pubkey domain-pubkey threshold acme-thumbprint]}]
   (let [sid (or subnet-id "bitecho.org/infra")
         anchors (set (map #(str/lower-case (str/trim (str %))) trust-anchors))
-        cold-pk (some-> cold-pubkey str str/trim str/lower-case)
-        dom-pk (some-> (or domain-pubkey cold-pk (first anchors)) str str/trim str/lower-case)
+        cold-pk (when (and (string? cold-pubkey) (not (str/blank? cold-pubkey)))
+                  (str/lower-case (str/trim cold-pubkey)))
+        dom-pk (when (and (string? domain-pubkey) (not (str/blank? domain-pubkey)))
+                 (str/lower-case (str/trim domain-pubkey)))
         thresh (long (or threshold (max 1 (min 2 (count anchors)))))
+        gov (cond-> {:governance/type (if cold-pk :cold-key-or-quorum :quorum)
+                     :threshold thresh}
+              cold-pk (assoc :cold-pubkey cold-pk))
         gate (cond-> {:gate/mode :permissioned
                       :gate/admission :allowlist
                       :gate/trust-anchors anchors
-                      :gate/governance {:governance/type (if cold-pk :cold-key-or-quorum :quorum)
-                                        :cold-pubkey cold-pk
-                                        :threshold thresh}}
+                      :gate/governance gov}
                (and (string? acme-thumbprint) (not (str/blank? acme-thumbprint)))
                (assoc :gate/acme-thumbprint (str/trim acme-thumbprint)))
+        dns-rule (if dom-pk
+                   {:pattern "dns/*" :principal {:type :pubkey :pubkey dom-pk}}
+                   {:pattern "dns/*" :principal {:type :allowlist}})
         base {:subnet/id sid
               :subnet/parent-id "global"
               :subnet/gate gate
-              :subnet/path-acl (cond-> [{:pattern "subnet/policy" :principal {:type :governance}}
-                                        {:pattern "bootstrap" :principal {:type :allowlist}}
-                                        {:pattern "dir/*" :principal {:type :allowlist}}
-                                        {:pattern "acme/challenge/*" :principal {:type :leader}}
-                                        {:pattern "tls/*" :principal {:type :leader}}
-                                        {:pattern "web/*" :principal {:type :allowlist}}
-                                        {:pattern "mail/*" :principal {:type :allowlist}}]
-                                 dom-pk (conj {:pattern "dns/*" :principal {:type :pubkey :pubkey dom-pk}}))
+              :subnet/path-acl [{:pattern "subnet/policy" :principal {:type :governance}}
+                                {:pattern "bootstrap" :principal {:type :allowlist}}
+                                {:pattern "dir/*" :principal {:type :allowlist}}
+                                {:pattern "acme/challenge/*" :principal {:type :leader}}
+                                {:pattern "tls/*" :principal {:type :leader}}
+                                {:pattern "web/*" :principal {:type :allowlist}}
+                                {:pattern "mail/*" :principal {:type :allowlist}}
+                                dns-rule]
               :subnet/economy {:economy/mode :none
                                :economy/burn-floor 0
                                :economy/settlement-take-bps 0}
@@ -320,6 +330,68 @@
   [rt epoch]
   (when-let [a (:epoch-atom rt)]
     (reset! a (when (some? epoch) (long epoch)))))
+
+(defn- fetch-validator-epoch-http
+  [url]
+  (try
+    (let [client (-> (HttpClient/newBuilder)
+                     (.connectTimeout (Duration/ofMillis 1500))
+                     (.build))
+          req (-> (HttpRequest/newBuilder (URI/create (str url)))
+                  (.timeout (Duration/ofMillis 1500))
+                  (.GET)
+                  (.build))
+          resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+      (when (= 200 (.statusCode resp))
+        (let [body (str/trim (.body resp))]
+          (or (when-let [[_ n] (re-find #"(?i)(?:finalized[_-]?epoch|epoch)[=:\"\s]+(\d+)" body)]
+                (Long/parseLong n))
+              (let [d (try (edn/read-string body) (catch Exception _ nil))]
+                (when (map? d)
+                  (or (:finalized-epoch d) (:epoch d))))))))
+    (catch Exception _ nil)))
+
+(defn sync-runtime-epoch-from-validators!
+  "Queries `validator-urls` (using optional `fetcher-fn` `(fn [url] epoch-or-nil)` for deterministic tests),
+   verifies strict BFT majority (`> n/2`) agreement on a non-regressive integer epoch, and updates `rt` (`F-C4`).
+   Emits counted `:diagnose` on quorum disagreement or regressive epoch."
+  ([rt validator-urls]
+   (sync-runtime-epoch-from-validators! rt validator-urls fetch-validator-epoch-http))
+  ([rt validator-urls fetcher-fn]
+   (let [urls (vec validator-urls)
+         total (count urls)]
+     (if (zero? total)
+       {:ok? false :error :no-validators}
+       (let [quorum (inc (quot total 2))
+             f (if (map? fetcher-fn) #(get fetcher-fn %) fetcher-fn)
+             epochs (keep (fn [u]
+                            (let [v (try (f u) (catch Exception _ nil))]
+                              (when (integer? v) (long v))))
+                          urls)
+             freqs (frequencies epochs)
+             agreed (->> freqs
+                         (filter (fn [[_ cnt]] (>= cnt quorum)))
+                         (map first)
+                         sort
+                         last)
+             cur-ep (current-runtime-epoch rt)]
+         (cond
+           (nil? agreed)
+           (do
+             (apply-shell-event! (:shell-atom rt)
+                                 {:type :diagnose :reason :validator-epoch-quorum-failed :responses (count epochs)})
+             {:ok? false :error :validator-epoch-quorum-failed})
+
+           (and (integer? cur-ep) (< (long agreed) (long cur-ep)))
+           (do
+             (apply-shell-event! (:shell-atom rt)
+                                 {:type :diagnose :reason :validator-epoch-regressive :current cur-ep :proposed agreed})
+             {:ok? false :error :validator-epoch-regressive})
+
+           :else
+           (do
+             (set-runtime-epoch! rt agreed)
+             {:ok? true :epoch agreed})))))))
 
 (defn- active-peer-sender
   [rt]
@@ -613,12 +685,14 @@
                 default-sender (or (:default-sender opts)
                                    (when (string? (:node-id opts)) (:node-id opts))
                                    (first (get-in (:policy opts) [:subnet/gate :gate/trust-anchors])))
-                ticker (when (:heartbeat-ticker? opts)
+                validator-urls (vec (or (:validator-urls opts) []))
+                ticker (when (or (:heartbeat-ticker? opts) (seq validator-urls))
                          (Executors/newSingleThreadScheduledExecutor))
                 rt {:shell-atom shell-atom
                     :subnet-atom subnet-atom
                     :epoch-atom (atom (:initial-epoch opts))
                     :epoch-fn (:epoch-fn opts)
+                    :validator-urls validator-urls
                     :state-dir state-dir
                     :node-id (:node-id opts)
                     :node-privkey (:node-privkey opts)
@@ -631,10 +705,18 @@
                     :on-fetch-blob (:on-fetch-blob opts)
                     :on-fetch-blob-atom (atom nil)
                     :ticker ticker}]
+            (when (seq validator-urls)
+              (try (sync-runtime-epoch-from-validators! rt validator-urls) (catch Exception _ nil)))
             (when ticker
               (let [hb-ms (long (get-in inst0 [:leader-election :heartbeat-interval-ms] 2000))]
                 (.scheduleAtFixedRate ^ScheduledExecutorService ticker
-                                      ^Runnable (fn [] (try (tick-runtime! rt) (catch Exception _ nil)))
+                                      ^Runnable (fn []
+                                                  (try
+                                                    (when (:heartbeat-ticker? opts)
+                                                      (tick-runtime! rt))
+                                                    (when (seq validator-urls)
+                                                      (sync-runtime-epoch-from-validators! rt validator-urls))
+                                                    (catch Exception _ nil)))
                                       hb-ms hb-ms TimeUnit/MILLISECONDS)))
             (apply-shell-event! shell-atom {:type :started :generation gen :resources {:ticker ticker}})
             rt))))))
@@ -667,25 +749,60 @@
 ;; 5. Phase C: 3-Node `clj-datachannel` Mutual-DTLS Peer Mesh (`:5000..5002`)
 ;; =============================================================================
 
+(defn- validate-legacy-ed25519-pair!
+  [pubkey-hex privkey-hex src-path]
+  (let [pub-h (some-> pubkey-hex str str/trim str/lower-case)
+        priv-h (some-> privkey-hex str str/trim str/lower-case)
+        pub-bs (try (when pub-h (basalt/hex->bytes pub-h)) (catch Exception _ nil))
+        priv-bs (try (when priv-h (basalt/hex->bytes priv-h)) (catch Exception _ nil))
+        probe (fressian/utf8->bytes "bitecho-legacy-keypair-probe")
+        valid? (try
+                 (and pub-bs priv-bs
+                      (crypto/verify pub-bs probe (crypto/sign priv-bs probe)))
+                 (catch Exception _ false))]
+    (when-not valid?
+      (throw (ex-info "Corrupt or mismatched Ed25519 keypair in legacy node-identity.edn"
+                      {:file src-path :pubkey-hex pub-h})))
+    {:pubkey-hex pub-h
+     :privkey-hex priv-h
+     :privkey-bytes priv-bs
+     :keypair {:public pub-bs :private priv-bs}}))
+
 (defn load-or-create-infra-peer-identity!
-  "Loads or creates the persistent Ed25519 + DTLS identity for an infra node.
-   If a legacy `clj-web` `<state-dir>/cluster/node-identity.edn` exists, preserves its exact
-   DTLS certificate, key, and SHA-256 fingerprint for seamless in-place `ns1..ns3` cutover!"
+  "Loads or creates the persistent Ed25519 + DTLS identity for an infra node (`F-C1`):
+   - If `<state-dir>/cluster/node-identity.edn` exists AND contains `:pubkey-hex` / `:privkey-hex`,
+     cryptographically validates and preserves that exact Ed25519 keypair (persisting it into
+     `<state-dir>/identity/` so no fresh keypair is ever generated over it), alongside its DTLS cert/fingerprint.
+   - If `<state-dir>/cluster/node-identity.edn` exists with only `clj-web` DTLS keys (`:cert-pem`/`:key-pem`),
+     preserves its exact DTLS cert/fingerprint alongside the persistent `<state-dir>/identity/` Ed25519 keypair."
   [state-dir node-id]
-  (let [base-id (identity/load-or-create-node-identity! state-dir node-id)
-        priv-bytes (or (get-in base-id [:keypair :private])
-                       (basalt/hex->bytes (:privkey-hex base-id)))
-        legacy-file (io/file state-dir "cluster" "node-identity.edn")]
-    (if (.exists legacy-file)
+  (let [legacy-file (io/file state-dir "cluster" "node-identity.edn")]
+    (if-not (.exists legacy-file)
+      (let [base-id (identity/load-or-create-node-identity! state-dir node-id)
+            priv-bytes (or (get-in base-id [:keypair :private])
+                           (basalt/hex->bytes (:privkey-hex base-id)))]
+        (assoc base-id :privkey-bytes priv-bytes))
       (let [d (edn/read-string (slurp legacy-file))
             cert (identity/parse-cert-pem (:cert-pem d))
             k (identity/parse-private-key-pem (:key-pem d))
-            fp (identity/normalize-fingerprint (:fingerprint d))]
-        (assoc base-id
-               :privkey-bytes priv-bytes
-               :fingerprint fp
-               :cert-data {:cert cert :key k :fingerprint fp}))
-      (assoc base-id :privkey-bytes priv-bytes))))
+            fp (identity/normalize-fingerprint (:fingerprint d))
+            has-legacy-ed? (or (contains? d :pubkey-hex) (contains? d :privkey-hex))]
+        (when (or (nil? cert) (nil? k))
+          (throw (ex-info "Corrupt DTLS certificate/key in legacy node-identity.edn"
+                          {:file (.getAbsolutePath legacy-file)})))
+        (if has-legacy-ed?
+          (let [ed (validate-legacy-ed25519-pair! (:pubkey-hex d) (:privkey-hex d) (.getAbsolutePath legacy-file))]
+            (merge ed
+                   {:node-id node-id
+                    :fingerprint fp
+                    :cert-data {:cert cert :key k :fingerprint fp}}))
+          (let [base-id (identity/load-or-create-node-identity! state-dir node-id)
+                priv-bytes (or (get-in base-id [:keypair :private])
+                               (basalt/hex->bytes (:privkey-hex base-id)))]
+            (assoc base-id
+                   :privkey-bytes priv-bytes
+                   :fingerprint fp
+                   :cert-data {:cert cert :key k :fingerprint fp})))))))
 
 (defn- push-anti-entropy-snapshot-to-peer!
   [rt send-one!]
@@ -817,6 +934,13 @@
                                                        (apply-shell-event! shell-atom {:type :drop :reason :malformed-peer-frame :detail pid})))
                                                    (catch Exception e
                                                      (apply-shell-event! shell-atom {:type :drop :reason :peer-decode-error :detail (.getMessage e)}))))
+                                               :on-error
+                                               (fn [evt]
+                                                 (apply-shell-event! shell-atom
+                                                                     {:type :drop
+                                                                      :reason :peer-dtls-error
+                                                                      :peer pid
+                                                                      :detail (or (:message evt) (:error evt) (str evt))}))
                                                :on-close
                                                (fn [_]
                                                  (submit-event! rt {:type :peer-disconnected :peer-id pid :now-ms (System/currentTimeMillis)}))}]

@@ -23,6 +23,7 @@
             [bitecho.shell.blob-fs :as blob-fs]
             [bitecho.shell.dns :as dns-shell]
             [bitecho.shell.http :as http-shell]
+            [bitecho.shell.identity :as identity]
             [bitecho.shell.infra :as infra]
             [bitecho.shell.smtp :as smtp-shell]
             [bitecho.shell.upnp :as upnp]
@@ -1234,3 +1235,136 @@
           (delete-dir-recursive! dir1)
           (delete-dir-recursive! dir2)
           (delete-dir-recursive! dir3))))))
+
+(deftest test-fc1-to-fc4-cutover-flags-regression
+  (testing "F-C1..F-C4: preserves & validates legacy Ed25519 keypairs, counts DTLS :on-error mismatches, blocks hot-node cold-key elevation, and feeds BFT validator quorum epochs"
+    (let [tmp-dir (make-temp-dir! "fc1-fc4-")]
+      (try
+        ;; 1. F-C1: legacy cluster/node-identity.edn WITH :pubkey-hex/:privkey-hex preserves exact Bitecho Ed25519 keypair + DTLS cert, and rejects tampered privkey
+        (let [leg-dir (io/file tmp-dir "leg-with-ed25519")
+              _ (.mkdirs (io/file leg-dir "cluster"))
+              ed-kp (crypto/generate-keypair)
+              ed-pub (basalt/bytes->hex (:public ed-kp))
+              ed-priv (basalt/bytes->hex (:private ed-kp))
+              dtls-b (http-shell/generate-cert-and-keypair "ns1.bitecho.org" 30)
+              cert-pem (http-shell/encode-cert-pem (:certificate dtls-b))
+              key-pem (http-shell/encode-private-key-pem (.getPrivate ^java.security.KeyPair (:keypair dtls-b)))
+              raw-fp (let [md (java.security.MessageDigest/getInstance "SHA-256")
+                           bs (.digest md (.getEncoded ^X509Certificate (:certificate dtls-b)))]
+                       (str/join ":" (map #(format "%02X" (bit-and % 0xff)) bs)))
+              _ (spit (io/file leg-dir "cluster" "node-identity.edn")
+                      (pr-str {:pubkey-hex ed-pub
+                               :privkey-hex ed-priv
+                               :cert-pem cert-pem
+                               :key-pem key-pem
+                               :fingerprint raw-fp}))
+              loaded1 (infra/load-or-create-infra-peer-identity! leg-dir :ns1)
+              loaded2 (infra/load-or-create-infra-peer-identity! leg-dir :ns1)
+              bad-dir (io/file tmp-dir "leg-corrupt-ed25519")
+              _ (.mkdirs (io/file bad-dir "cluster"))
+              other-kp (crypto/generate-keypair)
+              _ (spit (io/file bad-dir "cluster" "node-identity.edn")
+                      (pr-str {:pubkey-hex ed-pub
+                               :privkey-hex (basalt/bytes->hex (:private other-kp))
+                               :cert-pem cert-pem
+                               :key-pem key-pem
+                               :fingerprint raw-fp}))
+              ;; Pure clj-web legacy file (without :pubkey-hex) preserves DTLS fp & stable Ed25519 across reloads
+              cljweb-dir (io/file tmp-dir "leg-cljweb-only")
+              _ (.mkdirs (io/file cljweb-dir "cluster"))
+              _ (spit (io/file cljweb-dir "cluster" "node-identity.edn")
+                      (pr-str {:cert-pem cert-pem :key-pem key-pem :fingerprint raw-fp}))
+              cw1 (infra/load-or-create-infra-peer-identity! cljweb-dir :ns1)
+              cw2 (infra/load-or-create-infra-peer-identity! cljweb-dir :ns1)]
+          (is (= ed-pub (:pubkey-hex loaded1)) "F-C1: legacy Ed25519 pubkey preserved without rotation")
+          (is (= ed-pub (:pubkey-hex loaded2)))
+          (is (= (identity/normalize-fingerprint raw-fp) (:fingerprint loaded1)))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (infra/load-or-create-infra-peer-identity! bad-dir :ns1))
+              "F-C1: mismatched legacy Ed25519 keypair fails closed")
+          (is (= (identity/normalize-fingerprint raw-fp) (:fingerprint cw1)))
+          (is (= (:pubkey-hex cw1) (:pubkey-hex cw2))))
+
+        ;; 2. F-C2: DTLS fingerprint mismatch triggers :on-error -> counted :peer-dtls-error diagnostic
+        (let [m-dir1 (io/file tmp-dir "mismatch-ns1")
+              m-dir2 (io/file tmp-dir "mismatch-ns2")
+              id1 (infra/load-or-create-infra-peer-identity! m-dir1 :ns1)
+              id2 (infra/load-or-create-infra-peer-identity! m-dir2 :ns2)
+              wrong-fp (apply str (interpose ":" (repeat 32 "FF")))
+              pol (infra/default-infra-policy {:subnet-id "bitecho.org/infra"
+                                               :trust-anchors #{(:pubkey-hex id1) (:pubkey-hex id2)}})
+              sec (crypto/sha256 (fressian/utf8->bytes "mismatch-sec"))
+              p1 (with-open [s (DatagramSocket. 0)] (.getLocalPort s))
+              p2 (with-open [s (DatagramSocket. 0)] (.getLocalPort s))
+              rt1 (infra/start-subnet-runtime! {:state-dir m-dir1 :policy pol :node-id :ns1
+                                                :default-sender (:pubkey-hex id1) :node-privkey (:privkey-bytes id1)
+                                                :all-nodes #{:ns1 :ns2} :tls-secret sec})
+              rt2 (infra/start-subnet-runtime! {:state-dir m-dir2 :policy pol :node-id :ns2
+                                                :default-sender (:pubkey-hex id2) :node-privkey (:privkey-bytes id2)
+                                                :all-nodes #{:ns1 :ns2} :tls-secret sec})
+              mesh1 (infra/start-datachannel-peer-mesh!
+                     {:node/id :ns1 :state-dir m-dir1
+                      :cluster {:heartbeat-interval-ms 5000
+                                :nodes {:ns1 {:ip4 "127.0.0.1" :port p1 :fingerprint (:fingerprint id1)}
+                                        :ns2 {:ip4 "127.0.0.1" :port p2 :fingerprint wrong-fp}}}}
+                     rt1)
+              mesh2 (infra/start-datachannel-peer-mesh!
+                     {:node/id :ns2 :state-dir m-dir2
+                      :cluster {:heartbeat-interval-ms 5000
+                                :nodes {:ns1 {:ip4 "127.0.0.1" :port p1 :fingerprint (:fingerprint id1)}
+                                        :ns2 {:ip4 "127.0.0.1" :port p2 :fingerprint (:fingerprint id2)}}}}
+                     rt2)]
+          (try
+            (let [deadline (+ (System/currentTimeMillis) 5000)]
+              (loop []
+                (when (and (< (System/currentTimeMillis) deadline)
+                           (zero? (get-in @(:shell-atom mesh1) [:diagnostics-counts :peer-dtls-error] 0)))
+                  (Thread/sleep 50)
+                  (recur))))
+            (is (pos? (get-in @(:shell-atom mesh1) [:diagnostics-counts :peer-dtls-error] 0))
+                "F-C2: DTLS fingerprint mismatch counted in :peer-dtls-error")
+            (finally
+              (infra/stop-datachannel-peer-mesh! mesh1)
+              (infra/stop-datachannel-peer-mesh! mesh2)
+              (infra/stop-subnet-runtime! rt1)
+              (infra/stop-subnet-runtime! rt2))))
+
+        ;; 3. F-C3 & F-C4: multi-node start-infra-node! without :cold-pubkey uses :quorum (never hot-key cold-root!), and validator epoch poller feeds BFT quorum epoch
+        (let [s-dir (io/file tmp-dir "fc3-fc4-stack")
+              sec-f (io/file tmp-dir "fc3.key")
+              _ (spit sec-f "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+              stack (main/start-infra-node! {:state-dir (.getAbsolutePath s-dir)
+                                             :node/id :ns1
+                                             :all-nodes #{:ns1 :ns2 :ns3}
+                                             :tls-secret-file (.getAbsolutePath sec-f)
+                                             :domain "bitecho.org"
+                                             :heartbeat-ticker? false
+                                             :cluster {:enabled? false}
+                                             :dns {:enabled? false}
+                                             :http {:enabled? false}
+                                             :acme {:enabled? false}})
+              rt (:runtime stack)
+              gov (get-in @(:subnet-atom rt) [:policy :subnet/gate :gate/governance])
+              ops-src (slurp "scripts/infra_cluster.sh")]
+          (try
+            (is (= :quorum (:governance/type gov)) "F-C3: multi-node default governance is :quorum, never ns1 hot key")
+            (is (nil? (:cold-pubkey gov)))
+            (is (str/includes? ops-src "infra_cold_root_keypair.edn")
+                "F-C3: infra_cluster.sh uses dedicated offline cold root keypair")
+            ;; F-C4: BFT validator epoch sync (disagreement fails closed with :diagnose; >=2 majority updates runtime epoch monotonically)
+            (let [disagree-res (infra/sync-runtime-epoch-from-validators! rt ["v1" "v2" "v3"]
+                                                                          {"v1" 100 "v2" 101 "v3" 102})]
+              (is (false? (:ok? disagree-res)))
+              (is (nil? (infra/current-runtime-epoch rt))))
+            (let [agree-res (infra/sync-runtime-epoch-from-validators! rt ["v1" "v2" "v3"]
+                                                                       {"v1" 36600 "v2" 36600 "v3" 36599})
+                  stale-res (infra/sync-runtime-epoch-from-validators! rt ["v1" "v2" "v3"]
+                                                                       {"v1" 36500 "v2" 36500 "v3" 36500})]
+              (is (:ok? agree-res))
+              (is (= 36600 (infra/current-runtime-epoch rt)))
+              (is (false? (:ok? stale-res)) "Regressive validator epoch rejected")
+              (is (= 36600 (infra/current-runtime-epoch rt))))
+            (finally
+              ((:stop! stack)))))
+        (finally
+          (delete-dir-recursive! tmp-dir))))))

@@ -268,6 +268,23 @@ cmd_cutover() {
   echo "--> Building target/bitecho.jar locally..."
   (cd "${ROOT_DIR}" && clojure -T:build uber)
 
+  local cold_key_file="${ROOT_DIR}/.ssh/infra_cold_root_keypair.edn"
+  mkdir -p "$(dirname "${cold_key_file}")"
+  if [[ ! -f "${cold_key_file}" ]]; then
+    echo "--> Generating dedicated offline Cold Infra Root Keypair at ${cold_key_file}..."
+    java --enable-native-access=ALL-UNNAMED \
+         --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+         --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+         -jar "${ROOT_DIR}/target/bitecho.jar" gen-keypair "${cold_key_file}" >/dev/null
+    chmod 600 "${cold_key_file}"
+  fi
+  local cold_pubkey
+  cold_pubkey="$(sed -n 's/.*:pubkey-hex "\([0-9a-fA-F]*\)".*/\1/p' "${cold_key_file}" | head -n 1)"
+  if [[ -z "${cold_pubkey}" ]]; then
+    echo "FATAL: Failed to read :pubkey-hex from offline cold key ${cold_key_file}" >&2
+    exit 1
+  fi
+
   declare -A PUBKEYS=()
   declare -A FINGERPRINTS=()
 
@@ -293,6 +310,10 @@ REMOTE_ID
       echo "FATAL: Failed to extract pubkey/fingerprint on ${node}" >&2
       exit 1
     fi
+    if [[ "${PUBKEYS[$node]}" == "${cold_pubkey}" ]]; then
+      echo "FATAL: Hot node ${node} pubkey must never equal offline Cold Infra Root Key (F-C3)!" >&2
+      exit 1
+    fi
   done
 
   for node in "${NODES[@]}"; do
@@ -305,8 +326,10 @@ REMOTE_ID
  :domain "${DOMAIN}"
  :state-dir "/var/lib/clj-web"
  :tls-secret-file "/etc/clj-web/tls-secret.key"
- :cold-pubkey "${PUBKEYS[ns1]}"
- :domain-pubkey "${PUBKEYS[ns1]}"
+ :cold-pubkey "${cold_pubkey}"
+ :validator-urls ["http://35.212.129.138:8080/statusz"
+                  "http://35.206.120.143:8080/statusz"
+                  "http://35.211.71.139:8080/statusz"]
  :acme {:enabled? true
         :directory-url "https://acme-v02.api.letsencrypt.org/directory"
         :contact-email "mailto:admin@${DOMAIN}"

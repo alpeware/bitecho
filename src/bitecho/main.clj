@@ -70,13 +70,15 @@
         all-nodes (or (:all-nodes cfg)
                       (when (seq nodes-map) (set (keys nodes-map)))
                       #{node-id})
+        multi-node? (> (count all-nodes) 1)
         acme-enabled? (boolean (get-in cfg [:acme :enabled?] false))
         acme-thumb (acme-shell/account-keypair-thumbprint! state-dir acme-enabled?)
         policy (or (:policy cfg)
                    (infra/default-infra-policy {:subnet-id (or (:subnet-id cfg) "bitecho.org/infra")
                                                 :trust-anchors anchors
-                                                :cold-pubkey (or (:cold-pubkey cfg) pub-hex)
-                                                :domain-pubkey (or (:domain-pubkey cfg) pub-hex)
+                                                :cold-pubkey (or (:cold-pubkey cfg)
+                                                                 (when-not multi-node? pub-hex))
+                                                :domain-pubkey (:domain-pubkey cfg)
                                                 :acme-thumbprint acme-thumb}))
         rt (infra/start-subnet-runtime! {:state-dir state-dir
                                          :policy policy
@@ -85,6 +87,7 @@
                                          :node-privkey priv-bytes
                                          :all-nodes all-nodes
                                          :heartbeat-ticker? (boolean (get cfg :heartbeat-ticker? true))
+                                         :validator-urls (:validator-urls cfg)
                                          :tls-manager tls-mgr
                                          :tls-secret (:tls-secret cfg)
                                          :tls-secret-file (:tls-secret-file cfg)
