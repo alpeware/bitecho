@@ -1628,6 +1628,8 @@
                                                     "error" "p2p-dial-failed"}
                                                    privkey-bytes)]
             (reset! state-atom (:state cmd-res))
+            (when state-atom
+              (swap! state-atom update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
             (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev)))))))))
 
 (defn start-ingress-tcp-listener!
@@ -1716,10 +1718,12 @@
                                   sid (:session-id inner-ev)
                                   sess (when (and state-atom sid) (get-in @state-atom [:sessions sid]))
                                   expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))
+                                  p2p-phase (when sess (get-in sess [:p2p :phase]))
                                   valid? (and (verify-p2p-link-bind inner-ev)
                                               (some? sess)
                                               (= "open" (:state sess))
-                                              (= norm-sender expected-peer))]
+                                              (= norm-sender expected-peer)
+                                              (contains? #{:offered :offer-received :connecting :open nil} p2p-phase))]
                               (if valid?
                                 (let [my-gen (inc (long (or (get-in @p2p-peers-atom [norm-sender :generation]) 0)))]
                                   (reset! bound-sender norm-sender)

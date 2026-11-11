@@ -457,7 +457,7 @@
             "p2p" "zero-burn?" "zero-burn" "candidates" "local-candidates" "remote-candidates"
             "local-transport" "remote-transport" "local-ice-ufrag" "remote-ice-ufrag"
             "local-fingerprint" "remote-fingerprint" "dtls-fingerprint"
-            "p2p-signaling-rejected" "p2p-dial-failed" "signal-seq" "local-signal-seq" "remote-offer-seq" "remote-answer-seq"
+            "p2p-signaling-rejected" "p2p-dial-failed" "p2p-answer-empty-candidates" "signal-seq" "local-signal-seq" "remote-offer-seq" "remote-answer-seq"
             "p2p-direct?" "p2p-broadcast?" "p2p-peer" "p2p-session-id" "p2p-dial"
             "domain-a" "domain-a-verified?" "domain-b" "domain-b-verified?"
             "advertisement-verified?" "inter-subnet-routed?" "subnet-mismatch-dropped" "unroutable-dropped"

@@ -693,11 +693,13 @@
       (let [sender-pk (light-core/normalize-pubkey-hex (:sender env))
             sid (:session-id env)
             sess (get-in @node-atom [:light-state :sessions sid])
-            expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))]
+            expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))
+            p2p-phase (when sess (get-in sess [:p2p :phase]))]
         (if (and (verify-p2p-link-bind env)
                  (some? sess)
                  (= "open" (:state sess))
-                 (= sender-pk expected-peer))
+                 (= sender-pk expected-peer)
+                 (contains? #{:offered :offer-received :connecting :open nil} p2p-phase))
           (set-p2p-channel-state node-atom sid true nil)
           (swap! node-atom update-in [:light-state :diagnostics :p2p-signaling-rejected] (fnil inc 0))))
       (let [node @node-atom

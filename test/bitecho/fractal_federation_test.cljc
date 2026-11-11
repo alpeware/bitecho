@@ -781,3 +781,140 @@
           "effective-signaling-burn-floor must return positive [:bootstrap :burn-floor] when min-signaling-burn not set")
       (is (= 0 (light-core/effective-signaling-burn-floor st-disabled))
           "effective-signaling-burn-floor must return 0 when economy is disabled"))))
+
+(deftest test-flags-c1-c4-remediation
+  (testing "F-C1: handle-wire-offer respects effective-signaling-burn-floor"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          node-a-0 (light-core/init-light-state {:pubkey-hex pub-a} {:epoch 5})
+          st0 (-> (light-core/init-light-state {:pubkey-hex pub-b} {:epoch 5})
+                  (assoc :burn-floor 150))
+          off-low (light-core/handle-command node-a-0
+                                             {"cmd" "offer" "callee" pub-b "price" 0 "burn" 100}
+                                             (:private kp-a))
+          sid-low (get-in off-low [:response "session_id"])
+          res-low (reduce (fn [st env]
+                            (:state (light-core/handle-wire-payload st env (:private kp-b))))
+                          st0
+                          (:net-envelopes off-low))
+          off-ok (light-core/handle-command node-a-0
+                                            {"cmd" "offer" "callee" pub-b "price" 0 "burn" 150}
+                                            (:private kp-a))
+          sid-ok (get-in off-ok [:response "session_id"])
+          res-ok (reduce (fn [st env]
+                           (:state (light-core/handle-wire-payload st env (:private kp-b))))
+                         st0
+                         (:net-envelopes off-ok))]
+      (is (nil? (get-in res-low [:pending-offers sid-low]))
+          "handle-wire-offer must reject offer with burn 100 when floor is 150")
+      (is (some? (get-in res-ok [:pending-offers sid-ok]))
+          "handle-wire-offer must accept offer with burn 150 when floor is 150")))
+
+  (testing "F-C2: handle-wire-p2p-answer distinguishes local-candidates vs zero-candidate failure"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          node-a-0 (light-core/init-light-state {:pubkey-hex pub-a} {:epoch 5})
+          node-b-0 (light-core/init-light-state {:pubkey-hex pub-b} {:epoch 5})
+          ;; Setup open session between A and B
+          off-res (light-core/handle-command node-a-0
+                                             {"cmd" "offer" "callee" pub-b "price" 10 "burn" 500}
+                                             (:private kp-a))
+          sid (get-in off-res [:response "session_id"])
+          node-b-1 (reduce (fn [st env]
+                             (:state (light-core/handle-wire-payload st env (:private kp-b))))
+                           node-b-0
+                           (:net-envelopes off-res))
+          acc-res (light-core/handle-command node-b-1
+                                             {"cmd" "accept" "session_id" sid}
+                                             (:private kp-b))
+          node-b-open (:state acc-res)
+          node-a-open (reduce (fn [st env]
+                                (:state (light-core/handle-wire-payload st env (:private kp-a))))
+                              (:state off-res)
+                              (:net-envelopes acc-res))
+          ;; Node B sends p2p-answer with empty candidates
+          p2p-ans (light-core/handle-command node-b-open
+                                             {"cmd" "p2p-answer" "session_id" sid "candidates" []}
+                                             (:private kp-b))
+          ans-envs (:net-envelopes p2p-ans)
+          ;; Case 3a: has-local-candidates? is true
+          st-local (assoc-in node-a-open [:sessions sid :p2p]
+                             {:phase :offered :connected? false :local-candidates ["udp://127.0.0.1:9001"]})
+          res-local (reduce (fn [acc env]
+                              (let [r (light-core/handle-wire-payload (:state acc) env (:private kp-a))]
+                                {:state (:state r)
+                                 :stdout-events (into (:stdout-events acc) (:stdout-events r))}))
+                            {:state st-local :stdout-events []}
+                            ans-envs)
+          ;; Case 3b: neither side has candidates -> fail loudly
+          st-neither (assoc-in node-a-open [:sessions sid :p2p]
+                               {:phase :offered :connected? false :local-candidates []})
+          res-neither (reduce (fn [acc env]
+                                (let [r (light-core/handle-wire-payload (:state acc) env (:private kp-a))]
+                                  {:state (:state r)
+                                   :stdout-events (into (:stdout-events acc) (:stdout-events r))}))
+                              {:state st-neither :stdout-events []}
+                              ans-envs)]
+      (is (= :offered (get-in (:state res-local) [:sessions sid :p2p :phase]))
+          "handle-wire-p2p-answer must stay :offered when local candidates exist")
+      (is (= 1 (get-in (:state res-local) [:diagnostics :p2p-answer-empty-candidates]))
+          "handle-wire-p2p-answer must increment :p2p-answer-empty-candidates")
+      (is (= :closed (get-in (:state res-neither) [:sessions sid :p2p :phase]))
+          "handle-wire-p2p-answer must fail closed when neither side has candidates")
+      (is (= 1 (get-in (:state res-neither) [:diagnostics :p2p-dial-failed]))
+          "handle-wire-p2p-answer must increment :p2p-dial-failed when neither side has candidates")
+      (is (some #(= "p2p-disconnected" (get % "event")) (:stdout-events res-neither))
+          "handle-wire-p2p-answer must emit p2p-disconnected event when neither side has candidates")))
+
+  (testing "F-C3: strip-sensitive-keys preserves monotonic signal sequence counters and rejects transient keys"
+    (let [s0 {:sessions {"s1" {:session-id "s1"
+                               :peer "p1"
+                               :tx-key "tx"
+                               :rx-key "rx"
+                               :ephemeral-priv "priv"
+                               :p2p {:connected? true
+                                     :phase :open
+                                     :zero-burn? true
+                                     :local-signal-seq 42
+                                     :remote-offer-seq 5
+                                     :remote-answer-seq 7}}}}
+          stripped (light-core/strip-sensitive-keys s0)]
+      (is (= {:local-signal-seq 42 :remote-offer-seq 5 :remote-answer-seq 7}
+             (get-in stripped [:sessions "s1" :p2p]))
+          "strip-sensitive-keys must retain sequence counters in :p2p")
+      (is (nil? (get-in stripped [:sessions "s1" :p2p :connected?]))
+          "strip-sensitive-keys must strip transient :connected?")
+      (is (nil? (get-in stripped [:sessions "s1" :p2p :phase]))
+          "strip-sensitive-keys must strip transient :phase")
+      (is (nil? (get-in stripped [:sessions "s1" :ephemeral-priv]))
+          "strip-sensitive-keys must strip :ephemeral-priv")))
+
+  (testing "F-C4: bootstrap.txt format and parse round-trip economy and burn settings"
+    (let [desc {:network :devnet
+                :domain "bitecho.org"
+                :authority-pubkey "302a300506032b657003210056b505baa32c3b99663d163d6ee00b5018a26e182405f5ec4d5062f12f633ce9"
+                :issued-epoch 10
+                :expires-epoch 100
+                :signature "aabbcc"
+                :treasury-pubkey "302a300506032b65700321001111111111111111111111111111111111111111111111111111111111111111"
+                :custody-pubkey "302a300506032b65700321002222222222222222222222222222222222222222222222222222222222222222"
+                :directory-pubkey "302a300506032b65700321003333333333333333333333333333333333333333333333333333333333333333"
+                :economy-enabled? true
+                :burn-floor 250
+                :min-signaling-burn 300
+                :nodes {:node1 {:ip "127.0.0.1"
+                                :port 9000
+                                :agent-port 9001
+                                :pubkey "302a300506032b65700321004444444444444444444444444444444444444444444444444444444444444444"
+                                :fingerprint "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00"
+                                :ice-ufrag "ufrag"
+                                :ice-pwd "pwd"}}}
+          formatted (light-core/format-bootstrap-txt-pure desc)
+          parsed (light-core/parse-bootstrap-descriptor-pure formatted)]
+      (is (= true (:economy-enabled? parsed)) "parse-bootstrap-descriptor-pure must parse :economy-enabled?")
+      (is (= 250 (:burn-floor parsed)) "parse-bootstrap-descriptor-pure must parse :burn-floor")
+      (is (= 300 (:min-signaling-burn parsed)) "parse-bootstrap-descriptor-pure must parse :min-signaling-burn"))))

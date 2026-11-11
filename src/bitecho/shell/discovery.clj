@@ -139,6 +139,9 @@
         treasury-match (re-find #"(?im)^Treasury Public Key:\s*([0-9a-fA-F]+)" txt-str)
         custody-match (re-find #"(?im)^Custody Public Key:\s*([0-9a-fA-F]+)" txt-str)
         dir-match (re-find #"(?im)^Directory Authority Public Key:\s*([0-9a-fA-F]+)" txt-str)
+        econ-match (re-find #"(?im)^Economy Enabled:\s*([^\s]+)" txt-str)
+        burn-floor-match (re-find #"(?im)^Burn Floor:\s*([0-9]+)" txt-str)
+        min-burn-match (re-find #"(?im)^Min Signaling Burn:\s*([0-9]+)" txt-str)
         network (keyword (str/lower-case (or (second net-match) "devnet")))
         dom (when dom-match (second dom-match))
         auth-pk (when (second auth-match) (validate-pubkey! (second auth-match) "authority"))
@@ -148,6 +151,9 @@
         treasury-pk (validate-pubkey! (second treasury-match) "treasury")
         custody-pk (validate-pubkey! (second custody-match) "custody")
         dir-pk (when (second dir-match) (validate-pubkey! (second dir-match) "directory"))
+        econ-enabled (when econ-match (Boolean/parseBoolean (str/lower-case (second econ-match))))
+        burn-floor (when burn-floor-match (Long/parseLong (second burn-floor-match)))
+        min-burn (when min-burn-match (Long/parseLong (second min-burn-match)))
         node-blocks (rest (str/split txt-str #"(?im)(?=^Node:\s*)"))
         nodes-entries (keep parse-single-node-txt-block node-blocks)
         nodes-map (into {} nodes-entries)]
@@ -163,7 +169,10 @@
       auth-pk (assoc :authority-pubkey auth-pk)
       issued-ep (assoc :issued-epoch issued-ep)
       expires-ep (assoc :expires-epoch expires-ep)
-      sig (assoc :signature sig))))
+      sig (assoc :signature sig)
+      (some? econ-enabled) (assoc :economy-enabled? econ-enabled)
+      burn-floor (assoc :burn-floor burn-floor)
+      min-burn (assoc :min-signaling-burn min-burn))))
 
 (defn format-bootstrap-txt
   "Renders a validated bootstrap descriptor map into canonical bootstrap.txt string format."
@@ -184,6 +193,12 @@
     (.append sb (str "Custody Public Key: " (:custody-pubkey desc) "\n"))
     (when-let [dp (:directory-pubkey desc)]
       (.append sb (str "Directory Authority Public Key: " dp "\n")))
+    (when (contains? desc :economy-enabled?)
+      (.append sb (str "Economy Enabled: " (boolean (:economy-enabled? desc)) "\n")))
+    (when-let [bf (:burn-floor desc)]
+      (.append sb (str "Burn Floor: " bf "\n")))
+    (when-let [msb (:min-signaling-burn desc)]
+      (.append sb (str "Min Signaling Burn: " msb "\n")))
     (.append sb "\n")
     (doseq [[node-id n] (sort-by #(name (first %)) (:nodes desc))]
       (.append sb (str "Node: " (name node-id) "\n"))

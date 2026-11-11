@@ -2436,8 +2436,8 @@
           id-b (light-shell/load-or-create-light-identity! dir-b)
           port-a (let [ss (java.net.ServerSocket. 0)]
                    (try (.getLocalPort ss) (finally (.close ss))))
-          init-a (light-core/init-light-state id-a {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
-          init-b (light-core/init-light-state id-b {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
+          init-a (light-core/init-light-state id-a {:subnet-id "chat/simon-nexus-axiom" :economy-enabled? false :burn-floor 0 :epoch 10})
+          init-b (light-core/init-light-state id-b {:subnet-id "chat/simon-nexus-axiom" :economy-enabled? false :burn-floor 0 :epoch 10})
           off-res (light-core/handle-command init-a
                                              {"cmd" "offer" "callee" (:pubkey-hex id-b) "price" 0 "burn" 0}
                                              (:privkey-bytes id-a))
@@ -2534,8 +2534,8 @@
           id-att (light-shell/load-or-create-light-identity! dir-att)
           port-a (let [ss (ServerSocket. 0)]
                    (try (.getLocalPort ss) (finally (.close ss))))
-          init-a (light-core/init-light-state id-a {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
-          init-b (light-core/init-light-state id-b {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
+          init-a (light-core/init-light-state id-a {:subnet-id "chat/simon-nexus-axiom" :economy-enabled? false :burn-floor 0 :epoch 10})
+          init-b (light-core/init-light-state id-b {:subnet-id "chat/simon-nexus-axiom" :economy-enabled? false :burn-floor 0 :epoch 10})
           off-res (light-core/handle-command init-a
                                              {"cmd" "offer" "callee" (:pubkey-hex id-b) "price" 0 "burn" 0}
                                              (:privkey-bytes id-a))

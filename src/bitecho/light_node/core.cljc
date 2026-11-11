@@ -67,7 +67,11 @@
    messages across process invocations without re-running the X25519 handshake."
   [state]
   (let [clean-sessions (into {} (for [[sid s] (:sessions state)]
-                                  [sid (dissoc s :ephemeral-priv :ratchet :pq-secret-key :handshake-state :p2p)]))]
+                                  (let [p2p-seqs (select-keys (:p2p s) [:local-signal-seq :remote-offer-seq :remote-answer-seq])
+                                        cleaned (dissoc s :ephemeral-priv :ratchet :pq-secret-key :handshake-state)]
+                                    [sid (if (seq p2p-seqs)
+                                           (assoc cleaned :p2p p2p-seqs)
+                                           (dissoc cleaned :p2p))])))]
     (-> state
         (assoc :sessions clean-sessions)
         (dissoc :connected? :connection-error :conn-diagnostics))))
@@ -329,7 +333,8 @@
                         :broadcast-duplicates-dropped 0
                         :broadcast-rejected 0
                         :p2p-signaling-rejected 0
-                        :p2p-dial-failed 0}
+                        :p2p-dial-failed 0
+                        :p2p-answer-empty-candidates 0}
                        (:diagnostics opts))
    :crypto-suites (or (:crypto-suites opts) sealed/default-crypto-suites)})
 
@@ -1854,9 +1859,7 @@
                       :price (:price offer)
                       :burn burn-val
                       :seq 1
-                      :min-burn (if (get state :economy-enabled? true)
-                                  (long (or (:min-signaling-burn state) (:burn-floor state) 100))
-                                  0)})
+                      :min-burn (effective-signaling-burn-floor state)})
             delivery-ack (into {} (:delivery-ack ack-res))
             has-caller-suites? (boolean (seq (:crypto-suites offer)))
             selected-suite (if has-caller-suites?
@@ -3461,13 +3464,7 @@
                                               :revoked-dac-ids (:revoked-dacs state)
                                               :required-scope "offer"}))
             economy-enabled? (get state :economy-enabled? true)
-            burn-floor (if (false? economy-enabled?)
-                         0
-                         (long (or (:min-signaling-burn state)
-                                   (get-in state [:bootstrap :min-signaling-burn])
-                                   (:burn-floor state)
-                                   (get-in state [:bootstrap :burn-floor])
-                                   burn/min-signaling-burn)))
+            burn-floor (effective-signaling-burn-floor state)
             actual-burn (long (or (:burn msg) 0))]
         (if (or (not valid-sig?)
                 (not valid-suite?)
@@ -4206,50 +4203,101 @@
             (let [norm-sender (normalize-pubkey-hex (:sender msg))
                   already-connected? (boolean (get-in session [:p2p :connected?]))
                   has-candidates? (boolean (seq candidates))
+                  has-local-candidates? (boolean (seq (get-in session [:p2p :local-candidates])))
                   p2p-base (get session :p2p {})
-                  p2p-entry (if already-connected?
-                              (assoc p2p-base
-                                     :phase :open
-                                     :connected? true
-                                     :remote-candidates (vec candidates)
-                                     :remote-transport transport
-                                     :remote-ice-ufrag ice-ufrag
-                                     :remote-ice-pwd ice-pwd
-                                     :remote-fingerprint fp
-                                     :remote-answer-seq signal-seq
-                                     :updated-epoch (long (or (:epoch state) 0)))
-                              (merge p2p-base
-                                     {:phase :connecting
-                                      :connected? false
-                                      :zero-burn? false
-                                      :remote-transport transport
-                                      :remote-candidates (vec candidates)
-                                      :remote-ice-ufrag ice-ufrag
-                                      :remote-ice-pwd ice-pwd
-                                      :remote-fingerprint fp
-                                      :remote-answer-seq signal-seq}))
-                  new-state (assoc-in state [:sessions sid :p2p] p2p-entry)
                   pname (pubkey->petname state norm-sender)
                   evt (cond-> {"event" "p2p-answer-received"
                                "session_id" sid
                                "peer" norm-sender
                                "transport" transport
                                "candidates" candidates}
-                        pname (assoc "peer_petname" pname))
-                  p2p-dial (when (and (not already-connected?) has-candidates?)
-                             {:session-id sid
-                              :peer norm-sender
-                              :role :initiator
-                              :transport transport
-                              :local-candidates (get-in session [:p2p :local-candidates])
-                              :remote-candidates candidates
-                              :remote-ice-ufrag ice-ufrag
-                              :remote-ice-pwd ice-pwd
-                              :remote-fingerprint fp})]
-              {:state new-state
-               :net-envelopes []
-               :stdout-events [evt]
-               :p2p-dial p2p-dial})))))
+                        pname (assoc "peer_petname" pname))]
+              (cond
+                already-connected?
+                (let [p2p-entry (assoc p2p-base
+                                       :phase :open
+                                       :connected? true
+                                       :remote-candidates (vec candidates)
+                                       :remote-transport transport
+                                       :remote-ice-ufrag ice-ufrag
+                                       :remote-ice-pwd ice-pwd
+                                       :remote-fingerprint fp
+                                       :remote-answer-seq signal-seq
+                                       :updated-epoch (long (or (:epoch state) 0)))
+                      new-state (assoc-in state [:sessions sid :p2p] p2p-entry)]
+                  {:state new-state
+                   :net-envelopes []
+                   :stdout-events [evt]
+                   :p2p-dial nil})
+
+                has-candidates?
+                (let [p2p-entry (merge p2p-base
+                                       {:phase :connecting
+                                        :connected? false
+                                        :zero-burn? false
+                                        :remote-transport transport
+                                        :remote-candidates (vec candidates)
+                                        :remote-ice-ufrag ice-ufrag
+                                        :remote-ice-pwd ice-pwd
+                                        :remote-fingerprint fp
+                                        :remote-answer-seq signal-seq})
+                      new-state (assoc-in state [:sessions sid :p2p] p2p-entry)
+                      p2p-dial {:session-id sid
+                                :peer norm-sender
+                                :role :initiator
+                                :transport transport
+                                :local-candidates (get-in session [:p2p :local-candidates])
+                                :remote-candidates candidates
+                                :remote-ice-ufrag ice-ufrag
+                                :remote-ice-pwd ice-pwd
+                                :remote-fingerprint fp}]
+                  {:state new-state
+                   :net-envelopes []
+                   :stdout-events [evt]
+                   :p2p-dial p2p-dial})
+
+                has-local-candidates?
+                (let [p2p-entry (merge p2p-base
+                                       {:phase (or (get-in session [:p2p :phase]) :offered)
+                                        :connected? false
+                                        :zero-burn? false
+                                        :remote-transport transport
+                                        :remote-candidates (vec candidates)
+                                        :remote-ice-ufrag ice-ufrag
+                                        :remote-ice-pwd ice-pwd
+                                        :remote-fingerprint fp
+                                        :remote-answer-seq signal-seq})
+                      new-state (-> state
+                                    (assoc-in [:sessions sid :p2p] p2p-entry)
+                                    (update-in [:diagnostics :p2p-answer-empty-candidates] (fnil inc 0)))]
+                  {:state new-state
+                   :net-envelopes []
+                   :stdout-events [evt]
+                   :p2p-dial nil})
+
+                :else
+                (let [p2p-entry (merge p2p-base
+                                       {:phase :closed
+                                        :connected? false
+                                        :zero-burn? false
+                                        :error "p2p-dial-failed"
+                                        :remote-transport transport
+                                        :remote-candidates (vec candidates)
+                                        :remote-ice-ufrag ice-ufrag
+                                        :remote-ice-pwd ice-pwd
+                                        :remote-fingerprint fp
+                                        :remote-answer-seq signal-seq})
+                      new-state (-> state
+                                    (assoc-in [:sessions sid :p2p] p2p-entry)
+                                    (update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
+                      disconn-evt {"event" "p2p-disconnected"
+                                   "session_id" sid
+                                   "peer" norm-sender
+                                   "reason" "p2p-dial-failed"}]
+                  {:state new-state
+                   :net-envelopes []
+                   :stdout-events [evt disconn-evt]
+                   :p2p-dial nil})))))))
     (catch #?(:clj Exception :cljs :default) _
       (let [diag-evt {"event" "p2p-signaling-rejected"
                       "type" (name (or (:type msg) :unknown))
@@ -4808,7 +4856,10 @@
                        (:signature desc) (conj (str "Authority Signature: " (:signature desc)))
                        (:treasury-pubkey desc) (conj (str "Treasury Public Key: " (:treasury-pubkey desc)))
                        (:custody-pubkey desc) (conj (str "Custody Public Key: " (:custody-pubkey desc)))
-                       (:directory-pubkey desc) (conj (str "Directory Authority Public Key: " (:directory-pubkey desc))))
+                       (:directory-pubkey desc) (conj (str "Directory Authority Public Key: " (:directory-pubkey desc)))
+                       (contains? desc :economy-enabled?) (conj (str "Economy Enabled: " (boolean (:economy-enabled? desc))))
+                       (:burn-floor desc) (conj (str "Burn Floor: " (:burn-floor desc)))
+                       (:min-signaling-burn desc) (conj (str "Min Signaling Burn: " (:min-signaling-burn desc))))
         norm-nodes (normalize-nodes-for-bootstrap (:nodes desc))
         node-blocks (map (fn [n]
                            (str "Node: " (:node-id n) "\n"
@@ -4856,6 +4907,12 @@
                                    (assoc acc :treasury-pubkey (str/trim (second (re-find #"^Treasury Public Key:\s*(.+)$" t))))
                                    (re-find #"^Custody Public Key:\s*(.+)$" t)
                                    (assoc acc :custody-pubkey (str/trim (second (re-find #"^Custody Public Key:\s*(.+)$" t))))
+                                   (re-find #"(?i)^Economy Enabled:\s*(.+)$" t)
+                                   (assoc acc :economy-enabled? (= "true" (str/lower-case (str/trim (second (re-find #"(?i)^Economy Enabled:\s*(.+)$" t))))))
+                                   (re-find #"(?i)^Burn Floor:\s*(\d+)$" t)
+                                   (assoc acc :burn-floor (parse-long-safe (second (re-find #"(?i)^Burn Floor:\s*(\d+)$" t)) 0))
+                                   (re-find #"(?i)^Min Signaling Burn:\s*(\d+)$" t)
+                                   (assoc acc :min-signaling-burn (parse-long-safe (second (re-find #"(?i)^Min Signaling Burn:\s*(\d+)$" t)) 0))
                                    :else acc)))
                              {:nodes nodes-map}
                              lines)]
