@@ -2627,24 +2627,34 @@
             (is (nil? (get @p2p-peers-a (:pubkey-hex id-att))) "Attacker was NOT bound in Node A p2p-peers-atom")
             (is (> (long (or (get-in @state-atom-a [:diagnostics :p2p-signaling-rejected]) 0)) initial-rej)
                 "F-R6: Node A incremented :p2p-signaling-rejected on forged link-bind")
+            (api/close! attacker-node)
 
             ;; 4. F-R1: Stale generation :on-close does not evict newer generation in p2p-peers-atom
             (let [norm-b (:pubkey-hex id-b)
                   current-entry (get @p2p-peers-a norm-b)
                   current-gen (:generation current-entry)
+                  old-close-fn (:close-fn current-entry)
                   initial-stale (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0))]
               (is (some? current-entry) "Node B currently bound in Node A")
               ;; Bump generation in p2p-peers-a to simulate a newer generation taking over
               (swap! p2p-peers-a assoc-in [norm-b :generation] (+ current-gen 10))
-              ;; Now close the attacker node connection
-              (api/close! attacker-node)
-              (Thread/sleep 200)
+              (when (get @p2p-peers-b (:pubkey-hex id-a))
+                (swap! p2p-peers-b update-in [(:pubkey-hex id-a) :generation] #(+ (long (or % 0)) 10)))
+              ;; Now close the bound connection using old-close-fn and Node B close-fn
+              (when-let [b-close (:close-fn (get @p2p-peers-b (:pubkey-hex id-a)))]
+                (b-close))
+              (when old-close-fn
+                (old-close-fn))
+              (let [deadline (+ (System/currentTimeMillis) 2000)]
+                (while (and (< (System/currentTimeMillis) deadline)
+                            (<= (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0)) initial-stale))
+                  (Thread/sleep 50)))
               ;; Verify Node B entry is STILL present in p2p-peers-a with the newer generation
               (is (contains? @p2p-peers-a norm-b) "F-R1: Newer generation entry was NOT evicted by stale close")
               (is (= (+ current-gen 10) (get-in @p2p-peers-a [norm-b :generation]))
                   "F-R1: Newer generation preserved")
-              (is (>= (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0)) initial-stale)
-                  "F-R1: Diagnostic counter recorded stale closes"))))
+              (is (> (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0)) initial-stale)
+                  "F-R1: Diagnostic counter strictly incremented on stale bound close"))))
         (finally
           (when-let [stop-fn (:stop! listener)]
             (stop-fn))
