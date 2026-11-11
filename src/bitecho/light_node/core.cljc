@@ -322,8 +322,8 @@
                               :subnet-mismatch-dropped 0
                               :last-error nil}
    :subnet-id (str (or (:subnet-id opts) (:subnet-id identity-pub-map) "global"))
-   :economy-enabled? (boolean (get opts :economy-enabled? true))
-   :burn-floor (long (or (:burn-floor opts) 0))
+   :economy-enabled? (boolean (get opts :economy-enabled? (get-in opts [:bootstrap :economy-enabled?] true)))
+   :burn-floor (long (or (:burn-floor opts) (get-in opts [:bootstrap :burn-floor]) 0))
    :diagnostics (merge {:subnet-mismatch-dropped 0
                         :p2p-relayed 0
                         :broadcast-duplicates-dropped 0
@@ -332,6 +332,21 @@
                         :p2p-dial-failed 0}
                        (:diagnostics opts))
    :crypto-suites (or (:crypto-suites opts) sealed/default-crypto-suites)})
+
+(defn effective-signaling-burn-floor
+  "Computes the effective signaling burn floor for P2P signaling envelopes.
+   Returns 0 if economy is disabled. Otherwise returns configured :min-signaling-burn
+   or positive :burn-floor in state or bootstrap, defaulting to burn/min-signaling-burn (100)."
+  [state]
+  (if (false? (:economy-enabled? state))
+    0
+    (long (or (:min-signaling-burn state)
+              (get-in state [:bootstrap :min-signaling-burn])
+              (when (and (:burn-floor state) (pos? (long (:burn-floor state))))
+                (:burn-floor state))
+              (when-let [bf (get-in state [:bootstrap :burn-floor])]
+                (when (pos? (long bf)) bf))
+              burn/min-signaling-burn))))
 
 ;; -----------------------------------------------------------------------------
 ;; Petnames Address Book & Counterparty Resolution (Pure Helpers)
@@ -762,7 +777,7 @@
           exp-ep (long (or expires-epoch 0))
           max-spend (long (or max-spend-per-epoch 0))
           sorted-scopes (vec (sort (distinct (map (fn [s] (str/lower-case (name s)))
-                                                  (or scopes ["gossip" "offer" "settle-intent" "transfer"])))))
+                                                  (or scopes ["broadcast" "gossip" "offer" "settle-intent" "transfer"])))))
           canonical-str (str "bitecho-dac-v1|" norm-anchor "|" norm-agent "|" iss-ep "|" exp-ep "|" max-spend "|" (str/join "," sorted-scopes))
           dac-id (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes canonical-str)))
           sig-bytes (crypto/sign anchor-privkey-bytes (fressian/utf8->bytes canonical-str))
@@ -1840,7 +1855,7 @@
                       :burn burn-val
                       :seq 1
                       :min-burn (if (get state :economy-enabled? true)
-                                  (long (or (:burn-floor state) 100))
+                                  (long (or (:min-signaling-burn state) (:burn-floor state) 100))
                                   0)})
             delivery-ack (into {} (:delivery-ack ack-res))
             has-caller-suites? (boolean (seq (:crypto-suites offer)))
@@ -2043,23 +2058,25 @@
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
             sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
             p2p-open? (true? (get-in session [:p2p :connected?]))
-            econ-enabled? (get state :economy-enabled? true)
-            floor (long (if-not econ-enabled?
-                          0
-                          (or (:min-signaling-burn state)
-                              (when (and (:burn-floor state) (pos? (long (:burn-floor state))))
-                                (:burn-floor state))
-                              burn/min-signaling-burn)))
+            burn-floor (effective-signaling-burn-floor state)
             raw-burn (or (get cmd-map "burn") (:burn cmd-map))
-            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) nil)
-            burn-amt (cond
-                       (= parsed-burn :invalid) :invalid
-                       (some? parsed-burn) parsed-burn
-                       p2p-open? 0
-                       :else floor)]
-        (if (or (= burn-amt :invalid) (neg? (long burn-amt)))
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) nil)]
+        (cond
+          (= parsed-burn :invalid)
           {:state state :response {"ok" false "error" "invalid-numeric-parameter"} :net-envelopes [] :stdout-events []}
-          (let [payload {:protocol-version current-wire-version
+
+          (and (number? parsed-burn) (neg? (long parsed-burn)))
+          {:state state :response {"ok" false "error" "invalid-numeric-parameter"} :net-envelopes [] :stdout-events []}
+
+          (and (not p2p-open?) (number? parsed-burn) (pos? burn-floor) (< (long parsed-burn) burn-floor))
+          {:state state :response {"ok" false "error" "burn-below-floor" "required_floor" burn-floor} :net-envelopes [] :stdout-events []}
+
+          :else
+          (let [burn-amt (cond
+                           (some? parsed-burn) (long parsed-burn)
+                           p2p-open? 0
+                           :else burn-floor)
+                payload {:protocol-version current-wire-version
                          :wire-format current-wire-format
                          :subnet-id sub-id
                          :bitecho/type :p2p-offer
@@ -2128,23 +2145,25 @@
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
             sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
             p2p-open? (true? (get-in session [:p2p :connected?]))
-            econ-enabled? (get state :economy-enabled? true)
-            floor (long (if-not econ-enabled?
-                          0
-                          (or (:min-signaling-burn state)
-                              (when (and (:burn-floor state) (pos? (long (:burn-floor state))))
-                                (:burn-floor state))
-                              burn/min-signaling-burn)))
+            burn-floor (effective-signaling-burn-floor state)
             raw-burn (or (get cmd-map "burn") (:burn cmd-map))
-            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) nil)
-            burn-amt (cond
-                       (= parsed-burn :invalid) :invalid
-                       (some? parsed-burn) parsed-burn
-                       p2p-open? 0
-                       :else floor)]
-        (if (or (= burn-amt :invalid) (neg? (long burn-amt)))
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) nil)]
+        (cond
+          (= parsed-burn :invalid)
           {:state state :response {"ok" false "error" "invalid-numeric-parameter"} :net-envelopes [] :stdout-events []}
-          (let [payload {:protocol-version current-wire-version
+
+          (and (number? parsed-burn) (neg? (long parsed-burn)))
+          {:state state :response {"ok" false "error" "invalid-numeric-parameter"} :net-envelopes [] :stdout-events []}
+
+          (and (not p2p-open?) (number? parsed-burn) (pos? burn-floor) (< (long parsed-burn) burn-floor))
+          {:state state :response {"ok" false "error" "burn-below-floor" "required_floor" burn-floor} :net-envelopes [] :stdout-events []}
+
+          :else
+          (let [burn-amt (cond
+                           (some? parsed-burn) (long parsed-burn)
+                           p2p-open? 0
+                           :else burn-floor)
+                payload {:protocol-version current-wire-version
                          :wire-format current-wire-format
                          :subnet-id sub-id
                          :bitecho/type :p2p-answer
@@ -2266,7 +2285,14 @@
             next-seq (inc (long (or (:broadcast-seq state) 0)))
             msg-id (compute-broadcast-msg-id sub-id sender next-seq text)
             epoch (long (or (:epoch state) 0))
-            dac (or (get cmd-map "dac") (:dac cmd-map) (:dac state))
+            explicit-dac (or (get cmd-map "dac") (:dac cmd-map))
+            dac (or explicit-dac
+                    (when-let [d (:dac state)]
+                      (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
+                                                 :current-epoch epoch
+                                                 :revoked-dac-ids (:revoked-dacs state)
+                                                 :required-scope "broadcast"}))
+                        d)))
             dac-id (when (map? dac) (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id")))
             sig-str (canonical-broadcast-str sub-id sender next-seq msg-id text epoch dac-id)
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
@@ -3435,7 +3461,13 @@
                                               :revoked-dac-ids (:revoked-dacs state)
                                               :required-scope "offer"}))
             economy-enabled? (get state :economy-enabled? true)
-            burn-floor (long (or (:burn-floor state) 100))
+            burn-floor (if (false? economy-enabled?)
+                         0
+                         (long (or (:min-signaling-burn state)
+                                   (get-in state [:bootstrap :min-signaling-burn])
+                                   (:burn-floor state)
+                                   (get-in state [:bootstrap :burn-floor])
+                                   burn/min-signaling-burn)))
             actual-burn (long (or (:burn msg) 0))]
         (if (or (not valid-sig?)
                 (not valid-suite?)
@@ -4172,16 +4204,30 @@
                :net-envelopes []
                :stdout-events [diag-evt]})
             (let [norm-sender (normalize-pubkey-hex (:sender msg))
-                  p2p-entry (merge (get session :p2p {})
-                                   {:phase :connecting
-                                    :connected? false
-                                    :zero-burn? false
-                                    :remote-transport transport
-                                    :remote-candidates candidates
-                                    :remote-ice-ufrag ice-ufrag
-                                    :remote-ice-pwd ice-pwd
-                                    :remote-fingerprint fp
-                                    :remote-answer-seq signal-seq})
+                  already-connected? (boolean (get-in session [:p2p :connected?]))
+                  has-candidates? (boolean (seq candidates))
+                  p2p-base (get session :p2p {})
+                  p2p-entry (if already-connected?
+                              (assoc p2p-base
+                                     :phase :open
+                                     :connected? true
+                                     :remote-candidates (vec candidates)
+                                     :remote-transport transport
+                                     :remote-ice-ufrag ice-ufrag
+                                     :remote-ice-pwd ice-pwd
+                                     :remote-fingerprint fp
+                                     :remote-answer-seq signal-seq
+                                     :updated-epoch (long (or (:epoch state) 0)))
+                              (merge p2p-base
+                                     {:phase :connecting
+                                      :connected? false
+                                      :zero-burn? false
+                                      :remote-transport transport
+                                      :remote-candidates (vec candidates)
+                                      :remote-ice-ufrag ice-ufrag
+                                      :remote-ice-pwd ice-pwd
+                                      :remote-fingerprint fp
+                                      :remote-answer-seq signal-seq}))
                   new-state (assoc-in state [:sessions sid :p2p] p2p-entry)
                   pname (pubkey->petname state norm-sender)
                   evt (cond-> {"event" "p2p-answer-received"
@@ -4190,15 +4236,16 @@
                                "transport" transport
                                "candidates" candidates}
                         pname (assoc "peer_petname" pname))
-                  p2p-dial {:session-id sid
-                            :peer norm-sender
-                            :role :initiator
-                            :transport transport
-                            :local-candidates (get-in session [:p2p :local-candidates])
-                            :remote-candidates candidates
-                            :remote-ice-ufrag ice-ufrag
-                            :remote-ice-pwd ice-pwd
-                            :remote-fingerprint fp}]
+                  p2p-dial (when (and (not already-connected?) has-candidates?)
+                             {:session-id sid
+                              :peer norm-sender
+                              :role :initiator
+                              :transport transport
+                              :local-candidates (get-in session [:p2p :local-candidates])
+                              :remote-candidates candidates
+                              :remote-ice-ufrag ice-ufrag
+                              :remote-ice-pwd ice-pwd
+                              :remote-fingerprint fp})]
               {:state new-state
                :net-envelopes []
                :stdout-events [evt]
@@ -4339,8 +4386,10 @@
                                          (distinct)
                                          vec)
                      relay-pub (or (:pubkey state) norm-sender)
+                     relay-payload (cond-> msg
+                                     wire-dac (assoc :dac wire-dac))
                      relay-envs (mapv (fn [target]
-                                        (assoc (build-gossip-envelope relay-pub privkey-bytes (freeze-payload msg) 0 sub-id)
+                                        (assoc (build-gossip-envelope relay-pub privkey-bytes (freeze-payload relay-payload) 0 sub-id)
                                                :p2p-direct? true
                                                :p2p-peer (:peer target)
                                                :p2p-session-id (:session-id target)))

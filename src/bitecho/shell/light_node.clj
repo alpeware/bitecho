@@ -944,6 +944,15 @@
              :connection-error (:error c)
              :conn-diagnostics diag))))
 
+(defn- record-conn-diagnostic!
+  "Records a connection-level diagnostic failure into state-atom under :diagnostics."
+  [state-atom tag info]
+  (when state-atom
+    (swap! state-atom (fn [st]
+                        (-> st
+                            (update-in [:diagnostics tag] (fnil inc 0))
+                            (assoc-in [:diagnostics :last-diagnostic] {:effect :diagnose :tag tag :info info}))))))
+
 (defn- validate-node-fingerprints
   "Verifies DTLS fingerprints for all nodes in descriptor.
    Returns nil if valid, or {:ok? false :error \"bad-fingerprint\"} on mismatch."
@@ -1707,12 +1716,10 @@
                                   sid (:session-id inner-ev)
                                   sess (when (and state-atom sid) (get-in @state-atom [:sessions sid]))
                                   expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))
-                                  p2p-phase (get-in sess [:p2p :phase])
                                   valid? (and (verify-p2p-link-bind inner-ev)
                                               (some? sess)
                                               (= "open" (:state sess))
-                                              (= norm-sender expected-peer)
-                                              (contains? #{:offered :offer-received :connecting :open} p2p-phase))]
+                                              (= norm-sender expected-peer))]
                               (if valid?
                                 (let [my-gen (inc (long (or (get-in @p2p-peers-atom [norm-sender :generation]) 0)))]
                                   (reset! bound-sender norm-sender)
@@ -1795,7 +1802,12 @@
                          :ice-creds (:ice-creds identity)
                          :peer-ice-pwds peer-ice-pwds}
             listener (api/listen-tcp! listen-opts {:on-connection on-conn-fn})
-            udp-listener (try (api/listen! listen-opts {:on-connection on-conn-fn}) (catch Exception _ nil))]
+            udp-listener (try
+                           (api/listen! listen-opts {:on-connection on-conn-fn})
+                           (catch Exception e
+                             (when state-atom
+                               (record-conn-diagnostic! state-atom :udp-listen-failed {:port port :error (or (.getMessage e) (str e))}))
+                             nil))]
         {:listener listener
          :udp-listener udp-listener
          :ingress-peers-atom ingress-peers-atom
@@ -2009,12 +2021,21 @@
                            (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                            (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                            (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
-                           (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))))
+                           (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                           (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                           (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                           (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
                        (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
                                                                       :autonomous? (boolean (:autonomous? opts false))}
                                                                (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
-                                                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts)))))
-        initial-state (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
+                                                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                                               (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                                               (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                                               (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
+        initial-state (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
+                        (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                        (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                        (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
         state-atom (atom initial-state)
         conn-atom (atom (init-conn-state))
         out-writer (PrintWriter. System/out true)
@@ -2173,12 +2194,21 @@
                            (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                            (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                            (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
-                           (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))))
+                           (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                           (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                           (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                           (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
                        (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
                                                                       :autonomous? (boolean (:autonomous? opts false))}
                                                                (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
-                                                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts)))))
-        initial-state (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
+                                                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                                               (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                                               (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                                               (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
+        initial-state (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
+                        (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                        (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                        (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
         state-atom (atom initial-state)
         raw-cmd-map (:cmd-map opts)
         verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))

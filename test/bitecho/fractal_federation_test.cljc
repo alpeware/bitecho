@@ -631,7 +631,15 @@
         (is (= true (get-in ans-res-1 [:response "ok"])))
         (is (= 100 (get-in ans-res-1 [:response "burn"])))
         (is (= ["udp://127.0.0.1:7777"] (get-in ans-res-1 [:response "candidates"])))
-        (is (= 100 (get-in (first (:net-envelopes ans-res-1)) [:event :message :burn-amount])))))))
+        (is (= 100 (get-in (first (:net-envelopes ans-res-1)) [:event :message :burn-amount]))))
+
+      ;; 6. Explicit burn below floor when closed is rejected with "burn-below-floor" (F-H3)
+      (let [off-res-below (light-core/handle-command base-a {"cmd" "p2p-offer" "session_id" sid "burn" 0} (:private kp-a))]
+        (is (= false (get-in off-res-below [:response "ok"])))
+        (is (= "burn-below-floor" (get-in off-res-below [:response "error"]))))
+      (let [ans-res-below (light-core/handle-command base-a {"cmd" "p2p-answer" "session_id" sid "burn" 50} (:private kp-a))]
+        (is (= false (get-in ans-res-below [:response "ok"])))
+        (is (= "burn-below-floor" (get-in ans-res-below [:response "error"])))))))
 
 (deftest test-state-machine-min-signaling-burn-floor
   (testing "state_machine/handle-receive-gossip respects custom :min-signaling-burn and :burn-floor in state config, and allows 0-burn when economy-enabled? is false"
@@ -679,4 +687,97 @@
             res-zero (sm/handle-event s-no-econ {:type :receive-gossip :sender pub2 :message msg-zero})]
         (is (contains? (get-in (:state res-zero) [:murmur-cache :set])
                        (basalt/bytes->hex (crypto/sha256 (:payload msg-zero))))
-            ":economy-enabled? false must accept 0-burn gossip without deduction")))))
+            ":economy-enabled? false must accept 0-burn gossip without deduction"))
+
+      ;; Test handle-signaling-burn with :min-signaling-burn 200 (F-H4)
+      (let [ev-burn-low {:type :signaling-burn :sender pub2 :burn-amount 150}
+            ev-burn-ok {:type :signaling-burn :sender pub2 :burn-amount 200}
+            res-sb-low (sm/handle-event s0 ev-burn-low)
+            res-sb-ok (sm/handle-event s0 ev-burn-ok)]
+        (is (= (get-in s0 [:ledger pub2 :balance]) (get-in (:state res-sb-low) [:ledger pub2 :balance]))
+            "handle-signaling-burn must reject burn 150 when :min-signaling-burn is 200")
+        (is (= (- (get-in s0 [:ledger pub2 :balance]) 200) (get-in (:state res-sb-ok) [:ledger pub2 :balance]))
+            "handle-signaling-burn must accept and deduct burn 200 when :min-signaling-burn is 200")))))
+
+(deftest test-wire-p2p-and-dac-broadcast-remediation
+  (testing "F-H2 & F-H9: create-dac default scopes include 'broadcast', and exec-broadcast only attaches broadcast-scoped DAC"
+    (let [kp-anc (crypto/generate-keypair)
+          kp-agent (crypto/generate-keypair)
+          anc-pub (basalt/bytes->hex (:public kp-anc))
+          agent-pub (basalt/bytes->hex (:public kp-agent))
+          dac-default (light-core/create-dac (:private kp-anc)
+                                             {:anchor-pubkey anc-pub
+                                              :agent-pubkey agent-pub
+                                              :issued-epoch 1
+                                              :expires-epoch 100
+                                              :max-spend-per-epoch 1000})
+          dac-nobroadcast (light-core/create-dac (:private kp-anc)
+                                                 {:anchor-pubkey anc-pub
+                                                  :agent-pubkey agent-pub
+                                                  :issued-epoch 1
+                                                  :expires-epoch 100
+                                                  :max-spend-per-epoch 1000
+                                                  :scopes ["gossip" "offer"]})
+          st0 (-> (light-core/init-light-state {:pubkey-hex agent-pub} {:epoch 5})
+                  (assoc :trusted-dac-anchors #{anc-pub}))
+          st-with-nobroadcast (assoc st0 :dac dac-nobroadcast)
+          res-nobroadcast (light-core/handle-command st-with-nobroadcast
+                                                     {"cmd" "broadcast" "message" "hello without dac"}
+                                                     (:private kp-agent))
+          env-nobroadcast (first (:net-envelopes res-nobroadcast))
+          payload-nobroadcast (light-core/thaw-payload (get-in env-nobroadcast [:event :message :payload]))
+          st-with-default (assoc st0 :dac dac-default)
+          res-default (light-core/handle-command st-with-default
+                                                 {"cmd" "broadcast" "message" "hello with dac"}
+                                                 (:private kp-agent))
+          env-default (first (:net-envelopes res-default))
+          payload-default (light-core/thaw-payload (get-in env-default [:event :message :payload]))]
+      (is (contains? (set (:scopes dac-default)) "broadcast")
+          "create-dac default scopes must include broadcast")
+      (is (nil? (:dac payload-nobroadcast))
+          "exec-broadcast must not attach DAC when broadcast scope is missing")
+      (is (some? (:dac payload-default))
+          "exec-broadcast must attach DAC when broadcast scope is present")
+      (is (= anc-pub (get-in payload-default [:dac :anchor-pubkey])))))
+
+  (testing "F-H7: handle-wire-p2p-answer does not emit :p2p-dial on empty candidates, and maintains :phase :open when already connected"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          sid "sess-ans-empty-cand"
+          st-open (-> (light-core/init-light-state {:pubkey-hex pub-a} {:epoch 5})
+                      (assoc-in [:sessions sid]
+                                {:session-id sid
+                                 :peer pub-b
+                                 :state "open"
+                                 :p2p {:phase :open :connected? true}}))
+          ans-msg-empty {:type :p2p-answer
+                         :sender pub-b
+                         :session-id sid
+                         :candidates []
+                         :signal-seq 1
+                         :epoch 5}
+          ans-env-empty {:bitecho/type :agent-envelope
+                         :event {:type :p2p-answer
+                                 :message ans-msg-empty
+                                 :signature (crypto/sign (:private kp-b) (fressian/encode-wire ans-msg-empty))}}
+          res-empty (light-core/handle-wire-payload st-open ans-env-empty (:private kp-a))]
+      (is (nil? (:p2p-dial res-empty))
+          "handle-wire-p2p-answer must not emit :p2p-dial on empty candidates")
+      (is (= :open (get-in (:state res-empty) [:sessions sid :p2p :phase]))
+          "handle-wire-p2p-answer must maintain :phase :open when already connected")))
+
+  (testing "F-H1: effective-signaling-burn-floor respects [:bootstrap :min-signaling-burn] and positive [:bootstrap :burn-floor]"
+    (let [st-boot-min (light-core/init-light-state {:pubkey-hex "302a300506032b65700321000000000000000000000000000000000000000000000000000000000000000001"}
+                                                   {:bootstrap {:min-signaling-burn 500 :burn-floor 250}})
+          st-boot-floor (light-core/init-light-state {:pubkey-hex "302a300506032b65700321000000000000000000000000000000000000000000000000000000000000000001"}
+                                                     {:bootstrap {:burn-floor 350}})
+          st-disabled (light-core/init-light-state {:pubkey-hex "302a300506032b65700321000000000000000000000000000000000000000000000000000000000000000001"}
+                                                   {:economy-enabled? false :bootstrap {:min-signaling-burn 500}})]
+      (is (= 500 (light-core/effective-signaling-burn-floor st-boot-min))
+          "effective-signaling-burn-floor must return [:bootstrap :min-signaling-burn] when configured")
+      (is (= 350 (light-core/effective-signaling-burn-floor st-boot-floor))
+          "effective-signaling-burn-floor must return positive [:bootstrap :burn-floor] when min-signaling-burn not set")
+      (is (= 0 (light-core/effective-signaling-burn-floor st-disabled))
+          "effective-signaling-burn-floor must return 0 when economy is disabled"))))

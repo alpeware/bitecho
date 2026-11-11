@@ -693,13 +693,11 @@
       (let [sender-pk (light-core/normalize-pubkey-hex (:sender env))
             sid (:session-id env)
             sess (get-in @node-atom [:light-state :sessions sid])
-            expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))
-            p2p-phase (get-in sess [:p2p :phase])]
+            expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))]
         (if (and (verify-p2p-link-bind env)
                  (some? sess)
                  (= "open" (:state sess))
-                 (= sender-pk expected-peer)
-                 (contains? #{:offered :offer-received :connecting :open} p2p-phase))
+                 (= sender-pk expected-peer))
           (set-p2p-channel-state node-atom sid true nil)
           (swap! node-atom update-in [:light-state :diagnostics :p2p-signaling-rejected] (fnil inc 0))))
       (let [node @node-atom
@@ -1523,12 +1521,12 @@
                     (not cmd-ok?) (assoc :error (get resp "error")))))))))
 
 (defn broadcast-message
-  "Broadcasts a zero-burn message across the 3-way mesh subnet (default 'chat/simon-nexus-axiom')."
-  ([text] (broadcast-message @active-node-atom text light-core/simon-nexus-axiom-subnet-id))
+  "Broadcasts a zero-burn message across the 3-way mesh subnet (default node's subnet, 'chat/simon-nexus-axiom', or 'global')."
+  ([text] (broadcast-message @active-node-atom text nil))
   ([arg1 arg2]
    (if (or (satisfies? IAtom arg1)
            (and (some? arg1) (fn? (.-deref arg1))))
-     (broadcast-message arg1 arg2 light-core/simon-nexus-axiom-subnet-id)
+     (broadcast-message arg1 arg2 nil)
      (broadcast-message @active-node-atom arg1 arg2)))
   ([node-atom text subnet-id]
    (let [na (or node-atom @active-node-atom)]
@@ -1536,7 +1534,11 @@
        (clj->js {:ok false :error "no-active-node"})
        (let [node @na
              privkey (:private-key (:keypair node))
-             eff-subnet (or subnet-id light-core/simon-nexus-axiom-subnet-id)]
+             eff-subnet (or (when (and (string? subnet-id) (not (str/blank? subnet-id))) subnet-id)
+                            (:subnet-id node)
+                            (get-in node [:light-state :subnet-id])
+                            light-core/simon-nexus-axiom-subnet-id
+                            "global")]
          (if-not privkey
            (clj->js {:ok false :error "hardware-unlock-required"})
            (let [cmd-res (light-core/handle-command (:light-state node)

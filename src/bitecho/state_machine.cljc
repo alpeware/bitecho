@@ -1951,7 +1951,13 @@
    and incrementing the epoch's burn accumulator."
   [state event]
   (let [econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
-        floor (long (get-in state [:config :burn-floor] (get state :burn-floor (if econ-enabled? burn/min-signaling-burn 0))))
+        floor (if-not econ-enabled?
+                0
+                (long (or (get-in state [:config :min-signaling-burn])
+                          (get state :min-signaling-burn)
+                          (get-in state [:config :burn-floor])
+                          (get state :burn-floor)
+                          burn/min-signaling-burn)))
         sender (:sender event)
         sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))
         burn-amt (or (:burn event) (:burn-amount event) floor)]
@@ -1972,7 +1978,10 @@
                 {:state state :commands []}))
             {:state state :commands []}))
         (let [ledger (or (:ledger state) {})
-              res (when sender-hex (burn/deduct-signaling-burn ledger sender-hex burn-amt))]
+              res (when (and sender-hex
+                             (number? burn-amt)
+                             (>= burn-amt floor))
+                    (burn/deduct-signaling-burn ledger sender-hex burn-amt))]
           (if res
             (let [current-epoch (or (:epoch state) 0)]
               {:state (-> state

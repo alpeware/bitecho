@@ -93,7 +93,10 @@
       auth-pk (assoc :authority-pubkey auth-pk)
       issued-ep (assoc :issued-epoch issued-ep)
       expires-ep (assoc :expires-epoch expires-ep)
-      sig (assoc :signature sig))))
+      sig (assoc :signature sig)
+      (contains? data :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? data)))
+      (some? (:burn-floor data)) (assoc :burn-floor (long (:burn-floor data)))
+      (some? (:min-signaling-burn data)) (assoc :min-signaling-burn (long (:min-signaling-burn data))))))
 
 (defn- parse-single-node-txt-block
   "Extracts a validator node map from a text block starting with 'Node: <id>'."

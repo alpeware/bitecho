@@ -38,6 +38,8 @@
   "Pinned Directory Authority public key for bitecho.org devnet."
   "302a300506032b657003210056b505baa32c3b99663d163d6ee00b5018a26e182405f5ec4d5062f12f633ce9")
 
+(declare dial-p2p-peer! send-routed-envelopes!)
+
 (defn normalize-fingerprint
   "Normalizes a SHA-256 DTLS fingerprint string to 32 uppercase colon-separated hex pairs."
   [fp]
@@ -138,7 +140,10 @@
       auth-pk (assoc :authority-pubkey auth-pk)
       issued-ep (assoc :issued-epoch issued-ep)
       expires-ep (assoc :expires-epoch expires-ep)
-      sig (assoc :signature sig))))
+      sig (assoc :signature sig)
+      (contains? data :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? data)))
+      (some? (:burn-floor data)) (assoc :burn-floor (long (:burn-floor data)))
+      (some? (:min-signaling-burn data)) (assoc :min-signaling-burn (long (:min-signaling-burn data))))))
 
 (defn- parse-single-node-txt-block
   [block-str]
@@ -1025,6 +1030,15 @@
              :connection-error (:error c)
              :conn-diagnostics diag))))
 
+(defn- record-conn-diagnostic!
+  "Records a connection-level diagnostic failure into state-atom under :diagnostics."
+  [state-atom tag info]
+  (when state-atom
+    (swap! state-atom (fn [st]
+                        (-> st
+                            (update-in [:diagnostics tag] (fnil inc 0))
+                            (assoc-in [:diagnostics :last-diagnostic] {:effect :diagnose :tag tag :info info}))))))
+
 (defn connection-live?
   "Checks if connection is marked ok and open, channel-id is present, and state is connected."
   [conn state]
@@ -1150,8 +1164,12 @@
                              (when (and event-out (seq (:stdout-events res)))
                                (doseq [ev (:stdout-events res)]
                                  (event-out ev)))
+                             (when-let [dial-info (:p2p-dial res)]
+                               (dial-p2p-peer! state-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) (:mdns-atom ctx) (:privkey-bytes identity) event-out dial-info))
                              (when (seq (:net-envelopes res))
-                               (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts))))))))
+                               (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) (:net-envelopes res))
+                                 (send-routed-envelopes! (:net-envelopes res) send-fn-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) state-atom (:privkey-bytes identity))
+                                 (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts)))))))))
      :on-error (fn [evt]
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (settle-fn! :bad-fingerprint)))
@@ -1902,171 +1920,177 @@
             ingress-peers-atom (or (:ingress-peers-atom opts) (atom {}))
             peer-seq (atom 0)
             peer-ice-pwds (atom {})
-            listener
-            (api/listen-tcp!
-             {:port port
-              :cert-data (:cert-data identity)
-              :ice-creds (:ice-creds identity)
-              :peer-ice-pwds peer-ice-pwds}
-             {:on-connection
-              (fn [peer-node]
-                (try (api/set-max-message-size! peer-node) (catch :default _ nil))
-                (let [peer-key (swap! peer-seq inc)
-                      peer-cid (atom 0)
-                      bound-sender (atom nil)
-                      bound-gen (atom nil)
-                      on-close-fired? (atom false)
-                      peer-send! (fn [env]
-                                   (let [payload (try
-                                                   (if (bytes? env) env (fressian/encode-wire env))
-                                                   (catch :default _ nil))]
-                                     (if (nil? payload)
-                                       false
-                                       (try
-                                         (api/send! peer-node payload (int (or @peer-cid 0)))
-                                         true
-                                         (catch :default _ false)))))
-                      on-close-fn (fn [_]
-                                    (when (compare-and-set! on-close-fired? false true)
-                                      (swap! ingress-peers-atom dissoc peer-key)
-                                      (when-let [peer @bound-sender]
-                                        (let [my-gen @bound-gen
-                                              cur-gen (long (or (get-in @p2p-peers-atom [peer :generation]) 0))]
-                                          (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
-                                            (when state-atom
-                                              (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
-                                            (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
-                                              (let [entry (when p2p-peers-atom (get @p2p-peers-atom peer))
-                                                    sid (:session-id entry)]
-                                                (when p2p-peers-atom (swap! p2p-peers-atom dissoc peer))
-                                                (when (and state-atom sid (get-in @state-atom [:sessions sid]))
-                                                  (let [cmd-res (light-core/handle-command @state-atom
-                                                                                           {"cmd" "p2p-channel-state"
-                                                                                            "session_id" sid
-                                                                                            "connected" false
-                                                                                            "error" "channel-closed"}
-                                                                                           (:privkey-bytes identity))]
-                                                    (reset! state-atom (:state cmd-res))
-                                                    (when (and event-out (seq (:stdout-events cmd-res)))
-                                                      (doseq [ev (:stdout-events cmd-res)] (event-out ev))))))))))))
-                      peer-close! (fn []
-                                    (try
-                                      (when-let [ch @(:channel peer-node)]
-                                        (cond
-                                          (fn? (.-destroy ch)) (.destroy ch)
-                                          (fn? (.-close ch)) (.close ch)))
-                                      (api/close! peer-node)
-                                      (on-close-fn {:type :on-close})
-                                      (catch :default _ nil)))]
-                  (swap! ingress-peers-atom assoc peer-key peer-send!)
-                  (api/set-callbacks!
-                   peer-node
-                   {:on-open (fn [evt]
-                               (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                 (reset! peer-cid cid)))
-                    :on-data-channel (fn [evt]
-                                       (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                         (reset! peer-cid cid)))
-                    :on-message
-                    (fn [evt]
-                      (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) @peer-cid 0)]
-                        (reset! peer-cid cid)
-                        (when-let [payload (:payload evt)]
-                          (let [decoded (try (if (bytes? payload) (fressian/decode-wire payload) payload) (catch :default _ nil))
-                                inner-ev (if (and (map? decoded) (map? (:event decoded))) (:event decoded) decoded)]
-                            (cond
-                              (and (map? inner-ev) (= :p2p-link-bind (or (:type inner-ev) (:bitecho/type inner-ev))))
-                              (let [norm-sender (light-core/normalize-pubkey-hex (:sender inner-ev))
-                                    sid (:session-id inner-ev)
-                                    sess (when (and state-atom sid) (get-in @state-atom [:sessions sid]))
-                                    expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))
-                                    p2p-phase (get-in sess [:p2p :phase])
-                                    valid? (and (verify-p2p-link-bind inner-ev)
-                                                (some? sess)
-                                                (= "open" (:state sess))
-                                                (= norm-sender expected-peer)
-                                                (contains? #{:offered :offer-received :connecting :open} p2p-phase))]
-                                (if valid?
-                                  (let [my-gen (inc (long (or (get-in @p2p-peers-atom [norm-sender :generation]) 0)))]
-                                    (reset! bound-sender norm-sender)
-                                    (reset! bound-gen my-gen)
-                                    (when p2p-peers-atom
-                                      (swap! p2p-peers-atom assoc norm-sender {:send-fn peer-send!
-                                                                               :close-fn peer-close!
-                                                                               :session-id sid
-                                                                               :generation my-gen}))
-                                    (when state-atom
-                                      (let [cmd-res (light-core/handle-command @state-atom
-                                                                               {"cmd" "p2p-channel-state"
-                                                                                "session_id" sid
-                                                                                "connected" true}
-                                                                               (:privkey-bytes identity))]
-                                        (reset! state-atom (:state cmd-res))
-                                        (when (and event-out (seq (:stdout-events cmd-res)))
-                                          (doseq [ev (:stdout-events cmd-res)] (event-out ev))))))
+            on-conn-fn
+            (fn [peer-node]
+              (try (api/set-max-message-size! peer-node) (catch :default _ nil))
+              (let [peer-key (swap! peer-seq inc)
+                    peer-cid (atom 0)
+                    bound-sender (atom nil)
+                    bound-gen (atom nil)
+                    on-close-fired? (atom false)
+                    peer-send! (fn [env]
+                                 (let [payload (try
+                                                 (if (bytes? env) env (fressian/encode-wire env))
+                                                 (catch :default _ nil))]
+                                   (if (nil? payload)
+                                     false
+                                     (try
+                                       (api/send! peer-node payload (int (or @peer-cid 0)))
+                                       true
+                                       (catch :default _ false)))))
+                    on-close-fn (fn [_]
+                                  (when (compare-and-set! on-close-fired? false true)
+                                    (swap! ingress-peers-atom dissoc peer-key)
+                                    (when-let [peer @bound-sender]
+                                      (let [my-gen @bound-gen
+                                            cur-gen (long (or (get-in @p2p-peers-atom [peer :generation]) 0))]
+                                        (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
+                                          (when state-atom
+                                            (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
+                                          (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
+                                            (let [entry (when p2p-peers-atom (get @p2p-peers-atom peer))
+                                                  sid (:session-id entry)]
+                                              (when p2p-peers-atom (swap! p2p-peers-atom dissoc peer))
+                                              (when (and state-atom sid (get-in @state-atom [:sessions sid]))
+                                                (let [cmd-res (light-core/handle-command @state-atom
+                                                                                         {"cmd" "p2p-channel-state"
+                                                                                          "session_id" sid
+                                                                                          "connected" false
+                                                                                          "error" "channel-closed"}
+                                                                                         (:privkey-bytes identity))]
+                                                  (reset! state-atom (:state cmd-res))
+                                                  (when (and event-out (seq (:stdout-events cmd-res)))
+                                                    (doseq [ev (:stdout-events cmd-res)] (event-out ev))))))))))))
+                    peer-close! (fn []
+                                  (try
+                                    (when-let [ch @(:channel peer-node)]
+                                      (cond
+                                        (fn? (.-destroy ch)) (.destroy ch)
+                                        (fn? (.-close ch)) (.close ch)))
+                                    (api/close! peer-node)
+                                    (on-close-fn {:type :on-close})
+                                    (catch :default _ nil)))]
+                (swap! ingress-peers-atom assoc peer-key peer-send!)
+                (api/set-callbacks!
+                 peer-node
+                 {:on-open (fn [evt]
+                             (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                               (reset! peer-cid cid)))
+                  :on-data-channel (fn [evt]
+                                     (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                       (reset! peer-cid cid)))
+                  :on-message
+                  (fn [evt]
+                    (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) @peer-cid 0)]
+                      (reset! peer-cid cid)
+                      (when-let [payload (:payload evt)]
+                        (let [decoded (try (if (bytes? payload) (fressian/decode-wire payload) payload) (catch :default _ nil))
+                              inner-ev (if (and (map? decoded) (map? (:event decoded))) (:event decoded) decoded)]
+                          (cond
+                            (and (map? inner-ev) (= :p2p-link-bind (or (:type inner-ev) (:bitecho/type inner-ev))))
+                            (let [norm-sender (light-core/normalize-pubkey-hex (:sender inner-ev))
+                                  sid (:session-id inner-ev)
+                                  sess (when (and state-atom sid) (get-in @state-atom [:sessions sid]))
+                                  expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))
+                                  valid? (and (verify-p2p-link-bind inner-ev)
+                                              (some? sess)
+                                              (= "open" (:state sess))
+                                              (= norm-sender expected-peer))]
+                              (if valid?
+                                (let [my-gen (inc (long (or (get-in @p2p-peers-atom [norm-sender :generation]) 0)))]
+                                  (reset! bound-sender norm-sender)
+                                  (reset! bound-gen my-gen)
+                                  (when p2p-peers-atom
+                                    (swap! p2p-peers-atom assoc norm-sender {:send-fn peer-send!
+                                                                             :close-fn peer-close!
+                                                                             :session-id sid
+                                                                             :generation my-gen}))
                                   (when state-atom
-                                    (swap! state-atom update-in [:diagnostics :p2p-signaling-rejected] (fnil inc 0)))))
+                                    (let [cmd-res (light-core/handle-command @state-atom
+                                                                             {"cmd" "p2p-channel-state"
+                                                                              "session_id" sid
+                                                                              "connected" true}
+                                                                             (:privkey-bytes identity))]
+                                      (reset! state-atom (:state cmd-res))
+                                      (when (and event-out (seq (:stdout-events cmd-res)))
+                                        (doseq [ev (:stdout-events cmd-res)] (event-out ev))))))
+                                (when state-atom
+                                  (swap! state-atom update-in [:diagnostics :p2p-signaling-rejected] (fnil inc 0)))))
 
-                              (and (map? inner-ev) (= :query-chain-state (or (:type inner-ev) (:bitecho/type inner-ev))))
-                              (let [st (if state-atom @state-atom {})
-                                    target-pk (or (:pubkey inner-ev) (:agent-pubkey decoded) (:pubkey st) (:pubkey-hex identity))
-                                    fin-ep (or (get-in st [:account :finalized-epoch]) (:epoch st) 0)
-                                    bal (or (get-in st [:account :balance]) 0)
-                                    spend (or (get-in st [:account :spendable]) bal 0)
-                                    sq (or (get-in st [:account :seq]) 0)
-                                    deps (vec (or (get-in st [:account :deps]) []))
-                                    base-snap {:bitecho/type :chain-state-snapshot
-                                               :type :chain-state-snapshot
-                                               :validator-pubkey (or (:pubkey-hex identity) (:pubkey identity))
-                                               :pubkey target-pk
-                                               :finalized-epoch fin-ep
-                                               :balance bal
-                                               :spendable spend
-                                               :seq sq
-                                               :deps deps
-                                               :escrows []
-                                               :nonce (str (or (:nonce inner-ev) ""))}
-                                    signed-snap (light-core/sign-chain-state-snapshot base-snap (:privkey-bytes identity))]
-                                (peer-send! signed-snap))
+                            (and (map? inner-ev) (= :query-chain-state (or (:type inner-ev) (:bitecho/type inner-ev))))
+                            (let [st (if state-atom @state-atom {})
+                                  target-pk (or (:pubkey inner-ev) (:agent-pubkey decoded) (:pubkey st) (:pubkey-hex identity))
+                                  fin-ep (or (get-in st [:account :finalized-epoch]) (:epoch st) 0)
+                                  bal (or (get-in st [:account :balance]) 0)
+                                  spend (or (get-in st [:account :spendable]) bal 0)
+                                  sq (or (get-in st [:account :seq]) 0)
+                                  deps (vec (or (get-in st [:account :deps]) []))
+                                  base-snap {:bitecho/type :chain-state-snapshot
+                                             :type :chain-state-snapshot
+                                             :validator-pubkey (or (:pubkey-hex identity) (:pubkey identity))
+                                             :pubkey target-pk
+                                             :finalized-epoch fin-ep
+                                             :balance bal
+                                             :spendable spend
+                                             :seq sq
+                                             :deps deps
+                                             :escrows []
+                                             :nonce (str (or (:nonce inner-ev) ""))}
+                                  signed-snap (light-core/sign-chain-state-snapshot base-snap (:privkey-bytes identity))]
+                              (peer-send! signed-snap))
 
-                              :else
-                              (when state-atom
-                                (let [st @state-atom
-                                      st-rej (+ (long (or (get-in st [:diagnostics :p2p-signaling-rejected]) 0))
-                                                (long (or (get-in st [:diagnostics :broadcast-rejected]) 0)))
-                                      res (light-core/handle-wire-payload st payload (:privkey-bytes identity))
-                                      new-st (:state res)
-                                      new-rej (+ (long (or (get-in new-st [:diagnostics :p2p-signaling-rejected]) 0))
-                                                 (long (or (get-in new-st [:diagnostics :broadcast-rejected]) 0)))]
-                                  (when (and (<= new-rej st-rej)
-                                             (map? inner-ev)
-                                             (contains? #{:p2p-offer :p2p-answer :p2p-broadcast :p2p-hub-relay :sealed-message}
-                                                        (or (:type inner-ev) (:bitecho/type inner-ev))))
-                                    (when-let [norm-sender (light-core/normalize-pubkey-hex (:sender inner-ev))]
-                                      (when (and p2p-peers-atom (get @p2p-peers-atom norm-sender))
-                                        (reset! bound-sender norm-sender)
-                                        (swap! p2p-peers-atom update norm-sender #(merge {:send-fn peer-send! :close-fn peer-close!} %)))))
-                                  (reset! state-atom new-st)
-                                  (when (and state-file (not= st new-st))
-                                    (try (save-light-state! state-file new-st) (catch :default _ nil)))
-                                  (when (and event-out (seq (:stdout-events res)))
-                                    (doseq [ev (:stdout-events res)]
-                                      (event-out ev)))
-                                  (when-let [dial-info (:p2p-dial res)]
-                                    (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
-                                  (when (seq (:net-envelopes res))
-                                    (send-routed-envelopes! (:net-envelopes res)
-                                                            (when (and conn-atom (connection-live? @conn-atom @state-atom))
-                                                              (:send-fn @conn-atom))
-                                                            p2p-peers-atom
-                                                            ingress-peers-atom
-                                                            state-atom
-                                                            (:privkey-bytes identity))))))))))
-                    :on-close on-close-fn})))})]
+                            :else
+                            (when state-atom
+                              (let [st @state-atom
+                                    st-rej (+ (long (or (get-in st [:diagnostics :p2p-signaling-rejected]) 0))
+                                              (long (or (get-in st [:diagnostics :broadcast-rejected]) 0)))
+                                    res (light-core/handle-wire-payload st payload (:privkey-bytes identity))
+                                    new-st (:state res)
+                                    new-rej (+ (long (or (get-in new-st [:diagnostics :p2p-signaling-rejected]) 0))
+                                               (long (or (get-in new-st [:diagnostics :broadcast-rejected]) 0)))]
+                                (when (and (<= new-rej st-rej)
+                                           (map? inner-ev)
+                                           (contains? #{:p2p-offer :p2p-answer :p2p-broadcast :p2p-hub-relay :sealed-message :session-ack}
+                                                      (or (:type inner-ev) (:bitecho/type inner-ev))))
+                                  (when-let [norm-sender (light-core/normalize-pubkey-hex (:sender inner-ev))]
+                                    (when (and p2p-peers-atom (get @p2p-peers-atom norm-sender))
+                                      (reset! bound-sender norm-sender)
+                                      (swap! p2p-peers-atom update norm-sender #(merge {:send-fn peer-send! :close-fn peer-close!} %)))))
+                                (reset! state-atom new-st)
+                                (when (and state-file (not= st new-st))
+                                  (try (save-light-state! state-file new-st) (catch :default _ nil)))
+                                (when (and event-out (seq (:stdout-events res)))
+                                  (doseq [ev (:stdout-events res)]
+                                    (event-out ev)))
+                                (when-let [dial-info (:p2p-dial res)]
+                                  (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
+                                (when (seq (:net-envelopes res))
+                                  (send-routed-envelopes! (:net-envelopes res)
+                                                          (when (and conn-atom (connection-live? @conn-atom @state-atom))
+                                                            (:send-fn @conn-atom))
+                                                          p2p-peers-atom
+                                                          ingress-peers-atom
+                                                          state-atom
+                                                          (:privkey-bytes identity))))))))))
+                  :on-close on-close-fn})))
+            listen-opts {:port port
+                         :cert-data (:cert-data identity)
+                         :ice-creds (:ice-creds identity)
+                         :peer-ice-pwds peer-ice-pwds}
+            listener (api/listen-tcp! listen-opts {:on-connection on-conn-fn})
+            udp-listener (try
+                           (api/listen! listen-opts {:on-connection on-conn-fn})
+                           (catch :default e
+                             (when state-atom
+                               (record-conn-diagnostic! state-atom :udp-listen-failed {:port port :error (or (ex-message e) (str e))}))
+                             nil))]
         {:listener listener
+         :udp-listener udp-listener
          :ingress-peers-atom ingress-peers-atom
          :p2p-peers-atom p2p-peers-atom
-         :stop! #(try (api/close! listener) (catch :default _ nil))}))))
+         :stop! (fn []
+                  (try (api/close! listener) (catch :default _ nil))
+                  (when udp-listener (try (api/close! udp-listener) (catch :default _ nil))))}))))
 
 (defn handle-serve-line!
   "Processes a single STDIN or `--cmd-file` JSON line in `serve` mode, invoking `(done-cb)` when complete."
@@ -2297,12 +2321,21 @@
                                   (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                   (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                   (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
-                                  (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))))
+                                  (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                  (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                  (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                  (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
                               (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
                                                                              :autonomous? (boolean (:autonomous? opts false))}
                                                                       (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
-                                                                      (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts)))))
-               initial-state (assoc base-state :max-epoch-skew (or (:max-epoch-skew base-state) 15))
+                                                                      (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                                                      (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                                                      (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                                                      (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
+               initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew base-state) 15))
+                               (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                               (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                               (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
                state-atom (atom initial-state)
                conn-atom (atom (init-conn-state))
                event-out (fn [ev] (emit-json-line! ev events-out))
@@ -2460,12 +2493,21 @@
                                   (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                                   (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                   (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
-                                  (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))))
+                                  (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                  (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                  (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                  (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
                               (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
                                                                              :autonomous? (boolean (:autonomous? opts false))}
                                                                       (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
-                                                                      (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts)))))
-               initial-state (assoc base-state :max-epoch-skew (or (:max-epoch-skew base-state) 15))
+                                                                      (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                                                      (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                                                      (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                                                      (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
+               initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew base-state) 15))
+                               (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                               (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                               (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
                state-atom (atom initial-state)
                raw-cmd-map (:cmd-map opts)
                verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
