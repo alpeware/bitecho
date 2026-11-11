@@ -736,7 +736,14 @@ Per Simon's refactoring-first architecture decision (`2026-11-08` / `2026-11-09`
    - Cross-platform `.cljc` `clj-datachannel` + `IDtlsEngine` + `state.fressian` + pure Node.js light-node bundle (`UDP` + RFC 4571 `TCP/HTTP CONNECT`), paired with local UPnP + delegated `nexus.ingress.bitecho.org:443` `HTTP CONNECT` ingress powered by Phase B's `bitecho.shell.http` and `bitecho.shell.upnp`.
 7. **Subnet #4 / Milestone 16 (`M4` — `"chat/simon-nexus-axiom"`) — `[BUILT & VERIFIED]`:**
    - Instantiate the 3-way zero-burn private chat & broadcast subnet (`"chat/simon-nexus-axiom"`, `:gate :dac`, `:economy :none`, `:replication :gossip-crdt` + `:eager-push`) over off-chain P2P ICE DataChannels (`datachannel.mdns` RFC 8828 `.local` mDNS on LAN legs + `p2p-offer`/`p2p-answer` upgrade + Nexus `:p2p-hub-relay` for `Browser <-> Axiom` + `broadcast` with `msg_id` deduplication).
-8. **Milestone 17 (`M5`) & Milestone 12 Anchoring (`M12`):**
-   - Mobile Browser UI + RC-4 wake identity guard (`M5`), followed by child-subnet Merkle state-root `Pointer` anchoring into parent subnets (`M12`).
+8. **Milestone 12 Anchoring (`M12` — Child-Subnet Merkle State-Root Pointer Anchoring into Parent Subnets) — `[BUILT & VERIFIED]`:**
+   - Active Pointers resolution and deterministic RFC 6962 Binary Merkle Tree (`compute-merkle-root`, `merkle-leaf-hash`, `merkle-branch-hash`, `merkle-empty-root`, odd-node promotion) in `bitecho.core.data`.
+   - Cryptographic Merkle inclusion proofs (`generate-merkle-proof`, `verify-merkle-proof`) with step position tags (`:left` / `:right`) and leaf-to-root path verification against parent state roots.
+   - Child state-root Blobs (`:bitecho/type :subnet-state-root`) and parent anchor Pointers (`path "anchor/<child-subnet-id>"`) signed by single authority or k-of-n quorum (`build-subnet-anchor`) in `bitecho.core.subnet`.
+   - Parent-side non-circular verification (`verify-subnet-anchor`) enforcing CID integrity, path matching, strict epoch monotonicity ($t_{i+1} > t_i$), and predecessor hash-chain continuity (`:prev-anchor-cid`).
+   - Pure multi-subnet multiplexer automatic anchor propagation (`handle-multiplexed-anchor-effects`) with `:on-change` and `:epoch` triggers, routing anchor Blobs and Pointers directly into parent subnet instances.
+   - Carried LOW cleanups: validator-side `effective-signaling-burn-floor` centralization in `bitecho.economy.burn` (`F-C1` + `O-2`), eliminated duplicate `:p2p-dial-failed` counts in Node.js and JVM shells (`F-D1`), enforce `:burn-floor` in `exec-offer` (`F-D2`), and automated in-repo Node.js daemon UDP WebRTC DataChannel accept test (`test/bitecho/node_bundle_test.clj` for `F-H2`).
+9. **Milestone 17 (`M5`):**
+   - Mobile Browser UI + RC-4 wake identity guard (`M5`).
 
 

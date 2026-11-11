@@ -340,18 +340,9 @@
 
 (defn effective-signaling-burn-floor
   "Computes the effective signaling burn floor for P2P signaling envelopes.
-   Returns 0 if economy is disabled. Otherwise returns configured :min-signaling-burn
-   or positive :burn-floor in state or bootstrap, defaulting to burn/min-signaling-burn (100)."
+   Delegates directly to `burn/effective-signaling-burn-floor`."
   [state]
-  (if (false? (:economy-enabled? state))
-    0
-    (long (or (:min-signaling-burn state)
-              (get-in state [:bootstrap :min-signaling-burn])
-              (when (and (:burn-floor state) (pos? (long (:burn-floor state))))
-                (:burn-floor state))
-              (when-let [bf (get-in state [:bootstrap :burn-floor])]
-                (when (pos? (long bf)) bf))
-              burn/min-signaling-burn))))
+  (burn/effective-signaling-burn-floor state))
 
 ;; -----------------------------------------------------------------------------
 ;; Petnames Address Book & Counterparty Resolution (Pure Helpers)
@@ -1731,14 +1722,24 @@
        :stdout-events []}
       (let [raw-price (or (get cmd-map "price") (:price cmd-map))
             raw-burn (or (get cmd-map "burn") (:burn cmd-map))
+            burn-floor (effective-signaling-burn-floor state)
             parsed-price (if (some? raw-price) (parse-long-safe raw-price :invalid) 0)
-            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) 500)]
-        (if (or (= parsed-price :invalid) (< parsed-price 0)
-                (= parsed-burn :invalid) (< parsed-burn 0))
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) (max 500 burn-floor))]
+        (cond
+          (or (= parsed-price :invalid) (< parsed-price 0)
+              (= parsed-burn :invalid) (< parsed-burn 0))
           {:state state
            :response {"ok" false "error" "invalid-numeric-parameter"}
            :net-envelopes []
            :stdout-events []}
+
+          (and (pos? burn-floor) (< (long parsed-burn) burn-floor))
+          {:state state
+           :response {"ok" false "error" "burn-below-floor" "required_floor" burn-floor}
+           :net-envelopes []
+           :stdout-events []}
+
+          :else
           (let [callee (:pubkey resolved)
                 pname (:petname resolved)
                 price parsed-price
@@ -4647,14 +4648,47 @@
 (defn register-subnet-instance
   "Registers or updates a subnet state machine instance in the multiplexer."
   [mux subnet-id instance-state]
-  (let [sid (str (or subnet-id "global"))]
-    (assoc-in mux [:subnets sid] (assoc instance-state :subnet-id sid))))
+  (let [sid (str (or subnet-id "global"))
+        inst (or (:instance instance-state) instance-state)]
+    (assoc-in mux [:subnets sid] (assoc inst :subnet-id sid))))
 
 (defn remove-subnet-instance
   "Removes a subnet state machine instance from the multiplexer."
   [mux subnet-id]
   (let [sid (str (or subnet-id "global"))]
     (update mux :subnets dissoc sid)))
+
+(defn- handle-multiplexed-anchor-effects
+  "Propagates any child-to-parent :anchor-to-parent effects across registered subnets in `mux`."
+  [mux effects now-ms]
+  (reduce (fn [{:keys [mux effs]} eff]
+            (if (= :anchor-to-parent (:effect eff))
+              (let [parent-id (str (:parent-subnet eff))
+                    parent-inst (get-in mux [:subnets parent-id])]
+                (if-not (and parent-inst (:bitecho.subnet/unified? parent-inst))
+                  ;; Parent subnet not locally hosted on this multiplexer; keep effect for network propagation
+                  {:mux mux :effs (conj effs eff)}
+                  (let [auth (or (get-in eff [:pointer :pointer/authority])
+                                 (get-in eff [:pointer :authority]))
+                        b-res (core-subnet/reduce-subnet parent-inst
+                                                         {:type :put-blob
+                                                          :blob (:blob eff)
+                                                          :sender auth
+                                                          :now-ms now-ms})
+                        p-res (core-subnet/reduce-subnet (:state b-res)
+                                                         {:type :publish-pointer
+                                                          :pointer (:pointer eff)
+                                                          :sender auth
+                                                          :now-ms now-ms})
+                        updated-mux (assoc-in mux [:subnets parent-id] (:state p-res))
+                        parent-effs (into (vec (or (:effects b-res) []))
+                                          (or (:effects p-res) []))
+                        nested (handle-multiplexed-anchor-effects updated-mux parent-effs now-ms)]
+                    {:mux (:mux nested)
+                     :effs (into (conj effs eff) (:effs nested))})))
+              {:mux mux :effs (conj effs eff)}))
+          {:mux mux :effs []}
+          effects))
 
 (defn route-multiplexed-envelope
   "Routes an incoming wire envelope to the matching registered subnet state machine by :subnet-id.
@@ -4679,9 +4713,12 @@
       (if (:bitecho.subnet/unified? instance)
         (let [sub-event (or (:event envelope) envelope)
               res (core-subnet/reduce-subnet instance sub-event)
-              new-mux (assoc-in mux [:subnets sub-id] (:state res))]
-          {:mux new-mux
-           :effects (or (:effects res) [])
+              now-ms (long (or (:now-ms sub-event) (:now-ms envelope) 0))
+              handled (handle-multiplexed-anchor-effects (assoc-in mux [:subnets sub-id] (:state res))
+                                                         (or (:effects res) [])
+                                                         now-ms)]
+          {:mux (:mux handled)
+           :effects (:effs handled)
            :net-envelopes []
            :stdout-events []})
         (let [res (handle-wire-payload instance envelope privkey-bytes)
@@ -4715,17 +4752,30 @@
        :response {"ok" false "error" "subnet-not-found" "subnet" sub-id}
        :net-envelopes []
        :stdout-events []}
-      (let [res (handle-command instance cmd-map privkey-bytes)
-            tagged-envs (mapv (fn [e]
-                                (cond-> e
-                                  (or (nil? (:subnet-id e)) (= (:subnet-id e) "global"))
-                                  (assoc :subnet-id sub-id)))
-                              (or (:net-envelopes res) []))
-            new-mux (assoc-in mux [:subnets sub-id] (:state res))]
-        {:mux new-mux
-         :response (:response res)
-         :net-envelopes tagged-envs
-         :stdout-events (or (:stdout-events res) [])}))))
+      (if (:bitecho.subnet/unified? instance)
+        (let [now-ms (long (or (:now-ms cmd-map) 0))
+              res (core-subnet/reduce-subnet instance cmd-map)
+              handled (handle-multiplexed-anchor-effects (assoc-in mux [:subnets sub-id] (:state res))
+                                                         (or (:effects res) [])
+                                                         now-ms)]
+          {:mux (:mux handled)
+           :response (if (:applied? res)
+                       {"ok" true "subnet" sub-id}
+                       {"ok" false "error" (str (:error res)) "subnet" sub-id})
+           :effects (:effs handled)
+           :net-envelopes []
+           :stdout-events []})
+        (let [res (handle-command instance cmd-map privkey-bytes)
+              tagged-envs (mapv (fn [e]
+                                  (cond-> e
+                                    (or (nil? (:subnet-id e)) (= (:subnet-id e) "global"))
+                                    (assoc :subnet-id sub-id)))
+                                (or (:net-envelopes res) []))
+              new-mux (assoc-in mux [:subnets sub-id] (:state res))]
+          {:mux new-mux
+           :response (:response res)
+           :net-envelopes tagged-envs
+           :stdout-events (or (:stdout-events res) [])})))))
 
 ;; -----------------------------------------------------------------------------
 ;; Authority-Signed Bootstrap & Domain Discovery (Milestone 12 - Step 12B)

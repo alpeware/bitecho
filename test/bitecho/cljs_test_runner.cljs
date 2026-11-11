@@ -3,6 +3,7 @@
   (:require [bitecho.anchor-webauthn-test]
             [bitecho.basalt.core-test]
             [bitecho.contagion.core-test]
+            [bitecho.core.anchoring-test]
             [bitecho.core.data-test]
             [bitecho.core.protocol-test]
             [bitecho.core.subnet-test]
@@ -51,6 +52,7 @@
              'bitecho.state-machine-portability-test
              'bitecho.wire-negotiation-test
              'bitecho.fractal-federation-test
+             'bitecho.core.anchoring-test
              'bitecho.core.data-test
              'bitecho.core.protocol-test
              'bitecho.core.subnet-test))

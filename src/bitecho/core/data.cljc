@@ -654,6 +654,43 @@
           {:ok? true}
           {:ok? false :error :invalid-home-set-proof})
 
+        :anchor
+        (let [child-sid (:child-subnet proof)
+              m-root (normalize-hex (:merkle-root proof))
+              child-ep (:child-epoch proof)
+              path (str (:pointer/path pointer))
+              expected-path (str "anchor/" child-sid)]
+          (cond
+            (or (not (str/starts-with? path "anchor/"))
+                (nil? child-sid)
+                (not= path expected-path))
+            {:ok? false :error :invalid-anchor-path}
+
+            (or (nil? m-root)
+                (not (re-matches #"[0-9a-f]{64}" m-root))
+                (not (integer? child-ep))
+                (neg? (long child-ep)))
+            {:ok? false :error :malformed-anchor-proof}
+
+            :else
+            (let [blob-entry (when (and target (:blobs ctx))
+                               (get-in (:blobs ctx) [:entries target]))
+                  blob-bs (when blob-entry (:bytes blob-entry))]
+              (if-not (bytes? blob-bs)
+                {:ok? true}
+                (let [decoded (try (fressian/decode-wire blob-bs)
+                                   (catch #?(:clj Exception :cljs :default) _ nil))]
+                  (if-not (and (map? decoded)
+                               (= :subnet-state-root (:bitecho/type decoded))
+                               (= (str child-sid) (str (:child-subnet decoded)))
+                               (= (str (:pointer/subnet pointer)) (str (:parent-subnet decoded)))
+                               (= m-root (normalize-hex (:merkle-root decoded)))
+                               (= (long child-ep) (long (:child-epoch decoded -1)))
+                               (= (long (:pointer/seq pointer)) (long (:anchor-seq decoded -1)))
+                               (= (normalize-hex (:prev-anchor-cid proof)) (normalize-hex (:prev-anchor-cid decoded))))
+                    {:ok? false :error :anchor-blob-mismatch}
+                    {:ok? true}))))))
+
         {:ok? false :error :unknown-proof-type}))))
 
 (defn pointer-skew-tolerance-ms
@@ -787,10 +824,191 @@
   ([state subnet path]
    (resolve-pointer state subnet path nil))
   ([state subnet path now-ms]
-   (let [ptr (get-in state [:pointers [(str subnet) (str path)]])]
+   (let [data-st (or (:data state) state)
+         ptr (get-in data-st [:pointers [(str subnet) (str path)]])]
      (when (and ptr (some? (:pointer/target ptr)))
        (let [exp (:pointer/expires ptr)
              skew (pointer-skew-tolerance-ms ptr nil)]
          (if (and (some? exp) (some? now-ms) (>= (long now-ms) (+ (long exp) skew)))
            nil
            ptr))))))
+
+;; =============================================================================
+;; 3. Binary Merkle Tree & Inclusion Proofs (Milestone 12 / RFC 6962)
+;; =============================================================================
+
+(defn- prefix-bytes
+  "Prepends a single byte `b` to byte sequence `bs` portably across JVM and JS."
+  [b bs]
+  #?(:clj (let [out (byte-array (inc (alength ^bytes bs)))]
+            (aset out 0 (byte b))
+            (System/arraycopy bs 0 out 1 (alength ^bytes bs))
+            out)
+     :cljs (let [out (js/Uint8Array. (inc (.-length bs)))]
+             (.set out (js/Uint8Array. #js [(byte b)]) 0)
+             (.set out (js/Uint8Array. bs) 1)
+             out)))
+
+(defn active-subnet-pointers
+  "Returns all active (non-tombstoned, non-expired at `now-ms`) Pointers for `subnet-id`
+   in `state`, sorted deterministically by `[(str (:pointer/subnet ptr)) (str (:pointer/path ptr)) (str (:pointer/target ptr))]`."
+  ([state subnet-id]
+   (active-subnet-pointers state subnet-id nil))
+  ([state subnet-id now-ms]
+   (let [inst (or (:instance state) state)
+         data-st (or (:data inst) inst)
+         sid (str subnet-id)]
+     (->> (:pointers data-st)
+          (keep (fn [[[s p] _ptr]]
+                  (when (= (str s) sid)
+                    (resolve-pointer data-st sid p now-ms))))
+          (sort-by (fn [ptr]
+                     [(str (:pointer/subnet ptr))
+                      (str (:pointer/path ptr))
+                      (str (:pointer/target ptr))]))
+          vec))))
+
+(defn merkle-leaf-hash
+  "Computes RFC 6962 leaf hash (0x00 prefix) for a Pointer:
+   `sha256(0x00 || fressian([\"bitecho-merkle-leaf-v1\" (canonical-pointer-map ptr) sig]))`."
+  [pointer]
+  (let [canon (canonical-pointer-map pointer)
+        sig (normalize-hex (:pointer/sig pointer))
+        encoded (fressian/encode-canonical ["bitecho-merkle-leaf-v1" canon sig])
+        prefixed (prefix-bytes 0 encoded)]
+    (compute-cid prefixed)))
+
+(defn merkle-branch-hash
+  "Computes RFC 6962 branch hash (0x01 prefix) for two sibling hashes:
+   `sha256(0x01 || fressian([\"bitecho-merkle-branch-v1\" left right]))`."
+  [left-hash right-hash]
+  (let [l (normalize-hex left-hash)
+        r (normalize-hex right-hash)
+        encoded (fressian/encode-canonical ["bitecho-merkle-branch-v1" l r])
+        prefixed (prefix-bytes 1 encoded)]
+    (compute-cid prefixed)))
+
+(defn merkle-empty-root
+  "Computes deterministic empty-tree root hash for a subnet."
+  [subnet-id]
+  (compute-cid (fressian/encode-canonical ["bitecho-merkle-empty-v1" (str subnet-id)])))
+
+(defn compute-merkle-root
+  "Computes the deterministic binary Merkle root hash over active Pointers for `subnet-id`."
+  ([state subnet-id]
+   (compute-merkle-root state subnet-id nil))
+  ([state subnet-id now-ms]
+   (let [leaves (mapv merkle-leaf-hash (active-subnet-pointers state subnet-id now-ms))]
+     (if (empty? leaves)
+       (merkle-empty-root subnet-id)
+       (loop [level leaves]
+         (if (= 1 (count level))
+           (first level)
+           (recur (mapv (fn [pair]
+                          (if (= 2 (count pair))
+                            (merkle-branch-hash (first pair) (second pair))
+                            (first pair)))
+                        (partition-all 2 level)))))))))
+
+(defn generate-merkle-proof
+  "Generates an RFC 6962 Merkle inclusion proof for the active Pointer at `(subnet-id, path)`."
+  ([state subnet-id path]
+   (generate-merkle-proof state subnet-id path nil))
+  ([state subnet-id path now-ms]
+   (let [active (active-subnet-pointers state subnet-id now-ms)
+         target-path (str path)
+         target-idx (first (keep-indexed (fn [i ptr]
+                                           (when (= (str (:pointer/path ptr)) target-path)
+                                             i))
+                                         active))]
+     (when (some? target-idx)
+       (let [ptr (nth active target-idx)
+             leaves (mapv merkle-leaf-hash active)
+             root (compute-merkle-root state subnet-id now-ms)]
+         (loop [level leaves
+                idx target-idx
+                steps []]
+           (if (= 1 (count level))
+             {:proof/version "bitecho-merkle-proof-v1"
+              :subnet-id (str subnet-id)
+              :path target-path
+              :pointer ptr
+              :leaf-hash (merkle-leaf-hash ptr)
+              :leaf-index target-idx
+              :leaf-count (count active)
+              :steps steps
+              :root root}
+             (let [next-step (if (even? idx)
+                               (when (< (inc idx) (count level))
+                                 {:position :right :hash (nth level (inc idx))})
+                               {:position :left :hash (nth level (dec idx))})
+                   next-level (mapv (fn [pair]
+                                      (if (= 2 (count pair))
+                                        (merkle-branch-hash (first pair) (second pair))
+                                        (first pair)))
+                                    (partition-all 2 level))
+                   next-idx (quot idx 2)
+                   new-steps (cond-> steps next-step (conj next-step))]
+               (recur next-level next-idx new-steps)))))))))
+
+(defn verify-merkle-proof
+  "Purely verifies an RFC 6962 binary Merkle inclusion proof against optional `expected-root`."
+  ([proof]
+   (verify-merkle-proof proof nil))
+  ([proof expected-root]
+   (if-not (and (map? proof)
+                (= "bitecho-merkle-proof-v1" (:proof/version proof))
+                (map? (:pointer proof))
+                (string? (:subnet-id proof))
+                (string? (:path proof))
+                (= (str (:pointer/subnet (:pointer proof))) (:subnet-id proof))
+                (= (str (:pointer/path (:pointer proof))) (:path proof))
+                (integer? (:leaf-index proof))
+                (integer? (:leaf-count proof))
+                (<= 0 (:leaf-index proof))
+                (< (:leaf-index proof) (:leaf-count proof))
+                (string? (:root proof))
+                (re-matches #"[0-9a-f]{64}" (normalize-hex (:root proof)))
+                (sequential? (:steps proof)))
+     {:ok? false :error :malformed-merkle-proof}
+     (let [ptr (:pointer proof)
+           auth (:pointer/authority ptr)
+           sig (:pointer/sig ptr)
+           canon (canonical-pointer-map ptr)
+           payload (canonical-pointer-signing-payload canon)]
+       (if-not (and (string? auth) (string? sig) (crypto/verify-with-fallback auth payload sig))
+         {:ok? false :error :invalid-pointer-signature}
+         (let [actual-leaf (merkle-leaf-hash ptr)
+               proof-leaf (normalize-hex (:leaf-hash proof))]
+           (if-not (= actual-leaf proof-leaf)
+             {:ok? false :error :leaf-hash-mismatch}
+             (let [fold-res
+                   (reduce (fn [acc step]
+                             (if-not (:ok? acc)
+                               (reduced acc)
+                               (let [h (normalize-hex (:hash step))
+                                     pos (:position step)]
+                                 (if-not (and h (re-matches #"[0-9a-f]{64}" h) (contains? #{:left :right} pos))
+                                   (reduced {:ok? false :error :invalid-merkle-step})
+                                   (let [curr (:hash acc)
+                                         nxt (if (= pos :left)
+                                               (merkle-branch-hash h curr)
+                                               (merkle-branch-hash curr h))]
+                                     {:ok? true :hash nxt})))))
+                           {:ok? true :hash actual-leaf}
+                           (:steps proof))]
+               (if-not (:ok? fold-res)
+                 fold-res
+                 (let [computed-root (:hash fold-res)
+                       proof-root (normalize-hex (:root proof))]
+                   (cond
+                     (not= computed-root proof-root)
+                     {:ok? false :error :root-mismatch :computed-root computed-root}
+
+                     (and (some? expected-root)
+                          (not= computed-root (normalize-hex expected-root)))
+                     {:ok? false :error :expected-root-mismatch :computed-root computed-root}
+
+                     :else
+                     {:ok? true :root computed-root :pointer ptr})))))))))))
+

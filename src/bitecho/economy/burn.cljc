@@ -21,6 +21,32 @@
   "Backward-compatible alias for min-signaling-burn."
   min-signaling-burn)
 
+(defn- pos-long
+  [x]
+  (when (and (number? x) (pos? (long x)))
+    (long x)))
+
+(defn effective-signaling-burn-floor
+  "Computes the effective signaling burn floor for a validator or light-node state map.
+   Returns 0 when economy is disabled (`:economy-enabled? false`).
+   Otherwise returns the first positive (`pos?`) value among `:min-signaling-burn` and `:burn-floor`
+   in `[:config ...]`, top-level `state`, or `[:bootstrap ...]`, defaulting to `min-signaling-burn` (100)."
+  [state]
+  (let [econ? (boolean (if (and (map? (:config state)) (contains? (:config state) :economy-enabled?))
+                         (get-in state [:config :economy-enabled?])
+                         (if (contains? state :economy-enabled?)
+                           (:economy-enabled? state)
+                           (get-in state [:bootstrap :economy-enabled?] true))))]
+    (if-not econ?
+      0
+      (long (or (pos-long (get-in state [:config :min-signaling-burn]))
+                (pos-long (:min-signaling-burn state))
+                (pos-long (get-in state [:bootstrap :min-signaling-burn]))
+                (pos-long (get-in state [:config :burn-floor]))
+                (pos-long (:burn-floor state))
+                (pos-long (get-in state [:bootstrap :burn-floor]))
+                min-signaling-burn)))))
+
 (defn- deduct-account-burn
   [account-state burn-amount]
   (when (and (map? account-state)

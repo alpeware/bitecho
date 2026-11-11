@@ -906,13 +906,7 @@
    Returns {:state updated-state :burn-amount burn-amt} or nil if deduction failed or burn invalid."
   [state event current-epoch]
   (let [econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
-        floor (if-not econ-enabled?
-                0
-                (long (or (get-in state [:config :min-signaling-burn])
-                          (get state :min-signaling-burn)
-                          (get-in state [:config :burn-floor])
-                          (get state :burn-floor)
-                          burn/min-signaling-burn)))
+        floor (burn/effective-signaling-burn-floor state)
         burn-spec (if (contains? event :burn)
                     (:burn event)
                     (:signaling-burn event))
@@ -939,13 +933,7 @@
   [state event]
   (let [current-epoch (or (:epoch state) 0)
         econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
-        floor (if-not econ-enabled?
-                0
-                (long (or (get-in state [:config :min-signaling-burn])
-                          (get state :min-signaling-burn)
-                          (get-in state [:config :burn-floor])
-                          (get state :burn-floor)
-                          burn/min-signaling-burn)))
+        floor (burn/effective-signaling-burn-floor state)
         burn-spec (if (contains? event :burn) (:burn event) (:signaling-burn event))
         burn-amt (cond
                    (number? burn-spec) (when (>= burn-spec floor) burn-spec)
@@ -1209,13 +1197,7 @@
         rng (:rng event)
         burn-amt (:burn-amount message)
         econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
-        floor (if-not econ-enabled?
-                0
-                (long (or (get-in state [:config :min-signaling-burn])
-                          (get state :min-signaling-burn)
-                          (get-in state [:config :burn-floor])
-                          (get state :burn-floor)
-                          burn/min-signaling-burn)))
+        floor (burn/effective-signaling-burn-floor state)
         valid-burn? (and (number? burn-amt) (>= burn-amt floor))
         valid-signature? (when (and valid-burn? message) (sieve/validate-message message))]
     (if (and (some? msg-id) valid-burn? valid-signature?)
@@ -1951,13 +1933,7 @@
    and incrementing the epoch's burn accumulator."
   [state event]
   (let [econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
-        floor (if-not econ-enabled?
-                0
-                (long (or (get-in state [:config :min-signaling-burn])
-                          (get state :min-signaling-burn)
-                          (get-in state [:config :burn-floor])
-                          (get state :burn-floor)
-                          burn/min-signaling-burn)))
+        floor (burn/effective-signaling-burn-floor state)
         sender (:sender event)
         sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))
         burn-amt (or (:burn event) (:burn-amount event) floor)]

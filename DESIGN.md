@@ -599,20 +599,22 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
      - `verify-federated-domain-bootstrap`: Validates that a domain descriptor was signed by the expected authority pubkey and has not expired.
    - **Federated Rendezvous & Inter-Subnet Relay**: Subnet coordinators broadcast signed rendezvous advertisements (`build-subnet-advertisement`, `parse-subnet-advertisement`) carrying `:subnet-id`, `:topic`, supported crypto suites, and wire formats, allowing peers to discover and route across domain boundaries.
 
-3. **Cross-Subnet Rollup & State-Root Settlement Anchoring Specification (Milestone 12B Spec-Only)**:
-   - **Subnet State Roots**: Each child subnet periodically computes a cryptographic state root $R_{t} = \text{MerkleRoot}(\mathcal{S}_t)$ over its finalized local ledger and state machine state at epoch $t$.
-   - **Rollup Commitment Tuples**: The rollup commitment posted by the subnet coordinator to the parent/settlement chain is defined as:
-     $$\mathcal{C} = \langle \text{"bitecho-subnet-rollup-v1"}, \text{subnet-id}, \text{parent-epoch}, \text{child-epoch}, R_{t}, \text{prev-rollup-hash}, \text{batch-receipts-hash}, \text{withdrawal-merkle-root} \rangle$$
-   - **Settlement Chain Invariants**:
-     - **Monotonicity**: Successive rollups for a subnet must strictly advance `child-epoch` ($t_{i+1} > t_i$).
-     - **Predecessor Continuity**: Each rollup must hash-chain to the previous rollup commitment ($\text{prev-rollup-hash} = H(\mathcal{C}_{i-1})$).
-     - **Multi-Quorum Certification**: In consensus subnets, the rollup commitment must be signed by at least $2f+1$ notarized validator votes or the authoritative coordinator key.
-   - **Cross-Subnet Withdrawals & Asset Transfers**:
-     - **Two-Phase Lock and Mint / Burn and Release**: To transfer value or state between subnets, the source subnet executes an intent lock/burn producing a cryptographic receipt $\mathcal{R}_{\text{xfer}}$.
-     - **Inclusion Proofs**: The receipt $\mathcal{R}_{\text{xfer}}$ is anchored in the source subnet's `withdrawal-merkle-root`.
-     - **Settlement Verification**: The destination subnet verifies the Merkle inclusion proof against the source subnet's finalized state root anchored on the global/parent settlement chain before minting or unlocking funds.
-   - **Fraud & Validity Windows**:
-     - Spec-only protocol parameter defines a challenge window $\Delta_{\text{challenge}}$ (default: 3 epochs) during which dispute proofs or state inconsistencies can be challenged before final state withdrawal execution.
+3. **Child-Subnet Merkle State-Root Pointer Anchoring into Parent Subnets (`Milestone 12`)**:
+   - **Deterministic RFC 6962 Binary Merkle Trees (`bitecho.core.data`)**:
+     - Active Pointers for a subnet (non-tombstoned, non-expired) are deterministically resolved and sorted by `[subnet path target]`.
+     - Leaf hashes use RFC 6962 domain separation with `0x00` prefix: `sha256(0x00 || fressian(["bitecho-merkle-leaf-v1" canonical-pointer sig]))`.
+     - Branch hashes use RFC 6962 domain separation with `0x01` prefix: `sha256(0x01 || fressian(["bitecho-merkle-branch-v1" left right]))`.
+     - Odd-leaf levels promote the unbalanced trailing node without duplicate hashing, producing a deterministic 64-hex lowercase SHA-256 root (`merkle-empty-root` when no active pointers exist).
+   - **Cryptographic Inclusion Proofs (`generate-merkle-proof` / `verify-merkle-proof`)**:
+     - Proves presence of any active Pointer within a child subnet state root without revealing unselected sibling leaves.
+     - Steps encode `{:hash <hex> :position (:left | :right)}`; verification folds sibling hashes upward under domain separation, matching the anchored Merkle root.
+   - **Child State-Root Blobs & Parent Anchoring Pointers (`bitecho.core.subnet`)**:
+     - State-root payload: `{:bitecho/type :subnet-state-root :child-subnet ... :parent-subnet ... :child-epoch ... :anchor-seq ... :merkle-root ... :prev-anchor-cid ...}` encoded in Canonical Fressian `Blob`.
+     - Signed `Pointer` recorded in parent subnet at path `"anchor/<child-subnet-id>"` with `:pointer/proof {:proof/type :anchor ...}` (or `:quorum` for multi-signer subnets).
+     - **Non-Circular Verification (`verify-subnet-anchor`)**: Parent verifies CID integrity, proof structure, strict epoch advancement ($t_{i+1} > t_i$), and predecessor hash-chain continuity (`:prev-anchor-cid == prev-anchor-blob-cid`).
+   - **Multi-Subnet Multiplexer Automatic Anchor Propagation (`bitecho.light-node.core`)**:
+     - Child subnets configured with `:on-change` or `:epoch` anchoring emit pure `{:effect :anchor-to-parent}` effects on state transitions.
+     - Multiplexer intercepts anchor effects and feeds `:put-blob` followed by `:publish-pointer` directly into parent subnet instances hosted on the same node.
 
 
 

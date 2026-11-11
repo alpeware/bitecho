@@ -1804,8 +1804,6 @@
                                                             "error" "p2p-dial-failed"}
                                                            privkey-bytes)]
                     (reset! state-atom (:state cmd-res))
-                    (when state-atom
-                      (swap! state-atom update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
                     (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))
                   (doseq [cand parsed-candidates
                           :while (not @success?)]
@@ -1914,7 +1912,7 @@
                           (api/start! client-node remote-sdp callbacks))
                         (js/setTimeout
                          (fn []
-                           (when-not @success?
+                           (when (and (not @success?) (not (get-in @state-atom [:sessions sid :p2p :connected?])))
                              (let [cmd-res (light-core/handle-command @state-atom
                                                                       {"cmd" "p2p-channel-state"
                                                                        "session_id" sid
@@ -1922,8 +1920,6 @@
                                                                        "error" "p2p-dial-failed"}
                                                                       privkey-bytes)]
                                (reset! state-atom (:state cmd-res))
-                               (when state-atom
-                                 (swap! state-atom update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
                                (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))
                          3000))
                       (catch :default _ nil))))))]

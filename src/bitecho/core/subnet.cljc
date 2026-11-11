@@ -10,12 +10,15 @@
    - Provides thin Pointer/Blob adapters for Directory descriptors, Bootstrap descriptors, DACs,
      and Home-Set registrations over `bitecho.core.data`.
    100% pure `.cljc` portable across Clojure (JVM) and ClojureScript (Node/Browser)."
+  (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.data :as data]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
             [clojure.string :as str]))
+
+(def ^:private bytes? fressian/bytes?)
 
 (defn- normalize-hex
   [s]
@@ -341,9 +344,15 @@
                      :admitted-members anchors
                      :leader-election le-state
                      :burned-ech 0
+                     :anchoring-creds (or (:anchoring-creds opts) (:subnet/anchoring policy))
+                     :anchoring-state {:last-anchor-seq 0
+                                       :last-child-epoch 0
+                                       :last-anchor-cid nil
+                                       :last-merkle-root nil}
                      :diagnostics {:gate-rejected 0
                                    :insufficient-burn 0
-                                   :policy-rejected 0}}})))))
+                                   :policy-rejected 0
+                                   :anchor-rejected 0}}})))))
 
 (defn- pointer-verify-ctx
   [instance admitted-member now-ms]
@@ -367,12 +376,146 @@
       (get-in policy [:subnet/gate :gate/allowed-dac-capabilities])
       (assoc :allowed-dac-capabilities (get-in policy [:subnet/gate :gate/allowed-dac-capabilities])))))
 
+;; =============================================================================
+;; 3. Child State-Root Anchoring (Milestone 12 / UNIFICATION.md §§4-6)
+;; =============================================================================
+
+(defn build-subnet-anchor
+  "Builds a child subnet's Merkle state-root `Blob` and signed parent `Pointer`
+   at `\"anchor/<child-subnet-id>\"` (UNIFICATION.md §§4-6, DESIGN.md §T.3).
+   Supports single-authority (`:authority-privkey` + `:authority-pubkey`) or
+   k-of-n quorum (`:quorum-signers` vector of `{:pubkey :privkey}`).
+   Returns `{:blob state-root-blob :pointer parent-pointer :state-root state-root-map :merkle-root root}`."
+  [child-instance {:keys [authority-privkey authority-pubkey quorum-signers
+                          parent-subnet child-epoch parent-epoch anchor-seq prev-anchor-cid now-ms]}]
+  (let [child-instance (or (:instance child-instance) child-instance)
+        child-sid (str (or (:subnet-id child-instance) (get-in child-instance [:policy :subnet/id])))
+        p-sid (str (or parent-subnet (get-in child-instance [:policy :subnet/parent-id]) "global"))
+        root (data/compute-merkle-root child-instance child-sid now-ms)
+        last-anc (or (:anchoring-state child-instance) {})
+        c-epoch (long (or child-epoch (when (pos? (long (or (:last-child-epoch last-anc) 0))) (:last-child-epoch last-anc)) 1))
+        p-epoch (when parent-epoch (long parent-epoch))
+        a-seq (long (or anchor-seq (inc (long (or (:last-anchor-seq last-anc) 0)))))
+        prev-cid (when-let [p (or prev-anchor-cid (:last-anchor-cid last-anc))]
+                   (normalize-hex p))
+        state-root-map (cond-> {:bitecho/type :subnet-state-root
+                                :type :subnet-state-root
+                                :child-subnet child-sid
+                                :parent-subnet p-sid
+                                :child-epoch c-epoch
+                                :anchor-seq a-seq
+                                :merkle-root root
+                                :prev-anchor-cid prev-cid
+                                :active-pointer-count (count (data/active-subnet-pointers child-instance child-sid now-ms))}
+                         p-epoch (assoc :parent-epoch p-epoch))
+        blob-bytes (fressian/encode-canonical state-root-map)
+        blob (data/make-blob blob-bytes "application/fressian")
+        target-cid (:blob/cid blob)
+        anchor-path (str "anchor/" child-sid)]
+    (if (seq quorum-signers)
+      (let [q-proof (data/create-quorum-proof quorum-signers p-sid anchor-path a-seq target-cid)
+            auth-priv (or authority-privkey (:privkey (first quorum-signers)))
+            auth-pub (or authority-pubkey (:pubkey (first quorum-signers)))
+            raw-ptr {:pointer/authority (normalize-hex auth-pub)
+                     :pointer/subnet p-sid
+                     :pointer/path anchor-path
+                     :pointer/seq a-seq
+                     :pointer/target target-cid
+                     :pointer/proof q-proof}
+            pointer (data/sign-pointer auth-priv raw-ptr)]
+        {:blob blob
+         :pointer pointer
+         :state-root state-root-map
+         :merkle-root root})
+      (let [auth-pub (normalize-hex (or authority-pubkey
+                                        (when (map? authority-privkey)
+                                          (basalt/bytes->hex (:public authority-privkey)))))
+            priv (if (map? authority-privkey) (:private authority-privkey) authority-privkey)
+            proof {:proof/type :anchor
+                   :child-subnet child-sid
+                   :merkle-root root
+                   :child-epoch c-epoch
+                   :prev-anchor-cid prev-cid}
+            raw-ptr {:pointer/authority auth-pub
+                     :pointer/subnet p-sid
+                     :pointer/path anchor-path
+                     :pointer/seq a-seq
+                     :pointer/target target-cid
+                     :pointer/proof proof}
+            pointer (data/sign-pointer priv raw-ptr)]
+        {:blob blob
+         :pointer pointer
+         :state-root state-root-map
+         :merkle-root root}))))
+
+(defn verify-subnet-anchor
+  "Non-circular parent-side verification of a child subnet's anchor `Blob` + `Pointer`:
+   1. Verifies `blob` CID integrity (`compute-cid == :blob/cid == :pointer/target`).
+   2. Verifies `pointer` signature, path `\"anchor/<child-subnet-id>\"`, and proof (`:anchor` or `:quorum`) against `parent-ctx`.
+   3. Decodes `blob` and verifies `:child-epoch` freshness (`> prev-child-epoch` from parent's stored latest anchor)
+      and `:prev-anchor-cid` hash-chain continuity."
+  ([pointer blob parent-ctx]
+   (verify-subnet-anchor pointer blob parent-ctx nil))
+  ([pointer blob parent-ctx prev-anchor-entry]
+   (let [target (normalize-hex (:pointer/target pointer))
+         blob-cid (when (map? blob) (normalize-hex (:blob/cid blob)))
+         blob-bs (when (map? blob) (or (:bytes blob) (:blob/bytes blob)))]
+     (cond
+       (or (nil? target) (nil? blob-cid) (not (bytes? blob-bs))
+           (not= target blob-cid)
+           (not= (data/compute-cid blob-bs) blob-cid))
+       {:ok? false :error :invalid-blob-cid}
+
+       :else
+       (let [path (str (:pointer/path pointer))]
+         (if-not (str/starts-with? path "anchor/")
+           {:ok? false :error :invalid-anchor-path}
+           (let [blob-entry (assoc blob :bytes blob-bs :cid target :media-type (or (:media-type blob) (:blob/media-type blob) "application/fressian"))
+                 blobs-ctx (assoc-in (or (:blobs parent-ctx) {}) [:entries target] blob-entry)
+                 ctx-with-blob (assoc parent-ctx :blobs blobs-ctx)
+                 v-ptr (data/verify-pointer pointer ctx-with-blob)]
+             (if-not (:ok? v-ptr)
+               v-ptr
+               (let [child-sid (subs path (count "anchor/"))
+                     decoded (try (fressian/decode-wire blob-bs) (catch #?(:clj Exception :cljs :default) _ nil))]
+                 (if-not (and (map? decoded)
+                              (= :subnet-state-root (:bitecho/type decoded))
+                              (= child-sid (str (:child-subnet decoded)))
+                              (= (str (:pointer/subnet pointer)) (str (:parent-subnet decoded))))
+                   {:ok? false :error :invalid-state-root-blob}
+                   (let [prev-blob (when prev-anchor-entry (or (:blob prev-anchor-entry) (:state-root prev-anchor-entry)))
+                         prev-epoch (when prev-blob (long (or (:child-epoch prev-blob) -1)))
+                         curr-epoch (long (or (:child-epoch decoded) -1))
+                         prev-cid (when prev-anchor-entry
+                                    (normalize-hex (or (:blob/cid prev-blob)
+                                                       (get-in prev-anchor-entry [:pointer :pointer/target])
+                                                       (:target prev-anchor-entry))))
+                         curr-prev-cid (when-let [p (:prev-anchor-cid decoded)] (normalize-hex p))]
+                     (cond
+                       (and (some? prev-epoch) (<= curr-epoch prev-epoch))
+                       {:ok? false :error :anchor-epoch-regression :current curr-epoch :previous prev-epoch}
+
+                       (and (some? prev-cid) (not= curr-prev-cid prev-cid))
+                       {:ok? false :error :anchor-predecessor-mismatch :expected prev-cid :actual curr-prev-cid}
+
+                       (and (nil? prev-anchor-entry) (some? curr-prev-cid) (= 1 (long (:pointer/seq pointer))))
+                       {:ok? false :error :anchor-predecessor-mismatch :expected nil :actual curr-prev-cid}
+
+                       :else
+                       {:ok? true
+                        :child-subnet child-sid
+                        :merkle-root (:merkle-root decoded)
+                        :child-epoch curr-epoch
+                        :anchor-seq (long (:anchor-seq decoded 0))
+                        :state-root decoded}))))))))))))
+
 (defn reduce-subnet
   "Pure Sans-IO unified Subnet reducer (`Gate -> Economy -> Replication`):
    Accepts an initialized `instance` (or `[policy state]`) and `event`, returning
    `{:state updated-instance :applied? boolean :effects [...]}`."
   [instance event]
-  (let [now-ms (long (or (:now-ms event) 0))
+  (let [instance (or (:instance instance) instance)
+        now-ms (long (or (:now-ms event) 0))
         etype (:type event)
         policy (:policy instance)
         sid (:subnet/id policy)]
@@ -447,73 +590,197 @@
                   (let [ptr (:pointer event)
                         ptype (get-in ptr [:pointer/proof :proof/type])
                         target-cid (:pointer/target ptr)
+                        path (str (:pointer/path ptr))
+                        is-anchor-path? (str/starts-with? path "anchor/")
                         requires-target-blob? (and (some? target-cid)
-                                                   (contains? #{:cert :acme-key-auth :dac} ptype))
+                                                   (or is-anchor-path?
+                                                       (= :anchor ptype)
+                                                       (contains? #{:cert :acme-key-auth :dac} ptype)))
                         pre-blob-read (when requires-target-blob?
                                         (data/get-blob (get-in inst1 [:data :blobs])
                                                        target-cid
                                                        {:subnet sid :now-ms now-ms}))]
                     (if (and requires-target-blob? (not (:hit? pre-blob-read)))
-                      {:state (assoc-in inst1 [:data :blobs] (:store pre-blob-read))
-                       :applied? false
-                       :error :missing-target-blob
-                       :effects (:effects pre-blob-read)}
+                      (let [diag (if is-anchor-path?
+                                   {:effect :diagnose :reason :missing-anchor-blob :subnet sid :target target-cid}
+                                   {:effect :diagnose :reason :missing-target-blob :subnet sid :target target-cid})]
+                        {:state (cond-> (assoc-in inst1 [:data :blobs] (:store pre-blob-read))
+                                  is-anchor-path? (update-in [:diagnostics :anchor-rejected] (fnil inc 0)))
+                         :applied? false
+                         :error :missing-target-blob
+                         :effects (conj (vec (:effects pre-blob-read)) diag)})
                       (let [ctx (pointer-verify-ctx inst1 admitted-member now-ms)
-                            res (data/apply-pointer (:data inst1) ptr ctx)]
-                        (if-not (:applied? res)
-                          {:state (assoc inst1 :data (:state res))
-                           :applied? false
-                           :error (:error res)
-                           :effects (:effects res)}
-                          (let [valid-ptr (:pointer res)
-                                is-policy-path? (= "subnet/policy" (:pointer/path valid-ptr))
-                                inst2 (assoc inst1 :data (:state res))]
-                            (if-not is-policy-path?
-                              (let [ptr-rep (get-in policy [:subnet/replication :replication/pointers])
-                                    rep-eff {:effect :replicate-pointer
-                                             :engine ptr-rep
-                                             :subnet sid
-                                             :pointer valid-ptr}]
-                                {:state inst2
-                                 :applied? true
-                                 :effects (conj (vec (:effects res)) rep-eff)})
-                              ;; "subnet/policy" cannot be tombstoned and must have its target Blob present & valid BEFORE recording Pointer!
-                              (if (nil? (:pointer/target valid-ptr))
-                                (let [diag {:effect :diagnose :reason :invalid-policy-update :subnet sid}]
-                                  {:state (update-in inst1 [:diagnostics :policy-rejected] (fnil inc 0))
-                                   :applied? false
-                                   :error :invalid-policy-update
-                                   :effects [diag]})
-                                (let [blob-read (data/get-blob (get-in inst1 [:data :blobs])
-                                                               (:pointer/target valid-ptr)
-                                                               {:subnet sid :now-ms now-ms})]
-                                  (if-not (:hit? blob-read)
-                                    {:state (assoc-in inst1 [:data :blobs] (:store blob-read))
-                                     :applied? false
-                                     :error :missing-policy-blob
-                                     :effects (:effects blob-read)}
-                                    (let [decoded (try (fressian/decode-wire (get-in blob-read [:blob :blob/bytes]))
-                                                       (catch #?(:clj Exception :cljs :default) _ nil))
-                                          merged-pol (when (map? decoded)
-                                                       (cond-> decoded
-                                                         (:subnet/genesis-policy-cid policy)
-                                                         (dissoc :subnet/genesis-policy-cid)))
-                                          v-pol (validate-subnet-policy merged-pol)]
-                                      (if-not (and (:ok? v-pol) (= sid (:subnet/id merged-pol)))
-                                        (let [diag {:effect :diagnose :reason :invalid-policy-update :subnet sid}]
-                                          {:state (update-in inst1 [:diagnostics :policy-rejected] (fnil inc 0))
-                                           :applied? false
-                                           :error :invalid-policy-update
-                                           :effects [diag]})
-                                        (let [new-anchors (set (map normalize-hex (get-in merged-pol [:subnet/gate :gate/trust-anchors] #{})))
-                                              final-pol (cond-> merged-pol
-                                                          (:subnet/genesis-policy-cid policy)
-                                                          (assoc :subnet/genesis-policy-cid (:subnet/genesis-policy-cid policy)))]
-                                          {:state (-> inst2
-                                                      (assoc :policy final-pol)
-                                                      (update :admitted-members into new-anchors))
-                                           :applied? true
-                                           :effects [{:effect :policy-updated :subnet sid :seq (:pointer/seq valid-ptr)}]}))))))))))))
+                            anchor-v (when is-anchor-path?
+                                       (let [prev-ptr (get-in inst1 [:data :pointers [sid path]])
+                                             prev-target (:pointer/target prev-ptr)
+                                             prev-blob (when prev-target (get-in inst1 [:data :blobs :entries prev-target]))
+                                             prev-decoded (when (:bytes prev-blob)
+                                                            (try (fressian/decode-wire (:bytes prev-blob))
+                                                                 (catch #?(:clj Exception :cljs :default) _ nil)))
+                                             prev-entry (when (or prev-ptr prev-decoded)
+                                                          {:pointer prev-ptr :state-root prev-decoded :target prev-target})]
+                                         (verify-subnet-anchor ptr (:blob pre-blob-read) ctx prev-entry)))]
+                        (if (and is-anchor-path? (not (:ok? anchor-v)))
+                          (let [diag {:effect :diagnose :reason :anchor-rejected :error (:error anchor-v) :subnet sid :pointer ptr}]
+                            {:state (update-in inst1 [:diagnostics :anchor-rejected] (fnil inc 0))
+                             :applied? false
+                             :error (:error anchor-v)
+                             :effects [diag]})
+                          (let [res (data/apply-pointer (:data inst1) ptr ctx)]
+                            (if-not (:applied? res)
+                              {:state (assoc inst1 :data (:state res))
+                               :applied? false
+                               :error (:error res)
+                               :effects (:effects res)}
+                              (let [valid-ptr (:pointer res)
+                                    is-policy-path? (= "subnet/policy" (:pointer/path valid-ptr))
+                                    inst2 (assoc inst1 :data (:state res))]
+                                (if-not is-policy-path?
+                                  (let [ptr-rep (get-in policy [:subnet/replication :replication/pointers])
+                                        rep-eff {:effect :replicate-pointer
+                                                 :engine ptr-rep
+                                                 :subnet sid
+                                                 :pointer valid-ptr}
+                                        anc-cfg (get-in policy [:subnet/anchoring])
+                                        anc-trigger (or (:trigger anc-cfg) (:anchoring/trigger anc-cfg) (:anchoring/cadence anc-cfg))
+                                        creds (or (:anchoring-creds inst2) anc-cfg)
+                                        anchor-effs (if (and (= anc-trigger :on-change)
+                                                             (or (:authority-privkey creds) (:quorum-signers creds)))
+                                                      (let [curr-root (data/compute-merkle-root inst2 sid now-ms)
+                                                            prev-root (get-in inst2 [:anchoring-state :last-merkle-root])]
+                                                        (if (= curr-root prev-root)
+                                                          []
+                                                          (let [parent-sid (or (:parent-subnet creds)
+                                                                               (:anchoring/parent-subnet anc-cfg)
+                                                                               (:subnet/parent-id policy)
+                                                                               "global")
+                                                                next-epoch (inc (long (or (get-in inst2 [:anchoring-state :last-child-epoch]) 0)))
+                                                                anchor (build-subnet-anchor inst2 (merge creds
+                                                                                                         {:parent-subnet parent-sid
+                                                                                                          :child-epoch next-epoch
+                                                                                                          :now-ms now-ms}))]
+                                                            [{:effect :anchor-to-parent
+                                                              :child-subnet sid
+                                                              :parent-subnet parent-sid
+                                                              :blob (:blob anchor)
+                                                              :pointer (:pointer anchor)
+                                                              :state-root (:state-root anchor)}])))
+                                                      [])
+                                        inst3 (if (seq anchor-effs)
+                                                (let [a-eff (first anchor-effs)
+                                                      sr (:state-root a-eff)]
+                                                  (-> inst2
+                                                      (assoc-in [:anchoring-state :last-anchor-seq] (long (:anchor-seq sr)))
+                                                      (assoc-in [:anchoring-state :last-child-epoch] (long (:child-epoch sr)))
+                                                      (assoc-in [:anchoring-state :last-anchor-cid] (get-in a-eff [:blob :blob/cid]))
+                                                      (assoc-in [:anchoring-state :last-merkle-root] (:merkle-root sr))))
+                                                inst2)]
+                                    {:state inst3
+                                     :applied? true
+                                     :effects (into (conj (vec (:effects res)) rep-eff) anchor-effs)})
+                                  ;; "subnet/policy" cannot be tombstoned and must have its target Blob present & valid BEFORE recording Pointer!
+                                  (if (nil? (:pointer/target valid-ptr))
+                                    (let [diag {:effect :diagnose :reason :invalid-policy-update :subnet sid}]
+                                      {:state (update-in inst1 [:diagnostics :policy-rejected] (fnil inc 0))
+                                       :applied? false
+                                       :error :invalid-policy-update
+                                       :effects [diag]})
+                                    (let [blob-read (data/get-blob (get-in inst1 [:data :blobs])
+                                                                   (:pointer/target valid-ptr)
+                                                                   {:subnet sid :now-ms now-ms})]
+                                      (if-not (:hit? blob-read)
+                                        {:state (assoc-in inst1 [:data :blobs] (:store blob-read))
+                                         :applied? false
+                                         :error :missing-policy-blob
+                                         :effects (:effects blob-read)}
+                                        (let [decoded (try (fressian/decode-wire (get-in blob-read [:blob :blob/bytes]))
+                                                           (catch #?(:clj Exception :cljs :default) _ nil))
+                                              merged-pol (when (map? decoded)
+                                                           (cond-> decoded
+                                                             (:subnet/genesis-policy-cid policy)
+                                                             (dissoc :subnet/genesis-policy-cid)))
+                                              v-pol (validate-subnet-policy merged-pol)]
+                                          (if-not (and (:ok? v-pol) (= sid (:subnet/id merged-pol)))
+                                            (let [diag {:effect :diagnose :reason :invalid-policy-update :subnet sid}]
+                                              {:state (update-in inst1 [:diagnostics :policy-rejected] (fnil inc 0))
+                                               :applied? false
+                                               :error :invalid-policy-update
+                                               :effects [diag]})
+                                            (let [new-anchors (set (map normalize-hex (get-in merged-pol [:subnet/gate :gate/trust-anchors] #{})))
+                                                  final-pol (cond-> merged-pol
+                                                              (:subnet/genesis-policy-cid policy)
+                                                              (assoc :subnet/genesis-policy-cid (:subnet/genesis-policy-cid policy)))]
+                                              {:state (-> inst2
+                                                          (assoc :policy final-pol)
+                                                          (update :admitted-members into new-anchors))
+                                               :applied? true
+                                               :effects [{:effect :policy-updated :subnet sid :seq (:pointer/seq valid-ptr)}]}))))))))))))))
+
+                  :anchor-subnet
+                  (let [anc-cfg (get-in policy [:subnet/anchoring])
+                        creds (merge anc-cfg (:anchoring-creds inst1) event)
+                        parent-sid (or (:parent-subnet creds)
+                                       (:anchoring/parent-subnet anc-cfg)
+                                       (:subnet/parent-id policy)
+                                       "global")]
+                    (if-not (or (:authority-privkey creds) (:quorum-signers creds))
+                      (let [diag {:effect :diagnose :reason :missing-anchoring-credentials :subnet sid}]
+                        {:state inst1 :applied? false :error :missing-anchoring-credentials :effects [diag]})
+                      (let [next-epoch (long (or (:child-epoch event)
+                                                 (inc (long (or (get-in inst1 [:anchoring-state :last-child-epoch]) 0)))))
+                            anchor (build-subnet-anchor inst1 (merge creds
+                                                                     {:parent-subnet parent-sid
+                                                                      :child-epoch next-epoch
+                                                                      :now-ms now-ms}))
+                            sr (:state-root anchor)
+                            inst2 (-> inst1
+                                      (assoc-in [:anchoring-state :last-anchor-seq] (long (:anchor-seq sr)))
+                                      (assoc-in [:anchoring-state :last-child-epoch] (long (:child-epoch sr)))
+                                      (assoc-in [:anchoring-state :last-anchor-cid] (:blob/cid (:blob anchor)))
+                                      (assoc-in [:anchoring-state :last-merkle-root] (:merkle-root sr)))
+                            eff {:effect :anchor-to-parent
+                                 :child-subnet sid
+                                 :parent-subnet parent-sid
+                                 :blob (:blob anchor)
+                                 :pointer (:pointer anchor)
+                                 :state-root sr}]
+                        {:state inst2 :applied? true :anchor anchor :effects [eff]})))
+
+                  :epoch-tick
+                  (let [anc-cfg (get-in policy [:subnet/anchoring])
+                        cadence (or (:cadence anc-cfg) (:anchoring/cadence anc-cfg) (:trigger anc-cfg))
+                        creds (merge anc-cfg (:anchoring-creds inst1))]
+                    (if (and (= cadence :epoch) (or (:authority-privkey creds) (:quorum-signers creds)))
+                      (let [interval (long (or (:interval-epochs event) (:interval-epochs anc-cfg) (:anchoring/interval-epochs anc-cfg) 1))
+                            curr-root (data/compute-merkle-root inst1 sid now-ms)
+                            prev-root (get-in inst1 [:anchoring-state :last-merkle-root])
+                            last-ep (long (or (get-in inst1 [:anchoring-state :last-child-epoch]) 0))
+                            next-epoch (long (or (:epoch event) (inc last-ep)))]
+                        (if (and (>= (- next-epoch last-ep) interval)
+                                 (not= curr-root prev-root))
+                          (let [parent-sid (or (:parent-subnet creds)
+                                               (:anchoring/parent-subnet anc-cfg)
+                                               (:subnet/parent-id policy)
+                                               "global")
+                                anchor (build-subnet-anchor inst1 (merge creds
+                                                                         {:parent-subnet parent-sid
+                                                                          :child-epoch next-epoch
+                                                                          :now-ms now-ms}))
+                                sr (:state-root anchor)
+                                inst2 (-> inst1
+                                          (assoc-in [:anchoring-state :last-anchor-seq] (long (:anchor-seq sr)))
+                                          (assoc-in [:anchoring-state :last-child-epoch] (long (:child-epoch sr)))
+                                          (assoc-in [:anchoring-state :last-anchor-cid] (:blob/cid (:blob anchor)))
+                                          (assoc-in [:anchoring-state :last-merkle-root] (:merkle-root sr)))
+                                eff {:effect :anchor-to-parent
+                                     :child-subnet sid
+                                     :parent-subnet parent-sid
+                                     :blob (:blob anchor)
+                                     :pointer (:pointer anchor)
+                                     :state-root sr}]
+                            {:state inst2 :applied? true :anchor anchor :effects [eff]})
+                          {:state inst1 :applied? false :effects []}))
+                      {:state inst1 :applied? false :effects []}))
 
                   (let [diag {:effect :diagnose :reason :unknown-subnet-event :subnet sid :event-type etype}]
                     {:state inst1 :applied? false :error :unknown-subnet-event :effects [diag]}))))))))))
