@@ -702,6 +702,38 @@ EOF_GIT_INDEX
         "${SSH_USER}@${ip}:/var/www/clj-web/public/app/"
     fi
   done
+
+  echo "=== Rolling Pointer Refresh & Verification across ns3, ns2, ns1 ==="
+  for node in ns3 ns2 ns1; do
+    local ip="${NODE_IPS[$node]}"
+    echo "--> Running migrate-infra & rolling restart on ${node} (${ip})..."
+    ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "bash -s" << 'REMOTE_PUBLISH_MIGRATE'
+set -euo pipefail
+sudo -u cljweb java -Xms128m -Xmx512m \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho-infra/bitecho.jar migrate-infra /etc/bitecho-infra/config.edn
+sudo chown -R cljweb:cljweb /var/lib/clj-web
+sudo systemctl restart bitecho-infra.service
+REMOTE_PUBLISH_MIGRATE
+
+    for _ in {1..20}; do
+      if curl -fsS --max-time 2 "http://${ip}:80/healthz" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+    verify_node_health "$node"
+    echo "--> Verifying SKILL.md and --trusted-dac-anchors on ${node} (${ip})..."
+    local skill_content
+    skill_content="$(curl -fsS --max-time 5 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/SKILL.md")"
+    if ! echo "${skill_content}" | grep -q -- "--trusted-dac-anchors"; then
+      echo "FATAL: ${node} SKILL.md missing --trusted-dac-anchors" >&2
+      exit 1
+    fi
+    echo "  [OK] ${node} verified --trusted-dac-anchors in SKILL.md"
+  done
   echo "=== Canonical Git Repositories & Web Docs Published to ns1..ns3 ==="
 }
 

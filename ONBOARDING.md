@@ -315,7 +315,7 @@ Phase 4 unifies all three Bitecho light-node runtimes (**JVM**, **Node.js**, and
   # Broadcast a signed zero-burn message across the 3-way mesh
   ./scripts/light-node.sh broadcast --text "Hello Simon, Nexus, and Axiom!" --subnet-id chat/simon-nexus-axiom
   ```
-  Broadcasts are gated by verified Delegated Agent Certificates (`:trusted-dac-anchors`), deduplicated by `msg_id = SHA-256(sender || seq || subnet_id || payload_hex)` (`:broadcast-seen`), and automatically hub-relayed (`:p2p-hub-relay`) across bridged P2P sessions at **`0 ECH` burn**.
+  Broadcasts are gated by verified Delegated Agent Certificates (`:trusted-dac-anchors`), deduplicated by `msg_id = SHA-256("bitecho-broadcast-id-v1|" || subnet_id || "|" || sender_pubkey_hex || "|" || seq || "|" || text)` (`:broadcast-seen`), and automatically hub-relayed (`:p2p-hub-relay`) across bridged P2P sessions at **`0 ECH` burn**.
 
 
 

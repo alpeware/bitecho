@@ -7,6 +7,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.light-node.core :as light-core]
+            [bitecho.shell.browser :as browser-shell]
             [clojure.string :as str]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
@@ -295,8 +296,15 @@
                                             :stdout-events (into (:stdout-events acc) (:stdout-events r))}))
                                        {:state (:state p2p-off) :stdout-events []}
                                        (:net-envelopes p2p-ans))
-                 browser-2 (:state browser-2-res)
-                 axiom-2 (:state p2p-ans)
+                 ;; Direct P2P transport connection completes -> p2p-channel-state connected: true
+                 browser-2-conn (light-core/handle-command (:state browser-2-res)
+                                                           {"cmd" "p2p-channel-state" "session_id" sid "connected" true}
+                                                           (:private kp-browser))
+                 axiom-2-conn (light-core/handle-command (:state p2p-ans)
+                                                         {"cmd" "p2p-channel-state" "session_id" sid "connected" true}
+                                                         (:private kp-axiom))
+                 browser-2 (:state browser-2-conn)
+                 axiom-2 (:state axiom-2-conn)
                  ;; 3. Send 1:1 message over P2P at 0 ECH burn, routed via Nexus opaque hub relay
                  send-res (light-core/handle-command browser-2
                                                      {"cmd" "send" "session_id" sid "text" msg-text}
@@ -313,9 +321,13 @@
                                        (:state (light-core/handle-wire-payload st env (:private kp-axiom))))
                                      axiom-2
                                      (:net-envelopes nexus-relay-res))]
-             (and (true? (get-in browser-2 [:sessions sid :p2p :connected?]))
+             (and (= :connecting (get-in (:state p2p-ans) [:sessions sid :p2p :phase]))
+                  (false? (get-in (:state p2p-ans) [:sessions sid :p2p :connected?]))
+                  (some? (:p2p-dial p2p-ans))
+                  (some #(= "p2p-answer-received" (get % "event")) (:stdout-events browser-2-res))
+                  (true? (get-in browser-2 [:sessions sid :p2p :connected?]))
                   (true? (get-in axiom-2 [:sessions sid :p2p :connected?]))
-                  (some #(= "p2p-connected" (get % "event")) (:stdout-events browser-2-res))
+                  (some #(= "p2p-connected" (get % "event")) (:stdout-events browser-2-conn))
                   (= 0 (get-in send-res [:response "burn"]))
                   (true? (get-in send-res [:response "p2p"]))
                   (= burned-before-p2p burned-after-p2p)
@@ -415,3 +427,154 @@
       (is (= 0 (:total-ech-burned res)))
       (is (= 3 (:broadcast-count res)))
       (is (= 1 (:duplicates-dropped res))))))
+
+(deftest test-p2p-transient-liveness-rule-4
+  (testing "Rule 4: Derived runtime :p2p liveness is never persisted and cleared on close/prune"
+    (let [kp-a (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          kp-b (crypto/generate-keypair)
+          pub-b (basalt/bytes->hex (:public kp-b))
+          node-0 (light-core/init-light-state {:pubkey-hex pub-a} {:epoch 10})
+          sid "test-sess-rule4"
+          node-with-p2p (assoc-in node-0 [:sessions sid]
+                                  {:session-id sid
+                                   :peer pub-b
+                                   :state "open"
+                                   :role :initiator
+                                   :p2p {:phase :open
+                                         :connected? true
+                                         :zero-burn? true
+                                         :local-transport "udp"
+                                         :remote-transport "udp"}})]
+      ;; 1. strip-sensitive-keys strips :p2p from all sessions
+      (let [stripped (light-core/strip-sensitive-keys node-with-p2p)]
+        (is (nil? (get-in stripped [:sessions sid :p2p]))
+            "strip-sensitive-keys must strip :p2p map from sessions"))
+      ;; 2. exec-close removes :p2p from closed session
+      (let [closed-res (light-core/handle-command node-with-p2p
+                                                  {"cmd" "close" "session_id" sid}
+                                                  (:private kp-a))]
+        (is (= "closed" (get-in (:state closed-res) [:sessions sid :state])))
+        (is (nil? (get-in (:state closed-res) [:sessions sid :p2p]))
+            "exec-close must dissoc :p2p from closed session"))
+      ;; 3. browser prune-ghost-sessions strips :p2p
+      (let [pruned (browser-shell/prune-ghost-sessions (:sessions node-with-p2p))]
+        (is (nil? (get-in pruned [sid :p2p]))
+            "browser prune-ghost-sessions must strip :p2p from active sessions")))))
+
+(deftest test-p2p-signaling-replay-protection-and-epoch-skew
+  (testing "Monotonic signal-seq anti-replay, epoch skew, and invalid signature rejection (Rule 5)"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          node-a-0 (light-core/init-light-state {:pubkey-hex pub-a} {:epoch 10})
+          node-b-0 (light-core/init-light-state {:pubkey-hex pub-b} {:epoch 10})
+          ;; Setup open session between A and B
+          off-res (light-core/handle-command node-a-0
+                                             {"cmd" "offer" "callee" pub-b "price" 10 "burn" 500}
+                                             (:private kp-a))
+          sid (get-in off-res [:response "session_id"])
+          node-b-1 (reduce (fn [st env]
+                             (:state (light-core/handle-wire-payload st env (:private kp-b))))
+                           node-b-0
+                           (:net-envelopes off-res))
+          acc-res (light-core/handle-command node-b-1
+                                             {"cmd" "accept" "session_id" sid}
+                                             (:private kp-b))
+          node-b-open (:state acc-res)
+          node-a-1 (reduce (fn [st env]
+                             (:state (light-core/handle-wire-payload st env (:private kp-a))))
+                           (:state off-res)
+                           (:net-envelopes acc-res))
+          ;; Node A sends p2p-offer (signal-seq = 1)
+          p2p-off (light-core/handle-command node-a-1
+                                             {"cmd" "p2p-offer" "session_id" sid "transport" "udp" "candidates" ["udp://127.0.0.1:9001"]}
+                                             (:private kp-a))
+          env-off (first (:net-envelopes p2p-off))
+          ;; 1. First offer with signal-seq 1 succeeds
+          b-recv-1 (light-core/handle-wire-payload node-b-open env-off (:private kp-b))]
+      (is (= :offer-received (get-in (:state b-recv-1) [:sessions sid :p2p :phase])))
+      (is (= 1 (get-in (:state b-recv-1) [:sessions sid :p2p :remote-offer-seq])))
+      (is (= 0 (get-in (:state b-recv-1) [:diagnostics :p2p-signaling-rejected] 0)))
+
+        ;; 2. Replay of same p2p-offer (signal-seq <= 1) is rejected
+      (let [b-replay (light-core/handle-wire-payload (:state b-recv-1) env-off (:private kp-b))]
+        (is (= 1 (get-in (:state b-replay) [:diagnostics :p2p-signaling-rejected]))
+            "Replay of p2p-offer must increment :p2p-signaling-rejected")
+        (is (some #(= "p2p-signaling-rejected" (get % "event")) (:stdout-events b-replay))))
+
+        ;; 3. Tampered signature on p2p-offer is rejected
+      (let [tampered-payload (assoc (light-core/thaw-payload (:payload env-off)) :signature "302a00")
+            tampered-env (assoc env-off :payload (light-core/freeze-payload tampered-payload))
+            b-bad-sig (light-core/handle-wire-payload (:state b-recv-1) tampered-env (:private kp-b))]
+        (is (= 1 (get-in (:state b-bad-sig) [:diagnostics :p2p-signaling-rejected])))
+        (is (some #(= "p2p-signaling-rejected" (get % "event")) (:stdout-events b-bad-sig))))
+
+        ;; 4. Epoch skew > 2 on p2p-offer is dropped with :p2p-signaling-rejected
+      (let [skewed-payload (assoc (light-core/thaw-payload (:payload env-off)) :epoch 100)
+            skewed-env (assoc env-off :payload (light-core/freeze-payload skewed-payload))
+            b-skew (light-core/handle-wire-payload (:state b-recv-1) skewed-env (:private kp-b))]
+        (is (= 1 (get-in (:state b-skew) [:diagnostics :p2p-signaling-rejected]))
+            "Epoch skew > 2 must increment :p2p-signaling-rejected")
+        (is (some #(= "p2p-signaling-rejected" (get % "event")) (:stdout-events b-skew)))))))
+
+(deftest test-hub-broadcast-automatic-fan-out
+  (testing "Automatic Hub broadcast fan-out (Browser -> Nexus -> Axiom) increments :p2p-relayed"
+    (let [kp-browser (crypto/generate-keypair)
+          kp-nexus (crypto/generate-keypair)
+          kp-axiom (crypto/generate-keypair)
+          pub-browser (basalt/bytes->hex (:public kp-browser))
+          pub-nexus (basalt/bytes->hex (:public kp-nexus))
+          pub-axiom (basalt/bytes->hex (:public kp-axiom))
+          subnet-id "chat/simon-nexus-axiom"
+          sid-bn "sess-browser-nexus"
+          sid-an "sess-axiom-nexus"
+          nexus-0 (-> (light-core/init-light-state {:pubkey-hex pub-nexus}
+                                                   {:subnet-id subnet-id :epoch 10})
+                      (assoc-in [:sessions sid-bn]
+                                {:session-id sid-bn
+                                 :peer pub-browser
+                                 :state "open"
+                                 :p2p {:phase :open :connected? true :zero-burn? true}})
+                      (assoc-in [:sessions sid-an]
+                                {:session-id sid-an
+                                 :peer pub-axiom
+                                 :state "open"
+                                 :p2p {:phase :open :connected? true :zero-burn? true}}))
+          browser-0 (-> (light-core/init-light-state {:pubkey-hex pub-browser}
+                                                     {:subnet-id subnet-id :epoch 10})
+                        (assoc-in [:sessions sid-bn]
+                                  {:session-id sid-bn
+                                   :peer pub-nexus
+                                   :state "open"
+                                   :p2p {:phase :open :connected? true :zero-burn? true}}))
+          axiom-0 (-> (light-core/init-light-state {:pubkey-hex pub-axiom}
+                                                   {:subnet-id subnet-id :epoch 10})
+                      (assoc-in [:sessions sid-an]
+                                {:session-id sid-an
+                                 :peer pub-nexus
+                                 :state "open"
+                                 :p2p {:phase :open :connected? true :zero-burn? true}}))
+          ;; Browser broadcasts a message
+          b-res (light-core/handle-command browser-0
+                                           {"cmd" "broadcast" "text" "fan-out-hello" "subnet_id" subnet-id}
+                                           (:private kp-browser))
+          b-env (first (:net-envelopes b-res))
+          ;; Nexus receives Browser's broadcast over wire
+          nexus-res (light-core/handle-wire-payload nexus-0 b-env (:private kp-nexus))]
+      ;; Nexus should record the broadcast, increment :p2p-relayed, and emit fan-out envelope to Axiom
+      (is (= 1 (count (:broadcast-inbox (:state nexus-res)))))
+      (is (= 1 (get-in (:state nexus-res) [:diagnostics :p2p-relayed]))
+          "Nexus must increment :p2p-relayed upon fanning out broadcast")
+      (is (= 1 (count (:net-envelopes nexus-res)))
+          "Nexus must fan out exactly 1 envelope to Axiom (excluding sender Browser)")
+      (let [relay-env (first (:net-envelopes nexus-res))]
+        (is (true? (:p2p-direct? relay-env)))
+        (is (= pub-axiom (:p2p-peer relay-env)))
+        (is (= sid-an (:p2p-session-id relay-env)))
+        ;; Deliver fan-out envelope to Axiom
+        (let [axiom-res (light-core/handle-wire-payload axiom-0 relay-env (:private kp-axiom))]
+          (is (= 1 (count (:broadcast-inbox (:state axiom-res)))))
+          (is (= "fan-out-hello" (:text (first (:broadcast-inbox (:state axiom-res))))))
+          (is (= pub-browser (:from (first (:broadcast-inbox (:state axiom-res)))))))))))

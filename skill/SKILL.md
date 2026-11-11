@@ -60,6 +60,7 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--turn-password <pass>`: Password for TURN long-term credential authentication.
 - `--turn-realm <realm>`: Authentication realm for TURN server.
 - `--turn-force-relay`: Force all WebRTC traffic through TURN relay (drops unrelayable packets rather than falling back to direct UDP).
+- `--trusted-dac-anchors <pk1,pk2,...>`: Comma-separated list of trusted DAC anchor public keys required for DAC admission and zero-burn broadcast validation.
 
 ---
 
@@ -754,16 +755,16 @@ Initiates an in-band direct P2P WebRTC/ICE + RFC 8828 `.local` mDNS signaling of
   {
     "ok": true,
     "session_id": "sess-c47b19...",
-    "p2p_state": "offering",
-    "local_transport": "mdns://...",
-    "candidates": ["mdns://..."]
+    "phase": "offered",
+    "connected": false,
+    "burn": 0
   }
   ```
 
 ---
 
 ### `p2p-answer`
-Answers an incoming `p2p-offer` (`p2p-offer-received`) over an open sealed session, completing the direct P2P upgrade (`p2p-connected`) so subsequent `send` and `broadcast` messages route at `0 ECH` burn.
+Answers an incoming `p2p-offer` (`p2p-offer-received`) over an open sealed session, initiating direct P2P connection dialing.
 
 - **CLI**: `clojure -M:light-node p2p-answer --session-id <session-id> [--candidates <c1,c2,...>]` (or `--session <session-id>`)
 - **JSONL**: `{"cmd": "p2p-answer", "session_id": "<session-id>", "candidates": ["connect://nexus.ingress.bitecho.org:443"]}`
@@ -772,7 +773,25 @@ Answers an incoming `p2p-offer` (`p2p-offer-received`) over an open sealed sessi
   {
     "ok": true,
     "session_id": "sess-c47b19...",
-    "p2p_state": "connected",
+    "phase": "connecting",
+    "connected": false,
+    "burn": 0
+  }
+  ```
+
+---
+
+### `p2p-channel-state`
+Sets or notifies the transport connectivity status of a direct P2P session per Rule 4.
+
+- **CLI**: `clojure -M:light-node p2p-channel-state --session-id <session-id> --connected <true|false> [--transport <udp|tcp>] [--error <reason>]`
+- **JSONL**: `{"cmd": "p2p-channel-state", "session_id": "<session-id>", "connected": true, "transport": "udp"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "session_id": "sess-c47b19...",
+    "phase": "open",
     "connected": true,
     "zero_burn": true
   }
@@ -781,7 +800,7 @@ Answers an incoming `p2p-offer` (`p2p-offer-received`) over an open sealed sessi
 ---
 
 ### `broadcast`
-Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across an authenticated mesh subnet (default `"chat/simon-nexus-axiom"`), attaching the sender's Delegated Agent Certificate (DAC) and deduplicating via `msg_id = SHA-256(sender || seq || subnet_id || payload_hex)`. Peers with multiple open P2P channels automatically hub-relay (`:p2p-hub-relay`) to bridged peers.
+Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across an authenticated mesh subnet (default `"chat/simon-nexus-axiom"`), attaching the sender's Delegated Agent Certificate (DAC) and deduplicating via `msg_id = SHA-256("bitecho-broadcast-id-v1|" || subnet_id || "|" || sender_pubkey_hex || "|" || seq || "|" || text)`. Peers with multiple open P2P channels automatically hub-relay (`:p2p-hub-relay`) to bridged peers.
 
 - **CLI**: `clojure -M:light-node broadcast --text "Hello Simon, Nexus, and Axiom" [--subnet-id chat/simon-nexus-axiom]`
 - **JSONL**: `{"cmd": "broadcast", "text": "Hello Simon, Nexus, and Axiom", "subnet_id": "chat/simon-nexus-axiom"}`
@@ -792,9 +811,8 @@ Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across a
     "msg_id": "<sha256-hex>",
     "subnet_id": "chat/simon-nexus-axiom",
     "seq": 1,
-    "burn": 0,
     "zero_burn": true,
-    "p2p_peers_count": 2
+    "direct_p2p": true
   }
   ```
 

@@ -15,6 +15,7 @@
             [bitecho.rendezvous.core :as rendezvous]
             [clojure.edn :as edn]
             [clojure.string :as str]
+            [datachannel.mdns :as mdns]
             #?(:cljs [bitecho.economy.account :as account])
             #?(:cljs [bitecho.sieve.core :as sieve])
             #?(:clj [bitecho.shell.agent-sim :as agent-sim])
@@ -58,7 +59,7 @@
 
 (defn strip-sensitive-keys
   "Pure helper to remove single-use ECDH `:ephemeral-priv` keys from session state prior to persistence,
-   and dissoc transient runtime connection liveness keys (`:connected?`, `:connection-error`, `:conn-diagnostics`)
+   and dissoc transient runtime connection liveness keys (`:connected?`, `:connection-error`, `:conn-diagnostics`, `:p2p`)
    so persisted state never includes them.
    NOTE (`M2a-1` Trust Boundary): Active session symmetric `:tx-key` and `:rx-key` are intentionally retained
    inside `state.fressian` (enforced `0600` POSIX permissions alongside `<state-dir>/identity/node-identity.edn`)
@@ -66,7 +67,7 @@
    messages across process invocations without re-running the X25519 handshake."
   [state]
   (let [clean-sessions (into {} (for [[sid s] (:sessions state)]
-                                  [sid (dissoc s :ephemeral-priv)]))]
+                                  [sid (dissoc s :ephemeral-priv :ratchet :pq-secret-key :handshake-state :p2p)]))]
     (-> state
         (assoc :sessions clean-sessions)
         (dissoc :connected? :connection-error :conn-diagnostics))))
@@ -264,6 +265,8 @@
 ;; State Initialization
 ;; -----------------------------------------------------------------------------
 
+(declare normalize-pubkey-hex valid-pubkey-hex?)
+
 (def simon-nexus-axiom-subnet-id
   "Canonical zero-burn DAC-gated 3-way private broadcast & chat subnet ID (Subnet #4)."
   "chat/simon-nexus-axiom")
@@ -282,10 +285,7 @@
    :trusted-directory-pubkey (or (:directory-pubkey opts)
                                  (get-in opts [:bootstrap :directory-pubkey])
                                  (:trusted-directory-pubkey opts))
-   :trusted-dac-anchors (set (keep (fn [k]
-                                     (when (and (string? k) (not (str/blank? k)))
-                                       (str/lower-case (str/trim k))))
-                                   (:trusted-dac-anchors opts)))
+   :trusted-dac-anchors (set (keep normalize-pubkey-hex (:trusted-dac-anchors opts)))
    :home-set []
    :petnames {}
    :dac nil
@@ -327,7 +327,9 @@
    :diagnostics (merge {:subnet-mismatch-dropped 0
                         :p2p-relayed 0
                         :broadcast-duplicates-dropped 0
-                        :broadcast-rejected 0}
+                        :broadcast-rejected 0
+                        :p2p-signaling-rejected 0
+                        :p2p-dial-failed 0}
                        (:diagnostics opts))
    :crypto-suites (or (:crypto-suites opts) sealed/default-crypto-suites)})
 
@@ -1897,18 +1899,76 @@
          :net-envelopes [gossip-env]
          :stdout-events [event]}))))
 
+(defn parse-p2p-candidate
+  "Parses a candidate URI string or SDP candidate line into
+   {:scheme :host :port :transport ?(:proxy-connect? true)},
+   resolving .local mDNS hostnames against mdns-state."
+  ([cand-str]
+   (parse-p2p-candidate cand-str nil))
+  ([cand-str mdns-state]
+   (when (and (string? cand-str) (not (str/blank? cand-str)))
+     (let [s (str/trim cand-str)
+           sdp-cand? (or (str/starts-with? s "candidate:") (str/starts-with? s "a=candidate:"))
+           [scheme host port proxy-connect?]
+           (if sdp-cand?
+             (let [tokens (vec (str/split s #"\s+"))
+                   cand-idx (if (str/starts-with? (first tokens) "a=") 0 0)
+                   tr-token (get tokens (+ cand-idx 2))
+                   host-token (get tokens (+ cand-idx 4))
+                   port-token (get tokens (+ cand-idx 5))
+                   p (try (when port-token (#?(:clj Integer/parseInt :cljs js/parseInt) port-token)) (catch #?(:clj Exception :cljs :default) _ nil))
+                   tr (when tr-token (str/lower-case tr-token))]
+               [tr host-token p false])
+             (let [[scheme-part rest-part] (if-let [idx (str/index-of s "://")]
+                                             [(subs s 0 idx) (subs s (+ idx 3))]
+                                             [nil s])
+                   sch (when scheme-part (str/lower-case scheme-part))
+                   [raw-host raw-port] (if-let [last-colon (str/last-index-of rest-part ":")]
+                                         [(subs rest-part 0 last-colon) (subs rest-part (inc last-colon))]
+                                         [rest-part nil])
+                   p (try (when raw-port (#?(:clj Integer/parseInt :cljs js/parseInt) (str/trim raw-port)))
+                          (catch #?(:clj Exception :cljs :default) _ nil))
+                   h (when raw-host (str/trim raw-host))]
+               [sch h p (= sch "connect")]))
+           tab (cond
+                 (nil? mdns-state) nil
+                 #?@(:clj [(instance? clojure.lang.IDeref mdns-state) @mdns-state]
+                     :cljs [(satisfies? IDeref mdns-state) @mdns-state])
+                 (map? mdns-state) mdns-state
+                 :else nil)
+           resolved-host (if (and host (mdns/mdns-hostname? host))
+                           (or (when tab
+                                 (let [cand-map {:ip host :port (or port 0)}
+                                       res (mdns/resolve-candidate-address cand-map tab)]
+                                   (when (and res (not= (:ip res) host))
+                                     (:ip res))))
+                               (when tab (mdns/lookup-cached-ip tab host))
+                               host)
+                           host)]
+       (when (and (seq resolved-host) port (pos? port))
+         (cond-> {:scheme (or scheme "udp")
+                  :host resolved-host
+                  :port port
+                  :transport (case scheme
+                               ("tcp" "connect") :tcp
+                               :udp)}
+           proxy-connect? (assoc :proxy-connect? true)))))))
+
 (defn- canonical-p2p-signal-str
-  [kind session-id sender recipient transport candidates ice-ufrag ice-pwd fingerprint epoch]
-  (str "bitecho-p2p-" (name kind) "-v1|"
-       session-id "|"
-       (normalize-pubkey-hex sender) "|"
-       (normalize-pubkey-hex recipient) "|"
-       (or transport "udp") "|"
-       (str/join "," (sort (map str (or candidates [])))) "|"
-       (or ice-ufrag "") "|"
-       (or ice-pwd "") "|"
-       (or fingerprint "") "|"
-       (long (or epoch 0))))
+  ([kind session-id sender recipient transport candidates ice-ufrag ice-pwd fingerprint epoch]
+   (canonical-p2p-signal-str kind session-id sender recipient transport candidates ice-ufrag ice-pwd fingerprint epoch 1))
+  ([kind session-id sender recipient transport candidates ice-ufrag ice-pwd fingerprint epoch signal-seq]
+   (str "bitecho-p2p-" (name kind) "-v1|"
+        session-id "|"
+        (normalize-pubkey-hex sender) "|"
+        (normalize-pubkey-hex recipient) "|"
+        (or transport "udp") "|"
+        (str/join "," (sort (map str (or candidates [])))) "|"
+        (or ice-ufrag "") "|"
+        (or ice-pwd "") "|"
+        (or fingerprint "") "|"
+        (long (or epoch 0)) "|"
+        (long (or signal-seq 1)))))
 
 (defn compute-broadcast-msg-id
   "Computes a deterministic SHA-256 hex message ID for a 3-way P2P broadcast."
@@ -1954,8 +2014,9 @@
                  :target-pubkey norm-target
                  :session-id sid
                  :sealed-envelope sealed-envelope
-                 :signature sig-hex}]
-    (build-gossip-envelope norm-sender sender-privkey (freeze-payload payload) 0 sub-id)))
+                 :signature sig-hex}
+        env (build-gossip-envelope norm-sender sender-privkey (freeze-payload payload) 0 sub-id)]
+    (assoc env :p2p-direct? true :p2p-peer norm-target)))
 
 (defn- exec-p2p-offer [state cmd-map privkey-bytes]
   (let [session-id (resolve-session-id state cmd-map :open)
@@ -1972,7 +2033,8 @@
             ice-pwd (str (or (get cmd-map "ice_pwd") (get cmd-map "ice-pwd") (:ice-pwd cmd-map) (get-in state [:ice-creds :pwd]) "pwd"))
             fp (str (or (get cmd-map "fingerprint") (:fingerprint cmd-map) (:fingerprint state) ""))
             epoch (long (or (:epoch session) (:epoch state) 0))
-            sig-str (canonical-p2p-signal-str :offer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch)
+            signal-seq (inc (long (or (get-in session [:p2p :local-signal-seq]) 0)))
+            sig-str (canonical-p2p-signal-str :offer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
             sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
             payload {:protocol-version current-wire-version
@@ -1989,6 +2051,7 @@
                      :ice-pwd ice-pwd
                      :fingerprint fp
                      :epoch epoch
+                     :signal-seq signal-seq
                      :signature sig-hex}
             env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload payload) 0 sub-id)
             p2p-entry (merge (get session :p2p {})
@@ -1999,7 +2062,8 @@
                               :local-candidates candidates
                               :local-ice-ufrag ice-ufrag
                               :local-ice-pwd ice-pwd
-                              :local-fingerprint fp})
+                              :local-fingerprint fp
+                              :local-signal-seq signal-seq})
             new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)]
         {:state new-state
          :response {"ok" true
@@ -2008,6 +2072,7 @@
                     "transport" transport
                     "candidates" candidates
                     "phase" "offered"
+                    "connected" false
                     "burn" 0}
          :net-envelopes [env]
          :stdout-events []}))))
@@ -2027,7 +2092,8 @@
             ice-pwd (str (or (get cmd-map "ice_pwd") (get cmd-map "ice-pwd") (:ice-pwd cmd-map) (get-in state [:ice-creds :pwd]) "pwd"))
             fp (str (or (get cmd-map "fingerprint") (:fingerprint cmd-map) (:fingerprint state) ""))
             epoch (long (or (:epoch session) (:epoch state) 0))
-            sig-str (canonical-p2p-signal-str :answer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch)
+            signal-seq (inc (long (or (get-in session [:p2p :local-signal-seq]) 0)))
+            sig-str (canonical-p2p-signal-str :answer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
             sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
             payload {:protocol-version current-wire-version
@@ -2044,37 +2110,99 @@
                      :ice-pwd ice-pwd
                      :fingerprint fp
                      :epoch epoch
+                     :signal-seq signal-seq
                      :signature sig-hex}
             env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload payload) 0 sub-id)
             p2p-entry (merge (get session :p2p {})
-                             {:phase :open
-                              :connected? true
-                              :zero-burn? true
+                             {:phase :connecting
+                              :connected? false
+                              :zero-burn? false
                               :role :responder
                               :local-transport transport
                               :local-candidates candidates
                               :local-ice-ufrag ice-ufrag
                               :local-ice-pwd ice-pwd
-                              :local-fingerprint fp})
+                              :local-fingerprint fp
+                              :local-signal-seq signal-seq})
             new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)
-            pname (pubkey->petname state (:peer session))
-            evt (cond-> {"event" "p2p-connected"
-                         "session_id" session-id
-                         "peer" (:peer session)
-                         "transport" transport
-                         "zero_burn" true}
-                  pname (assoc "peer_petname" pname))]
+            p2p-dial {:session-id session-id
+                      :peer (:peer session)
+                      :role :responder
+                      :transport transport
+                      :local-candidates candidates
+                      :remote-candidates (get-in session [:p2p :remote-candidates])
+                      :remote-ice-ufrag (get-in session [:p2p :remote-ice-ufrag])
+                      :remote-ice-pwd (get-in session [:p2p :remote-ice-pwd])
+                      :remote-fingerprint (get-in session [:p2p :remote-fingerprint])}]
         {:state new-state
          :response {"ok" true
                     "session_id" session-id
                     "peer" (:peer session)
                     "transport" transport
                     "candidates" candidates
-                    "phase" "open"
-                    "connected" true
+                    "phase" "connecting"
+                    "connected" false
                     "burn" 0}
          :net-envelopes [env]
-         :stdout-events [evt]}))))
+         :stdout-events []
+         :p2p-dial p2p-dial}))))
+
+(defn- exec-p2p-channel-state [state cmd-map]
+  (let [session-id (or (get cmd-map "session_id") (get cmd-map "session-id")
+                       (:session_id cmd-map) (:session-id cmd-map)
+                       (resolve-session-id state cmd-map :active))
+        session (get-in state [:sessions session-id])]
+    (if-not session
+      {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
+      (let [connected? (let [c (or (get cmd-map "connected") (:connected cmd-map)
+                                   (get cmd-map "connected?") (:connected? cmd-map))]
+                         (if (nil? c) false (boolean c)))
+            transport (or (get cmd-map "transport") (:transport cmd-map))
+            error (or (get cmd-map "error") (:error cmd-map))
+            pname (pubkey->petname state (:peer session))]
+        (if connected?
+          (let [eff-transport (str (or transport
+                                       (get-in session [:p2p :remote-transport])
+                                       (get-in session [:p2p :local-transport])
+                                       "udp"))
+                p2p-entry (merge (get session :p2p {})
+                                 {:phase :open
+                                  :connected? true
+                                  :zero-burn? true
+                                  :transport eff-transport})
+                new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)
+                evt (cond-> {"event" "p2p-connected"
+                             "session_id" session-id
+                             "peer" (:peer session)
+                             "transport" eff-transport
+                             "zero_burn" true}
+                      pname (assoc "peer_petname" pname))]
+            {:state new-state
+             :response {"ok" true
+                        "session_id" session-id
+                        "connected" true
+                        "phase" "open"}
+             :net-envelopes []
+             :stdout-events [evt]})
+          (let [p2p-entry (cond-> (merge (get session :p2p {})
+                                         {:phase :closed
+                                          :connected? false
+                                          :zero-burn? false})
+                            error (assoc :last-error error))
+                new-state (cond-> (assoc-in state [:sessions session-id :p2p] p2p-entry)
+                            error (update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
+                evt (cond-> {"event" "p2p-disconnected"
+                             "session_id" session-id
+                             "peer" (:peer session)
+                             "reason" (or error "closed")}
+                      pname (assoc "peer_petname" pname))]
+            {:state new-state
+             :response {"ok" true
+                        "session_id" session-id
+                        "connected" false
+                        "phase" "closed"}
+             :net-envelopes []
+             :stdout-events [evt]}))))))
 
 (defn- exec-broadcast [state cmd-map privkey-bytes]
   (let [raw-text (or (get cmd-map "text") (get cmd-map "message") (:text cmd-map) (:message cmd-map))
@@ -2103,7 +2231,8 @@
                              :epoch epoch
                              :signature sig-hex}
                       dac (assoc :dac dac))
-            env (build-gossip-envelope sender privkey-bytes (freeze-payload payload) 0 sub-id)
+            raw-env (build-gossip-envelope sender privkey-bytes (freeze-payload payload) 0 sub-id)
+            env (assoc raw-env :p2p-direct? true :p2p-broadcast? true)
             dedup-key [sender next-seq msg-id]
             b-entry {:from sender
                      :seq next-seq
@@ -2122,6 +2251,7 @@
                     "seq" next-seq
                     "msg_id" msg-id
                     "burn" 0
+                    "zero_burn" true
                     "p2p" true}
          :net-envelopes [env]
          :stdout-events []}))))
@@ -2141,8 +2271,16 @@
                                 :else empty-bytes)]
         (if (zero? (fressian/count-bytes payload-bytes))
           {:state state :response {"ok" false "error" "empty-payload"} :net-envelopes [] :stdout-events []}
-          (let [p2p-open? (or (true? (get-in session [:p2p :connected?]))
-                              (= :open (get-in session [:p2p :phase])))
+          ;; NOTE on Zero-Burn Direct P2P Routing vs Validator Gossip:
+          ;; Per src/bitecho/state_machine.cljc lines 1198-1201 (handle-receive-gossip:
+          ;; valid-burn? (and (number? burn-amt) (>= burn-amt burn/min-signaling-burn))
+          ;; where burn/min-signaling-burn = 100 in src/bitecho/economy/burn.cljc line 4),
+          ;; validator gossip drops any 0-burn envelope. Zero-burn sends are ONLY emitted when
+          ;; p2p-open? (:connected? true) is true and are tagged with :p2p-direct? true,
+          ;; :p2p-peer (normalize-pubkey-hex (:peer session)), and :p2p-session-id session-id
+          ;; so the shell routes them strictly over direct P2P DataChannels.
+          ;; When p2p-open? is false, exec-send uses standard 500 ECH default burn (with >= 100 ECH floor).
+          (let [p2p-open? (true? (get-in session [:p2p :connected?]))
                 burn-amt (if p2p-open?
                            0
                            (long (or (get cmd-map "burn") (:burn cmd-map) (if (get state :economy-enabled? true) 500 0))))
@@ -2162,7 +2300,11 @@
                              :suite suite
                              :nonce (basalt/bytes->hex (:nonce sealed))
                              :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
-                gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt sub-id)
+                raw-gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) burn-amt sub-id)
+                gossip-env (cond-> raw-gossip-env
+                             p2p-open? (assoc :p2p-direct? true
+                                              :p2p-peer (normalize-pubkey-hex (:peer session))
+                                              :p2p-session-id session-id))
                 max-outbox (long (or (:max-outbox-size state) 64))
                 curr-outbox (or (:outbox session) {})
                 curr-order (or (:outbox-order session) [])
@@ -2244,7 +2386,7 @@
             gossip-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload close-payload) burn-amt sub-id)
             closed-sess (-> session
                             (assoc :state "closed")
-                            (dissoc :tx-key :rx-key :ephemeral-priv))
+                            (dissoc :tx-key :rx-key :ephemeral-priv :p2p))
             new-state (assoc-in state [:sessions session-id] closed-sess)]
         {:state new-state
          :response (cond-> {"ok" true "session_id" session-id "state" "closed"}
@@ -3101,6 +3243,8 @@
               "accept" (exec-accept state effective-map privkey-bytes)
               "p2p-offer" (exec-p2p-offer state effective-map privkey-bytes)
               "p2p-answer" (exec-p2p-answer state effective-map privkey-bytes)
+              "p2p-channel-state" (exec-p2p-channel-state state effective-map)
+              "p2p_channel_state" (exec-p2p-channel-state state effective-map)
               "broadcast" (exec-broadcast state effective-map privkey-bytes)
               "rendezvous-policy" (exec-rendezvous-policy state effective-map)
               "rendezvous-offer" (exec-rendezvous-offer state effective-map privkey-bytes)
@@ -3870,28 +4014,41 @@
   [state msg]
   (try
     (let [sid (:session-id msg)
-          session (get-in state [:sessions sid])]
-      (if-not (and session
-                   (= "open" (:state session))
-                   (string? (:sender msg))
-                   (string? (:recipient msg))
-                   (= (normalize-pubkey-hex (:recipient msg)) (normalize-pubkey-hex (:pubkey state)))
-                   (= (normalize-pubkey-hex (:sender msg)) (normalize-pubkey-hex (:peer session)))
-                   (string? (:signature msg)) (not (str/blank? (:signature msg))))
-        {:state state :net-envelopes [] :stdout-events []}
+          session (get-in state [:sessions sid])
+          signal-seq (long (or (:signal-seq msg) 0))
+          last-seq (long (or (get-in session [:p2p :remote-offer-seq]) 0))
+          valid-seq? (and (pos? signal-seq) (> signal-seq last-seq))
+          valid-session? (and session (= "open" (:state session)))
+          valid-endpoints? (and (string? (:sender msg))
+                                (string? (:recipient msg))
+                                (= (normalize-pubkey-hex (:recipient msg)) (normalize-pubkey-hex (:pubkey state)))
+                                (= (normalize-pubkey-hex (:sender msg)) (normalize-pubkey-hex (:peer session))))
+          valid-sig-field? (and (string? (:signature msg)) (not (str/blank? (:signature msg))))]
+      (if-not (and valid-session? valid-endpoints? valid-sig-field? valid-seq?)
+        (let [diag-evt {"event" "p2p-signaling-rejected"
+                        "type" (name (or (:type msg) :unknown))
+                        "session_id" (str (or sid ""))}]
+          {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+           :net-envelopes []
+           :stdout-events [diag-evt]})
         (let [transport (str (or (:transport msg) "udp"))
               candidates (vec (map str (or (:candidates msg) [])))
               ice-ufrag (str (or (:ice-ufrag msg) ""))
               ice-pwd (str (or (:ice-pwd msg) ""))
               fp (str (or (:fingerprint msg) ""))
               epoch (long (or (:epoch msg) 0))
-              sig-str (canonical-p2p-signal-str :offer sid (:sender msg) (:recipient msg) transport candidates ice-ufrag ice-pwd fp epoch)
+              sig-str (canonical-p2p-signal-str :offer sid (:sender msg) (:recipient msg) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
               sender-pub (try (basalt/hex->bytes (:sender msg)) (catch #?(:clj Exception :cljs :default) _ nil))
               sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
               sig-valid? (and sender-pub sig-bytes
                               (crypto/verify sender-pub (fressian/utf8->bytes sig-str) sig-bytes))]
           (if-not sig-valid?
-            {:state state :net-envelopes [] :stdout-events []}
+            (let [diag-evt {"event" "p2p-signaling-rejected"
+                            "type" (name (or (:type msg) :unknown))
+                            "session_id" (str (or sid ""))}]
+              {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+               :net-envelopes []
+               :stdout-events [diag-evt]})
             (let [p2p-entry (merge (get session :p2p {})
                                    {:phase :offer-received
                                     :connected? false
@@ -3899,7 +4056,8 @@
                                     :remote-candidates candidates
                                     :remote-ice-ufrag ice-ufrag
                                     :remote-ice-pwd ice-pwd
-                                    :remote-fingerprint fp})
+                                    :remote-fingerprint fp
+                                    :remote-offer-seq signal-seq})
                   new-state (assoc-in state [:sessions sid :p2p] p2p-entry)
                   pname (pubkey->petname state (:sender msg))
                   evt (cond-> {"event" "p2p-offer-received"
@@ -3912,56 +4070,91 @@
                :net-envelopes []
                :stdout-events [evt]})))))
     (catch #?(:clj Exception :cljs :default) _
-      {:state state :net-envelopes [] :stdout-events []})))
+      (let [diag-evt {"event" "p2p-signaling-rejected"
+                      "type" (name (or (:type msg) :unknown))
+                      "session_id" (str (or (:session-id msg) ""))}]
+        {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+         :net-envelopes []
+         :stdout-events [diag-evt]}))))
 
 (defn- handle-wire-p2p-answer
   [state msg]
   (try
     (let [sid (:session-id msg)
-          session (get-in state [:sessions sid])]
-      (if-not (and session
-                   (= "open" (:state session))
-                   (string? (:sender msg))
-                   (string? (:recipient msg))
-                   (= (normalize-pubkey-hex (:recipient msg)) (normalize-pubkey-hex (:pubkey state)))
-                   (= (normalize-pubkey-hex (:sender msg)) (normalize-pubkey-hex (:peer session)))
-                   (string? (:signature msg)) (not (str/blank? (:signature msg))))
-        {:state state :net-envelopes [] :stdout-events []}
+          session (get-in state [:sessions sid])
+          signal-seq (long (or (:signal-seq msg) 0))
+          last-seq (long (or (get-in session [:p2p :remote-answer-seq]) 0))
+          valid-seq? (and (pos? signal-seq) (> signal-seq last-seq))
+          valid-session? (and session (= "open" (:state session)))
+          valid-endpoints? (and (string? (:sender msg))
+                                (string? (:recipient msg))
+                                (= (normalize-pubkey-hex (:recipient msg)) (normalize-pubkey-hex (:pubkey state)))
+                                (= (normalize-pubkey-hex (:sender msg)) (normalize-pubkey-hex (:peer session))))
+          valid-sig-field? (and (string? (:signature msg)) (not (str/blank? (:signature msg))))]
+      (if-not (and valid-session? valid-endpoints? valid-sig-field? valid-seq?)
+        (let [diag-evt {"event" "p2p-signaling-rejected"
+                        "type" (name (or (:type msg) :unknown))
+                        "session_id" (str (or sid ""))}]
+          {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+           :net-envelopes []
+           :stdout-events [diag-evt]})
         (let [transport (str (or (:transport msg) "udp"))
               candidates (vec (map str (or (:candidates msg) [])))
               ice-ufrag (str (or (:ice-ufrag msg) ""))
               ice-pwd (str (or (:ice-pwd msg) ""))
               fp (str (or (:fingerprint msg) ""))
               epoch (long (or (:epoch msg) 0))
-              sig-str (canonical-p2p-signal-str :answer sid (:sender msg) (:recipient msg) transport candidates ice-ufrag ice-pwd fp epoch)
+              sig-str (canonical-p2p-signal-str :answer sid (:sender msg) (:recipient msg) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
               sender-pub (try (basalt/hex->bytes (:sender msg)) (catch #?(:clj Exception :cljs :default) _ nil))
               sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
               sig-valid? (and sender-pub sig-bytes
                               (crypto/verify sender-pub (fressian/utf8->bytes sig-str) sig-bytes))]
           (if-not sig-valid?
-            {:state state :net-envelopes [] :stdout-events []}
-            (let [p2p-entry (merge (get session :p2p {})
-                                   {:phase :open
-                                    :connected? true
-                                    :zero-burn? true
+            (let [diag-evt {"event" "p2p-signaling-rejected"
+                            "type" (name (or (:type msg) :unknown))
+                            "session_id" (str (or sid ""))}]
+              {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+               :net-envelopes []
+               :stdout-events [diag-evt]})
+            (let [norm-sender (normalize-pubkey-hex (:sender msg))
+                  p2p-entry (merge (get session :p2p {})
+                                   {:phase :connecting
+                                    :connected? false
+                                    :zero-burn? false
                                     :remote-transport transport
                                     :remote-candidates candidates
                                     :remote-ice-ufrag ice-ufrag
                                     :remote-ice-pwd ice-pwd
-                                    :remote-fingerprint fp})
+                                    :remote-fingerprint fp
+                                    :remote-answer-seq signal-seq})
                   new-state (assoc-in state [:sessions sid :p2p] p2p-entry)
-                  pname (pubkey->petname state (:sender msg))
-                  evt (cond-> {"event" "p2p-connected"
+                  pname (pubkey->petname state norm-sender)
+                  evt (cond-> {"event" "p2p-answer-received"
                                "session_id" sid
-                               "peer" (normalize-pubkey-hex (:sender msg))
+                               "peer" norm-sender
                                "transport" transport
-                               "zero_burn" true}
-                        pname (assoc "peer_petname" pname))]
+                               "candidates" candidates}
+                        pname (assoc "peer_petname" pname))
+                  p2p-dial {:session-id sid
+                            :peer norm-sender
+                            :role :initiator
+                            :transport transport
+                            :local-candidates (get-in session [:p2p :local-candidates])
+                            :remote-candidates candidates
+                            :remote-ice-ufrag ice-ufrag
+                            :remote-ice-pwd ice-pwd
+                            :remote-fingerprint fp}]
               {:state new-state
                :net-envelopes []
-               :stdout-events [evt]})))))
+               :stdout-events [evt]
+               :p2p-dial p2p-dial})))))
     (catch #?(:clj Exception :cljs :default) _
-      {:state state :net-envelopes [] :stdout-events []})))
+      (let [diag-evt {"event" "p2p-signaling-rejected"
+                      "type" (name (or (:type msg) :unknown))
+                      "session_id" (str (or (:session-id msg) ""))}]
+        {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+         :net-envelopes []
+         :stdout-events [diag-evt]}))))
 
 (declare handle-wire-payload)
 
@@ -3972,7 +4165,12 @@
                  (string? (:target-pubkey msg)) (valid-pubkey-hex? (:target-pubkey msg))
                  (some? (:sealed-envelope msg))
                  (string? (:signature msg)) (not (str/blank? (:signature msg))))
-      {:state state :net-envelopes [] :stdout-events []}
+      (let [diag-evt {"event" "p2p-signaling-rejected"
+                      "type" (name (or (:type msg) :p2p-hub-relay))
+                      "session_id" (str (or (:session-id msg) ""))}]
+        {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+         :net-envelopes []
+         :stdout-events [diag-evt]})
       (let [norm-sender (normalize-pubkey-hex (:sender msg))
             norm-target (normalize-pubkey-hex (:target-pubkey msg))
             sub-id (str (or (:subnet-id msg) (:subnet-id state) "global"))
@@ -3983,95 +4181,127 @@
             sig-valid? (and sender-pub sig-bytes
                             (crypto/verify sender-pub (fressian/utf8->bytes canonical-str) sig-bytes))]
         (if-not sig-valid?
-          {:state state :net-envelopes [] :stdout-events []}
+          (let [diag-evt {"event" "p2p-signaling-rejected"
+                          "type" (name (or (:type msg) :p2p-hub-relay))
+                          "session_id" (str (or (:session-id msg) ""))}]
+            {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+             :net-envelopes []
+             :stdout-events [diag-evt]})
           (if (= norm-target (normalize-pubkey-hex (:pubkey state)))
             (handle-wire-payload state (:sealed-envelope msg) privkey-bytes)
-            {:state (update-in state [:diagnostics :p2p-relayed] (fnil inc 0))
-             :net-envelopes [(:sealed-envelope msg)]
-             :stdout-events []}))))
+            (let [relay-env (assoc (:sealed-envelope msg)
+                                   :p2p-direct? true
+                                   :p2p-peer norm-target)]
+              {:state (update-in state [:diagnostics :p2p-relayed] (fnil inc 0))
+               :net-envelopes [relay-env]
+               :stdout-events []})))))
     (catch #?(:clj Exception :cljs :default) _
-      {:state state :net-envelopes [] :stdout-events []})))
+      (let [diag-evt {"event" "p2p-signaling-rejected"
+                      "type" (name (or (:type msg) :p2p-hub-relay))
+                      "session_id" (str (or (:session-id msg) ""))}]
+        {:state (update-in state [:diagnostics :p2p-signaling-rejected] (fnil inc 0))
+         :net-envelopes []
+         :stdout-events [diag-evt]}))))
 
 (defn- handle-wire-broadcast
-  [state msg]
-  (try
-    (if-not (and (string? (:sender msg)) (valid-pubkey-hex? (:sender msg))
-                 (integer? (:seq msg)) (pos? (long (:seq msg)))
-                 (string? (:msg-id msg)) (not (str/blank? (:msg-id msg)))
-                 (string? (:text msg)) (not (str/blank? (:text msg)))
-                 (string? (:signature msg)) (not (str/blank? (:signature msg))))
-      {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
-       :net-envelopes []
-       :stdout-events []}
-      (let [norm-sender (normalize-pubkey-hex (:sender msg))
-            seq-num (long (:seq msg))
-            msg-id (:msg-id msg)
-            text (:text msg)
-            sub-id (str (or (:subnet-id msg) (:subnet-id state) "global"))
-            epoch (long (or (:epoch msg) (:epoch state) 0))
-            wire-dac (or (:dac msg) (get msg "dac"))
-            dac-id (when (map? wire-dac) (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id")))
-            expected-msg-id (compute-broadcast-msg-id sub-id norm-sender seq-num text)
-            sig-str (canonical-broadcast-str sub-id norm-sender seq-num msg-id text epoch dac-id)
-            sender-pub (try (basalt/hex->bytes norm-sender) (catch #?(:clj Exception :cljs :default) _ nil))
-            sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-            sig-valid? (and (= msg-id expected-msg-id)
-                            sender-pub sig-bytes
-                            (crypto/verify sender-pub (fressian/utf8->bytes sig-str) sig-bytes))
-            trusted-anchors (:trusted-dac-anchors state #{})
-            requires-dac? (seq trusted-anchors)
-            dac-valid? (if-not requires-dac?
-                         (if wire-dac
-                           (:ok? (verify-dac wire-dac {:expected-agent-pubkey norm-sender
-                                                       :current-epoch (:epoch state)
-                                                       :revoked-dac-ids (:revoked-dacs state)
-                                                       :required-scope "broadcast"}))
-                           true)
-                         (and (map? wire-dac)
-                              (let [v (verify-dac wire-dac {:expected-agent-pubkey norm-sender
-                                                            :current-epoch (:epoch state)
-                                                            :revoked-dac-ids (:revoked-dacs state)
-                                                            :required-scope "broadcast"})]
-                                (and (:ok? v)
-                                     (contains? trusted-anchors
-                                                (normalize-pubkey-hex (get-in v [:dac :anchor-pubkey])))))))]
-        (if-not (and sig-valid? dac-valid?)
-          {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
-           :net-envelopes []
-           :stdout-events []}
-          (let [dedup-key [norm-sender seq-num msg-id]
-                seen (:broadcast-seen state #{})]
-            (if (contains? seen dedup-key)
-              {:state (update-in state [:diagnostics :broadcast-duplicates-dropped] (fnil inc 0))
-               :net-envelopes []
-               :stdout-events []}
-              (let [pname (pubkey->petname state norm-sender)
-                    b-entry (cond-> {:from norm-sender
-                                     :seq seq-num
-                                     :msg-id msg-id
-                                     :text text
-                                     :subnet-id sub-id
-                                     :epoch epoch
-                                     :broadcast? true}
-                              pname (assoc :from_petname pname "from_petname" pname))
-                    evt (cond-> {"event" "broadcast-received"
-                                 "subnet_id" sub-id
-                                 "from" norm-sender
-                                 "seq" seq-num
-                                 "msg_id" msg-id
-                                 "text" text}
-                          pname (assoc "from_petname" pname))
-                    new-state (-> state
-                                  (update :broadcast-seen (fnil conj #{}) dedup-key)
-                                  (update :broadcast-inbox (fnil conj []) b-entry)
-                                  (update :inbox (fnil conj []) b-entry))]
-                {:state new-state
-                 :net-envelopes []
-                 :stdout-events [evt]}))))))
-    (catch #?(:clj Exception :cljs :default) _
-      {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
-       :net-envelopes []
-       :stdout-events []})))
+  ([state msg]
+   (handle-wire-broadcast state msg nil))
+  ([state msg privkey-bytes]
+   (try
+     (if-not (and (string? (:sender msg)) (valid-pubkey-hex? (:sender msg))
+                  (integer? (:seq msg)) (pos? (long (:seq msg)))
+                  (string? (:msg-id msg)) (not (str/blank? (:msg-id msg)))
+                  (string? (:text msg)) (not (str/blank? (:text msg)))
+                  (string? (:signature msg)) (not (str/blank? (:signature msg))))
+       {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
+        :net-envelopes []
+        :stdout-events []}
+       (let [norm-sender (normalize-pubkey-hex (:sender msg))
+             seq-num (long (:seq msg))
+             msg-id (:msg-id msg)
+             text (:text msg)
+             sub-id (str (or (:subnet-id msg) (:subnet-id state) "global"))
+             epoch (long (or (:epoch msg) (:epoch state) 0))
+             wire-dac (or (:dac msg) (get msg "dac"))
+             dac-id (when (map? wire-dac) (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id")))
+             expected-msg-id (compute-broadcast-msg-id sub-id norm-sender seq-num text)
+             sig-str (canonical-broadcast-str sub-id norm-sender seq-num msg-id text epoch dac-id)
+             sender-pub (try (basalt/hex->bytes norm-sender) (catch #?(:clj Exception :cljs :default) _ nil))
+             sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+             sig-valid? (and (= msg-id expected-msg-id)
+                             sender-pub sig-bytes
+                             (crypto/verify sender-pub (fressian/utf8->bytes sig-str) sig-bytes))
+             trusted-anchors (into #{} (concat (:trusted-dac-anchors state) (get-in state [:account :trusted-dac-anchors])))
+             requires-dac? (seq trusted-anchors)
+             dac-valid? (if-not requires-dac?
+                          (if wire-dac
+                            (:ok? (verify-dac wire-dac {:expected-agent-pubkey norm-sender
+                                                        :current-epoch (:epoch state)
+                                                        :revoked-dac-ids (:revoked-dacs state)
+                                                        :required-scope "broadcast"}))
+                            true)
+                          (and (map? wire-dac)
+                               (let [v (verify-dac wire-dac {:expected-agent-pubkey norm-sender
+                                                             :current-epoch (:epoch state)
+                                                             :revoked-dac-ids (:revoked-dacs state)
+                                                             :required-scope "broadcast"})]
+                                 (and (:ok? v)
+                                      (contains? trusted-anchors
+                                                 (normalize-pubkey-hex (get-in v [:dac :anchor-pubkey])))))))]
+         (if-not (and sig-valid? dac-valid?)
+           {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
+            :net-envelopes []
+            :stdout-events []}
+           (let [dedup-key [norm-sender seq-num msg-id]
+                 seen (:broadcast-seen state #{})]
+             (if (contains? seen dedup-key)
+               {:state (update-in state [:diagnostics :broadcast-duplicates-dropped] (fnil inc 0))
+                :net-envelopes []
+                :stdout-events []}
+               (let [pname (pubkey->petname state norm-sender)
+                     b-entry (cond-> {:from norm-sender
+                                      :seq seq-num
+                                      :msg-id msg-id
+                                      :text text
+                                      :subnet-id sub-id
+                                      :epoch epoch
+                                      :broadcast? true}
+                               pname (assoc :from_petname pname "from_petname" pname))
+                     evt (cond-> {"event" "broadcast-received"
+                                  "subnet_id" sub-id
+                                  "from" norm-sender
+                                  "seq" seq-num
+                                  "msg_id" msg-id
+                                  "text" text}
+                           pname (assoc "from_petname" pname))
+                     open-p2p-peers (->> (:sessions state)
+                                         (keep (fn [[sid s]]
+                                                 (when (and (= "open" (:state s))
+                                                            (true? (get-in s [:p2p :connected?]))
+                                                            (not= (normalize-pubkey-hex (:peer s)) norm-sender))
+                                                   {:peer (normalize-pubkey-hex (:peer s))
+                                                    :session-id sid})))
+                                         (distinct)
+                                         vec)
+                     relay-pub (or (:pubkey state) norm-sender)
+                     relay-envs (mapv (fn [target]
+                                        (assoc (build-gossip-envelope relay-pub privkey-bytes (freeze-payload msg) 0 sub-id)
+                                               :p2p-direct? true
+                                               :p2p-peer (:peer target)
+                                               :p2p-session-id (:session-id target)))
+                                      open-p2p-peers)
+                     new-state (-> state
+                                   (update :broadcast-seen (fnil conj #{}) dedup-key)
+                                   (update :broadcast-inbox (fnil conj []) b-entry)
+                                   (update :inbox (fnil conj []) b-entry)
+                                   (update-in [:diagnostics :p2p-relayed] (fnil + 0) (count relay-envs)))]
+                 {:state new-state
+                  :net-envelopes relay-envs
+                  :stdout-events [evt]}))))))
+     (catch #?(:clj Exception :cljs :default) _
+       {:state (update-in state [:diagnostics :broadcast-rejected] (fnil inc 0))
+        :net-envelopes []
+        :stdout-events []}))))
 
 (defn handle-wire-chain-state-snapshot
   "Handles incoming validator :chain-state-snapshot over wire.
@@ -4196,8 +4426,6 @@
                                     (or sess-epoch msg-epoch))
                         max-skew (long (or (:max-epoch-skew state) 2))
                         skew-exceeded? (and (not (contains? #{:chain-state-snapshot
-                                                              :p2p-offer
-                                                              :p2p-answer
                                                               :p2p-hub-relay
                                                               :p2p-broadcast}
                                                             msg-type))
@@ -4206,7 +4434,15 @@
                                             (or (nil? sess-epoch)
                                                 (> (math-abs (- msg-epoch (long sess-epoch))) max-skew)))]
                     (if skew-exceeded?
-                      {:state state :net-envelopes [] :stdout-events []}
+                      (let [p2p-sig? (contains? #{:p2p-offer :p2p-answer} msg-type)
+                            diag-event (when p2p-sig?
+                                         {"event" "p2p-signaling-rejected" "reason" "epoch-skew-exceeded"})
+                            new-state (cond-> state
+                                        true (update-in [:diagnostics :epoch-skew-dropped] (fnil inc 0))
+                                        p2p-sig? (update-in [:diagnostics :p2p-signaling-rejected] (fnil inc 0)))]
+                        {:state new-state
+                         :net-envelopes []
+                         :stdout-events (if diag-event [diag-event] [])})
                       (let [res (case msg-type
                                   :channel-offer (handle-wire-offer state msg privkey-bytes)
                                   :channel-accept (handle-wire-accept state msg)
@@ -4220,7 +4456,7 @@
                                   :p2p-offer (handle-wire-p2p-offer state msg)
                                   :p2p-answer (handle-wire-p2p-answer state msg)
                                   :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
-                                  :p2p-broadcast (handle-wire-broadcast state msg)
+                                  :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
                                   {:state state :net-envelopes [] :stdout-events []})]
                         (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
                           (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
@@ -4767,11 +5003,18 @@
         simon-2 (:state (handle-wire-payload (:state p2p-off)
                                              (first (:net-envelopes p2p-ans))
                                              (:private kp-simon)))
+        ;; P2P channel opens -> transition p2p-channel-state to connected: true on both sides
+        nexus-p2p (handle-command (:state p2p-ans)
+                                  {"cmd" "p2p-channel-state" "session_id" sid-sn "connected" true}
+                                  (:private kp-nexus))
+        simon-p2p (handle-command simon-2
+                                  {"cmd" "p2p-channel-state" "session_id" sid-sn "connected" true}
+                                  (:private kp-simon))
         ;; 2. 3-way Broadcast across Simon, Nexus, and Axiom on chat/simon-nexus-axiom
-        b-simon (handle-command simon-2
+        b-simon (handle-command (:state simon-p2p)
                                 {"cmd" "broadcast" "text" "Browser ready on chat/simon-nexus-axiom" "subnet_id" subnet-id}
                                 (:private kp-simon))
-        b-nexus (handle-command (:state p2p-ans)
+        b-nexus (handle-command (:state nexus-p2p)
                                 {"cmd" "broadcast" "text" "JVM Light-Node ready on chat/simon-nexus-axiom" "subnet_id" subnet-id}
                                 (:private kp-nexus))
         b-axiom (handle-command axiom-0

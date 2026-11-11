@@ -3,6 +3,7 @@
    Handles CLI invocation, JSONL STDIN/STDOUT serve loop, state persistence
    with atomic rename (0600 permissions), and WebRTC DataChannel agent connections."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.agent-sim :as agent-sim]
@@ -13,6 +14,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datachannel.api :as api]
+            [datachannel.mdns :as mdns]
             [taoensso.nippy :as nippy])
   (:import [java.io BufferedReader InputStreamReader PrintWriter RandomAccessFile]
            [java.net URI]
@@ -21,6 +23,8 @@
            [java.nio.file Files StandardCopyOption]
            [java.nio.file.attribute PosixFilePermissions]
            [java.time Duration]))
+
+(declare dial-p2p-peer! send-routed-envelopes!)
 
 ;; -----------------------------------------------------------------------------
 ;; Pure State Sanitization & Argument Parsing
@@ -242,6 +246,20 @@
                                     sid (assoc "session_id" sid)
                                     cands (assoc "candidates" (vec (remove str/blank? (map str/trim (str/split cands #",")))))
                                     tr (assoc "transport" tr)))
+                   "p2p-channel-state" (let [sid (or (extract-flag-value args "--session-id" nil)
+                                                     (extract-flag-value args "--session" nil))
+                                             conn-raw (extract-flag-value args "--connected" nil)
+                                             conn? (if (some? conn-raw)
+                                                     (not= (str/lower-case (str/trim (str conn-raw))) "false")
+                                                     (boolean (some #{"--connected"} args)))
+                                             tr (extract-flag-value args "--transport" nil)
+                                             err (extract-flag-value args "--error" nil)
+                                             m {"cmd" "p2p-channel-state"
+                                                "session_id" sid
+                                                "connected" conn?}]
+                                         (cond-> m
+                                           tr (assoc "transport" tr)
+                                           err (assoc "error" err)))
                    "broadcast" (let [t (extract-flag-value args "--text" nil)
                                      sub (extract-flag-value args "--subnet-id" nil)
                                      m {"cmd" "broadcast"}]
@@ -303,6 +321,14 @@
         proxy-cli (extract-flag-value clean-args "--proxy" nil)
         proxy-url (resolve-proxy-url proxy-cli)
         subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+        trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
+        trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
+                              (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
+                                                      (str/starts-with? (str/trim trusted-dac-anchors-raw) "#{"))
+                                                (try (edn/read-string trusted-dac-anchors-raw)
+                                                     (catch Exception _ (str/split trusted-dac-anchors-raw #",")))
+                                                (str/split trusted-dac-anchors-raw #","))]
+                                (set (map #(or (light-core/normalize-pubkey-hex %) (str/trim (str %))) (remove str/blank? (map str raw-items))))))
         turn-server (extract-flag-value clean-args "--turn-server" nil)
         turn-username (extract-flag-value clean-args "--turn-username" nil)
         turn-password (extract-flag-value clean-args "--turn-password" nil)
@@ -340,6 +366,7 @@
       subnet-id (assoc :subnet-id subnet-id)
       timeout-ms (assoc :timeout-ms timeout-ms)
       ingress-tcp-port (assoc :ingress-tcp-port (int ingress-tcp-port))
+      (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
       proxy-url (assoc :proxy proxy-url)
       turn-config (assoc :turn-config turn-config))))
 
@@ -1056,8 +1083,12 @@
                              (when (and event-out (seq (:stdout-events res)))
                                (doseq [ev (:stdout-events res)]
                                  (event-out ev)))
+                             (when-let [dial-info (:p2p-dial res)]
+                               (dial-p2p-peer! state-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) (:mdns-atom ctx) (:privkey-bytes identity) event-out dial-info))
                              (when (seq (:net-envelopes res))
-                               (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts))))))))
+                               (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) (:net-envelopes res))
+                                 (send-routed-envelopes! (:net-envelopes res) send-fn-atom (:p2p-peers-atom ctx) (:ingress-peers-atom ctx) state-atom (:privkey-bytes identity))
+                                 (dispatch-auto-reply! (:net-envelopes res) send-fn-atom state-atom conn-atom event-out reconnect-fn cb-opts)))))))))
      :on-error (fn [evt]
                  (when (str/includes? (str (:message evt)) "Fingerprint")
                    (deliver connected? :bad-fingerprint)))
@@ -1362,6 +1393,191 @@
                  (catch InterruptedException _ nil))
             (recur next-offset)))))))
 
+;; -----------------------------------------------------------------------------
+;; P2P Direct Signaling & Transport Binding
+;; -----------------------------------------------------------------------------
+
+(defn build-p2p-link-bind-envelope
+  "Builds and signs a :p2p-link-bind envelope proving peer pubkey and session identity."
+  [sender-pub sender-priv sid]
+  (let [norm-sender (light-core/normalize-pubkey-hex sender-pub)
+        sig-str (str "bitecho-p2p-link-bind-v1|" norm-sender "|" sid)
+        sig-bytes (crypto/sign sender-priv (fressian/utf8->bytes sig-str))]
+    {:bitecho/type :p2p-link-bind
+     :type :p2p-link-bind
+     :sender norm-sender
+     :session-id sid
+     :signature (fressian/bytes->hex sig-bytes)}))
+
+(defn verify-p2p-link-bind
+  "Verifies a :p2p-link-bind message signature."
+  [msg]
+  (when (and (map? msg) (= :p2p-link-bind (or (:type msg) (:bitecho/type msg))))
+    (let [sender (light-core/normalize-pubkey-hex (:sender msg))
+          sid (:session-id msg)
+          sig-hex (:signature msg)]
+      (when (and sender sid sig-hex)
+        (let [pub-bytes (try (basalt/hex->bytes sender) (catch Exception _ nil))
+              sig-bytes (try (basalt/hex->bytes sig-hex) (catch Exception _ nil))
+              sig-str (str "bitecho-p2p-link-bind-v1|" sender "|" sid)]
+          (boolean
+           (and pub-bytes sig-bytes
+                (crypto/verify pub-bytes (fressian/utf8->bytes sig-str) sig-bytes))))))))
+
+(defn route-net-envelope!
+  "Routes an outgoing network envelope directly to P2P peer(s) or falls back to validator gossip."
+  [env send-fn-atom p2p-peers-atom ingress-peers-atom state-atom privkey-bytes]
+  (let [send-default! (fn []
+                        (when-let [sfn (cond
+                                         (instance? clojure.lang.IAtom send-fn-atom) @send-fn-atom
+                                         (fn? send-fn-atom) send-fn-atom
+                                         :else nil)]
+                          (sfn env)))]
+    (cond
+      (:p2p-broadcast? env)
+      (let [p2p-sends (keep :send-fn (vals (or (when p2p-peers-atom @p2p-peers-atom) {})))
+            ingress-sends (vals (or (when ingress-peers-atom @ingress-peers-atom) {}))
+            all-sends (concat p2p-sends ingress-sends)]
+        (if (seq all-sends)
+          (doseq [sfn all-sends]
+            (try (sfn env) (catch Throwable _ nil)))
+          (send-default!)))
+
+      (:p2p-direct? env)
+      (let [norm-target (light-core/normalize-pubkey-hex (:p2p-peer env))
+            p2p-entry (when p2p-peers-atom (get @p2p-peers-atom norm-target))
+            ingress-send (when ingress-peers-atom (get @ingress-peers-atom norm-target))
+            direct-send (or (:send-fn p2p-entry) ingress-send)]
+        (if direct-send
+          (try (direct-send env) (catch Throwable _ (send-default!)))
+          (do
+            (when (and state-atom (:p2p-session-id env))
+              (let [cmd-res (light-core/handle-command @state-atom
+                                                       {"cmd" "p2p-channel-state"
+                                                        "session_id" (:p2p-session-id env)
+                                                        "connected" false
+                                                        "error" "no-direct-route"}
+                                                       privkey-bytes)]
+                (reset! state-atom (:state cmd-res))))
+            (send-default!))))
+
+      :else
+      (send-default!))))
+
+(defn send-routed-envelopes!
+  "Routes a sequence of outgoing network envelopes via route-net-envelope!."
+  [envs send-fn-atom p2p-peers-atom ingress-peers-atom state-atom privkey-bytes]
+  (doseq [env envs]
+    (route-net-envelope! env send-fn-atom p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))
+  true)
+
+(defn dial-p2p-peer!
+  "Dials a remote P2P candidate peer via WebRTC DataChannel (TCP/UDP/mDNS)."
+  [state-atom p2p-peers-atom ingress-peers-atom mdns-atom privkey-bytes emit-event! dial-info]
+  (let [peer-pk (light-core/normalize-pubkey-hex (:peer dial-info))
+        sid (:session-id dial-info)
+        existing-p2p (when p2p-peers-atom (get @p2p-peers-atom peer-pk))]
+    (if (and existing-p2p (:send-fn existing-p2p))
+      (let [cmd-res (light-core/handle-command @state-atom
+                                               {"cmd" "p2p-channel-state"
+                                                "session_id" sid
+                                                "connected" true}
+                                               privkey-bytes)]
+        (reset! state-atom (:state cmd-res))
+        (when emit-event!
+          (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))
+      (let [candidates (or (:remote-candidates dial-info) [])
+            mdns-state (when mdns-atom @mdns-atom)
+            parsed-candidates (keep #(light-core/parse-p2p-candidate % mdns-state) candidates)
+            success? (atom false)]
+        (doseq [cand parsed-candidates
+                :while (not @success?)]
+          (try
+            (let [host (:host cand)
+                  port (int (:port cand))
+                  transport (or (:transport cand) :tcp)
+                  connected-prom (promise)
+                  channel-id (atom nil)
+                  client-node (api/create-node {:port 0 :setup "active"})
+                  peer-send! (fn [env]
+                               (if-let [cid @channel-id]
+                                 (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch Throwable _ nil))]
+                                   (if payload
+                                     (try (api/send! client-node payload cid) true (catch Throwable _ false))
+                                     false))
+                                 false))
+                  peer-close! (fn [] (try (api/close! client-node) (catch Throwable _ nil)))
+                  remote-sdp (cond-> {:ip host
+                                      :port port
+                                      :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
+                                      :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
+                               (:remote-fingerprint dial-info)
+                               (assoc :fingerprint (identity/normalize-fingerprint (:remote-fingerprint dial-info)))
+                               (:proxy-connect? cand)
+                               (assoc :proxy (resolve-proxy-url nil)))]
+              (api/set-callbacks!
+               client-node
+               {:on-open (fn [evt]
+                           (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                             (reset! channel-id cid)
+                             (deliver connected-prom true)))
+                :on-data-channel (fn [evt]
+                                   (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                     (reset! channel-id cid)
+                                     (deliver connected-prom true)))
+                :on-message (fn [evt]
+                              (when-let [payload (:payload evt)]
+                                (when state-atom
+                                  (let [st @state-atom
+                                        res (light-core/handle-wire-payload st payload privkey-bytes)]
+                                    (reset! state-atom (:state res))
+                                    (when (seq (:stdout-events res))
+                                      (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
+                                    (when (seq (:net-envelopes res))
+                                      (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
+                :on-close (fn [_]
+                            (when p2p-peers-atom
+                              (swap! p2p-peers-atom dissoc peer-pk))
+                            (when state-atom
+                              (let [cmd-res (light-core/handle-command @state-atom
+                                                                       {"cmd" "p2p-channel-state"
+                                                                        "session_id" sid
+                                                                        "connected" false
+                                                                        "error" "channel-closed"}
+                                                                       privkey-bytes)]
+                                (reset! state-atom (:state cmd-res))
+                                (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))})
+              (if (or (= transport :tcp) (= transport :connect))
+                (api/start-tcp! client-node remote-sdp {})
+                (api/start! client-node remote-sdp {}))
+              (let [res (deref connected-prom 3000 :timeout)]
+                (when (= res true)
+                  (reset! success? true)
+                  (when p2p-peers-atom
+                    (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
+                                                         :close-fn peer-close!
+                                                         :session-id sid}))
+                  (let [local-pub (or (:pubkey @state-atom) "")
+                        bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
+                    (peer-send! bind-env))
+                  (let [cmd-res (light-core/handle-command @state-atom
+                                                           {"cmd" "p2p-channel-state"
+                                                            "session_id" sid
+                                                            "connected" true}
+                                                           privkey-bytes)]
+                    (reset! state-atom (:state cmd-res))
+                    (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev)))))))
+            (catch Throwable _ nil)))
+        (when-not @success?
+          (let [cmd-res (light-core/handle-command @state-atom
+                                                   {"cmd" "p2p-channel-state"
+                                                    "session_id" sid
+                                                    "connected" false
+                                                    "error" "p2p-dial-failed"}
+                                                   privkey-bytes)]
+            (reset! state-atom (:state cmd-res))
+            (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev)))))))))
+
 (defn start-ingress-tcp-listener!
   "Starts a passive RFC 4571 DTLS-over-TCP DataChannel ingress listener on `:ingress-tcp-port`
    for direct `HTTP CONNECT` / TCP peer connections (Step 15C).
@@ -1369,7 +1585,7 @@
   [identity opts]
   (let [port (int (or (:ingress-tcp-port opts) 0))]
     (when (pos? port)
-      (let [{:keys [state-atom conn-atom event-out state-file]} opts
+      (let [{:keys [state-atom conn-atom event-out state-file p2p-peers-atom mdns-atom]} opts
             ingress-peers-atom (or (:ingress-peers-atom opts) (atom {}))
             peer-ice-pwds (atom {})
             listener
@@ -1388,6 +1604,7 @@
                 (try (api/set-max-message-size! peer-node) (catch Exception _ nil))
                 (let [peer-key (System/identityHashCode peer-node)
                       peer-cid (atom 0)
+                      bound-sender (atom nil)
                       peer-send! (fn [env]
                                    (let [payload (try
                                                    (if (bytes? env) env (fressian/encode-wire env))
@@ -1397,7 +1614,8 @@
                                        (try
                                          (api/send! peer-node payload (int (or @peer-cid 0)))
                                          true
-                                         (catch Throwable _ false)))))]
+                                         (catch Throwable _ false)))))
+                      peer-close! (fn [] (try (api/close! peer-node) (catch Exception _ nil)))]
                   (swap! ingress-peers-atom assoc peer-key peer-send!)
                   (api/set-callbacks!
                    peer-node
@@ -1414,7 +1632,27 @@
                         (when-let [payload (:payload evt)]
                           (let [decoded (try (if (bytes? payload) (fressian/decode-wire payload) payload) (catch Exception _ nil))
                                 inner-ev (if (and (map? decoded) (map? (:event decoded))) (:event decoded) decoded)]
-                            (if (and (map? inner-ev) (= :query-chain-state (or (:type inner-ev) (:bitecho/type inner-ev))))
+                            (cond
+                              (and (map? inner-ev) (= :p2p-link-bind (or (:type inner-ev) (:bitecho/type inner-ev))))
+                              (when (verify-p2p-link-bind inner-ev)
+                                (let [norm-sender (light-core/normalize-pubkey-hex (:sender inner-ev))
+                                      sid (:session-id inner-ev)]
+                                  (reset! bound-sender norm-sender)
+                                  (when p2p-peers-atom
+                                    (swap! p2p-peers-atom assoc norm-sender {:send-fn peer-send!
+                                                                             :close-fn peer-close!
+                                                                             :session-id sid}))
+                                  (when (and state-atom sid (get-in @state-atom [:sessions sid]))
+                                    (let [cmd-res (light-core/handle-command @state-atom
+                                                                             {"cmd" "p2p-channel-state"
+                                                                              "session_id" sid
+                                                                              "connected" true}
+                                                                             (:privkey-bytes identity))]
+                                      (reset! state-atom (:state cmd-res))
+                                      (when (and event-out (seq (:stdout-events cmd-res)))
+                                        (doseq [ev (:stdout-events cmd-res)] (event-out ev)))))))
+
+                              (and (map? inner-ev) (= :query-chain-state (or (:type inner-ev) (:bitecho/type inner-ev))))
                               (let [st (if state-atom @state-atom {})
                                     target-pk (or (:pubkey inner-ev) (:agent-pubkey decoded) (:pubkey st) (:pubkey-hex identity))
                                     fin-ep (long (or (get-in st [:account :finalized-epoch]) (:epoch st) 0))
@@ -1435,30 +1673,59 @@
                                                :nonce (str (or (:nonce inner-ev) ""))}
                                     signed-snap (light-core/sign-chain-state-snapshot base-snap (:privkey-bytes identity))]
                                 (peer-send! signed-snap))
-                              (when state-atom
-                                (let [st @state-atom
-                                      res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
-                                  (reset! state-atom (:state res))
-                                  (when (and state-file (not= st (:state res)))
-                                    (try (save-light-state! state-file (:state res)) (catch Exception _ nil)))
-                                  (when (and event-out (seq (:stdout-events res)))
-                                    (doseq [ev (:stdout-events res)]
-                                      (event-out ev)))
-                                  (when (seq (:net-envelopes res))
-                                    (doseq [env (:net-envelopes res)]
-                                      (peer-send! env))
-                                    (when (and conn-atom (connection-live? @conn-atom @state-atom))
-                                      (send-all-envelopes! (:send-fn @conn-atom) (:net-envelopes res)))))))))))
+
+                              :else
+                              (do
+                                (when (and (map? inner-ev) (contains? #{:p2p-offer :p2p-answer :p2p-broadcast :p2p-hub-relay :sealed-message}
+                                                                      (or (:type inner-ev) (:bitecho/type inner-ev))))
+                                  (when-let [norm-sender (light-core/normalize-pubkey-hex (:sender inner-ev))]
+                                    (reset! bound-sender norm-sender)
+                                    (when p2p-peers-atom
+                                      (swap! p2p-peers-atom update norm-sender #(merge {:send-fn peer-send! :close-fn peer-close!} %)))))
+                                (when state-atom
+                                  (let [st @state-atom
+                                        res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
+                                    (reset! state-atom (:state res))
+                                    (when (and state-file (not= st (:state res)))
+                                      (try (save-light-state! state-file (:state res)) (catch Exception _ nil)))
+                                    (when (and event-out (seq (:stdout-events res)))
+                                      (doseq [ev (:stdout-events res)]
+                                        (event-out ev)))
+                                    (when-let [dial-info (:p2p-dial res)]
+                                      (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
+                                    (when (seq (:net-envelopes res))
+                                      (send-routed-envelopes! (:net-envelopes res)
+                                                              (when (and conn-atom (connection-live? @conn-atom @state-atom))
+                                                                (:send-fn @conn-atom))
+                                                              p2p-peers-atom
+                                                              ingress-peers-atom
+                                                              state-atom
+                                                              (:privkey-bytes identity)))))))))))
                     :on-close (fn [_]
-                                (swap! ingress-peers-atom dissoc peer-key))})))})]
+                                (swap! ingress-peers-atom dissoc peer-key)
+                                (when-let [peer @bound-sender]
+                                  (let [entry (when p2p-peers-atom (get @p2p-peers-atom peer))
+                                        sid (:session-id entry)]
+                                    (when p2p-peers-atom (swap! p2p-peers-atom dissoc peer))
+                                    (when (and state-atom sid (get-in @state-atom [:sessions sid]))
+                                      (let [cmd-res (light-core/handle-command @state-atom
+                                                                               {"cmd" "p2p-channel-state"
+                                                                                "session_id" sid
+                                                                                "connected" false
+                                                                                "error" "channel-closed"}
+                                                                               (:privkey-bytes identity))]
+                                        (reset! state-atom (:state cmd-res))
+                                        (when (and event-out (seq (:stdout-events cmd-res)))
+                                          (doseq [ev (:stdout-events cmd-res)] (event-out ev))))))))})))})]
         {:listener listener
          :ingress-peers-atom ingress-peers-atom
+         :p2p-peers-atom p2p-peers-atom
          :stop! #(try (api/close! listener) (catch Exception _ nil))}))))
 
 (defn handle-serve-line!
   "Processes a single STDIN or --cmd-file JSON line in serve mode, handling network retries if required."
   [line ctx]
-  (let [{:keys [state-atom conn-atom out-writer events-out state-file identity bootstrap conn-opts ingress-peers-atom]} ctx
+  (let [{:keys [state-atom conn-atom out-writer events-out state-file identity bootstrap conn-opts ingress-peers-atom p2p-peers-atom mdns-atom]} ctx
         emit! (fn [payload] (emit-json-line! out-writer payload events-out))
         cmd-map (try (json/read-str line) (catch Exception _ nil))
         verb (when (map? cmd-map) (get cmd-map "cmd"))
@@ -1484,6 +1751,8 @@
                                  line))
                              line)
             res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
+            _ (when-let [dial-info (:p2p-dial res)]
+                (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info))
             needs-net? (seq (:net-envelopes res))]
         (if needs-net?
           (let [currently-live? (connection-live? @conn-atom @state-atom)
@@ -1491,58 +1760,71 @@
                               (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
                 live-envs (if (seq replay-envs)
                             (into (vec replay-envs) (:net-envelopes res))
-                            (:net-envelopes res))
-                sent-ingress? (boolean
-                               (when (and ingress-peers-atom (seq @ingress-peers-atom))
-                                 (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
-                sent-val? (when currently-live?
-                            (send-all-envelopes! (:send-fn @conn-atom) live-envs))
-                sent? (or sent-val? sent-ingress?)]
-            (if sent?
+                            (:net-envelopes res))]
+            (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
               (do
-                (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                (send-routed-envelopes! live-envs
+                                        (when currently-live? (:send-fn @conn-atom))
+                                        p2p-peers-atom
+                                        ingress-peers-atom
+                                        state-atom
+                                        (:privkey-bytes identity))
+                (reset! state-atom (:state res))
                 (sync-conn-diagnostics! state-atom conn-atom)
                 (save-light-state! state-file @state-atom)
                 (when-let [resp (:response res)]
                   (emit! resp)))
-              (do
-                (when conn-atom
-                  (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
-                (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
-                      cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
-                      home-set (if state-atom (:home-set @state-atom) [])
-                      opts-with-gen (assoc (or conn-opts {})
-                                           :generation target-gen
-                                           :validator-cursor cursor
-                                           :home-set home-set)
-                      reconn (connect-validators! identity bootstrap opts-with-gen)]
-                  (if (:ok? reconn)
-                    (do
-                      (when conn-atom
-                        (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
-                      (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
-                            all-envs (into (vec replay-envs) (:net-envelopes res))]
-                        (if (send-all-envelopes! (:send-fn reconn) all-envs)
-                          (do
-                            (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
-                            (sync-conn-diagnostics! state-atom conn-atom)
-                            (save-light-state! state-file @state-atom)
-                            (when-let [resp (:response res)]
-                              (emit! resp)))
-                          (let [err "send-failed"]
-                            (when conn-atom
-                              (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
-                            (when state-atom
-                              (swap! state-atom assoc :connected? false :connection-error err))
-                            (sync-conn-diagnostics! state-atom conn-atom)
-                            (emit! {"ok" false "error" err})))))
-                    (let [err (or (:error reconn) "listener-disabled")]
-                      (when conn-atom
-                        (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
-                      (when state-atom
-                        (swap! state-atom assoc :connected? false :connection-error err))
-                      (sync-conn-diagnostics! state-atom conn-atom)
-                      (emit! {"ok" false "error" err})))))))
+              (let [sent-ingress? (boolean
+                                   (when (and ingress-peers-atom (seq @ingress-peers-atom))
+                                     (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
+                    sent-val? (when currently-live?
+                                (send-all-envelopes! (:send-fn @conn-atom) live-envs))
+                    sent? (or sent-val? sent-ingress?)]
+                (if sent?
+                  (do
+                    (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                    (sync-conn-diagnostics! state-atom conn-atom)
+                    (save-light-state! state-file @state-atom)
+                    (when-let [resp (:response res)]
+                      (emit! resp)))
+                  (do
+                    (when conn-atom
+                      (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
+                    (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
+                          cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
+                          home-set (if state-atom (:home-set @state-atom) [])
+                          opts-with-gen (assoc (or conn-opts {})
+                                               :generation target-gen
+                                               :validator-cursor cursor
+                                               :home-set home-set)
+                          reconn (connect-validators! identity bootstrap opts-with-gen)]
+                      (if (:ok? reconn)
+                        (do
+                          (when conn-atom
+                            (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
+                          (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
+                                all-envs (into (vec replay-envs) (:net-envelopes res))]
+                            (if (send-all-envelopes! (:send-fn reconn) all-envs)
+                              (do
+                                (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                                (sync-conn-diagnostics! state-atom conn-atom)
+                                (save-light-state! state-file @state-atom)
+                                (when-let [resp (:response res)]
+                                  (emit! resp)))
+                              (let [err "send-failed"]
+                                (when conn-atom
+                                  (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
+                                (when state-atom
+                                  (swap! state-atom assoc :connected? false :connection-error err))
+                                (sync-conn-diagnostics! state-atom conn-atom)
+                                (emit! {"ok" false "error" err})))))
+                        (let [err (or (:error reconn) "listener-disabled")]
+                          (when conn-atom
+                            (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
+                          (when state-atom
+                            (swap! state-atom assoc :connected? false :connection-error err))
+                          (sync-conn-diagnostics! state-atom conn-atom)
+                          (emit! {"ok" false "error" err})))))))))
           (do
             (reset! state-atom (:state res))
             (sync-conn-diagnostics! state-atom conn-atom)
@@ -1623,10 +1905,12 @@
                          (cond-> loaded-state
                            (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                            (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
-                           (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
+                           (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
+                           (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))))
                        (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
                                                                       :autonomous? (boolean (:autonomous? opts false))}
-                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
+                                                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts)))))
         initial-state (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
         state-atom (atom initial-state)
         conn-atom (atom (init-conn-state))
@@ -1665,6 +1949,9 @@
                                     :connection-error err)
                              (sync-conn-diagnostics! state-atom conn-atom)
                              reconn))))
+        mdns-svc (try (mdns/start-mdns-service! {:port 0}) (catch Exception _ nil))
+        mdns-atom (atom (or (:table-atom mdns-svc) (mdns/init-mdns-table)))
+        p2p-peers-atom (atom {})
         ingress-peers-atom (atom {})
         conn-opts (assoc opts
                          :state-atom state-atom
@@ -1673,6 +1960,8 @@
                          :reconnect-fn reconnect-fn
                          :state-file state-file
                          :ingress-peers-atom ingress-peers-atom
+                         :p2p-peers-atom p2p-peers-atom
+                         :mdns-atom mdns-atom
                          :async-reconnect? true)
         _ (reset! conn-opts-atom conn-opts)
         ingress-listener (start-ingress-tcp-listener! identity conn-opts)
@@ -1688,6 +1977,8 @@
              :identity identity
              :bootstrap bootstrap
              :ingress-peers-atom ingress-peers-atom
+             :p2p-peers-atom p2p-peers-atom
+             :mdns-atom mdns-atom
              :conn-opts conn-opts}
         _ (when auto-sync-enabled?
             (doto (Thread.
@@ -1748,6 +2039,8 @@
               (recur)))))
       (finally
         (reset! daemon-running? false)
+        (when mdns-svc
+          (try (mdns/stop-mdns-service! mdns-svc) (catch Exception _ nil)))
         (when-let [stop-fn (:stop! ingress-listener)]
           (try (stop-fn) (catch Exception _ nil)))))))
 
@@ -1763,10 +2056,12 @@
                          (cond-> loaded-state
                            (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
                            (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
-                           (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))))
+                           (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
+                           (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))))
                        (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
                                                                       :autonomous? (boolean (:autonomous? opts false))}
-                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
+                                                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts)))))
         initial-state (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew base-state) 15)))
         state-atom (atom initial-state)
         raw-cmd-map (:cmd-map opts)

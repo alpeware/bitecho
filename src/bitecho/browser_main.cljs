@@ -92,17 +92,19 @@
 
 (defn- prune-ghost-sessions
   "Removes restored sessions whose ephemeral/session keys (:tx-key, :ephemeral-priv)
-   were stripped during IndexedDB persistence sanitization."
+   were stripped during IndexedDB persistence sanitization, and strips transient :p2p liveness per Rule 4."
   [sessions]
   (if-not (map? sessions)
     {}
     (into {}
-          (filter (fn [[_sid s]]
-                    (let [st (or (:state s) (when (:status s) (name (:status s))))]
-                      (cond
-                        (= st "open") (or (some? (:tx-key s)) (some? (:session-keys s)))
-                        (= st "offered") (some? (:ephemeral-priv s))
-                        :else false))))
+          (keep (fn [[sid s]]
+                  (let [st (or (:state s) (when (:status s) (name (:status s))))
+                        survives? (cond
+                                    (= st "open") (or (some? (:tx-key s)) (some? (:session-keys s)))
+                                    (= st "offered") (some? (:ephemeral-priv s))
+                                    :else false)]
+                    (when survives?
+                      [sid (dissoc s :p2p)]))))
           sessions)))
 
 (defn- apply-hardware-identity!
@@ -1341,6 +1343,48 @@
                                :response resp}
                         (not cmd-ok?) (assoc :error (get resp "error")))))))))))
 
+(defn set-p2p-channel-state
+  "Sets the direct P2P transport connectivity status for a session per Rule 4."
+  ([session-id connected?]
+   (set-p2p-channel-state @active-node-atom session-id connected? nil))
+  ([arg1 arg2 arg3]
+   (if (or (satisfies? IAtom arg1)
+           (and (some? arg1) (fn? (.-deref arg1))))
+     (set-p2p-channel-state arg1 arg2 arg3 nil)
+     (set-p2p-channel-state @active-node-atom arg1 arg2 arg3)))
+  ([node-atom session-id connected? opts]
+   (let [na (or (when (or (satisfies? IAtom node-atom)
+                          (and (some? node-atom) (fn? (.-deref node-atom))))
+                  node-atom)
+                @active-node-atom)]
+     (if-not na
+       (clj->js {:ok false :error "no-active-node"})
+       (let [node @na
+             privkey (:private-key (:keypair node))
+             opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
+             transport (:transport opts-map)
+             err-val (or (:error opts-map) (:reason opts-map))
+             cmd-map (cond-> {"cmd" "p2p-channel-state"
+                              "session_id" (str session-id)
+                              "connected" (boolean connected?)}
+                       transport (assoc "transport" (str transport))
+                       err-val (assoc "error" (str err-val)))
+             cmd-res (light-core/handle-command (:light-state node) cmd-map privkey)
+             new-st (:state cmd-res)
+             resp (:response cmd-res)
+             cmd-ok? (boolean (get resp "ok" true))]
+         (swap! na (fn [curr]
+                     (-> curr
+                         (assoc :light-state new-st)
+                         (assoc :sessions (:sessions new-st)))))
+         (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+         (notify-ui-listeners!)
+         (clj->js (cond-> {:ok cmd-ok?
+                           :sessionId (str session-id)
+                           :connected (boolean connected?)
+                           :response resp}
+                    (not cmd-ok?) (assoc :error (get resp "error")))))))))
+
 (defn broadcast-message
   "Broadcasts a zero-burn message across the 3-way mesh subnet (default 'chat/simon-nexus-axiom')."
   ([text] (broadcast-message @active-node-atom text light-core/simon-nexus-axiom-subnet-id))
@@ -1459,6 +1503,7 @@
        :acceptChannelOffer accept-channel-offer
        :p2pOffer p2p-offer
        :p2pAnswer p2p-answer
+       :setP2pChannelState set-p2p-channel-state
        :broadcastMessage broadcast-message
        :sendMessage send-message
        :closeSession close-session

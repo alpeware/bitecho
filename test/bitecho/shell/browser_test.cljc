@@ -457,6 +457,8 @@
             "p2p" "zero-burn?" "zero-burn" "candidates" "local-candidates" "remote-candidates"
             "local-transport" "remote-transport" "local-ice-ufrag" "remote-ice-ufrag"
             "local-fingerprint" "remote-fingerprint" "dtls-fingerprint"
+            "p2p-signaling-rejected" "p2p-dial-failed" "signal-seq" "local-signal-seq" "remote-offer-seq" "remote-answer-seq"
+            "p2p-direct?" "p2p-broadcast?" "p2p-peer" "p2p-session-id" "p2p-dial"
             "domain-a" "domain-a-verified?" "domain-b" "domain-b-verified?"
             "advertisement-verified?" "inter-subnet-routed?" "subnet-mismatch-dropped" "unroutable-dropped"
             "autonomous" "autonomous?" "autonomous-off?" "economy-enabled" "economy-enabled?"
@@ -1013,3 +1015,16 @@
       (is (vector? (get-in sanitized [:light-state :inbox])))
       (is (= ["m1" "m2" "m3"]
              (mapv :text (conj (:chat-history sanitized) {:text "m3"})))))))
+
+(deftest prune-ghost-sessions-test
+  (testing "prune-ghost-sessions strips ghost sessions and removes transient :p2p liveness per Rule 4"
+    (let [sessions {"s1" {:state "open" :tx-key "k1" :peer "p1" :p2p {:phase :open :connected? true}}
+                    "s2" {:state "open" :peer "p2" :p2p {:phase :open :connected? true}} ;; ghost: missing tx-key
+                    "s3" {:state "offered" :ephemeral-priv "priv" :p2p {:phase :offered}}
+                    "s4" {:state "offered" :p2p {:phase :offered}}} ;; ghost: missing ephemeral-priv
+          pruned (browser/prune-ghost-sessions sessions)]
+      (is (= #{"s1" "s3"} (set (keys pruned))))
+      (is (nil? (get-in pruned ["s1" :p2p])))
+      (is (nil? (get-in pruned ["s3" :p2p])))
+      (is (= "k1" (get-in pruned ["s1" :tx-key])))
+      (is (= "priv" (get-in pruned ["s3" :ephemeral-priv]))))))

@@ -1243,7 +1243,7 @@
                  "dac-attach" "dac-revoke" "directory-verify"
                  "directory-register" "directory-lookup"
                  "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"
-                 "p2p-offer" "p2p-answer" "broadcast"
+                 "p2p-offer" "p2p-answer" "p2p-channel-state" "broadcast"
                  "lock-intent" "release-intent" "refund-intent" "escrows"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--ingress-tcp-port"
@@ -1255,7 +1255,8 @@
                   "--offer-hash" "--from"
                   "--escrow-id" "--deliverable-hash" "--expires-epoch" "--preimage"
                   "--nickname" "--domain" "--mailbox" "--prev-pubkey" "--prev-privkey"
-                  "--subnet-id" "--candidates"
+                  "--subnet-id" "--candidates" "--trusted-dac-anchors"
+                  "--connected" "--error"
                   "--auto-sync" "--no-auto-sync" "--sync-interval-ms"
                   "--auto-register-home-set" "--no-auto-register-home-set"
                   "--cmd-file" "--events-out" "--min-seq" "--after-ts"
@@ -1301,6 +1302,8 @@
       (is (= "directory-lookup" (get-in (light-shell/parse-light-node-args ["directory-lookup"]) [:cmd-map "cmd"])))
       (is (= "p2p-offer" (get-in (light-shell/parse-light-node-args ["p2p-offer" "--session-id" "s1"]) [:cmd-map "cmd"])))
       (is (= "p2p-answer" (get-in (light-shell/parse-light-node-args ["p2p-answer" "--session-id" "s1"]) [:cmd-map "cmd"])))
+      (is (= "p2p-channel-state" (get-in (light-shell/parse-light-node-args ["p2p-channel-state" "--session-id" "s1" "--connected"]) [:cmd-map "cmd"])))
+      (is (true? (get-in (light-shell/parse-light-node-args ["p2p-channel-state" "--session-id" "s1" "--connected"]) [:cmd-map "connected"])))
       (is (= "broadcast" (get-in (light-shell/parse-light-node-args ["broadcast" "--text" "hi"]) [:cmd-map "cmd"])))
       (is (= ["c1" "c2"] (get-in (light-shell/parse-light-node-args ["p2p-offer" "--session-id" "s1" "--candidates" "c1,c2"]) [:cmd-map "candidates"])))
       (is (= "chat/simon-nexus-axiom" (get-in (light-shell/parse-light-node-args ["broadcast" "--subnet-id" "chat/simon-nexus-axiom" "--text" "hi"]) [:cmd-map "subnet_id"])))
@@ -1327,6 +1330,7 @@
       (is (= "alice" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "petname"])))
       (is (= "deadbeef" (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "pubkey"])))
       (is (true? (get-in (light-shell/parse-light-node-args ["petname-set" "--petname" "alice" "--pubkey" "deadbeef" "--overwrite"]) [:cmd-map "overwrite"])))
+      (is (= #{"deadbeef"} (:trusted-dac-anchors (light-shell/parse-light-node-args ["status" "--trusted-dac-anchors" "deadbeef"]))))
       ;; Flags (all 22 flags tested end-to-end)
       (is (= "foo/bar" (:state-dir (light-shell/parse-light-node-args ["status" "--state-dir" "foo/bar"]))))
       (is (= "boot.edn" (:bootstrap (light-shell/parse-light-node-args ["status" "--bootstrap" "boot.edn"]))))
@@ -2418,6 +2422,96 @@
               (try (api/close! srv-udp) (catch Exception _ nil))
               (try (api/close! srv-tcp) (catch Exception _ nil)))))
         (finally
+          (doseq [f (reverse (file-seq (.toFile temp-dir)))]
+            (.delete f)))))))
+
+(deftest test-p2p-direct-tcp-ingress-and-zero-burn-routing
+  (testing "Real TCP ingress + P2P DataChannel transport test exchanging :p2p-link-bind, and sending zero-burn message & broadcast with no validator"
+    (let [temp-dir (Files/createTempDirectory "p2p-tcp-test-" (into-array java.nio.file.attribute.FileAttribute []))
+          dir-a (str (.resolve temp-dir "node-a"))
+          dir-b (str (.resolve temp-dir "node-b"))
+          id-a (light-shell/load-or-create-light-identity! dir-a)
+          id-b (light-shell/load-or-create-light-identity! dir-b)
+          port-a (let [ss (java.net.ServerSocket. 0)]
+                   (try (.getLocalPort ss) (finally (.close ss))))
+          init-a (light-core/init-light-state id-a {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
+          init-b (light-core/init-light-state id-b {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
+          off-res (light-core/handle-command init-a
+                                             {"cmd" "offer" "callee" (:pubkey-hex id-b) "price" 0 "burn" 0}
+                                             (:privkey-bytes id-a))
+          sid (get-in off-res [:response "session_id"])
+          state-a-off (:state off-res)
+          b-off-res (reduce (fn [st env] (:state (light-core/handle-wire-payload st env (:privkey-bytes id-b))))
+                            init-b
+                            (:net-envelopes off-res))
+          b-acc-res (light-core/handle-command b-off-res {"cmd" "accept" "session_id" sid} (:privkey-bytes id-b))
+          state-b-open (:state b-acc-res)
+          a-acc-res (reduce (fn [st env] (:state (light-core/handle-wire-payload st env (:privkey-bytes id-a))))
+                            state-a-off
+                            (:net-envelopes b-acc-res))
+          state-a-open a-acc-res
+          state-atom-a (atom state-a-open)
+          state-atom-b (atom state-b-open)
+          p2p-peers-a (atom {})
+          ingress-peers-a (atom {})
+          events-a (atom [])
+          p2p-peers-b (atom {})
+          ingress-peers-b (atom {})
+          events-b (atom [])
+          listener (light-shell/start-ingress-tcp-listener! id-a
+                                                            {:ingress-tcp-port port-a
+                                                             :state-atom state-atom-a
+                                                             :p2p-peers-atom p2p-peers-a
+                                                             :ingress-peers-atom ingress-peers-a
+                                                             :event-out #(swap! events-a conj %)})]
+      (try
+        (let [dial-info {:peer (:pubkey-hex id-a)
+                         :session-id sid
+                         :role :initiator
+                         :transport :tcp
+                         :remote-candidates [(str "tcp://127.0.0.1:" port-a)]}]
+          (light-shell/dial-p2p-peer! state-atom-b p2p-peers-b ingress-peers-b (atom {}) (:privkey-bytes id-b) #(swap! events-b conj %) dial-info)
+          (let [deadline (+ (System/currentTimeMillis) 3000)]
+            (while (and (< (System/currentTimeMillis) deadline)
+                        (not (and (true? (get-in @state-atom-b [:sessions sid :p2p :connected?]))
+                                  (true? (get-in @state-atom-a [:sessions sid :p2p :connected?])))))
+              (Thread/sleep 50)))
+          (is (true? (get-in @state-atom-b [:sessions sid :p2p :connected?])) "Node B direct P2P connected")
+          (is (true? (get-in @state-atom-a [:sessions sid :p2p :connected?])) "Node A direct P2P connected via :p2p-link-bind")
+          (is (some #(= "p2p-connected" (get % "event")) @events-b) "Node B emitted p2p-connected event")
+          (is (some #(= "p2p-connected" (get % "event")) @events-a) "Node A emitted p2p-connected event")
+
+          (let [send-res (light-core/handle-command @state-atom-b
+                                                    {"cmd" "send" "session_id" sid "text" "direct zero burn payload"}
+                                                    (:privkey-bytes id-b))]
+            (is (= 0 (get-in send-res [:response "burn"])) "Send burned 0 ECH")
+            (is (true? (get-in send-res [:response "p2p"])) "Send flagged as direct p2p")
+            (is (true? (:p2p-direct? (first (:net-envelopes send-res)))) "Envelope flagged :p2p-direct?")
+            (reset! state-atom-b (:state send-res))
+            (light-shell/route-net-envelope! (first (:net-envelopes send-res)) nil p2p-peers-b ingress-peers-b state-atom-b (:privkey-bytes id-b))
+            (let [deadline (+ (System/currentTimeMillis) 3000)]
+              (while (and (< (System/currentTimeMillis) deadline)
+                          (empty? (:inbox @state-atom-a)))
+                (Thread/sleep 50)))
+            (is (= 1 (count (:inbox @state-atom-a))) "Node A received 1:1 message")
+            (is (= "direct zero burn payload" (:text (first (:inbox @state-atom-a)))) "Message content matches"))
+
+          (let [bcast-res (light-core/handle-command @state-atom-b
+                                                     {"cmd" "broadcast" "text" "mesh broadcast zero burn"}
+                                                     (:privkey-bytes id-b))]
+            (is (true? (get-in bcast-res [:response "zero_burn"])) "Broadcast flagged zero_burn")
+            (is (true? (:p2p-broadcast? (first (:net-envelopes bcast-res)))) "Envelope flagged :p2p-broadcast?")
+            (reset! state-atom-b (:state bcast-res))
+            (light-shell/route-net-envelope! (first (:net-envelopes bcast-res)) nil p2p-peers-b ingress-peers-b state-atom-b (:privkey-bytes id-b))
+            (let [deadline (+ (System/currentTimeMillis) 3000)]
+              (while (and (< (System/currentTimeMillis) deadline)
+                          (empty? (:broadcast-inbox @state-atom-a)))
+                (Thread/sleep 50)))
+            (is (= 1 (count (:broadcast-inbox @state-atom-a))) "Node A received broadcast")
+            (is (= "mesh broadcast zero burn" (:text (first (:broadcast-inbox @state-atom-a)))) "Broadcast text matches")))
+        (finally
+          (when-let [stop-fn (:stop! listener)]
+            (stop-fn))
           (doseq [f (reverse (file-seq (.toFile temp-dir)))]
             (.delete f)))))))
 
