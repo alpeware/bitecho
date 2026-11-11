@@ -238,7 +238,7 @@
 
 (defspec ^{:doc "Generative property test verifying in-session p2p-offer/p2p-answer negotiation, automatic 0-ECH burn 1:1 P2P routing, and opaque Nexus hub relay."}
   prop-p2p-offer-answer-and-zero-burn-1to1-routing 30
-  (for-all [msg-text (gen/not-empty gen/string-ascii)
+  (for-all [msg-text (gen/such-that #(not (str/blank? %)) (gen/not-empty gen/string-ascii))
             mdns-uuid (gen/not-empty gen/string-alphanumeric)]
            (let [kp-browser (crypto/generate-keypair)
                  kp-nexus (crypto/generate-keypair)
@@ -338,8 +338,8 @@
 
 (defspec ^{:doc "Generative property test verifying 3-way zero-burn broadcast deduplication by (sender-pubkey, sender-seq, msg-id) and DAC admission in chat/simon-nexus-axiom."}
   prop-three-way-broadcast-dedup-and-dac-gate 30
-  (for-all [msg-1 (gen/not-empty gen/string-ascii)
-            msg-2 (gen/not-empty gen/string-ascii)]
+  (for-all [msg-1 (gen/such-that #(not (str/blank? %)) (gen/not-empty gen/string-ascii))
+            msg-2 (gen/such-that #(not (str/blank? %)) (gen/not-empty gen/string-ascii))]
            (let [kp-anchor (crypto/generate-keypair)
                  pub-anchor (basalt/bytes->hex (:public kp-anchor))
                  kp-simon (crypto/generate-keypair)

@@ -792,8 +792,7 @@ Sets or notifies the transport connectivity status of a direct P2P session per R
     "ok": true,
     "session_id": "sess-c47b19...",
     "phase": "open",
-    "connected": true,
-    "zero_burn": true
+    "connected": true
   }
   ```
 
@@ -808,11 +807,12 @@ Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across a
   ```json
   {
     "ok": true,
-    "msg_id": "<sha256-hex>",
     "subnet_id": "chat/simon-nexus-axiom",
     "seq": 1,
+    "msg_id": "<sha256-hex>",
+    "burn": 0,
     "zero_burn": true,
-    "direct_p2p": true
+    "p2p": true
   }
   ```
 

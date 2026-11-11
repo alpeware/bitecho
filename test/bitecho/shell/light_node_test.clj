@@ -3,6 +3,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
+            [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.identity :as identity]
@@ -17,6 +18,7 @@
             [clojure.test.check.properties :as prop]
             [datachannel.api :as api]
             [datachannel.core :as dc-core]
+            [datachannel.mdns :as mdns]
             [taoensso.nippy :as nippy])
   (:import [java.io PrintWriter StringWriter]
            [java.net ServerSocket Socket]
@@ -2465,6 +2467,12 @@
                                                              :ingress-peers-atom ingress-peers-a
                                                              :event-out #(swap! events-a conj %)})]
       (try
+        (let [p2p-off (light-core/handle-command @state-atom-a
+                                                 {"cmd" "p2p-offer"
+                                                  "session_id" sid
+                                                  "candidates" [(str "tcp://127.0.0.1:" port-a)]}
+                                                 (:privkey-bytes id-a))]
+          (reset! state-atom-a (:state p2p-off)))
         (let [dial-info {:peer (:pubkey-hex id-a)
                          :session-id sid
                          :role :initiator
@@ -2509,6 +2517,134 @@
                 (Thread/sleep 50)))
             (is (= 1 (count (:broadcast-inbox @state-atom-a))) "Node A received broadcast")
             (is (= "mesh broadcast zero burn" (:text (first (:broadcast-inbox @state-atom-a)))) "Broadcast text matches")))
+        (finally
+          (when-let [stop-fn (:stop! listener)]
+            (stop-fn))
+          (doseq [f (reverse (file-seq (.toFile temp-dir)))]
+            (.delete f)))))))
+
+(deftest test-p2p-dial-seam-and-link-bind-auth
+  (testing "handle-serve-line! :p2p-dial dispatch seam, F-R6 ingress link-bind auth, and F-R1 stale close guard"
+    (let [temp-dir (Files/createTempDirectory "p2p-seam-test-" (into-array FileAttribute []))
+          dir-a (str (.resolve temp-dir "node-a"))
+          dir-b (str (.resolve temp-dir "node-b"))
+          dir-att (str (.resolve temp-dir "node-att"))
+          id-a (light-shell/load-or-create-light-identity! dir-a)
+          id-b (light-shell/load-or-create-light-identity! dir-b)
+          id-att (light-shell/load-or-create-light-identity! dir-att)
+          port-a (let [ss (ServerSocket. 0)]
+                   (try (.getLocalPort ss) (finally (.close ss))))
+          init-a (light-core/init-light-state id-a {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
+          init-b (light-core/init-light-state id-b {:subnet-id "chat/simon-nexus-axiom" :burn-floor 0 :epoch 10})
+          off-res (light-core/handle-command init-a
+                                             {"cmd" "offer" "callee" (:pubkey-hex id-b) "price" 0 "burn" 0}
+                                             (:privkey-bytes id-a))
+          sid (get-in off-res [:response "session_id"])
+          state-a-off (:state off-res)
+          b-off-res (reduce (fn [st env] (:state (light-core/handle-wire-payload st env (:privkey-bytes id-b))))
+                            init-b
+                            (:net-envelopes off-res))
+          b-acc-res (light-core/handle-command b-off-res {"cmd" "accept" "session_id" sid} (:privkey-bytes id-b))
+          state-b-open (:state b-acc-res)
+          a-acc-res (reduce (fn [st env] (:state (light-core/handle-wire-payload st env (:privkey-bytes id-a))))
+                            state-a-off
+                            (:net-envelopes b-acc-res))
+          state-a-open a-acc-res
+          state-atom-a (atom state-a-open)
+          state-atom-b (atom state-b-open)
+          p2p-peers-a (atom {})
+          ingress-peers-a (atom {})
+          events-a (atom [])
+          p2p-peers-b (atom {})
+          ingress-peers-b (atom {})
+          events-b (atom [])
+          sw-b (StringWriter.)
+          pw-b (PrintWriter. sw-b)
+          listener (light-shell/start-ingress-tcp-listener! id-a
+                                                            {:ingress-tcp-port port-a
+                                                             :state-atom state-atom-a
+                                                             :p2p-peers-atom p2p-peers-a
+                                                             :ingress-peers-atom ingress-peers-a
+                                                             :event-out #(swap! events-a conj %)})
+          ctx-b {:state-atom state-atom-b
+                 :conn-atom (atom {:ok? true :channel-id (atom 1)})
+                 :out-writer pw-b
+                 :events-out events-b
+                 :state-file nil
+                 :identity id-b
+                 :bootstrap nil
+                 :conn-opts nil
+                 :ingress-peers-atom ingress-peers-b
+                 :p2p-peers-atom p2p-peers-b
+                 :mdns-atom (atom (mdns/init-mdns-table))}]
+      (try
+        ;; 1. Node A offers P2P upgrade with TCP candidate
+        (let [p2p-off (light-core/handle-command @state-atom-a
+                                                 {"cmd" "p2p-offer"
+                                                  "session_id" sid
+                                                  "candidates" [(str "tcp://127.0.0.1:" port-a)]}
+                                                 (:privkey-bytes id-a))]
+          (reset! state-atom-a (:state p2p-off))
+          ;; Feed A's offer envelope to Node B
+          (doseq [env (:net-envelopes p2p-off)]
+            (let [res (light-core/handle-wire-payload @state-atom-b env (:privkey-bytes id-b))]
+              (reset! state-atom-b (:state res))))
+          (is (= :offer-received (get-in @state-atom-b [:sessions sid :p2p :phase])) "Node B received P2P offer")
+
+          ;; 2. Drive p2p-answer through handle-serve-line! on Node B (the shell dispatch seam!)
+          (let [ans-line (json/write-str {"cmd" "p2p-answer" "session_id" sid})]
+            (light-shell/handle-serve-line! ans-line ctx-b))
+
+          ;; Wait for automatic P2P DataChannel dial and :p2p-link-bind handshake
+          (let [deadline (+ (System/currentTimeMillis) 3000)]
+            (while (and (< (System/currentTimeMillis) deadline)
+                        (not (and (true? (get-in @state-atom-b [:sessions sid :p2p :connected?]))
+                                  (true? (get-in @state-atom-a [:sessions sid :p2p :connected?])))))
+              (Thread/sleep 50)))
+          (is (true? (get-in @state-atom-b [:sessions sid :p2p :connected?])) "Node B connected via seam")
+          (is (true? (get-in @state-atom-a [:sessions sid :p2p :connected?])) "Node A connected via seam")
+          (let [b-entry (get @p2p-peers-b (:pubkey-hex id-a))]
+            (is (some? b-entry) "Node B registered peer in p2p-peers-atom")
+            (is (pos? (:generation b-entry)) "Node B assigned positive generation"))
+
+          ;; 3. F-R6: Attacker attempts unauthorized :p2p-link-bind for sid
+          (let [attacker-node (api/create-node {:port 0 :setup "active"})
+                attacker-prom (promise)
+                attacker-cid (atom nil)
+                forged-bind (light-shell/build-p2p-link-bind-envelope (:pubkey-hex id-att) (:privkey-bytes id-att) sid)
+                initial-rej (long (or (get-in @state-atom-a [:diagnostics :p2p-signaling-rejected]) 0))]
+            (api/set-callbacks!
+             attacker-node
+             {:on-open (fn [evt]
+                         (let [cid (or (:channel-id evt) (:stream-id evt) 0)]
+                           (reset! attacker-cid cid)
+                           (deliver attacker-prom true)))})
+            (api/start-tcp! attacker-node {:ip "127.0.0.1" :port port-a} {})
+            (is (= true (deref attacker-prom 2000 :timeout)) "Attacker connected to ingress port")
+            (when-let [cid @attacker-cid]
+              (api/send! attacker-node (fressian/encode-wire forged-bind) cid))
+            (Thread/sleep 200)
+            (is (nil? (get @p2p-peers-a (:pubkey-hex id-att))) "Attacker was NOT bound in Node A p2p-peers-atom")
+            (is (> (long (or (get-in @state-atom-a [:diagnostics :p2p-signaling-rejected]) 0)) initial-rej)
+                "F-R6: Node A incremented :p2p-signaling-rejected on forged link-bind")
+
+            ;; 4. F-R1: Stale generation :on-close does not evict newer generation in p2p-peers-atom
+            (let [norm-b (:pubkey-hex id-b)
+                  current-entry (get @p2p-peers-a norm-b)
+                  current-gen (:generation current-entry)
+                  initial-stale (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0))]
+              (is (some? current-entry) "Node B currently bound in Node A")
+              ;; Bump generation in p2p-peers-a to simulate a newer generation taking over
+              (swap! p2p-peers-a assoc-in [norm-b :generation] (+ current-gen 10))
+              ;; Now close the attacker node connection
+              (api/close! attacker-node)
+              (Thread/sleep 200)
+              ;; Verify Node B entry is STILL present in p2p-peers-a with the newer generation
+              (is (contains? @p2p-peers-a norm-b) "F-R1: Newer generation entry was NOT evicted by stale close")
+              (is (= (+ current-gen 10) (get-in @p2p-peers-a [norm-b :generation]))
+                  "F-R1: Newer generation preserved")
+              (is (>= (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0)) initial-stale)
+                  "F-R1: Diagnostic counter recorded stale closes"))))
         (finally
           (when-let [stop-fn (:stop! listener)]
             (stop-fn))

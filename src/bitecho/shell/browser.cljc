@@ -254,8 +254,8 @@
      to IndexedDB/disk; identity keys are recovered via WebAuthn/YubiKey assertion or generated
      fresh in memory, and session/transport secrets are re-negotiated via X25519 ECDH / ICE on reconnect.
    - Derived runtime liveness & live handles (:conn, :conn-atom, :active-channels, :channel,
-     :transport, :connected?, :connection-error, :last-error, :conn-diagnostics): never
-     persisted per AGENTS.md Rule 4; re-initialized from `initial-conn-state` on reload.
+     :transport, :connected?, :connection-error, :last-error, :conn-diagnostics, :p2p-channels,
+     :p2p-peers): never persisted per AGENTS.md Rule 4; re-initialized from `initial-conn-state` on reload.
    - Redundant inner :session-id field inside `:sessions {sid record}`: omitted from the allowlist
      while the canonical 64-char SHA-256 `sid` outer map key is preserved."
   #{"pubkey" "pubkeys" "public-key" "public-keys" "public" "public-hex"
@@ -647,6 +647,16 @@
          "a=ice-lite\r\n"
          "a=rtcp-mux\r\n"
          "a=candidate:1 1 UDP 2130706431 " ip " " port " typ host\r\n")))
+
+(defn format-p2p-sdp-answer
+  "Generates passive WebRTC SDP answer for direct browser-to-peer P2P DataChannels from dial-info and a candidate."
+  [dial-info cand]
+  (format-validator-sdp-answer
+   {:ip (:host cand)
+    :port (:port cand)
+    :ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
+    :ice-pwd (or (:remote-ice-pwd dial-info) "pwd")
+    :fingerprint (:remote-fingerprint dial-info)}))
 
 (defn send-webrtc-envelope!
   "Sends an envelope over the active WebRTC DataChannel via Rule 4 :send transition."

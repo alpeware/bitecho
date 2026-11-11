@@ -503,6 +503,7 @@
                           :petnames default-petnames
                           :chat-history []
                           :active-channels {}
+                          :p2p-channels {}
                           :sessions {}
                           :inbox []
                           :outbox []
@@ -558,6 +559,35 @@
                                :unsupportedFormatDropped (or (:unsupported-format-dropped diag) 0)
                                :backgroundThrottledEvents (or (:background-throttled-events diag) 0)}})))))
 
+(declare set-p2p-channel-state dial-browser-p2p-peer! handle-inbound-wire-envelope! route-browser-envelope!)
+
+(defn build-p2p-link-bind-envelope
+  "Builds and signs a :p2p-link-bind envelope proving peer pubkey and session identity."
+  [sender-pub sender-priv sid]
+  (let [norm-sender (light-core/normalize-pubkey-hex sender-pub)
+        sig-str (str "bitecho-p2p-link-bind-v1|" norm-sender "|" sid)
+        sig-bytes (crypto/sign sender-priv (fressian/utf8->bytes sig-str))]
+    {:bitecho/type :p2p-link-bind
+     :type :p2p-link-bind
+     :sender norm-sender
+     :session-id sid
+     :signature (fressian/bytes->hex sig-bytes)}))
+
+(defn verify-p2p-link-bind
+  "Verifies a :p2p-link-bind message signature."
+  [msg]
+  (when (and (map? msg) (= :p2p-link-bind (or (:type msg) (:bitecho/type msg))))
+    (let [sender (light-core/normalize-pubkey-hex (:sender msg))
+          sid (:session-id msg)
+          sig-hex (:signature msg)]
+      (when (and sender sid sig-hex)
+        (let [pub-bytes (try (basalt/hex->bytes sender) (catch :default _ nil))
+              sig-bytes (try (basalt/hex->bytes sig-hex) (catch :default _ nil))
+              sig-str (str "bitecho-p2p-link-bind-v1|" sender "|" sid)]
+          (boolean
+           (and pub-bytes sig-bytes
+                (crypto/verify pub-bytes (fressian/utf8->bytes sig-str) sig-bytes))))))))
+
 (defn- send-to-all-channels!
   [node-atom env]
   (let [channels (:active-channels @node-atom)
@@ -566,78 +596,180 @@
       (when (and dc (= (.-readyState dc) "open"))
         (try (.send dc wire-bytes) (catch :default _ nil))))))
 
+(defn route-browser-envelope!
+  "Routes an outgoing envelope directly to open P2P channel(s) or falls back to validator mesh."
+  [node-atom env]
+  (cond
+    (:p2p-broadcast? env)
+    (let [p2p-chans (vals (or (:p2p-channels @node-atom) {}))
+          open-chans (into [] (keep (fn [entry]
+                                      (let [dc (:channel entry)]
+                                        (when (and dc (= (.-readyState dc) "open")) dc)))
+                                    p2p-chans))]
+      (if (seq open-chans)
+        (let [wire-bytes (fressian/encode-wire env)]
+          (doseq [dc open-chans]
+            (try (.send dc wire-bytes) (catch :default _ nil))))
+        (send-to-all-channels! node-atom env)))
+
+    (:p2p-direct? env)
+    (let [peer-pk (light-core/normalize-pubkey-hex (:p2p-peer env))
+          entry (get-in @node-atom [:p2p-channels peer-pk])
+          dc (:channel entry)]
+      (if (and dc (= (.-readyState dc) "open"))
+        (let [wire-bytes (fressian/encode-wire env)]
+          (try (.send dc wire-bytes) (catch :default _ nil)))
+        (do
+          (when (:p2p-session-id env)
+            (set-p2p-channel-state node-atom (:p2p-session-id env) false {:error "no-direct-route"}))
+          (send-to-all-channels! node-atom env))))
+
+    :else
+    (send-to-all-channels! node-atom env)))
+
+(defn dial-browser-p2p-peer!
+  "Dials a remote P2P candidate peer via WebRTC DataChannel in the browser per Rule 4."
+  [node-atom dial-info]
+  (when (and node-atom dial-info)
+    (let [peer-pk (light-core/normalize-pubkey-hex (:peer dial-info))
+          sid (:session-id dial-info)
+          existing-entry (get-in @node-atom [:p2p-channels peer-pk])
+          existing-dc (:channel existing-entry)]
+      (if (and existing-dc (= (.-readyState existing-dc) "open"))
+        (set-p2p-channel-state node-atom sid true nil)
+        (let [candidates (or (:remote-candidates dial-info) [])
+              parsed-candidates (keep #(light-core/parse-p2p-candidate % nil) candidates)
+              cand (first parsed-candidates)]
+          (if-not cand
+            (set-p2p-channel-state node-atom sid false {:error "no-valid-candidates"})
+            (let [p2p-conn-atom (atom (browser/initial-conn-state {:peer-id peer-pk :subnet-id (:subnet-id @node-atom)}))
+                  tr-name (name (or (:transport cand) :udp))
+                  target-url (str tr-name "://" (:host cand) ":" (:port cand))
+                  answer-sdp (browser/format-p2p-sdp-answer dial-info cand)
+                  res (browser/connect-webrtc!
+                       p2p-conn-atom
+                       {:peer-id peer-pk
+                        :target-url target-url
+                        :answer-sdp answer-sdp
+                        :channel-label "bitecho-p2p"
+                        :on-open
+                        (fn [{:keys [channel]}]
+                          (let [my-gen (inc (long (or (get-in @node-atom [:p2p-channels peer-pk :generation]) 0)))]
+                            (swap! node-atom assoc-in [:p2p-channels peer-pk]
+                                   {:channel channel
+                                    :conn-atom p2p-conn-atom
+                                    :session-id sid
+                                    :generation my-gen})
+                            (try
+                              (.addEventListener channel "close"
+                                                 (fn [_]
+                                                   (let [cur-gen (long (or (get-in @node-atom [:p2p-channels peer-pk :generation]) 0))]
+                                                     (if (and (pos? cur-gen) (< my-gen cur-gen))
+                                                       (swap! node-atom update-in [:light-state :diagnostics :ignored-stale] (fnil inc 0))
+                                                       (do
+                                                         (swap! node-atom update :p2p-channels dissoc peer-pk)
+                                                         (set-p2p-channel-state node-atom sid false {:error "channel-closed"}))))))
+                              (catch :default _ nil)))
+                          (let [local-pub (get-in @node-atom [:light-state :pubkey])
+                                local-priv (get-in @node-atom [:keypair :private-key])
+                                bind-env (build-p2p-link-bind-envelope local-pub local-priv sid)
+                                wire-bytes (fressian/encode-wire bind-env)]
+                            (try (.send channel wire-bytes) (catch :default _ nil)))
+                          (set-p2p-channel-state node-atom sid true {:transport tr-name}))
+                        :on-deliver-message
+                        (fn [env]
+                          (handle-inbound-wire-envelope! node-atom env))})]
+              (when-not (:ok? res)
+                (set-p2p-channel-state node-atom sid false {:error (or (:error res) "p2p-dial-failed")}))
+              res)))))))
+
 (defn handle-inbound-wire-envelope!
   "Processes an incoming wire envelope, updates light state, handles decrypted messages,
    and replies over the WebRTC mesh DataChannel."
   [node-atom env]
   (when (and node-atom env)
-    (let [node @node-atom
-          privkey (:private-key (:keypair node))
-          st (:light-state node)
-          prev-offers (or (:pending-offers st) {})
-          prev-inbox (vec (get-in st [:inbox] []))
-          prev-bcasts (vec (get-in st [:broadcast-inbox] []))
-          res (light-core/handle-wire-payload st env privkey)
-          new-st (:state res)
-          curr-inbox (vec (get-in new-st [:inbox] []))
-          curr-bcasts (vec (get-in new-st [:broadcast-inbox] []))
-          new-msgs (into (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
-                         (subvec curr-bcasts (min (count prev-bcasts) (count curr-bcasts))))
-          curr-offers (or (:pending-offers new-st) {})]
-      (swap! node-atom (fn [curr]
-                         (-> curr
-                             (assoc :light-state (update new-st :inbox #(vec (or % []))))
-                             (assoc :sessions (:sessions new-st))
-                             (update :chat-history
-                                     (fn [hist]
-                                       (let [base-hist (vec (or hist []))
-                                             seen-keys (into #{}
-                                                             (keep (fn [e]
-                                                                     (when (and (= (:direction e) :incoming)
-                                                                                (:sessionId e)
-                                                                                (:seq e))
-                                                                       [(:sessionId e) (:seq e)])))
-                                                             base-hist)
-                                             pnames (or (:petnames curr) (:petnames new-st) default-petnames)]
-                                         (reduce
-                                          (fn [acc m]
-                                            (let [sid (or (:session-id m) (:session_id m))
-                                                  m-seq (:seq m)
-                                                  sender-hex (or (:sender m) (:from m) (:peer-id m))
-                                                  pname (some (fn [[k v]]
-                                                                (when (= v sender-hex)
-                                                                  (if (keyword? k) (name k) (str k))))
-                                                              pnames)
-                                                  entry (cond-> {:timestamp (.toISOString (js/Date.))
-                                                                 :direction :incoming
-                                                                 :peer (or (:from_petname m) (:from-petname m) pname sender-hex "peer")
-                                                                 :text (or (:text m) (:message m) (str m))
-                                                                 :status :received}
-                                                          sid (assoc :sessionId sid)
-                                                          (some? m-seq) (assoc :seq m-seq))]
-                                              (if (and sid (some? m-seq) (contains? seen-keys [sid m-seq]))
-                                                acc
-                                                (conj acc entry))))
-                                          base-hist
-                                          new-msgs)))))))
+    (if (and (map? env) (= :p2p-link-bind (or (:type env) (:bitecho/type env))))
+      (let [sender-pk (light-core/normalize-pubkey-hex (:sender env))
+            sid (:session-id env)
+            sess (get-in @node-atom [:light-state :sessions sid])
+            expected-peer (when sess (light-core/normalize-pubkey-hex (:peer sess)))
+            p2p-phase (get-in sess [:p2p :phase])]
+        (if (and (verify-p2p-link-bind env)
+                 (some? sess)
+                 (= "open" (:state sess))
+                 (= sender-pk expected-peer)
+                 (contains? #{:offered :offer-received :connecting :open} p2p-phase))
+          (set-p2p-channel-state node-atom sid true nil)
+          (swap! node-atom update-in [:light-state :diagnostics :p2p-signaling-rejected] (fnil inc 0))))
+      (let [node @node-atom
+            privkey (:private-key (:keypair node))
+            st (:light-state node)
+            prev-offers (or (:pending-offers st) {})
+            prev-inbox (vec (get-in st [:inbox] []))
+            prev-bcasts (vec (get-in st [:broadcast-inbox] []))
+            res (light-core/handle-wire-payload st env privkey)
+            new-st (:state res)
+            curr-inbox (vec (get-in new-st [:inbox] []))
+            curr-bcasts (vec (get-in new-st [:broadcast-inbox] []))
+            new-msgs (into (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
+                           (subvec curr-bcasts (min (count prev-bcasts) (count curr-bcasts))))
+            curr-offers (or (:pending-offers new-st) {})]
+        (swap! node-atom (fn [curr]
+                           (-> curr
+                               (assoc :light-state (update new-st :inbox #(vec (or % []))))
+                               (assoc :sessions (:sessions new-st))
+                               (update :chat-history
+                                       (fn [hist]
+                                         (let [base-hist (vec (or hist []))
+                                               seen-keys (into #{}
+                                                               (keep (fn [e]
+                                                                       (when (and (= (:direction e) :incoming)
+                                                                                  (:sessionId e)
+                                                                                  (:seq e))
+                                                                         [(:sessionId e) (:seq e)])))
+                                                               base-hist)
+                                               pnames (or (:petnames curr) (:petnames new-st) default-petnames)]
+                                           (reduce
+                                            (fn [acc m]
+                                              (let [sid (or (:session-id m) (:session_id m))
+                                                    m-seq (:seq m)
+                                                    sender-hex (or (:sender m) (:from m) (:peer-id m))
+                                                    pname (some (fn [[k v]]
+                                                                  (when (= v sender-hex)
+                                                                    (if (keyword? k) (name k) (str k))))
+                                                                pnames)
+                                                    entry (cond-> {:timestamp (.toISOString (js/Date.))
+                                                                   :direction :incoming
+                                                                   :peer (or (:from_petname m) (:from-petname m) pname sender-hex "peer")
+                                                                   :text (or (:text m) (:message m) (str m))
+                                                                   :status :received}
+                                                            sid (assoc :sessionId sid)
+                                                            (some? m-seq) (assoc :seq m-seq))]
+                                                (if (and sid (some? m-seq) (contains? seen-keys [sid m-seq]))
+                                                  acc
+                                                  (conj acc entry))))
+                                            base-hist
+                                            new-msgs)))))))
       ;; Surface any new live incoming channel offers into the Human Anchor queue
-      (doseq [[sid offer] curr-offers]
-        (when-not (contains? prev-offers sid)
-          (when-not @anchor-state-atom
-            (init-anchor nil))
-          (swap! anchor-state-atom anchor/queue-incoming-offer
-                 {:offer-id sid
-                  :session-id sid
-                  :peer-id (:caller offer)
-                  :caller-pubkey (:caller offer)
-                  :callee-pubkey (:callee offer)
-                  :price (or (:price offer) 10)
-                  :burn (or (:burn offer) 100)
-                  :epoch (or (:epoch offer) 0)})))
-      (doseq [reply-env (:net-envelopes res)]
-        (send-to-all-channels! node-atom reply-env))
-      (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
-      (notify-ui-listeners!))))
+        (doseq [[sid offer] curr-offers]
+          (when-not (contains? prev-offers sid)
+            (when-not @anchor-state-atom
+              (init-anchor nil))
+            (swap! anchor-state-atom anchor/queue-incoming-offer
+                   {:offer-id sid
+                    :session-id sid
+                    :peer-id (:caller offer)
+                    :caller-pubkey (:caller offer)
+                    :callee-pubkey (:callee offer)
+                    :price (or (:price offer) 10)
+                    :burn (or (:burn offer) 100)
+                    :epoch (or (:epoch offer) 0)})))
+        (doseq [reply-env (:net-envelopes res)]
+          (route-browser-envelope! node-atom reply-env))
+        (when-let [dial-info (:p2p-dial res)]
+          (dial-browser-p2p-peer! node-atom dial-info))
+        (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
+        (notify-ui-listeners!)))))
 
 (defn- send-chain-state-query!
   "Sends a signed :query-chain-state envelope on the given DataChannel."
@@ -828,7 +960,7 @@
                          (assoc :light-state new-st)
                          (assoc :sessions (:sessions new-st)))))
          (doseq [env out-envs]
-           (send-to-all-channels! na env))
+           (route-browser-envelope! na env))
          (browser/persist-state! (browser/sanitize-state-for-persistence @na))
          (notify-ui-listeners!)
          (clj->js (cond-> {:ok cmd-ok?
@@ -918,7 +1050,7 @@
                                         :text text
                                         :status :sent}))))))
          (doseq [env out-envs]
-           (send-to-all-channels! na env))
+           (route-browser-envelope! na env))
          (browser/persist-state! (browser/sanitize-state-for-persistence @na))
          (notify-ui-listeners!)
          (clj->js (cond-> {:ok cmd-ok?
@@ -1293,7 +1425,9 @@
                              (assoc :light-state new-st)
                              (assoc :sessions (:sessions new-st)))))
              (doseq [env out-envs]
-               (send-to-all-channels! na env))
+               (route-browser-envelope! na env))
+             (when-let [dial-info (:p2p-dial cmd-res)]
+               (dial-browser-p2p-peer! na dial-info))
              (browser/persist-state! (browser/sanitize-state-for-persistence @na))
              (notify-ui-listeners!)
              (clj->js (cond-> {:ok cmd-ok?
@@ -1334,7 +1468,9 @@
                              (assoc :light-state new-st)
                              (assoc :sessions (:sessions new-st)))))
              (doseq [env out-envs]
-               (send-to-all-channels! na env))
+               (route-browser-envelope! na env))
+             (when-let [dial-info (:p2p-dial cmd-res)]
+               (dial-browser-p2p-peer! na dial-info))
              (browser/persist-state! (browser/sanitize-state-for-persistence @na))
              (notify-ui-listeners!)
              (clj->js (cond-> {:ok cmd-ok?
@@ -1427,7 +1563,9 @@
                                             :text (str text)
                                             :status :sent}))))))
              (doseq [env out-envs]
-               (send-to-all-channels! na env))
+               (route-browser-envelope! na env))
+             (when-let [dial-info (:p2p-dial cmd-res)]
+               (dial-browser-p2p-peer! na dial-info))
              (browser/persist-state! (browser/sanitize-state-for-persistence @na))
              (notify-ui-listeners!)
              (clj->js (cond-> {:ok cmd-ok?

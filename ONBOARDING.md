@@ -309,7 +309,7 @@ Phase 4 unifies all three Bitecho light-node runtimes (**JVM**, **Node.js**, and
   # Answer incoming p2p-offer
   ./scripts/light-node.sh p2p-answer --session-id <sid> --candidates mdns://<uuid>.local:5011
   ```
-  Once upgraded (`:p2p {:state "connected" :connected? true}`), all 1-to-1 `send` messages automatically route at **`0 ECH` burn** (`"zero_burn": true`).
+  Once upgraded (`:p2p {:phase :open :connected? true}`), all 1-to-1 `send` messages automatically route at **`0 ECH` burn** (`"zero_burn": true`).
 - **3-Way Zero-Burn Broadcast (`chat/simon-nexus-axiom`)**:
   ```bash
   # Broadcast a signed zero-burn message across the 3-way mesh

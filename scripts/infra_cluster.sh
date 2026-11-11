@@ -694,7 +694,7 @@ EOF_GIT_INDEX
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding.md"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding/index.md"
-    if [[ -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
+    if [[ ( "${DEPLOY_LIVE:-0}" == "1" || "${1:-}" == "--deploy" ) && -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
       rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/dist/bitecho-browser.js" \
         "${ROOT_DIR}/dist/bitecho-browser.js.sri" \
@@ -703,13 +703,14 @@ EOF_GIT_INDEX
     fi
   done
 
-  echo "=== Rolling Pointer Refresh & Verification across ns3, ns2, ns1 ==="
-  for node in ns3 ns2 ns1; do
-    local ip="${NODE_IPS[$node]}"
-    echo "--> Running migrate-infra & rolling restart on ${node} (${ip})..."
-    ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "bash -s" << 'REMOTE_PUBLISH_MIGRATE'
+  if [[ "${DEPLOY_LIVE:-0}" == "1" || "${1:-}" == "--deploy" ]]; then
+    echo "=== Rolling Pointer Refresh & Verification across ns3, ns2, ns1 ==="
+    for node in ns3 ns2 ns1; do
+      local ip="${NODE_IPS[$node]}"
+      echo "--> Running migrate-infra & rolling restart on ${node} (${ip})..."
+      ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "bash -s" << 'REMOTE_PUBLISH_MIGRATE'
 set -euo pipefail
-sudo -u cljweb java -Xms128m -Xmx512m \
+sudo -u cljweb /opt/jdk-25/bin/java -Xms128m -Xmx512m \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
   --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
@@ -718,22 +719,25 @@ sudo chown -R cljweb:cljweb /var/lib/clj-web
 sudo systemctl restart bitecho-infra.service
 REMOTE_PUBLISH_MIGRATE
 
-    for _ in {1..20}; do
-      if curl -fsS --max-time 2 "http://${ip}:80/healthz" >/dev/null 2>&1; then
-        break
+      for _ in {1..20}; do
+        if curl -fsS --max-time 2 "http://${ip}:80/healthz" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 1
+      done
+      verify_node_health "$node"
+      echo "--> Verifying SKILL.md and --trusted-dac-anchors on ${node} (${ip})..."
+      local skill_content
+      skill_content="$(curl -fsS --max-time 5 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/SKILL.md")"
+      if ! echo "${skill_content}" | grep -q -- "--trusted-dac-anchors"; then
+        echo "FATAL: ${node} SKILL.md missing --trusted-dac-anchors" >&2
+        exit 1
       fi
-      sleep 1
+      echo "  [OK] ${node} verified --trusted-dac-anchors in SKILL.md"
     done
-    verify_node_health "$node"
-    echo "--> Verifying SKILL.md and --trusted-dac-anchors on ${node} (${ip})..."
-    local skill_content
-    skill_content="$(curl -fsS --max-time 5 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/SKILL.md")"
-    if ! echo "${skill_content}" | grep -q -- "--trusted-dac-anchors"; then
-      echo "FATAL: ${node} SKILL.md missing --trusted-dac-anchors" >&2
-      exit 1
-    fi
-    echo "  [OK] ${node} verified --trusted-dac-anchors in SKILL.md"
-  done
+  else
+    echo "  [INFO] Skipping live migrate-infra + service restart (pass --deploy or DEPLOY_LIVE=1 after deploy go-ahead)"
+  fi
   echo "=== Canonical Git Repositories & Web Docs Published to ns1..ns3 ==="
 }
 
@@ -763,7 +767,8 @@ case "${1:-}" in
     cmd_retire_clj_web
     ;;
   publish-git)
-    cmd_publish_git
+    shift
+    cmd_publish_git "$@"
     ;;
   rollback)
     shift
