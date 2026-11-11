@@ -1490,14 +1490,22 @@
             mdns-svc (or (when (map? mdns-atom) mdns-atom)
                          (when (and mdns-atom (instance? clojure.lang.IMeta mdns-atom))
                            (:mdns-svc (meta mdns-atom))))
-            mdns-state (when mdns-atom (if (instance? clojure.lang.IDeref mdns-atom) @mdns-atom mdns-atom))
+            mdns-table-atom (if (and (map? mdns-atom) (:table-atom mdns-atom))
+                              (:table-atom mdns-atom)
+                              mdns-atom)
+            read-mdns-state (fn []
+                              (when mdns-table-atom
+                                (if (instance? clojure.lang.IDeref mdns-table-atom)
+                                  @mdns-table-atom
+                                  mdns-table-atom)))
+            mdns-state (read-mdns-state)
             queried? (atom false)
             _ (doseq [cand candidates]
                 (let [cand-map (if (map? cand) cand (light-core/parse-p2p-candidate cand nil))
                       raw-host (when (map? cand) (or (:host cand) (:ip cand)))
                       host (or raw-host (when (and cand-map (mdns/mdns-hostname? (:host cand-map))) (:host cand-map)))]
                   (when (and host (mdns/mdns-hostname? host))
-                    (let [tab (if (instance? clojure.lang.IDeref mdns-state) @mdns-state mdns-state)]
+                    (let [tab mdns-state]
                       (when-not (and tab (mdns/lookup-cached-ip tab host))
                         (when-let [sfn (:send-fn mdns-svc)]
                           (try
@@ -1506,7 +1514,7 @@
                             (catch Throwable _ nil))))))))
             _ (when @queried?
                 (try (Thread/sleep 50) (catch Throwable _ nil)))
-            mdns-state' (when mdns-atom (if (instance? clojure.lang.IDeref mdns-atom) @mdns-atom mdns-atom))
+            mdns-state' (read-mdns-state)
             parsed-candidates (keep #(light-core/parse-p2p-candidate % mdns-state') candidates)
             success? (atom false)]
         (doseq [cand parsed-candidates
@@ -2021,10 +2029,7 @@
                              (sync-conn-diagnostics! state-atom conn-atom)
                              reconn))))
         mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {(mdns/generate-mdns-hostname) "127.0.0.1"}}) (catch Exception _ nil))
-        mdns-atom (let [a (or (:table-atom mdns-svc) (atom (mdns/init-mdns-table)))]
-                    (if (instance? clojure.lang.IAtom a)
-                      (with-meta a {:mdns-svc mdns-svc})
-                      (atom (mdns/init-mdns-table))))
+        mdns-atom (or mdns-svc (atom (mdns/init-mdns-table)))
         p2p-peers-atom (atom {})
         ingress-peers-atom (atom {})
         conn-opts (assoc opts

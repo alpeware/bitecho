@@ -2654,7 +2654,53 @@
               (is (= (+ current-gen 10) (get-in @p2p-peers-a [norm-b :generation]))
                   "F-R1: Newer generation preserved")
               (is (> (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0)) initial-stale)
-                  "F-R1: Diagnostic counter strictly incremented on stale bound close"))))
+                  "F-R1: Diagnostic counter strictly incremented on stale bound close"))
+
+            ;; 5. F-G2: nil/zero generation stale close when live entry exists
+            (let [norm-b (:pubkey-hex id-b)
+                  stale-before (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0))
+                  conn2 (api/create-node {:port 0 :setup "active"})
+                  conn2-prom (promise)
+                  conn2-cid (atom nil)
+                  sess-b (get-in @state-atom-b [:sessions sid])
+                  tx-k (:tx-key sess-b)
+                  suite (or (:suite sess-b) sealed/suite-v1-chacha20poly1305)
+                  seq-num (inc (long (or (:tx-seq sess-b) 0)))
+                  sealed-m (sealed/seal-message tx-k seq-num (.getBytes "test nil gen" "UTF-8") (.getBytes sid "UTF-8") suite)
+                  msg-env {:protocol-version 1
+                           :wire-format "fressian-v1"
+                           :subnet-id "chat/simon-nexus-axiom"
+                           :bitecho/type :sealed-message
+                           :type :sealed-message
+                           :session-id sid
+                           :sender norm-b
+                           :recipient (:pubkey-hex id-a)
+                           :epoch 10
+                           :seq seq-num
+                           :suite suite
+                           :nonce (basalt/bytes->hex (:nonce sealed-m))
+                           :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}]
+              (api/set-callbacks!
+               conn2
+               {:on-open (fn [evt]
+                           (let [cid (or (:channel-id evt) (:stream-id evt) 0)]
+                             (reset! conn2-cid cid)
+                             (deliver conn2-prom true)))})
+              (api/start-tcp! conn2 {:ip "127.0.0.1" :port port-a} {})
+              (is (= true (deref conn2-prom 2000 :timeout)) "Conn 2 connected to port A")
+              (when-let [cid @conn2-cid]
+                (let [payload (if (bytes? msg-env) msg-env (fressian/encode-wire msg-env))]
+                  (api/send! conn2 payload cid)))
+              (Thread/sleep 150)
+              (api/close! conn2)
+              (let [deadline (+ (System/currentTimeMillis) 2000)]
+                (while (and (< (System/currentTimeMillis) deadline)
+                            (<= (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0)) stale-before))
+                  (Thread/sleep 50)))
+              (is (contains? @p2p-peers-a norm-b) "F-G2: Live entry preserved after nil-generation close")
+              (is (> (long (or (get-in @state-atom-a [:diagnostics :ignored-stale]) 0)) stale-before)
+                  "F-G2: Diagnostic counter strictly incremented on nil-generation close")
+              (try (api/close! conn2) (catch Exception _ nil)))))
         (finally
           (when-let [stop-fn (:stop! listener)]
             (stop-fn))

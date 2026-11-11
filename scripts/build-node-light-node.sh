@@ -121,4 +121,12 @@ if [[ "${SMOKE_OUT}" != *'"ok":true'* || "${SMOKE_OUT}" != *'"pubkey":'* ]]; the
   exit 1
 fi
 
+# Serve startup smoke check (F-G3: verifies serve starts without crashing on IWithMeta)
+SERVE_OUT=$(echo "" | timeout 5 "${NODE_BIN}" "dist/bitecho-light-node.cjs" serve --state-dir "${TMP_STATE_DIR}" --bootstrap "devnet/bootstrap.txt" --ingress-tcp-port 0 2>&1 || true)
+echo "Serve smoke check output: ${SERVE_OUT}"
+if [[ "${SERVE_OUT}" == *"IWithMeta"* || "${SERVE_OUT}" == *"alter-meta!"* || "${SERVE_OUT}" == *"TypeError"* ]]; then
+  echo "ERROR: Serve smoke check failed for dist/bitecho-light-node.cjs (IWithMeta crash detected)!" >&2
+  exit 1
+fi
+
 echo "=== Bitecho Node.js Light-Node Bundle Verified Successfully ==="

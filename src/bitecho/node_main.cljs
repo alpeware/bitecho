@@ -1742,90 +1742,83 @@
             mdns-svc (or (when (map? mdns-atom) mdns-atom)
                          (when (and mdns-atom (satisfies? IMeta mdns-atom))
                            (:mdns-svc (meta mdns-atom))))
-            mdns-state (when mdns-atom (if (satisfies? IDeref mdns-atom) @mdns-atom mdns-atom))
+            mdns-table-atom (if (and (map? mdns-atom) (:table-atom mdns-atom))
+                              (:table-atom mdns-atom)
+                              mdns-atom)
+            read-mdns-state (fn []
+                              (when mdns-table-atom
+                                (if (satisfies? IDeref mdns-table-atom)
+                                  @mdns-table-atom
+                                  mdns-table-atom)))
+            mdns-state (read-mdns-state)
+            queried? (atom false)
             _ (doseq [cand candidates]
                 (let [cand-map (if (map? cand) cand (light-core/parse-p2p-candidate cand nil))
                       raw-host (when (map? cand) (or (:host cand) (:ip cand)))
                       host (or raw-host (when (and cand-map (mdns/mdns-hostname? (:host cand-map))) (:host cand-map)))]
                   (when (and host (mdns/mdns-hostname? host))
-                    (let [tab (if (satisfies? IDeref mdns-state) @mdns-state mdns-state)]
+                    (let [tab mdns-state]
                       (when-not (and tab (mdns/lookup-cached-ip tab host))
                         (when-let [sfn (:send-fn mdns-svc)]
-                          (try (sfn (mdns/encode-mdns-query host)) (catch :default _ nil))))))))
-            mdns-state' (when mdns-atom (if (satisfies? IDeref mdns-atom) @mdns-atom mdns-atom))
-            parsed-candidates (keep #(light-core/parse-p2p-candidate % mdns-state') candidates)
-            success? (atom false)]
-        (doseq [cand parsed-candidates
-                :while (not @success?)]
-          (try
-            (let [host (:host cand)
-                  port (int (:port cand))
-                  transport (or (:transport cand) :tcp)
-                  channel-id (atom nil)
-                  assigned-gen (atom nil)
-                  on-close-fired? (atom false)
-                  client-node (api/create-node {:port 0 :setup "active"})
-                  peer-send! (fn [env]
-                               (if-let [cid @channel-id]
-                                 (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch :default _ nil))]
-                                   (if payload
-                                     (try (api/send! client-node payload cid) true (catch :default _ false))
-                                     false))
-                                 false))
-                  on-close-fn (fn [_]
-                                (when (compare-and-set! on-close-fired? false true)
-                                  (let [my-gen @assigned-gen
-                                        cur-gen (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0))]
-                                    (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
-                                      (when state-atom
-                                        (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
-                                      (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
-                                        (when p2p-peers-atom
-                                          (swap! p2p-peers-atom dissoc peer-pk))
-                                        (when state-atom
-                                          (let [cmd-res (light-core/handle-command @state-atom
-                                                                                   {"cmd" "p2p-channel-state"
-                                                                                    "session_id" sid
-                                                                                    "connected" false
-                                                                                    "error" "channel-closed"}
-                                                                                   privkey-bytes)]
-                                            (reset! state-atom (:state cmd-res))
-                                            (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))))
-                  peer-close! (fn []
-                                (try
-                                  (api/close! client-node)
-                                  (on-close-fn {:type :on-close})
-                                  (catch :default _ nil)))
-                  remote-sdp (cond-> {:ip host
-                                      :port port
-                                      :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
-                                      :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
-                               (:remote-fingerprint dial-info)
-                               (assoc :fingerprint (normalize-fingerprint (:remote-fingerprint dial-info)))
-                               (:proxy-connect? cand)
-                               (assoc :proxy (resolve-proxy-url nil)))
-                  callbacks {:on-open (fn [evt]
-                                        (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                          (reset! channel-id cid)
-                                          (when (compare-and-set! success? false true)
-                                            (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
-                                              (reset! assigned-gen my-gen)
-                                              (when p2p-peers-atom
-                                                (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
-                                                                                     :close-fn peer-close!
-                                                                                     :session-id sid
-                                                                                     :generation my-gen}))
-                                              (let [local-pub (or (:pubkey @state-atom) "")
-                                                    bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
-                                                (peer-send! bind-env))
-                                              (let [cmd-res (light-core/handle-command @state-atom
-                                                                                       {"cmd" "p2p-channel-state"
-                                                                                        "session_id" sid
-                                                                                        "connected" true}
-                                                                                       privkey-bytes)]
-                                                (reset! state-atom (:state cmd-res))
-                                                (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))
-                             :on-data-channel (fn [evt]
+                          (try
+                            (sfn (mdns/encode-mdns-query host))
+                            (reset! queried? true)
+                            (catch :default _ nil))))))))
+            attempt-dial!
+            (fn []
+              (let [mdns-state' (read-mdns-state)
+                    parsed-candidates (keep #(light-core/parse-p2p-candidate % mdns-state') candidates)
+                    success? (atom false)]
+                (doseq [cand parsed-candidates
+                        :while (not @success?)]
+                  (try
+                    (let [host (:host cand)
+                          port (int (:port cand))
+                          transport (or (:transport cand) :tcp)
+                          channel-id (atom nil)
+                          assigned-gen (atom nil)
+                          on-close-fired? (atom false)
+                          client-node (api/create-node {:port 0 :setup "active"})
+                          peer-send! (fn [env]
+                                       (if-let [cid @channel-id]
+                                         (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch :default _ nil))]
+                                           (if payload
+                                             (try (api/send! client-node payload cid) true (catch :default _ false))
+                                             false))
+                                         false))
+                          on-close-fn (fn [_]
+                                        (when (compare-and-set! on-close-fired? false true)
+                                          (let [my-gen @assigned-gen
+                                                cur-gen (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0))]
+                                            (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
+                                              (when state-atom
+                                                (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
+                                              (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
+                                                (when p2p-peers-atom
+                                                  (swap! p2p-peers-atom dissoc peer-pk))
+                                                (when state-atom
+                                                  (let [cmd-res (light-core/handle-command @state-atom
+                                                                                           {"cmd" "p2p-channel-state"
+                                                                                            "session_id" sid
+                                                                                            "connected" false
+                                                                                            "error" "channel-closed"}
+                                                                                           privkey-bytes)]
+                                                    (reset! state-atom (:state cmd-res))
+                                                    (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))))
+                          peer-close! (fn []
+                                        (try
+                                          (api/close! client-node)
+                                          (on-close-fn {:type :on-close})
+                                          (catch :default _ nil)))
+                          remote-sdp (cond-> {:ip host
+                                              :port port
+                                              :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
+                                              :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
+                                       (:remote-fingerprint dial-info)
+                                       (assoc :fingerprint (normalize-fingerprint (:remote-fingerprint dial-info)))
+                                       (:proxy-connect? cand)
+                                       (assoc :proxy (resolve-proxy-url nil)))
+                          callbacks {:on-open (fn [evt]
                                                 (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
                                                   (reset! channel-id cid)
                                                   (when (compare-and-set! success? false true)
@@ -1846,33 +1839,57 @@
                                                                                                privkey-bytes)]
                                                         (reset! state-atom (:state cmd-res))
                                                         (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))
-                             :on-message (fn [evt]
-                                           (when-let [payload (:payload evt)]
-                                             (when state-atom
-                                               (let [st @state-atom
-                                                     res (light-core/handle-wire-payload st payload privkey-bytes)]
-                                                 (reset! state-atom (:state res))
-                                                 (when (seq (:stdout-events res))
-                                                   (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
-                                                 (when (seq (:net-envelopes res))
-                                                   (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
-                             :on-close on-close-fn}]
-              (if (or (= transport :tcp) (= transport :connect))
-                (api/start-tcp! client-node remote-sdp callbacks)
-                (api/start! client-node remote-sdp callbacks))
-              (js/setTimeout
-               (fn []
-                 (when-not @success?
-                   (let [cmd-res (light-core/handle-command @state-atom
-                                                            {"cmd" "p2p-channel-state"
-                                                             "session_id" sid
-                                                             "connected" false
-                                                             "error" "p2p-dial-failed"}
-                                                            privkey-bytes)]
-                     (reset! state-atom (:state cmd-res))
-                     (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))
-               3000))
-            (catch :default _ nil)))))))
+                                     :on-data-channel (fn [evt]
+                                                        (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                                          (reset! channel-id cid)
+                                                          (when (compare-and-set! success? false true)
+                                                            (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
+                                                              (reset! assigned-gen my-gen)
+                                                              (when p2p-peers-atom
+                                                                (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
+                                                                                                     :close-fn peer-close!
+                                                                                                     :session-id sid
+                                                                                                     :generation my-gen}))
+                                                              (let [local-pub (or (:pubkey @state-atom) "")
+                                                                    bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
+                                                                (peer-send! bind-env))
+                                                              (let [cmd-res (light-core/handle-command @state-atom
+                                                                                                       {"cmd" "p2p-channel-state"
+                                                                                                        "session_id" sid
+                                                                                                        "connected" true}
+                                                                                                       privkey-bytes)]
+                                                                (reset! state-atom (:state cmd-res))
+                                                                (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))
+                                     :on-message (fn [evt]
+                                                   (when-let [payload (:payload evt)]
+                                                     (when state-atom
+                                                       (let [st @state-atom
+                                                             res (light-core/handle-wire-payload st payload privkey-bytes)]
+                                                         (reset! state-atom (:state res))
+                                                         (when (seq (:stdout-events res))
+                                                           (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
+                                                         (when (seq (:net-envelopes res))
+                                                           (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
+                                     :on-close on-close-fn}]
+                      (if (or (= transport :tcp) (= transport :connect))
+                        (api/start-tcp! client-node remote-sdp callbacks)
+                        (api/start! client-node remote-sdp callbacks))
+                      (js/setTimeout
+                       (fn []
+                         (when-not @success?
+                           (let [cmd-res (light-core/handle-command @state-atom
+                                                                    {"cmd" "p2p-channel-state"
+                                                                     "session_id" sid
+                                                                     "connected" false
+                                                                     "error" "p2p-dial-failed"}
+                                                                    privkey-bytes)]
+                             (reset! state-atom (:state cmd-res))
+                             (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))
+                       3000))
+                    (catch :default _ nil)))))]
+        (if (and @queried? (identical? mdns-state (read-mdns-state)))
+          (js/setTimeout attempt-dial! 50)
+          (attempt-dial!))))))
 
 (defn start-ingress-tcp-listener!
   "Starts a passive RFC 4571 DTLS-over-TCP DataChannel ingress listener on `:ingress-tcp-port`
@@ -2306,10 +2323,7 @@
                           (sync-conn-diagnostics! state-atom conn-atom)
                           (when cb (cb reconn))))))))
                mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {(mdns/generate-mdns-hostname) "127.0.0.1"}}) (catch :default _ nil))
-               mdns-atom (let [a (or (:table-atom mdns-svc) (atom (mdns/init-mdns-table)))]
-                           (if (satisfies? IAtom a)
-                             (with-meta a {:mdns-svc mdns-svc})
-                             (atom (mdns/init-mdns-table))))
+               mdns-atom (or mdns-svc (atom (mdns/init-mdns-table)))
                p2p-peers-atom (atom {})
                ingress-peers-atom (atom {})
                conn-opts (assoc opts
