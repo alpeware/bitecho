@@ -2025,7 +2025,12 @@
       {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
       (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
             transport (str (or (get cmd-map "transport") (:transport cmd-map) "udp"))
-            raw-cands (or (get cmd-map "candidates") (:candidates cmd-map) [])
+            raw-cands (let [rc (or (get cmd-map "candidates") (:candidates cmd-map))]
+                        (if (or (nil? rc)
+                                (and (coll? rc) (empty? rc))
+                                (and (string? rc) (str/blank? rc)))
+                          (:default-p2p-candidates state [])
+                          rc))
             candidates (vec (map str (if (string? raw-cands)
                                        (remove str/blank? (str/split raw-cands #","))
                                        raw-cands)))
@@ -2037,45 +2042,66 @@
             sig-str (canonical-p2p-signal-str :offer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
             sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
-            payload {:protocol-version current-wire-version
-                     :wire-format current-wire-format
-                     :subnet-id sub-id
-                     :bitecho/type :p2p-offer
-                     :type :p2p-offer
-                     :session-id session-id
-                     :sender (:pubkey state)
-                     :recipient (:peer session)
-                     :transport transport
-                     :candidates candidates
-                     :ice-ufrag ice-ufrag
-                     :ice-pwd ice-pwd
-                     :fingerprint fp
-                     :epoch epoch
-                     :signal-seq signal-seq
-                     :signature sig-hex}
-            env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload payload) 0 sub-id)
-            p2p-entry (merge (get session :p2p {})
-                             {:phase :offered
-                              :connected? false
-                              :role :initiator
-                              :local-transport transport
-                              :local-candidates candidates
-                              :local-ice-ufrag ice-ufrag
-                              :local-ice-pwd ice-pwd
-                              :local-fingerprint fp
-                              :local-signal-seq signal-seq})
-            new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)]
-        {:state new-state
-         :response {"ok" true
-                    "session_id" session-id
-                    "peer" (:peer session)
-                    "transport" transport
-                    "candidates" candidates
-                    "phase" "offered"
-                    "connected" false
-                    "burn" 0}
-         :net-envelopes [env]
-         :stdout-events []}))))
+            p2p-open? (true? (get-in session [:p2p :connected?]))
+            econ-enabled? (get state :economy-enabled? true)
+            floor (long (if-not econ-enabled?
+                          0
+                          (or (:min-signaling-burn state)
+                              (when (and (:burn-floor state) (pos? (long (:burn-floor state))))
+                                (:burn-floor state))
+                              burn/min-signaling-burn)))
+            raw-burn (or (get cmd-map "burn") (:burn cmd-map))
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) nil)
+            burn-amt (cond
+                       (= parsed-burn :invalid) :invalid
+                       (some? parsed-burn) parsed-burn
+                       p2p-open? 0
+                       :else floor)]
+        (if (or (= burn-amt :invalid) (neg? (long burn-amt)))
+          {:state state :response {"ok" false "error" "invalid-numeric-parameter"} :net-envelopes [] :stdout-events []}
+          (let [payload {:protocol-version current-wire-version
+                         :wire-format current-wire-format
+                         :subnet-id sub-id
+                         :bitecho/type :p2p-offer
+                         :type :p2p-offer
+                         :session-id session-id
+                         :sender (:pubkey state)
+                         :recipient (:peer session)
+                         :transport transport
+                         :candidates candidates
+                         :ice-ufrag ice-ufrag
+                         :ice-pwd ice-pwd
+                         :fingerprint fp
+                         :epoch epoch
+                         :signal-seq signal-seq
+                         :signature sig-hex}
+                raw-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload payload) (long burn-amt) sub-id)
+                env (cond-> raw-env
+                      p2p-open? (assoc :p2p-direct? true
+                                       :p2p-peer (normalize-pubkey-hex (:peer session))
+                                       :p2p-session-id session-id))
+                p2p-entry (merge (get session :p2p {})
+                                 {:phase :offered
+                                  :connected? false
+                                  :role :initiator
+                                  :local-transport transport
+                                  :local-candidates candidates
+                                  :local-ice-ufrag ice-ufrag
+                                  :local-ice-pwd ice-pwd
+                                  :local-fingerprint fp
+                                  :local-signal-seq signal-seq})
+                new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)]
+            {:state new-state
+             :response {"ok" true
+                        "session_id" session-id
+                        "peer" (:peer session)
+                        "transport" transport
+                        "candidates" candidates
+                        "phase" "offered"
+                        "connected" false
+                        "burn" (long burn-amt)}
+             :net-envelopes [env]
+             :stdout-events []}))))))
 
 (defn- exec-p2p-answer [state cmd-map privkey-bytes]
   (let [session-id (resolve-session-id state cmd-map :open)
@@ -2084,7 +2110,12 @@
       {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
       (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
             transport (str (or (get cmd-map "transport") (:transport cmd-map) (get-in session [:p2p :remote-transport]) "udp"))
-            raw-cands (or (get cmd-map "candidates") (:candidates cmd-map) [])
+            raw-cands (let [rc (or (get cmd-map "candidates") (:candidates cmd-map))]
+                        (if (or (nil? rc)
+                                (and (coll? rc) (empty? rc))
+                                (and (string? rc) (str/blank? rc)))
+                          (:default-p2p-candidates state [])
+                          rc))
             candidates (vec (map str (if (string? raw-cands)
                                        (remove str/blank? (str/split raw-cands #","))
                                        raw-cands)))
@@ -2096,56 +2127,77 @@
             sig-str (canonical-p2p-signal-str :answer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
             sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
-            payload {:protocol-version current-wire-version
-                     :wire-format current-wire-format
-                     :subnet-id sub-id
-                     :bitecho/type :p2p-answer
-                     :type :p2p-answer
-                     :session-id session-id
-                     :sender (:pubkey state)
-                     :recipient (:peer session)
-                     :transport transport
-                     :candidates candidates
-                     :ice-ufrag ice-ufrag
-                     :ice-pwd ice-pwd
-                     :fingerprint fp
-                     :epoch epoch
-                     :signal-seq signal-seq
-                     :signature sig-hex}
-            env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload payload) 0 sub-id)
-            p2p-entry (merge (get session :p2p {})
-                             {:phase :connecting
-                              :connected? false
-                              :zero-burn? false
-                              :role :responder
-                              :local-transport transport
-                              :local-candidates candidates
-                              :local-ice-ufrag ice-ufrag
-                              :local-ice-pwd ice-pwd
-                              :local-fingerprint fp
-                              :local-signal-seq signal-seq})
-            new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)
-            p2p-dial {:session-id session-id
-                      :peer (:peer session)
-                      :role :responder
-                      :transport transport
-                      :local-candidates candidates
-                      :remote-candidates (get-in session [:p2p :remote-candidates])
-                      :remote-ice-ufrag (get-in session [:p2p :remote-ice-ufrag])
-                      :remote-ice-pwd (get-in session [:p2p :remote-ice-pwd])
-                      :remote-fingerprint (get-in session [:p2p :remote-fingerprint])}]
-        {:state new-state
-         :response {"ok" true
-                    "session_id" session-id
-                    "peer" (:peer session)
-                    "transport" transport
-                    "candidates" candidates
-                    "phase" "connecting"
-                    "connected" false
-                    "burn" 0}
-         :net-envelopes [env]
-         :stdout-events []
-         :p2p-dial p2p-dial}))))
+            p2p-open? (true? (get-in session [:p2p :connected?]))
+            econ-enabled? (get state :economy-enabled? true)
+            floor (long (if-not econ-enabled?
+                          0
+                          (or (:min-signaling-burn state)
+                              (when (and (:burn-floor state) (pos? (long (:burn-floor state))))
+                                (:burn-floor state))
+                              burn/min-signaling-burn)))
+            raw-burn (or (get cmd-map "burn") (:burn cmd-map))
+            parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) nil)
+            burn-amt (cond
+                       (= parsed-burn :invalid) :invalid
+                       (some? parsed-burn) parsed-burn
+                       p2p-open? 0
+                       :else floor)]
+        (if (or (= burn-amt :invalid) (neg? (long burn-amt)))
+          {:state state :response {"ok" false "error" "invalid-numeric-parameter"} :net-envelopes [] :stdout-events []}
+          (let [payload {:protocol-version current-wire-version
+                         :wire-format current-wire-format
+                         :subnet-id sub-id
+                         :bitecho/type :p2p-answer
+                         :type :p2p-answer
+                         :session-id session-id
+                         :sender (:pubkey state)
+                         :recipient (:peer session)
+                         :transport transport
+                         :candidates candidates
+                         :ice-ufrag ice-ufrag
+                         :ice-pwd ice-pwd
+                         :fingerprint fp
+                         :epoch epoch
+                         :signal-seq signal-seq
+                         :signature sig-hex}
+                raw-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload payload) (long burn-amt) sub-id)
+                env (cond-> raw-env
+                      p2p-open? (assoc :p2p-direct? true
+                                       :p2p-peer (normalize-pubkey-hex (:peer session))
+                                       :p2p-session-id session-id))
+                p2p-entry (merge (get session :p2p {})
+                                 {:phase :connecting
+                                  :connected? false
+                                  :zero-burn? false
+                                  :role :responder
+                                  :local-transport transport
+                                  :local-candidates candidates
+                                  :local-ice-ufrag ice-ufrag
+                                  :local-ice-pwd ice-pwd
+                                  :local-fingerprint fp
+                                  :local-signal-seq signal-seq})
+                new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)
+                p2p-dial {:session-id session-id
+                          :peer (:peer session)
+                          :role :responder
+                          :transport transport
+                          :local-candidates candidates
+                          :remote-candidates (get-in session [:p2p :remote-candidates])
+                          :remote-ice-ufrag (get-in session [:p2p :remote-ice-ufrag])
+                          :remote-ice-pwd (get-in session [:p2p :remote-ice-pwd])
+                          :remote-fingerprint (get-in session [:p2p :remote-fingerprint])}]
+            {:state new-state
+             :response {"ok" true
+                        "session_id" session-id
+                        "peer" (:peer session)
+                        "transport" transport
+                        "candidates" candidates
+                        "phase" "connecting"
+                        "connected" false
+                        "burn" (long burn-amt)}
+             :net-envelopes [env]
+             :stdout-events []
+             :p2p-dial p2p-dial}))))))
 
 (defn- exec-p2p-channel-state [state cmd-map]
   (let [session-id (or (get cmd-map "session_id") (get cmd-map "session-id")
@@ -3218,7 +3270,10 @@
                                          "supported_formats" ["fressian-v1" "legacy-nippy"]
                                          "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
                                          "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}}
-                 (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state)))
+                 (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state))
+                 (:mdns-hostname state) (assoc "mdns_hostname" (:mdns-hostname state))
+                 (:lan-ip state) (assoc "lan_ip" (:lan-ip state))
+                 (seq (:default-p2p-candidates state)) (assoc "default_p2p_candidates" (:default-p2p-candidates state)))
      :net-envelopes []
      :stdout-events []}))
 

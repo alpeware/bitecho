@@ -906,7 +906,13 @@
    Returns {:state updated-state :burn-amount burn-amt} or nil if deduction failed or burn invalid."
   [state event current-epoch]
   (let [econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
-        floor (long (get-in state [:config :burn-floor] (get state :burn-floor (if econ-enabled? burn/min-signaling-burn 0))))
+        floor (if-not econ-enabled?
+                0
+                (long (or (get-in state [:config :min-signaling-burn])
+                          (get state :min-signaling-burn)
+                          (get-in state [:config :burn-floor])
+                          (get state :burn-floor)
+                          burn/min-signaling-burn)))
         burn-spec (if (contains? event :burn)
                     (:burn event)
                     (:signaling-burn event))
@@ -933,7 +939,13 @@
   [state event]
   (let [current-epoch (or (:epoch state) 0)
         econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
-        floor (long (get-in state [:config :burn-floor] (get state :burn-floor (if econ-enabled? burn/min-signaling-burn 0))))
+        floor (if-not econ-enabled?
+                0
+                (long (or (get-in state [:config :min-signaling-burn])
+                          (get state :min-signaling-burn)
+                          (get-in state [:config :burn-floor])
+                          (get state :burn-floor)
+                          burn/min-signaling-burn)))
         burn-spec (if (contains? event :burn) (:burn event) (:signaling-burn event))
         burn-amt (cond
                    (number? burn-spec) (when (>= burn-spec floor) burn-spec)
@@ -1196,7 +1208,15 @@
         message (when msg-id (assoc raw-message :message-id msg-id))
         rng (:rng event)
         burn-amt (:burn-amount message)
-        valid-burn? (and (number? burn-amt) (>= burn-amt burn/min-signaling-burn))
+        econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
+        floor (if-not econ-enabled?
+                0
+                (long (or (get-in state [:config :min-signaling-burn])
+                          (get state :min-signaling-burn)
+                          (get-in state [:config :burn-floor])
+                          (get state :burn-floor)
+                          burn/min-signaling-burn)))
+        valid-burn? (and (number? burn-amt) (>= burn-amt floor))
         valid-signature? (when (and valid-burn? message) (sieve/validate-message message))]
     (if (and (some? msg-id) valid-burn? valid-signature?)
       (let [non-self-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
@@ -1210,52 +1230,54 @@
             sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
             node-pk (when-let [np (:node-pubkey state)] (if (string? np) np (basalt/bytes->hex np)))
             current-epoch (or (:epoch state) 0)]
-        (if (consensus-mode? state)
-          (if new-message?
-            (let [burn-rid (str "gossip-burn:" msg-id)
-                  already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
-                                      (contains? (or (:executed-receipt-ids state) #{}) burn-rid))]
-              (if already-burned?
-                (record-accepted-gossip state message gossip-result new-message? current-epoch)
-                (if (and (not= sender node-pk) sender)
-                  (if (and (get-in state [:ledger sender])
-                           (>= (spendable-balance state sender) burn-amt))
+        (if (or (not econ-enabled?) (zero? (long (or burn-amt 0))))
+          (record-accepted-gossip state message gossip-result new-message? current-epoch)
+          (if (consensus-mode? state)
+            (if new-message?
+              (let [burn-rid (str "gossip-burn:" msg-id)
+                    already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
+                                        (contains? (or (:executed-receipt-ids state) #{}) burn-rid))]
+                (if already-burned?
+                  (record-accepted-gossip state message gossip-result new-message? current-epoch)
+                  (if (and (not= sender node-pk) sender)
+                    (if (and (get-in state [:ledger sender])
+                             (>= (spendable-balance state sender) burn-amt))
+                      (let [staged (stage-receipt state {:receipt-id burn-rid
+                                                         :type :burn
+                                                         :sender sender
+                                                         :amount burn-amt})]
+                        (if (:ok? staged)
+                          (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
+                          {:state state :commands []}))
+                      {:state state :commands []})
                     (let [staged (stage-receipt state {:receipt-id burn-rid
                                                        :type :burn
                                                        :sender sender
                                                        :amount burn-amt})]
                       (if (:ok? staged)
                         (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
-                        {:state state :commands []}))
-                    {:state state :commands []})
-                  (let [staged (stage-receipt state {:receipt-id burn-rid
-                                                     :type :burn
-                                                     :sender sender
-                                                     :amount burn-amt})]
-                    (if (:ok? staged)
-                      (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
-                      {:state state :commands []})))))
-            (record-accepted-gossip state message gossip-result new-message? current-epoch))
-          ;; Standalone non-consensus mode
-          (let [burn-rid (str "gossip-burn:" msg-id)
-                already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
-                                    (contains? (or (:executed-receipt-ids state) #{}) burn-rid))
-                burn-deduction (when (and new-message? (not already-burned?) (not= sender node-pk) sender)
-                                 (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
-            (if (and new-message? (not already-burned?) (not= sender node-pk) (nil? burn-deduction))
-              {:state state :commands []}
-              (let [state-with-burn (if (and burn-deduction (not already-burned?))
-                                      (let [[next-known next-known-ord] (fifo-track (:known-receipt-ids state)
-                                                                                    (:known-receipt-order state)
-                                                                                    burn-rid
-                                                                                    (long (or (get-in state [:config :max-tracked-receipts]) 10000)))]
-                                        (-> state
-                                            (assoc :ledger (:ledger burn-deduction))
-                                            (assoc :known-receipt-ids next-known
-                                                   :known-receipt-order next-known-ord)
-                                            (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt)))
-                                      state)]
-                (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch))))))
+                        {:state state :commands []})))))
+              (record-accepted-gossip state message gossip-result new-message? current-epoch))
+            ;; Standalone non-consensus mode
+            (let [burn-rid (str "gossip-burn:" msg-id)
+                  already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
+                                      (contains? (or (:executed-receipt-ids state) #{}) burn-rid))
+                  burn-deduction (when (and new-message? (not already-burned?) (not= sender node-pk) sender)
+                                   (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
+              (if (and new-message? (not already-burned?) (not= sender node-pk) (nil? burn-deduction))
+                {:state state :commands []}
+                (let [state-with-burn (if (and burn-deduction (not already-burned?))
+                                        (let [[next-known next-known-ord] (fifo-track (:known-receipt-ids state)
+                                                                                      (:known-receipt-order state)
+                                                                                      burn-rid
+                                                                                      (long (or (get-in state [:config :max-tracked-receipts]) 10000)))]
+                                          (-> state
+                                              (assoc :ledger (:ledger burn-deduction))
+                                              (assoc :known-receipt-ids next-known
+                                                     :known-receipt-order next-known-ord)
+                                              (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt)))
+                                        state)]
+                  (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch)))))))
       {:state state :commands []})))
 
 (defn- transition-to-ready

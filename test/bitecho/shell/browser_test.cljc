@@ -1028,3 +1028,20 @@
       (is (nil? (get-in pruned ["s3" :p2p])))
       (is (= "k1" (get-in pruned ["s1" :tx-key])))
       (is (= "priv" (get-in pruned ["s3" :ephemeral-priv]))))))
+
+(deftest test-format-p2p-sdp-answer-multi-candidate-and-local-safe
+  (testing "format-p2p-sdp-answer emits multiple candidates and avoids .local in o= and c= lines"
+    (let [dial-info {:session-id "sid-multi-cand"
+                     :remote-ice-ufrag "testufrag"
+                     :remote-ice-pwd "testpwd"
+                     :remote-fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B"}
+          cands [{:host "btec-123.local" :port 5011 :transport :udp}
+                 {:host "192.168.86.36" :port 5011 :transport :udp}]
+          sdp (browser/format-p2p-sdp-answer dial-info cands)]
+      ;; Header lines must use non-.local IP
+      (is (str/includes? sdp "o=- 123456789 2 IN IP4 192.168.86.36"))
+      (is (str/includes? sdp "c=IN IP4 192.168.86.36"))
+      (is (not (str/includes? sdp "c=IN IP4 btec-123.local")))
+      ;; Candidate lines must preserve both hostnames/IPs
+      (is (str/includes? sdp "a=candidate:1 1 UDP 2130706431 btec-123.local 5011 typ host"))
+      (is (str/includes? sdp "a=candidate:2 1 UDP 2130706430 192.168.86.36 5011 typ host")))))

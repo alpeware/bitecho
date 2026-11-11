@@ -5,9 +5,13 @@
    - Rule 4: Single-authority lifecycle state over shared connection pools.
    - Rule 5: Zero silent failures on unroutable or mismatched subnets."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.browser :as browser-shell]
+            [bitecho.sieve.core :as sieve]
+            [bitecho.state-machine :as sm]
             [clojure.string :as str]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
@@ -578,3 +582,101 @@
           (is (= 1 (count (:broadcast-inbox (:state axiom-res)))))
           (is (= "fan-out-hello" (:text (first (:broadcast-inbox (:state axiom-res))))))
           (is (= pub-browser (:from (first (:broadcast-inbox (:state axiom-res)))))))))))
+
+(deftest test-p2p-offer-answer-signaling-burn
+  (testing "exec-p2p-offer and exec-p2p-answer apply :min-signaling-burn floor when closed, and 0 burn when direct P2P is open"
+    (let [kp-a (crypto/generate-keypair)
+          kp-b (crypto/generate-keypair)
+          pub-a (basalt/bytes->hex (:public kp-a))
+          pub-b (basalt/bytes->hex (:public kp-b))
+          sid "sess-signaling-burn-test"
+          base-a (-> (light-core/init-light-state {:pubkey-hex pub-a} {:subnet-id "test/burn" :epoch 10})
+                     (assoc :default-p2p-candidates ["udp://127.0.0.1:7777"])
+                     (assoc-in [:sessions sid]
+                               {:session-id sid
+                                :peer pub-b
+                                :state "open"
+                                :p2p {:phase :none :connected? false}}))
+          ;; 1. Omitted candidates falls back to :default-p2p-candidates, burn defaults to 100
+          off-res-1 (light-core/handle-command base-a {"cmd" "p2p-offer" "session_id" sid} (:private kp-a))]
+      (is (= true (get-in off-res-1 [:response "ok"])))
+      (is (= 100 (get-in off-res-1 [:response "burn"])))
+      (is (= ["udp://127.0.0.1:7777"] (get-in off-res-1 [:response "candidates"])))
+      (let [env-1 (first (:net-envelopes off-res-1))]
+        (is (nil? (:p2p-direct? env-1)))
+        (is (= 100 (get-in env-1 [:event :message :burn-amount]))))
+
+      ;; 2. When p2p-open? is true, burn is 0 and :p2p-direct? is true
+      (let [open-a (assoc-in base-a [:sessions sid :p2p :connected?] true)
+            off-res-2 (light-core/handle-command open-a {"cmd" "p2p-offer" "session_id" sid} (:private kp-a))]
+        (is (= true (get-in off-res-2 [:response "ok"])))
+        (is (= 0 (get-in off-res-2 [:response "burn"])))
+        (let [env-2 (first (:net-envelopes off-res-2))]
+          (is (true? (:p2p-direct? env-2)))
+          (is (= 0 (get-in env-2 [:event :message :burn-amount])))))
+
+      ;; 3. Custom burn parameter
+      (let [off-res-3 (light-core/handle-command base-a {"cmd" "p2p-offer" "session_id" sid "burn" 250} (:private kp-a))]
+        (is (= true (get-in off-res-3 [:response "ok"])))
+        (is (= 250 (get-in off-res-3 [:response "burn"])))
+        (is (= 250 (get-in (first (:net-envelopes off-res-3)) [:event :message :burn-amount]))))
+
+      ;; 4. Negative burn rejected
+      (let [off-res-4 (light-core/handle-command base-a {"cmd" "p2p-offer" "session_id" sid "burn" -50} (:private kp-a))]
+        (is (= false (get-in off-res-4 [:response "ok"])))
+        (is (= "invalid-numeric-parameter" (get-in off-res-4 [:response "error"]))))
+
+      ;; 5. p2p-answer behaves identically
+      (let [ans-res-1 (light-core/handle-command base-a {"cmd" "p2p-answer" "session_id" sid} (:private kp-a))]
+        (is (= true (get-in ans-res-1 [:response "ok"])))
+        (is (= 100 (get-in ans-res-1 [:response "burn"])))
+        (is (= ["udp://127.0.0.1:7777"] (get-in ans-res-1 [:response "candidates"])))
+        (is (= 100 (get-in (first (:net-envelopes ans-res-1)) [:event :message :burn-amount])))))))
+
+(deftest test-state-machine-min-signaling-burn-floor
+  (testing "state_machine/handle-receive-gossip respects custom :min-signaling-burn and :burn-floor in state config, and allows 0-burn when economy-enabled? is false"
+    (let [kp1 (crypto/generate-keypair)
+          kp2 (crypto/generate-keypair)
+          pub1 (basalt/bytes->hex (:public kp1))
+          pub2 (basalt/bytes->hex (:public kp2))
+          cfg-min-burn (assoc config/default-config
+                              :economy-enabled? true
+                              :min-signaling-burn 200
+                              :genesis-ledger {pub1 {:balance 100000 :seq 0 :deps []}
+                                               pub2 {:balance 100000 :seq 0 :deps []}})
+          s0 (sm/init-state [] pub1 (assoc cfg-min-burn :keypair kp1))
+          ;; Gossip with burn 150 (< 200) should be dropped
+          msg-low (sieve/wrap-message (fressian/utf8->bytes "low burn") (:private kp2) (:public kp2) 150)
+          res-low (sm/handle-event s0 {:type :receive-gossip :sender pub2 :message msg-low})
+          ;; Gossip with burn 200 (>= 200) should be accepted
+          msg-ok (sieve/wrap-message (fressian/utf8->bytes "ok burn") (:private kp2) (:public kp2) 200)
+          res-ok (sm/handle-event s0 {:type :receive-gossip :sender pub2 :message msg-ok})]
+      (is (empty? (get-in (:state res-low) [:murmur-cache :set])))
+      (is (contains? (get-in (:state res-ok) [:murmur-cache :set])
+                     (basalt/bytes->hex (crypto/sha256 (:payload msg-ok)))))
+
+      ;; Test :burn-floor 200 on default-config (without :min-signaling-burn)
+      (let [cfg-burn-floor (assoc config/default-config
+                                  :economy-enabled? true
+                                  :burn-floor 200
+                                  :genesis-ledger {pub1 {:balance 100000 :seq 0 :deps []}
+                                                   pub2 {:balance 100000 :seq 0 :deps []}})
+            s-bf (sm/init-state [] pub1 (assoc cfg-burn-floor :keypair kp1))
+            res-bf-low (sm/handle-event s-bf {:type :receive-gossip :sender pub2 :message msg-low})
+            res-bf-ok (sm/handle-event s-bf {:type :receive-gossip :sender pub2 :message msg-ok})]
+        (is (empty? (get-in (:state res-bf-low) [:murmur-cache :set]))
+            ":burn-floor 200 must reject burn 150 on default-config")
+        (is (contains? (get-in (:state res-bf-ok) [:murmur-cache :set])
+                       (basalt/bytes->hex (crypto/sha256 (:payload msg-ok))))
+            ":burn-floor 200 must accept burn 200 on default-config"))
+
+      ;; Test :economy-enabled? false allows 0-burn
+      (let [cfg-no-econ (assoc config/default-config
+                               :economy-enabled? false
+                               :genesis-ledger {})
+            s-no-econ (sm/init-state [] pub1 (assoc cfg-no-econ :keypair kp1))
+            msg-zero (sieve/wrap-message (fressian/utf8->bytes "zero burn") (:private kp2) (:public kp2) 0)
+            res-zero (sm/handle-event s-no-econ {:type :receive-gossip :sender pub2 :message msg-zero})]
+        (is (contains? (get-in (:state res-zero) [:murmur-cache :set])
+                       (basalt/bytes->hex (crypto/sha256 (:payload msg-zero))))
+            ":economy-enabled? false must accept 0-burn gossip without deduction")))))

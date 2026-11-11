@@ -121,11 +121,30 @@ if [[ "${SMOKE_OUT}" != *'"ok":true'* || "${SMOKE_OUT}" != *'"pubkey":'* ]]; the
   exit 1
 fi
 
-# Serve startup smoke check (F-G3: verifies serve starts without crashing on IWithMeta)
-SERVE_OUT=$(echo "" | timeout 5 "${NODE_BIN}" "dist/bitecho-light-node.cjs" serve --state-dir "${TMP_STATE_DIR}" --bootstrap "devnet/bootstrap.txt" --ingress-tcp-port 0 2>&1 || true)
+# Serve startup smoke check (F-G3 / F-G4: verifies serve starts without crashing on IWithMeta or failing offline bootstrap)
+cat << 'EOF' > "${TMP_STATE_DIR}/bootstrap.txt"
+Network: devnet
+Treasury Public Key: 302a300506032b65700321007c2b695b77904a19a630b75ce53889a53963c0f85aa69e5276bb988a183b91b8
+Custody Public Key:  302a300506032b6570032100e476d77ef34962d09baee0062b4c03be832a1ccc2d691623a8cb39e356793f2b
+Directory Authority Public Key: 302a300506032b657003210056b505baa32c3b99663d163d6ee00b5018a26e182405f5ec4d5062f12f633ce9
+
+Node: node1 (local-smoke)
+  Cluster Address:   127.0.0.1:19999 (UDP DataChannel)
+  Agent Ingress:     127.0.0.1:19999 (UDP DataChannel)
+  Agent TCP Ingress: 127.0.0.1:19999 (TCP DataChannel)
+  Ed25519 Pubkey:    302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086
+  DTLS Fingerprint:  95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B
+  ICE Credentials:   ufrag=1ec0ae74 pwd=d928f1aac56a0d6e6fdda551
+EOF
+
+SERVE_OUT=$( (sleep 0.5; echo '{"cmd":"status"}'; sleep 0.5) | timeout 5 "${NODE_BIN}" "dist/bitecho-light-node.cjs" serve --state-dir "${TMP_STATE_DIR}" --bootstrap "${TMP_STATE_DIR}/bootstrap.txt" --transport tcp --ingress-tcp-port 0 2>&1 || true)
 echo "Serve smoke check output: ${SERVE_OUT}"
-if [[ "${SERVE_OUT}" == *"IWithMeta"* || "${SERVE_OUT}" == *"alter-meta!"* || "${SERVE_OUT}" == *"TypeError"* ]]; then
-  echo "ERROR: Serve smoke check failed for dist/bitecho-light-node.cjs (IWithMeta crash detected)!" >&2
+if [[ "${SERVE_OUT}" == *"descriptor-file-not-found"* || "${SERVE_OUT}" == *"IWithMeta"* || "${SERVE_OUT}" == *"alter-meta!"* || "${SERVE_OUT}" == *"TypeError"* ]]; then
+  echo "ERROR: Serve smoke check failed for dist/bitecho-light-node.cjs!" >&2
+  exit 1
+fi
+if [[ "${SERVE_OUT}" != *'"mdns_hostname":'* ]]; then
+  echo "ERROR: Serve smoke check did not produce expected mdns_hostname status output!" >&2
   exit 1
 fi
 

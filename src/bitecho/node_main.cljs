@@ -2259,6 +2259,21 @@
                          "synced" false
                          "error" err}))))))))
 
+(defn- detect-lan-ipv4
+  "Finds the first non-internal IPv4 address using node:os networkInterfaces,
+   falling back to 127.0.0.1 on exception or if none found."
+  []
+  (try
+    (let [ifaces (.networkInterfaces node-os)
+          addrs (for [k (js/Object.keys ifaces)
+                      entry (aget ifaces k)
+                      :when (and (not (.-internal entry))
+                                 (= (.-family entry) "IPv4"))]
+                  (.-address entry))]
+      (or (first addrs) "127.0.0.1"))
+    (catch :default _
+      "127.0.0.1")))
+
 (defn run-serve!
   "Runs the Node.js light node in continuous JSONL `serve` mode reading STDIN (and optional `--cmd-file`)
    and writing STDOUT (and optional `--events-out`)."
@@ -2322,7 +2337,18 @@
                           (swap! state-atom assoc :connected? false :connection-error err)
                           (sync-conn-diagnostics! state-atom conn-atom)
                           (when cb (cb reconn))))))))
-               mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {(mdns/generate-mdns-hostname) "127.0.0.1"}}) (catch :default _ nil))
+               mdns-host (mdns/generate-mdns-hostname)
+               lan-ip (detect-lan-ipv4)
+               ingress-port (int (or (:ingress-tcp-port opts) 0))
+               default-cands (if (pos? ingress-port)
+                               [(str "tcp://" mdns-host ":" ingress-port)
+                                (str "tcp://" lan-ip ":" ingress-port)]
+                               [])
+               _ (swap! state-atom assoc
+                        :mdns-hostname mdns-host
+                        :lan-ip lan-ip
+                        :default-p2p-candidates default-cands)
+               mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {mdns-host lan-ip}}) (catch :default _ nil))
                mdns-atom (or mdns-svc (atom (mdns/init-mdns-table)))
                p2p-peers-atom (atom {})
                ingress-peers-atom (atom {})

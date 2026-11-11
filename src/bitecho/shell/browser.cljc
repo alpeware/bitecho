@@ -623,20 +623,33 @@
       :clj (fn [] nil))))
 
 (defn format-validator-sdp-answer
-  "Generates passive WebRTC SDP answer (ice-lite, setup:passive) for connecting to a Bitecho validator."
+  "Generates passive WebRTC SDP answer (ice-lite, setup:passive) for connecting to a Bitecho validator or peer."
   [node-cfg]
-  (let [ip (or (:ip node-cfg) "127.0.0.1")
+  (let [raw-ip (or (:ip node-cfg) "127.0.0.1")
+        conn-ip (if (str/ends-with? (str/lower-case raw-ip) ".local") "127.0.0.1" raw-ip)
         port (or (:agent-port node-cfg) (:port node-cfg) 9001)
         ufrag (or (:ice-ufrag node-cfg) "ufrag")
         pwd (or (:ice-pwd node-cfg) "pwd")
-        fp (or (:fingerprint node-cfg) "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00")]
+        fp (or (:fingerprint node-cfg) "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00")
+        candidate-lines (if (seq (:candidates node-cfg))
+                          (str/join
+                           ""
+                           (map-indexed
+                            (fn [idx cand]
+                              (let [c-idx (inc idx)
+                                    priority (- 2130706431 idx)
+                                    c-host (or (:host cand) (:ip cand) raw-ip)
+                                    c-port (or (:port cand) port)]
+                                (str "a=candidate:" c-idx " 1 UDP " priority " " c-host " " c-port " typ host\r\n")))
+                            (:candidates node-cfg)))
+                          (str "a=candidate:1 1 UDP 2130706431 " raw-ip " " port " typ host\r\n"))]
     (str "v=0\r\n"
-         "o=- 123456789 2 IN IP4 " ip "\r\n"
+         "o=- 123456789 2 IN IP4 " conn-ip "\r\n"
          "s=-\r\n"
          "t=0 0\r\n"
          "a=group:BUNDLE 0\r\n"
          "m=application " port " UDP/DTLS/SCTP webrtc-datachannel\r\n"
-         "c=IN IP4 " ip "\r\n"
+         "c=IN IP4 " conn-ip "\r\n"
          "a=setup:passive\r\n"
          "a=mid:0\r\n"
          "a=max-message-size:262144\r\n"
@@ -646,17 +659,31 @@
          "a=ice-pwd:" pwd "\r\n"
          "a=ice-lite\r\n"
          "a=rtcp-mux\r\n"
-         "a=candidate:1 1 UDP 2130706431 " ip " " port " typ host\r\n")))
+         candidate-lines)))
 
 (defn format-p2p-sdp-answer
-  "Generates passive WebRTC SDP answer for direct browser-to-peer P2P DataChannels from dial-info and a candidate."
-  [dial-info cand]
-  (format-validator-sdp-answer
-   {:ip (:host cand)
-    :port (:port cand)
-    :ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
-    :ice-pwd (or (:remote-ice-pwd dial-info) "pwd")
-    :fingerprint (:remote-fingerprint dial-info)}))
+  "Generates passive WebRTC SDP answer for direct browser-to-peer P2P DataChannels from dial-info and candidate(s)."
+  [dial-info cand-or-cands]
+  (let [all-cands (if (sequential? cand-or-cands)
+                    (vec cand-or-cands)
+                    (if (map? cand-or-cands) [cand-or-cands] []))
+        udp-cands (let [filtered (filterv #(= :udp (or (:transport %) :udp)) all-cands)]
+                    (if (seq filtered) filtered all-cands))
+        first-cand (first udp-cands)
+        non-local-cand (some (fn [c]
+                               (let [h (or (:host c) (:ip c) "")]
+                                 (when-not (str/ends-with? (str/lower-case h) ".local")
+                                   h)))
+                             udp-cands)
+        ip (or non-local-cand (:host first-cand) "127.0.0.1")
+        port (or (:port first-cand) 9001)]
+    (format-validator-sdp-answer
+     {:ip ip
+      :port port
+      :candidates udp-cands
+      :ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
+      :ice-pwd (or (:remote-ice-pwd dial-info) "pwd")
+      :fingerprint (:remote-fingerprint dial-info)})))
 
 (defn send-webrtc-envelope!
   "Sends an envelope over the active WebRTC DataChannel via Rule 4 :send transition."

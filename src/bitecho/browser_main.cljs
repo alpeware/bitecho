@@ -639,13 +639,14 @@
         (set-p2p-channel-state node-atom sid true nil)
         (let [candidates (or (:remote-candidates dial-info) [])
               parsed-candidates (keep #(light-core/parse-p2p-candidate % nil) candidates)
-              cand (first parsed-candidates)]
+              udp-candidates (vec (filter #(= :udp (or (:transport %) :udp)) parsed-candidates))
+              cand (first udp-candidates)]
           (if-not cand
             (set-p2p-channel-state node-atom sid false {:error "no-valid-candidates"})
             (let [p2p-conn-atom (atom (browser/initial-conn-state {:peer-id peer-pk :subnet-id (:subnet-id @node-atom)}))
                   tr-name (name (or (:transport cand) :udp))
                   target-url (str tr-name "://" (:host cand) ":" (:port cand))
-                  answer-sdp (browser/format-p2p-sdp-answer dial-info cand)
+                  answer-sdp (browser/format-p2p-sdp-answer dial-info udp-candidates)
                   res (browser/connect-webrtc!
                        p2p-conn-atom
                        {:peer-id peer-pk
