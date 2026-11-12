@@ -374,3 +374,69 @@
         (is (= msg-id (:envelope-id r2)))
         (is (= 1 (count (:broadcasts (:state r2)))) "Duplicate is not appended to broadcasts")))))
 
+(deftest test-relay-validator-chain-state-snapshot-routing-f-bb-8
+  (testing "F-Bb-8: Validator-signed :chain-state-snapshot envelopes are verified and routed to queried pubkey inbox"
+    (let [st0 (relay/init-relay-state)
+          kp-val (crypto/generate-keypair)
+          kp-user (crypto/generate-keypair)
+          val-pub (basalt/bytes->hex (:public kp-val))
+          user-pub (basalt/bytes->hex (:public kp-user))
+          base-snap {:type :chain-state-snapshot
+                     :bitecho/type :chain-state-snapshot
+                     :validator-pubkey val-pub
+                     :pubkey user-pub
+                     :finalized-epoch 42
+                     :balance 100000
+                     :spendable 95000
+                     :seq 7
+                     :deps []
+                     :escrows []
+                     :nonce "qcs-42-nonce"}
+          canonical-str (relay/canonical-chain-state-snapshot-str base-snap)
+          sig (crypto/sign (:private kp-val) (fressian/utf8->bytes canonical-str))
+          signed-snap (assoc base-snap :signature (basalt/bytes->hex sig))]
+
+      ;; 1. Signature verification
+      (is (true? (relay/verify-chain-state-snapshot-signature signed-snap)))
+      ;; Alter balance -> signature invalid
+      (let [forged (assoc signed-snap :balance 999999)]
+        (is (false? (relay/verify-chain-state-snapshot-signature forged))))
+
+      ;; 2. Relay submission routes into user-pub inbox
+      (let [r1 (relay/reduce-relay st0 {:type :relay-submit :envelope signed-snap :from-validator? true :now-ms 1000})]
+        (is (true? (:ok? r1)))
+        (is (= user-pub (get-in r1 [:response "recipient"])))
+        (is (false? (get-in r1 [:response "broadcast"])))
+        (is (empty? (:effects r1)) "No forwarding effects for incoming validator snapshot")
+        (let [st1 (:state r1)
+              user-inbox (get-in st1 [:inboxes user-pub])]
+          (is (= 1 (count user-inbox)))
+          (is (= 1 (:relay-seq (first user-inbox))))
+
+          ;; 3. Poll by user delivers the validator snapshot envelope
+          (let [ts 1050
+                nonce "poll-nonce-1"
+                sig-poll (relay/sign-poll-request (:private kp-user)
+                                                  {:pubkey user-pub
+                                                   :since-seq 0
+                                                   :timestamp-ms ts
+                                                   :nonce nonce})
+                poll-res (relay/reduce-relay st1 {:type :relay-poll
+                                                  :pubkey user-pub
+                                                  :since-seq 0
+                                                  :timestamp-ms ts
+                                                  :nonce nonce
+                                                  :signature sig-poll
+                                                  :now-ms 1050})]
+            (is (true? (:ok? poll-res)))
+            (let [msgs (get-in poll-res [:response "messages"])]
+              (is (= 1 (count msgs)))
+              (is (= user-pub (:recipient (first msgs))))))))
+
+      ;; 4. Forged snapshot is rejected fail-closed
+      (let [forged-snap (assoc signed-snap :balance 999999)
+            r-bad (relay/reduce-relay st0 {:type :relay-submit :envelope forged-snap :now-ms 1100})]
+        (is (false? (:ok? r-bad)))
+        (is (= :invalid-signature (:error r-bad)))))))
+
+

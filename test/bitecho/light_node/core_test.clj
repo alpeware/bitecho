@@ -199,7 +199,9 @@
                     (and (= 1 (count (:pending-offers (:state res-bob))))
                          (= 1 (count (:stdout-events res-bob))))
                     (and (empty? (:pending-offers (:state res-bob)))
-                         (empty? (:stdout-events res-bob)))))))
+                         (if (= tamper-field :epoch)
+                           (= 1 (count (:stdout-events res-bob)))
+                           (empty? (:stdout-events res-bob))))))))
 
 (defspec ^{:doc "Property: Consecutive transfers auto-increment seq and chain causal deps"}
   prop-transfer-auto-sequence-and-deps 20
@@ -339,8 +341,8 @@
             stale-env (first (:net-envelopes res-alice-stale))
             res-stale (light-core/handle-wire-payload (:state res-p2p) stale-env (:privkey-bytes bob))]
         (is (= :offer-received (get-in (:state res-p2p) [:sessions session-id :p2p :phase])))
-        (is (pos? (get-in (:state res-stale) [:diagnostics :p2p-signaling-rejected] 0)))
-        (is (= "p2p-signaling-rejected" (get (first (:stdout-events res-stale)) "event"))))
+        (is (pos? (get-in (:state res-stale) [:diagnostics :p2p-signal-deduped] 0)))
+        (is (empty? (:stdout-events res-stale))))
 
       ;; 7. Non-open session still enforces 2-epoch skew check!
       (let [closed-sid "sess-closed"
@@ -1074,17 +1076,17 @@
         (is (= 1 (get-in res-status [:response "petnames_count"])))
         (is (= "bob" (:peer_petname sess-summary)))))
 
-    (testing "4. resolve-session-id fails closed on ambiguous multiple active sessions"
+    (testing "4. resolve-session-id resolves most active session on multiple open sessions"
       (let [tx-k (byte-array 32)
             st-multi (-> st-a0
                          (assoc-in [:sessions "sess-1"] {:session-id "sess-1" :peer pub-bob :state "open" :tx-key tx-k :replay-window (sealed/init-replay-window)})
                          (assoc-in [:sessions "sess-2"] {:session-id "sess-2" :peer pub-bob :state "open" :tx-key tx-k :replay-window (sealed/init-replay-window)}))]
-        ;; Ambiguous: 2 open sessions to bob -> send by petname fails closed
+        ;; Multiple open sessions to bob -> send by petname resolves to most active (tie-break sess-2)
         (let [res-ambig (light-core/handle-command st-multi {"cmd" "send" "peer" "@bob" "text" "hi"} priv-alice)]
-          (is (= false (get-in res-ambig [:response "ok"])))
-          (is (= "session-not-open" (get-in res-ambig [:response "error"]))))
+          (is (= true (get-in res-ambig [:response "ok"])))
+          (is (= "sess-2" (get-in res-ambig [:response "session_id"]))))
 
-        ;; Ambiguous: 2 active sessions to bob -> close by petname fails closed
+        ;; Ambiguous: 2 active sessions to bob -> close by petname still fails closed
         (let [res-ambig-close (light-core/handle-command st-multi {"cmd" "close" "peer" "bob"} priv-alice)]
           (is (= false (get-in res-ambig-close [:response "ok"])))
           (is (= "session-not-found" (get-in res-ambig-close [:response "error"]))))
@@ -3154,6 +3156,405 @@
       (is (= 1850 (get-in st1 [:account :finalized-epoch])))
       (is (= 1850 (:epoch st1)))
       (is (true? (:epoch-initialized? st1))))))
+
+(deftest test-epoch-skew-diagnostic-event-f-bb-8
+  (testing "Incoming offer with epoch skew > 15 emits diagnostic event and counts in diagnostics"
+    (let [alice (test-identity)
+          bob (test-identity)
+          st-bob (light-core/init-light-state (:identity bob) {:epoch 100})
+          ;; Alice creates offer at epoch 50 (|50 - 100| = 50 > 15)
+          offer-res (light-core/handle-command (light-core/init-light-state (:identity alice) {:epoch 50})
+                                               {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 10 "burn" 500}
+                                               (:privkey-bytes alice))
+          offer-env (first (:net-envelopes offer-res))
+          bob-recv (light-core/handle-wire-payload st-bob offer-env (:privkey-bytes bob))]
+      (is (= 1 (get-in (:state bob-recv) [:diagnostics :epoch-skew-dropped])))
+      (let [diag (first (filter #(= "diagnostic" (get % "event")) (:stdout-events bob-recv)))]
+        (is (some? diag))
+        (is (= "epoch-skew-dropped" (get diag "reason")))
+        (is (= 50 (get diag "offer_epoch")))
+        (is (= 100 (get diag "local_epoch")))
+        (is (= (:pubkey-hex alice) (get diag "from")))))))
+
+(deftest test-multi-session-resolution-and-export-send
+  (testing "Multi-session resolution picks most recently active open session"
+    (let [alice (test-identity)
+          bob (test-identity)
+          st-alice (light-core/init-light-state (:identity alice) {:epoch 10})
+          st-bob (light-core/init-light-state (:identity bob) {:epoch 10})
+
+          ;; Create first session sid-1
+          off-1 (light-core/handle-command st-alice {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 0 "burn" 500} (:privkey-bytes alice))
+          env-1 (first (filter gossip-env? (:net-envelopes off-1)))
+          sid-1 (get-in off-1 [:response "session_id"])
+          bob-1 (light-core/handle-wire-payload st-bob env-1 (:privkey-bytes bob))
+          acc-1 (light-core/handle-command (:state bob-1) {"cmd" "accept" "session_id" sid-1} (:privkey-bytes bob))
+          env-acc-1 (first (filter gossip-env? (:net-envelopes acc-1)))
+          alice-open-1 (light-core/handle-wire-payload (:state off-1) env-acc-1 (:privkey-bytes alice))
+
+          ;; Create second session sid-2
+          st-alice-2 (assoc-in (:state alice-open-1) [:sessions sid-1 :created-epoch] 10)
+          off-2 (light-core/handle-command st-alice-2 {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 0 "burn" 500} (:privkey-bytes alice))
+          env-2 (first (filter gossip-env? (:net-envelopes off-2)))
+          sid-2 (get-in off-2 [:response "session_id"])
+          bob-2 (light-core/handle-wire-payload (:state acc-1) env-2 (:privkey-bytes bob))
+          acc-2 (light-core/handle-command (:state bob-2) {"cmd" "accept" "session_id" sid-2} (:privkey-bytes bob))
+          env-acc-2 (first (filter gossip-env? (:net-envelopes acc-2)))
+          alice-open-2 (light-core/handle-wire-payload (:state off-2) env-acc-2 (:privkey-bytes alice))
+          st-both (-> (:state alice-open-2)
+                      (assoc-in [:sessions sid-1 :created-epoch] 10)
+                      (assoc-in [:sessions sid-1 :last-active-epoch] 10)
+                      (assoc-in [:sessions sid-2 :created-epoch] 20)
+                      (assoc-in [:sessions sid-2 :last-active-epoch] 20))]
+
+      (is (not= sid-1 sid-2))
+      (is (= "open" (get-in st-both [:sessions sid-1 :state])))
+      (is (= "open" (get-in st-both [:sessions sid-2 :state])))
+
+      ;; Send targeting bob's pubkey without session-id picks sid-2 (more recent epoch)
+      (let [send-res (light-core/handle-command st-both
+                                                {"cmd" "send" "to" (:pubkey-hex bob) "message" "hello sid-2"}
+                                                (:privkey-bytes alice))]
+        (is (true? (get-in send-res [:response "ok"])))
+        (is (= sid-2 (get-in send-res [:response "session_id"]))))
+
+      ;; Send targeting sid-1 directly picks sid-1
+      (let [send-res (light-core/handle-command st-both
+                                                {"cmd" "send" "session_id" sid-1 "message" "hello sid-1"}
+                                                (:privkey-bytes alice))]
+        (is (true? (get-in send-res [:response "ok"])))
+        (is (= sid-1 (get-in send-res [:response "session_id"])))))))
+
+(deftest test-actionable-event-queue-and-wait
+  (testing "Actionable events are enqueued with monotonic :event-id and popped via cmd: wait"
+    (let [alice (test-identity)
+          bob (test-identity)
+          st-bob (light-core/init-light-state (:identity bob) {:epoch 10})
+          off-res (light-core/handle-command (light-core/init-light-state (:identity alice) {:epoch 10})
+                                             {"cmd" "offer" "callee" (:pubkey-hex bob) "price" 0 "burn" 500}
+                                             (:privkey-bytes alice))
+          bob-recv (light-core/handle-wire-payload st-bob (first (filter gossip-env? (:net-envelopes off-res))) (:privkey-bytes bob))
+          st1 (:state bob-recv)]
+      ;; "offer-received" is actionable -> should be in :event-queue
+      (is (pos? (count (:event-queue st1))))
+      (let [ev (first (:event-queue st1))]
+        (is (= "offer-received" (get ev "event")))
+        (is (= 1 (or (get ev "event_id") (:event-id ev)))))
+
+      ;; cmd: status surfaces unread_events
+      (let [stat-res (light-core/handle-command st1 {"cmd" "status"} (:privkey-bytes bob))]
+        (is (= (count (:event-queue st1)) (get-in stat-res [:response "unread_events"]))))
+
+      ;; cmd: wait pops all queued events
+      (let [wait-res (light-core/handle-command st1 {"cmd" "wait"} (:privkey-bytes bob))]
+        (is (true? (get-in wait-res [:response "ok"])))
+        (is (= 1 (count (get-in wait-res [:response "events"]))))
+        (is (empty? (:event-queue (:state wait-res))))
+        ;; Second wait on empty queue returns park: true
+        (let [wait-empty (light-core/handle-command (:state wait-res) {"cmd" "wait"} (:privkey-bytes bob))]
+          (is (true? (get-in wait-empty [:response "ok"])))
+          (is (true? (get-in wait-empty [:response "park"])))
+          (is (empty? (get-in wait-empty [:response "events"]))))))))
+
+(deftest test-p2p-signal-deduplication-and-preservation
+  (testing "Duplicate p2p-offer is deduplicated without dropping connected state"
+    (let [alice (test-identity)
+          bob (test-identity)
+          sid "test-p2p-sess-42"
+          init-sess {:session-id sid
+                     :state "open"
+                     :peer (:pubkey-hex bob)
+                     :p2p {:phase :open
+                           :connected? true
+                           :remote-offer-seq 5
+                           :transport "udp"}
+                     :p2p-meta {:local-signal-seq 2
+                                :remote-offer-seq 5
+                                :preferred-transport "udp"}}
+          st-alice (-> (light-core/init-light-state (:identity alice) {:epoch 10})
+                       (assoc-in [:sessions sid] init-sess))
+          canonical-str (light-core/canonical-p2p-signal-str :offer sid (:pubkey-hex bob) (:pubkey-hex alice) "udp" ["c1"] "u" "p" "fp" 10 5)
+          sig (basalt/bytes->hex (crypto/sign (:privkey-bytes bob) (.getBytes canonical-str "UTF-8")))
+          dup-msg {:bitecho/type :p2p-offer
+                   :session-id sid
+                   :sender (:pubkey-hex bob)
+                   :recipient (:pubkey-hex alice)
+                   :transport "udp"
+                   :candidates ["c1"]
+                   :ice-ufrag "u"
+                   :ice-pwd "p"
+                   :fingerprint "fp"
+                   :epoch 10
+                   :signal-seq 5
+                   :signature sig}
+          res (light-core/handle-wire-payload st-alice dup-msg (:privkey-bytes alice))]
+      (is (= 1 (get-in (:state res) [:diagnostics :p2p-signal-deduped])))
+      (is (true? (get-in (:state res) [:sessions sid :p2p :connected?])) "Leg remains connected!")
+      (is (empty? (:stdout-events res)) "No error event emitted on duplicate signal"))))
+
+(deftest test-f2-session-prefix-and-raw-pubkey-resolution
+  (testing "F-2: Unique session prefix matches open session"
+    (let [alice (test-identity)
+          bob (test-identity)
+          sid1 "1234567890abcdef1234567890abcdef"
+          sid2 "abcdef1234567890abcdef1234567890"
+          sess1 {:session-id sid1 :state "open" :peer (:pubkey-hex bob) :contiguous-rx-seq 0 :outbound-seq 0}
+          sess2 {:session-id sid2 :state "open" :peer (:pubkey-hex bob) :contiguous-rx-seq 0 :outbound-seq 0}
+          st (-> (light-core/init-light-state (:identity alice) {:epoch 1})
+                 (assoc-in [:sessions sid1] sess1)
+                 (assoc-in [:sessions sid2] sess2))]
+      (is (= sid1 (light-core/resolve-session-id st {"session_id" "123456"} :open)))
+      (is (= sid2 (light-core/resolve-session-id st {"session_id" "abcdef"} :open)))))
+
+  (testing "F-2: Ambiguous session prefix fails closed across all commands"
+    (let [alice (test-identity)
+          bob (test-identity)
+          sid1 "deadbeef111111111111111111111111"
+          sid2 "deadbeef222222222222222222222222"
+          sess1 {:session-id sid1 :state "open" :peer (:pubkey-hex bob) :contiguous-rx-seq 0 :outbound-seq 0
+                 :tx-key (byte-array 32) :rx-key (byte-array 32) :suite sealed/suite-v1-chacha20poly1305}
+          sess2 {:session-id sid2 :state "open" :peer (:pubkey-hex bob) :contiguous-rx-seq 0 :outbound-seq 0
+                 :tx-key (byte-array 32) :rx-key (byte-array 32) :suite sealed/suite-v1-chacha20poly1305}
+          st (-> (light-core/init-light-state (:identity alice) {:epoch 1})
+                 (assoc-in [:sessions sid1] sess1)
+                 (assoc-in [:sessions sid2] sess2))
+          prefix "deadbeef"
+          cmds [{"cmd" "send" "to" prefix "text" "hello"}
+                {"cmd" "ack" "session_id" prefix}
+                {"cmd" "p2p-offer" "session_id" prefix}
+                {"cmd" "export-send" "to" prefix "text" "hello"}
+                {"cmd" "export-ack" "to" prefix}
+                {"cmd" "export-offer" "to" prefix}]]
+      ;; Direct resolve-session-id
+      (let [res (light-core/resolve-session-id st {"session_id" prefix} :open)]
+        (is (map? res))
+        (is (false? (:ok? res)))
+        (is (= "ambiguous-session-prefix" (:error res)))
+        (is (= [sid1 sid2] (sort (:matches res)))))
+      ;; Across all 6 commands
+      (doseq [cmd-map cmds]
+        (let [res (light-core/handle-command st cmd-map (:privkey-bytes alice))]
+          (is (false? (get-in res [:response "ok"])) (str "Command failed closed: " (get cmd-map "cmd")))
+          (is (= "ambiguous-session-prefix" (get-in res [:response "error"])) (str "Error matches for " (get cmd-map "cmd")))
+          (is (= [sid1 sid2] (sort (get-in res [:response "matches"]))) (str "Matches surfaced for " (get cmd-map "cmd")))))))
+
+  (testing "F-2: 64-hex raw pubkey resolution across commands"
+    (let [alice (test-identity)
+          bob (test-identity)
+          bob-spki (:pubkey-hex bob)
+          bob-raw (subs bob-spki 24)
+          sid "cafe0102030405060708090a0b0c0d0e"
+          sess {:session-id sid :state "open" :peer bob-spki :contiguous-rx-seq 0 :outbound-seq 0
+                :tx-key (byte-array 32) :rx-key (byte-array 32) :suite sealed/suite-v1-chacha20poly1305}
+          st (-> (light-core/init-light-state (:identity alice) {:epoch 1})
+                 (assoc-in [:sessions sid] sess))]
+      ;; Send via 64-hex raw pubkey
+      (let [res (light-core/handle-command st {"cmd" "send" "to" bob-raw "text" "hi"} (:privkey-bytes alice))]
+        (is (true? (get-in res [:response "ok"])))
+        (is (= sid (get-in res [:response "session_id"]))))
+      ;; Ack via 64-hex raw pubkey
+      (let [res (light-core/handle-command st {"cmd" "ack" "to" bob-raw} (:privkey-bytes alice))]
+        (is (true? (get-in res [:response "ok"])))
+        (is (= sid (get-in res [:response "session_id"]))))
+      ;; Export-send via 64-hex raw pubkey
+      (let [res (light-core/handle-command st {"cmd" "export-send" "to" bob-raw "text" "hi"} (:privkey-bytes alice))]
+        (is (true? (get-in res [:response "ok"])))
+        (is (string? (get-in res [:response "envelope_hex"]))))
+      ;; Export-ack via 64-hex raw pubkey
+      (let [res (light-core/handle-command st {"cmd" "export-ack" "to" bob-raw} (:privkey-bytes alice))]
+        (is (true? (get-in res [:response "ok"])))
+        (is (string? (get-in res [:response "envelope_hex"]))))
+      ;; P2P-offer via 64-hex raw pubkey
+      (let [res (light-core/handle-command st {"cmd" "p2p-offer" "to" bob-raw "candidates" ["c1"]} (:privkey-bytes alice))]
+        (is (true? (get-in res [:response "ok"])))
+        (is (= sid (get-in res [:response "session_id"]))))
+      ;; Export-offer via 64-hex raw pubkey
+      (let [res (light-core/handle-command st {"cmd" "export-offer" "to" bob-raw} (:privkey-bytes alice))]
+        (is (true? (get-in res [:response "ok"])))
+        (is (string? (get-in res [:response "envelope_hex"])))))))
+
+(defspec ^{:doc "Property: Generative test for unique session ID prefix resolution"}
+  test-generative-session-prefix-invariants
+  50
+  (prop/for-all [hex-tail (gen/fmap (partial apply str) (gen/vector (gen/elements [\0 \1 \2 \3 \4 \5 \6 \7 \8 \9 \a \b \c \d \e \f]) 26 26))
+                 hex-head (gen/fmap (partial apply str) (gen/vector (gen/elements [\0 \1 \2 \3 \4 \5 \6 \7 \8 \9 \a \b \c \d \e \f]) 6 6))]
+                (let [sid (str hex-head hex-tail)
+                      sess {:session-id sid :state "open" :peer (sample-pubkey-hex)}
+                      alice (test-identity)
+                      st (-> (light-core/init-light-state (:identity alice) {:epoch 1})
+                             (assoc-in [:sessions sid] sess))]
+                  (= sid (light-core/resolve-session-id st {"session_id" hex-head} :open)))))
+
+(deftest test-f3-handle-wire-p2p-offer-answers-while-open
+  (testing "F-3: handle-wire-p2p-offer preserves connected? true and emits p2p-answer when already open"
+    (let [alice (test-identity)
+          bob (test-identity)
+          sid "f3-session-001"
+          init-sess {:session-id sid
+                     :state "open"
+                     :peer (:pubkey-hex bob)
+                     :p2p {:phase :open
+                           :connected? true
+                           :remote-offer-seq 5
+                           :transport "udp"
+                           :local-transport "udp"
+                           :local-candidates ["a-cand-1"]}
+                     :p2p-meta {:local-signal-seq 2
+                                :remote-offer-seq 5
+                                :preferred-transport "udp"
+                                :preferred-candidates ["a-cand-1"]}}
+          st-alice (-> (light-core/init-light-state (:identity alice) {:epoch 10})
+                       (assoc-in [:sessions sid] init-sess))
+          canonical-str (light-core/canonical-p2p-signal-str :offer sid (:pubkey-hex bob) (:pubkey-hex alice) "udp" ["b-cand-1"] "u" "p" "fp" 10 9)
+          sig (basalt/bytes->hex (crypto/sign (:privkey-bytes bob) (.getBytes canonical-str "UTF-8")))
+          offer-msg {:bitecho/type :p2p-offer
+                     :session-id sid
+                     :sender (:pubkey-hex bob)
+                     :recipient (:pubkey-hex alice)
+                     :transport "udp"
+                     :candidates ["b-cand-1"]
+                     :ice-ufrag "u"
+                     :ice-pwd "p"
+                     :fingerprint "fp"
+                     :epoch 10
+                     :signal-seq 9
+                     :signature sig}
+          res (light-core/handle-wire-p2p-offer st-alice offer-msg (:privkey-bytes alice))]
+      ;; Connected state preserved
+      (is (= :open (get-in (:state res) [:sessions sid :p2p :phase])))
+      (is (true? (get-in (:state res) [:sessions sid :p2p :connected?])))
+      (is (= 9 (get-in (:state res) [:sessions sid :p2p :remote-offer-seq])))
+      ;; Answer envelope emitted with :p2p-broadcast? true
+      (is (= 1 (count (:net-envelopes res))))
+      (let [ans-env (first (:net-envelopes res))]
+        (is (true? (:p2p-broadcast? ans-env)))
+        (is (= sid (:p2p-session-id ans-env)))
+        (is (= (:pubkey-hex bob) (:p2p-peer ans-env))))
+      ;; Actionable event emitted
+      (is (= 1 (count (:stdout-events res))))
+      (let [evt (first (:stdout-events res))]
+        (is (= "p2p-offer-answered-while-open" (or (get evt "event") (get evt :event))))
+        (is (= sid (or (get evt "session_id") (get evt :session_id)))))
+      ;; Diagnostics incremented
+      (is (= 1 (get-in (:state res) [:diagnostics :p2p-offer-answered-while-open]))))))
+
+(deftest test-f4-chunk-checksum-verification
+  (testing "F-4: verify-and-strip-chunk-prefixes validates correct checksums"
+    (let [payload "0123456789abcdef"
+          sha (subs (basalt/bytes->hex (crypto/sha256 (.getBytes payload "UTF-8"))) 0 8)
+          chunk-line (str "L01 [16c sha=" sha "]: " payload)
+          res (light-core/verify-and-strip-chunk-prefixes chunk-line)]
+      (is (true? (:ok? res)))
+      (is (= payload (:hex res)))
+      (is (= payload (light-core/strip-chunk-prefixes chunk-line)))))
+
+  (testing "F-4: verify-and-strip-chunk-prefixes rejects corrupted checksums fail-closed"
+    (let [payload "0123456789abcdef"
+          corrupted-line (str "L01 [16c sha=deadbeef]: " payload)
+          res (light-core/verify-and-strip-chunk-prefixes corrupted-line)]
+      (is (false? (:ok? res)))
+      (is (= "chunk-checksum-mismatch" (:error res)))
+      (is (= "deadbeef" (:expected res)))
+      (is (thrown? Exception (light-core/strip-chunk-prefixes corrupted-line)))))
+
+  (testing "F-4: Corrupted chunk in import fails closed with diagnostic"
+    (let [alice (test-identity)
+          st (light-core/init-light-state (:identity alice) {:epoch 1})
+          corrupted "L01 [20c sha=00000000]: 0123456789abcdef0123"
+          res (light-core/handle-command st {"cmd" "import" "hex" corrupted} (:privkey-bytes alice))]
+      (is (false? (get-in res [:response "ok"])))
+      (is (= "chunk-checksum-mismatch" (get-in res [:response "error"])))
+      (is (= 1 (get-in (:state res) [:diagnostics :chunk-checksum-mismatch]))))))
+
+(deftest test-f5-outbox-rto-retransmission-and-eviction
+  (testing "F-5: Outbox retransmits oldest-first, respects rto-ms, and evicts after 5 retries"
+    (let [alice (test-identity)
+          bob (test-identity)
+          sid "f5-outbox-session"
+          t0 1000000
+          msg1 {:seq 1 :msg-id "m1" :retries 0 :created-ms (- t0 40000) :last-sent-ms (- t0 40000)
+                :env {:type :receive-gossip :body "env1"}}
+          msg2 {:seq 2 :msg-id "m2" :retries 1 :created-ms (- t0 35000) :last-sent-ms (- t0 35000)
+                :env {:type :receive-gossip :body "env2"}}
+          msg-fresh {:seq 3 :msg-id "m3" :retries 0 :created-ms (- t0 10000) :last-sent-ms (- t0 10000)
+                     :env {:type :receive-gossip :body "env3"}}
+          sess {:session-id sid :state "open" :peer (:pubkey-hex bob)
+                :outbox [msg2 msg1 msg-fresh]}
+          st (-> (light-core/init-light-state (:identity alice) {:epoch 1})
+                 (assoc-in [:sessions sid] sess))
+          ;; Retransmit with 30s RTO at t0 (msg1 and msg2 are >= 30s old, msg-fresh is 10s old)
+          rx-res (light-core/retransmit-unacked-outbox st sid t0 30000)]
+      ;; Envelopes retransmitted oldest-first by seq: msg1 (seq 1), then msg2 (seq 2)
+      (is (= 2 (count (:net-envelopes rx-res))))
+      (is (= "env1" (:body (first (:net-envelopes rx-res)))))
+      (is (= "env2" (:body (second (:net-envelopes rx-res)))))
+      ;; Retries incremented
+      (let [outbox (get-in (:state rx-res) [:sessions sid :outbox])]
+        (is (= 3 (count outbox)))
+        (is (= 1 (:retries (get outbox 1))))
+        (is (= 2 (:retries (get outbox 2))))
+        (is (= 0 (:retries (get outbox 3)))))
+
+      ;; Now test eviction after 5 retries:
+      (let [msg-doomed {:seq 9 :msg-id "m-dead" :retries 5 :created-ms (- t0 60000) :last-sent-ms (- t0 60000)
+                        :env {:type :receive-gossip :body "env-dead"}}
+            st-doomed (assoc-in st [:sessions sid :outbox] [msg-doomed])
+            evict-res (light-core/retransmit-unacked-outbox st-doomed sid t0 30000)]
+        ;; msg-doomed is evicted from outbox
+        (is (empty? (get-in (:state evict-res) [:sessions sid :outbox])))
+        (is (= 1 (get-in (:state evict-res) [:diagnostics :outbox-evicted])))
+        ;; Actionable event emitted and queued
+        (is (some #(= "outbox-evicted" (or (get % "event") (get % :event))) (:stdout-events evict-res)))
+        (is (some #(= "outbox-evicted" (or (get % "event") (get % :event))) (:event-queue (:state evict-res))))))))
+
+(deftest test-f6-p2p-auto-reoffer-gating-and-backoff
+  (testing "F-6: Shuttle mode never triggers auto-reoffer"
+    (let [alice (test-identity)
+          bob (test-identity)
+          sid "f6-shuttle-session"
+          sess {:session-id sid :state "open" :peer (:pubkey-hex bob)
+                :p2p {:phase :closed :connected? false}
+                :p2p-meta {:mode :shuttle :preferred-candidates ["c1"]}}
+          st (-> (light-core/init-light-state (:identity alice) {:epoch 1})
+                 (assoc-in [:sessions sid] sess))]
+      ;; Even with autonomous daemon flag, shuttle mode sessions NEVER re-offer
+      (is (false? (light-core/should-auto-reoffer? st sid 1000000 true)))
+      (is (false? (light-core/should-auto-reoffer? st sid 1000000 false)))))
+
+  (testing "F-6: Autonomous mode follows exponential backoff"
+    (let [alice (test-identity)
+          bob (test-identity)
+          ;; Make alice pubkey lexicographically smaller than bob to win tie-breaker
+          pk-a (if (neg? (compare (:pubkey-hex alice) (:pubkey-hex bob))) (:pubkey-hex alice) (:pubkey-hex bob))
+          pk-b (if (neg? (compare (:pubkey-hex alice) (:pubkey-hex bob))) (:pubkey-hex bob) (:pubkey-hex alice))
+          sid "f6-auto-session"
+          sess {:session-id sid :state "open" :peer pk-b
+                :p2p {:phase :closed :connected? false}
+                :p2p-meta {:mode :autonomous :preferred-candidates ["c1"] :reconnect-attempts 0}}
+          st (-> (light-core/init-light-state {:pubkey-hex pk-a} {:epoch 1})
+                 (assoc-in [:sessions sid] sess))
+          t0 1000000]
+      ;; Initially ready to re-offer
+      (is (true? (light-core/should-auto-reoffer? st sid t0 false)))
+      ;; Record re-offer attempt 1 -> next reconnect is t0 + 1000ms
+      (let [st1 (light-core/record-reoffer-attempt st sid t0)]
+        (is (= 1 (get-in st1 [:sessions sid :p2p-meta :reconnect-attempts])))
+        (is (= (+ t0 1000) (get-in st1 [:sessions sid :p2p-meta :next-reconnect-ms])))
+        ;; Before backoff deadline -> false
+        (is (false? (light-core/should-auto-reoffer? st1 sid (+ t0 500) false)))
+        ;; At or after backoff deadline -> true
+        (is (true? (light-core/should-auto-reoffer? st1 sid (+ t0 1000) false)))
+        ;; Attempt 2 -> next reconnect is +2000ms (t0 + 1000 + 2000 = +3000ms)
+        (let [st2 (light-core/record-reoffer-attempt st1 sid (+ t0 1000))]
+          (is (= 2 (get-in st2 [:sessions sid :p2p-meta :reconnect-attempts])))
+          (is (= (+ t0 3000) (get-in st2 [:sessions sid :p2p-meta :next-reconnect-ms])))
+          ;; Attempt 5 -> capped at 30000ms
+          (let [st5 (reduce (fn [s t] (light-core/record-reoffer-attempt s sid t))
+                            st2
+                            [(+ t0 3000) (+ t0 7000) (+ t0 15000) (+ t0 31000)])]
+            (is (>= (get-in st5 [:sessions sid :p2p-meta :reconnect-attempts]) 5))
+            (is (= 30000 (light-core/calculate-reconnect-backoff-ms 5)))))))))
+
 
 
 

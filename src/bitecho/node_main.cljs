@@ -704,9 +704,13 @@
 
 (defn- parse-json-safe
   [s]
-  (try
-    (js->clj (js/JSON.parse s))
-    (catch :default _ nil)))
+  (cond
+    (map? s) s
+    (nil? s) nil
+    :else
+    (try
+      (js->clj (js/JSON.parse s))
+      (catch :default _ nil))))
 
 (defn build-one-shot-cmd-map
   "Constructs a JSON command map from parsed CLI arguments."
@@ -766,14 +770,21 @@
                                          (cond-> m
                                            oh (assoc "offer_hash" oh)
                                            from (assoc "from" from)))
-                   "send"     (let [m {"cmd" "send"
-                                       "session_id" (or (extract-flag-value args "--session-id" nil)
-                                                        (extract-flag-value args "--session" nil))
+                   "send"     (let [to (or (extract-flag-value args "--to" nil)
+                                           (extract-flag-value args "--peer" nil))
+                                    sid (or (extract-flag-value args "--session-id" nil)
+                                            (extract-flag-value args "--session" nil)
+                                            to)
+                                    m {"cmd" "send"
+                                       "session_id" sid
                                        "burn" (extract-long-flag args "--burn" 500)}
                                     t (extract-flag-value args "--text" nil)
+                                    msg (extract-flag-value args "--message" nil)
                                     h (extract-flag-value args "--payload-hex" nil)]
                                 (cond-> m
+                                  to (assoc "to" to)
                                   t (assoc "text" t)
+                                  msg (assoc "message" msg "text" (or t msg))
                                   h (assoc "payload_hex" h)))
                    "close"    {"cmd" "close"
                                "session_id" (or (extract-flag-value args "--session-id" nil)
@@ -948,6 +959,86 @@
                                             (cond-> m
                                               sub (assoc "subnet_id" sub)
                                               psub (assoc "parent_subnet" psub)))
+                   "export-poll" (let [mseq (or (extract-long-flag args "--since-seq" nil)
+                                                (extract-long-flag args "--since-relay-seq" nil))
+                                       bseq (extract-long-flag args "--since-broadcast-seq" nil)
+                                       m {"cmd" "export-poll"}]
+                                   (cond-> m
+                                     mseq (assoc "since_seq" mseq)
+                                     bseq (assoc "since_broadcast_seq" bseq)))
+                   "import-poll" (let [f (extract-flag-value args "--file" nil)
+                                       content (if f
+                                                 (try (.readFileSync node-fs f "utf8") (catch :default _ nil))
+                                                 (or (extract-flag-value args "--json" nil)
+                                                     (extract-flag-value args "--payload" nil)
+                                                     (when (seq (remove #(str/starts-with? % "-") args))
+                                                       (first (remove #(str/starts-with? % "-") args)))))]
+                                   {"cmd" "import-poll" "file_content" (or content "")})
+                   "import" (let [f (extract-flag-value args "--file" nil)
+                                  h (or (extract-flag-value args "--hex" nil)
+                                        (if f
+                                          (try (.readFileSync node-fs f "utf8") (catch :default _ nil))
+                                          (when (seq (remove #(str/starts-with? % "-") args))
+                                            (first (remove #(str/starts-with? % "-") args)))))]
+                              {"cmd" "import" "hex" (or h "")})
+                   "export-offer" (let [to (or (extract-flag-value args "--to" nil)
+                                               (extract-flag-value args "--callee" nil))
+                                        ep (extract-long-flag args "--epoch" nil)
+                                        p (extract-long-flag args "--price" 0)
+                                        b (extract-long-flag args "--burn" 500)
+                                        hn (extract-flag-value args "--home-node" nil)
+                                        m {"cmd" "export-offer" "callee" to "price" p "burn" b}]
+                                    (cond-> m
+                                      to (assoc "to" to)
+                                      ep (assoc "epoch" ep)
+                                      hn (assoc "home_node" hn)))
+                   "export-send" (let [to (or (extract-flag-value args "--to" nil)
+                                              (extract-flag-value args "--peer" nil)
+                                              (extract-flag-value args "--session-id" nil)
+                                              (extract-flag-value args "--session" nil))
+                                       msg (or (extract-flag-value args "--message" nil)
+                                               (extract-flag-value args "--text" nil))
+                                       b (extract-long-flag args "--burn" 500)
+                                       m {"cmd" "export-send" "to" to "message" msg "burn" b}]
+                                   (cond-> m
+                                     to (assoc "session_id" to)))
+                   "ack" (let [seq-num (or (extract-long-flag args "--up-to-seq" nil)
+                                           (extract-long-flag args "--seq" nil)
+                                           (extract-long-flag args "--ack-seq" nil))
+                               bseq (or (extract-long-flag args "--up-to-broadcast-seq" nil)
+                                        (extract-long-flag args "--broadcast-seq" nil)
+                                        (extract-long-flag args "--ack-broadcast-seq" nil))
+                               to (or (extract-flag-value args "--to" nil)
+                                      (extract-flag-value args "--peer" nil)
+                                      (extract-flag-value args "--session-id" nil)
+                                      (extract-flag-value args "--session" nil))
+                               m {"cmd" "ack"}]
+                           (cond-> m
+                             seq-num (assoc "up_to_seq" seq-num "ack_seq" seq-num)
+                             bseq (assoc "up_to_broadcast_seq" bseq "ack_broadcast_seq" bseq)
+                             to (assoc "to" to "session_id" to)))
+                   "export-ack" (let [seq-num (or (extract-long-flag args "--up-to-seq" nil)
+                                                  (extract-long-flag args "--seq" nil)
+                                                  (extract-long-flag args "--ack-seq" nil))
+                                      bseq (or (extract-long-flag args "--up-to-broadcast-seq" nil)
+                                               (extract-long-flag args "--broadcast-seq" nil)
+                                               (extract-long-flag args "--ack-broadcast-seq" nil))
+                                      to (or (extract-flag-value args "--to" nil)
+                                             (extract-flag-value args "--peer" nil)
+                                             (extract-flag-value args "--session-id" nil)
+                                             (extract-flag-value args "--session" nil))
+                                      m {"cmd" "export-ack"}]
+                                  (cond-> m
+                                    seq-num (assoc "up_to_seq" seq-num "ack_seq" seq-num)
+                                    bseq (assoc "up_to_broadcast_seq" bseq "ack_broadcast_seq" bseq)
+                                    to (assoc "to" to "session_id" to)))
+                   "wait" (let [t (extract-long-flag args "--timeout-ms" nil)]
+                            (cond-> {"cmd" "wait"}
+                              t (assoc "timeout_ms" t)))
+                   "retransmit-outbox" (let [sid (or (extract-flag-value args "--session-id" nil)
+                                                     (extract-flag-value args "--session" nil))]
+                                         (cond-> {"cmd" "retransmit-outbox"}
+                                           sid (assoc "session_id" sid)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -987,6 +1078,7 @@
   ([args getenv-fn]
    (let [clean-args (if (= (first args) "light-node") (vec (rest args)) (vec args))
          verb (or (first clean-args) "status")
+         ctl? (= verb "ctl")
          serve? (= verb "serve")
          wait-event? (= verb "wait-event")
          default-state-dir (.join node-path (.homedir node-os) ".bitecho" "light-node")
@@ -1002,6 +1094,8 @@
          explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
          auto-register-home-set? (and (not no-auto-reg?) (or explicit-auto-reg? (and serve? autonomous?)))
          home-set-price (extract-long-flag clean-args "--price" (when auto-register-home-set? 10))
+         control-port (extract-long-flag clean-args "--control-port" (if serve? 5020 nil))
+         max-epoch-skew (extract-long-flag clean-args "--max-epoch-skew" nil)
          cmd-file (extract-flag-value clean-args "--cmd-file" nil)
          events-out (extract-flag-value clean-args "--events-out" nil)
          wait-session-id (or (extract-flag-value clean-args "--session-id" nil)
@@ -1042,6 +1136,7 @@
                           :realm turn-realm
                           :force-relay? turn-force-relay?}))]
      (cond-> {:mode (cond
+                      ctl? :ctl
                       serve? :serve
                       wait-event? :wait-event
                       :else :one-shot)
@@ -1052,9 +1147,13 @@
               :auto-sync? (boolean auto-sync?)
               :auto-register-home-set? (boolean auto-register-home-set?)
               :transport transport
-              :cmd-map (let [m (when-not (or serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
+              :cmd-map (let [m (when-not (or ctl? serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
                          (cond-> m
                            subnet-id (assoc "subnet_id" subnet-id)))}
+       control-port (assoc :control-port control-port)
+       max-epoch-skew (assoc :max-epoch-skew max-epoch-skew)
+       ctl? (assoc :ctl-subverb (second clean-args)
+                   :ctl-args (vec (drop 2 clean-args)))
        sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
        home-set-price (assoc :home-set-price home-set-price)
        cmd-file (assoc :cmd-file cmd-file)
@@ -1083,8 +1182,13 @@
               u8-or-buf
               (js/Buffer.from u8-or-buf))]
     (try
-      (.writeFileSync node-fs tmp-file buf #js {:mode 0600})
-      (try (.chmodSync node-fs tmp-file 0600) (catch :default _ nil))
+      (let [fd (.openSync node-fs tmp-file "w" 8r600)]
+        (try
+          (.writeSync node-fs fd buf 0 (.-length buf))
+          (.fsyncSync node-fs fd)
+          (finally
+            (.closeSync node-fs fd))))
+      (try (.chmodSync node-fs tmp-file 8r600) (catch :default _ nil))
       (.renameSync node-fs tmp-file (str target-file))
       true
       (finally
@@ -2193,10 +2297,9 @@
       (let [p2p-sends (keep :send-fn (vals (or (when p2p-peers-atom @p2p-peers-atom) {})))
             ingress-sends (vals (or (when ingress-peers-atom @ingress-peers-atom) {}))
             all-sends (concat p2p-sends ingress-sends)]
-        (if (seq all-sends)
-          (doseq [sfn all-sends]
-            (try (sfn env) (catch :default _ nil)))
-          (send-default!)))
+        (doseq [sfn all-sends]
+          (try (sfn env) (catch :default _ nil)))
+        (send-default!))
 
       (:p2p-direct? env)
       (let [norm-target (light-core/normalize-pubkey-hex (:p2p-peer env))
@@ -2589,11 +2692,12 @@
                   (when udp-listener (try (api/close! udp-listener) (catch :default _ nil))))}))))
 
 (defn handle-serve-line!
-  "Processes a single STDIN or `--cmd-file` JSON line in `serve` mode, invoking `(done-cb)` when complete."
+  "Processes a single STDIN or `--cmd-file` JSON line in `serve` mode, invoking `(done-cb resp)` when complete."
   [line ctx done-cb]
   (let [{:keys [state-atom conn-atom events-out state-file identity bootstrap conn-opts ingress-peers-atom p2p-peers-atom mdns-atom]} ctx
         emit! (fn [payload] (emit-json-line! payload events-out))
         cmd-map (parse-json-safe line)
+        line-str (if (string? line) line (write-json-str line))
         verb (when (map? cmd-map) (get cmd-map "cmd"))
         sync-wanted? (or (and (= verb "sync-account")
                               (nil? (get cmd-map "balance"))
@@ -2628,7 +2732,7 @@
                     (save-light-state! state-file @state-atom)
                     (when-let [resp (:response res)]
                       (emit! resp))
-                    (done-cb))
+                    (done-cb (:response res)))
                   (let [sent-ingress? (boolean
                                        (when (and ingress-peers-atom (seq @ingress-peers-atom))
                                          (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
@@ -2642,7 +2746,7 @@
                         (save-light-state! state-file @state-atom)
                         (when-let [resp (:response res)]
                           (emit! resp))
-                        (done-cb))
+                        (done-cb (:response res)))
                       (do
                         (when conn-atom
                           (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
@@ -2668,29 +2772,33 @@
                                        (sync-conn-diagnostics! state-atom conn-atom)
                                        (save-light-state! state-file @state-atom)
                                        (when-let [resp (:response res)]
-                                         (emit! resp)))
-                                     (let [err "send-failed"]
+                                         (emit! resp))
+                                       (done-cb (:response res)))
+                                     (let [err "send-failed"
+                                           resp {"ok" false "error" err}]
                                        (when conn-atom
                                          (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
                                        (when state-atom
                                          (swap! state-atom assoc :connected? false :connection-error err))
                                        (sync-conn-diagnostics! state-atom conn-atom)
-                                       (emit! {"ok" false "error" err})))))
-                               (let [err (or (:error reconn) "listener-disabled")]
+                                       (emit! resp)
+                                       (done-cb resp)))))
+                               (let [err (or (:error reconn) "listener-disabled")
+                                     resp {"ok" false "error" err}]
                                  (when conn-atom
                                    (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
                                  (when state-atom
                                    (swap! state-atom assoc :connected? false :connection-error err))
                                  (sync-conn-diagnostics! state-atom conn-atom)
-                                 (emit! {"ok" false "error" err})))
-                             (done-cb)))))))))
+                                 (emit! resp)
+                                 (done-cb resp)))))))))))
               (do
                 (reset! state-atom (:state res))
                 (sync-conn-diagnostics! state-atom conn-atom)
                 (save-light-state! state-file @state-atom)
                 (when-let [resp (:response res)]
                   (emit! resp))
-                (done-cb)))))
+                (done-cb (:response res))))))
         after-sync!
         (fn []
           (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
@@ -2702,19 +2810,167 @@
                 (fetch-directory-descriptor!
                  dom nick conn-opts
                  (fn [desc]
-                   (execute-cmd! (if desc (write-json-str (assoc cmd-map "descriptor" desc)) line))))
-                (execute-cmd! line)))
-            (execute-cmd! line)))]
+                   (execute-cmd! (if desc (write-json-str (assoc cmd-map "descriptor" desc)) line-str))))
+                (execute-cmd! line-str)))
+            (execute-cmd! line-str)))]
     (if sync-wanted?
       (maybe-sync-account-state!
        state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts
        (fn [sync-res]
          (if (false? (:ok? sync-res))
-           (do
-             (emit! {"ok" false "error" (:error sync-res)})
-             (done-cb))
+           (let [resp {"ok" false "error" (:error sync-res)}]
+             (emit! resp)
+             (done-cb resp))
            (after-sync!))))
       (after-sync!))))
+
+(defn- handle-ctl-wait!
+  "Non-blocking wait handler for control server /ctl endpoint."
+  [cmd-map ctx cb]
+  (let [state-atom (:state-atom ctx)
+        timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 5000))
+        deadline (+ (.now js/Date) timeout-ms)
+        check! (fn check! []
+                 (if (or (seq (:event-queue @state-atom))
+                         (>= (.now js/Date) deadline))
+                   (handle-serve-line! cmd-map ctx cb)
+                   (js/setTimeout check! 50)))]
+    (check!)))
+
+(defn start-control-server!
+  "Starts loopback-only (127.0.0.1) control HTTP server on control-port (default 5020 or ephemeral).
+   Writes <state-dir>/control.json with 0600 permissions."
+  [state-dir ctx conn-opts]
+  (let [req-port (int (or (:control-port conn-opts) 5020))
+        token (.toString (.randomBytes node-crypto 32) "hex")
+        pid (.-pid js/process)
+        ctrl-file (.join node-path state-dir "control.json")
+        server (.createServer
+                node-http
+                (fn [req res]
+                  (try
+                    (let [url-str (str "http://127.0.0.1" (.-url req))
+                          url-obj (js/URL. url-str)
+                          path (.-pathname url-obj)
+                          method (.-method req)
+                          auth-hdr (aget (.-headers req) "authorization")
+                          expected-auth (str "Bearer " token)]
+                      (cond
+                        (not= auth-hdr expected-auth)
+                        (do
+                          (.writeHead res 401 #js {"Content-Type" "application/json"})
+                          (.end res (write-json-str {"ok" false "error" "unauthorized"})))
+
+                        (and (= method "POST") (= path "/ctl"))
+                        (let [body-chunks #js []]
+                          (.on req "data" (fn [chunk] (.push body-chunks chunk)))
+                          (.on req "end"
+                               (fn []
+                                 (let [body-str (.toString (.concat (.-Buffer js/globalThis) body-chunks) "utf8")
+                                       cmd-map (parse-json-safe body-str)]
+                                   (if-not (and (map? cmd-map) (contains? cmd-map "cmd"))
+                                     (do
+                                       (.writeHead res 400 #js {"Content-Type" "application/json"})
+                                       (.end res (write-json-str {"ok" false "error" "malformed-command"})))
+                                     (let [done-fn (fn [result]
+                                                     (let [payload (or result {"ok" true})]
+                                                       (.writeHead res 200 #js {"Content-Type" "application/json"})
+                                                       (.end res (write-json-str payload))))]
+                                       (if (= (get cmd-map "cmd") "wait")
+                                         (handle-ctl-wait! cmd-map ctx done-fn)
+                                         (handle-serve-line! cmd-map ctx done-fn))))))))
+
+                        :else
+                        (do
+                          (.writeHead res 404 #js {"Content-Type" "application/json"})
+                          (.end res (write-json-str {"ok" false "error" "not-found"})))))
+                    (catch :default _
+                      (try
+                        (.writeHead res 500 #js {"Content-Type" "application/json"})
+                        (.end res (write-json-str {"ok" false "error" "internal-server-error"}))
+                        (catch :default _ nil))))))]
+    (let [write-ctrl-file!
+          (fn []
+            (let [actual-port (.-port (.address server))
+                  ctrl-info {"port" actual-port
+                             "token" token
+                             "pid" (or pid 0)}
+                  json-str (write-json-str ctrl-info)]
+              (try
+                (write-bytes-atomic! ctrl-file (js/Buffer.from json-str "utf8"))
+                (catch :default _ nil))))]
+      (.once server "error"
+             (fn [err]
+               (when (= (.-code err) "EADDRINUSE")
+                 (.listen server 0 "127.0.0.1" write-ctrl-file!))))
+      (.listen server req-port "127.0.0.1" write-ctrl-file!))
+    {:server server
+     :control-file ctrl-file
+     :stop! (fn []
+              (try (.close server) (catch :default _ nil))
+              (try
+                (when (.existsSync node-fs ctrl-file)
+                  (.unlinkSync node-fs ctrl-file))
+                (catch :default _ nil)))}))
+
+(defn run-ctl!
+  "Executes a CLI command against a running light-node daemon via loopback control socket."
+  [opts]
+  (let [state-dir (:state-dir opts)
+        control-file (.join node-path state-dir "control.json")]
+    (if-not (.existsSync node-fs control-file)
+      (let [err {"ok" false "error" "daemon-not-running" "hint" "start daemon with 'serve' first"}]
+        (emit-json-line! err)
+        (.exit js/process 1))
+      (let [control-data (try
+                           (parse-json-safe (.readFileSync node-fs control-file "utf8"))
+                           (catch :default e
+                             {"error" (str e)}))
+            port (or (:control-port opts) (get control-data "port") (get control-data :port))
+            token (or (get control-data "token") (get control-data :token))
+            subverb (:ctl-subverb opts)
+            subargs (:ctl-args opts)]
+        (if-not (and port token subverb)
+          (let [err {"ok" false "error" "invalid-control-metadata-or-subverb"}]
+            (emit-json-line! err)
+            (.exit js/process 1))
+          (let [cmd-map (build-one-shot-cmd-map subverb subargs)
+                body-json (write-json-str cmd-map)
+                body-buf (.from (.-Buffer js/globalThis) body-json "utf8")
+                timeout-ms (if (= subverb "wait")
+                             (+ 5000 (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 5000)))
+                             10000)
+                req-opts #js {:hostname "127.0.0.1"
+                              :port (int port)
+                              :path "/ctl"
+                              :method "POST"
+                              :headers #js {"Authorization" (str "Bearer " token)
+                                            "Content-Type" "application/json"
+                                            "Content-Length" (.-length body-buf)}
+                              :timeout timeout-ms}
+                req (.request node-http req-opts
+                              (fn [res]
+                                (let [chunks #js []]
+                                  (.on res "data" (fn [c] (.push chunks c)))
+                                  (.on res "end"
+                                       (fn []
+                                         (let [resp-str (.toString (.concat (.-Buffer js/globalThis) chunks) "utf8")
+                                               parsed (try (parse-json-safe resp-str) (catch :default _ resp-str))]
+                                           (if (map? parsed)
+                                             (emit-json-line! parsed)
+                                             (.write (.-stdout js/process) (str resp-str "\n")))
+                                           (.exit js/process (if (and (map? parsed) (false? (get parsed "ok"))) 1 0))))))))]
+            (.on req "error"
+                 (fn [err]
+                   (emit-json-line! {"ok" false "error" "control-request-failed" "message" (.-message err)})
+                   (.exit js/process 1)))
+            (.on req "timeout"
+                 (fn []
+                   (.destroy req)
+                   (emit-json-line! {"ok" false "error" "control-request-timeout"})
+                   (.exit js/process 1)))
+            (.write req body-buf)
+            (.end req)))))))
 
 (defn run-auto-sync-tick!
   "Executes a single non-blocking background chain-state quorum sync tick on Node.js."
@@ -2830,7 +3086,7 @@
                                                                       (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                                                       (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                                                       (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
-               initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew base-state) 15))
+               initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15))
                                (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
@@ -2895,13 +3151,6 @@
                                 :state-file state-file)
                _ (reset! conn-opts-atom conn-opts)
                ingress-listener (start-ingress-tcp-listener! identity conn-opts)
-               stop-ingress! (fn []
-                               (when mdns-svc (try (mdns/stop-mdns-service! mdns-svc) (catch :default _ nil)))
-                               (when-let [stop-fn (:stop! ingress-listener)]
-                                 (try (stop-fn) (catch :default _ nil))))
-               _ (.on js/process "exit" (fn [_] (stop-ingress!)))
-               _ (.on js/process "SIGINT" (fn [] (stop-ingress!) (.exit js/process 0)))
-               _ (.on js/process "SIGTERM" (fn [] (stop-ingress!) (.exit js/process 0)))
                ctx {:state-atom state-atom
                     :conn-atom conn-atom
                     :events-out events-out
@@ -2912,6 +3161,18 @@
                     :p2p-peers-atom p2p-peers-atom
                     :mdns-atom mdns-atom
                     :conn-opts conn-opts}
+               ctrl-svc (try (start-control-server! state-dir ctx opts) (catch :default _ nil))
+               maint-timer (atom nil)
+               stop-all! (fn []
+                           (when @maint-timer (try (js/clearInterval @maint-timer) (catch :default _ nil)))
+                           (when mdns-svc (try (mdns/stop-mdns-service! mdns-svc) (catch :default _ nil)))
+                           (when-let [stop-fn (:stop! ingress-listener)]
+                             (try (stop-fn) (catch :default _ nil)))
+                           (when-let [stop-ctrl (:stop! ctrl-svc)]
+                             (try (stop-ctrl) (catch :default _ nil))))
+               _ (.on js/process "exit" (fn [_] (stop-all!)))
+               _ (.on js/process "SIGINT" (fn [] (stop-all!) (.exit js/process 0)))
+               _ (.on js/process "SIGTERM" (fn [] (stop-all!) (.exit js/process 0)))
                line-queue (atom [])
                processing? (atom false)
                drain-queue!
@@ -2922,7 +3183,7 @@
                        (swap! line-queue #(vec (rest %)))
                        (handle-serve-line!
                         next-line ctx
-                        (fn []
+                        (fn [_]
                           (reset! processing? false)
                           (drain!))))
                      (reset! processing? false))))
@@ -2930,7 +3191,49 @@
                (fn [line]
                  (when-not (str/blank? line)
                    (swap! line-queue conj line)
-                   (drain-queue!)))]
+                   (drain-queue!)))
+               _ (let [maint-tick!
+                       (fn []
+                         (try
+                           (let [now-ms (.now js/Date)
+                                 st @state-atom
+                                 sessions (:sessions st)]
+                             ;; F-5: 30s Outbox RTO Retransmit Loop across all open sessions
+                             (doseq [[sid _] sessions]
+                               (try
+                                 (let [rx-res (light-core/retransmit-unacked-outbox @state-atom sid now-ms 30000)]
+                                   (when (not= @state-atom (:state rx-res))
+                                     (reset! state-atom (:state rx-res))
+                                     (when (some? state-file)
+                                       (save-light-state! state-file @state-atom))
+                                     (when (seq (:net-envelopes rx-res))
+                                       (send-routed-envelopes! (:net-envelopes rx-res)
+                                                               (:send-fn @conn-atom)
+                                                               p2p-peers-atom
+                                                               ingress-peers-atom
+                                                               state-atom
+                                                               (:privkey-bytes identity)))
+                                     (when (seq (:stdout-events rx-res))
+                                       (doseq [evt (:stdout-events rx-res)]
+                                         (emit-json-line! evt events-out)))))
+                                 (catch :default _ nil)))
+                             ;; F-6: Gated Autonomous P2P Re-Offers with exponential backoff & tie-breaker protection
+                             (let [reconn-sids (for [[sid _] (:sessions @state-atom)
+                                                     :when (light-core/should-auto-reoffer? @state-atom sid now-ms (:autonomous? opts))]
+                                                 sid)]
+                               (doseq [sid reconn-sids]
+                                 (let [sess (get-in @state-atom [:sessions sid])
+                                       pref-cands (or (get-in sess [:p2p-meta :preferred-candidates])
+                                                      (get-in sess [:p2p :local-candidates])
+                                                      (:default-p2p-candidates @state-atom))
+                                       pref-tr (or (get-in sess [:p2p-meta :preferred-transport]) "udp")
+                                       cmd {"cmd" "p2p-offer" "session_id" sid "candidates" pref-cands "transport" pref-tr}]
+                                   (swap! state-atom light-core/record-reoffer-attempt sid now-ms)
+                                   (when (some? state-file)
+                                     (save-light-state! state-file @state-atom))
+                                   (enqueue-line! (write-json-str cmd))))))
+                           (catch :default _ nil)))]
+                   (reset! maint-timer (js/setInterval maint-tick! 5000)))]
            (reconnect-fn
             (fn [conn-res]
               (if (:ok? conn-res)
@@ -3069,7 +3372,7 @@
                                                                       (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                                                       (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                                                       (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
-               initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew base-state) 15))
+               initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15))
                                (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
@@ -3163,6 +3466,7 @@
   [args]
   (let [parsed (parse-light-node-args args)]
     (case (:mode parsed)
+      :ctl (run-ctl! parsed)
       :serve (run-serve! parsed)
       :wait-event (run-wait-event! parsed)
       :one-shot (run-one-shot! parsed))))

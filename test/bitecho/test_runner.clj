@@ -20,6 +20,7 @@
             [bitecho.economy.treasury-test]
             [bitecho.fractal-federation-test]
             [bitecho.fressian-test]
+            [bitecho.light-node.cli-flag-inventory-test]
             [bitecho.light-node.core-test]
             [bitecho.murmur.core-test]
             [bitecho.node-bundle-test]

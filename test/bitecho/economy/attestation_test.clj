@@ -48,9 +48,9 @@
         (is (false? (attestation/verify-transcript tampered)))))
 
     (testing "Fails verification when sig-a or sig-b is corrupted"
-      (let [corrupted-a (update transcript :sig-a #(assoc (vec %) 0 (byte (inc (first %)))))]
+      (let [corrupted-a (update transcript :sig-a #(assoc (vec %) 0 (unchecked-byte (inc (first %)))))]
         (is (false? (attestation/verify-transcript corrupted-a))))
-      (let [corrupted-b (update transcript :sig-b #(assoc (vec %) 0 (byte (inc (first %)))))]
+      (let [corrupted-b (update transcript :sig-b #(assoc (vec %) 0 (unchecked-byte (inc (first %)))))]
         (is (false? (attestation/verify-transcript corrupted-b)))))))
 
 (deftest half-signed-fallback-transcript-test

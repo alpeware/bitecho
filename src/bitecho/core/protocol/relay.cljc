@@ -252,43 +252,118 @@
   (cond-> (record-seen-id state envelope-id now-ms)
     (and gossip-id (not= gossip-id envelope-id)) (record-seen-id gossip-id now-ms)))
 
+(defn canonical-escrow-entry-str
+  "Formats a single escrow map into canonical colon-separated representation:
+   <escrow-id>:<payer>:<receiver>:<amount>:<deliverable-hash>:<created-epoch>:<expires-epoch>:<status-name>:<settled-epoch-or-empty>:<net-amount-or-empty>:<refund-reason-or-empty>"
+  [esc]
+  (let [eid (or (:escrow-id esc) (get esc "escrow-id") (:escrow_id esc) (get esc "escrow_id") "")
+        payer (or (:payer esc) (get esc "payer") "")
+        receiver (or (:receiver esc) (get esc "receiver") (:recipient esc) (get esc "recipient") "")
+        amt (long (or (:amount esc) (get esc "amount") 0))
+        dh (or (:deliverable-hash esc) (get esc "deliverable-hash") (:deliverable_hash esc) (get esc "deliverable_hash") "")
+        cr-ep (long (or (:created-epoch esc) (get esc "created-epoch") (:created_epoch esc) (get esc "created_epoch") 0))
+        exp-ep (long (or (:expires-epoch esc) (get esc "expires-epoch") (:expires_epoch esc) (get esc "expires_epoch") 0))
+        st-name (name (or (:status esc) (get esc "status") :locked))
+        settled-ep (if (some? (or (:settled-epoch esc) (get esc "settled-epoch") (:settled_epoch esc) (get esc "settled_epoch")))
+                     (str (or (:settled-epoch esc) (get esc "settled-epoch") (:settled_epoch esc) (get esc "settled_epoch")))
+                     "")
+        net-amt (if (some? (or (:net-amount esc) (get esc "net-amount") (:net_amount esc) (get esc "net_amount")))
+                  (str (or (:net-amount esc) (get esc "net-amount") (:net_amount esc) (get esc "net_amount")))
+                  "")
+        refund-re (if (some? (or (:refund-reason esc) (get esc "refund-reason") (:refund_reason esc) (get esc "refund_reason")))
+                    (str (or (:refund-reason esc) (get esc "refund-reason") (:refund_reason esc) (get esc "refund_reason")))
+                    "")]
+    (str eid ":" payer ":" receiver ":" amt ":" dh ":" cr-ep ":" exp-ep ":" st-name ":" settled-ep ":" net-amt ":" refund-re)))
+
+(defn canonical-chain-state-snapshot-str
+  "Computes deterministic canonical representation of a chain state snapshot:
+   bitecho-chain-state-snapshot-v1|<validator-pubkey>|<pubkey>|<finalized-epoch>|<balance>|<spendable>|<seq>|<comma-joined-deps>|<canonical-escrows-str>|<nonce>"
+  [snapshot]
+  (let [val-pub (or (:validator-pubkey snapshot) (get snapshot "validator-pubkey") (get snapshot "validator_pubkey") (:validator snapshot) (get snapshot "validator") "")
+        pk (or (:pubkey snapshot) (get snapshot "pubkey") "")
+        fin-ep (long (or (:finalized-epoch snapshot) (get snapshot "finalized-epoch") (get snapshot "finalized_epoch") 0))
+        bal (long (or (:balance snapshot) (get snapshot "balance") 0))
+        spd (long (or (:spendable snapshot) (get snapshot "spendable") 0))
+        seq-num (long (or (:seq snapshot) (get snapshot "seq") 0))
+        deps (vec (or (:deps snapshot) (get snapshot "deps") []))
+        deps-str (str/join "," deps)
+        raw-escrows (or (:escrows snapshot) (get snapshot "escrows") [])
+        escrows-vec (if (map? raw-escrows) (vals raw-escrows) (vec raw-escrows))
+        sorted-escrows (sort-by (fn [e] (str (or (:escrow-id e) (get e "escrow-id") (:escrow_id e) (get e "escrow_id") ""))) escrows-vec)
+        escrows-str (str/join ";" (map canonical-escrow-entry-str sorted-escrows))
+        nonce (or (:nonce snapshot) (get snapshot "nonce") "")]
+    (str "bitecho-chain-state-snapshot-v1|"
+         val-pub "|"
+         pk "|"
+         fin-ep "|"
+         bal "|"
+         spd "|"
+         seq-num "|"
+         deps-str "|"
+         escrows-str "|"
+         nonce)))
+
+(defn verify-chain-state-snapshot-signature
+  "Verifies that a chain state snapshot map has a valid Ed25519 signature from its validator-pubkey."
+  [snapshot]
+  (when (map? snapshot)
+    (let [val-pub (or (:validator-pubkey snapshot)
+                      (get snapshot "validator-pubkey")
+                      (get snapshot "validator_pubkey")
+                      (:validator snapshot)
+                      (get snapshot "validator"))
+          sig (or (:signature snapshot) (get snapshot "signature"))]
+      (when (and (string? val-pub) (not (str/blank? val-pub))
+                 (string? sig) (not (str/blank? sig)))
+        (try
+          (let [val-pub-bytes (basalt/hex->bytes val-pub)
+                sig-bytes (basalt/hex->bytes sig)
+                canonical-str (canonical-chain-state-snapshot-str snapshot)]
+            (boolean
+             (and val-pub-bytes sig-bytes
+                  (crypto/verify val-pub-bytes (fressian/utf8->bytes canonical-str) sig-bytes))))
+          (catch #?(:clj Exception :cljs :default) _ false))))))
+
 (defn- verify-envelope-signature
   [env]
   (let [cb (crypto/make-crypto-boundary)
         verified (crypto/pre-verify-envelope cb env)]
     (if (true? (:crypto/verified? verified))
       true
-      (if (map? (:message env))
-        (some? (sieve/validate-message (:message env)))
-        (let [sender (or (:sender env) (:agent-pubkey env) (:from env)
-                         (get env "sender") (get env "agent-pubkey") (get env "from"))
-              sig (or (:signature env) (:sig env)
-                      (get env "signature") (get env "sig"))]
-          (and (some? sender) (some? sig)
-               (try
-                 (let [sig-bytes (if (string? sig) (basalt/hex->bytes sig) sig)]
-                   (cond
-                     (or (and (:agent-pubkey env) (:event env))
-                         (and (get env "agent-pubkey") (get env "event")))
-                     (let [ev (or (:event env) (get env "event"))
-                           apk (or (:agent-pubkey env) (get env "agent-pubkey"))
-                           clean (dissoc ev :sender :sender-pubkey-bytes :rng "sender" "sender-pubkey-bytes" "rng")]
-                       (crypto/verify sender
-                                      (crypto/canonical-signing-bytes [(or apk "") (crypto/canonicalize-agent-event clean)])
-                                      sig-bytes))
+      (let [snap-type (or (:bitecho/type env) (:type env) (get env "bitecho/type") (get env "type"))]
+        (if (or (= :chain-state-snapshot snap-type) (= "chain-state-snapshot" snap-type))
+          (boolean (verify-chain-state-snapshot-signature env))
+          (if (map? (:message env))
+            (some? (sieve/validate-message (:message env)))
+            (let [sender (or (:sender env) (:agent-pubkey env) (:from env)
+                             (get env "sender") (get env "agent-pubkey") (get env "from"))
+                  sig (or (:signature env) (:sig env)
+                          (get env "signature") (get env "sig"))]
+              (and (some? sender) (some? sig)
+                   (try
+                     (let [sig-bytes (if (string? sig) (basalt/hex->bytes sig) sig)]
+                       (cond
+                         (or (and (:agent-pubkey env) (:event env))
+                             (and (get env "agent-pubkey") (get env "event")))
+                         (let [ev (or (:event env) (get env "event"))
+                               apk (or (:agent-pubkey env) (get env "agent-pubkey"))
+                               clean (dissoc ev :sender :sender-pubkey-bytes :rng "sender" "sender-pubkey-bytes" "rng")]
+                           (crypto/verify sender
+                                          (crypto/canonical-signing-bytes [(or apk "") (crypto/canonicalize-agent-event clean)])
+                                          sig-bytes))
 
-                     (or (contains? env :payload) (contains? env "payload"))
-                     (let [p (or (:payload env) (get env "payload"))
-                           p-bytes (if (bytes? p) p (fressian/utf8->bytes (str p)))
-                           burn (or (:burn-amount env) (get env "burn-amount"))
-                           payload (if burn
-                                     (fressian/concat-bytes p-bytes (fressian/utf8->bytes (str ":burn:" burn)))
-                                     p-bytes)]
-                       (crypto/verify sender payload sig-bytes))
+                         (or (contains? env :payload) (contains? env "payload"))
+                         (let [p (or (:payload env) (get env "payload"))
+                               p-bytes (if (bytes? p) p (fressian/utf8->bytes (str p)))
+                               burn (or (:burn-amount env) (get env "burn-amount"))
+                               payload (if burn
+                                         (fressian/concat-bytes p-bytes (fressian/utf8->bytes (str ":burn:" burn)))
+                                         p-bytes)]
+                           (crypto/verify sender payload sig-bytes))
 
-                     :else
-                     (crypto/verify sender (crypto/canonical-signing-bytes env) sig-bytes)))
-                 (catch #?(:clj Exception :cljs :default) _ false))))))))
+                         :else
+                         (crypto/verify sender (crypto/canonical-signing-bytes env) sig-bytes)))
+                     (catch #?(:clj Exception :cljs :default) _ false))))))))))
 
 ;; =============================================================================
 ;; 4. Pure Sans-IO Relay Reducer (`reduce-relay`)
@@ -387,7 +462,11 @@
                      :effects [diag]})
 
                   :else
-                  (let [raw-inner-payload (or (get-in decoded [:event :message :payload])
+                  (let [snap? (or (= :chain-state-snapshot ev-type)
+                                  (= :chain-state-snapshot (:bitecho/type decoded))
+                                  (= "chain-state-snapshot" (:bitecho/type decoded))
+                                  (= "chain-state-snapshot" (:type decoded)))
+                        raw-inner-payload (or (get-in decoded [:event :message :payload])
                                               (get-in decoded [:message :payload]))
                         inner-msg (when (bytes? raw-inner-payload)
                                     (try (fressian/decode-wire raw-inner-payload)
@@ -397,7 +476,14 @@
                                    (when-let [s (:agent-pubkey decoded)] (normalize-pubkey-hex s))
                                    (when-let [s (:from decoded)] (normalize-pubkey-hex s))
                                    (when-let [s (:caller inner-msg)] (normalize-pubkey-hex s))
-                                   (when-let [s (:sender inner-msg)] (normalize-pubkey-hex s)))
+                                   (when-let [s (:sender inner-msg)] (normalize-pubkey-hex s))
+                                   (when snap?
+                                     (when-let [s (or (:validator-pubkey decoded)
+                                                      (get decoded "validator-pubkey")
+                                                      (get decoded "validator_pubkey")
+                                                      (:validator decoded)
+                                                      (get decoded "validator"))]
+                                       (normalize-pubkey-hex s))))
                         recipient (or (when-let [r (:recipient decoded)] (normalize-pubkey-hex r))
                                       (when-let [r (get-in decoded [:event :recipient])] (normalize-pubkey-hex r))
                                       (when-let [r (get-in decoded [:event :to])] (normalize-pubkey-hex r))
@@ -406,21 +492,26 @@
                                       (when-let [r (get-in decoded [:payload :to])] (normalize-pubkey-hex r))
                                       (when-let [r (:recipient inner-msg)] (normalize-pubkey-hex r))
                                       (when-let [r (:to inner-msg)] (normalize-pubkey-hex r))
-                                      (when-let [r (:callee inner-msg)] (normalize-pubkey-hex r)))
+                                      (when-let [r (:callee inner-msg)] (normalize-pubkey-hex r))
+                                      (when snap?
+                                        (when-let [r (or (:pubkey decoded) (get decoded "pubkey"))]
+                                          (normalize-pubkey-hex r))))
                         raw-recip (or (:recipient decoded)
                                       (get-in decoded [:event :recipient])
                                       (get-in decoded [:payload :recipient])
-                                      (:recipient inner-msg))
-                        validator-only? (or (contains? #{:on-deliver :transfer :settle-escrow :burn :mint :burn-for-credit} ev-type)
-                                            (and (map? (:event decoded))
-                                                 (contains? #{:on-deliver :transfer :settle-escrow :burn} (:type (:event decoded)))))
+                                      (:recipient inner-msg)
+                                      (when snap? (or (:pubkey decoded) (get decoded "pubkey"))))
+                        validator-only? (and (not snap?)
+                                             (or (contains? #{:on-deliver :transfer :settle-escrow :burn :mint :burn-for-credit} ev-type)
+                                                 (and (map? (:event decoded))
+                                                      (contains? #{:on-deliver :transfer :settle-escrow :burn} (:type (:event decoded))))))
                         broadcast? (or (= raw-recip "*")
                                        (nil? recipient)
                                        (= :broadcast (:type decoded))
                                        (= :p2p-broadcast (:type decoded))
                                        (= :broadcast (get-in decoded [:event :type]))
                                        (= :receive-gossip (get-in decoded [:event :type])))
-                        from-val? (boolean (:from-validator? event))]
+                        from-val? (or (boolean (:from-validator? event)) snap?)]
                     (cond
                       validator-only?
                       (let [eff {:effect :forward-to-validators

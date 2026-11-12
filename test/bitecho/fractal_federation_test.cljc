@@ -502,23 +502,28 @@
       (is (= 1 (get-in (:state b-recv-1) [:sessions sid :p2p :remote-offer-seq])))
       (is (= 0 (get-in (:state b-recv-1) [:diagnostics :p2p-signaling-rejected] 0)))
 
-        ;; 2. Replay of same p2p-offer (signal-seq <= 1) is rejected
+        ;; 2. Benign duplicate gossip copy of p2p-offer (signal-seq <= 1) is deduplicated
       (let [b-replay (light-core/handle-wire-payload (:state b-recv-1) env-off (:private kp-b))]
-        (is (= 1 (get-in (:state b-replay) [:diagnostics :p2p-signaling-rejected]))
-            "Replay of p2p-offer must increment :p2p-signaling-rejected")
-        (is (some #(= "p2p-signaling-rejected" (get % "event")) (:stdout-events b-replay))))
+        (is (= 1 (get-in (:state b-replay) [:diagnostics :p2p-signal-deduped]))
+            "Duplicate gossip of p2p-offer must increment :p2p-signal-deduped")
+        (is (empty? (:stdout-events b-replay))))
 
-        ;; 3. Tampered signature on p2p-offer is rejected
-      (let [tampered-payload (assoc (light-core/thaw-payload (:payload env-off)) :signature "302a00")
-            tampered-env (assoc env-off :payload (light-core/freeze-payload tampered-payload))
+        ;; 3. Tampered signature on p2p-offer (signal-seq = 2) is rejected
+      (let [raw-payload (get-in env-off [:event :message :payload])
+            thawed (light-core/thaw-payload raw-payload)
+            tampered-payload (assoc thawed :signal-seq 2 :signature "302a00")
+            tampered-env (assoc-in env-off [:event :message :payload] (light-core/freeze-payload tampered-payload))
             b-bad-sig (light-core/handle-wire-payload (:state b-recv-1) tampered-env (:private kp-b))]
         (is (= 1 (get-in (:state b-bad-sig) [:diagnostics :p2p-signaling-rejected])))
         (is (some #(= "p2p-signaling-rejected" (get % "event")) (:stdout-events b-bad-sig))))
 
-        ;; 4. Epoch skew > 2 on p2p-offer is dropped with :p2p-signaling-rejected
-      (let [skewed-payload (assoc (light-core/thaw-payload (:payload env-off)) :epoch 100)
-            skewed-env (assoc env-off :payload (light-core/freeze-payload skewed-payload))
-            b-skew (light-core/handle-wire-payload (:state b-recv-1) skewed-env (:private kp-b))]
+        ;; 4. Epoch skew > 2 on non-open session p2p-offer is dropped with :p2p-signaling-rejected
+      (let [raw-payload (get-in env-off [:event :message :payload])
+            thawed (light-core/thaw-payload raw-payload)
+            closed-b (assoc-in (:state b-recv-1) [:sessions sid :state] "closed")
+            skewed-payload (assoc thawed :epoch 100)
+            skewed-env (assoc-in env-off [:event :message :payload] (light-core/freeze-payload skewed-payload))
+            b-skew (light-core/handle-wire-payload closed-b skewed-env (:private kp-b))]
         (is (= 1 (get-in (:state b-skew) [:diagnostics :p2p-signaling-rejected]))
             "Epoch skew > 2 must increment :p2p-signaling-rejected")
         (is (some #(= "p2p-signaling-rejected" (get % "event")) (:stdout-events b-skew)))))))

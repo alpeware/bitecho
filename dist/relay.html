@@ -13,7 +13,7 @@
   It MUST be served from bitecho.org itself: the relay sends no
   Access-Control-Allow-Origin headers, so a page on any other origin cannot
   fetch it. Same-origin fetch needs no CORS headers and no preflight.
-  All fetches use same-origin relative URLs (/relay/v1/send|poll|ack).
+  All fetches use same-origin relative URLs (/relay/v1/send|poll|ack|chain-state).
 
   WHO USES IT: an offline light node (e.g. Gemini's sandbox, zero network)
   signs/seals everything locally with shuttle.cjs and ferries opaque blobs
@@ -24,17 +24,21 @@
   INTEGRITY: every blob shown carries a character count AND a SHA-256 prefix
   (first 16 hex chars), computed live in the browser, so a dropped character
   while copying is detectable before submitting and after receiving.
+  Chunked 200-char lines carry per-line 8-char SHA-256 prefixes.
 -->
 <style>
   body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; color: #111; }
   h1 { font-size: 1.4em; } h2 { font-size: 1.15em; margin-top: 1.8em; }
   textarea { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 12px; }
   pre { background: #f4f4f4; padding: .6em; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
-  button { padding: .5em 1em; margin: .4em 0; font-size: 1em; }
+  pre.chunked-lines { font-family: monospace; font-size: 11px; line-height: 1.4; background: #eef2f7; border: 1px solid #d0d7de; }
+  button { padding: .5em 1em; margin: .4em .4em .4em 0; font-size: 1em; cursor: pointer; }
   .meta { font-family: monospace; font-size: 12px; color: #333; margin: .2em 0 .8em 0; }
   .status { font-weight: bold; margin: .4em 0; }
-  .msg { border: 1px solid #ccc; padding: .6em; margin: .6em 0; }
+  .msg { border: 1px solid #ccc; padding: .6em; margin: .6em 0; background: #fff; }
   .msg h4 { margin: .2em 0; }
+  details { margin: .6em 0; }
+  details summary { cursor: pointer; font-weight: 500; }
   code { background: #f4f4f4; padding: 0 .2em; }
 </style>
 </head>
@@ -42,21 +46,19 @@
 <h1>Bitecho Relay Ferry</h1>
 <p>Ferry opaque blobs between an offline light node and the
 <a href="/relay/v1/chain-state">HTTP Gateway Relay</a> (<code>/relay/v1/*</code>).
-The node signs everything locally (<code>shuttle.cjs</code>); this page only
-moves bytes. Nothing here holds a key. Poll/ack blobs are single-use and
+The node signs everything locally (<code>shuttle.cjs</code> or <code>bitecho-light-node.cjs</code>);
+this page only moves bytes. Nothing here holds a key. Poll/ack blobs are single-use and
 expire after 5 minutes &mdash; generate fresh, ferry immediately.</p>
 <p><b>Multi-node note (measured 2026-11-12):</b> the relay ring is per-node
 in-memory state and <code>bitecho.org</code> load-balances across ns1..ns3, so
 a poll that lands on another node than the send may return empty &mdash; click
 Poll again (each click may reach a different node). Opening this page at
-<code>ns1.bitecho.org/relay.html</code> pins send and poll to one node.
-The relay needs shared state or sticky routing before this page is relied on
-at the bare <code>bitecho.org</code> URL.</p>
+<code>ns1.bitecho.org/relay.html</code> pins send and poll to one node.</p>
 
 <section id="send">
   <h2>1. Send an envelope</h2>
   <p>Paste the <code>envelope_hex</code> from
-  <code>shuttle.cjs export-offer</code>, <code>export-accept</code> or
+  <code>export-offer</code>, <code>export-accept</code> or
   <code>export-send</code>. Check the character count and SHA-256 prefix match
   the node before clicking send.</p>
   <label for="send-in">Envelope hex</label>
@@ -72,23 +74,28 @@ at the bare <code>bitecho.org</code> URL.</p>
 <section id="poll">
   <h2>2. Poll for envelopes</h2>
   <p>Paste the <code>poll_request</code> JSON from
-  <code>shuttle.cjs export-poll</code> (whole object, or the full shuttle
+  <code>export-poll</code> (whole object, or the full command
   output line &mdash; the page takes <code>poll_request</code> if present).</p>
   <label for="poll-in">Poll request JSON</label>
   <textarea id="poll-in" rows="6" spellcheck="false" placeholder="paste poll_request JSON here"></textarea>
   <div class="meta" id="poll-in-meta">0 chars</div>
   <button id="poll-btn" type="button">Poll relay</button>
+  <button id="btn-download-poll" type="button" style="display:none;">Download poll-response.json</button>
   <div class="status" id="poll-status"></div>
-  <h3>Relay response</h3>
-  <pre id="poll-out">(no response yet)</pre>
-  <div class="meta" id="poll-out-meta"></div>
+
   <h3>Envelopes to ferry back to the node</h3>
   <div id="poll-messages"><p>(none yet)</p></div>
+
+  <details>
+    <summary>Raw Poll JSON</summary>
+    <pre id="poll-out">(no response yet)</pre>
+    <div class="meta" id="poll-out-meta"></div>
+  </details>
 </section>
 
 <section id="ack">
   <h2>3. Acknowledge received envelopes</h2>
-  <p>Paste the <code>ack_request</code> JSON from <code>shuttle.cjs import-poll</code>
+  <p>Paste the <code>ack_request</code> JSON from <code>import-poll</code>
   (or <code>export-ack</code>). This prunes the relay inbox/broadcast ring so
   the same envelopes are not delivered twice.</p>
   <label for="ack-in">Ack request JSON</label>
@@ -101,12 +108,32 @@ at the bare <code>bitecho.org</code> URL.</p>
   <div class="meta" id="ack-out-meta"></div>
 </section>
 
+<section id="chain-state">
+  <h2>4. Fetch Chain State</h2>
+  <p>Query <code>/relay/v1/chain-state</code> to fetch validator-signed <code>:chain-state-snapshot</code> maps (when <code>pubkey</code> is provided) and the relay's <code>min_signaling_burn</code> / bootstrap metadata.</p>
+  <label for="chain-state-pubkey">Account Pubkey (hex, optional)</label>
+  <input type="text" id="chain-state-pubkey" style="width:100%; box-sizing:border-box; font-family:monospace; padding:.4em;" placeholder="optional 32-byte hex pubkey">
+  <button id="chain-state-btn" type="button">Fetch Chain State</button>
+  <button id="btn-download-chain-state" type="button" style="display:none;">Download chain-state.json</button>
+  <div class="status" id="chain-state-status"></div>
+
+  <h3>Chain state snapshots</h3>
+  <div id="chain-state-messages"><p>(none yet)</p></div>
+
+  <details>
+    <summary>Raw Chain State JSON</summary>
+    <pre id="chain-state-out">(no response yet)</pre>
+    <div class="meta" id="chain-state-out-meta"></div>
+  </details>
+</section>
+
 <script>
 'use strict';
 
-// SHA-256 hex (first 16 chars) of a string, via WebCrypto. bitecho.org is
-// HTTPS so crypto.subtle is available; if it ever is not, the meta line
-// still shows the character count and says so.
+let lastPollRawJson = null;
+let lastChainStateRawJson = null;
+
+// SHA-256 hex (first 16 chars) of a string, via WebCrypto.
 async function shaPrefix(text) {
   try {
     if (!window.crypto || !crypto.subtle) return 'unavailable (no WebCrypto)';
@@ -116,7 +143,17 @@ async function shaPrefix(text) {
   } catch (e) { return 'unavailable (' + e.message + ')'; }
 }
 
+async function sha8(text) {
+  try {
+    if (!window.crypto || !crypto.subtle) return '00000000';
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    return hex.slice(0, 8);
+  } catch (e) { return '00000000'; }
+}
+
 async function setMeta(el, text) {
+  if (!el) return;
   el.textContent = text.length + ' chars · sha256 ' + await shaPrefix(text);
 }
 
@@ -125,8 +162,23 @@ function now() { return new Date().toISOString(); }
 function bindLiveMeta(inputId, metaId) {
   const input = document.getElementById(inputId);
   const meta = document.getElementById(metaId);
+  if (!input || !meta) return;
   input.addEventListener('input', () => setMeta(meta, input.value.replace(/\s+/g, '')));
   setMeta(meta, '');
+}
+
+async function formatChunkedLines(hex) {
+  const chunks = [];
+  const chunkSize = 200;
+  let lineNum = 1;
+  for (let i = 0; i < hex.length; i += chunkSize) {
+    const slice = hex.slice(i, i + chunkSize);
+    const hash = await sha8(slice);
+    const lineLabel = 'L' + String(lineNum).padStart(2, '0');
+    chunks.push(lineLabel + ' [' + slice.length + 'c sha=' + hash + ']: ' + slice);
+    lineNum++;
+  }
+  return chunks.join('\n');
 }
 
 // POST JSON to a same-origin relay endpoint; renders status + response in the DOM.
@@ -142,18 +194,18 @@ async function postJson(path, body, statusEl, outEl, outMetaEl) {
     text = await res.text();
   } catch (e) {
     statusEl.textContent = 'FETCH FAILED at ' + now() + ': ' + e.message;
-    outEl.textContent = '(no response — fetch failed: ' + e.message + ')';
-    await setMeta(outMetaEl, '');
+    if (outEl) outEl.textContent = '(no response — fetch failed: ' + e.message + ')';
+    if (outMetaEl) await setMeta(outMetaEl, '');
     return null;
   }
   statusEl.textContent = 'HTTP ' + res.status + ' at ' + now() +
     (res.ok ? '' : ' — relay rejected the request (see response)');
-  outEl.textContent = text;
-  await setMeta(outMetaEl, text);
-  try { return JSON.parse(text); } catch (e) { return null; }
+  if (outEl) outEl.textContent = text;
+  if (outMetaEl) await setMeta(outMetaEl, text);
+  try { return { parsed: JSON.parse(text), raw: text }; } catch (e) { return { parsed: null, raw: text }; }
 }
 
-function renderPolledMessages(container, resp) {
+async function renderPolledMessages(container, resp) {
   container.innerHTML = '';
   if (!resp || typeof resp !== 'object') {
     container.innerHTML = '<p>(response was not JSON — nothing to list)</p>';
@@ -166,7 +218,8 @@ function renderPolledMessages(container, resp) {
     container.innerHTML = '<p>(no envelopes — inbox and broadcast ring are empty)</p>';
     return;
   }
-  items.forEach((item, i) => {
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
     const hex = (item.envelope_hex || item.envelope || '').replace(/\s+/g, '');
     const seq = item.relay_seq || item.broadcast_seq || '';
     const box = document.createElement('div');
@@ -178,17 +231,35 @@ function renderPolledMessages(container, resp) {
     const meta = document.createElement('div');
     meta.className = 'meta';
     meta.textContent = 'computing integrity…';
+
     const area = document.createElement('textarea');
     area.rows = 4;
     area.readOnly = true;
     area.spellcheck = false;
     area.value = hex;
+
+    const chunkDetails = document.createElement('details');
+    chunkDetails.open = true;
+    const chunkSummary = document.createElement('summary');
+    chunkSummary.textContent = 'Chunked 200-char lines (with per-line SHA-256)';
+    const chunkPre = document.createElement('pre');
+    chunkPre.className = 'chunked-lines';
+    chunkPre.textContent = 'Computing chunk hashes…';
+
+    chunkDetails.appendChild(chunkSummary);
+    chunkDetails.appendChild(chunkPre);
+
     box.appendChild(title);
     box.appendChild(meta);
     box.appendChild(area);
+    box.appendChild(chunkDetails);
     container.appendChild(box);
+
     setMeta(meta, hex);
-  });
+    formatChunkedLines(hex).then(formatted => {
+      chunkPre.textContent = formatted;
+    });
+  }
 }
 
 document.getElementById('send-btn').addEventListener('click', async () => {
@@ -213,9 +284,27 @@ document.getElementById('poll-btn').addEventListener('click', async () => {
     statusEl.textContent = 'NOT SENT at ' + now() + ': poll JSON does not parse: ' + e.message;
     return;
   }
-  const resp = await postJson('/relay/v1/poll', body,
+  const result = await postJson('/relay/v1/poll', body,
     statusEl, document.getElementById('poll-out'), document.getElementById('poll-out-meta'));
-  renderPolledMessages(document.getElementById('poll-messages'), resp);
+  if (result) {
+    lastPollRawJson = result.raw;
+    const dlBtn = document.getElementById('btn-download-poll');
+    if (dlBtn) dlBtn.style.display = 'inline-block';
+    renderPolledMessages(document.getElementById('poll-messages'), result.parsed);
+  }
+});
+
+document.getElementById('btn-download-poll').addEventListener('click', () => {
+  if (!lastPollRawJson) return;
+  const blob = new Blob([lastPollRawJson], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'poll-response.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 });
 
 document.getElementById('ack-btn').addEventListener('click', async () => {
@@ -231,6 +320,108 @@ document.getElementById('ack-btn').addEventListener('click', async () => {
   }
   await postJson('/relay/v1/ack', body,
     statusEl, document.getElementById('ack-out'), document.getElementById('ack-out-meta'));
+});
+
+function renderChainStateSnapshots(container, resp) {
+  container.innerHTML = '';
+  if (!resp || typeof resp !== 'object') {
+    container.innerHTML = '<p>(response was not JSON — nothing to list)</p>';
+    return;
+  }
+  const items = [].concat(resp.snapshots || (resp.snapshot ? [resp.snapshot] : []));
+  if (items.length === 0) {
+    container.innerHTML = '<p>(no snapshots returned for pubkey)</p>';
+    return;
+  }
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const hex = (typeof item === 'string' ? item : (item.envelope_hex || item.envelope || item.snapshot_hex || '')).replace(/\s+/g, '');
+    const validator = item.validator_pubkey || item.validator || '';
+    const epoch = item.epoch || '';
+    const box = document.createElement('div');
+    box.className = 'msg';
+    const title = document.createElement('h4');
+    title.textContent = 'Snapshot ' + (i + 1) + ' of ' + items.length +
+      (epoch ? ' · epoch ' + epoch : '') +
+      (validator ? ' · validator ' + validator : '');
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = 'computing integrity…';
+
+    const area = document.createElement('textarea');
+    area.rows = 4;
+    area.readOnly = true;
+    area.spellcheck = false;
+    area.value = hex || (typeof item === 'object' ? JSON.stringify(item, null, 2) : String(item));
+
+    const chunkDetails = document.createElement('details');
+    chunkDetails.open = true;
+    const chunkSummary = document.createElement('summary');
+    chunkSummary.textContent = 'Chunked 200-char lines (with per-line SHA-256)';
+    const chunkPre = document.createElement('pre');
+    chunkPre.className = 'chunked-lines';
+    chunkPre.textContent = 'Computing chunk hashes…';
+
+    chunkDetails.appendChild(chunkSummary);
+    chunkDetails.appendChild(chunkPre);
+
+    box.appendChild(title);
+    box.appendChild(meta);
+    box.appendChild(area);
+    if (hex) {
+      box.appendChild(chunkDetails);
+      formatChunkedLines(hex).then(formatted => {
+        chunkPre.textContent = formatted;
+      });
+    }
+    container.appendChild(box);
+
+    if (hex) {
+      setMeta(meta, hex);
+    } else {
+      meta.textContent = 'Structured JSON snapshot';
+    }
+  }
+}
+
+document.getElementById('chain-state-btn').addEventListener('click', async () => {
+  const pk = document.getElementById('chain-state-pubkey').value.trim();
+  const statusEl = document.getElementById('chain-state-status');
+  const outEl = document.getElementById('chain-state-out');
+  const outMetaEl = document.getElementById('chain-state-out-meta');
+  statusEl.textContent = 'Fetching chain state at ' + now() + ' …';
+  const url = pk ? '/relay/v1/chain-state?pubkey=' + encodeURIComponent(pk) : '/relay/v1/chain-state';
+  try {
+    const res = await fetch(url);
+    const text = await res.text();
+    statusEl.textContent = 'HTTP ' + res.status + ' at ' + now();
+    outEl.textContent = text;
+    if (outMetaEl) outMetaEl.textContent = text.length + ' chars';
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (_) {}
+    if (parsed) {
+      lastChainStateRawJson = text;
+      const dlBtn = document.getElementById('btn-download-chain-state');
+      if (dlBtn) dlBtn.style.display = 'inline-block';
+      renderChainStateSnapshots(document.getElementById('chain-state-messages'), parsed);
+    }
+  } catch (e) {
+    statusEl.textContent = 'FETCH FAILED at ' + now() + ': ' + e.message;
+    outEl.textContent = '(fetch failed: ' + e.message + ')';
+  }
+});
+
+document.getElementById('btn-download-chain-state').addEventListener('click', () => {
+  if (!lastChainStateRawJson) return;
+  const blob = new Blob([lastChainStateRawJson], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'chain-state.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 });
 
 bindLiveMeta('send-in', 'send-in-meta');
