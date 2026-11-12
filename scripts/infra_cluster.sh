@@ -700,6 +700,14 @@ EOF_GIT_INDEX
         "${ROOT_DIR}/dist/bitecho-browser.js.sri" \
         "${ROOT_DIR}/dist/index.html" \
         "${SSH_USER}@${ip}:/var/www/clj-web/public/app/"
+      if [[ -f "${ROOT_DIR}/dist/relay.html" ]]; then
+        rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+          "${ROOT_DIR}/dist/relay.html" \
+          "${SSH_USER}@${ip}:/var/www/clj-web/public/relay.html"
+        rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+          "${ROOT_DIR}/dist/relay.html" \
+          "${SSH_USER}@${ip}:/var/www/clj-web/public/app/relay.html"
+      fi
     fi
   done
 

@@ -61,18 +61,31 @@ When running in restricted environments where UDP or direct TCP sockets are bloc
 ### Endpoints
 1. **`POST /relay/v1/send`**:
    - Ingests Fressian or JSON envelopes.
-   - Unicast envelopes are queued into recipient inboxes (`:max-inbox-size 256`, 16MB total inbox limit across max 1024 recipients).
+   - Per-request HTTP request body limit is strictly bounded to **64KB** (`:max-payload-bytes 65536`), returning HTTP 413 `payload-too-large` on overflow.
+   - Unicast envelopes are queued into recipient inboxes (`:max-inbox-size 256`, max **1MB** per-recipient inbox limit via `:max-recipient-inbox-bytes 1048576`, returning HTTP 429 `inbox-full` when exceeded).
+   - Global queued bytes across all recipient inboxes and broadcasts is capped at **16MB** (`:max-total-queued-bytes 16777216`) with FIFO oldest-message eviction and counted `:queued-bytes-evicted` diagnose effect.
    - Broadcast envelopes enter the 256-slot global ring buffer with 24-hour TTL eviction.
    - Ledger transactions (`:forward-to-validators`) are forwarded directly to validators, bypassing recipient inboxes.
-   - Streaming reader bounds request payloads to 16MB, returning HTTP 413 `payload-too-large` on overflow.
    - Rate-limited via token-bucket limiter (HTTP 429 `rate-limited`).
+   - Cluster peer replication: Incoming `/relay/v1/send` requests are replicated in parallel across all cluster nodes (`[:cluster :nodes]`) with header `X-Bitecho-Relay-Replicated: true`.
+
+### Standing Rule: Fractal Relay Gateways (Mesh-Member Relay vs. Peer Zero-Burn Leg Gateway)
+The Bitecho relay architecture is fractal in both directions:
+1. **Public Mesh-Member Relay (`https://bitecho.org/relay/v1/*` / `https://bitecho.org/relay.html`)**:
+   - Connected directly into the validator mesh (`:validator-bootstrap` enabled, `:min-signaling-burn 100`) as a mesh home node.
+   - Envelopes submitted via `/relay/v1/send` are forwarded to the validator mesh (`:on-relay-forward`), settling signaling burns (`500 ECH` standard, `>= 100 ECH` floor) on-chain and gossiping across the mesh while buffering responses for `/relay/v1/poll` pickup.
+2. **Peer Zero-Burn Leg Gateway (e.g. `https://nexus.ingress.bitecho.org/relay/v1/*` / `https://nexus.ingress.bitecho.org/relay.html`)**:
+   - Any node with an ingress endpoint can expose its own `/relay/v1/*` gateway (`:min-signaling-burn 0`, no validator mesh forwarding) as a direct leg for sandboxed or offline peers (such as Lumen's browser ferry).
+   - An onboarding peer only needs **one** funded offer/answer exchange over the public mesh relay (`https://bitecho.org/relay.html`); once the session is established and pointed at the peer's leg gateway (`https://nexus.ingress.bitecho.org/relay.html`), all subsequent traffic over the leg gateway is **zero-burn (`0 ECH`)**, identical to a direct WebRTC/TCP P2P leg. Mesh burn is strictly the price of mesh-routed discovery/gossip traffic, never of gateway-mediated leg traffic.
 
 2. **`GET / POST /relay/v1/poll`**:
    - Long-polls inbound envelopes and broadcasts.
    - Parameter `wait_ms` allows virtual thread parking up to 25,000 ms.
    - Bounded waiter pool (`:max-relay-waiters 256`) returns HTTP 429 `too-many-waiters` when saturated.
+   - Per-pubkey waiter cap (`:max-relay-waiters-per-pubkey 4`) returns HTTP 429 `too-many-client-waiters` on the 5th concurrent long-poll for the same pubkey.
    - Authenticated via canonical Proof-of-Possession (`PoP`):
      `bitecho-relay-poll-v1|<pubkey>|<since-seq>|<timestamp-ms>|<nonce>`
+   - Query-parameter-only PoP is rejected with HTTP 403 `missing-pop-headers`; authentication is accepted exclusively via `X-Bitecho-*` HTTP request headers or `POST` JSON body fields.
    - Enforces clock skew tolerance (`<= 300,000 ms`) and timestamped replay protection (`:max-nonces 2048`).
    - Supports request headers:
      - `X-Bitecho-Pubkey`: Requester's Ed25519 public key hex.
@@ -86,7 +99,8 @@ When running in restricted environments where UDP or direct TCP sockets are bloc
 3. **`POST /relay/v1/ack`**:
    - Prunes processed inbox messages up to acknowledged sequence number.
    - Accepts `ack_seq` / `X-Bitecho-Ack-Seq` and `ack_broadcast_seq` / `X-Bitecho-Ack-Broadcast-Seq`.
-   - Authenticated via Proof-of-Possession signature.
+   - Authenticated via Proof-of-Possession signature (in headers or `POST` JSON body).
+   - Replicated across cluster nodes with `X-Bitecho-Relay-Replicated: true`.
 
 4. **`GET / POST /relay/v1/chain-state`**:
    - Fetches signed validator chain-state snapshots for a given public key hex (`pubkey=<hex>`) and client nonce (`nonce=<str>`).
@@ -94,11 +108,11 @@ When running in restricted environments where UDP or direct TCP sockets are bloc
 
 ---
 
-## 3. Fail-Closed 2f+1 BFT Quorum Verification
+## 3. Fail-Closed $\lceil 2n/3 \rceil$ BFT Quorum Verification
 
 In adherence with **Rule 5 (Zero Silent Failures)**, light nodes never trust unsigned relay responses or single-validator assertions:
 
-1. **Quorum Requirement**: Nodes require at least $2f+1$ agreeing snapshots from trusted validators (e.g. 2 of 3 validators on a 3-node cluster).
+1. **Quorum Requirement**: Nodes require at least $\lceil 2n/3 \rceil$ (or $2f+1$) agreeing snapshots from trusted validators (e.g. 2 of 3 validators on a 3-node cluster).
 2. **State Agreement**: Snapshots within the quorum must agree strictly on:
    - Account balance (`:balance`)
    - Spendable balance (`:spendable`)

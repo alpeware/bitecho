@@ -126,32 +126,33 @@
         issued-ep (when-let [ie (:issued-epoch data)] (parse-long-safe ie nil))
         expires-ep (when-let [ee (:expires-epoch data)] (parse-long-safe ee nil))
         sig (when-let [s (:signature data)] (str/trim (str s)))
+        relay-url (when-let [ru (:relay-url data)] (relay/normalize-relay-base-url ru))
         nodes-map (or (:nodes data) {})
         _ (when (empty? nodes-map)
             (throw (ex-info "Bootstrap descriptor contains no validator nodes"
                             {:error :invalid-descriptor :data data})))
-        parsed-pairs (mapv (fn [[k v]]
-                             (try
-                               {:ok? true :pair [(keyword k) (normalize-node-entry k v)]}
-                               (catch :default e
-                                 {:ok? false :entry (str k " (" (.-message e) ")")})))
-                           nodes-map)
-        normalized-nodes (into {} (keep :pair (filter :ok? parsed-pairs)))
-        dropped-edn (mapv :entry (remove :ok? parsed-pairs))
-        _ (when (empty? normalized-nodes)
-            (throw (ex-info "Invalid bootstrap descriptor: no valid validator nodes"
-                            {:error :invalid-descriptor :data data :dropped-entries dropped-edn})))]
+        normalized-nodes (into {} (for [[k v] nodes-map]
+                                    [(keyword k)
+                                     (try
+                                       (normalize-node-entry k v)
+                                       (catch :default e
+                                         (throw (ex-info "Invalid validator entry in bootstrap descriptor"
+                                                         {:line (str k " " v)
+                                                          :entry k
+                                                          :node v
+                                                          :error :invalid-validator-entry}
+                                                         e))))]))]
     (cond-> {:network network
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes normalized-nodes}
-      (seq dropped-edn) (assoc :dropped-entries dropped-edn)
       dir-pk (assoc :directory-pubkey dir-pk)
       dom (assoc :domain dom)
       auth-pk (assoc :authority-pubkey auth-pk)
       issued-ep (assoc :issued-epoch issued-ep)
       expires-ep (assoc :expires-epoch expires-ep)
       sig (assoc :signature sig)
+      (seq relay-url) (assoc :relay-url relay-url)
       (contains? data :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? data)))
       (some? (:burn-floor data)) (assoc :burn-floor (long (:burn-floor data)))
       (some? (:min-signaling-burn data)) (assoc :min-signaling-burn (long (:min-signaling-burn data))))))
@@ -188,6 +189,17 @@
   (when (or (nil? txt-str) (str/blank? txt-str))
     (throw (ex-info "Empty bootstrap.txt descriptor" {:error :invalid-descriptor})))
   (let [lines (str/split-lines txt-str)
+        _ (doseq [line lines]
+            (let [trimmed (str/trim line)]
+              (when (re-find #"(?i)^validator[=:]" trimmed)
+                (let [parts (str/split trimmed #"[=:\s]+")]
+                  (when (< (count parts) 2)
+                    (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                    {:line trimmed :error :invalid-validator-entry})))
+                  (let [cand-pk (last parts)]
+                    (when-not (re-matches valid-pubkey-regex cand-pk)
+                      (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                      {:line trimmed :error :invalid-validator-entry}))))))))
         find-header (fn [prefix-re]
                       (some (fn [line]
                               (when-let [m (re-find prefix-re line)]
@@ -205,6 +217,9 @@
         econ-raw (find-header #"(?i)^Economy Enabled:\s*([^\s]+)")
         burn-floor-raw (find-header #"(?i)^Burn Floor:\s*([0-9]+)")
         min-burn-raw (find-header #"(?i)^Min Signaling Burn:\s*([0-9]+)")
+        relay-match (or (find-header #"(?i)^Relay URL:\s*([^\s]+)")
+                        (find-header #"(?i)^relay[=:]\s*([^\s]+)"))
+        relay-url (when relay-match (relay/normalize-relay-base-url relay-match))
         network (keyword (str/lower-case (or net-str "devnet")))
         auth-pk (when auth-raw (validate-pubkey! auth-raw "authority"))
         issued-ep (when issued-raw (parse-long-safe issued-raw nil))
@@ -224,17 +239,19 @@
                      (if (re-find #"(?i)^Node:\s*" ln)
                        (recur (rest rem-lines) [ln] (if curr (conj acc (str/join "\n" curr)) acc))
                        (recur (rest rem-lines) (when curr (conj curr ln)) acc)))))
-        parsed-blocks (mapv (fn [b]
-                              (try
-                                (let [entry (parse-single-node-txt-block b)]
-                                  (if entry
-                                    {:ok? true :entry entry}
-                                    {:ok? false :block (str/trim b)}))
-                                (catch :default e
-                                  {:ok? false :block (str (str/trim b) " (" (.-message e) ")")})))
+        nodes-entries (mapv (fn [b]
+                              (let [trimmed (str/trim b)
+                                    entry (try
+                                            (parse-single-node-txt-block b)
+                                            (catch :default e
+                                              (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                                              {:line trimmed :error :invalid-validator-entry}
+                                                              e))))]
+                                (when-not entry
+                                  (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                                  {:line trimmed :error :invalid-validator-entry})))
+                                entry))
                             blocks)
-        nodes-entries (keep :entry (filter :ok? parsed-blocks))
-        dropped-txt (mapv :block (remove :ok? parsed-blocks))
         nodes-map (into {} nodes-entries)]
     (when (empty? nodes-map)
       (throw (ex-info "No validator node blocks found in bootstrap.txt"
@@ -243,13 +260,13 @@
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes nodes-map}
-      (seq dropped-txt) (assoc :dropped-entries dropped-txt)
       dir-pk (assoc :directory-pubkey dir-pk)
       dom (assoc :domain dom)
       auth-pk (assoc :authority-pubkey auth-pk)
       issued-ep (assoc :issued-epoch issued-ep)
       expires-ep (assoc :expires-epoch expires-ep)
       sig (assoc :signature sig)
+      (seq relay-url) (assoc :relay-url relay-url)
       (some? econ-enabled) (assoc :economy-enabled? econ-enabled)
       burn-floor (assoc :burn-floor burn-floor)
       min-burn (assoc :min-signaling-burn min-burn))))
@@ -263,16 +280,113 @@
 
     (string? str-or-map)
     (let [trimmed (str/trim str-or-map)]
-      (if (or (str/starts-with? trimmed "{")
-              (str/starts-with? trimmed ";;"))
+      (cond
+        (str/starts-with? trimmed "{")
+        (parse-bootstrap-edn trimmed)
+
+        (str/starts-with? trimmed ";;")
         (try
           (parse-bootstrap-edn trimmed)
           (catch :default _
             (parse-bootstrap-txt trimmed)))
+
+        :else
         (parse-bootstrap-txt trimmed)))
 
     :else
     (throw (ex-info "Unsupported descriptor format" {:error :invalid-descriptor :input str-or-map}))))
+
+(def ^:private recognized-header-prefixes
+  [#"(?i)^Network:"
+   #"(?i)^Domain:"
+   #"(?i)^Authority Pubkey:"
+   #"(?i)^Issued Epoch:"
+   #"(?i)^Expires Epoch:"
+   #"(?i)^Authority Signature:"
+   #"(?i)^Treasury Public Key:"
+   #"(?i)^Custody Public Key:"
+   #"(?i)^Directory Authority Public Key:"
+   #"(?i)^Economy Enabled:"
+   #"(?i)^Burn Floor:"
+   #"(?i)^Min Signaling Burn:"
+   #"(?i)^Relay URL:"
+   #"(?i)^relay[=:]"
+   #"(?i)^Bootstrap Validators:"
+   #"(?i)^Connection Instructions"
+   #"(?i)^Node:"
+   #"(?i)^Cluster Address:"
+   #"(?i)^Agent Ingress:"
+   #"(?i)^Agent TCP Ingress:"
+   #"(?i)^Agent HTTPS/Proxy Ingress:"
+   #"(?i)^HTTP Diagnostics:"
+   #"(?i)^Ed25519 Pubkey:"
+   #"(?i)^DTLS Fingerprint:"
+   #"(?i)^ICE Credentials:"
+   #"(?i)^Generated:"
+   #"(?i)^Agents connect"
+   #"(?i)^\"bitecho\""
+   #"(?i)^All inbound"
+   #"(?i)^Ed25519-signed"])
+
+(defn parse-bootstrap-descriptor-with-diagnostics
+  "Parses a bootstrap descriptor (EDN or text) with strict validation, returning the
+   descriptor map augmented with :diagnostics (vector of dropped/unrecognized lines/elements)
+   and :dropped count. Fails closed throwing on invalid validator entries."
+  [str-or-map]
+  (let [desc (parse-bootstrap-descriptor str-or-map)
+        diags (if (string? str-or-map)
+                (let [trimmed-input (str/trim str-or-map)]
+                  (if (or (str/starts-with? trimmed-input "{")
+                          (str/starts-with? trimmed-input ";;"))
+                    ;; EDN string diagnostics
+                    (let [data (try (edn/read-string trimmed-input) (catch :default _ {}))
+                          known-keys #{:network :domain :authority-pubkey :issued-epoch :expires-epoch
+                                       :signature :treasury-pubkey :custody-pubkey :directory-pubkey
+                                       :economy-enabled? :burn-floor :min-signaling-burn :relay-url
+                                       :nodes :dropped-entries :diagnostics :dropped}
+                          extra (remove known-keys (keys data))]
+                      (mapv (fn [k] {:reason :unrecognized-key :key k :value (get data k)}) extra))
+                    ;; Text descriptor line diagnostics
+                    (let [lines (str/split-lines str-or-map)]
+                      (loop [rem-lines lines
+                             acc []]
+                        (if (empty? rem-lines)
+                          acc
+                          (let [line (first rem-lines)
+                                tr (str/trim line)]
+                            (cond
+                              (str/blank? tr)
+                              (recur (rest rem-lines) acc)
+
+                              (or (str/starts-with? tr "#")
+                                  (str/starts-with? tr ";")
+                                  (str/starts-with? tr "=")
+                                  (str/starts-with? tr "-"))
+                              (recur (rest rem-lines) acc)
+
+                              ;; Optional keys with format checks
+                              (re-find #"(?i)^turn[=:]" tr)
+                              (let [val (str/trim (subs tr (if (str/includes? tr "=") (inc (str/index-of tr "=")) (inc (str/index-of tr ":")))))]
+                                (if (re-matches #"^turn:[^\s]+:[0-9]+" val)
+                                  (recur (rest rem-lines) acc)
+                                  (recur (rest rem-lines) (conj acc {:reason :malformed-optional :line tr :element :turn}))))
+
+                              (re-find #"(?i)^signal[=:]" tr)
+                              (let [val (str/trim (subs tr (if (str/includes? tr "=") (inc (str/index-of tr "=")) (inc (str/index-of tr ":")))))]
+                                (if (re-matches #"^https?://[^\s]+" val)
+                                  (recur (rest rem-lines) acc)
+                                  (recur (rest rem-lines) (conj acc {:reason :malformed-optional :line tr :element :signal}))))
+
+                              (some #(re-find % tr) recognized-header-prefixes)
+                              (recur (rest rem-lines) acc)
+
+                              :else
+                              (recur (rest rem-lines) (conj acc {:reason :unrecognized-line :line tr})))))))))
+                [])]
+    (assoc desc
+           :diagnostics diags
+           :dropped (count diags)
+           :descriptor desc)))
 
 (defn- http-get-string!
   "Fetches `url-str` over HTTP/HTTPS with a timeout, invoking `(cb body-or-nil)`."
@@ -435,11 +549,6 @@
                                                        :timestamp-ms now-ms
                                                        :nonce nonce})
                  params (cond-> {"pubkey" pk-hex
-                                 "sig" sig
-                                 "signature" sig
-                                 "ts" (str now-ms)
-                                 "timestamp_ms" (str now-ms)
-                                 "nonce" nonce
                                  "since_seq" (str since-seq)}
                           (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
                           (:limit opts) (assoc "limit" (str (:limit opts)))
@@ -857,92 +966,109 @@
                    (str/trim (str val)))))
              ["HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy"]))))
 
+(defn resolve-relay-url
+  "Pure helper resolving relay URL from explicit flag or BITECHO_RELAY_URL environment variable,
+   normalized via `relay/normalize-relay-base-url`."
+  ([explicit-relay]
+   (resolve-relay-url explicit-relay #(aget (.-env js/process) %)))
+  ([explicit-relay getenv-fn]
+   (let [candidate (or (when (and (string? explicit-relay) (seq (str/trim explicit-relay)))
+                         (str/trim explicit-relay))
+                       (when-let [val (getenv-fn "BITECHO_RELAY_URL")]
+                         (when (seq (str/trim (str val)))
+                           (str/trim (str val)))))]
+     (when candidate
+       (relay/normalize-relay-base-url candidate)))))
+
 (defn parse-light-node-args
   "Parses light-node command line arguments into an options map."
-  [args]
-  (let [clean-args (if (= (first args) "light-node") (vec (rest args)) (vec args))
-        verb (or (first clean-args) "status")
-        serve? (= verb "serve")
-        wait-event? (= verb "wait-event")
-        default-state-dir (.join node-path (.homedir node-os) ".bitecho" "light-node")
-        default-bootstrap "https://bitecho.org/devnet/bootstrap.txt"
-        state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
-        bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
-        autonomous? (boolean (some #{"--autonomous"} clean-args))
-        no-auto-sync? (boolean (some #{"--no-auto-sync"} clean-args))
-        explicit-auto-sync? (boolean (some #{"--auto-sync"} clean-args))
-        auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
-        sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
-        no-auto-reg? (boolean (some #{"--no-auto-register-home-set"} clean-args))
-        explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
-        auto-register-home-set? (and (not no-auto-reg?) (or explicit-auto-reg? (and serve? autonomous?)))
-        home-set-price (extract-long-flag clean-args "--price" (when auto-register-home-set? 10))
-        cmd-file (extract-flag-value clean-args "--cmd-file" nil)
-        events-out (extract-flag-value clean-args "--events-out" nil)
-        wait-session-id (or (extract-flag-value clean-args "--session-id" nil)
-                            (extract-flag-value clean-args "--session" nil))
-        min-seq (extract-long-flag clean-args "--min-seq" nil)
-        after-ts (extract-long-flag clean-args "--after-ts" nil)
-        transport-str (extract-flag-value clean-args "--transport" "udp")
-        transport (case (str/lower-case transport-str)
-                    "tcp" :tcp
-                    "connect" :connect
-                    :udp)
-        timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
-        ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
-        proxy-cli (extract-flag-value clean-args "--proxy" nil)
-        proxy-url (resolve-proxy-url proxy-cli)
-        relay-url (extract-flag-value clean-args "--relay-url" nil)
-        subnet-id (extract-flag-value clean-args "--subnet-id" nil)
-        trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
-        trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
-                              (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
-                                                      (str/starts-with? (str/trim trusted-dac-anchors-raw) "#{"))
-                                                (try (edn/read-string trusted-dac-anchors-raw)
-                                                     (catch :default _ (str/split trusted-dac-anchors-raw #",")))
-                                                (str/split trusted-dac-anchors-raw #","))]
-                                (set (map #(or (light-core/normalize-pubkey-hex %) (str/trim (str %))) (remove str/blank? (map str raw-items))))))
-        turn-server (extract-flag-value clean-args "--turn-server" nil)
-        turn-username (extract-flag-value clean-args "--turn-username" nil)
-        turn-password (extract-flag-value clean-args "--turn-password" nil)
-        turn-realm (extract-flag-value clean-args "--turn-realm" nil)
-        turn-force-relay? (boolean (some #{"--turn-force-relay"} clean-args))
-        turn-config (when (or turn-server turn-username turn-password turn-realm turn-force-relay?)
-                      (let [[h p] (when turn-server (str/split turn-server #":" 2))]
-                        {:server-host (or h "127.0.0.1")
-                         :server-port (if (and p (seq p)) (parse-long-safe p 3478) 3478)
-                         :username turn-username
-                         :password turn-password
-                         :realm turn-realm
-                         :force-relay? turn-force-relay?}))]
-    (cond-> {:mode (cond
-                     serve? :serve
-                     wait-event? :wait-event
-                     :else :one-shot)
-             :verb verb
-             :state-dir state-dir
-             :bootstrap bootstrap-path
-             :autonomous? autonomous?
-             :auto-sync? (boolean auto-sync?)
-             :auto-register-home-set? (boolean auto-register-home-set?)
-             :transport transport
-             :cmd-map (let [m (when-not (or serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
-                        (cond-> m
-                          subnet-id (assoc "subnet_id" subnet-id)))}
-      sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
-      home-set-price (assoc :home-set-price home-set-price)
-      cmd-file (assoc :cmd-file cmd-file)
-      events-out (assoc :events-out events-out)
-      wait-session-id (assoc :session-id wait-session-id)
-      min-seq (assoc :min-seq min-seq)
-      after-ts (assoc :after-ts after-ts)
-      subnet-id (assoc :subnet-id subnet-id)
-      timeout-ms (assoc :timeout-ms timeout-ms)
-      ingress-tcp-port (assoc :ingress-tcp-port ingress-tcp-port)
-      (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
-      proxy-url (assoc :proxy proxy-url)
-      relay-url (assoc :relay-url relay-url)
-      turn-config (assoc :turn-config turn-config))))
+  ([args]
+   (parse-light-node-args args #(aget (.-env js/process) %)))
+  ([args getenv-fn]
+   (let [clean-args (if (= (first args) "light-node") (vec (rest args)) (vec args))
+         verb (or (first clean-args) "status")
+         serve? (= verb "serve")
+         wait-event? (= verb "wait-event")
+         default-state-dir (.join node-path (.homedir node-os) ".bitecho" "light-node")
+         default-bootstrap "https://bitecho.org/devnet/bootstrap.txt"
+         state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
+         bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
+         autonomous? (boolean (some #{"--autonomous"} clean-args))
+         no-auto-sync? (boolean (some #{"--no-auto-sync"} clean-args))
+         explicit-auto-sync? (boolean (some #{"--auto-sync"} clean-args))
+         auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
+         sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
+         no-auto-reg? (boolean (some #{"--no-auto-register-home-set"} clean-args))
+         explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
+         auto-register-home-set? (and (not no-auto-reg?) (or explicit-auto-reg? (and serve? autonomous?)))
+         home-set-price (extract-long-flag clean-args "--price" (when auto-register-home-set? 10))
+         cmd-file (extract-flag-value clean-args "--cmd-file" nil)
+         events-out (extract-flag-value clean-args "--events-out" nil)
+         wait-session-id (or (extract-flag-value clean-args "--session-id" nil)
+                             (extract-flag-value clean-args "--session" nil))
+         min-seq (extract-long-flag clean-args "--min-seq" nil)
+         after-ts (extract-long-flag clean-args "--after-ts" nil)
+         transport-str (extract-flag-value clean-args "--transport" "udp")
+         transport (case (str/lower-case transport-str)
+                     "tcp" :tcp
+                     "connect" :connect
+                     :udp)
+         timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
+         ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
+         proxy-cli (extract-flag-value clean-args "--proxy" nil)
+         proxy-url (resolve-proxy-url proxy-cli getenv-fn)
+         relay-cli (extract-flag-value clean-args "--relay-url" nil)
+         relay-url (resolve-relay-url relay-cli getenv-fn)
+         subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+         trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
+         trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
+                               (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
+                                                       (str/starts-with? (str/trim trusted-dac-anchors-raw) "#{"))
+                                                 (try (edn/read-string trusted-dac-anchors-raw)
+                                                      (catch :default _ (str/split trusted-dac-anchors-raw #",")))
+                                                 (str/split trusted-dac-anchors-raw #","))]
+                                 (set (map #(or (light-core/normalize-pubkey-hex %) (str/trim (str %))) (remove str/blank? (map str raw-items))))))
+         turn-server (extract-flag-value clean-args "--turn-server" nil)
+         turn-username (extract-flag-value clean-args "--turn-username" nil)
+         turn-password (extract-flag-value clean-args "--turn-password" nil)
+         turn-realm (extract-flag-value clean-args "--turn-realm" nil)
+         turn-force-relay? (boolean (some #{"--turn-force-relay"} clean-args))
+         turn-config (when (or turn-server turn-username turn-password turn-realm turn-force-relay?)
+                       (let [[h p] (when turn-server (str/split turn-server #":" 2))]
+                         {:server-host (or h "127.0.0.1")
+                          :server-port (if (and p (seq p)) (parse-long-safe p 3478) 3478)
+                          :username turn-username
+                          :password turn-password
+                          :realm turn-realm
+                          :force-relay? turn-force-relay?}))]
+     (cond-> {:mode (cond
+                      serve? :serve
+                      wait-event? :wait-event
+                      :else :one-shot)
+              :verb verb
+              :state-dir state-dir
+              :bootstrap bootstrap-path
+              :autonomous? autonomous?
+              :auto-sync? (boolean auto-sync?)
+              :auto-register-home-set? (boolean auto-register-home-set?)
+              :transport transport
+              :cmd-map (let [m (when-not (or serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
+                         (cond-> m
+                           subnet-id (assoc "subnet_id" subnet-id)))}
+       sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
+       home-set-price (assoc :home-set-price home-set-price)
+       cmd-file (assoc :cmd-file cmd-file)
+       events-out (assoc :events-out events-out)
+       wait-session-id (assoc :session-id wait-session-id)
+       min-seq (assoc :min-seq min-seq)
+       after-ts (assoc :after-ts after-ts)
+       subnet-id (assoc :subnet-id subnet-id)
+       timeout-ms (assoc :timeout-ms timeout-ms)
+       ingress-tcp-port (assoc :ingress-tcp-port ingress-tcp-port)
+       (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
+       proxy-url (assoc :proxy proxy-url)
+       relay-url (assoc :relay-url relay-url)
+       turn-config (assoc :turn-config turn-config)))))
 
 ;; =============================================================================
 ;; 3. Atomic `state.fressian` & `node-identity.edn` Persistence (`0600`)
@@ -1702,7 +1828,8 @@
         callbacks {:on-open
                    (fn [evt]
                      (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
-                           query-env (light-core/build-chain-state-query-envelope pubkey privkey-bytes {:nonce nonce})
+                           signer-pk (or (:pubkey-hex identity) (:pubkey identity) pubkey)
+                           query-env (light-core/build-chain-state-query-envelope signer-pk privkey-bytes {:nonce nonce :target-pubkey pubkey})
                            frozen (fressian/encode-wire query-env)]
                        (try
                          (api/send! client-node frozen cid)

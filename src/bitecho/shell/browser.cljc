@@ -339,7 +339,7 @@
     "activity-log" "activity-count" "team-call-subnet" "topic-name" "ai-inference"
     "directory-cache" "directory-cache-count" "bootstrap" "signature"
     "trusted-dac-anchors" "broadcast-seq" "broadcast-seen" "broadcast-inbox" "broadcast?"
-    "relay-since-seq" "relay-since-broadcast-seq" "ack-broadcast-seq"
+    "relay-since-seq" "relay-since-broadcast-seq" "ack-broadcast-seq" "auto-relay-fallback" "auto-relay-fallback?"
     "p2p-relayed" "broadcast-duplicates-dropped" "broadcast-rejected" "msg-id"
     "p2p" "zero-burn?" "zero-burn" "candidates" "local-candidates" "remote-candidates"
     "local-transport" "remote-transport" "local-ice-ufrag" "remote-ice-ufrag"

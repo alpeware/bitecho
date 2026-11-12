@@ -313,92 +313,109 @@
                    (str/trim val))))
              ["HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy"]))))
 
+(defn resolve-relay-url
+  "Pure helper. Returns normalized explicit relay url, or resolves from environment variable
+   BITECHO_RELAY_URL, normalized via relay/normalize-relay-base-url."
+  ([explicit-relay]
+   (resolve-relay-url explicit-relay #(System/getenv %)))
+  ([explicit-relay getenv-fn]
+   (let [candidate (or (when (and (string? explicit-relay) (seq (str/trim explicit-relay)))
+                         (str/trim explicit-relay))
+                       (when-let [val (getenv-fn "BITECHO_RELAY_URL")]
+                         (when (seq (str/trim val))
+                           (str/trim val))))]
+     (when candidate
+       (relay/normalize-relay-base-url candidate)))))
+
 (defn parse-light-node-args
   "Parses light-node command line arguments into an options map."
-  [args]
-  (let [clean-args (if (= (first args) "light-node") (vec (rest args)) (vec args))
-        verb (first clean-args)
-        serve? (= verb "serve")
-        wait-event? (= verb "wait-event")
-        default-state-dir (str (System/getProperty "user.home") "/.bitecho/light-node")
-        default-bootstrap "https://bitecho.org/devnet/bootstrap.txt"
-        state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
-        bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
-        autonomous? (boolean (some #{"--autonomous"} clean-args))
-        no-auto-sync? (boolean (some #{"--no-auto-sync"} clean-args))
-        explicit-auto-sync? (boolean (some #{"--auto-sync"} clean-args))
-        auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
-        sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
-        no-auto-reg? (boolean (some #{"--no-auto-register-home-set"} clean-args))
-        explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
-        auto-register-home-set? (and (not no-auto-reg?) (or explicit-auto-reg? (and serve? autonomous?)))
-        home-set-price (extract-long-flag clean-args "--price" (when auto-register-home-set? 10))
-        cmd-file (extract-flag-value clean-args "--cmd-file" nil)
-        events-out (extract-flag-value clean-args "--events-out" nil)
-        wait-session-id (or (extract-flag-value clean-args "--session-id" nil)
-                            (extract-flag-value clean-args "--session" nil))
-        min-seq (extract-long-flag clean-args "--min-seq" nil)
-        after-ts (extract-long-flag clean-args "--after-ts" nil)
-        transport-str (extract-flag-value clean-args "--transport" "udp")
-        transport (case (str/lower-case transport-str)
-                    "tcp" :tcp
-                    "connect" :connect
-                    :udp)
-        timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
-        ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
-        proxy-cli (extract-flag-value clean-args "--proxy" nil)
-        proxy-url (resolve-proxy-url proxy-cli)
-        relay-url (extract-flag-value clean-args "--relay-url" nil)
-        subnet-id (extract-flag-value clean-args "--subnet-id" nil)
-        trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
-        trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
-                              (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
-                                                      (str/starts-with? (str/trim trusted-dac-anchors-raw) "#{"))
-                                                (try (edn/read-string trusted-dac-anchors-raw)
-                                                     (catch Exception _ (str/split trusted-dac-anchors-raw #",")))
-                                                (str/split trusted-dac-anchors-raw #","))]
-                                (set (map #(or (light-core/normalize-pubkey-hex %) (str/trim (str %))) (remove str/blank? (map str raw-items))))))
-        turn-server (extract-flag-value clean-args "--turn-server" nil)
-        turn-username (extract-flag-value clean-args "--turn-username" nil)
-        turn-password (extract-flag-value clean-args "--turn-password" nil)
-        turn-realm (extract-flag-value clean-args "--turn-realm" nil)
-        turn-force-relay? (boolean (some #{"--turn-force-relay"} clean-args))
-        turn-config (when (or turn-server turn-username turn-password turn-realm turn-force-relay?)
-                      (let [[h p] (when turn-server (str/split turn-server #":" 2))]
-                        {:server-host (or h "127.0.0.1")
-                         :server-port (if (and p (seq p)) (try (Integer/parseInt p) (catch Exception _ 3478)) 3478)
-                         :username turn-username
-                         :password turn-password
-                         :realm turn-realm
-                         :force-relay? turn-force-relay?}))]
-    (cond-> {:mode (cond
-                     serve? :serve
-                     wait-event? :wait-event
-                     :else :one-shot)
-             :verb verb
-             :state-dir state-dir
-             :bootstrap bootstrap-path
-             :autonomous? autonomous?
-             :auto-sync? (boolean auto-sync?)
-             :auto-register-home-set? (boolean auto-register-home-set?)
-             :transport transport
-             :cmd-map (let [m (when-not (or serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
-                        (cond-> m
-                          subnet-id (assoc "subnet_id" subnet-id)))}
-      sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
-      home-set-price (assoc :home-set-price home-set-price)
-      cmd-file (assoc :cmd-file cmd-file)
-      events-out (assoc :events-out events-out)
-      wait-session-id (assoc :session-id wait-session-id)
-      min-seq (assoc :min-seq min-seq)
-      after-ts (assoc :after-ts after-ts)
-      subnet-id (assoc :subnet-id subnet-id)
-      timeout-ms (assoc :timeout-ms timeout-ms)
-      ingress-tcp-port (assoc :ingress-tcp-port (int ingress-tcp-port))
-      (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
-      proxy-url (assoc :proxy proxy-url)
-      relay-url (assoc :relay-url relay-url)
-      turn-config (assoc :turn-config turn-config))))
+  ([args]
+   (parse-light-node-args args #(System/getenv %)))
+  ([args getenv-fn]
+   (let [clean-args (if (= (first args) "light-node") (vec (rest args)) (vec args))
+         verb (first clean-args)
+         serve? (= verb "serve")
+         wait-event? (= verb "wait-event")
+         default-state-dir (str (System/getProperty "user.home") "/.bitecho/light-node")
+         default-bootstrap "https://bitecho.org/devnet/bootstrap.txt"
+         state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
+         bootstrap-path (or (extract-flag-value clean-args "--bootstrap" nil) default-bootstrap)
+         autonomous? (boolean (some #{"--autonomous"} clean-args))
+         no-auto-sync? (boolean (some #{"--no-auto-sync"} clean-args))
+         explicit-auto-sync? (boolean (some #{"--auto-sync"} clean-args))
+         auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
+         sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
+         no-auto-reg? (boolean (some #{"--no-auto-register-home-set"} clean-args))
+         explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
+         auto-register-home-set? (and (not no-auto-reg?) (or explicit-auto-reg? (and serve? autonomous?)))
+         home-set-price (extract-long-flag clean-args "--price" (when auto-register-home-set? 10))
+         cmd-file (extract-flag-value clean-args "--cmd-file" nil)
+         events-out (extract-flag-value clean-args "--events-out" nil)
+         wait-session-id (or (extract-flag-value clean-args "--session-id" nil)
+                             (extract-flag-value clean-args "--session" nil))
+         min-seq (extract-long-flag clean-args "--min-seq" nil)
+         after-ts (extract-long-flag clean-args "--after-ts" nil)
+         transport-str (extract-flag-value clean-args "--transport" "udp")
+         transport (case (str/lower-case transport-str)
+                     "tcp" :tcp
+                     "connect" :connect
+                     :udp)
+         timeout-ms (extract-long-flag clean-args "--timeout-ms" nil)
+         ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
+         proxy-cli (extract-flag-value clean-args "--proxy" nil)
+         proxy-url (resolve-proxy-url proxy-cli getenv-fn)
+         relay-cli (extract-flag-value clean-args "--relay-url" nil)
+         relay-url (resolve-relay-url relay-cli getenv-fn)
+         subnet-id (extract-flag-value clean-args "--subnet-id" nil)
+         trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
+         trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
+                               (let [raw-items (if (or (str/starts-with? (str/trim trusted-dac-anchors-raw) "[")
+                                                       (str/starts-with? (str/trim trusted-dac-anchors-raw) "#{"))
+                                                 (try (edn/read-string trusted-dac-anchors-raw)
+                                                      (catch Exception _ (str/split trusted-dac-anchors-raw #",")))
+                                                 (str/split trusted-dac-anchors-raw #","))]
+                                 (set (map #(or (light-core/normalize-pubkey-hex %) (str/trim (str %))) (remove str/blank? (map str raw-items))))))
+         turn-server (extract-flag-value clean-args "--turn-server" nil)
+         turn-username (extract-flag-value clean-args "--turn-username" nil)
+         turn-password (extract-flag-value clean-args "--turn-password" nil)
+         turn-realm (extract-flag-value clean-args "--turn-realm" nil)
+         turn-force-relay? (boolean (some #{"--turn-force-relay"} clean-args))
+         turn-config (when (or turn-server turn-username turn-password turn-realm turn-force-relay?)
+                       (let [[h p] (when turn-server (str/split turn-server #":" 2))]
+                         {:server-host (or h "127.0.0.1")
+                          :server-port (if (and p (seq p)) (try (Integer/parseInt p) (catch Exception _ 3478)) 3478)
+                          :username turn-username
+                          :password turn-password
+                          :realm turn-realm
+                          :force-relay? turn-force-relay?}))]
+     (cond-> {:mode (cond
+                      serve? :serve
+                      wait-event? :wait-event
+                      :else :one-shot)
+              :verb verb
+              :state-dir state-dir
+              :bootstrap bootstrap-path
+              :autonomous? autonomous?
+              :auto-sync? (boolean auto-sync?)
+              :auto-register-home-set? (boolean auto-register-home-set?)
+              :transport transport
+              :cmd-map (let [m (when-not (or serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
+                         (cond-> m
+                           subnet-id (assoc "subnet_id" subnet-id)))}
+       sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
+       home-set-price (assoc :home-set-price home-set-price)
+       cmd-file (assoc :cmd-file cmd-file)
+       events-out (assoc :events-out events-out)
+       wait-session-id (assoc :session-id wait-session-id)
+       min-seq (assoc :min-seq min-seq)
+       after-ts (assoc :after-ts after-ts)
+       subnet-id (assoc :subnet-id subnet-id)
+       timeout-ms (assoc :timeout-ms timeout-ms)
+       ingress-tcp-port (assoc :ingress-tcp-port (int ingress-tcp-port))
+       (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
+       proxy-url (assoc :proxy proxy-url)
+       relay-url (assoc :relay-url relay-url)
+       turn-config (assoc :turn-config turn-config)))))
 
 ;; -----------------------------------------------------------------------------
 ;; State Persistence & Identity Loading
@@ -602,11 +619,6 @@
                                                :timestamp-ms now-ms
                                                :nonce nonce})
          params (cond-> {"pubkey" pk-hex
-                         "sig" sig
-                         "signature" sig
-                         "ts" (str now-ms)
-                         "timestamp_ms" (str now-ms)
-                         "nonce" nonce
                          "since_seq" (str since-seq)}
                   (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
                   (:limit opts) (assoc "limit" (str (:limit opts)))
@@ -755,7 +767,8 @@
         callbacks {:on-open
                    (fn [evt]
                      (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
-                           query-env (light-core/build-chain-state-query-envelope pubkey privkey-bytes {:nonce nonce})
+                           signer-pk (or (:pubkey-hex identity) (:pubkey identity) pubkey)
+                           query-env (light-core/build-chain-state-query-envelope signer-pk privkey-bytes {:nonce nonce :target-pubkey pubkey})
                            frozen (fressian/encode-wire query-env)]
                        (try
                          (api/send! client-node frozen cid)
@@ -1316,6 +1329,8 @@
                        (when-let [cid (:channel-id evt)]
                          (reset! channel-id cid))
                        (when-let [payload (:payload evt)]
+                         (when-let [on-msg (:on-message ctx)]
+                           (try (on-msg payload) (catch Exception _ nil)))
                          (when state-atom
                            (let [st @state-atom
                                  res (light-core/handle-wire-payload st payload (:privkey-bytes identity))]
@@ -1430,7 +1445,8 @@
                                           :diagnose-fn (:diagnose-fn opts)
                                           :p2p-peers-atom (:p2p-peers-atom opts)
                                           :ingress-peers-atom (:ingress-peers-atom opts)
-                                          :mdns-atom (:mdns-atom opts)})
+                                          :mdns-atom (:mdns-atom opts)
+                                          :on-message (:on-message opts)})
         transport (:transport opts)
         target-host (if (= transport :connect)
                       (or (:ingress-host node) (:ip node) "127.0.0.1")

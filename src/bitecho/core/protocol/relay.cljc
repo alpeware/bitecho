@@ -26,18 +26,93 @@
 
 (defn normalize-relay-base-url
   "Normalizes a relay URL by trimming whitespace, stripping trailing slashes,
-   and stripping any trailing `/relay/v1` suffix so callers can safely append `/relay/v1/<endpoint>`."
+   and stripping any trailing `/relay/v1` or `/relay/v1/*` suffix so callers can safely append `/relay/v1/<endpoint>`."
   [relay-url]
   (when (and (string? relay-url) (not (str/blank? relay-url)))
     (-> relay-url
         str/trim
         (str/replace #"/+$" "")
-        (str/replace #"/relay/v1$" "")
+        (str/replace #"/relay/v1(/+.*)?$" "")
         (str/replace #"/+$" ""))))
 
 ;; =============================================================================
-;; 1. Relay State Initialization
+;; 1. Relay State Initialization & Global Capacity
 ;; =============================================================================
+
+(defn total-queued-bytes
+  "Computes total queued byte size across all inboxes and broadcasts in relay state."
+  [state]
+  (let [inbox-bytes (reduce (fn [acc [_ inbox]]
+                              (reduce (fn [i-acc entry]
+                                        (+ i-acc (long (or (:byte-size entry)
+                                                           (quot (count (or (:envelope-hex entry) "")) 2)
+                                                           0))))
+                                      acc
+                                      inbox))
+                            0
+                            (get state :inboxes {}))
+        bcast-bytes (reduce (fn [acc entry]
+                              (+ acc (long (or (:byte-size entry)
+                                               (quot (count (or (:envelope-hex entry) "")) 2)
+                                               0))))
+                            0
+                            (get state :broadcasts []))]
+    (+ inbox-bytes bcast-bytes)))
+
+(defn- count-queued-entries
+  [state]
+  (+ (reduce + (map count (vals (get state :inboxes {}))))
+     (count (get state :broadcasts []))))
+
+(defn- evict-oldest-queued-entry
+  "Finds and removes the oldest queued message across all inboxes and broadcasts.
+   Returns [updated-state evicted-entry-or-nil]."
+  [state]
+  (let [inbox-candidates (keep (fn [[recip inbox]]
+                                 (when (seq inbox)
+                                   {:type :inbox :recip recip :entry (first inbox)}))
+                               (get state :inboxes {}))
+        all-candidates (if (seq (get state :broadcasts []))
+                         (conj inbox-candidates {:type :broadcast :entry (first (:broadcasts state))})
+                         inbox-candidates)]
+    (if (empty? all-candidates)
+      [state nil]
+      (let [oldest (apply min-key (fn [c] (long (or (:received-at (:entry c)) 0))) all-candidates)
+            evicted-entry (:entry oldest)
+            new-state (case (:type oldest)
+                        :inbox
+                        (let [recip (:recip oldest)
+                              remaining (subvec (get-in state [:inboxes recip]) 1)]
+                          (if (empty? remaining)
+                            (update state :inboxes dissoc recip)
+                            (assoc-in state [:inboxes recip] remaining)))
+                        :broadcast
+                        (update state :broadcasts (fn [bcasts] (if (seq bcasts) (subvec bcasts 1) []))))
+            new-state (update-in new-state [:diagnostics :evicted] (fnil inc 0))]
+        [new-state evicted-entry]))))
+
+(defn- enforce-global-byte-cap
+  "Purely evicts oldest entries from inboxes and broadcasts until total queued bytes + incoming-bytes <= max-total-queued-bytes.
+   Returns [updated-state eviction-diagnose-effects]."
+  [state incoming-bytes now-ms]
+  (let [max-total (long (get state :max-total-queued-bytes 16777216))]
+    (loop [st state
+           evicted-effects []]
+      (if (and (pos? (count-queued-entries st))
+               (> (+ (total-queued-bytes st) incoming-bytes) max-total))
+        (let [[next-st evicted] (evict-oldest-queued-entry st)]
+          (if evicted
+            (let [evicted-sz (long (or (:byte-size evicted)
+                                       (quot (count (or (:envelope-hex evicted) "")) 2)
+                                       0))
+                  diag {:effect :diagnose
+                        :reason :queued-bytes-evicted
+                        :evicted-message-id (:envelope-id evicted)
+                        :evicted-bytes evicted-sz
+                        :now-ms now-ms}]
+              (recur next-st (conj evicted-effects diag)))
+            [st evicted-effects]))
+        [st evicted-effects]))))
 
 (defn init-relay-state
   "Initializes pure relay state with configurable limits and default empty collections."
@@ -46,9 +121,10 @@
    {:max-inbox-size (long (or (:max-inbox-size opts) 256))
     :max-broadcast-size (long (or (:max-broadcast-size opts) 256))
     :max-payload-bytes (long (or (:max-payload-bytes opts) 65536))
-    :max-total-queued-bytes (long (or (:max-total-queued-bytes opts) 16777216))
+    :max-total-queued-bytes (long (or (:max-total-queued-bytes opts) (:max-queued-bytes opts) 16777216))
     :max-recipients (long (or (:max-recipients opts) 1024))
     :ttl-ms (long (or (:ttl-ms opts) 86400000))
+    :min-signaling-burn (long (or (:min-signaling-burn opts) 100))
     :max-skew-ms (long (or (:max-skew-ms opts) 300000))
     :max-nonces (long (or (:max-nonces opts) 2048))
     :inboxes {}
@@ -69,6 +145,7 @@
                   :too-large 0
                   :malformed 0
                   :invalid-sig 0
+                  :insufficient-burn 0
                   :auth-failed 0
                   :skew-exceeded 0
                   :replay-rejected 0
@@ -170,6 +247,11 @@
         (assoc state :seen-ids (assoc trimmed-seen envelope-id now-ms)
                :seen-id-order trimmed-order)))))
 
+(defn- record-envelope-and-gossip-ids
+  [state envelope-id gossip-id now-ms]
+  (cond-> (record-seen-id state envelope-id now-ms)
+    (and gossip-id (not= gossip-id envelope-id)) (record-seen-id gossip-id now-ms)))
+
 (defn- verify-envelope-signature
   [env]
   (let [cb (crypto/make-crypto-boundary)
@@ -220,6 +302,7 @@
       :relay-submit
       (let [raw-env (:envelope event)
             max-payload (long (get state :max-payload-bytes 65536))
+            max-total (long (get state :max-total-queued-bytes 16777216))
             wire-bytes (cond
                          (bytes? raw-env) raw-env
                          (string? raw-env) (try (basalt/hex->bytes raw-env) (catch #?(:clj Exception :cljs :default) _ nil))
@@ -234,8 +317,8 @@
                            (update-in [:diagnostics :malformed] (fnil inc 0)))]
             {:state new-st :ok? false :error :malformed-envelope :response {"ok" false "error" "malformed-envelope"} :effects [diag]})
 
-          (> payload-size max-payload)
-          (let [diag {:effect :diagnose :reason :payload-too-large :size payload-size :max max-payload :now-ms now-ms}
+          (or (> payload-size max-payload) (> payload-size max-total))
+          (let [diag {:effect :diagnose :reason :payload-too-large :size payload-size :max (min max-payload max-total) :now-ms now-ms}
                 new-st (-> state
                            (update-in [:diagnostics :rejected] (fnil inc 0))
                            (update-in [:diagnostics :too-large] (fnil inc 0)))]
@@ -261,17 +344,49 @@
                 {:state new-st :ok? false :error :invalid-signature :response {"ok" false "error" "invalid-signature"} :effects [diag]})
 
               :else
-              (let [envelope-id (basalt/bytes->hex (crypto/sha256 wire-bytes))
-                    wire-hex (basalt/bytes->hex wire-bytes)]
-                (if (contains? (get state :seen-ids {}) envelope-id)
-                  (let [diag {:effect :diagnose :reason :duplicate-envelope :envelope-id envelope-id :now-ms now-ms}]
+              (let [ev-type (or (get-in decoded [:event :type]) (:type decoded))
+                    gossip-msg (when (= :receive-gossip ev-type)
+                                 (or (get-in decoded [:event :message]) (:message decoded)))
+                    burn-amt (when gossip-msg
+                               (long (or (:burn-amount gossip-msg) (get gossip-msg "burn-amount") 0)))
+                    min-burn (long (get state :min-signaling-burn 100))
+                    gossip-id (when gossip-msg
+                                (or (:message-id gossip-msg)
+                                    (get gossip-msg "message-id")
+                                    (when-let [p (or (:payload gossip-msg) (get gossip-msg "payload"))]
+                                      (when (bytes? p)
+                                        (basalt/bytes->hex (crypto/sha256 p))))))
+                    envelope-id (basalt/bytes->hex (crypto/sha256 wire-bytes))
+                    wire-hex (basalt/bytes->hex wire-bytes)
+                    seen-set (get state :seen-ids {})
+                    dup-id (or (when (contains? seen-set envelope-id) envelope-id)
+                               (when (and gossip-id (contains? seen-set gossip-id)) gossip-id))]
+                (cond
+                  (and (= :receive-gossip ev-type) (< burn-amt min-burn))
+                  (let [diag {:effect :diagnose
+                              :reason :insufficient-burn
+                              :required min-burn
+                              :provided burn-amt
+                              :now-ms now-ms}
+                        new-st (-> state
+                                   (update-in [:diagnostics :rejected] (fnil inc 0))
+                                   (update-in [:diagnostics :insufficient-burn] (fnil inc 0)))]
+                    {:state new-st
+                     :ok? false
+                     :error :insufficient-burn
+                     :response {"ok" false "error" "insufficient-burn" "required" min-burn "provided" burn-amt}
+                     :effects [diag]})
+
+                  dup-id
+                  (let [diag {:effect :diagnose :reason :duplicate-envelope :envelope-id dup-id :now-ms now-ms}]
                     {:state (update-in state [:diagnostics :duplicates] (fnil inc 0))
                      :ok? true
                      :duplicate? true
-                     :envelope-id envelope-id
-                     :response {"ok" true "duplicate" true "envelope_id" envelope-id "status" "duplicate"}
+                     :envelope-id dup-id
+                     :response {"ok" true "duplicate" true "envelope_id" dup-id "status" "duplicate"}
                      :effects [diag]})
 
+                  :else
                   (let [raw-inner-payload (or (get-in decoded [:event :message :payload])
                                               (get-in decoded [:message :payload]))
                         inner-msg (when (bytes? raw-inner-payload)
@@ -296,7 +411,6 @@
                                       (get-in decoded [:event :recipient])
                                       (get-in decoded [:payload :recipient])
                                       (:recipient inner-msg))
-                        ev-type (or (get-in decoded [:event :type]) (:type decoded))
                         validator-only? (or (contains? #{:on-deliver :transfer :settle-escrow :burn :mint :burn-for-credit} ev-type)
                                             (and (map? (:event decoded))
                                                  (contains? #{:on-deliver :transfer :settle-escrow :burn} (:type (:event decoded)))))
@@ -314,7 +428,7 @@
                                  :wire-bytes wire-bytes
                                  :envelope-id envelope-id
                                  :broadcast? false}]
-                        {:state (-> (record-seen-id state envelope-id now-ms)
+                        {:state (-> (record-envelope-and-gossip-ids state envelope-id gossip-id now-ms)
                                     (update-in [:diagnostics :submitted] (fnil inc 0)))
                          :ok? true
                          :duplicate? false
@@ -323,13 +437,14 @@
                          :effects (if from-val? [] [eff])})
 
                       broadcast?
-                      (let [next-bseq (inc (long (get state :next-broadcast-seq 0)))
-                            ttl-ms (long (get state :ttl-ms 86400000))
+                      (let [[capped-st cap-effects] (enforce-global-byte-cap state payload-size now-ms)
+                            next-bseq (inc (long (get capped-st :next-broadcast-seq 0)))
+                            ttl-ms (long (get capped-st :ttl-ms 86400000))
                             cutoff-ms (- now-ms ttl-ms)
                             existing-bcasts (if (pos? now-ms)
                                               (filterv (fn [e] (>= (long (:received-at e 0)) cutoff-ms))
-                                                       (or (:broadcasts state) []))
-                                              (or (:broadcasts state) []))
+                                                       (or (:broadcasts capped-st) []))
+                                              (or (:broadcasts capped-st) []))
                             b-entry {:broadcast-seq next-bseq
                                      :broadcast_seq next-bseq
                                      :envelope-id envelope-id
@@ -339,14 +454,15 @@
                                      :envelope_hex wire-hex
                                      :sender sender
                                      :received-at now-ms
-                                     :received_at now-ms}
+                                     :received_at now-ms
+                                     :byte-size payload-size}
                             b-ring (conj existing-bcasts b-entry)
-                            max-b (long (get state :max-broadcast-size 256))
+                            max-b (long (get capped-st :max-broadcast-size 256))
                             evicted-count (max 0 (- (count b-ring) max-b))
                             trimmed-b (if (pos? evicted-count)
                                         (subvec b-ring evicted-count)
                                         b-ring)
-                            new-st (-> (record-seen-id state envelope-id now-ms)
+                            new-st (-> (record-envelope-and-gossip-ids capped-st envelope-id gossip-id now-ms)
                                        (assoc :broadcasts trimmed-b
                                               :next-broadcast-seq next-bseq)
                                        (update-in [:diagnostics :submitted] (fnil inc 0))
@@ -362,14 +478,15 @@
                          :duplicate? false
                          :envelope-id envelope-id
                          :response {"ok" true "envelope_id" envelope-id "seq" next-bseq "broadcast" true "status" "forwarded"}
-                         :effects (if from-val? [] [eff])})
+                         :effects (into (vec cap-effects) (if from-val? [] [eff]))})
 
                       :else
-                      (let [next-seq (inc (long (get-in state [:inbox-seqs recipient] 0)))
-                            ttl-ms (long (get state :ttl-ms 86400000))
+                      (let [[capped-st cap-effects] (enforce-global-byte-cap state payload-size now-ms)
+                            next-seq (inc (long (get-in capped-st [:inbox-seqs recipient] 0)))
+                            ttl-ms (long (get capped-st :ttl-ms 86400000))
                             cutoff-ms (- now-ms ttl-ms)
-                            max-recipients (long (get state :max-recipients 1024))
-                            cur-inboxes (get state :inboxes {})
+                            max-recipients (long (get capped-st :max-recipients 1024))
+                            cur-inboxes (get capped-st :inboxes {})
                             inboxes-full? (and (not (contains? cur-inboxes recipient))
                                                (>= (count cur-inboxes) max-recipients))
                             pruned-inboxes (if inboxes-full?
@@ -387,15 +504,16 @@
                                        :sender sender
                                        :recipient recipient
                                        :received-at now-ms
-                                       :received_at now-ms}
+                                       :received_at now-ms
+                                       :byte-size payload-size}
                             new-inbox (conj existing-inbox new-entry)
-                            max-inbox (long (get state :max-inbox-size 256))
+                            max-inbox (long (get capped-st :max-inbox-size 256))
                             evicted-count (+ (if inboxes-full? 1 0)
                                              (max 0 (- (count new-inbox) max-inbox)))
                             trimmed-inbox (if (> (count new-inbox) max-inbox)
                                             (subvec new-inbox (- (count new-inbox) max-inbox))
                                             new-inbox)
-                            new-st (-> (record-seen-id state envelope-id now-ms)
+                            new-st (-> (record-envelope-and-gossip-ids capped-st envelope-id gossip-id now-ms)
                                        (assoc-in [:inboxes] (assoc pruned-inboxes recipient trimmed-inbox))
                                        (assoc-in [:inbox-seqs recipient] next-seq)
                                        (update-in [:diagnostics :submitted] (fnil inc 0))
@@ -413,7 +531,7 @@
                          :duplicate? false
                          :envelope-id envelope-id
                          :response {"ok" true "envelope_id" envelope-id "seq" next-seq "recipient" recipient "broadcast" false "status" "accepted"}
-                         :effects (if from-val? [] [eff])})))))))))
+                         :effects (into (vec cap-effects) (if from-val? [] [eff]))})))))))))
 
       :relay-poll
       (let [v (verify-poll-request state event)]

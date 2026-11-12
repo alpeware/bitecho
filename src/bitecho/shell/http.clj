@@ -19,6 +19,7 @@
             [bitecho.fressian :as fressian]
             [bitecho.shell.infra :as infra]
             [bitecho.shell.light-node :as light-node]
+            [bitecho.shell.mesh :as mesh]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -26,7 +27,8 @@
             [datachannel.api :as api])
   (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer HttpsConfigurator HttpsExchange HttpsParameters HttpsServer]
            [java.io ByteArrayInputStream ByteArrayOutputStream File InputStream OutputStream RandomAccessFile]
-           [java.net InetSocketAddress ServerSocket Socket SocketException]
+           [java.net InetSocketAddress ServerSocket Socket SocketException URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
            [java.nio ByteBuffer]
            [java.nio.charset StandardCharsets]
            [java.nio.file CopyOption Files StandardCopyOption]
@@ -35,6 +37,7 @@
            [java.security.cert CertificateFactory X509Certificate]
            [java.security.spec PKCS8EncodedKeySpec]
            [java.text SimpleDateFormat]
+           [java.time Duration]
            [java.util Arrays Base64 Date]
            [java.util.concurrent Executors ExecutorService]
            [java.util.concurrent.atomic AtomicInteger]
@@ -807,6 +810,40 @@
                   (.write baos buf 0 n)
                   (recur new-total))))))))))
 
+(defn- replicate-relay-request!
+  "Replicates a raw relay request body in parallel across all cluster nodes (excluding self)."
+  [config endpoint ^bytes body-bytes]
+  (let [peers (get-in config [:cluster :nodes])
+        my-id (or (:node/id config) (:node-id config) (get-in config [:node :id]))]
+    (when (and (map? peers) (pos? (count peers)) body-bytes (pos? (alength body-bytes)))
+      (let [client (.. (HttpClient/newBuilder)
+                       (connectTimeout (Duration/ofMillis 1500))
+                       build)
+            eligible-peers (for [[nid pinfo] peers
+                                 :let [ip (or (:ip4 pinfo) (:ip pinfo) (:host pinfo))
+                                       port (or (:http-port pinfo)
+                                                (when (and (:port pinfo) (not= 5000 (long (:port pinfo))))
+                                                  (:port pinfo))
+                                                (get-in config [:http :http-port])
+                                                80)]
+                                 :when (and (not= (name (keyword nid)) (when my-id (name (keyword my-id))))
+                                            (some? ip))]
+                             [ip port])]
+        (doseq [res (pmap (fn [[ip port]]
+                            (try
+                              (let [uri (URI/create (str "http://" ip ":" port endpoint))
+                                    req (-> (HttpRequest/newBuilder)
+                                            (.uri uri)
+                                            (.timeout (Duration/ofMillis 1500))
+                                            (.header "Content-Type" "application/json")
+                                            (.header "X-Bitecho-Relay-Replicated" "true")
+                                            (.POST (HttpRequest$BodyPublishers/ofByteArray body-bytes))
+                                            (.build))]
+                                (.send client req (HttpResponse$BodyHandlers/discarding)))
+                              (catch Exception _ nil)))
+                          eligible-peers)]
+          res)))))
+
 (defn- handle-relay-send
   [^HttpExchange exchange req relay-atom relay-waiters-atom config]
   (let [max-payload (long (or (get @relay-atom :max-payload-bytes) 65536))
@@ -817,7 +854,8 @@
                      {:response/status 413
                       :response/headers {"Content-Type" "application/json; charset=utf-8"}
                       :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
-      (let [ct (first (get (:request/headers req) :header/content-type ""))
+      (let [replicated? (= "true" (str/lower-case (str (first (get (:request/headers req) :header/x-bitecho-relay-replicated)))))
+            ct (first (get (:request/headers req) :header/content-type ""))
             env (try
                   (cond
                     (and (string? ct) (str/includes? (str/lower-case ct) "application/json"))
@@ -841,10 +879,12 @@
             r @res-box]
         (if (:ok? r)
           (do
-            (when-let [forwarder (:on-relay-forward config)]
-              (doseq [eff (:effects r)]
-                (when (= :forward-to-validators (:effect eff))
-                  (try (forwarder eff) (catch Exception _ nil)))))
+            (when-not replicated?
+              (when-let [forwarder (:on-relay-forward config)]
+                (doseq [eff (:effects r)]
+                  (when (= :forward-to-validators (:effect eff))
+                    (try (forwarder eff) (catch Exception _ nil)))))
+              (replicate-relay-request! config "/relay/v1/send" body-bytes))
             (let [recip (or (get-in r [:response "recipient"])
                             (when-let [eff (first (filter #(= :forward-to-validators (:effect %)) (:effects r)))]
                               (:recipient eff)))
@@ -902,22 +942,17 @@
                                                      (first (get headers :header/x-bitecho-since-broadcast-seq))
                                                      0)))
                             (catch Exception _ 0))
+            query-pop? (boolean (some #(contains? query-params %) ["signature" "sig" "nonce" "timestamp_ms" "timestamp-ms" "ts"]))
             ts-ms (try (Long/parseLong (str (or (get body-json "timestamp_ms")
                                                 (get body-json "timestamp-ms")
                                                 (get body-json "ts")
-                                                (get query-params "timestamp_ms")
-                                                (get query-params "timestamp-ms")
-                                                (get query-params "ts")
                                                 (first (get headers :header/x-bitecho-timestamp-ms))
                                                 0)))
                        (catch Exception _ 0))
             nonce (or (get body-json "nonce")
-                      (get query-params "nonce")
                       (first (get headers :header/x-bitecho-nonce)))
             signature (or (get body-json "signature")
                           (get body-json "sig")
-                          (get query-params "signature")
-                          (get query-params "sig")
                           (first (get headers :header/x-bitecho-signature)))
             raw-wait-val (or (get body-json "wait_ms")
                              (get body-json "wait-ms")
@@ -934,11 +969,20 @@
             invalid-wait? (or (= parsed-wait :invalid)
                               (and (number? parsed-wait)
                                    (or (neg? parsed-wait) (> parsed-wait 25000))))]
-        (if invalid-wait?
+        (cond
+          (and query-pop? (or (str/blank? (str signature)) (str/blank? (str nonce)) (zero? ts-ms)))
+          (send-response exchange
+                         {:response/status 403
+                          :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "missing-pop-headers" "status" "rejected"})})
+
+          invalid-wait?
           (send-response exchange
                          {:response/status 400
                           :response/headers {"Content-Type" "application/json; charset=utf-8"}
                           :response/body (json/write-str {"ok" false "error" "invalid-wait-ms"})})
+
+          :else
           (let [wait-ms (long (or parsed-wait 0))
                 now-ms (System/currentTimeMillis)
                 poll-event {:type :relay-poll
@@ -966,12 +1010,23 @@
                     norm-pk (get-in r [:response "pubkey"] pubkey)]
                 (if (and (empty? msgs) (empty? bcasts) (pos? wait-ms))
                   (let [max-waiters (long (or (:max-relay-waiters config) 256))
-                        current-waiters (count (distinct (apply concat (vals @relay-waiters-atom))))]
-                    (if (>= current-waiters max-waiters)
+                        max-client-waiters (long (or (:max-relay-waiters-per-pubkey config) 4))
+                        current-waiters (count (distinct (apply concat (vals @relay-waiters-atom))))
+                        client-waiters (count (get @relay-waiters-atom norm-pk #{}))]
+                    (cond
+                      (>= current-waiters max-waiters)
                       (send-response exchange
                                      {:response/status 429
                                       :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                                      :response/body (json/write-str {"ok" false "error" "too-many-waiters"})})
+                                      :response/body (json/write-str {"ok" false "error" "too-many-waiters" "status" "rejected"})})
+
+                      (>= client-waiters max-client-waiters)
+                      (send-response exchange
+                                     {:response/status 429
+                                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                      :response/body (json/write-str {"ok" false "error" "too-many-client-waiters" "status" "rejected" "reason" "too-many-client-waiters"})})
+
+                      :else
                       (let [p (promise)
                             _ (swap! relay-waiters-atom (fn [m]
                                                           (-> m
@@ -1005,7 +1060,7 @@
                                   :response/body (json/write-str (:response r))}))))))))))
 
 (defn- handle-relay-ack
-  [^HttpExchange exchange req relay-atom]
+  [^HttpExchange exchange req relay-atom config]
   (let [[body-bytes body-exceeded?] (with-open [is (.getRequestBody exchange)]
                                       (read-body-bounded is 65536))]
     (if body-exceeded?
@@ -1039,44 +1094,52 @@
                                                    (first (get headers :header/x-bitecho-ack-broadcast-seq))
                                                    0)))
                           (catch Exception _ 0))
+            query-pop? (boolean (some #(contains? query-params %) ["signature" "sig" "nonce" "timestamp_ms" "timestamp-ms" "ts"]))
             ts-ms (try (Long/parseLong (str (or (get body-json "timestamp_ms")
                                                 (get body-json "timestamp-ms")
                                                 (get body-json "ts")
-                                                (get query-params "timestamp_ms")
-                                                (get query-params "timestamp-ms")
-                                                (get query-params "ts")
                                                 (first (get headers :header/x-bitecho-timestamp-ms))
                                                 0)))
                        (catch Exception _ 0))
             nonce (or (get body-json "nonce")
-                      (get query-params "nonce")
                       (first (get headers :header/x-bitecho-nonce)))
             signature (or (get body-json "signature")
                           (get body-json "sig")
-                          (get query-params "signature")
-                          (get query-params "sig")
-                          (first (get headers :header/x-bitecho-signature)))
-            now-ms (System/currentTimeMillis)
-            ack-event (cond-> {:type :relay-ack
-                               :pubkey pubkey
-                               :ack-seq ack-seq
-                               :timestamp-ms ts-ms
-                               :nonce nonce
-                               :signature signature
-                               :now-ms now-ms}
-                        (pos? ack-bseq) (assoc :ack-broadcast-seq ack-bseq))
-            res-box (atom nil)
-            _ (swap! relay-atom
-                     (fn [st]
-                       (let [r (relay/reduce-relay st ack-event)]
-                         (reset! res-box r)
-                         (:state r))))
-            r @res-box
-            status (if (:ok? r) 200 403)]
-        (send-response exchange
-                       {:response/status status
-                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                        :response/body (json/write-str (:response r))})))))
+                          (first (get headers :header/x-bitecho-signature)))]
+        (if (and query-pop? (or (str/blank? (str signature)) (str/blank? (str nonce)) (zero? ts-ms)))
+          (send-response exchange
+                         {:response/status 403
+                          :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "missing-pop-headers" "status" "rejected"})})
+          (let [now-ms (System/currentTimeMillis)
+                ack-event (cond-> {:type :relay-ack
+                                   :pubkey pubkey
+                                   :ack-seq ack-seq
+                                   :timestamp-ms ts-ms
+                                   :nonce nonce
+                                   :signature signature
+                                   :now-ms now-ms}
+                            (pos? ack-bseq) (assoc :ack-broadcast-seq ack-bseq))
+                res-box (atom nil)
+                _ (swap! relay-atom
+                         (fn [st]
+                           (let [r (relay/reduce-relay st ack-event)]
+                             (reset! res-box r)
+                             (:state r))))
+                r @res-box]
+            (if-not (:ok? r)
+              (send-response exchange
+                             {:response/status 403
+                              :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                              :response/body (json/write-str (:response r))})
+              (do
+                (let [replicated? (= "true" (str/lower-case (str (first (get (:request/headers req) :header/x-bitecho-relay-replicated)))))]
+                  (when-not replicated?
+                    (replicate-relay-request! config "/relay/v1/ack" body-bytes)))
+                (send-response exchange
+                               {:response/status 200
+                                :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                :response/body (json/write-str (:response r))})))))))))
 
 (defn- handle-relay-chain-state
   [^HttpExchange exchange req config subnet-runtime]
@@ -1120,20 +1183,21 @@
                             (:snapshots cached)
 
                             (and subnet-runtime (or (:validator-bootstrap config) (:validator-bootstrap subnet-runtime)))
-                            (if (and pubkey (re-matches #"^[0-9a-fA-F]{64}$|^[0-9a-fA-F]{88}$" (str/trim pubkey)))
-                              (let [v-snaps (try
-                                              (infra/fetch-validator-chain-state-snapshots!
-                                               subnet-runtime
-                                               (or (:validator-bootstrap config) (:validator-bootstrap subnet-runtime))
-                                               (or pubkey (:default-sender subnet-runtime))
-                                               (or nonce (str (System/currentTimeMillis))))
-                                              (catch Exception _ []))]
-                                (when (and chain-cache (seq v-snaps))
-                                  (swap! chain-cache (fn [c]
-                                                       (let [trimmed (if (>= (count c) 1024) (into {} (take-last 512 c)) c)]
-                                                         (assoc trimmed pubkey {:snapshots v-snaps :cached-at-ms now-ms})))))
-                                (or v-snaps []))
-                              [])
+                            (let [effective-pk (or pubkey (:default-sender subnet-runtime) (get-in subnet-runtime [:peer-identity :pubkey-hex]))]
+                              (if (and effective-pk (re-matches #"^[0-9a-fA-F]{64}$|^[0-9a-fA-F]{88}$" (str/trim (str effective-pk))))
+                                (let [v-snaps (try
+                                                (infra/fetch-validator-chain-state-snapshots!
+                                                 subnet-runtime
+                                                 (or (:validator-bootstrap config) (:validator-bootstrap subnet-runtime))
+                                                 effective-pk
+                                                 (or nonce (str (System/currentTimeMillis))))
+                                                (catch Exception _ []))]
+                                  (when (and chain-cache (seq v-snaps))
+                                    (swap! chain-cache (fn [c]
+                                                         (let [trimmed (if (>= (count c) 1024) (into {} (take-last 512 c)) c)]
+                                                           (assoc trimmed effective-pk {:snapshots v-snaps :cached-at-ms now-ms})))))
+                                  (or v-snaps []))
+                                []))
 
                             (and subnet-runtime (seq (:chain-state-snapshots @(:subnet-atom subnet-runtime))))
                             (vec (:chain-state-snapshots @(:subnet-atom subnet-runtime)))
@@ -1142,7 +1206,7 @@
                 burn-fl (long (or (get-in config [:burn-floor]) (get-in config [:min-signaling-burn]) 100))
                 st (when subnet-runtime (try (infra/runtime-status subnet-runtime) (catch Exception _ nil)))
                 resp (cond-> {"ok" true
-                              "pubkey" pubkey
+                              "pubkey" (or pubkey (:default-sender subnet-runtime) (get-in subnet-runtime [:peer-identity :pubkey-hex]))
                               "snapshots" snapshots
                               "min_signaling_burn" burn-fl
                               "bootstrap" (or (:bootstrap config) (:domain config) "bitecho.org")}
@@ -1190,7 +1254,7 @@
          (handle-relay-poll exchange req relay-atom relay-waiters-atom config)
 
          (and (= method :POST) (= clean-path "/relay/v1/ack"))
-         (handle-relay-ack exchange req relay-atom)
+         (handle-relay-ack exchange req relay-atom config)
 
          (and (or (= method :GET) (= method :POST)) (= clean-path "/relay/v1/chain-state"))
          (handle-relay-chain-state exchange req config subnet-runtime)
@@ -1513,8 +1577,57 @@
         forwarded-ips-atom (atom {})
         relay-atom (or (:relay-atom config) (atom (relay/init-relay-state (get-in config [:http :relay]))))
         relay-waiters-atom (or (:relay-waiters-atom config) (atom {}))
-        val-bootstrap (or (:validator-bootstrap config) (when subnet-runtime (:validator-bootstrap subnet-runtime)))
+        val-bootstrap (infra/resolve-validator-bootstrap (or (:validator-bootstrap config) (when subnet-runtime (:validator-bootstrap subnet-runtime))))
         bridge-conn-atom (atom nil)
+        on-bridge-msg (fn [payload]
+                        (try
+                          (swap! relay-atom
+                                 (fn [st]
+                                   (let [res (relay/reduce-relay st {:type :relay-submit
+                                                                     :envelope payload
+                                                                     :from-validator? true
+                                                                     :now-ms (System/currentTimeMillis)})]
+                                     (when (:ok? res)
+                                       (let [recip (or (get-in res [:response "recipient"])
+                                                       (get-in res [:response "pubkey"]))
+                                             broadcast? (boolean (get-in res [:response "broadcast"]))]
+                                         (when (or recip broadcast?)
+                                           (let [to-wake (concat
+                                                          (when recip (get @relay-waiters-atom recip #{}))
+                                                          (get @relay-waiters-atom :broadcast #{}))]
+                                             (doseq [p to-wake]
+                                               (deliver p :notified))))))
+                                     (:state res))))
+                          (catch Exception _ nil)))
+        connect-bridge! (fn []
+                          (when (and (:peer-identity subnet-runtime) val-bootstrap)
+                            (try
+                              (when-let [old-c @bridge-conn-atom]
+                                (when-let [n (:node old-c)]
+                                  (try (api/close! n) (catch Exception _ nil))))
+                              (let [c (light-node/connect-validators!
+                                       (:peer-identity subnet-runtime)
+                                       val-bootstrap
+                                       {:timeout-ms 5000
+                                        :on-message on-bridge-msg})]
+                                (when (:ok? c)
+                                  (reset! bridge-conn-atom c)
+                                  (try
+                                    (let [edge-id (:peer-identity subnet-runtime)
+                                          edge-pk (or (:pubkey-hex edge-id) (:pubkey edge-id))
+                                          edge-priv (:privkey-bytes edge-id)
+                                          reg-env (mesh/wrap-agent-event
+                                                   {:type :register-home-set
+                                                    :callee edge-pk
+                                                    :candidates [{:node-id "node-1" :price 100}]
+                                                    :price 100
+                                                    :price-max 100
+                                                    :epoch (long (or (infra/current-runtime-epoch subnet-runtime) 1))}
+                                                   edge-pk edge-priv)]
+                                      (light-node/send-all-envelopes! (:send-fn c) [(fressian/encode-wire reg-env)]))
+                                    (catch Exception _ nil))
+                                  c))
+                              (catch Exception _ nil))))
         default-forwarder (when (and (nil? (:on-relay-forward config))
                                      (:peer-identity subnet-runtime)
                                      val-bootstrap)
@@ -1523,19 +1636,29 @@
                                        ^Runnable
                                        (fn []
                                          (try
-                                           (if-let [active-conn @bridge-conn-atom]
-                                             (when (:ok? active-conn)
-                                               (light-node/send-all-envelopes! (:send-fn active-conn) [(:wire-bytes eff)]))
-                                             (let [conn (light-node/connect-validators!
-                                                         (:peer-identity subnet-runtime)
-                                                         val-bootstrap
-                                                         {:timeout-ms 2000})]
-                                               (when (:ok? conn)
-                                                 (try
-                                                   (light-node/send-all-envelopes! (:send-fn conn) [(:wire-bytes eff)])
-                                                   (finally
-                                                     (when-let [n (:node conn)]
-                                                       (try (api/close! n) (catch Exception _ nil))))))))
+                                           (let [env (:envelope eff)
+                                                 edge-id (:peer-identity subnet-runtime)
+                                                 edge-pk (or (:pubkey-hex edge-id) (:pubkey edge-id))
+                                                 edge-priv (:privkey-bytes edge-id)
+                                                 ev-type (or (get-in env [:event :type]) (:type env))
+                                                 gossip-msg (when (= :receive-gossip ev-type)
+                                                              (or (get-in env [:event :message]) (:message env)))
+                                                 payload-to-send (if (and edge-pk edge-priv gossip-msg)
+                                                                   (let [rewrapped (mesh/wrap-agent-event
+                                                                                    {:type :receive-gossip
+                                                                                     :subnet-id (or (:subnet-id env) (get-in env [:event :subnet-id]) "global")
+                                                                                     :message gossip-msg}
+                                                                                    edge-pk edge-priv)]
+                                                                     (fressian/encode-wire rewrapped))
+                                                                   (:wire-bytes eff))
+                                                 active-conn (or (when-let [c @bridge-conn-atom]
+                                                                   (when (:ok? c) c))
+                                                                 (connect-bridge!))]
+                                             (when active-conn
+                                               (let [sent-res (light-node/send-all-envelopes! (:send-fn active-conn) [payload-to-send])]
+                                                 (when-not (pos? (long (or (:sent sent-res) 0)))
+                                                   (when-let [reconn (connect-bridge!)]
+                                                     (light-node/send-all-envelopes! (:send-fn reconn) [payload-to-send]))))))
                                            (catch Exception _ nil))))))
         relay-chain-state-cache (or (:relay-chain-state-cache config) (atom {}))
         effective-config (cond-> (assoc config :relay-chain-state-cache relay-chain-state-cache)
@@ -1547,35 +1670,7 @@
             (.submit vthread-executor
                      ^Runnable
                      (fn []
-                       (try
-                         (let [on-msg (fn [payload]
-                                        (try
-                                          (swap! relay-atom
-                                                 (fn [st]
-                                                   (let [res (relay/reduce-relay st {:type :relay-submit
-                                                                                     :envelope payload
-                                                                                     :from-validator? true
-                                                                                     :now-ms (System/currentTimeMillis)})]
-                                                     (when (:ok? res)
-                                                       (let [recip (or (get-in res [:response "recipient"])
-                                                                       (get-in res [:response "pubkey"]))
-                                                             broadcast? (boolean (get-in res [:response "broadcast"]))]
-                                                         (when (or recip broadcast?)
-                                                           (let [to-wake (concat
-                                                                          (when recip (get @relay-waiters-atom recip #{}))
-                                                                          (get @relay-waiters-atom :broadcast #{}))]
-                                                             (doseq [p to-wake]
-                                                               (deliver p :notified))))))
-                                                     (:state res))))
-                                          (catch Exception _ nil)))
-                               c (light-node/connect-validators!
-                                  (:peer-identity subnet-runtime)
-                                  val-bootstrap
-                                  {:timeout-ms 5000
-                                   :on-message on-msg})]
-                           (when (:ok? c)
-                             (reset! bridge-conn-atom c)))
-                         (catch Exception _ nil)))))
+                       (connect-bridge!))))
         limiter-atom (atom (dns-proto/init-limiter
                             {:capacity 100.0
                              :refill-per-sec 20.0

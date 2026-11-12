@@ -5,6 +5,7 @@
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
+            [bitecho.sieve.core :as sieve]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
@@ -27,6 +28,17 @@
      :recipient recipient
      :payload payload
      :signature sig-hex}))
+
+(defn- make-signed-gossip-envelope
+  [kp text burn-amt msg-id]
+  (let [sender (basalt/bytes->hex (:public kp))
+        payload (fressian/utf8->bytes text)
+        msg (cond-> (sieve/wrap-message payload (:private kp) (:public kp) burn-amt)
+              msg-id (assoc :message-id msg-id))]
+    {:type :receive-gossip
+     :sender sender
+     :message msg
+     :signature (basalt/bytes->hex (crypto/sign (:private kp) (fressian/encode-canonical msg)))}))
 
 ;; -----------------------------------------------------------------------------
 ;; 1. Generative Property: Deduplication & Monotonic Delivery
@@ -189,7 +201,7 @@
       (is (= 2 (long (:broadcast-seq (first bcasts)))) "Oldest broadcast evicted"))))
 
 (deftest test-normalize-relay-base-url
-  (testing "F-Relay-2: normalize-relay-base-url strips trailing slashes and /relay/v1 suffix"
+  (testing "F-Relay-2: normalize-relay-base-url strips trailing slashes, /relay/v1 suffix, and any subpaths under /relay/v1"
     (is (nil? (relay/normalize-relay-base-url nil)))
     (is (nil? (relay/normalize-relay-base-url "")))
     (is (nil? (relay/normalize-relay-base-url "   ")))
@@ -198,7 +210,11 @@
     (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org///")))
     (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org/relay/v1")))
     (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org/relay/v1/")))
-    (is (= "http://127.0.0.1:8080" (relay/normalize-relay-base-url "http://127.0.0.1:8080/relay/v1/   ")))))
+    (is (= "http://127.0.0.1:8080" (relay/normalize-relay-base-url "http://127.0.0.1:8080/relay/v1/   ")))
+    (is (= "http://127.0.0.1:8080" (relay/normalize-relay-base-url "http://127.0.0.1:8080/relay/v1/poll")))
+    (is (= "http://127.0.0.1:8080" (relay/normalize-relay-base-url "http://127.0.0.1:8080/relay/v1/send/")))
+    (is (= "http://127.0.0.1:8080" (relay/normalize-relay-base-url "http://127.0.0.1:8080/relay/v1/ack")))
+    (is (= "http://127.0.0.1:8080" (relay/normalize-relay-base-url "http://127.0.0.1:8080/relay/v1/chain-state")))))
 
 (deftest test-validator-only-ledger-dispatch
   (testing "F-Relay-7: Validator-only ledger transactions are forwarded without polluting chat inboxes/broadcast ring"
@@ -266,4 +282,95 @@
       (is (true? (:ok? r2)))
       (is (false? (:ok? r3)))
       (is (= :poll-rate-limited (:error r3))))))
+
+(deftest test-global-queued-bytes-cap-and-eviction
+  (testing "F-Rem-2: Global queued bytes limit evicts oldest messages and emits :queued-bytes-evicted diagnose effects"
+    (let [kp (crypto/generate-keypair)
+          recip1 (basalt/bytes->hex (:public (crypto/generate-keypair)))
+          recip2 (basalt/bytes->hex (:public (crypto/generate-keypair)))
+          env1 (make-signed-envelope kp recip1 "first-msg-payload")
+          sz1 (fressian/count-bytes (fressian/encode-canonical env1))
+          ;; Cap to allow exactly ~2 messages
+          max-cap (+ (* 2 sz1) 10)
+          st0 (relay/init-relay-state {:max-total-queued-bytes max-cap})
+          r1 (relay/reduce-relay st0 {:type :relay-submit :envelope env1 :now-ms 1000})
+          st1 (:state r1)
+          env2 (make-signed-envelope kp recip2 "second-msg-payload")
+          r2 (relay/reduce-relay st1 {:type :relay-submit :envelope env2 :now-ms 2000})
+          st2 (:state r2)
+          env3 (make-signed-envelope kp recip1 "third-msg-payload")
+          r3 (relay/reduce-relay st2 {:type :relay-submit :envelope env3 :now-ms 3000})
+          st3 (:state r3)]
+      (is (true? (:ok? r1)))
+      (is (true? (:ok? r2)))
+      (is (true? (:ok? r3)))
+      ;; Total queued bytes must remain <= max-cap
+      (is (<= (relay/total-queued-bytes st3) max-cap))
+      ;; Diagnostic counter for evicted must be at least 1
+      (is (pos? (get-in st3 [:diagnostics :evicted] 0)))
+      ;; r3 must have emitted a :queued-bytes-evicted diagnose effect
+      (let [evicted-eff (first (filter #(= :queued-bytes-evicted (:reason %)) (:effects r3)))]
+        (is (some? evicted-eff))
+        (is (= :diagnose (:effect evicted-eff)))
+        (is (pos? (:evicted-bytes evicted-eff))))
+      ;; First message must be gone from recip1's inbox, leaving only the third message
+      (is (= 1 (count (get-in st3 [:inboxes recip1]))))
+      (is (= 1 (count (get-in st3 [:inboxes recip2]))))
+      ;; Submitting a single message that exceeds max-total-queued-bytes must be rejected immediately
+      (let [huge-text (apply str (repeat (inc max-cap) "x"))
+            huge-env (make-signed-envelope kp recip1 huge-text)
+            r-huge (relay/reduce-relay st3 {:type :relay-submit :envelope huge-env :now-ms 4000})]
+        (is (false? (:ok? r-huge)))
+        (is (= :payload-too-large (:error r-huge)))))))
+
+(defspec ^{:doc "Property: Total queued bytes across inboxes and broadcasts strictly satisfies global cap invariant"}
+  prop-global-queued-bytes-invariant 25
+  (for-all [msg-count (gen/choose 3 8)]
+           (let [kp (crypto/generate-keypair)
+                 recip (basalt/bytes->hex (:public (crypto/generate-keypair)))
+                 st0 (relay/init-relay-state {:max-total-queued-bytes 600})
+                 final-st (reduce (fn [st idx]
+                                    (let [env (make-signed-envelope kp recip (str "msg-" idx "-" (apply str (repeat 20 "a"))))
+                                          res (relay/reduce-relay st {:type :relay-submit :envelope env :now-ms (+ 1000 idx)})]
+                                      (:state res)))
+                                  st0
+                                  (range msg-count))]
+             (and (<= (relay/total-queued-bytes final-st) 600)
+                  (pos? (get-in final-st [:diagnostics :submitted] 0))))))
+
+(deftest test-signaling-burn-floor-and-gossip-deduplication
+  (testing "Rejects :receive-gossip envelope with burn-amount < min-signaling-burn"
+    (let [st0 (relay/init-relay-state {:min-signaling-burn 100})
+          kp (crypto/generate-keypair)
+          env-0 (make-signed-gossip-envelope kp "burn-test" 0 "gossip-mid-1")
+          r0 (relay/reduce-relay st0 {:type :relay-submit :envelope env-0 :now-ms 1000})]
+      (is (false? (:ok? r0)))
+      (is (= :insufficient-burn (:error r0)))
+      (is (= 1 (get-in (:state r0) [:diagnostics :insufficient-burn])))
+      (is (= 1 (get-in (:state r0) [:diagnostics :rejected])))))
+
+  (testing "Accepts :receive-gossip with burn-amount >= min-signaling-burn and deduplicates by message-id"
+    (let [st0 (relay/init-relay-state {:min-signaling-burn 100})
+          kp (crypto/generate-keypair)
+          kp2 (crypto/generate-keypair)
+          msg-id "canonical-gossip-mid-42"
+          env1 (make-signed-gossip-envelope kp "valid-burn" 100 msg-id)
+          r1 (relay/reduce-relay st0 {:type :relay-submit :envelope env1 :now-ms 1000})
+          st1 (:state r1)]
+      (is (true? (:ok? r1)))
+      (is (false? (:duplicate? r1)))
+      (is (= 1 (count (:broadcasts st1))))
+
+      ;; Re-submit same gossip message wrapped in another agent envelope (e.g. forwarded by validator)
+      (let [sender2 (basalt/bytes->hex (:public kp2))
+            gossip-msg (:message env1)
+            env2 {:type :receive-gossip
+                  :sender sender2
+                  :message gossip-msg
+                  :signature (basalt/bytes->hex (crypto/sign (:private kp2) (fressian/encode-canonical gossip-msg)))}
+            r2 (relay/reduce-relay st1 {:type :relay-submit :envelope env2 :from-validator? true :now-ms 2000})]
+        (is (true? (:ok? r2)))
+        (is (true? (:duplicate? r2)))
+        (is (= msg-id (:envelope-id r2)))
+        (is (= 1 (count (:broadcasts (:state r2)))) "Duplicate is not appended to broadcasts")))))
 

@@ -1369,7 +1369,7 @@
       (is (= "hello world" (get-in (light-shell/parse-light-node-args ["send" "--text" "hello world"]) [:cmd-map "text"])))
       (is (= "010203" (get-in (light-shell/parse-light-node-args ["send" "--payload-hex" "010203"]) [:cmd-map "payload_hex"])))
       (is (= "recv-pub" (get-in (light-shell/parse-light-node-args ["transfer" "--receiver" "recv-pub"]) [:cmd-map "receiver"])))
-      (is (= "https://bitecho.org/relay/v1" (:relay-url (light-shell/parse-light-node-args ["serve" "--relay-url" "https://bitecho.org/relay/v1"]))))
+      (is (= "https://bitecho.org" (:relay-url (light-shell/parse-light-node-args ["serve" "--relay-url" "https://bitecho.org/relay/v1"]))))
       (is (= "rcpt-pub" (get-in (light-shell/parse-light-node-args ["transfer" "--recipient" "rcpt-pub"]) [:cmd-map "recipient"])))
       (is (= 100 (get-in (light-shell/parse-light-node-args ["transfer" "--amount" "100"]) [:cmd-map "amount"])))
       (is (= 7 (get-in (light-shell/parse-light-node-args ["transfer" "--seq" "7"]) [:cmd-map "seq"])))
@@ -1388,6 +1388,24 @@
                                                                "--turn-password" "secretpass"
                                                                "--turn-realm" "bitecho.org"
                                                                "--turn-force-relay"])))))))
+
+(deftest test-resolve-relay-url-env-fallback
+  (testing "F-Rem-1: resolve-relay-url prefers explicit CLI flag over BITECHO_RELAY_URL and normalizes URL"
+    (let [fake-env {"BITECHO_RELAY_URL" "https://env-relay.bitecho.org/relay/v1/poll"}]
+      (is (= "https://cli-relay.bitecho.org"
+             (light-shell/resolve-relay-url "https://cli-relay.bitecho.org/relay/v1" fake-env)))
+      (is (= "https://env-relay.bitecho.org"
+             (light-shell/resolve-relay-url nil fake-env)))
+      (is (= "https://env-relay.bitecho.org"
+             (light-shell/resolve-relay-url "" fake-env)))
+      (is (nil? (light-shell/resolve-relay-url nil {})))))
+
+  (testing "F-Rem-1: parse-light-node-args uses getenv-fn to resolve :relay-url"
+    (let [fake-env {"BITECHO_RELAY_URL" "https://env-relay.bitecho.org/relay/v1/"}
+          p-env (light-shell/parse-light-node-args ["status"] fake-env)
+          p-cli (light-shell/parse-light-node-args ["status" "--relay-url" "https://cli.bitecho.org/relay/v1/send"] fake-env)]
+      (is (= "https://env-relay.bitecho.org" (:relay-url p-env)))
+      (is (= "https://cli.bitecho.org" (:relay-url p-cli))))))
 
 ;; -----------------------------------------------------------------------------
 ;; 13. Candidate Ordering, Failover Rotation & Session Durability Tests (Priority 2)

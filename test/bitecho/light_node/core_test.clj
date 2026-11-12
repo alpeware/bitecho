@@ -117,48 +117,28 @@
                        msg1-delivered?
                        msg2-delivered?))))
 
-(defspec ^{:doc "Property: 2-epoch skew tolerance and replay-protection enforcement in wire payload processing"}
+(defspec ^{:doc "Property: 2-epoch skew tolerance and replay-protection enforcement in wire payload processing for non-open sessions"}
   prop-epoch-skew-and-replay-protection 25
   (prop/for-all [skew (gen/choose -5 5)
                  duplicate? gen/boolean]
                 (let [alice (test-identity)
                       bob (test-identity)
-                      session-id "sess-skew-test"
-                      shared-secret (byte-array 32)
-                      alice-keys (sealed/derive-channel-keys shared-secret session-id :initiator)
-                      bob-keys (sealed/derive-channel-keys shared-secret session-id :responder)
-                      state-bob {:pubkey (:pubkey-hex bob)
-                                 :epoch 10
-                                 :sessions {session-id {:session-id session-id
-                                                        :peer (:pubkey-hex alice)
-                                                        :role :responder
-                                                        :state "open"
-                                                        :rx-key (:rx-key bob-keys)
-                                                        :tx-key (:tx-key bob-keys)
-                                                        :replay-window (sealed/init-replay-window 64)}}
-                                 :inbox []}
+                      callee (:pubkey-hex bob)
+                      cmd {"cmd" "offer" "callee" callee "price" 10 "burn" 500}
                       msg-epoch (+ 10 skew)
-                      plain-bytes (.getBytes "skew-test-payload" "UTF-8")
-                      sealed (sealed/seal-message (:tx-key alice-keys) 1 plain-bytes (.getBytes session-id "UTF-8"))
-                      wire-msg {:bitecho/type :sealed-message
-                                :session-id session-id
-                                :sender (:pubkey-hex alice)
-                                :recipient (:pubkey-hex bob)
-                                :epoch msg-epoch
-                                :seq 1
-                                :nonce (basalt/bytes->hex (:nonce sealed))
-                                :ciphertext (basalt/bytes->hex (:ciphertext sealed))}
-                      res1 (light-core/handle-wire-payload state-bob wire-msg (:privkey-bytes bob))
+                      st-alice (light-core/init-light-state (:identity alice) {:epoch msg-epoch})
+                      res-offer (light-core/handle-command st-alice cmd (:privkey-bytes alice))
+                      offer-env (first (filter gossip-env? (:net-envelopes res-offer)))
+                      st-bob (light-core/init-light-state (:identity bob) {:epoch 10})
+                      res-bob (light-core/handle-wire-payload st-bob offer-env (:privkey-bytes bob))
                       within-tolerance? (<= (Math/abs skew) 2)]
                   (if within-tolerance?
-                    (let [accepted? (= 1 (count (:inbox (:state res1))))
-                          ;; Test replay
-                          res-replay (light-core/handle-wire-payload (:state res1) wire-msg (:privkey-bytes bob))
-                          replay-dropped? (= 1 (count (:inbox (:state res-replay))))]
+                    (let [accepted? (= 1 (count (:pending-offers (:state res-bob))))
+                          res-replay (light-core/handle-wire-payload (:state res-bob) offer-env (:privkey-bytes bob))
+                          replay-dropped? (= 1 (count (:pending-offers (:state res-replay))))]
                       (and accepted? (if duplicate? replay-dropped? true)))
-                    ;; Out of tolerance: must be dropped cleanly
-                    (and (empty? (:inbox (:state res1)))
-                         (empty? (:stdout-events res1)))))))
+                    (and (empty? (:pending-offers (:state res-bob)))
+                         (pos? (get-in (:state res-bob) [:diagnostics :epoch-skew-dropped] 0)))))))
 
 (defspec ^{:doc "Property: JSONL processor handles arbitrary strings without crashing and never leaks private keys"}
   prop-jsonl-robustness-and-no-key-leaks 50
@@ -247,43 +227,159 @@
                        (= (get-in steps [:state :last-transfer-hash]) (get (last txs) "transfer_hash"))))))
 
 (deftest test-non-vacuous-epoch-skew-and-adoption
-  (testing "Light node adopts first epoch when uninitialized and rejects skew > 2 even from epoch 0"
+  (testing "Light node adopts first epoch when uninitialized and rejects skew > 2 on non-open session even from epoch 0"
     (let [alice (test-identity)
           bob (test-identity)
-          session-id "sess-adopt-epoch"
-          sec (byte-array 32)
-          alice-keys (sealed/derive-channel-keys sec session-id :initiator)
-          bob-keys (sealed/derive-channel-keys sec session-id :responder)
-          plain (.getBytes "test" "UTF-8")
-          sealed-fn (fn [seq-n] (sealed/seal-message (:tx-key alice-keys) seq-n plain (.getBytes session-id "UTF-8")))
-          make-msg (fn [ep seq-n]
-                     (let [s (sealed-fn seq-n)]
-                       {:bitecho/type :sealed-message
-                        :session-id session-id
-                        :sender (:pubkey-hex alice)
-                        :recipient (:pubkey-hex bob)
-                        :epoch ep
-                        :seq seq-n
-                        :nonce (basalt/bytes->hex (:nonce s))
-                        :ciphertext (basalt/bytes->hex (:ciphertext s))}))
+          callee (:pubkey-hex bob)
+          make-offer (fn [ep]
+                       (let [st-alice (light-core/init-light-state (:identity alice) {:epoch ep})
+                             res (light-core/handle-command st-alice {"cmd" "offer" "callee" callee "price" 10 "burn" 500} (:privkey-bytes alice))]
+                         (first (filter gossip-env? (:net-envelopes res)))))
           st0 (light-core/init-light-state (:identity bob) {})
-          st-sess (assoc-in st0 [:sessions session-id]
-                            {:session-id session-id :peer (:pubkey-hex alice) :role :responder :state "open"
-                             :rx-key (:rx-key bob-keys) :tx-key (:tx-key bob-keys)
-                             :replay-window (sealed/init-replay-window 64)})
-          ;; 1. First message arrives with epoch 0 -> node adopts epoch 0
-          res1 (light-core/handle-wire-payload st-sess (make-msg 0 1) (:privkey-bytes bob))
+          ;; 1. First offer arrives with epoch 0 -> node adopts epoch 0
+          res1 (light-core/handle-wire-payload st0 (make-offer 0) (:privkey-bytes bob))
           st1 (:state res1)
-          ;; 2. Message arrives with epoch 3 (> 2 skew from 0) -> dropped!
-          res2 (light-core/handle-wire-payload st1 (make-msg 3 2) (:privkey-bytes bob))
-          ;; 3. Message arrives with epoch 2 (<= 2 skew from 0) -> accepted!
-          res3 (light-core/handle-wire-payload st1 (make-msg 2 3) (:privkey-bytes bob))]
+          ;; 2. Offer arrives with epoch 3 (> 2 skew from 0) -> dropped!
+          res2 (light-core/handle-wire-payload st1 (make-offer 3) (:privkey-bytes bob))
+          ;; 3. Offer arrives with epoch 2 (<= 2 skew from 0) -> accepted!
+          res3 (light-core/handle-wire-payload st1 (make-offer 2) (:privkey-bytes bob))]
       (is (false? (:epoch-initialized? st0)))
       (is (= 0 (:epoch st1)))
       (is (true? (:epoch-initialized? st1)))
-      (is (= 1 (count (:inbox st1))))
-      (is (= 1 (count (:inbox (:state res2)))))
-      (is (= 2 (count (:inbox (:state res3))))))))
+      (is (= 1 (count (:pending-offers st1))))
+      (is (= 1 (count (:pending-offers (:state res2)))))
+      (is (= 2 (count (:pending-offers (:state res3))))))))
+
+(deftest test-open-session-epoch-skew-immunity
+  (testing "Open session established at epoch 100 continues to accept sealed-message, session-ack, p2p-offer, and p2p-answer at epoch 5000"
+    (let [alice (test-identity)
+          bob (test-identity)
+          session-id "sess-long-lived"
+          sec (byte-array 32)
+          alice-keys (sealed/derive-channel-keys sec session-id :initiator)
+          bob-keys (sealed/derive-channel-keys sec session-id :responder)
+          plain (.getBytes "hello long-lived session" "UTF-8")
+          make-sealed-msg (fn [ep seq-n]
+                            (let [s (sealed/seal-message (:tx-key alice-keys) seq-n plain (.getBytes session-id "UTF-8"))]
+                              {:bitecho/type :sealed-message
+                               :session-id session-id
+                               :sender (:pubkey-hex alice)
+                               :recipient (:pubkey-hex bob)
+                               :epoch ep
+                               :seq seq-n
+                               :nonce (basalt/bytes->hex (:nonce s))
+                               :ciphertext (basalt/bytes->hex (:ciphertext s))}))
+          st-bob (-> (light-core/init-light-state (:identity bob) {:epoch 5000})
+                     (assoc-in [:sessions session-id]
+                               {:session-id session-id
+                                :peer (:pubkey-hex alice)
+                                :role :responder
+                                :state "open"
+                                :epoch 100
+                                :rx-key (:rx-key bob-keys)
+                                :tx-key (:tx-key bob-keys)
+                                :replay-window (sealed/init-replay-window 64)
+                                :p2p {:phase :connecting
+                                      :signal-seq 1}}))
+          ;; 1. Sealed message with peer epoch 100 arriving at Bob (epoch 5000) -> ACCEPTED!
+          res1 (light-core/handle-wire-payload st-bob (make-sealed-msg 100 1) (:privkey-bytes bob))]
+      (is (= 1 (count (:inbox (:state res1)))))
+      (is (= 5000 (get-in (:state res1) [:sessions session-id :epoch])))
+
+      ;; 2. Replay of seq 1 on the open session is REJECTED by replay window
+      (let [res-replay (light-core/handle-wire-payload (:state res1) (make-sealed-msg 100 1) (:privkey-bytes bob))]
+        (is (= 1 (count (:inbox (:state res-replay))))))
+
+      ;; 3. Sealed message with peer epoch 0 arriving at Bob (epoch 5000) -> ACCEPTED!
+      (let [res2 (light-core/handle-wire-payload (:state res1) (make-sealed-msg 0 2) (:privkey-bytes bob))]
+        (is (= 2 (count (:inbox (:state res2)))))
+        (is (= 5000 (get-in (:state res2) [:sessions session-id :epoch]))))
+
+      ;; 4. Session ACK with epoch 100 -> ACCEPTED!
+      (let [ack-msg {:bitecho/type :session-ack
+                     :session-id session-id
+                     :sender (:pubkey-hex alice)
+                     :recipient (:pubkey-hex bob)
+                     :epoch 100
+                     :acked-seq 1
+                     :ack-seq 1}
+            res-ack (light-core/handle-wire-payload (:state res1) ack-msg (:privkey-bytes bob))]
+        (is (some? (get-in (:state res-ack) [:sessions session-id]))))
+
+      ;; 5. P2P-offer on open session with epoch 100 and signal-seq 2 -> ACCEPTED!
+      (let [st-alice (-> (light-core/init-light-state (:identity alice) {:epoch 100})
+                         (assoc-in [:sessions session-id]
+                                   {:session-id session-id
+                                    :peer (:pubkey-hex bob)
+                                    :role :initiator
+                                    :state "open"
+                                    :epoch 100
+                                    :p2p {:local-signal-seq 1}}))
+            res-alice (light-core/handle-command st-alice
+                                                 {"cmd" "p2p-offer"
+                                                  "session_id" session-id
+                                                  "candidates" ["udp://198.51.100.1:5010"]}
+                                                 (:privkey-bytes alice))
+            offer-env (first (:net-envelopes res-alice))
+            res-p2p (light-core/handle-wire-payload (:state res1) offer-env (:privkey-bytes bob))
+            ;; 6. Stale P2P-offer with signal-seq 1 (<= current 2) -> REJECTED
+            st-alice-stale (-> (light-core/init-light-state (:identity alice) {:epoch 5000})
+                               (assoc-in [:sessions session-id]
+                                         {:session-id session-id
+                                          :peer (:pubkey-hex bob)
+                                          :role :initiator
+                                          :state "open"
+                                          :epoch 5000
+                                          :p2p {:local-signal-seq 0}}))
+            res-alice-stale (light-core/handle-command st-alice-stale
+                                                       {"cmd" "p2p-offer"
+                                                        "session_id" session-id
+                                                        "candidates" ["udp://198.51.100.1:5010"]}
+                                                       (:privkey-bytes alice))
+            stale-env (first (:net-envelopes res-alice-stale))
+            res-stale (light-core/handle-wire-payload (:state res-p2p) stale-env (:privkey-bytes bob))]
+        (is (= :offer-received (get-in (:state res-p2p) [:sessions session-id :p2p :phase])))
+        (is (pos? (get-in (:state res-stale) [:diagnostics :p2p-signaling-rejected] 0)))
+        (is (= "p2p-signaling-rejected" (get (first (:stdout-events res-stale)) "event"))))
+
+      ;; 7. Non-open session still enforces 2-epoch skew check!
+      (let [closed-sid "sess-closed"
+            st-closed (assoc-in (:state res1) [:sessions closed-sid]
+                                {:session-id closed-sid
+                                 :peer (:pubkey-hex alice)
+                                 :role :responder
+                                 :state "closed"
+                                 :epoch 100})
+            closed-msg (assoc (make-sealed-msg 100 1) :session-id closed-sid)
+            res-closed (light-core/handle-wire-payload st-closed closed-msg (:privkey-bytes bob))]
+        (is (pos? (get-in (:state res-closed) [:diagnostics :epoch-skew-dropped] 0)))))))
+
+(deftest test-p2p-connection-failure-auto-relay-fallback
+  (testing "handle-p2p-connection-failure defaults auto-relay-fallback? to true unless explicitly false"
+    (let [alice (test-identity)
+          sid "sess-p2p-fail"
+          st (-> (light-core/init-light-state (:identity alice) {})
+                 (assoc-in [:sessions sid] {:session-id sid
+                                            :peer (sample-pubkey-hex)
+                                            :state "open"
+                                            :p2p {:phase :connecting}}))
+          st-failed (light-core/handle-p2p-connection-failure st sid "dial-timeout")]
+      (is (= :closed (get-in st-failed [:sessions sid :p2p :phase])))
+      (is (= true (get-in st-failed [:sessions sid :relay-fallback?])))
+      (is (= true (get-in st-failed [:sessions sid :p2p :relay-fallback?]))))
+
+    (testing "explicit :auto-relay-fallback? false suppresses relay-fallback?"
+      (let [alice (test-identity)
+            sid "sess-p2p-fail"
+            st (-> (light-core/init-light-state (:identity alice) {:auto-relay-fallback? false})
+                   (assoc-in [:sessions sid] {:session-id sid
+                                              :peer (sample-pubkey-hex)
+                                              :state "open"
+                                              :p2p {:phase :connecting}}))
+            st-failed (light-core/handle-p2p-connection-failure st sid "dial-timeout")]
+        (is (= :closed (get-in st-failed [:sessions sid :p2p :phase])))
+        (is (nil? (get-in st-failed [:sessions sid :relay-fallback?])))
+        (is (nil? (get-in st-failed [:sessions sid :p2p :relay-fallback?])))))))
 
 (deftest test-discover-status-inbox-keys
   (testing "exec-discover, exec-status, and exec-inbox output required keys"

@@ -453,7 +453,7 @@
             "activity-log" "activity-count" "team-call-subnet" "topic-name" "ai-inference"
             "directory-cache" "directory-cache-count" "bootstrap" "signature"
             "trusted-dac-anchors" "broadcast-seq" "broadcast-seen" "broadcast-inbox" "broadcast?"
-            "relay-since-seq" "relay-since-broadcast-seq" "ack-broadcast-seq"
+            "relay-since-seq" "relay-since-broadcast-seq" "ack-broadcast-seq" "auto-relay-fallback" "auto-relay-fallback?"
             "p2p-relayed" "broadcast-duplicates-dropped" "broadcast-rejected" "msg-id"
             "p2p" "zero-burn?" "zero-burn" "candidates" "local-candidates" "remote-candidates"
             "local-transport" "remote-transport" "local-ice-ufrag" "remote-ice-ufrag"
@@ -646,8 +646,8 @@
                                     (collect-keys populated-light)
                                     (collect-keys base-anchor)
                                     (collect-keys base-conn)))))
-        ;; All 41 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
-        (is (= 41 (count (keys base-light))))
+        ;; All 42 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
+        (is (= 42 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)

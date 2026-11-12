@@ -283,6 +283,7 @@
    :fingerprint (:fingerprint identity-pub-map)
    :ice-creds (:ice-creds identity-pub-map)
    :autonomous? (boolean (:autonomous? opts false))
+   :auto-relay-fallback? (boolean (get opts :auto-relay-fallback? true))
    :epoch (long (:epoch opts 0))
    :epoch-initialized? (contains? opts :epoch)
    :bootstrap (:bootstrap opts)
@@ -1225,13 +1226,14 @@
 
 (defn build-chain-state-query-envelope
   "Builds and wraps an authenticated :query-chain-state agent envelope.
-   opts can be a map (e.g. {:nonce ... :epoch ...}) or a string nonce."
+   opts can be a map (e.g. {:nonce ... :epoch ... :target-pubkey ...}) or a string nonce."
   [pubkey-hex ^bytes privkey-bytes opts]
   (let [opts-map (if (map? opts) opts {:nonce (str opts)})
         epoch-val (long (or (:epoch opts-map) 0))
-        default-nonce (str "qcs-" epoch-val "-" (subs (str pubkey-hex) 0 (min 16 (count (str pubkey-hex)))))
+        target-pk (or (:target-pubkey opts-map) pubkey-hex)
+        default-nonce (str "qcs-" epoch-val "-" (subs (str target-pk) 0 (min 16 (count (str target-pk)))))
         payload {:type :query-chain-state
-                 :pubkey pubkey-hex
+                 :pubkey target-pk
                  :epoch epoch-val
                  :nonce (or (:nonce opts-map) default-nonce)}]
     (wrap-agent-event payload pubkey-hex privkey-bytes)))
@@ -2285,17 +2287,22 @@
                         "phase" "open"}
              :net-envelopes []
              :stdout-events [evt]})
-          (let [p2p-entry (cond-> (merge (get session :p2p {})
+          (let [auto-relay? (not= false (:auto-relay-fallback? state))
+                p2p-entry (cond-> (merge (get session :p2p {})
                                          {:phase :closed
                                           :connected? false
                                           :zero-burn? false})
-                            error (assoc :last-error error))
-                new-state (cond-> (assoc-in state [:sessions session-id :p2p] p2p-entry)
+                            error (assoc :last-error error)
+                            auto-relay? (assoc :relay-fallback? true))
+                new-state (cond-> (-> state
+                                      (assoc-in [:sessions session-id :p2p] p2p-entry)
+                                      (cond-> auto-relay? (assoc-in [:sessions session-id :relay-fallback?] true)))
                             error (update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
                 evt (cond-> {"event" "p2p-disconnected"
                              "session_id" session-id
                              "peer" (:peer session)
                              "reason" (or error "closed")}
+                      auto-relay? (assoc "relay_fallback" true)
                       pname (assoc "peer_petname" pname))]
             {:state new-state
              :response {"ok" true
@@ -2304,6 +2311,18 @@
                         "phase" "closed"}
              :net-envelopes []
              :stdout-events [evt]}))))))
+
+(defn handle-p2p-connection-failure
+  "Pure state transition when a direct P2P connection or dial fails for a session.
+   Transitions P2P phase to :closed and, unless (:auto-relay-fallback? state) is explicitly false,
+   activates :relay-fallback? true on the session."
+  ([state session-id] (handle-p2p-connection-failure state session-id nil))
+  ([state session-id error]
+   (let [cmd-map (cond-> {"cmd" "p2p-channel-state"
+                          "session_id" session-id
+                          "connected" false}
+                   error (assoc "error" (str error)))]
+     (:state (exec-p2p-channel-state state cmd-map)))))
 
 (defn- exec-broadcast [state cmd-map privkey-bytes]
   (let [raw-text (or (get cmd-map "text") (get cmd-map "message") (:text cmd-map) (:message cmd-map))
@@ -4732,24 +4751,26 @@
                      :stdout-events [diag-event]})
                   (let [msg-type (or (:bitecho/type msg) (:type msg))
                         msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
-                        sess-epoch (when-let [sid (:session-id msg)]
-                                     (let [ep (get-in state [:sessions sid :epoch])]
+                        target-sid (or (:session-id msg) (get msg "session_id"))
+                        sess-epoch (when target-sid
+                                     (let [ep (get-in state [:sessions target-sid :epoch])]
                                        (when (integer? ep)
                                          (long ep))))
+                        open-session? (and (contains? #{:sealed-message :session-ack :p2p-offer :p2p-answer} msg-type)
+                                           (some? target-sid)
+                                           (= "open" (get-in state [:sessions target-sid :state])))
                         ref-epoch (if (or (:epoch-initialized? state)
                                           (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
                                     (:epoch state)
                                     (or sess-epoch msg-epoch))
                         max-skew (long (or (:max-epoch-skew state) 2))
-                        skew-exceeded? (and (not (contains? #{:chain-state-snapshot
+                        skew-exceeded? (and (not open-session?)
+                                            (not (contains? #{:chain-state-snapshot
                                                               :p2p-hub-relay
                                                               :p2p-broadcast}
                                                             msg-type))
                                             msg-epoch ref-epoch
-                                            (> (math-abs (- msg-epoch (long ref-epoch))) max-skew)
-                                            (or (nil? sess-epoch)
-                                                (and (pos? (long sess-epoch))
-                                                     (> (math-abs (- msg-epoch (long sess-epoch))) max-skew))))]
+                                            (> (math-abs (- msg-epoch (long ref-epoch))) max-skew))]
                     (if skew-exceeded?
                       (let [p2p-sig? (contains? #{:p2p-offer :p2p-answer} msg-type)
                             diag-event (when p2p-sig?
@@ -4774,12 +4795,19 @@
                                   :p2p-answer (handle-wire-p2p-answer state msg)
                                   :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
                                   :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
-                                  {:state state :net-envelopes [] :stdout-events []})]
-                        (if (and (not= msg-type :chain-state-snapshot)
-                                 msg-epoch
-                                 (not (:epoch-initialized? (:state res))))
-                          (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
-                          res)))))))))))))
+                                  {:state state :net-envelopes [] :stdout-events []})
+                            res' (if (and (not= msg-type :chain-state-snapshot)
+                                          msg-epoch
+                                          (not (:epoch-initialized? (:state res))))
+                                   (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
+                                   res)]
+                        (if (and open-session? (get-in (:state res') [:sessions target-sid]))
+                          (update-in res' [:state :sessions target-sid :epoch]
+                                     (fn [curr-ep]
+                                       (max (long (or curr-ep 0))
+                                            (long (or msg-epoch 0))
+                                            (long (or (:epoch (:state res')) 0)))))
+                          res')))))))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; JSONL Line Processor

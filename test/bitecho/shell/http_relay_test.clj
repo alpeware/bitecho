@@ -63,7 +63,7 @@
 (deftest test-relay-end-to-end-light-node-p2p-and-long-polling
   (let [tmp-dir (make-tmp-dir!)
         tls-mgr (http-shell/init-tls-manager! {:state-dir tmp-dir :domain "localhost"})
-        relay-atom (atom (relay/init-relay-state))
+        relay-atom (atom (relay/init-relay-state {:min-signaling-burn 0}))
         relay-waiters-atom (atom {})
         chain-fetcher-atom (atom nil)
         cfg {:domain "bitecho.org"
@@ -241,13 +241,14 @@
             v1-pk (basalt/bytes->hex (:public-key v1-kp))
             v2-pk (basalt/bytes->hex (:public-key v2-kp))
             v3-pk (basalt/bytes->hex (:public-key v3-kp))
+            dummy-fp "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
             bootstrap {:network :devnet
                        :domain "bitecho.org"
                        :treasury-pubkey (:pubkey-hex alice-id)
                        :custody-pubkey (:pubkey-hex alice-id)
-                       :nodes {:v1 {:node-id :v1 :ip "127.0.0.1" :port 5001 :agent-port 5011 :pubkey v1-pk}
-                               :v2 {:node-id :v2 :ip "127.0.0.1" :port 5002 :agent-port 5012 :pubkey v2-pk}
-                               :v3 {:node-id :v3 :ip "127.0.0.1" :port 5003 :agent-port 5013 :pubkey v3-pk}}}]
+                       :nodes {:v1 {:node-id :v1 :ip "127.0.0.1" :port 5001 :agent-port 5011 :pubkey v1-pk :fingerprint dummy-fp :ice-ufrag "u1" :ice-pwd "p1"}
+                               :v2 {:node-id :v2 :ip "127.0.0.1" :port 5002 :agent-port 5012 :pubkey v2-pk :fingerprint dummy-fp :ice-ufrag "u2" :ice-pwd "p2"}
+                               :v3 {:node-id :v3 :ip "127.0.0.1" :port 5003 :agent-port 5013 :pubkey v3-pk :fingerprint dummy-fp :ice-ufrag "u3" :ice-pwd "p3"}}}]
 
         (testing "connect-validators! returns :transport :http-relay when :relay-url is set"
           (let [conn-res (light-node/connect-validators! alice-id bootstrap {:relay-url relay-url})]
@@ -337,4 +338,149 @@
                 (is (true? (get ack-b "ok"))))))))
       (finally
         ((:stop-fn srv))))))
+
+(deftest test-relay-query-pop-rejection-and-waiter-cap
+  (let [tmp-dir (make-tmp-dir!)
+        tls-mgr (http-shell/init-tls-manager! {:state-dir tmp-dir :domain "localhost"})
+        relay-atom (atom (relay/init-relay-state {:min-signaling-burn 0}))
+        relay-waiters-atom (atom {})
+        cfg {:domain "bitecho.org"
+             :state-dir tmp-dir
+             :relay-atom relay-atom
+             :relay-waiters-atom relay-waiters-atom
+             :max-relay-waiters-per-pubkey 4
+             :http {:bind-ip "127.0.0.1"
+                    :http-port 0
+                    :https-port 0}}
+        srv (http-shell/start-http-servers! cfg tls-mgr nil)]
+    (try
+      (let [http-port (:http-port srv)
+            relay-url (str "http://127.0.0.1:" http-port)
+            alice-kp (crypto/generate-keypair)
+            alice-pk (basalt/bytes->hex (:public-key alice-kp))
+            client (HttpClient/newHttpClient)]
+
+        (testing "Test 1: Query-string-only PoP rejection returns 403 missing-pop-headers"
+          (let [now-ms (System/currentTimeMillis)
+                nonce "0123456789abcdef0123456789abcdef"
+                sig (relay/sign-poll-request (:private-key alice-kp)
+                                             {:pubkey alice-pk
+                                              :since-seq 0
+                                              :timestamp-ms now-ms
+                                              :nonce nonce})
+                uri (URI/create (str relay-url "/relay/v1/poll?pubkey=" alice-pk
+                                     "&since_seq=0&sig=" sig "&signature=" sig
+                                     "&ts=" now-ms "&timestamp_ms=" now-ms
+                                     "&nonce=" nonce))
+                req (-> (HttpRequest/newBuilder)
+                        (.uri uri)
+                        (.GET)
+                        (.build))
+                resp (.send client req (HttpResponse$BodyHandlers/ofString))
+                body (json/read-str (.body resp))]
+            (is (= 403 (.statusCode resp)))
+            (is (false? (get body "ok")))
+            (is (= "missing-pop-headers" (get body "error")))))
+
+        (testing "Test 2: Per-client waiter cap returns 429 too-many-client-waiters on 5th poll"
+          (let [threads (atom [])
+                results (atom [])]
+            (dotimes [_ 4]
+              (let [th (Thread/startVirtualThread
+                        (fn []
+                          (let [r (light-node/poll-relay-envelopes! relay-url alice-pk (:private-key alice-kp) {:timeout-ms 2000})]
+                            (swap! results conj r))))]
+                (swap! threads conj th)))
+            ;; Wait briefly so all 4 virtual threads are registered in relay-waiters-atom
+            (Thread/sleep 150)
+            (is (= 4 (count (get @relay-waiters-atom alice-pk #{}))))
+            ;; 5th poll should immediately fail with 429 too-many-client-waiters
+            (let [now-ms (System/currentTimeMillis)
+                  nonce "fifth-poll-nonce-1234567890123"
+                  sig (relay/sign-poll-request (:private-key alice-kp)
+                                               {:pubkey alice-pk
+                                                :since-seq 0
+                                                :timestamp-ms now-ms
+                                                :nonce nonce})
+                  uri (URI/create (str relay-url "/relay/v1/poll?pubkey=" alice-pk "&since_seq=0"))
+                  req (-> (HttpRequest/newBuilder)
+                          (.uri uri)
+                          (.header "X-Bitecho-Pubkey" alice-pk)
+                          (.header "X-Bitecho-Since-Seq" "0")
+                          (.header "X-Bitecho-Since-Broadcast-Seq" "0")
+                          (.header "X-Bitecho-Timestamp-Ms" (str now-ms))
+                          (.header "X-Bitecho-Nonce" nonce)
+                          (.header "X-Bitecho-Signature" sig)
+                          (.header "X-Bitecho-Wait-Ms" "2000")
+                          (.GET)
+                          (.build))
+                  resp (.send client req (HttpResponse$BodyHandlers/ofString))
+                  body (json/read-str (.body resp))]
+              (is (= 429 (.statusCode resp)))
+              (is (false? (get body "ok")))
+              (is (= "too-many-client-waiters" (get body "error"))))
+            ;; Wake up the parked threads so test completes cleanly
+            (doseq [p (get @relay-waiters-atom alice-pk #{})]
+              (deliver p :done))
+            (doseq [th @threads]
+              (.join th 2000)))))
+      (finally
+        ((:stop-fn srv))))))
+
+(deftest test-relay-peer-replication-ring
+  (let [tmp-dir1 (make-tmp-dir!)
+        tmp-dir2 (make-tmp-dir!)
+        tls-mgr1 (http-shell/init-tls-manager! {:state-dir tmp-dir1 :domain "localhost"})
+        tls-mgr2 (http-shell/init-tls-manager! {:state-dir tmp-dir2 :domain "localhost"})
+        relay-atom1 (atom (relay/init-relay-state {:min-signaling-burn 0}))
+        relay-atom2 (atom (relay/init-relay-state {:min-signaling-burn 0}))
+        waiters1 (atom {})
+        waiters2 (atom {})
+        cfg2-initial {:domain "bitecho.org"
+                      :state-dir tmp-dir2
+                      :node-id :srv2
+                      :relay-atom relay-atom2
+                      :relay-waiters-atom waiters2
+                      :http {:bind-ip "127.0.0.1" :http-port 0 :https-port 0}}
+        srv2 (http-shell/start-http-servers! cfg2-initial tls-mgr2 nil)
+        port2 (:http-port srv2)
+        cfg1 {:domain "bitecho.org"
+              :state-dir tmp-dir1
+              :node-id :srv1
+              :relay-atom relay-atom1
+              :relay-waiters-atom waiters1
+              :cluster {:nodes {:srv1 {:node-id :srv1 :ip "127.0.0.1" :http-port 0}
+                                :srv2 {:node-id :srv2 :ip "127.0.0.1" :http-port port2}}}
+              :http {:bind-ip "127.0.0.1" :http-port 0 :https-port 0}}
+        srv1 (http-shell/start-http-servers! cfg1 tls-mgr1 nil)
+        port1 (:http-port srv1)]
+    (try
+      (let [relay-url1 (str "http://127.0.0.1:" port1)
+            relay-url2 (str "http://127.0.0.1:" port2)
+            alice-kp (crypto/generate-keypair)
+            bob-kp (crypto/generate-keypair)
+            alice-id {:pubkey-hex (basalt/bytes->hex (:public-key alice-kp))
+                      :privkey-bytes (:private-key alice-kp)}
+            bob-id {:pubkey-hex (basalt/bytes->hex (:public-key bob-kp))
+                    :privkey-bytes (:private-key bob-kp)}
+            init-a (light-core/init-light-state alice-id {:subnet-id "test/repl" :economy-enabled? false :burn-floor 0 :epoch 1})
+            off-res (light-core/handle-command init-a
+                                               {"cmd" "offer" "callee" (:pubkey-hex bob-id) "price" 0 "burn" 0}
+                                               (:privkey-bytes alice-id))
+            off-envs (:net-envelopes off-res)]
+        (is (seq off-envs))
+        ;; Submit offer to Server 1
+        (doseq [env off-envs]
+          (let [res (light-node/submit-relay-envelope! relay-url1 env)]
+            (is (true? (get res "ok")))))
+        ;; Brief sleep for parallel replication to deliver to Server 2
+        (Thread/sleep 200)
+        ;; Bob polls Server 2, verifying envelopes were replicated to Server 2!
+        (let [poll-b (light-node/poll-relay-envelopes! relay-url2 (:pubkey-hex bob-id) (:privkey-bytes bob-id))
+              msgs (concat (get poll-b "messages" []) (get poll-b "broadcasts" []))]
+          (is (true? (get poll-b "ok")))
+          (is (pos? (count msgs)))))
+      (finally
+        ((:stop-fn srv1))
+        ((:stop-fn srv2))))))
 

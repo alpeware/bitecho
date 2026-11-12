@@ -160,3 +160,58 @@
                                                :ice-ufrag "ufrag123" :ice-pwd "pwd123456789012345678901"}}})]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid.*descriptor"
                             (discovery/parse-bootstrap-descriptor invalid-edn))))))
+
+(deftest test-fail-closed-invalid-validator-entries
+  (let [valid-base "Network: devnet\nTreasury Public Key: 302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086\nCustody Public Key: 302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086\n\nNode: node1\n  Cluster Address: 127.0.0.1:5000\n  Agent Ingress: 127.0.0.1:5010\n  Ed25519 Pubkey: 302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086\n  DTLS Fingerprint: 95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B\n  ICE Credentials: ufrag=ufrag123 pwd=pwd123456789012345678901\n"]
+    (testing "Fails closed when validator= has invalid format or pubkey"
+      (let [txt (str valid-base "\nvalidator=node2 badpubkey\n")]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid validator entry in bootstrap\.txt"
+                              (discovery/parse-bootstrap-descriptor txt)))))
+
+    (testing "Fails closed when a Node: block has invalid pubkey hex"
+      (let [txt (str valid-base "\nNode: node2\n  Cluster Address: 127.0.0.1:5001\n  Agent Ingress: 127.0.0.1:5011\n  Ed25519 Pubkey: NOT-A-PUBKEY\n  DTLS Fingerprint: 95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B\n  ICE Credentials: ufrag=ufrag123 pwd=pwd123456789012345678901\n")]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid validator entry in bootstrap\.txt"
+                              (discovery/parse-bootstrap-descriptor txt)))))
+
+    (testing "Fails closed when an EDN validator node entry has invalid pubkey"
+      (let [edn-map {:network :devnet
+                     :treasury-pubkey "302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086"
+                     :custody-pubkey "302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086"
+                     :nodes {:node1 {:ip "127.0.0.1" :port 5000 :agent-port 5010
+                                     :pubkey "302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086"
+                                     :fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B"
+                                     :ice-ufrag "ufrag123" :ice-pwd "pwd123456789012345678901"}
+                             :node2 {:ip "127.0.0.1" :port 5001 :agent-port 5011
+                                     :pubkey "invalid-pk"
+                                     :fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B"
+                                     :ice-ufrag "ufrag123" :ice-pwd "pwd123456789012345678901"}}}]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid validator entry in bootstrap descriptor"
+                              (discovery/parse-bootstrap-edn edn-map)))))))
+
+(deftest test-parse-bootstrap-descriptor-with-diagnostics
+  (testing "Collects unrecognized and malformed optional lines with line details and dropped count"
+    (let [txt (str "Network: devnet\n"
+                   "Treasury Public Key: 302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086\n"
+                   "Custody Public Key: 302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086\n"
+                   "Relay URL: https://bitecho.org/relay/v1/\n"
+                   "unknown-opt=42\n"
+                   "turn=bad turn uri\n"
+                   "\n"
+                   "Node: node1\n"
+                   "  Cluster Address: 127.0.0.1:5000\n"
+                   "  Agent Ingress: 127.0.0.1:5010\n"
+                   "  Ed25519 Pubkey: 302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086\n"
+                   "  DTLS Fingerprint: 95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B\n"
+                   "  ICE Credentials: ufrag=ufrag123 pwd=pwd123456789012345678901\n")
+          res (discovery/parse-bootstrap-descriptor-with-diagnostics txt)]
+      (is (= :devnet (:network res)))
+      (is (= "https://bitecho.org" (:relay-url res)))
+      (is (= 2 (:dropped res)))
+      (is (= 2 (count (:diagnostics res))))
+      (let [d1 (first (:diagnostics res))
+            d2 (second (:diagnostics res))]
+        (is (= :unrecognized-line (:reason d1)))
+        (is (= "unknown-opt=42" (:line d1)))
+        (is (= :malformed-optional (:reason d2)))
+        (is (= :turn (:element d2)))
+        (is (= "turn=bad turn uri" (:line d2)))))))

@@ -311,13 +311,15 @@
                                     :rng (java.util.Random.)))))
 
                      :query-chain-state
-                     (when (or (nil? (:pubkey base-event)) (= (:pubkey base-event) agent-pub-hex))
-                       (-> base-event
-                           (dissoc :sender :sender-pubkey-bytes :rng)
-                           (assoc :sender agent-pub-hex
-                                  :pubkey agent-pub-hex
-                                  :sender-pubkey-bytes agent-pub-bytes
-                                  :rng (java.util.Random.))))
+                     (let [q-pk (or (:pubkey base-event) agent-pub-hex)]
+                       (when (and (string? q-pk)
+                                  (re-matches #"^(?:302a300506032b6570032100)?[0-9a-fA-F]{64}$" (str/trim q-pk)))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :pubkey (str/lower-case (str/trim q-pk))
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
 
                      :register-home-set
                      (let [callee (:callee base-event)

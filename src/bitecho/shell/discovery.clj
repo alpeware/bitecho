@@ -1,7 +1,8 @@
 (ns bitecho.shell.discovery
   "Bootstrap peer and WebRTC connection descriptor discovery and parsing.
    Supports both canonical EDN (devnet/bootstrap.edn) and text (devnet/bootstrap.txt) formats."
-  (:require [bitecho.light-node.core :as light-node]
+  (:require [bitecho.core.protocol.relay :as relay]
+            [bitecho.light-node.core :as light-node]
             [bitecho.shell.identity :as identity]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -78,32 +79,33 @@
         issued-ep (when-let [ie (:issued-epoch data)] (long ie))
         expires-ep (when-let [ee (:expires-epoch data)] (long ee))
         sig (when-let [s (:signature data)] (str/trim (str s)))
+        relay-url (when-let [ru (:relay-url data)] (relay/normalize-relay-base-url ru))
         nodes-map (or (:nodes data) {})
         _ (when (empty? nodes-map)
             (throw (ex-info "Bootstrap descriptor contains no validator nodes"
                             {:error :invalid-descriptor :data data})))
-        parsed-pairs (mapv (fn [[k v]]
-                             (try
-                               {:ok? true :pair [(keyword k) (normalize-node-entry k v)]}
-                               (catch Exception e
-                                 {:ok? false :entry (str k " (" (ex-message e) ")")})))
-                           nodes-map)
-        normalized-nodes (into {} (keep :pair (filter :ok? parsed-pairs)))
-        dropped-edn (mapv :entry (remove :ok? parsed-pairs))
-        _ (when (empty? normalized-nodes)
-            (throw (ex-info "Invalid bootstrap descriptor: no valid validator nodes"
-                            {:error :invalid-descriptor :data data :dropped-entries dropped-edn})))]
+        normalized-nodes (into {} (for [[k v] nodes-map]
+                                    [(keyword k)
+                                     (try
+                                       (normalize-node-entry k v)
+                                       (catch Exception e
+                                         (throw (ex-info "Invalid validator entry in bootstrap descriptor"
+                                                         {:line (str k " " v)
+                                                          :entry k
+                                                          :node v
+                                                          :error :invalid-validator-entry}
+                                                         e))))]))]
     (cond-> {:network network
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes normalized-nodes}
-      (seq dropped-edn) (assoc :dropped-entries dropped-edn)
       dir-pk (assoc :directory-pubkey dir-pk)
       dom (assoc :domain dom)
       auth-pk (assoc :authority-pubkey auth-pk)
       issued-ep (assoc :issued-epoch issued-ep)
       expires-ep (assoc :expires-epoch expires-ep)
       sig (assoc :signature sig)
+      (seq relay-url) (assoc :relay-url relay-url)
       (contains? data :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? data)))
       (some? (:burn-floor data)) (assoc :burn-floor (long (:burn-floor data)))
       (some? (:min-signaling-burn data)) (assoc :min-signaling-burn (long (:min-signaling-burn data))))))
@@ -140,7 +142,19 @@
   [^String txt-str]
   (when (or (nil? txt-str) (str/blank? txt-str))
     (throw (ex-info "Empty bootstrap.txt descriptor" {:error :invalid-descriptor})))
-  (let [net-match (re-find #"(?im)^Network:\s*([a-zA-Z0-9_\-]+)" txt-str)
+  (let [lines (str/split-lines txt-str)
+        _ (doseq [line lines]
+            (let [trimmed (str/trim line)]
+              (when (re-find #"(?i)^validator[=:]" trimmed)
+                (let [parts (str/split trimmed #"[=:\s]+")]
+                  (when (< (count parts) 2)
+                    (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                    {:line trimmed :error :invalid-validator-entry})))
+                  (let [cand-pk (last parts)]
+                    (when-not (re-matches valid-pubkey-regex cand-pk)
+                      (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                      {:line trimmed :error :invalid-validator-entry}))))))))
+        net-match (re-find #"(?im)^Network:\s*([a-zA-Z0-9_\-]+)" txt-str)
         dom-match (re-find #"(?im)^Domain:\s*([^\s]+)" txt-str)
         auth-match (re-find #"(?im)^Authority Pubkey:\s*([0-9a-fA-F]+)" txt-str)
         issued-match (re-find #"(?im)^Issued Epoch:\s*([0-9]+)" txt-str)
@@ -152,6 +166,9 @@
         econ-match (re-find #"(?im)^Economy Enabled:\s*([^\s]+)" txt-str)
         burn-floor-match (re-find #"(?im)^Burn Floor:\s*([0-9]+)" txt-str)
         min-burn-match (re-find #"(?im)^Min Signaling Burn:\s*([0-9]+)" txt-str)
+        relay-match (or (re-find #"(?im)^Relay URL:\s*([^\s]+)" txt-str)
+                        (re-find #"(?im)^relay[=:]\s*([^\s]+)" txt-str))
+        relay-url (when relay-match (relay/normalize-relay-base-url (second relay-match)))
         network (keyword (str/lower-case (or (second net-match) "devnet")))
         dom (when dom-match (second dom-match))
         auth-pk (when (second auth-match) (validate-pubkey! (second auth-match) "authority"))
@@ -165,17 +182,19 @@
         burn-floor (when burn-floor-match (Long/parseLong (second burn-floor-match)))
         min-burn (when min-burn-match (Long/parseLong (second min-burn-match)))
         node-blocks (rest (str/split txt-str #"(?im)(?=^Node:\s*)"))
-        parsed-blocks (mapv (fn [b]
-                              (try
-                                (let [entry (parse-single-node-txt-block b)]
-                                  (if entry
-                                    {:ok? true :entry entry}
-                                    {:ok? false :block (str/trim b)}))
-                                (catch Exception e
-                                  {:ok? false :block (str (str/trim b) " (" (ex-message e) ")")})))
+        nodes-entries (mapv (fn [b]
+                              (let [trimmed (str/trim b)
+                                    entry (try
+                                            (parse-single-node-txt-block b)
+                                            (catch Exception e
+                                              (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                                              {:line trimmed :error :invalid-validator-entry}
+                                                              e))))]
+                                (when-not entry
+                                  (throw (ex-info "Invalid validator entry in bootstrap.txt"
+                                                  {:line trimmed :error :invalid-validator-entry})))
+                                entry))
                             node-blocks)
-        nodes-entries (keep :entry (filter :ok? parsed-blocks))
-        dropped-txt (mapv :block (remove :ok? parsed-blocks))
         nodes-map (into {} nodes-entries)]
     (when (empty? nodes-map)
       (throw (ex-info "No validator node blocks found in bootstrap.txt"
@@ -184,13 +203,13 @@
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes nodes-map}
-      (seq dropped-txt) (assoc :dropped-entries dropped-txt)
       dir-pk (assoc :directory-pubkey dir-pk)
       dom (assoc :domain dom)
       auth-pk (assoc :authority-pubkey auth-pk)
       issued-ep (assoc :issued-epoch issued-ep)
       expires-ep (assoc :expires-epoch expires-ep)
       sig (assoc :signature sig)
+      (seq relay-url) (assoc :relay-url relay-url)
       (some? econ-enabled) (assoc :economy-enabled? econ-enabled)
       burn-floor (assoc :burn-floor burn-floor)
       min-burn (assoc :min-signaling-burn min-burn))))
@@ -214,6 +233,8 @@
     (.append sb (str "Custody Public Key: " (:custody-pubkey desc) "\n"))
     (when-let [dp (:directory-pubkey desc)]
       (.append sb (str "Directory Authority Public Key: " dp "\n")))
+    (when-let [ru (:relay-url desc)]
+      (.append sb (str "Relay URL: " ru "\n")))
     (when (contains? desc :economy-enabled?)
       (.append sb (str "Economy Enabled: " (boolean (:economy-enabled? desc)) "\n")))
     (when-let [bf (:burn-floor desc)]
@@ -243,17 +264,114 @@
 
     (string? str-or-map)
     (let [trimmed (str/trim str-or-map)]
-      (if (or (str/starts-with? trimmed "{")
-              (str/starts-with? trimmed ";;"))
+      (cond
+        (str/starts-with? trimmed "{")
+        (parse-bootstrap-edn trimmed)
+
+        (str/starts-with? trimmed ";;")
         (try
           (parse-bootstrap-edn trimmed)
           (catch Exception _
             (parse-bootstrap-txt trimmed)))
+
+        :else
         (parse-bootstrap-txt trimmed)))
 
     :else
     (throw (ex-info "Unsupported descriptor format: expected EDN map or string"
                     {:error :invalid-descriptor :input str-or-map}))))
+
+(def ^:private recognized-header-prefixes
+  [#"(?i)^Network:"
+   #"(?i)^Domain:"
+   #"(?i)^Authority Pubkey:"
+   #"(?i)^Issued Epoch:"
+   #"(?i)^Expires Epoch:"
+   #"(?i)^Authority Signature:"
+   #"(?i)^Treasury Public Key:"
+   #"(?i)^Custody Public Key:"
+   #"(?i)^Directory Authority Public Key:"
+   #"(?i)^Economy Enabled:"
+   #"(?i)^Burn Floor:"
+   #"(?i)^Min Signaling Burn:"
+   #"(?i)^Relay URL:"
+   #"(?i)^relay[=:]"
+   #"(?i)^Bootstrap Validators:"
+   #"(?i)^Connection Instructions"
+   #"(?i)^Node:"
+   #"(?i)^Cluster Address:"
+   #"(?i)^Agent Ingress:"
+   #"(?i)^Agent TCP Ingress:"
+   #"(?i)^Agent HTTPS/Proxy Ingress:"
+   #"(?i)^HTTP Diagnostics:"
+   #"(?i)^Ed25519 Pubkey:"
+   #"(?i)^DTLS Fingerprint:"
+   #"(?i)^ICE Credentials:"
+   #"(?i)^Generated:"
+   #"(?i)^Agents connect"
+   #"(?i)^\"bitecho\""
+   #"(?i)^All inbound"
+   #"(?i)^Ed25519-signed"])
+
+(defn parse-bootstrap-descriptor-with-diagnostics
+  "Parses a bootstrap descriptor (EDN or text) with strict validation, returning the
+   descriptor map augmented with :diagnostics (vector of dropped/unrecognized lines/elements)
+   and :dropped count. Fails closed throwing on invalid validator entries."
+  [str-or-map]
+  (let [desc (parse-bootstrap-descriptor str-or-map)
+        diags (if (string? str-or-map)
+                (let [trimmed-input (str/trim str-or-map)]
+                  (if (or (str/starts-with? trimmed-input "{")
+                          (str/starts-with? trimmed-input ";;"))
+                    ;; EDN string diagnostics
+                    (let [data (try (edn/read-string trimmed-input) (catch Exception _ {}))
+                          known-keys #{:network :domain :authority-pubkey :issued-epoch :expires-epoch
+                                       :signature :treasury-pubkey :custody-pubkey :directory-pubkey
+                                       :economy-enabled? :burn-floor :min-signaling-burn :relay-url
+                                       :nodes :dropped-entries :diagnostics :dropped}
+                          extra (remove known-keys (keys data))]
+                      (mapv (fn [k] {:reason :unrecognized-key :key k :value (get data k)}) extra))
+                    ;; Text descriptor line diagnostics
+                    (let [lines (str/split-lines str-or-map)]
+                      (loop [rem-lines lines
+                             acc []]
+                        (if (empty? rem-lines)
+                          acc
+                          (let [line (first rem-lines)
+                                tr (str/trim line)]
+                            (cond
+                              (str/blank? tr)
+                              (recur (rest rem-lines) acc)
+
+                              (or (str/starts-with? tr "#")
+                                  (str/starts-with? tr ";")
+                                  (str/starts-with? tr "=")
+                                  (str/starts-with? tr "-"))
+                              (recur (rest rem-lines) acc)
+
+                              ;; Optional keys with format checks
+                              (re-find #"(?i)^turn[=:]" tr)
+                              (let [val (str/trim (subs tr (if (str/includes? tr "=") (inc (str/index-of tr "=")) (inc (str/index-of tr ":")))))]
+                                (if (re-matches #"^turn:[^\s]+:[0-9]+" val)
+                                  (recur (rest rem-lines) acc)
+                                  (recur (rest rem-lines) (conj acc {:reason :malformed-optional :line tr :element :turn}))))
+
+                              (re-find #"(?i)^signal[=:]" tr)
+                              (let [val (str/trim (subs tr (if (str/includes? tr "=") (inc (str/index-of tr "=")) (inc (str/index-of tr ":")))))]
+                                (if (re-matches #"^https?://[^\s]+" val)
+                                  (recur (rest rem-lines) acc)
+                                  (recur (rest rem-lines) (conj acc {:reason :malformed-optional :line tr :element :signal}))))
+
+                              (some #(re-find % tr) recognized-header-prefixes)
+                              (recur (rest rem-lines) acc)
+
+                              :else
+                              (recur (rest rem-lines) (conj acc {:reason :unrecognized-line :line tr})))))))))
+                [])]
+    (assoc desc
+           :diagnostics diags
+           :dropped (count diags)
+           :descriptor desc)))
 
 (def default-devnet-authority-pubkey
   "Pinned Directory Authority public key for bitecho.org devnet."

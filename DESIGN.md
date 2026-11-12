@@ -620,21 +620,22 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
 
 4. **HTTP Gateway Relay Architecture (`/relay/v1/*`) (Milestone 12 Follow-Up / Gateway Protocol)**:
    - **Pure Sans-IO Protocol (`bitecho.core.protocol.relay`)**:
-     - Manages bounded inboxes per recipient pubkey (`:max-inbox-size 256`, `:ttl-ms 86400000`, `:max-total-queued-bytes 16MB`, `:max-recipients 1024`) and a global ring buffer for mesh broadcasts (`:max-broadcast-size 256`, 24h broadcast TTL eviction).
+     - Manages bounded inboxes per recipient pubkey (`:max-inbox-size 256`, `:max-recipient-inbox-bytes 1048576` [1MB per recipient], `:ttl-ms 86400000`, `:max-queued-bytes 16777216` [16MB global cap across all recipients with FIFO oldest-message eviction and `:queued-bytes-evicted` diagnose effect], `:max-recipients 1024`) and a global ring buffer for mesh broadcasts (`:max-broadcast-size 256`, 24h broadcast TTL eviction).
      - Validator-only ledger transaction dispatch (`:forward-to-validators`, bypassing recipient inboxes and broadcast ring).
-     - Enforces deterministic SHA-256 `:envelope-id` deduplication and outer Ed25519 signature verification fail-closed (Rule 5).
+     - Enforces deterministic SHA-256 `:envelope-id` deduplication, minimum signaling burn floor (`:min-signaling-burn 100`) on `:receive-gossip`, and outer Ed25519 signature verification fail-closed (Rule 5).
      - Authenticates long-polling consumers via canonical Proof-of-Possession (`PoP`): `bitecho-relay-poll-v1|<pubkey>|<since-seq>|<timestamp-ms>|<nonce>` with bounded clock skew (`:max-skew-ms 300000`) and timestamped nonce replay protection map (`{[pubkey nonce] ts}`, `:max-nonces 2048`).
    - **Edge HTTP Shell Endpoints (`bitecho.shell.http`)**:
      - Multiplexed on both port 80 and port 443 alongside existing ACME and web services.
      - Rate-limited across all `/relay/v1/*` endpoints via token-bucket limiter returning HTTP 429 `rate-limited`.
-     - Streaming bounded request reader (`read-body-bounded`) capping inbound payloads at 16MB without unbounded buffering, returning HTTP 413 `payload-too-large`.
-     - `POST /relay/v1/send`: Ingests JSON/Fressian envelopes, inboxes unicast messages, delivers to broadcast ring, forwards to validator network, and notifies parked long-polling threads.
-     - `GET / POST /relay/v1/poll`: Serves queued envelopes or parks virtual threads (up to `:wait-ms` 25000, capped at `:max-relay-waiters 256`, returning HTTP 429 `too-many-waiters` when saturated) for instant event delivery. Authenticated via PoP headers (`X-Bitecho-Pubkey`, `X-Bitecho-Timestamp-Ms`, `X-Bitecho-Nonce`, `X-Bitecho-Signature`, `X-Bitecho-Since-Seq`, `X-Bitecho-Since-Broadcast-Seq`, `X-Bitecho-Wait-Ms`).
-     - `POST /relay/v1/ack`: Prunes acknowledged envelopes up to sequence number and broadcast sequence (`X-Bitecho-Ack-Broadcast-Seq`).
-     - `GET / POST /relay/v1/chain-state`: Returns signed validator snapshots cached from validators. Light nodes strictly verify 2f+1 BFT quorum fail-closed; the relay server never fabricates synthetic or unsigned zero-balance snapshots.
+     - Streaming bounded request reader (`read-body-bounded`) capping per-request HTTP body payloads at 64KB (`:max-payload-bytes 65536`), returning HTTP 413 `payload-too-large`.
+     - `POST /relay/v1/send`: Ingests JSON/Fressian envelopes, inboxes unicast messages (rejecting with 429 `inbox-full` if recipient exceeds 1MB limit), delivers to broadcast ring, forwards to validator network, replicates across cluster peer ring (`[:cluster :nodes]`) with `X-Bitecho-Relay-Replicated: true`, and notifies parked long-polling threads.
+     - `GET / POST /relay/v1/poll`: Serves queued envelopes or parks virtual threads (up to `:wait-ms` 25000, capped at `:max-relay-waiters 256` [HTTP 429 `too-many-waiters`] and `:max-relay-waiters-per-pubkey 4` [HTTP 429 `too-many-client-waiters`]) for instant event delivery. Authenticated exclusively via PoP headers (`X-Bitecho-*`) or `POST` JSON body (query-parameter-only PoP rejected with 403 `missing-pop-headers`).
+     - `POST /relay/v1/ack`: Prunes acknowledged envelopes up to sequence number and broadcast sequence (`X-Bitecho-Ack-Broadcast-Seq`), and replicates across cluster peers with `X-Bitecho-Relay-Replicated: true`.
+     - `GET / POST /relay/v1/chain-state`: Returns signed validator snapshots cached from validators. Light nodes strictly verify $\lceil 2n/3 \rceil$ (2-of-3) BFT quorum fail-closed; the relay server never fabricates synthetic or unsigned zero-balance snapshots.
    - **3-Runtime Parity (`--relay-url` & `BITECHO_RELAY_URL`)**:
      - JVM (`light_node.clj`), Node.js (`node_main.cljs`), and Browser (`browser_main.cljs`) light nodes support seamless fallback operation over HTTP Gateway Relay when direct UDP/TCP DataChannels are unavailable.
      - Automatic URL normalization (`normalize-relay-base-url`) transparently accepts both base origin (`http://host:port`) and versioned path (`http://host:port/relay/v1`).
+     - Browser client persists `relay-since-seq` and `relay-since-broadcast-seq` across sessions via IndexedDB and `localStorage`.
 
 
 

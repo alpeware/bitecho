@@ -1116,12 +1116,19 @@ else
 fi
 
 # 6. Sync to ../clj-web/public/app if clj-web exists
+if [ -f "public/relay.html" ]; then
+  cp public/relay.html dist/relay.html
+fi
 CLJ_WEB_PUBLIC="${ROOT_DIR}/../clj-web/public"
 if [ -d "${CLJ_WEB_PUBLIC}" ]; then
   mkdir -p "${CLJ_WEB_PUBLIC}/app"
   cp dist/bitecho-browser.js "${CLJ_WEB_PUBLIC}/app/"
   cp dist/bitecho-browser.js.sri "${CLJ_WEB_PUBLIC}/app/"
   cp dist/index.html "${CLJ_WEB_PUBLIC}/app/"
+  if [ -f "dist/relay.html" ]; then
+    cp dist/relay.html "${CLJ_WEB_PUBLIC}/relay.html"
+    cp dist/relay.html "${CLJ_WEB_PUBLIC}/app/relay.html"
+  fi
   echo "Synced bundle and SRI hash to ${CLJ_WEB_PUBLIC}/app/"
 fi
 

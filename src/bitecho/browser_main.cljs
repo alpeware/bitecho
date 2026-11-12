@@ -523,8 +523,16 @@
        (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom)))
      (when relay-url
        (fetch-relay-chain-state! relay-url {:node-atom node-atom})
-       (let [since-mseq (atom (long (or (get-in @node-atom [:light-state :relay-since-seq]) 0)))
-             since-bseq (atom (long (or (get-in @node-atom [:light-state :relay-since-broadcast-seq]) 0)))
+       (let [saved-mseq (or (get-in @node-atom [:light-state :relay-since-seq])
+                            (when (exists? js/localStorage)
+                              (try (js/parseInt (.getItem js/localStorage "relay-since-seq")) (catch :default _ nil)))
+                            0)
+             saved-bseq (or (get-in @node-atom [:light-state :relay-since-broadcast-seq])
+                            (when (exists? js/localStorage)
+                              (try (js/parseInt (.getItem js/localStorage "relay-since-broadcast-seq")) (catch :default _ nil)))
+                            0)
+             since-mseq (atom (long (if (and saved-mseq (not (js/isNaN saved-mseq))) saved-mseq 0)))
+             since-bseq (atom (long (if (and saved-bseq (not (js/isNaN saved-bseq))) saved-bseq 0)))
              polling? (atom false)
              poll-tick!
              (fn poll-tick! []
@@ -554,6 +562,13 @@
                                                        (-> n
                                                            (assoc-in [:light-state :relay-since-seq] @since-mseq)
                                                            (assoc-in [:light-state :relay-since-broadcast-seq] @since-bseq))))
+                                    (when (or (seq msgs) (seq bcasts))
+                                      (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
+                                      (when (exists? js/localStorage)
+                                        (try
+                                          (.setItem js/localStorage "relay-since-seq" (str @since-mseq))
+                                          (.setItem js/localStorage "relay-since-broadcast-seq" (str @since-bseq))
+                                          (catch :default _ nil))))
                                     (doseq [item all-items]
                                       (let [env-raw (or (:envelope_hex item) (:envelope item))
                                             wire-bytes (when env-raw
@@ -1734,11 +1749,6 @@
                                                   :timestamp-ms now-ms
                                                   :nonce nonce})
             params (cond-> {"pubkey" pk-hex
-                            "sig" sig
-                            "signature" sig
-                            "ts" (str now-ms)
-                            "timestamp_ms" (str now-ms)
-                            "nonce" nonce
                             "since_seq" (str since-seq)}
                      (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
                      (:limit opts) (assoc "limit" (str (:limit opts)))
