@@ -212,9 +212,9 @@ To independently verify the `F-H2` live Node.js daemon UDP WebRTC DataChannel ac
 
 9. **Phase 4 M5:** Mobile Browser UI + RC-4 wake identity guard.
 10. **HTTP Gateway Relay (`/relay/v1/*`) & M12 Follow-Up LOWs (`LOW-1..LOW-10` + `F-H2`):**
-    - Pure Sans-IO Relay reducer (`bitecho.core.protocol.relay`) with PoP poll authentication, bounded inboxes, broadcast ring buffer, and SHA-256 deduplication.
-    - Live HTTP Gateway Relay endpoints (`/relay/v1/send`, `/relay/v1/poll` with virtual thread long-polling park, `/relay/v1/ack`, `/relay/v1/chain-state`) multiplexed on ports 80 and 443.
-    - 3-Runtime `--relay-url` support in JVM (`light_node.clj`), Node.js (`node_main.cljs`), and Browser (`browser_main.cljs`).
+    - Pure Sans-IO Relay reducer (`bitecho.core.protocol.relay`) with PoP poll authentication, bounded inboxes (`:max-inbox-size 256`, `:max-total-queued-bytes 16MB`, `:max-recipients 1024`), broadcast ring buffer (`:max-broadcast-size 256`, 24h TTL eviction), validator-only transaction dispatch (`:forward-to-validators`), and SHA-256 deduplication.
+    - Live HTTP Gateway Relay endpoints (`/relay/v1/send`, `/relay/v1/poll` with virtual thread long-polling park up to 25s and max 256 waiters, `/relay/v1/ack` with `:ack-broadcast-seq`, `/relay/v1/chain-state` with 10s TTL validator cache and fail-closed snapshot quorum verification) multiplexed on ports 80 and 443 with token-bucket rate limiting and bounded body streaming reader (16MB max, 413 on overflow).
+    - 3-Runtime `--relay-url` CLI flag & `BITECHO_RELAY_URL` env var support in JVM (`light_node.clj`), Node.js (`node_main.cljs`), and Browser (`browser_main.cljs`) with automatic URL normalization (`normalize-relay-base-url` accepting `http://host:port` or `http://host:port/relay/v1`).
     - Resolution of all 9 M12 follow-up LOWs (`LOW-1..LOW-5`, `LOW-7..LOW-10`), P2P self-candidate filter, and `:closed` phase guard.
 
 ---

@@ -416,6 +416,20 @@
                    :now-ms 5000}]
       (is (:ok? (data/verify-pointer valid-cert-ptr infra-ctx)))
       (is (= :cert-fingerprint-mismatch (:error (data/verify-pointer bad-cert-ptr infra-ctx))))
+      ;; F-Relay-3: verify-pointer :cert fails closed when blob is missing or malformed
+      (is (= :missing-cert-blob (:error (data/verify-pointer valid-cert-ptr (assoc infra-ctx :blobs (data/init-blob-store))))))
+      (let [malformed-blob (data/make-blob (fressian/encode-canonical {:other "data"}) "application/fressian")
+            blobs-with-malformed (:store (data/put-blob (data/init-blob-store) malformed-blob 1000))
+            ptr-to-malformed (data/sign-pointer (:private leader-kp)
+                                                {:pointer/authority leader-pub
+                                                 :pointer/subnet "bitecho.org/infra"
+                                                 :pointer/path "tls/current-cert"
+                                                 :pointer/leader-term 1
+                                                 :pointer/seq 1
+                                                 :pointer/epoch 100
+                                                 :pointer/target (:blob/cid malformed-blob)
+                                                 :pointer/proof {:proof/type :cert :fingerprint cert-fp}})]
+        (is (= :cert-fingerprint-mismatch (:error (data/verify-pointer ptr-to-malformed (assoc infra-ctx :blobs blobs-with-malformed))))))
       (is (:ok? (data/verify-pointer valid-acme-ptr infra-ctx)))
       (is (= :invalid-acme-proof (:error (data/verify-pointer wrong-thumb-acme-ptr infra-ctx))))
       (is (= :invalid-acme-proof (:error (data/verify-pointer wrong-path-acme-ptr infra-ctx))))

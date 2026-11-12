@@ -82,12 +82,22 @@
         _ (when (empty? nodes-map)
             (throw (ex-info "Bootstrap descriptor contains no validator nodes"
                             {:error :invalid-descriptor :data data})))
-        normalized-nodes (into {} (for [[k v] nodes-map]
-                                    [(keyword k) (normalize-node-entry k v)]))]
+        parsed-pairs (mapv (fn [[k v]]
+                             (try
+                               {:ok? true :pair [(keyword k) (normalize-node-entry k v)]}
+                               (catch Exception e
+                                 {:ok? false :entry (str k " (" (ex-message e) ")")})))
+                           nodes-map)
+        normalized-nodes (into {} (keep :pair (filter :ok? parsed-pairs)))
+        dropped-edn (mapv :entry (remove :ok? parsed-pairs))
+        _ (when (empty? normalized-nodes)
+            (throw (ex-info "Invalid bootstrap descriptor: no valid validator nodes"
+                            {:error :invalid-descriptor :data data :dropped-entries dropped-edn})))]
     (cond-> {:network network
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes normalized-nodes}
+      (seq dropped-edn) (assoc :dropped-entries dropped-edn)
       dir-pk (assoc :directory-pubkey dir-pk)
       dom (assoc :domain dom)
       auth-pk (assoc :authority-pubkey auth-pk)
@@ -155,7 +165,17 @@
         burn-floor (when burn-floor-match (Long/parseLong (second burn-floor-match)))
         min-burn (when min-burn-match (Long/parseLong (second min-burn-match)))
         node-blocks (rest (str/split txt-str #"(?im)(?=^Node:\s*)"))
-        nodes-entries (keep parse-single-node-txt-block node-blocks)
+        parsed-blocks (mapv (fn [b]
+                              (try
+                                (let [entry (parse-single-node-txt-block b)]
+                                  (if entry
+                                    {:ok? true :entry entry}
+                                    {:ok? false :block (str/trim b)}))
+                                (catch Exception e
+                                  {:ok? false :block (str (str/trim b) " (" (ex-message e) ")")})))
+                            node-blocks)
+        nodes-entries (keep :entry (filter :ok? parsed-blocks))
+        dropped-txt (mapv :block (remove :ok? parsed-blocks))
         nodes-map (into {} nodes-entries)]
     (when (empty? nodes-map)
       (throw (ex-info "No validator node blocks found in bootstrap.txt"
@@ -164,6 +184,7 @@
              :treasury-pubkey treasury-pk
              :custody-pubkey custody-pk
              :nodes nodes-map}
+      (seq dropped-txt) (assoc :dropped-entries dropped-txt)
       dir-pk (assoc :directory-pubkey dir-pk)
       dom (assoc :domain dom)
       auth-pk (assoc :authority-pubkey auth-pk)

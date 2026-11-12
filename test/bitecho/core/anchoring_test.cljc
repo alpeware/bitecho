@@ -10,6 +10,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
+            [clojure.string :as str]
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
@@ -468,19 +469,53 @@
           kp-remote (crypto/generate-keypair)
           pub-remote (basalt/bytes->hex (:public kp-remote))
           gateway-cand "gateway.ingress.bitecho.org:443"
+          peer-cand "udp://198.51.100.7:5011"
           session-map {:session-id sid
                        :peer pub-remote
+                       :state "open"
                        :p2p {:phase :offered
                              :connected? false
                              :local-candidates [gateway-cand]}}
           state (assoc (light-core/init-light-state {:pubkey-hex pub-local :pubkey pub-local} {})
                        :sessions {sid session-map})
-          ;; Responder echoes the initiator's own candidates
-          answer-msg {:type :p2p-answer
-                      :sender pub-remote
-                      :session-id sid
-                      :candidates [gateway-cand]
-                      :transport "tcp"}
-          res (light-core/handle-wire-payload state answer-msg (:private kp-local))]
-      (is (nil? (:p2p-dial res)) "p2p-dial is nil because dialable candidates were empty (filtered out self-candidate)")
-      (is (= :offered (get-in (:state res) [:sessions sid :p2p :phase])) "State remains in :offered waiting for inbound bind"))))
+          make-answer (fn [candidates signal-seq]
+                        (let [sig-str (str "bitecho-p2p-answer-v1|"
+                                           sid "|"
+                                           pub-remote "|"
+                                           pub-local "|udp|"
+                                           (str/join "," (sort (map str candidates))) "||||0|"
+                                           signal-seq)
+                              sig (crypto/sign (:private kp-remote) (fressian/utf8->bytes sig-str))]
+                          {:type :p2p-answer
+                           :sender pub-remote
+                           :recipient pub-local
+                           :session-id sid
+                           :candidates candidates
+                           :transport "udp"
+                           :signal-seq signal-seq
+                           :signature (basalt/bytes->hex sig)}))
+          ;; Responder echoes the initiator's own candidate
+          answer-msg1 (make-answer [gateway-cand] 1)
+          res1 (light-core/handle-wire-payload state answer-msg1 (:private kp-local))]
+      (is (nil? (:p2p-dial res1)) "p2p-dial is nil because dialable candidates were empty (filtered out self-candidate)")
+      (is (= 0 (long (get-in (:state res1) [:diagnostics :p2p-signaling-rejected] 0))) "Not rejected at signature/session gate")
+      (is (= 1 (long (get-in (:state res1) [:diagnostics :p2p-answer-empty-candidates] 0))) "Empty candidates diagnostic incremented")
+      (is (= :offered (get-in (:state res1) [:sessions sid :p2p :phase])) "State remains in :offered waiting for inbound bind")
+      ;; Second answer with self candidate + actual peer candidate
+      (let [answer-msg2 (make-answer [gateway-cand peer-cand] 2)
+            res2 (light-core/handle-wire-payload (:state res1) answer-msg2 (:private kp-local))]
+        (is (some? (:p2p-dial res2)) "p2p-dial is non-nil for answer with remote candidate")
+        (is (= [peer-cand] (:remote-candidates (:p2p-dial res2))) "Self-candidate filtered out and peer candidate dialed")
+        (is (= :connecting (get-in (:state res2) [:sessions sid :p2p :phase]))))
+      ;; Also verify exec-p2p-answer produces nil p2p-dial when remote candidates are empty or self-candidates
+      (let [resp-state (assoc (light-core/init-light-state {:pubkey-hex pub-remote :pubkey pub-remote} {})
+                              :sessions {sid {:session-id sid
+                                              :peer pub-local
+                                              :state "open"
+                                              :p2p {:phase :offered
+                                                    :remote-candidates [gateway-cand]}}})
+            ans-res (light-core/handle-command resp-state
+                                               {"cmd" "p2p-answer" "session_id" sid "candidates" [gateway-cand]}
+                                               (:private kp-remote))]
+        (is (nil? (:p2p-dial ans-res)) "exec-p2p-answer returns nil p2p-dial when dialable remote candidates are empty")
+        (is (= :connecting (get-in (:state ans-res) [:sessions sid :p2p :phase])) "Responder remains in :connecting to wait passively")))))

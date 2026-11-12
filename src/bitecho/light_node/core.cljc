@@ -302,6 +302,8 @@
    :broadcast-seq 0
    :broadcast-seen #{}
    :broadcast-inbox []
+   :relay-since-seq 0
+   :relay-since-broadcast-seq 0
    :local-accounting {:burned-ech 0}
    :vouchers []
    :account nil
@@ -949,22 +951,22 @@
   "Formats a single escrow map into canonical colon-separated representation:
    <escrow-id>:<payer>:<receiver>:<amount>:<deliverable-hash>:<created-epoch>:<expires-epoch>:<status-name>:<settled-epoch-or-empty>:<net-amount-or-empty>:<refund-reason-or-empty>"
   [esc]
-  (let [eid (or (:escrow-id esc) (:escrow_id esc) "")
-        payer (or (:payer esc) "")
-        receiver (or (:receiver esc) (:recipient esc) "")
-        amt (long (or (:amount esc) 0))
-        dh (or (:deliverable-hash esc) (:deliverable_hash esc) "")
-        cr-ep (long (or (:created-epoch esc) (:created_epoch esc) 0))
-        exp-ep (long (or (:expires-epoch esc) (:expires_epoch esc) 0))
-        st-name (name (or (:status esc) :locked))
-        settled-ep (if (some? (or (:settled-epoch esc) (:settled_epoch esc)))
-                     (str (or (:settled-epoch esc) (:settled_epoch esc)))
+  (let [eid (or (:escrow-id esc) (get esc "escrow-id") (:escrow_id esc) (get esc "escrow_id") "")
+        payer (or (:payer esc) (get esc "payer") "")
+        receiver (or (:receiver esc) (get esc "receiver") (:recipient esc) (get esc "recipient") "")
+        amt (long (or (:amount esc) (get esc "amount") 0))
+        dh (or (:deliverable-hash esc) (get esc "deliverable-hash") (:deliverable_hash esc) (get esc "deliverable_hash") "")
+        cr-ep (long (or (:created-epoch esc) (get esc "created-epoch") (:created_epoch esc) (get esc "created_epoch") 0))
+        exp-ep (long (or (:expires-epoch esc) (get esc "expires-epoch") (:expires_epoch esc) (get esc "expires_epoch") 0))
+        st-name (name (or (:status esc) (get esc "status") :locked))
+        settled-ep (if (some? (or (:settled-epoch esc) (get esc "settled-epoch") (:settled_epoch esc) (get esc "settled_epoch")))
+                     (str (or (:settled-epoch esc) (get esc "settled-epoch") (:settled_epoch esc) (get esc "settled_epoch")))
                      "")
-        net-amt (if (some? (or (:net-amount esc) (:net_amount esc)))
-                  (str (or (:net-amount esc) (:net_amount esc)))
+        net-amt (if (some? (or (:net-amount esc) (get esc "net-amount") (:net_amount esc) (get esc "net_amount")))
+                  (str (or (:net-amount esc) (get esc "net-amount") (:net_amount esc) (get esc "net_amount")))
                   "")
-        refund-re (if (some? (or (:refund-reason esc) (:refund_reason esc)))
-                    (str (or (:refund-reason esc) (:refund_reason esc)))
+        refund-re (if (some? (or (:refund-reason esc) (get esc "refund-reason") (:refund_reason esc) (get esc "refund_reason")))
+                    (str (or (:refund-reason esc) (get esc "refund-reason") (:refund_reason esc) (get esc "refund_reason")))
                     "")]
     (str eid ":" payer ":" receiver ":" amt ":" dh ":" cr-ep ":" exp-ep ":" st-name ":" settled-ep ":" net-amt ":" refund-re)))
 
@@ -972,9 +974,9 @@
   "Computes deterministic canonical representation of a chain state snapshot:
    bitecho-chain-state-snapshot-v1|<validator-pubkey>|<pubkey>|<finalized-epoch>|<balance>|<spendable>|<seq>|<comma-joined-deps>|<canonical-escrows-str>|<nonce>"
   [snapshot]
-  (let [val-pub (or (:validator-pubkey snapshot) (get snapshot "validator_pubkey") "")
+  (let [val-pub (or (:validator-pubkey snapshot) (get snapshot "validator-pubkey") (get snapshot "validator_pubkey") "")
         pk (or (:pubkey snapshot) (get snapshot "pubkey") "")
-        fin-ep (long (or (:finalized-epoch snapshot) (get snapshot "finalized_epoch") 0))
+        fin-ep (long (or (:finalized-epoch snapshot) (get snapshot "finalized-epoch") (get snapshot "finalized_epoch") 0))
         bal (long (or (:balance snapshot) (get snapshot "balance") 0))
         spd (long (or (:spendable snapshot) (get snapshot "spendable") 0))
         seq-num (long (or (:seq snapshot) (get snapshot "seq") 0))
@@ -982,7 +984,7 @@
         deps-str (str/join "," deps)
         raw-escrows (or (:escrows snapshot) (get snapshot "escrows") [])
         escrows-vec (if (map? raw-escrows) (vals raw-escrows) (vec raw-escrows))
-        sorted-escrows (sort-by (fn [e] (str (or (:escrow-id e) (:escrow_id e) ""))) escrows-vec)
+        sorted-escrows (sort-by (fn [e] (str (or (:escrow-id e) (get e "escrow-id") (:escrow_id e) (get e "escrow_id") ""))) escrows-vec)
         escrows-str (str/join ";" (map canonical-escrow-entry-str sorted-escrows))
         nonce (or (:nonce snapshot) (get snapshot "nonce") "")]
     (str "bitecho-chain-state-snapshot-v1|"
@@ -1022,7 +1024,9 @@
     {:ok? false :error "pubkey-mismatch"}
 
     (let [trusted (:trusted-validators opts)
-          val-pub (or (:validator-pubkey snapshot) (get snapshot "validator_pubkey"))]
+          val-pub (or (:validator-pubkey snapshot)
+                      (get snapshot "validator-pubkey")
+                      (get snapshot "validator_pubkey"))]
       (or (empty? trusted)
           (not (contains? (set (map normalize-pubkey-hex trusted)) (normalize-pubkey-hex val-pub)))))
     {:ok? false :error "untrusted-validator"}
@@ -1032,7 +1036,10 @@
       (and exp-nonce (not= (str exp-nonce) (str snap-nonce))))
     {:ok? false :error "nonce-mismatch"}
 
-    (< (long (or (:finalized-epoch snapshot) (get snapshot "finalized_epoch") 0))
+    (< (long (or (:finalized-epoch snapshot)
+                 (get snapshot "finalized-epoch")
+                 (get snapshot "finalized_epoch")
+                 0))
        (long (or (:min-finalized-epoch opts) 0)))
     {:ok? false :error "stale-finalized-epoch"}
 
@@ -1040,12 +1047,16 @@
       (or (nil? sig) (str/blank? (str sig))))
     {:ok? false :error "missing-snapshot-signature"}
 
-    (let [val-pub (or (:validator-pubkey snapshot) (get snapshot "validator_pubkey"))]
+    (let [val-pub (or (:validator-pubkey snapshot)
+                      (get snapshot "validator-pubkey")
+                      (get snapshot "validator_pubkey"))]
       (or (nil? val-pub) (str/blank? (str val-pub))))
     {:ok? false :error "missing-validator-pubkey"}
 
     :else
-    (let [val-pub (or (:validator-pubkey snapshot) (get snapshot "validator_pubkey"))
+    (let [val-pub (or (:validator-pubkey snapshot)
+                      (get snapshot "validator-pubkey")
+                      (get snapshot "validator_pubkey"))
           sig (or (:signature snapshot) (get snapshot "signature"))
           canonical-str (canonical-chain-state-snapshot-str snapshot)
           val-pub-bytes (try (basalt/hex->bytes val-pub) (catch #?(:clj Exception :cljs :default) _ nil))
@@ -1057,18 +1068,18 @@
         (let [raw-escrows (or (:escrows snapshot) (get snapshot "escrows") [])
               escrows-vec (if (map? raw-escrows) (vals raw-escrows) (vec raw-escrows))
               normalized-escrows (mapv (fn [esc]
-                                         (let [eid (or (:escrow-id esc) (:escrow_id esc))
-                                               payer (or (:payer esc) "")
-                                               receiver (or (:receiver esc) (:recipient esc) "")
-                                               amt (long (or (:amount esc) 0))
-                                               dh (or (:deliverable-hash esc) (:deliverable_hash esc) "")
-                                               cr-ep (long (or (:created-epoch esc) (:created_epoch esc) 0))
-                                               exp-ep (long (or (:expires-epoch esc) (:expires_epoch esc) 0))
-                                               st-val (let [s (or (:status esc) :locked)]
+                                         (let [eid (or (:escrow-id esc) (get esc "escrow-id") (:escrow_id esc) (get esc "escrow_id"))
+                                               payer (or (:payer esc) (get esc "payer") "")
+                                               receiver (or (:receiver esc) (get esc "receiver") (:recipient esc) (get esc "recipient") "")
+                                               amt (long (or (:amount esc) (get esc "amount") 0))
+                                               dh (or (:deliverable-hash esc) (get esc "deliverable-hash") (:deliverable_hash esc) (get esc "deliverable_hash") "")
+                                               cr-ep (long (or (:created-epoch esc) (get esc "created-epoch") (:created_epoch esc) (get esc "created_epoch") 0))
+                                               exp-ep (long (or (:expires-epoch esc) (get esc "expires-epoch") (:expires_epoch esc) (get esc "expires_epoch") 0))
+                                               st-val (let [s (or (:status esc) (get esc "status") :locked)]
                                                         (if (keyword? s) s (keyword s)))
-                                               set-ep (when-let [se (or (:settled-epoch esc) (:settled_epoch esc))] (long se))
-                                               net-a (when-let [na (or (:net-amount esc) (:net_amount esc))] (long na))
-                                               ref-r (or (:refund-reason esc) (:refund_reason esc))]
+                                               set-ep (when-let [se (or (:settled-epoch esc) (get esc "settled-epoch") (:settled_epoch esc) (get esc "settled_epoch"))] (long se))
+                                               net-a (when-let [na (or (:net-amount esc) (get esc "net-amount") (:net_amount esc) (get esc "net_amount"))] (long na))
+                                               ref-r (or (:refund-reason esc) (get esc "refund-reason") (:refund_reason esc) (get esc "refund_reason"))]
                                            (cond-> {:escrow-id eid
                                                     :payer payer
                                                     :receiver receiver
@@ -1086,7 +1097,10 @@
                       :type :chain-state-snapshot
                       :validator-pubkey val-pub
                       :pubkey (or (:pubkey snapshot) (get snapshot "pubkey"))
-                      :finalized-epoch (long (or (:finalized-epoch snapshot) (get snapshot "finalized_epoch") 0))
+                      :finalized-epoch (long (or (:finalized-epoch snapshot)
+                                                 (get snapshot "finalized-epoch")
+                                                 (get snapshot "finalized_epoch")
+                                                 0))
                       :balance (long (or (:balance snapshot) (get snapshot "balance") 0))
                       :spendable (long (or (:spendable snapshot) (get snapshot "spendable") 0))
                       :seq (long (or (:seq snapshot) (get snapshot "seq") 0))
@@ -1114,7 +1128,7 @@
         unique-snaps (vals (into {}
                                  (keep (fn [s]
                                          (when (map? s)
-                                           [(or (:validator-pubkey s) (get s "validator_pubkey")) s]))
+                                           [(or (:validator-pubkey s) (get s "validator-pubkey") (get s "validator_pubkey")) s]))
                                        raw-snaps)))
         trusted (when (seq (:trusted-validators opts)) (set (:trusted-validators opts)))
         total-n (if (seq trusted) (count trusted) (count unique-snaps))
@@ -1167,17 +1181,20 @@
    status-dependent escrow fields on merge."
   [state snapshot]
   (let [curr-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
-        fin-epoch (parse-long-safe (or (:finalized-epoch snapshot) (get snapshot "finalized_epoch")) 0)]
+        fin-epoch (parse-long-safe (or (:finalized-epoch snapshot)
+                                       (get snapshot "finalized-epoch")
+                                       (get snapshot "finalized_epoch"))
+                                   0)]
     (if (< fin-epoch curr-fin-ep)
       state
-      (let [new-account {:balance (long (or (:balance snapshot) 0))
-                         :spendable (long (or (:spendable snapshot) 0))
-                         :seq (long (or (:seq snapshot) 0))
-                         :deps (vec (or (:deps snapshot) []))
+      (let [new-account {:balance (long (or (:balance snapshot) (get snapshot "balance") 0))
+                         :spendable (long (or (:spendable snapshot) (get snapshot "spendable") 0))
+                         :seq (long (or (:seq snapshot) (get snapshot "seq") 0))
+                         :deps (vec (or (:deps snapshot) (get snapshot "deps") []))
                          :finalized-epoch fin-epoch}
             has-escrows? (or (contains? snapshot :escrows) (contains? snapshot "escrows"))
             incoming-escrows (or (:escrows snapshot) (get snapshot "escrows") [])
-            incoming-ids (set (map #(or (:escrow-id %) (get % "escrow_id")) incoming-escrows))
+            incoming-ids (set (map #(or (:escrow-id %) (get % "escrow-id") (get % "escrow_id")) incoming-escrows))
             existing-escrows (or (:escrows state) {})
             non-terminal-statuses #{:locked :release-submitted :refund-submitted
                                     "locked" "release-submitted" "refund-submitted"}
@@ -1185,14 +1202,15 @@
                            (into {} (remove (fn [[eid existing]]
                                               (and (not (contains? incoming-ids eid))
                                                    (contains? non-terminal-statuses (:status existing))
-                                                   (< (long (or (:created-epoch existing) (:created_epoch existing) 0))
+                                                   (< (long (or (:created-epoch existing) (get existing "created-epoch") (:created_epoch existing) (get existing "created_epoch") 0))
                                                       (- fin-epoch 5))))
                                             existing-escrows))
                            existing-escrows)
             merged-escrows (reduce (fn [acc esc]
-                                     (let [eid (or (:escrow-id esc) (get esc "escrow_id"))
+                                     (let [eid (or (:escrow-id esc) (get esc "escrow-id") (get esc "escrow_id"))
                                            existing (dissoc (get acc eid {})
                                                             :settled-epoch :net-amount :take-burned :refund-reason
+                                                            "settled-epoch" "net-amount" "take-burned" "refund-reason"
                                                             "settled_epoch" "net_amount" "take_burned" "refund_reason")]
                                        (assoc acc eid (merge existing esc))))
                                    base-escrows
@@ -1973,6 +1991,12 @@
                                :udp)}
            proxy-connect? (assoc :proxy-connect? true)))))))
 
+(defn- effective-session-wire-epoch
+  [state session]
+  (let [st-ep (long (or (:epoch state) 0))
+        sess-ep (long (or (:epoch session) 0))]
+    (if (pos? st-ep) st-ep sess-ep)))
+
 (defn- canonical-p2p-signal-str
   ([kind session-id sender recipient transport candidates ice-ufrag ice-pwd fingerprint epoch]
    (canonical-p2p-signal-str kind session-id sender recipient transport candidates ice-ufrag ice-pwd fingerprint epoch 1))
@@ -2056,7 +2080,7 @@
             ice-ufrag (str (or (get cmd-map "ice_ufrag") (get cmd-map "ice-ufrag") (:ice-ufrag cmd-map) (get-in state [:ice-creds :ufrag]) "ufrag"))
             ice-pwd (str (or (get cmd-map "ice_pwd") (get cmd-map "ice-pwd") (:ice-pwd cmd-map) (get-in state [:ice-creds :pwd]) "pwd"))
             fp (str (or (get cmd-map "fingerprint") (:fingerprint cmd-map) (:fingerprint state) ""))
-            epoch (long (or (:epoch session) (:epoch state) 0))
+            epoch (effective-session-wire-epoch state session)
             signal-seq (inc (long (or (get-in session [:p2p :local-signal-seq]) 0)))
             sig-str (canonical-p2p-signal-str :offer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
@@ -2143,7 +2167,7 @@
             ice-ufrag (str (or (get cmd-map "ice_ufrag") (get cmd-map "ice-ufrag") (:ice-ufrag cmd-map) (get-in state [:ice-creds :ufrag]) "ufrag"))
             ice-pwd (str (or (get cmd-map "ice_pwd") (get cmd-map "ice-pwd") (:ice-pwd cmd-map) (get-in state [:ice-creds :pwd]) "pwd"))
             fp (str (or (get cmd-map "fingerprint") (:fingerprint cmd-map) (:fingerprint state) ""))
-            epoch (long (or (:epoch session) (:epoch state) 0))
+            epoch (effective-session-wire-epoch state session)
             signal-seq (inc (long (or (get-in session [:p2p :local-signal-seq]) 0)))
             sig-str (canonical-p2p-signal-str :answer session-id (:pubkey state) (:peer session) transport candidates ice-ufrag ice-pwd fp epoch signal-seq)
             sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
@@ -2200,15 +2224,17 @@
                                   :local-fingerprint fp
                                   :local-signal-seq signal-seq})
                 new-state (assoc-in state [:sessions session-id :p2p] p2p-entry)
-                p2p-dial {:session-id session-id
-                          :peer (:peer session)
-                          :role :responder
-                          :transport transport
-                          :local-candidates candidates
-                          :remote-candidates (get-in session [:p2p :remote-candidates])
-                          :remote-ice-ufrag (get-in session [:p2p :remote-ice-ufrag])
-                          :remote-ice-pwd (get-in session [:p2p :remote-ice-pwd])
-                          :remote-fingerprint (get-in session [:p2p :remote-fingerprint])}]
+                dialable-candidates (vec (remove #(contains? (set candidates) %) (get-in session [:p2p :remote-candidates])))
+                p2p-dial (when (seq dialable-candidates)
+                           {:session-id session-id
+                            :peer (:peer session)
+                            :role :responder
+                            :transport transport
+                            :local-candidates candidates
+                            :remote-candidates dialable-candidates
+                            :remote-ice-ufrag (get-in session [:p2p :remote-ice-ufrag])
+                            :remote-ice-pwd (get-in session [:p2p :remote-ice-pwd])
+                            :remote-fingerprint (get-in session [:p2p :remote-fingerprint])})]
             {:state new-state
              :response {"ok" true
                         "session_id" session-id
@@ -2377,7 +2403,7 @@
                              :session-id session-id
                              :sender (:pubkey state)
                              :recipient (:peer session)
-                             :epoch (long (or (:epoch session) (:epoch state) 0))
+                             :epoch (effective-session-wire-epoch state session)
                              :seq seq-num
                              :suite suite
                              :nonce (basalt/bytes->hex (:nonce sealed))
@@ -3309,59 +3335,108 @@
 
 (declare dispatch-multiplexed-command)
 
+(defn- ensure-light-node-subnet-mux
+  [state sub-id privkey-bytes]
+  (if (or (contains? (:subnets state) sub-id)
+          (:bitecho.subnet/unified? state)
+          (nil? privkey-bytes)
+          (nil? (:pubkey state))
+          (= sub-id "global"))
+    state
+    (let [parent-sid "global"
+          parent-policy {:subnet/id parent-sid
+                         :subnet/gate {:gate/mode :permissionless :gate/admission :open}
+                         :subnet/economy {:economy/mode :burn-only :economy/burn-floor 0}
+                         :subnet/path-acl [{:pattern "anchor/*" :principal {:type :allowlist}}]
+                         :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          child-policy {:subnet/id sub-id
+                        :subnet/parent-id parent-sid
+                        :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{(:pubkey state)}}
+                        :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                        :subnet/path-acl [{:pattern "head/*" :principal {:type :allowlist}}]
+                        :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}
+                        :subnet/anchoring {:trigger :epoch
+                                           :authority-privkey privkey-bytes
+                                           :authority-pubkey (:pubkey state)}}
+          parent-inst (:instance (core-subnet/init-subnet-instance parent-policy))
+          child-inst (:instance (core-subnet/init-subnet-instance child-policy))]
+      (update state :subnets (fn [m]
+                               (assoc (or m {})
+                                      parent-sid (or (get m parent-sid) parent-inst)
+                                      sub-id child-inst))))))
+
+(defn- anchor-effects->net-envelopes
+  [state privkey-bytes effects]
+  (if-not privkey-bytes
+    []
+    (vec
+     (keep (fn [eff]
+             (when (= :anchor-to-parent (:effect eff))
+               (let [parent-sid (str (or (:parent-subnet eff) "global"))
+                     payload (freeze-payload (merge {:type :anchor-to-parent} eff))
+                     burn-amt (max 100 (effective-signaling-burn-floor state))]
+                 (build-gossip-envelope (:pubkey state) privkey-bytes payload burn-amt parent-sid))))
+           effects))))
+
 (defn- exec-anchor-subnet
   [state effective-map privkey-bytes sub-id]
-  (cond
-    (contains? (:subnets state) sub-id)
-    (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :anchor-subnet) privkey-bytes)]
-      {:state (:mux res)
-       :response (:response res)
-       :effects (or (:effects res) [])
-       :net-envelopes (or (:net-envelopes res) [])
-       :stdout-events (or (:stdout-events res) [])})
+  (let [state (ensure-light-node-subnet-mux state sub-id privkey-bytes)]
+    (cond
+      (contains? (:subnets state) sub-id)
+      (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :anchor-subnet) privkey-bytes)
+            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))]
+        {:state (:mux res)
+         :response (:response res)
+         :effects (or (:effects res) [])
+         :net-envelopes (into (vec (or (:net-envelopes res) [])) anchor-envs)
+         :stdout-events (or (:stdout-events res) [])})
 
-    (:bitecho.subnet/unified? state)
-    (let [res (core-subnet/reduce-subnet state (assoc effective-map :type :anchor-subnet))]
-      {:state (:state res)
-       :response (if (:applied? res)
-                   (cond-> {"ok" true "subnet" (:subnet/id (:policy state))}
-                     (:anchor res) (assoc "anchor" (:anchor res)))
-                   {"ok" false "error" (str (:error res))})
-       :effects (or (:effects res) [])
-       :net-envelopes []
-       :stdout-events []})
+      (:bitecho.subnet/unified? state)
+      (let [res (core-subnet/reduce-subnet state (assoc effective-map :type :anchor-subnet))
+            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))]
+        {:state (:state res)
+         :response (if (:applied? res)
+                     (cond-> {"ok" true "subnet" (:subnet/id (:policy state))}
+                       (:anchor res) (assoc "anchor" (:anchor res)))
+                     {"ok" false "error" (str (:error res))})
+         :effects (or (:effects res) [])
+         :net-envelopes anchor-envs
+         :stdout-events []})
 
-    :else
-    {:state state :response {"ok" false "error" "subnet-not-found" "subnet" sub-id} :net-envelopes [] :stdout-events []}))
+      :else
+      {:state state :response {"ok" false "error" "subnet-not-found" "subnet" sub-id} :net-envelopes [] :stdout-events []})))
 
 (defn- exec-epoch-tick
   [state effective-map privkey-bytes sub-id]
-  (cond
-    (contains? (:subnets state) sub-id)
-    (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :epoch-tick) privkey-bytes)]
-      {:state (:mux res)
-       :response (:response res)
-       :effects (or (:effects res) [])
-       :net-envelopes (or (:net-envelopes res) [])
-       :stdout-events (or (:stdout-events res) [])})
+  (let [state (ensure-light-node-subnet-mux state sub-id privkey-bytes)]
+    (cond
+      (contains? (:subnets state) sub-id)
+      (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :epoch-tick) privkey-bytes)
+            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))]
+        {:state (:mux res)
+         :response (:response res)
+         :effects (or (:effects res) [])
+         :net-envelopes (into (vec (or (:net-envelopes res) [])) anchor-envs)
+         :stdout-events (or (:stdout-events res) [])})
 
-    (:bitecho.subnet/unified? state)
-    (let [res (core-subnet/reduce-subnet state (assoc effective-map :type :epoch-tick))]
-      {:state (:state res)
-       :response (if (:applied? res)
-                   (cond-> {"ok" true "subnet" (:subnet/id (:policy state))}
-                     (:anchor res) (assoc "anchor" (:anchor res)))
-                   {"ok" true "subnet" (:subnet/id (:policy state)) "unchanged" true})
-       :effects (or (:effects res) [])
-       :net-envelopes []
-       :stdout-events []})
+      (:bitecho.subnet/unified? state)
+      (let [res (core-subnet/reduce-subnet state (assoc effective-map :type :epoch-tick))
+            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))]
+        {:state (:state res)
+         :response (if (:applied? res)
+                     (cond-> {"ok" true "subnet" (:subnet/id (:policy state))}
+                       (:anchor res) (assoc "anchor" (:anchor res)))
+                     {"ok" true "subnet" (:subnet/id (:policy state)) "unchanged" true})
+         :effects (or (:effects res) [])
+         :net-envelopes anchor-envs
+         :stdout-events []})
 
-    :else
-    (let [next-ep (inc (long (or (:epoch state) 0)))]
-      {:state (assoc state :epoch next-ep)
-       :response {"ok" true "epoch" next-ep}
-       :net-envelopes []
-       :stdout-events []})))
+      :else
+      (let [next-ep (inc (long (or (:epoch state) 0)))]
+        {:state (assoc state :epoch next-ep)
+         :response {"ok" true "epoch" next-ep}
+         :net-envelopes []
+         :stdout-events []}))))
 
 (defn- exec-verify-subnet-anchor
   [state effective-map sub-id]
@@ -3699,7 +3774,7 @@
                         :session-id session-id
                         :sender (:pubkey state)
                         :recipient peer-pub
-                        :epoch (long (or (get-in state [:sessions session-id :epoch]) (:epoch state) 0))
+                        :epoch (effective-session-wire-epoch state (get-in state [:sessions session-id]))
                         :ack-seq contiguous-ack-seq
                         :acked-seq msg-seq
                         :seen-seqs seen-vec
@@ -4658,7 +4733,9 @@
                   (let [msg-type (or (:bitecho/type msg) (:type msg))
                         msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
                         sess-epoch (when-let [sid (:session-id msg)]
-                                     (get-in state [:sessions sid :epoch]))
+                                     (let [ep (get-in state [:sessions sid :epoch])]
+                                       (when (integer? ep)
+                                         (long ep))))
                         ref-epoch (if (or (:epoch-initialized? state)
                                           (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
                                     (:epoch state)
@@ -4671,7 +4748,8 @@
                                             msg-epoch ref-epoch
                                             (> (math-abs (- msg-epoch (long ref-epoch))) max-skew)
                                             (or (nil? sess-epoch)
-                                                (> (math-abs (- msg-epoch (long sess-epoch))) max-skew)))]
+                                                (and (pos? (long sess-epoch))
+                                                     (> (math-abs (- msg-epoch (long sess-epoch))) max-skew))))]
                     (if skew-exceeded?
                       (let [p2p-sig? (contains? #{:p2p-offer :p2p-answer} msg-type)
                             diag-event (when p2p-sig?
@@ -4697,7 +4775,9 @@
                                   :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
                                   :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
                                   {:state state :net-envelopes [] :stdout-events []})]
-                        (if (and (not= msg-type :chain-state-snapshot) msg-epoch (not (:epoch-initialized? (:state res))))
+                        (if (and (not= msg-type :chain-state-snapshot)
+                                 msg-epoch
+                                 (not (:epoch-initialized? (:state res))))
                           (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
                           res)))))))))))))
 

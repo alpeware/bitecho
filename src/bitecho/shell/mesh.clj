@@ -961,9 +961,9 @@
                         conns-map))]
         [new-map [eff]])
       (let [superseded? (and existing
-                             (:node existing)
-                             (not= (:node existing) (:node anon-conn)))
-            effects (if superseded?
+                             (or (nil? (:node existing))
+                                 (not= (:node existing) (:node anon-conn))))
+            effects (if (and superseded? (:node existing))
                       [{:effect :close-node :node (:node existing) :generation (:generation existing 0)}]
                       [])
             next-gen (inc (max (long (or (:generation anon-conn) 0))
@@ -972,9 +972,12 @@
                                   (long (or (:dropped existing) 0)))
             cumulative-stale (+ (long (or (:ignored-stale anon-conn) 0))
                                 (long (or (:ignored-stale existing) 0)))
-            existing-order (or (:sent-msg-order existing) (vec (conn-sent-msg-ids existing)))
+            existing-order (when-not superseded?
+                             (or (:sent-msg-order existing) (vec (conn-sent-msg-ids existing))))
             anon-order (or (:sent-msg-order anon-conn) (vec (conn-sent-msg-ids anon-conn)))
-            merged-sent-order (vec (distinct (into existing-order anon-order)))
+            merged-sent-order (if superseded?
+                                (vec (distinct anon-order))
+                                (vec (distinct (into (or existing-order []) anon-order))))
             capped-order (if (> (count merged-sent-order) 1024)
                            (subvec merged-sent-order (- (count merged-sent-order) 1024))
                            merged-sent-order)
@@ -1781,10 +1784,13 @@
         agent-node
         {:on-open (fn [evt]
                     (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
+                          has-cid? (or (contains? evt :channel-id)
+                                       (contains? evt :stream-id)
+                                       (some? (get-in evt [:channel :id])))
                           updated (when agent-conns
                                     (apply-mesh-conn-event! agent-conns @conn-key
                                                             {:type :on-open :generation @node-gen :node agent-node :channel-id cid}))]
-                      (when (or (nil? agent-conns) (= agent-node (:node updated)))
+                      (when (and has-cid? (or (nil? agent-conns) (= agent-node (:node updated))))
                         (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
          :on-data-channel (fn [evt]
                             (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)

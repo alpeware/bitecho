@@ -187,3 +187,83 @@
       (is (= 2 (count bcasts)) "Broadcast ring buffer bounded to max 2 entries")
       (is (= 3 (long (:next-broadcast-seq s3))) "Broadcast counter advanced to 3")
       (is (= 2 (long (:broadcast-seq (first bcasts)))) "Oldest broadcast evicted"))))
+
+(deftest test-normalize-relay-base-url
+  (testing "F-Relay-2: normalize-relay-base-url strips trailing slashes and /relay/v1 suffix"
+    (is (nil? (relay/normalize-relay-base-url nil)))
+    (is (nil? (relay/normalize-relay-base-url "")))
+    (is (nil? (relay/normalize-relay-base-url "   ")))
+    (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org")))
+    (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org/")))
+    (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org///")))
+    (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org/relay/v1")))
+    (is (= "https://bitecho.org" (relay/normalize-relay-base-url "https://bitecho.org/relay/v1/")))
+    (is (= "http://127.0.0.1:8080" (relay/normalize-relay-base-url "http://127.0.0.1:8080/relay/v1/   ")))))
+
+(deftest test-validator-only-ledger-dispatch
+  (testing "F-Relay-7: Validator-only ledger transactions are forwarded without polluting chat inboxes/broadcast ring"
+    (let [st0 (relay/init-relay-state)
+          kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          payload (fressian/utf8->bytes "tx-payload")
+          sig (crypto/sign (:private kp) payload)
+          env {:type :transfer
+               :sender pub
+               :payload payload
+               :signature (if (string? sig) sig (basalt/bytes->hex sig))}
+          res (relay/reduce-relay st0 {:type :relay-submit :envelope env :now-ms 1000})]
+      (is (true? (:ok? res)))
+      (is (= "forwarded-validator-only" (get-in res [:response "status"])))
+      (is (empty? (get-in (:state res) [:inboxes])))
+      (is (empty? (get-in (:state res) [:broadcasts])))
+      (is (= 1 (count (:effects res))))
+      (is (= :forward-to-validators (:effect (first (:effects res))))))))
+
+(deftest test-broadcast-ttl-eviction
+  (testing "F-Relay-6: Broadcasts older than 24h TTL are evicted on submit and filtered on poll"
+    (let [st0 (relay/init-relay-state {:ttl-ms 1000})
+          kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          env1 (make-signed-envelope kp "*" "bcast-old")
+          env2 (make-signed-envelope kp "*" "bcast-fresh")
+          s1 (:state (relay/reduce-relay st0 {:type :relay-submit :envelope env1 :now-ms 1000}))
+          ;; 2000ms later (> ttl 1000ms), submit second broadcast
+          s2 (:state (relay/reduce-relay s1 {:type :relay-submit :envelope env2 :now-ms 3000}))
+          ;; Poll at now-ms 3500
+          sig (relay/sign-poll-request (:private kp) {:pubkey pub :since-seq 0 :timestamp-ms 3500 :nonce "nonce-poll"})
+          poll-res (relay/reduce-relay s2 {:type :relay-poll
+                                           :pubkey pub
+                                           :since-seq 0
+                                           :since-broadcast-seq 0
+                                           :timestamp-ms 3500
+                                           :nonce "nonce-poll"
+                                           :signature sig
+                                           :now-ms 3500})
+          bcasts (get-in poll-res [:response "broadcasts"])]
+      (is (= 1 (count (:broadcasts s2))) "Old broadcast evicted on submit")
+      (is (= 1 (count bcasts)) "Only fresh broadcast returned on poll"))))
+
+(deftest test-poll-skew-and-nonce-rate-limiting
+  (testing "F-Relay-7: ts <= 0 rejected with :poll-skew-exceeded, active nonces >= max-nonces rejected with :poll-rate-limited"
+    (let [st0 (relay/init-relay-state {:max-nonces 2 :max-skew-ms 10000})
+          kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          now-ms 1000000
+          ;; 1. ts = 0
+          sig0 (relay/sign-poll-request (:private kp) {:pubkey pub :since-seq 0 :timestamp-ms 0 :nonce "n0"})
+          r0 (relay/reduce-relay st0 {:type :relay-poll :pubkey pub :timestamp-ms 0 :nonce "n0" :signature sig0 :now-ms now-ms})
+          ;; 2. poll 1 and poll 2
+          sig1 (relay/sign-poll-request (:private kp) {:pubkey pub :since-seq 0 :timestamp-ms now-ms :nonce "n1"})
+          r1 (relay/reduce-relay st0 {:type :relay-poll :pubkey pub :timestamp-ms now-ms :nonce "n1" :signature sig1 :now-ms now-ms})
+          sig2 (relay/sign-poll-request (:private kp) {:pubkey pub :since-seq 0 :timestamp-ms now-ms :nonce "n2"})
+          r2 (relay/reduce-relay (:state r1) {:type :relay-poll :pubkey pub :timestamp-ms now-ms :nonce "n2" :signature sig2 :now-ms now-ms})
+          ;; 3. poll 3 exceeds capacity 2
+          sig3 (relay/sign-poll-request (:private kp) {:pubkey pub :since-seq 0 :timestamp-ms now-ms :nonce "n3"})
+          r3 (relay/reduce-relay (:state r2) {:type :relay-poll :pubkey pub :timestamp-ms now-ms :nonce "n3" :signature sig3 :now-ms now-ms})]
+      (is (false? (:ok? r0)))
+      (is (= :poll-skew-exceeded (:error r0)))
+      (is (true? (:ok? r1)))
+      (is (true? (:ok? r2)))
+      (is (false? (:ok? r3)))
+      (is (= :poll-rate-limited (:error r3))))))
+

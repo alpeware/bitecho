@@ -555,7 +555,7 @@
                     (-> (HttpClient/newBuilder)
                         (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
                         (.build)))
-         url (str (str/replace relay-url #"/+$" "") "/relay/v1/send")
+         url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/send")
          wire-hex (cond
                     (string? envelope) envelope
                     (bytes? envelope) (basalt/bytes->hex envelope)
@@ -590,10 +590,12 @@
                     (-> (HttpClient/newBuilder)
                         (.connectTimeout (Duration/ofMillis (long (+ (or (:timeout-ms opts) 0) 5000))))
                         (.build)))
-         base-url (str (str/replace relay-url #"/+$" "") "/relay/v1/poll")
+         base-url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/poll")
          pk-hex (if (bytes? pubkey) (basalt/bytes->hex pubkey) (str pubkey))
          now-ms (System/currentTimeMillis)
          since-seq (long (or (:since-seq opts) (:seq-gte opts) 0))
+         bseq (long (or (:since-broadcast-seq opts) 0))
+         wait-ms (or (:timeout-ms opts) (:wait-ms opts))
          nonce (or (:nonce opts) (basalt/bytes->hex (crypto/random-bytes 16)))
          sig (relay/sign-poll-request privkey {:pubkey pk-hex
                                                :since-seq since-seq
@@ -614,11 +616,18 @@
                                                    "="
                                                    (java.net.URLEncoder/encode (str v) StandardCharsets/UTF_8)))
                                   params))
-         req (-> (HttpRequest/newBuilder)
-                 (.uri (URI/create (str base-url "?" q-str)))
-                 (.timeout (Duration/ofMillis (long (+ (or (:timeout-ms opts) 0) 5000))))
-                 (.GET)
-                 (.build))]
+         req (cond-> (HttpRequest/newBuilder)
+               true (.uri (URI/create (str base-url "?" q-str)))
+               true (.header "X-Bitecho-Pubkey" pk-hex)
+               true (.header "X-Bitecho-Since-Seq" (str since-seq))
+               true (.header "X-Bitecho-Since-Broadcast-Seq" (str bseq))
+               true (.header "X-Bitecho-Timestamp-Ms" (str now-ms))
+               true (.header "X-Bitecho-Nonce" nonce)
+               true (.header "X-Bitecho-Signature" sig)
+               (some? wait-ms) (.header "X-Bitecho-Wait-Ms" (str wait-ms))
+               true (.timeout (Duration/ofMillis (long (+ (or (:timeout-ms opts) 0) 5000))))
+               true (.GET)
+               true (.build))]
      (try
        (let [resp (.send client req (HttpResponse$BodyHandlers/ofString))]
          (try
@@ -637,29 +646,39 @@
                     (-> (HttpClient/newBuilder)
                         (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
                         (.build)))
-         url (str (str/replace relay-url #"/+$" "") "/relay/v1/ack")
+         url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/ack")
          pk-hex (if (bytes? pubkey) (basalt/bytes->hex pubkey) (str pubkey))
          now-ms (System/currentTimeMillis)
          ack-seq (long (or up-to-seq 0))
+         ack-bseq (or (:ack-broadcast-seq opts) (:ack_broadcast_seq opts))
          nonce (or (:nonce opts) (basalt/bytes->hex (crypto/random-bytes 16)))
          sig (relay/sign-poll-request privkey {:pubkey pk-hex
                                                :since-seq ack-seq
                                                :timestamp-ms now-ms
                                                :nonce nonce})
-         payload (json/write-str {"pubkey" pk-hex
-                                  "sig" sig
-                                  "signature" sig
-                                  "ts" now-ms
-                                  "timestamp_ms" now-ms
-                                  "nonce" nonce
-                                  "ack_seq" ack-seq
-                                  "up_to_seq" ack-seq})
-         req (-> (HttpRequest/newBuilder)
-                 (.uri (URI/create url))
-                 (.header "Content-Type" "application/json")
-                 (.timeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
-                 (.POST (HttpRequest$BodyPublishers/ofString payload StandardCharsets/UTF_8))
-                 (.build))]
+         payload-map (cond-> {"pubkey" pk-hex
+                              "sig" sig
+                              "signature" sig
+                              "ts" now-ms
+                              "timestamp_ms" now-ms
+                              "nonce" nonce
+                              "ack_seq" ack-seq
+                              "up_to_seq" ack-seq}
+                       ack-bseq (assoc "ack_broadcast_seq" (long ack-bseq)
+                                       "ack-broadcast-seq" (long ack-bseq)))
+         payload (json/write-str payload-map)
+         req (cond-> (HttpRequest/newBuilder)
+               true (.uri (URI/create url))
+               true (.header "Content-Type" "application/json")
+               true (.header "X-Bitecho-Pubkey" pk-hex)
+               true (.header "X-Bitecho-Ack-Seq" (str ack-seq))
+               true (.header "X-Bitecho-Timestamp-Ms" (str now-ms))
+               true (.header "X-Bitecho-Nonce" nonce)
+               true (.header "X-Bitecho-Signature" sig)
+               ack-bseq (.header "X-Bitecho-Ack-Broadcast-Seq" (str ack-bseq))
+               true (.timeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
+               true (.POST (HttpRequest$BodyPublishers/ofString payload StandardCharsets/UTF_8))
+               true (.build))]
      (try
        (let [resp (.send client req (HttpResponse$BodyHandlers/ofString))]
          (try
@@ -678,10 +697,7 @@
                     (-> (HttpClient/newBuilder)
                         (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
                         (.build)))
-         clean (str/replace (str relay-url) #"/+$" "")
-         base-url (if (str/ends-with? clean "/relay/v1")
-                    (str clean "/chain-state")
-                    (str clean "/relay/v1/chain-state"))
+         base-url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/chain-state")
          q-parts (cond-> []
                    (:pubkey opts) (conj (str "pubkey=" (java.net.URLEncoder/encode (str (:pubkey opts)) StandardCharsets/UTF_8)))
                    (:nonce opts) (conj (str "nonce=" (java.net.URLEncoder/encode (str (:nonce opts)) StandardCharsets/UTF_8))))
@@ -854,8 +870,7 @@
           relay-resp (fetch-relay-chain-state! (:relay-url opts) {:pubkey pubkey :nonce nonce :timeout-ms (:timeout-ms opts)})
           raw-snaps (or (get relay-resp "snapshots") (get relay-resp :snapshots) [])
           signed-snaps (filterv #(or (get % "signature") (get % :signature)) raw-snaps)]
-      (cond
-        (seq signed-snaps)
+      (if (seq signed-snaps)
         (let [trusted (set (keep :pubkey (vals (:nodes bootstrap))))
               verify-opts (assoc opts
                                  :expected-pubkey pubkey
@@ -867,20 +882,14 @@
             (do
               (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st (:snapshot q-res))))
               {:ok? true :state @state-atom :quorum-result q-res})
-            {:ok? false :error (:error q-res)}))
-
-        (or (true? (get relay-resp "ok")) (true? (get relay-resp :ok)))
+            (do
+              (swap! state-atom update-in [:diagnostics :chain-state-sync-failed] (fnil inc 0))
+              {:ok? false :error (:error q-res)})))
         (do
-          (swap! state-atom (fn [st]
-                              (cond-> st
-                                (or (get relay-resp "epoch") (get relay-resp :epoch))
-                                (assoc :epoch (long (or (get relay-resp "epoch") (get relay-resp :epoch))))
-                                (or (get relay-resp "min_signaling_burn") (get relay-resp :min-signaling-burn))
-                                (assoc :burn-floor (long (or (get relay-resp "min_signaling_burn") (get relay-resp :min-signaling-burn)))))))
-          {:ok? true :state @state-atom :relay-response relay-resp})
-
-        :else
-        {:ok? false :error (or (get relay-resp "error") (get relay-resp :error) "relay-chain-state-failed")}))
+          (swap! state-atom update-in [:diagnostics :chain-state-sync-failed] (fnil inc 0))
+          {:ok? false :error (or (when-not (or (true? (get relay-resp "ok")) (true? (get relay-resp :ok)))
+                                   (or (get relay-resp "error") (get relay-resp :error)))
+                                 "no-verified-relay-snapshots")})))
     (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})
           inband-res (fetch-inband-chain-state-quorum! id bootstrap pubkey privkey-bytes opts)]
       (cond
@@ -888,6 +897,15 @@
         (let [snap (:snapshot inband-res)]
           (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
           {:ok? true :state @state-atom :quorum-result inband-res})
+
+        (and (or (:auto-relay-fallback? opts)
+                 (:relay-url bootstrap)
+                 (get-in bootstrap [:relay :url]))
+             (not (:relay-url opts)))
+        (let [fallback-url (or (:relay-url bootstrap)
+                               (get-in bootstrap [:relay :url])
+                               "https://bitecho.org/relay/v1")]
+          (maybe-sync-account-state! state-atom bootstrap pubkey privkey-bytes (assoc opts :relay-url fallback-url)))
 
         (or (:inband-snapshot-fetcher opts)
             (and (not= (:error inband-res) "no-inband-snapshots-returned")
@@ -1409,7 +1427,10 @@
                                           :generation (:generation opts)
                                           :state-file (:state-file opts)
                                           :diagnostics-atom (:diagnostics-atom opts)
-                                          :diagnose-fn (:diagnose-fn opts)})
+                                          :diagnose-fn (:diagnose-fn opts)
+                                          :p2p-peers-atom (:p2p-peers-atom opts)
+                                          :ingress-peers-atom (:ingress-peers-atom opts)
+                                          :mdns-atom (:mdns-atom opts)})
         transport (:transport opts)
         target-host (if (= transport :connect)
                       (or (:ingress-host node) (:ip node) "127.0.0.1")
@@ -1497,9 +1518,18 @@
                     (recur (rest rem-candidates)
                            (conj failed-nodes {:validator-id (:node-id node)
                                                :error (or (:error res) "listener-disabled")}))))
-                {:ok? false
-                 :error "listener-disabled"
-                 :failed-nodes failed-nodes}))))))))
+                (let [fallback-url (when (or (:auto-relay-fallback? opts)
+                                             (:relay-url bootstrap-descriptor)
+                                             (get-in bootstrap-descriptor [:relay :url]))
+                                     (or (:relay-url opts)
+                                         (:relay-url bootstrap-descriptor)
+                                         (get-in bootstrap-descriptor [:relay :url])
+                                         "https://bitecho.org/relay/v1"))]
+                  (if fallback-url
+                    (connect-validators! identity bootstrap-descriptor (assoc opts :relay-url fallback-url))
+                    {:ok? false
+                     :error "listener-disabled"
+                     :failed-nodes failed-nodes}))))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; CLI Runner (Serve, Wait-Event & One-Shot Modes)
@@ -2397,8 +2427,8 @@
             (doto (Thread.
                    ^Runnable
                    (fn []
-                     (loop [since-mseq 0
-                            since-bseq 0]
+                     (loop [since-mseq (long (or (:relay-since-seq @state-atom) 0))
+                            since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))]
                        (when @daemon-running?
                          (let [poll-res (try
                                           (poll-relay-envelopes! (:relay-url opts)
@@ -2413,6 +2443,8 @@
                                all-items (concat msgs bcasts)
                                new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") since-mseq))
                                new-bseq (long (or (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))]
+                           (when (or (not= new-mseq since-mseq) (not= new-bseq since-bseq))
+                             (swap! state-atom assoc :relay-since-seq new-mseq :relay-since-broadcast-seq new-bseq))
                            (doseq [item all-items]
                              (let [env-raw (or (get item "envelope_hex") (get item "envelope")
                                                (get item :envelope_hex) (get item :envelope))
@@ -2444,7 +2476,8 @@
                                (ack-relay-envelopes! (:relay-url opts)
                                                      (:pubkey-hex identity)
                                                      (:privkey-bytes identity)
-                                                     new-mseq)
+                                                     new-mseq
+                                                     {:ack-broadcast-seq new-bseq})
                                (catch Exception _ nil)))
                            (recur new-mseq new-bseq))))))
               (.setDaemon true)

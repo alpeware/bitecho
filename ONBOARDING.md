@@ -322,5 +322,23 @@ Phase 4 unifies all three Bitecho light-node runtimes (**JVM**, **Node.js**, and
   ```
   Broadcasts are gated by verified Delegated Agent Certificates (`:trusted-dac-anchors`), deduplicated by `msg_id = SHA-256("bitecho-broadcast-id-v1|" || subnet_id || "|" || sender_pubkey_hex || "|" || seq || "|" || text)` (`:broadcast-seen`), and automatically hub-relayed (`:p2p-hub-relay`) across bridged P2P sessions at **`0 ECH` burn**.
 
+---
+
+## 10. HTTP Gateway Relay (`/relay/v1/*`) & Fallback Operation
+
+When operating in restricted enterprise networks, sandboxed containers, or web browser environments where direct UDP/TCP WebRTC DataChannels are blocked, light nodes can route all network interactions over the HTTP Gateway Relay (`https://bitecho.org/relay/v1`).
+
+### CLI Flag & Environment Variable
+- **CLI Flag**: `--relay-url <url>` (e.g. `--relay-url https://bitecho.org/relay/v1` or `--relay-url http://127.0.0.1:8080`)
+- **Environment Variable**: `BITECHO_RELAY_URL`
+- **Auto-Normalization**: Both `http://host:port` and `http://host:port/relay/v1` are transparently accepted and normalized by `normalize-relay-base-url`.
+
+### Relay Endpoints
+- **`POST /relay/v1/send`**: Submits signed Fressian/JSON envelopes to the network. Unicast envelopes are queued into recipient inboxes; broadcast messages enter the global ring; ledger transactions are forwarded to validators. Payloads are bounded to 16MB (HTTP 413 on overflow).
+- **`GET / POST /relay/v1/poll`**: Long-polls queued inbound envelopes and mesh broadcasts (`wait_ms <= 25000`). Authenticated via Proof-of-Possession (`PoP`) headers (`X-Bitecho-Pubkey`, `X-Bitecho-Timestamp-Ms`, `X-Bitecho-Nonce`, `X-Bitecho-Signature`, `X-Bitecho-Since-Seq`, `X-Bitecho-Since-Broadcast-Seq`, `X-Bitecho-Wait-Ms`). Returns HTTP 429 `too-many-waiters` when the active long-poll waiter pool reaches capacity (256).
+- **`POST /relay/v1/ack`**: Prunes processed inbox envelopes up to sequence number and broadcast sequence (`X-Bitecho-Ack-Broadcast-Seq`).
+- **`GET / POST /relay/v1/chain-state`**: Queries signed validator state snapshots. Light nodes independently verify $2f+1$ BFT quorum before accepting ledger balances and spendable sequences. If quorum verification fails, nodes fail closed without trusting unverified or synthetic state.
+
+
 
 

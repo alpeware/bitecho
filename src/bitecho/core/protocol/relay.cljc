@@ -24,6 +24,17 @@
       (when (re-matches #"(?:302a300506032b6570032100)?[0-9a-f]{64}" t)
         t))))
 
+(defn normalize-relay-base-url
+  "Normalizes a relay URL by trimming whitespace, stripping trailing slashes,
+   and stripping any trailing `/relay/v1` suffix so callers can safely append `/relay/v1/<endpoint>`."
+  [relay-url]
+  (when (and (string? relay-url) (not (str/blank? relay-url)))
+    (-> relay-url
+        str/trim
+        (str/replace #"/+$" "")
+        (str/replace #"/relay/v1$" "")
+        (str/replace #"/+$" ""))))
+
 ;; =============================================================================
 ;; 1. Relay State Initialization
 ;; =============================================================================
@@ -35,6 +46,8 @@
    {:max-inbox-size (long (or (:max-inbox-size opts) 256))
     :max-broadcast-size (long (or (:max-broadcast-size opts) 256))
     :max-payload-bytes (long (or (:max-payload-bytes opts) 65536))
+    :max-total-queued-bytes (long (or (:max-total-queued-bytes opts) 16777216))
+    :max-recipients (long (or (:max-recipients opts) 1024))
     :ttl-ms (long (or (:ttl-ms opts) 86400000))
     :max-skew-ms (long (or (:max-skew-ms opts) 300000))
     :max-nonces (long (or (:max-nonces opts) 2048))
@@ -45,8 +58,7 @@
     :seen-ids {}
     :seen-id-order []
     :max-seen-ids (long (or (:max-seen-ids opts) 4096))
-    :used-poll-nonces #{}
-    :poll-nonce-order []
+    :used-poll-nonces {}
     :diagnostics {:submitted 0
                   :duplicates 0
                   :delivered 0
@@ -59,7 +71,9 @@
                   :invalid-sig 0
                   :auth-failed 0
                   :skew-exceeded 0
-                  :replay-rejected 0}}))
+                  :replay-rejected 0
+                  :rate-limited 0
+                  :evicted 0}}))
 
 ;; =============================================================================
 ;; 2. Canonical Poll Proof-of-Possession (PoP)
@@ -87,8 +101,15 @@
   (let [now (long (or now-ms 0))
         ts (long (or timestamp-ms 0))
         max-skew (long (get state :max-skew-ms 300000))
+        max-n (long (get state :max-nonces 2048))
         norm-pk (when pubkey (normalize-pubkey-hex pubkey))
-        nonce-str (str (or nonce ""))]
+        nonce-str (str (or nonce ""))
+        cutoff (- now max-skew)
+        used-nonces (let [un (get state :used-poll-nonces {})]
+                      (if (map? un) un (into {} (map (fn [p] [p now])) un)))
+        active-nonces (if (pos? now)
+                        (into {} (filter (fn [[_k t]] (>= (long t) cutoff))) used-nonces)
+                        used-nonces)]
     (cond
       (or (nil? norm-pk) (not (re-matches #"(?:302a300506032b6570032100)?[0-9a-f]{64}" norm-pk)))
       {:ok? false :error :poll-auth-failed :reason :invalid-pubkey}
@@ -96,11 +117,15 @@
       (or (str/blank? nonce-str) (str/blank? (str signature)))
       {:ok? false :error :poll-auth-failed :reason :missing-auth-fields}
 
-      (and (pos? now) (pos? ts) (> (Math/abs (- now ts)) max-skew))
-      {:ok? false :error :poll-skew-exceeded :skew-ms (Math/abs (- now ts)) :max-skew-ms max-skew}
+      (or (<= ts 0)
+          (and (pos? now) (> (Math/abs (- now ts)) max-skew)))
+      {:ok? false :error :poll-skew-exceeded :skew-ms (if (pos? ts) (Math/abs (- now ts)) now) :max-skew-ms max-skew}
 
-      (contains? (get state :used-poll-nonces #{}) [norm-pk nonce-str])
+      (contains? active-nonces [norm-pk nonce-str])
       {:ok? false :error :poll-replay-rejected :pubkey norm-pk :nonce nonce-str}
+
+      (>= (count active-nonces) max-n)
+      {:ok? false :error :poll-rate-limited :pubkey norm-pk}
 
       :else
       (let [signing-str (poll-signing-str norm-pk (or since-seq 0) ts nonce-str)
@@ -109,7 +134,7 @@
                         (try (crypto/verify norm-pk (fressian/utf8->bytes signing-str) sig-bytes)
                              (catch #?(:clj Exception :cljs :default) _ false)))]
         (if valid?
-          {:ok? true :pubkey norm-pk :nonce nonce-str}
+          {:ok? true :pubkey norm-pk :nonce nonce-str :now-ms (if (pos? now) now ts)}
           {:ok? false :error :poll-auth-failed :reason :invalid-signature})))))
 
 ;; =============================================================================
@@ -117,18 +142,19 @@
 ;; =============================================================================
 
 (defn- record-poll-nonce
-  [state pubkey nonce]
-  (let [nonces (get state :used-poll-nonces #{})
-        nonce-order (get state :poll-nonce-order [])
-        pair [pubkey (str nonce)]
-        max-n (long (get state :max-nonces 2048))]
-    (if (contains? nonces pair)
-      state
-      (let [new-order (conj nonce-order pair)
-            drop-count (max 0 (- (count new-order) max-n))
-            trimmed-order (if (pos? drop-count) (subvec new-order drop-count) new-order)
-            trimmed-set (set trimmed-order)]
-        (assoc state :used-poll-nonces trimmed-set :poll-nonce-order trimmed-order)))))
+  ([state pubkey nonce]
+   (record-poll-nonce state pubkey nonce 0))
+  ([state pubkey nonce now-ms]
+   (let [now (long (or now-ms 0))
+         max-skew (long (get state :max-skew-ms 300000))
+         cutoff (- now max-skew)
+         used-nonces (let [un (get state :used-poll-nonces {})]
+                       (if (map? un) un (into {} (map (fn [p] [p now])) un)))
+         active (if (pos? now)
+                  (into {} (filter (fn [[_k t]] (>= (long t) cutoff))) used-nonces)
+                  used-nonces)
+         pair [pubkey (str nonce)]]
+     (assoc state :used-poll-nonces (assoc active pair now)))))
 
 (defn- record-seen-id
   [state envelope-id now-ms]
@@ -238,12 +264,13 @@
               (let [envelope-id (basalt/bytes->hex (crypto/sha256 wire-bytes))
                     wire-hex (basalt/bytes->hex wire-bytes)]
                 (if (contains? (get state :seen-ids {}) envelope-id)
-                  {:state (update-in state [:diagnostics :duplicates] (fnil inc 0))
-                   :ok? true
-                   :duplicate? true
-                   :envelope-id envelope-id
-                   :response {"ok" true "duplicate" true "envelope_id" envelope-id "status" "duplicate"}
-                   :effects []}
+                  (let [diag {:effect :diagnose :reason :duplicate-envelope :envelope-id envelope-id :now-ms now-ms}]
+                    {:state (update-in state [:diagnostics :duplicates] (fnil inc 0))
+                     :ok? true
+                     :duplicate? true
+                     :envelope-id envelope-id
+                     :response {"ok" true "duplicate" true "envelope_id" envelope-id "status" "duplicate"}
+                     :effects [diag]})
 
                   (let [raw-inner-payload (or (get-in decoded [:event :message :payload])
                                               (get-in decoded [:message :payload]))
@@ -269,6 +296,10 @@
                                       (get-in decoded [:event :recipient])
                                       (get-in decoded [:payload :recipient])
                                       (:recipient inner-msg))
+                        ev-type (or (get-in decoded [:event :type]) (:type decoded))
+                        validator-only? (or (contains? #{:on-deliver :transfer :settle-escrow :burn :mint :burn-for-credit} ev-type)
+                                            (and (map? (:event decoded))
+                                                 (contains? #{:on-deliver :transfer :settle-escrow :burn} (:type (:event decoded)))))
                         broadcast? (or (= raw-recip "*")
                                        (nil? recipient)
                                        (= :broadcast (:type decoded))
@@ -276,8 +307,29 @@
                                        (= :broadcast (get-in decoded [:event :type]))
                                        (= :receive-gossip (get-in decoded [:event :type])))
                         from-val? (boolean (:from-validator? event))]
-                    (if broadcast?
+                    (cond
+                      validator-only?
+                      (let [eff {:effect :forward-to-validators
+                                 :envelope decoded
+                                 :wire-bytes wire-bytes
+                                 :envelope-id envelope-id
+                                 :broadcast? false}]
+                        {:state (-> (record-seen-id state envelope-id now-ms)
+                                    (update-in [:diagnostics :submitted] (fnil inc 0)))
+                         :ok? true
+                         :duplicate? false
+                         :envelope-id envelope-id
+                         :response {"ok" true "envelope_id" envelope-id "status" "forwarded-validator-only"}
+                         :effects (if from-val? [] [eff])})
+
+                      broadcast?
                       (let [next-bseq (inc (long (get state :next-broadcast-seq 0)))
+                            ttl-ms (long (get state :ttl-ms 86400000))
+                            cutoff-ms (- now-ms ttl-ms)
+                            existing-bcasts (if (pos? now-ms)
+                                              (filterv (fn [e] (>= (long (:received-at e 0)) cutoff-ms))
+                                                       (or (:broadcasts state) []))
+                                              (or (:broadcasts state) []))
                             b-entry {:broadcast-seq next-bseq
                                      :broadcast_seq next-bseq
                                      :envelope-id envelope-id
@@ -288,16 +340,18 @@
                                      :sender sender
                                      :received-at now-ms
                                      :received_at now-ms}
-                            b-ring (conj (or (:broadcasts state) []) b-entry)
+                            b-ring (conj existing-bcasts b-entry)
                             max-b (long (get state :max-broadcast-size 256))
-                            trimmed-b (if (> (count b-ring) max-b)
-                                        (subvec b-ring (- (count b-ring) max-b))
+                            evicted-count (max 0 (- (count b-ring) max-b))
+                            trimmed-b (if (pos? evicted-count)
+                                        (subvec b-ring evicted-count)
                                         b-ring)
                             new-st (-> (record-seen-id state envelope-id now-ms)
                                        (assoc :broadcasts trimmed-b
                                               :next-broadcast-seq next-bseq)
                                        (update-in [:diagnostics :submitted] (fnil inc 0))
-                                       (update-in [:diagnostics :broadcast] (fnil inc 0)))
+                                       (update-in [:diagnostics :broadcast] (fnil inc 0))
+                                       (cond-> (pos? evicted-count) (update-in [:diagnostics :evicted] (fnil + 0) evicted-count)))
                             eff {:effect :forward-to-validators
                                  :envelope decoded
                                  :wire-bytes wire-bytes
@@ -310,11 +364,19 @@
                          :response {"ok" true "envelope_id" envelope-id "seq" next-bseq "broadcast" true "status" "forwarded"}
                          :effects (if from-val? [] [eff])})
 
+                      :else
                       (let [next-seq (inc (long (get-in state [:inbox-seqs recipient] 0)))
                             ttl-ms (long (get state :ttl-ms 86400000))
                             cutoff-ms (- now-ms ttl-ms)
+                            max-recipients (long (get state :max-recipients 1024))
+                            cur-inboxes (get state :inboxes {})
+                            inboxes-full? (and (not (contains? cur-inboxes recipient))
+                                               (>= (count cur-inboxes) max-recipients))
+                            pruned-inboxes (if inboxes-full?
+                                             (dissoc cur-inboxes (first (keys cur-inboxes)))
+                                             cur-inboxes)
                             existing-inbox (filterv (fn [e] (>= (long (:received-at e 0)) cutoff-ms))
-                                                    (get-in state [:inboxes recipient] []))
+                                                    (get pruned-inboxes recipient []))
                             new-entry {:relay-seq next-seq
                                        :relay_seq next-seq
                                        :envelope-id envelope-id
@@ -328,14 +390,17 @@
                                        :received_at now-ms}
                             new-inbox (conj existing-inbox new-entry)
                             max-inbox (long (get state :max-inbox-size 256))
+                            evicted-count (+ (if inboxes-full? 1 0)
+                                             (max 0 (- (count new-inbox) max-inbox)))
                             trimmed-inbox (if (> (count new-inbox) max-inbox)
                                             (subvec new-inbox (- (count new-inbox) max-inbox))
                                             new-inbox)
                             new-st (-> (record-seen-id state envelope-id now-ms)
-                                       (assoc-in [:inboxes recipient] trimmed-inbox)
+                                       (assoc-in [:inboxes] (assoc pruned-inboxes recipient trimmed-inbox))
                                        (assoc-in [:inbox-seqs recipient] next-seq)
                                        (update-in [:diagnostics :submitted] (fnil inc 0))
-                                       (update-in [:diagnostics :delivered] (fnil inc 0)))
+                                       (update-in [:diagnostics :delivered] (fnil inc 0))
+                                       (cond-> (pos? evicted-count) (update-in [:diagnostics :evicted] (fnil + 0) evicted-count)))
                             eff {:effect :forward-to-validators
                                  :envelope decoded
                                  :wire-bytes wire-bytes
@@ -359,7 +424,8 @@
                            (cond->
                             (= :poll-auth-failed (:error v)) (update-in [:diagnostics :auth-failed] (fnil inc 0))
                             (= :poll-skew-exceeded (:error v)) (update-in [:diagnostics :skew-exceeded] (fnil inc 0))
-                            (= :poll-replay-rejected (:error v)) (update-in [:diagnostics :replay-rejected] (fnil inc 0))))]
+                            (= :poll-replay-rejected (:error v)) (update-in [:diagnostics :replay-rejected] (fnil inc 0))
+                            (= :poll-rate-limited (:error v)) (update-in [:diagnostics :rate-limited] (fnil inc 0))))]
             {:state new-st
              :ok? false
              :error (:error v)
@@ -368,15 +434,16 @@
 
           (let [norm-pk (:pubkey v)
                 nonce (:nonce v)
-                state-with-nonce (record-poll-nonce state norm-pk nonce)
+                state-with-nonce (record-poll-nonce state norm-pk nonce (or (:now-ms v) now-ms))
                 since-seq (long (or (:since-seq event) 0))
                 since-bseq (long (or (:since-broadcast-seq event) 0))
                 ttl-ms (long (get state :ttl-ms 86400000))
                 cutoff-ms (- now-ms ttl-ms)
                 inbox (filterv (fn [e] (and (> (long (:relay-seq e)) since-seq)
-                                            (>= (long (:received-at e 0)) cutoff-ms)))
+                                            (or (<= now-ms 0) (>= (long (:received-at e 0)) cutoff-ms))))
                                (get-in state [:inboxes norm-pk] []))
-                bcasts (filterv (fn [e] (> (long (:broadcast-seq e)) since-bseq))
+                bcasts (filterv (fn [e] (and (> (long (:broadcast-seq e)) since-bseq)
+                                             (or (<= now-ms 0) (>= (long (:received-at e 0)) cutoff-ms))))
                                 (get state :broadcasts []))
                 new-st (update-in state-with-nonce [:diagnostics :polled] (fnil inc 0))]
             {:state new-st
@@ -389,6 +456,7 @@
 
       :relay-ack
       (let [ack-seq (long (or (:ack-seq event) 0))
+            ack-bseq (when-let [b (or (:ack-broadcast-seq event) (:ack_broadcast_seq event))] (long b))
             pop-event (assoc event :since-seq ack-seq)
             v (verify-poll-request state pop-event)]
         (if-not (:ok? v)
@@ -398,7 +466,8 @@
                            (cond->
                             (= :poll-auth-failed (:error v)) (update-in [:diagnostics :auth-failed] (fnil inc 0))
                             (= :poll-skew-exceeded (:error v)) (update-in [:diagnostics :skew-exceeded] (fnil inc 0))
-                            (= :poll-replay-rejected (:error v)) (update-in [:diagnostics :replay-rejected] (fnil inc 0))))]
+                            (= :poll-replay-rejected (:error v)) (update-in [:diagnostics :replay-rejected] (fnil inc 0))
+                            (= :poll-rate-limited (:error v)) (update-in [:diagnostics :rate-limited] (fnil inc 0))))]
             {:state new-st
              :ok? false
              :error (:error v)
@@ -407,7 +476,7 @@
 
           (let [norm-pk (:pubkey v)
                 nonce (:nonce v)
-                state-with-nonce (record-poll-nonce state norm-pk nonce)
+                state-with-nonce (record-poll-nonce state norm-pk nonce (or (:now-ms v) now-ms))
                 existing-inbox (get-in state [:inboxes norm-pk] [])
                 new-inbox (filterv (fn [e] (> (long (:relay-seq e)) ack-seq)) existing-inbox)
                 pruned-count (- (count existing-inbox) (count new-inbox))
@@ -416,14 +485,16 @@
                            (update-in [:diagnostics :acked] (fnil inc 0)))]
             {:state new-st
              :ok? true
-             :response {"ok" true
-                        "pubkey" norm-pk
-                        "acked_seq" ack-seq
-                        "pruned" pruned-count}
+             :response (cond-> {"ok" true
+                                "pubkey" norm-pk
+                                "acked_seq" ack-seq
+                                "pruned" pruned-count}
+                         ack-bseq (assoc "acked_broadcast_seq" ack-bseq))
              :effects []})))
 
-      (let [diag {:effect :diagnose :reason :unknown-relay-event :event-type (:type event) :now-ms now-ms}]
-        {:state state
+      (let [diag {:effect :diagnose :reason :unknown-relay-event :event-type (:type event) :now-ms now-ms}
+            new-st (update-in state [:diagnostics :rejected] (fnil inc 0))]
+        {:state new-st
          :ok? false
          :error :unknown-relay-event
          :response {"ok" false "error" "unknown-relay-event"}

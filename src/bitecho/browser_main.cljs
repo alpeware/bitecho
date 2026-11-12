@@ -89,7 +89,7 @@
     (seq? x) (mapv redact-for-js x)
     :else x))
 
-(declare send-to-all-channels! send-chain-state-query! set-p2p-channel-state dial-browser-p2p-peer! handle-inbound-wire-envelope! route-browser-envelope! poll-relay-envelopes! ack-relay-envelopes! submit-relay-envelope!)
+(declare send-to-all-channels! send-chain-state-query! set-p2p-channel-state dial-browser-p2p-peer! handle-inbound-wire-envelope! route-browser-envelope! poll-relay-envelopes! ack-relay-envelopes! submit-relay-envelope! fetch-relay-chain-state!)
 
 (defn- prune-ghost-sessions
   "Removes restored sessions whose ephemeral/session keys (:tx-key, :ephemeral-priv)
@@ -522,8 +522,9 @@
      (when (:persist? opts-map)
        (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom)))
      (when relay-url
-       (let [since-mseq (atom 0)
-             since-bseq (atom 0)
+       (fetch-relay-chain-state! relay-url {:node-atom node-atom})
+       (let [since-mseq (atom (long (or (get-in @node-atom [:light-state :relay-since-seq]) 0)))
+             since-bseq (atom (long (or (get-in @node-atom [:light-state :relay-since-broadcast-seq]) 0)))
              polling? (atom false)
              poll-tick!
              (fn poll-tick! []
@@ -549,6 +550,10 @@
                                       (let [last-b (last bcasts)
                                             bseq (or (:broadcast_seq last-b) (:broadcast-seq last-b))]
                                         (when bseq (reset! since-bseq (long bseq)))))
+                                    (swap! node-atom (fn [n]
+                                                       (-> n
+                                                           (assoc-in [:light-state :relay-since-seq] @since-mseq)
+                                                           (assoc-in [:light-state :relay-since-broadcast-seq] @since-bseq))))
                                     (doseq [item all-items]
                                       (let [env-raw (or (:envelope_hex item) (:envelope item))
                                             wire-bytes (when env-raw
@@ -556,7 +561,7 @@
                                         (when wire-bytes
                                           (handle-inbound-wire-envelope! node-atom wire-bytes))))
                                     (when (seq msgs)
-                                      (ack-relay-envelopes! relay-url pk-hex privkey @since-mseq)))
+                                      (ack-relay-envelopes! relay-url pk-hex privkey @since-mseq {:ack-broadcast-seq @since-bseq})))
                                   (finally
                                     (reset! polling? false)))))
                        (.catch (fn [_]
@@ -1699,7 +1704,7 @@
   ([relay-url envelope _opts]
    (js/Promise.
     (fn [resolve _]
-      (let [url (str (str/replace relay-url #"/+$" "") "/relay/v1/send")
+      (let [url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/send")
             env-hex (cond
                       (fressian/bytes? envelope) (fressian/bytes->hex envelope)
                       (string? envelope) envelope
@@ -1722,6 +1727,7 @@
       (let [now-ms (.now js/Date)
             pk-hex (if (fressian/bytes? pubkey) (fressian/bytes->hex pubkey) (str pubkey))
             since-seq (long (or (:since-seq opts) (:seq-gte opts) 0))
+            bseq (long (or (:since-broadcast-seq opts) 0))
             nonce (or (:nonce opts) (fressian/bytes->hex (crypto/random-bytes 16)))
             sig (relay/sign-poll-request privkey {:pubkey pk-hex
                                                   :since-seq since-seq
@@ -1738,8 +1744,17 @@
                      (:limit opts) (assoc "limit" (str (:limit opts)))
                      (:timeout-ms opts) (assoc "timeout_ms" (str (:timeout-ms opts))))
             q-str (str/join "&" (map (fn [[k v]] (str (js/encodeURIComponent (name k)) "=" (js/encodeURIComponent (str v)))) params))
-            url (str (str/replace relay-url #"/+$" "") "/relay/v1/poll?" q-str)]
-        (-> (js/fetch url #js {:method "GET"})
+            base-url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/poll")
+            url (str base-url "?" q-str)
+            headers (cond-> {"X-Bitecho-Pubkey" pk-hex
+                             "X-Bitecho-Since-Seq" (str since-seq)
+                             "X-Bitecho-Since-Broadcast-Seq" (str bseq)
+                             "X-Bitecho-Timestamp-Ms" (str now-ms)
+                             "X-Bitecho-Nonce" nonce
+                             "X-Bitecho-Signature" sig}
+                      (:timeout-ms opts) (assoc "X-Bitecho-Wait-Ms" (str (:timeout-ms opts))))]
+        (-> (js/fetch url #js {:method "GET"
+                               :headers (clj->js headers)})
             (.then (fn [res] (.json res)))
             (.then (fn [data] (resolve (js->clj data :keywordize-keys true))))
             (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
@@ -1753,44 +1768,84 @@
       (let [now-ms (.now js/Date)
             pk-hex (if (fressian/bytes? pubkey) (fressian/bytes->hex pubkey) (str pubkey))
             ack-seq (long (or up-to-seq 0))
+            ack-bseq (or (:ack-broadcast-seq opts) (:ack_broadcast_seq opts))
             nonce (or (:nonce opts) (fressian/bytes->hex (crypto/random-bytes 16)))
             sig (relay/sign-poll-request privkey {:pubkey pk-hex
                                                   :since-seq ack-seq
                                                   :timestamp-ms now-ms
                                                   :nonce nonce})
-            url (str (str/replace relay-url #"/+$" "") "/relay/v1/ack")
-            payload (js/JSON.stringify #js {:pubkey pk-hex
-                                            :sig sig
-                                            :signature sig
-                                            :ts now-ms
-                                            :timestamp_ms now-ms
-                                            :nonce nonce
-                                            :ack_seq ack-seq
-                                            :up_to_seq ack-seq})]
+            url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/ack")
+            payload-map (cond-> {"pubkey" pk-hex
+                                 "sig" sig
+                                 "signature" sig
+                                 "ts" now-ms
+                                 "timestamp_ms" now-ms
+                                 "nonce" nonce
+                                 "ack_seq" ack-seq
+                                 "up_to_seq" ack-seq}
+                          ack-bseq (assoc "ack_broadcast_seq" (long ack-bseq)
+                                          "ack-broadcast-seq" (long ack-bseq)))
+            payload (js/JSON.stringify (clj->js payload-map))
+            headers (cond-> {"Content-Type" "application/json"
+                             "X-Bitecho-Pubkey" pk-hex
+                             "X-Bitecho-Ack-Seq" (str ack-seq)
+                             "X-Bitecho-Timestamp-Ms" (str now-ms)
+                             "X-Bitecho-Nonce" nonce
+                             "X-Bitecho-Signature" sig}
+                      ack-bseq (assoc "X-Bitecho-Ack-Broadcast-Seq" (str ack-bseq)))]
         (-> (js/fetch url #js {:method "POST"
-                               :headers #js {"Content-Type" "application/json"}
+                               :headers (clj->js headers)
                                :body payload})
             (.then (fn [res] (.json res)))
             (.then (fn [data] (resolve (js->clj data :keywordize-keys true))))
             (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
 
 (defn fetch-relay-chain-state!
-  "Fetches chain-state and bootstrap info from `relay-url`. Returns a Promise."
+  "Fetches chain-state and bootstrap info from `relay-url`.
+   When `node-atom` is provided (or in `opts`), verifies 2f+1 quorum signatures fail-closed
+   via `light-core/verify-chain-state-quorum` and updates `node-atom`'s `:light-state`
+   via `light-core/apply-verified-chain-state-snapshot`. Returns a Promise."
   ([relay-url] (fetch-relay-chain-state! relay-url nil))
   ([relay-url opts]
    (js/Promise.
     (fn [resolve _]
-      (let [clean (str/replace (str relay-url) #"/+$" "")
-            base-url (if (str/ends-with? clean "/relay/v1")
-                       (str clean "/chain-state")
-                       (str clean "/relay/v1/chain-state"))
+      (let [clean (relay/normalize-relay-base-url relay-url)
+            base-url (str clean "/relay/v1/chain-state")
+            node-atom (if (map? opts) (or (:node-atom opts) @active-node-atom) (or opts @active-node-atom))
+            pk (when node-atom (or (get-in @node-atom [:light-state :pubkey])
+                                   (when-let [kp (:keypair @node-atom)]
+                                     (fressian/bytes->hex (:public-key kp)))))
+            nonce (or (:nonce opts) (str (.now js/Date) "-" (fressian/bytes->hex (crypto/random-bytes 8))))
             q-parts (cond-> []
-                      (:pubkey opts) (conj (str "pubkey=" (js/encodeURIComponent (str (:pubkey opts)))))
-                      (:nonce opts) (conj (str "nonce=" (js/encodeURIComponent (str (:nonce opts))))))
+                      pk (conj (str "pubkey=" (js/encodeURIComponent (str pk))))
+                      nonce (conj (str "nonce=" (js/encodeURIComponent (str nonce)))))
             url (if (seq q-parts) (str base-url "?" (str/join "&" q-parts)) base-url)]
         (-> (js/fetch url #js {:method "GET"})
             (.then (fn [res] (.json res)))
-            (.then (fn [data] (resolve (js->clj data :keywordize-keys true))))
+            (.then (fn [data]
+                     (let [resp (js->clj data :keywordize-keys true)
+                           raw-snaps (or (:snapshots resp) [])
+                           signed-snaps (filterv #(or (:signature %) (:sig %)) raw-snaps)]
+                       (if (and node-atom (seq signed-snaps))
+                         (let [bootstrap (or (get-in @node-atom [:light-state :bootstrap]) default-bootstrap-descriptor)
+                               trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+                               verify-opts {:expected-pubkey pk
+                                            :expected-nonce nonce
+                                            :trusted-validators trusted
+                                            :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0))}
+                               q-res (light-core/verify-chain-state-quorum signed-snaps verify-opts)]
+                           (if (:ok? q-res)
+                             (do
+                               (swap! node-atom update :light-state
+                                      (fn [st] (light-core/apply-verified-chain-state-snapshot st (:snapshot q-res))))
+                               (notify-ui-listeners!)
+                               (resolve (assoc resp :ok true :quorum-verified true :quorum-result q-res)))
+                             (resolve {:ok false :error (:error q-res)})))
+                         (if (seq signed-snaps)
+                           (resolve resp)
+                           (if node-atom
+                             (resolve {:ok false :error "no-verified-relay-snapshots"})
+                             (resolve resp)))))))
             (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
 
 (def api

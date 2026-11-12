@@ -46,10 +46,43 @@
             [bitecho.streamlet.fuzz-test]
             [bitecho.tokenomics-v2-e2e-test]
             [bitecho.wire-negotiation-test]
+            [clojure.string :as str]
             [clojure.test :as t]))
 
+(defn- parse-args [args]
+  (let [args-vec (vec args)
+        skip-int? (or (some #{"--skip-integration"} args-vec)
+                      (= "1" (System/getenv "BITECHO_SKIP_INTEGRATION")))
+        explicit-nses (->> args-vec
+                           (remove #(or (= % "--skip-integration")
+                                        (= % "-n")
+                                        (= % "--ns")))
+                           (filter #(str/starts-with? % "bitecho."))
+                           (map symbol)
+                           vec)]
+    {:skip-integration? skip-int?
+     :namespaces (if (seq explicit-nses) explicit-nses nil)}))
+
 (defn -main
-  "Main entry point for running tests"
-  [& _args]
-  (let [results (t/run-all-tests #"bitecho.*")]
-    (System/exit (+ (:fail results) (:error results)))))
+  "Main entry point for running tests.
+   Supports --skip-integration or BITECHO_SKIP_INTEGRATION=1 to skip ^:integration test vars/namespaces.
+   Accepts targeted namespace names to run a subset of tests."
+  [& args]
+  (let [{:keys [skip-integration? namespaces]} (parse-args args)
+        target-nses (or (seq namespaces)
+                        (->> (all-ns)
+                             (filter #(re-matches #"bitecho\..*" (name (ns-name %))))
+                             (map ns-name)
+                             sort))
+        target-nses (if skip-integration?
+                      (remove #{'bitecho.node-bundle-test 'bitecho.shell.http-relay-test} target-nses)
+                      target-nses)
+        orig-test-var t/test-var
+        results (if skip-integration?
+                  (with-redefs [t/test-var (fn [v]
+                                             (if (:integration (meta v))
+                                               (println "Skipping integration test:" (str (ns-name (:ns (meta v)))) "/" (:name (meta v)))
+                                               (orig-test-var v)))]
+                    (apply t/run-tests target-nses))
+                  (apply t/run-tests target-nses))]
+    (System/exit (+ (:fail results 0) (:error results 0)))))

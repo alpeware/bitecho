@@ -65,10 +65,12 @@
         tls-mgr (http-shell/init-tls-manager! {:state-dir tmp-dir :domain "localhost"})
         relay-atom (atom (relay/init-relay-state))
         relay-waiters-atom (atom {})
+        chain-fetcher-atom (atom nil)
         cfg {:domain "bitecho.org"
              :state-dir tmp-dir
              :relay-atom relay-atom
              :relay-waiters-atom relay-waiters-atom
+             :chain-state-fetcher (fn [pk nonce] (when-let [f @chain-fetcher-atom] (f pk nonce)))
              :http {:bind-ip "127.0.0.1"
                     :http-port 0
                     :https-port 0}}
@@ -217,10 +219,12 @@
         tls-mgr (http-shell/init-tls-manager! {:state-dir tmp-dir :domain "localhost"})
         relay-atom (atom (relay/init-relay-state))
         relay-waiters-atom (atom {})
+        chain-fetcher-atom (atom nil)
         cfg {:domain "bitecho.org"
              :state-dir tmp-dir
              :relay-atom relay-atom
              :relay-waiters-atom relay-waiters-atom
+             :chain-state-fetcher (fn [pk nonce] (when-let [f @chain-fetcher-atom] (f pk nonce)))
              :http {:bind-ip "127.0.0.1"
                     :http-port 0
                     :https-port 0}}
@@ -231,18 +235,19 @@
             alice-kp (crypto/generate-keypair)
             alice-id {:pubkey-hex (basalt/bytes->hex (:public-key alice-kp))
                       :privkey-bytes (:private-key alice-kp)}
+            v1-kp (crypto/generate-keypair)
+            v2-kp (crypto/generate-keypair)
+            v3-kp (crypto/generate-keypair)
+            v1-pk (basalt/bytes->hex (:public-key v1-kp))
+            v2-pk (basalt/bytes->hex (:public-key v2-kp))
+            v3-pk (basalt/bytes->hex (:public-key v3-kp))
             bootstrap {:network :devnet
                        :domain "bitecho.org"
                        :treasury-pubkey (:pubkey-hex alice-id)
                        :custody-pubkey (:pubkey-hex alice-id)
-                       :nodes {:n1 {:node-id :n1
-                                    :ip "127.0.0.1"
-                                    :port 5000
-                                    :agent-port 5010
-                                    :pubkey (:pubkey-hex alice-id)
-                                    :fingerprint "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff"
-                                    :ice-ufrag "u1"
-                                    :ice-pwd "p1"}}}]
+                       :nodes {:v1 {:node-id :v1 :ip "127.0.0.1" :port 5001 :agent-port 5011 :pubkey v1-pk}
+                               :v2 {:node-id :v2 :ip "127.0.0.1" :port 5002 :agent-port 5012 :pubkey v2-pk}
+                               :v3 {:node-id :v3 :ip "127.0.0.1" :port 5003 :agent-port 5013 :pubkey v3-pk}}}]
 
         (testing "connect-validators! returns :transport :http-relay when :relay-url is set"
           (let [conn-res (light-node/connect-validators! alice-id bootstrap {:relay-url relay-url})]
@@ -251,18 +256,61 @@
             (is (= :http-relay (:validator-id conn-res)))
             (is (fn? (:send-fn conn-res)))))
 
-        (testing "maybe-sync-account-state! succeeds and updates burn-floor via :relay-url"
+        (testing "connect-validators! works identically with /relay/v1 suffix in URL"
+          (let [conn-res (light-node/connect-validators! alice-id bootstrap {:relay-url (str relay-url "/relay/v1")})]
+            (is (true? (:ok? conn-res)))
+            (is (= :http-relay (:transport conn-res)))))
+
+        (testing "maybe-sync-account-state! fails closed when relay has snapshots: [] or unsigned snapshots"
           (let [state-atom (atom (light-core/init-light-state alice-id {:subnet-id "test/relay-sync"
                                                                         :economy-enabled? true
-                                                                        :burn-floor 0}))
+                                                                        :burn-floor 0
+                                                                        :epoch 0}))
                 sync-res (light-node/maybe-sync-account-state! state-atom bootstrap
                                                                (:pubkey-hex alice-id)
                                                                (:privkey-bytes alice-id)
                                                                {:relay-url relay-url})]
-            (is (true? (:ok? sync-res)))
-            (is (= 100 (:burn-floor @state-atom)))))
+            (is (false? (:ok? sync-res)))
+            (is (= "no-verified-relay-snapshots" (:error sync-res)))
+            (is (= 0 (:burn-floor @state-atom)))
+            (is (= 0 (:epoch @state-atom)))
+            (is (pos? (get-in @state-atom [:diagnostics :chain-state-sync-failed] 0)))))
 
-        (testing "run-one-shot! submits offer envelope via :relay-url and succeeds"
+        (testing "maybe-sync-account-state! verifies 2f+1 quorum with signed snapshots and works with /relay/v1 suffix"
+          (reset! chain-fetcher-atom
+                  (fn [pk nonce]
+                    [(light-core/sign-chain-state-snapshot
+                      {:validator-pubkey v1-pk
+                       :pubkey pk
+                       :finalized-epoch 15
+                       :balance 1000000000
+                       :spendable 1000000000
+                       :seq 2
+                       :nonce nonce}
+                      (:private-key v1-kp))
+                     (light-core/sign-chain-state-snapshot
+                      {:validator-pubkey v2-pk
+                       :pubkey pk
+                       :finalized-epoch 15
+                       :balance 1000000000
+                       :spendable 1000000000
+                       :seq 2
+                       :nonce nonce}
+                      (:private-key v2-kp))]))
+          (let [state-atom (atom (light-core/init-light-state alice-id {:subnet-id "test/relay-sync"
+                                                                        :economy-enabled? true
+                                                                        :burn-floor 0
+                                                                        :epoch 0}))
+                sync-res (light-node/maybe-sync-account-state! state-atom bootstrap
+                                                               (:pubkey-hex alice-id)
+                                                               (:privkey-bytes alice-id)
+                                                               {:relay-url (str relay-url "/relay/v1")})]
+            (is (true? (:ok? sync-res)))
+            (is (= 15 (:epoch @state-atom)))
+            (is (= 1000000000 (get-in @state-atom [:account :balance])))
+            (is (= 1000000000 (get-in @state-atom [:account :spendable])))))
+
+        (testing "run-one-shot! submits offer envelope via :relay-url (and /relay/v1 suffix) and succeeds"
           (let [bob-kp (crypto/generate-keypair)
                 bob-pk (basalt/bytes->hex (:public-key bob-kp))
                 node-state-dir (doto (java.io.File. tmp-dir "node-state") (.mkdirs))
@@ -273,18 +321,20 @@
                 opts {:cmd-map cmd-map
                       :state-dir (str node-state-dir)
                       :bootstrap (str desc-file)
-                      :relay-url relay-url
+                      :relay-url (str relay-url "/relay/v1")
                       :auto-sync? false}
                 res (light-node/run-one-shot! opts)]
             (is (true? (get res "ok")))
             (is (string? (get res "session_id")))
             ;; Verify the envelope was accepted into relay-atom
             (is (pos? (get-in @relay-atom [:diagnostics :submitted] 0)))
-            ;; And Bob can poll the envelope from relay
-            (let [poll-b (light-node/poll-relay-envelopes! relay-url bob-pk (:private-key bob-kp))]
+            ;; And Bob can poll and ack the envelope from relay using /relay/v1
+            (let [poll-b (light-node/poll-relay-envelopes! (str relay-url "/relay/v1") bob-pk (:private-key bob-kp))]
               (is (true? (get poll-b "ok")))
               (is (pos? (+ (count (get poll-b "messages" []))
-                           (count (get poll-b "broadcasts" [])))))))))
+                           (count (get poll-b "broadcasts" [])))))
+              (let [ack-b (light-node/ack-relay-envelopes! (str relay-url "/relay/v1") bob-pk (:private-key bob-kp) 1 {:ack-broadcast-seq 1})]
+                (is (true? (get ack-b "ok"))))))))
       (finally
         ((:stop-fn srv))))))
 

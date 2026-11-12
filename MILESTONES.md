@@ -760,10 +760,10 @@ Per Simon's refactoring-first architecture decision (`2026-11-08` / `2026-11-09`
       - `F-H2`: Node UDP accept test tagged `^:integration` in `test/bitecho/node_bundle_test.clj`.
     - P2P Candidate Filter: Rejected self-candidates in `handle-wire-p2p-answer` and added `:closed` to `:p2p-link-bind` phase guard across JVM, Node.js, and Browser runtimes.
     - Pure Sans-IO HTTP Gateway Relay Protocol (`bitecho.core.protocol.relay`):
-      - Manages inboxes for unicast envelopes (`max-inbox-size 256`), ring for broadcasts (`max-broadcast-size 256`), SHA-256 deduplication, Ed25519 outer signature verification, Proof-of-Possession poll authentication (`bitecho-relay-poll-v1|...`), clock skew checks, and nonce replay protection.
+      - Manages bounded inboxes for unicast envelopes (`max-inbox-size 256`, `:max-total-queued-bytes 16MB`, `:max-recipients 1024`), ring for broadcasts (`max-broadcast-size 256`, 24h TTL eviction), SHA-256 deduplication, Ed25519 outer signature verification, Proof-of-Possession poll authentication (`bitecho-relay-poll-v1|...`), clock skew checks, timestamped nonce replay map (`:max-nonces 2048`), and validator-only transaction dispatch (`:forward-to-validators`).
     - Edge HTTP Shell Endpoints (`bitecho.shell.http`):
-      - `/relay/v1/send`, `/relay/v1/poll` (with virtual thread long polling park), `/relay/v1/ack`, `/relay/v1/chain-state` served on both `:80` and `:443`.
-    - 3-Runtime `--relay-url` support in `light_node.clj`, `node_main.cljs`, and `browser_main.cljs`.
+      - `/relay/v1/send`, `/relay/v1/poll` (with virtual thread long polling park up to 25s and max 256 waiters), `/relay/v1/ack` (with `:ack-broadcast-seq`), `/relay/v1/chain-state` (with 10s TTL validator cache and fail-closed 2f+1 snapshot quorum verification; zero synthetic snapshots fabricated) served on both `:80` and `:443` with token-bucket rate limiting and bounded body streaming (16MB max, 413 on overflow).
+    - 3-Runtime `--relay-url` CLI flag & `BITECHO_RELAY_URL` env var support in `light_node.clj`, `node_main.cljs`, and `browser_main.cljs` with automatic URL normalization (`normalize-relay-base-url` accepting `http://host:port` or `http://host:port/relay/v1`).
     - Full integration tests (`test/bitecho/shell/http_relay_test.clj`), generative property tests (`test/bitecho/core/protocol/relay_test.cljc`), 100% test pass on JVM and Node CLJS.
 
 

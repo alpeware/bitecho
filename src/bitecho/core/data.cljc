@@ -586,10 +586,12 @@
             {:ok? false :error :invalid-cert-proof}
             (let [blob-entry (when (and target (:blobs ctx))
                                (get-in (:blobs ctx) [:entries target]))
-                  blob-bs (when blob-entry (:bytes blob-entry))]
+                  blob-bs (or (when blob-entry (or (:bytes blob-entry) (:blob/bytes blob-entry)))
+                              (get-in ctx [:blob :blob/bytes])
+                              (get-in ctx [:blob :bytes]))]
               (if-not (bytes? blob-bs)
-                {:ok? true}
-                (let [decoded (when (= "application/fressian" (:media-type blob-entry))
+                {:ok? false :error :missing-cert-blob}
+                (let [decoded (when (and blob-entry (= "application/fressian" (:media-type blob-entry)))
                                 (try (fressian/decode-wire blob-bs)
                                      (catch #?(:clj Exception :cljs :default) _ nil)))
                       cert-der (cond
@@ -599,12 +601,15 @@
                                  (and (map? decoded) (string? (:cert-pem decoded)))
                                  (acme/extract-first-pem-cert-der (:cert-pem decoded))
 
+                                 (map? decoded)
+                                 nil
+
                                  :else
                                  (or (acme/extract-first-pem-cert-der (fressian/bytes->utf8 blob-bs))
                                      blob-bs))
                       actual-fp (when (bytes? cert-der)
                                   (str/lower-case (basalt/bytes->hex (crypto/sha256 cert-der))))]
-                  (if (= norm-fp actual-fp)
+                  (if (and actual-fp (= norm-fp actual-fp))
                     {:ok? true}
                     {:ok? false :error :cert-fingerprint-mismatch}))))))
 
