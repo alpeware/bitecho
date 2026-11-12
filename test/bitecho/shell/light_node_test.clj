@@ -1263,7 +1263,8 @@
                   "--auto-register-home-set" "--no-auto-register-home-set"
                   "--cmd-file" "--events-out" "--min-seq" "--after-ts"
                   "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"
-                  "--relay-url"}]
+                  "--relay-url" "--daemon" "--control-port" "--max-epoch-skew"
+                  "--block" "--until-event"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))

@@ -437,6 +437,22 @@
       (let [forged-snap (assoc signed-snap :balance 999999)
             r-bad (relay/reduce-relay st0 {:type :relay-submit :envelope forged-snap :now-ms 1100})]
         (is (false? (:ok? r-bad)))
-        (is (= :invalid-signature (:error r-bad)))))))
+        (is (= :invalid-signature (:error r-bad))))
+
+      ;; 5. F-P0-9: Known-validators allowlist rejection
+      (let [kp-other (crypto/generate-keypair)
+            other-pub (basalt/bytes->hex (:public kp-other))
+            st-with-known (assoc st0 :known-validators {:primary other-pub})
+            r-rejected (relay/reduce-relay st-with-known {:type :relay-submit :envelope signed-snap :from-validator? true :now-ms 1200})]
+        (is (false? (:ok? r-rejected)) "Snapshot signed by unknown validator must be rejected")
+        (is (= :unknown-validator (:error r-rejected)))
+        (is (some #(= :unknown-validator (:reason %)) (:effects r-rejected)) "Emits :unknown-validator diagnostic")
+        (is (empty? (get-in (:state r-rejected) [:inboxes user-pub])) "Inbox remains empty on unknown validator rejection"))
+
+      ;; 6. F-P0-9: Known-validators allowlist acceptance when matching
+      (let [st-with-val (assoc st0 :known-validators {:primary val-pub})
+            r-accepted (relay/reduce-relay st-with-val {:type :relay-submit :envelope signed-snap :from-validator? true :now-ms 1300})]
+        (is (true? (:ok? r-accepted)) "Snapshot signed by authorized validator in allowlist must be accepted")
+        (is (= 1 (count (get-in (:state r-accepted) [:inboxes user-pub]))))))))
 
 

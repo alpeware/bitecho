@@ -513,6 +513,26 @@
                                        (= :receive-gossip (get-in decoded [:event :type])))
                         from-val? (or (boolean (:from-validator? event)) snap?)]
                     (cond
+                      (and snap? (seq (:known-validators state))
+                           (let [kv (:known-validators state)
+                                 allowed (if (map? kv)
+                                           (set (concat (map normalize-pubkey-hex (vals kv))
+                                                        (map normalize-pubkey-hex (keys kv))))
+                                           (set (map normalize-pubkey-hex kv)))]
+                             (not (contains? allowed sender))))
+                      (let [diag {:effect :diagnose
+                                  :reason :unknown-validator
+                                  :validator-pubkey sender
+                                  :now-ms now-ms}
+                            new-st (-> state
+                                       (update-in [:diagnostics :rejected] (fnil inc 0))
+                                       (update-in [:diagnostics :unknown-validator] (fnil inc 0)))]
+                        {:state new-st
+                         :ok? false
+                         :error :unknown-validator
+                         :response {"ok" false "error" "unknown-validator" "validator_pubkey" sender}
+                         :effects [diag]})
+
                       validator-only?
                       (let [eff {:effect :forward-to-validators
                                  :envelope decoded

@@ -32,7 +32,7 @@ Polls for queued messages addressed to `pubkey` and public broadcast envelopes.
     "signature": "<128-char-hex-signature>"
   }
   ```
-  *Canonical string for signature:* `(str "relay-poll:" pubkey ":" since-seq ":" since-broadcast-seq ":" timestamp-ms ":" nonce)`
+  *Canonical string for signature:* `(str "bitecho-relay-poll-v1|" pubkey "|" since-seq "|" timestamp-ms "|" nonce)`
 - **Response:**
   ```json
   {
@@ -70,6 +70,7 @@ Submits an envelope for forwarding to target inboxes or network broadcast.
   }
   ```
   *Note:* Submissions carrying valid validator-signed `:chain-state-snapshot` envelopes (`:validator-pubkey` and `:signature`) are verified via canonical snapshot signing payloads and routed directly into the queried account's inbox.
+  *Intra-Ring Replication (F-P0-1):* Intra-cluster peer forwarding includes headers `X-Bitecho-Relay-Replicated: true` and `X-Bitecho-Relay-Auth: <hmac-sha256(secret, path + ":" + body)>`. Requests claiming replication without valid HMAC are rejected with 403 Forbidden.
 
 #### `POST /relay/v1/ack`
 Acknowledges receipt of polled envelopes, allowing the gateway to garbage collect delivered items.
@@ -84,7 +85,7 @@ Acknowledges receipt of polled envelopes, allowing the gateway to garbage collec
     "signature": "<hex>"
   }
   ```
-  *Canonical string for signature:* `(str "relay-ack:" pubkey ":" ack-seq ":" ack-broadcast-seq ":" timestamp-ms ":" nonce)`
+  *Canonical string for signature:* `(str "bitecho-relay-poll-v1|" pubkey "|" ack-seq "|" timestamp-ms "|" nonce)`
 - **Response:**
   ```json
   {
@@ -104,18 +105,27 @@ Queries validator quorum for an account's authenticated chain state snapshot.
   ```json
   {
     "ok": true,
-    "snapshot": {
-      "type": "chain-state-snapshot",
-      "pubkey": "<hex>",
-      "epoch": 42,
-      "balance": 1000000,
-      "spendable": 1000000,
-      "seq": 5,
-      "validator_pubkey": "<hex>",
-      "signature": "<hex>"
-    }
+    "pubkey": "<hex>",
+    "snapshots": [
+      {
+        "type": "chain-state-snapshot",
+        "validator_pubkey": "<hex>",
+        "pubkey": "<hex>",
+        "finalized_epoch": 42,
+        "balance": 1000000,
+        "spendable": 1000000,
+        "seq": 5,
+        "deps": [],
+        "escrows": [],
+        "nonce": "<string>",
+        "signature": "<128-hex-signature>"
+      }
+    ],
+    "min_signaling_burn": 100,
+    "bootstrap": "bitecho.org"
   }
   ```
+  *Canonical string for snapshot signature:* `(str "bitecho-chain-state-snapshot-v1|" validator-pubkey "|" pubkey "|" finalized-epoch "|" balance "|" spendable "|" seq "|" comma-joined-deps "|" canonical-escrows-str "|" nonce)`
 
 #### `GET /healthz`
 Liveness probe returning HTTP 200 `{"ok": true}`.

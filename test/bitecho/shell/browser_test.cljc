@@ -646,8 +646,8 @@
                                     (collect-keys populated-light)
                                     (collect-keys base-anchor)
                                     (collect-keys base-conn)))))
-        ;; All 42 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
-        (is (= 42 (count (keys base-light))))
+        ;; All 43 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
+        (is (= 43 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)

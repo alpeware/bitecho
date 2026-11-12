@@ -19,6 +19,7 @@
             [taoensso.nippy :as nippy])
   (:import [com.sun.net.httpserver HttpHandler HttpServer]
            [java.io BufferedReader InputStreamReader PrintWriter RandomAccessFile]
+           [java.lang ProcessHandle ProcessBuilder ProcessBuilder$Redirect]
            [java.net InetSocketAddress URI]
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
            [java.nio.channels FileChannel]
@@ -376,9 +377,13 @@
                                     seq-num (assoc "up_to_seq" seq-num "ack_seq" seq-num)
                                     bseq (assoc "up_to_broadcast_seq" bseq "ack_broadcast_seq" bseq)
                                     to (assoc "to" to "session_id" to)))
-                   "wait" (let [t (extract-long-flag args "--timeout-ms" nil)]
-                            (cond-> {"cmd" "wait"}
-                              t (assoc "timeout_ms" t)))
+                   "wait" (let [t (or (extract-long-flag args "--timeout-ms" nil)
+                                      (extract-long-flag args "--timeout" nil))
+                                ms (extract-long-flag args "--min-seq" nil)
+                                block? (boolean (or (some #{"--block"} args) (some #{"--until-event"} args)))]
+                            (cond-> {"cmd" "wait" "timeout_ms" (or t 30000)}
+                              ms (assoc "min_seq" ms)
+                              block? (assoc "block" true)))
                    "retransmit-outbox" (let [sid (or (extract-flag-value args "--session-id" nil)
                                                      (extract-flag-value args "--session" nil))]
                                          (cond-> {"cmd" "retransmit-outbox"}
@@ -416,16 +421,52 @@
      (when candidate
        (relay/normalize-relay-base-url candidate)))))
 
+(defn- extract-subverb-and-args
+  "Extracts the subverb and remaining arguments, allowing global flags like
+   --state-dir <path> or --control-port <port> to appear before or after the subverb."
+  [tokens]
+  (let [global-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
+    (loop [rem (vec tokens)]
+      (if (empty? rem)
+        {:subverb nil :subargs []}
+        (let [tok (first rem)]
+          (if (contains? global-valued-flags tok)
+            (recur (vec (drop 2 rem)))
+            (if (str/starts-with? tok "--")
+              (recur (vec (rest rem)))
+              ;; Found the subverb
+              (let [subverb tok
+                    rest-tokens (vec (rest rem))
+                    cleaned-subargs (loop [in rest-tokens
+                                           out []]
+                                      (if (empty? in)
+                                        out
+                                        (let [t (first in)]
+                                          (if (contains? global-valued-flags t)
+                                            (recur (vec (drop 2 in)) out)
+                                            (recur (vec (rest in)) (conj out t))))))]
+                {:subverb subverb
+                 :subargs cleaned-subargs}))))))))
+
 (defn parse-light-node-args
   "Parses light-node command line arguments into an options map."
   ([args]
    (parse-light-node-args args #(System/getenv %)))
   ([args getenv-fn]
    (let [clean-args (if (= (first args) "light-node") (vec (rest args)) (vec args))
-         verb (first clean-args)
+         first-tok (first clean-args)
+         first-non-flag (if (and (string? first-tok) (str/starts-with? first-tok "--"))
+                          (:subverb (extract-subverb-and-args clean-args))
+                          first-tok)
+         verb first-non-flag
          ctl? (= verb "ctl")
          serve? (= verb "serve")
+         daemon? (= verb "daemon")
          wait-event? (= verb "wait-event")
+         serve-daemon? (and serve? (boolean (some #{"--daemon"} clean-args)))
+         ctl-sub (when ctl? (extract-subverb-and-args (rest clean-args)))
+         daemon-sub (when daemon? (extract-subverb-and-args (rest clean-args)))
+         ctl-ensure? (and ctl? (= (:subverb ctl-sub) "ensure"))
          default-state-dir (str (System/getProperty "user.home") "/.bitecho/light-node")
          default-bootstrap "https://bitecho.org/devnet/bootstrap.txt"
          state-dir (or (extract-flag-value clean-args "--state-dir" nil) default-state-dir)
@@ -436,7 +477,8 @@
          auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
          sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
          control-port (extract-long-flag clean-args "--control-port" (if serve? 5020 nil))
-         max-epoch-skew (extract-long-flag clean-args "--max-epoch-skew" nil)
+         raw-skew (extract-long-flag clean-args "--max-epoch-skew" nil)
+         max-epoch-skew (when raw-skew (max 1 (long raw-skew)))
          no-auto-reg? (boolean (some #{"--no-auto-register-home-set"} clean-args))
          explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
          auto-register-home-set? (and (not no-auto-reg?) (or explicit-auto-reg? (and serve? autonomous?)))
@@ -481,6 +523,7 @@
                           :realm turn-realm
                           :force-relay? turn-force-relay?}))]
      (cond-> {:mode (cond
+                      (or daemon? ctl-ensure? serve-daemon?) :daemon
                       ctl? :ctl
                       serve? :serve
                       wait-event? :wait-event
@@ -492,13 +535,27 @@
               :auto-sync? (boolean auto-sync?)
               :auto-register-home-set? (boolean auto-register-home-set?)
               :transport transport
-              :cmd-map (let [m (when-not (or ctl? serve? wait-event?) (build-one-shot-cmd-map verb (rest clean-args)))]
+              :cmd-map (let [m (when-not (or ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
+                                 (build-one-shot-cmd-map verb (if (and (string? first-tok) (str/starts-with? first-tok "--"))
+                                                                (:subargs (extract-subverb-and-args clean-args))
+                                                                (rest clean-args))))]
                          (cond-> m
                            subnet-id (assoc "subnet_id" subnet-id)))}
        control-port (assoc :control-port control-port)
        max-epoch-skew (assoc :max-epoch-skew max-epoch-skew)
-       ctl? (assoc :ctl-subverb (second clean-args)
-                   :ctl-args (vec (drop 2 clean-args)))
+       (or daemon? ctl-ensure? serve-daemon?)
+       (assoc :daemon-action (cond
+                               serve-daemon? "start"
+                               ctl-ensure? "ensure"
+                               daemon? (or (:subverb daemon-sub) "start")
+                               :else "start")
+              :daemon-args (cond
+                             daemon? (or (:subargs daemon-sub) [])
+                             ctl-ensure? (or (:subargs ctl-sub) [])
+                             :else [])
+              :raw-args clean-args)
+       ctl? (assoc :ctl-subverb (:subverb ctl-sub)
+                   :ctl-args (or (:subargs ctl-sub) []))
        sync-interval-ms (assoc :sync-interval-ms sync-interval-ms)
        home-set-price (assoc :home-set-price home-set-price)
        cmd-file (assoc :cmd-file cmd-file)
@@ -1700,8 +1757,9 @@
   ([^PrintWriter writer data]
    (emit-json-line! writer data nil))
   ([^PrintWriter writer data events-out-path]
-   (.println writer ^String (json/write-str data))
-   (.flush writer)
+   (when writer
+     (.println writer ^String (json/write-str data))
+     (.flush writer))
    (when events-out-path
      (try (append-event-jsonl! events-out-path data) (catch Exception _ nil)))))
 
@@ -1835,7 +1893,21 @@
             ingress-send (when ingress-peers-atom (get @ingress-peers-atom norm-target))
             direct-send (or (:send-fn p2p-entry) ingress-send)]
         (if direct-send
-          (try (direct-send env) (catch Throwable _ (send-default!)))
+          (try
+            (let [ok? (direct-send env)]
+              (if (false? ok?)
+                (throw (ex-info "p2p-direct-failed" {}))
+                ok?))
+            (catch Throwable _
+              (when (and state-atom (:p2p-session-id env))
+                (let [cmd-res (light-core/handle-command @state-atom
+                                                         {"cmd" "p2p-channel-state"
+                                                          "session_id" (:p2p-session-id env)
+                                                          "connected" false
+                                                          "error" "p2p-direct-failed"}
+                                                         privkey-bytes)]
+                  (reset! state-atom (:state cmd-res))))
+              (send-default!)))
           (do
             (when (and state-atom (:p2p-session-id env))
               (let [cmd-res (light-core/handle-command @state-atom
@@ -2243,13 +2315,13 @@
                                 (:net-envelopes res))]
                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
                   (do
+                    (reset! state-atom (:state res))
                     (send-routed-envelopes! live-envs
                                             (when currently-live? (:send-fn @conn-atom))
                                             p2p-peers-atom
                                             ingress-peers-atom
                                             state-atom
                                             (:privkey-bytes identity))
-                    (reset! state-atom (:state res))
                     (sync-conn-diagnostics! state-atom conn-atom)
                     (save-light-state! state-file @state-atom)
                     (when-let [resp (:response res)]
@@ -2297,21 +2369,39 @@
                                   (let [err "send-failed"]
                                     (when conn-atom
                                       (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
-                                    (when state-atom
-                                      (swap! state-atom assoc :connected? false :connection-error err))
-                                    (sync-conn-diagnostics! state-atom conn-atom)
-                                    (let [err-map {"ok" false "error" err}]
-                                      (emit! err-map)
-                                      err-map)))))
+                                    (if (= verb "send")
+                                      (do
+                                        (reset! state-atom (assoc (:state res) :connected? false :connection-error err))
+                                        (sync-conn-diagnostics! state-atom conn-atom)
+                                        (save-light-state! state-file @state-atom)
+                                        (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
+                                          (emit! err-map)
+                                          err-map))
+                                      (do
+                                        (when state-atom
+                                          (swap! state-atom assoc :connected? false :connection-error err))
+                                        (sync-conn-diagnostics! state-atom conn-atom)
+                                        (let [err-map {"ok" false "error" err}]
+                                          (emit! err-map)
+                                          err-map)))))))
                             (let [err (or (:error reconn) "listener-disabled")]
                               (when conn-atom
                                 (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
-                              (when state-atom
-                                (swap! state-atom assoc :connected? false :connection-error err))
-                              (sync-conn-diagnostics! state-atom conn-atom)
-                              (let [err-map {"ok" false "error" err}]
-                                (emit! err-map)
-                                err-map)))))))))
+                              (if (= verb "send")
+                                (do
+                                  (reset! state-atom (assoc (:state res) :connected? false :connection-error err))
+                                  (sync-conn-diagnostics! state-atom conn-atom)
+                                  (save-light-state! state-file @state-atom)
+                                  (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
+                                    (emit! err-map)
+                                    err-map))
+                                (do
+                                  (when state-atom
+                                    (swap! state-atom assoc :connected? false :connection-error err))
+                                  (sync-conn-diagnostics! state-atom conn-atom)
+                                  (let [err-map {"ok" false "error" err}]
+                                    (emit! err-map)
+                                    err-map)))))))))))
               (do
                 (reset! state-atom (:state res))
                 (sync-conn-diagnostics! state-atom conn-atom)
@@ -2336,8 +2426,19 @@
   (let [req-port (int (or (:control-port conn-opts) 5020))
         server (try
                  (HttpServer/create (InetSocketAddress. "127.0.0.1" req-port) 0)
-                 (catch Exception _
-                   (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)))
+                 (catch Exception e
+                   (binding [*out* *err*]
+                     (println (str "WARN: Failed to bind control server to 127.0.0.1:" req-port " (" (.getMessage e) "). Falling back to ephemeral port.")))
+                   (when-let [st (:state-atom ctx)]
+                     (swap! st update-in [:diagnostics :control-port-bind-failed] (fnil inc 0)))
+                   (try
+                     (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+                     (catch Exception e2
+                       (binding [*out* *err*]
+                         (println (str "ERROR: Failed to bind control server to ephemeral port: " (.getMessage e2))))
+                       (when-let [st (:state-atom ctx)]
+                         (swap! st update-in [:diagnostics :control-server-bind-fatal] (fnil inc 0)))
+                       (throw e2)))))
         actual-port (.getPort (.getAddress server))
         token (basalt/bytes->hex (crypto/random-bytes 32))
         pid (extract-pid)
@@ -2362,26 +2463,44 @@
 
                           (and (= method "POST") (= path "/ctl"))
                           (let [body-str (with-open [is (.getRequestBody exchange)]
-                                           (slurp is StandardCharsets/UTF_8))
+                                           (slurp is :encoding "UTF-8"))
                                 cmd-map (try (json/read-str body-str) (catch Exception _ nil))]
                             (if-not (and (map? cmd-map) (contains? cmd-map "cmd"))
                               (let [resp-bytes (.getBytes (json/write-str {"ok" false "error" "malformed-command"}) "UTF-8")]
                                 (.sendResponseHeaders exchange 400 (alength resp-bytes))
                                 (with-open [os (.getResponseBody exchange)]
                                   (.write os resp-bytes)))
-                              (let [res (if (= (get cmd-map "cmd") "wait")
-                                          (let [timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 5000))
+                              (let [cmd-lock (or (:cmd-lock ctx) (:serve-cmd-lock ctx) (Object.))
+                                    res (if (= (get cmd-map "cmd") "wait")
+                                          (let [block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
+                                                timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))
+                                                min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
+                                                          (long ms))
                                                 deadline (+ (System/currentTimeMillis) timeout-ms)]
                                             (loop []
-                                              (if (seq (:event-queue @state-atom))
-                                                (handle-serve-line! cmd-map ctx)
-                                                (let [rem (- deadline (System/currentTimeMillis))]
-                                                  (if (<= rem 0)
-                                                    (handle-serve-line! cmd-map ctx)
-                                                    (do
-                                                      (Thread/sleep (min 100 rem))
-                                                      (recur)))))))
-                                          (handle-serve-line! cmd-map ctx))
+                                              (let [popped (locking cmd-lock
+                                                             (let [q (:event-queue @state-atom)
+                                                                   has-events? (if min-seq
+                                                                                 (some (fn [ev]
+                                                                                         (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "seq") (:seq ev) 0))]
+                                                                                           (>= eid min-seq)))
+                                                                                       q)
+                                                                                 (seq q))]
+                                                               (if has-events?
+                                                                 (handle-serve-line! cmd-map ctx)
+                                                                 nil)))]
+                                                (if popped
+                                                  popped
+                                                  (if (and (:daemon-running? ctx) (false? @(:daemon-running? ctx)))
+                                                    {"ok" false "error" "daemon-shutting-down"}
+                                                    (let [rem (- deadline (System/currentTimeMillis))]
+                                                      (if (and (not block?) (<= rem 0))
+                                                        (locking cmd-lock (handle-serve-line! cmd-map ctx))
+                                                        (do
+                                                          (Thread/sleep (min 50 (if block? 50 (max 10 rem))))
+                                                          (recur)))))))))
+                                          (locking cmd-lock
+                                            (handle-serve-line! cmd-map ctx)))
                                     resp-bytes (.getBytes (json/write-str res) "UTF-8")]
                                 (.sendResponseHeaders exchange 200 (alength resp-bytes))
                                 (with-open [os (.getResponseBody exchange)]
@@ -2392,8 +2511,16 @@
                             (.sendResponseHeaders exchange 404 (alength resp-bytes))
                             (with-open [os (.getResponseBody exchange)]
                               (.write os resp-bytes)))))
-                      (catch Exception _
-                        (try (.sendResponseHeaders exchange 500 0) (catch Exception _ nil))))))]
+                      (catch Exception e
+                        (when state-atom
+                          (swap! state-atom update-in [:diagnostics :control-server-error] (fnil inc 0)))
+                        (try
+                          (let [err-map {"ok" false "error" "internal-server-error" "message" (or (.getMessage e) (str (class e)))}
+                                err-bytes (.getBytes (json/write-str err-map) "UTF-8")]
+                            (.sendResponseHeaders exchange 500 (alength err-bytes))
+                            (with-open [os (.getResponseBody exchange)]
+                              (.write os err-bytes)))
+                          (catch Exception _ nil))))))]
     (.createContext server "/ctl" handler)
     (.setExecutor server (java.util.concurrent.Executors/newCachedThreadPool))
     (.start server)
@@ -2437,8 +2564,11 @@
             err)
           (let [cmd-map (build-one-shot-cmd-map subverb subargs)
                 body-json (json/write-str cmd-map)
+                block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
                 timeout (if (= subverb "wait")
-                          (Duration/ofMillis (+ 5000 (long (or (get cmd-map "timeout_ms") 5000))))
+                          (if block?
+                            (Duration/ofDays 365)
+                            (Duration/ofMillis (+ 5000 (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000)))))
                           (Duration/ofSeconds 10))
                 client (-> (HttpClient/newBuilder)
                            (.connectTimeout (Duration/ofSeconds 3))
@@ -2660,7 +2790,10 @@
              :ingress-peers-atom ingress-peers-atom
              :p2p-peers-atom p2p-peers-atom
              :mdns-atom mdns-atom
-             :conn-opts conn-opts}
+             :conn-opts conn-opts
+             :cmd-lock serve-cmd-lock
+             :serve-cmd-lock serve-cmd-lock
+             :daemon-running? daemon-running?}
         _ (when auto-sync-enabled?
             (doto (Thread.
                    ^Runnable
@@ -2760,7 +2893,14 @@
               (.setDaemon true)
               (.setName "bitecho-light-node-relay-poll")
               (.start)))
-        ctrl-svc (try (start-control-server! state-dir ctx conn-opts) (catch Exception _ nil))
+        ctrl-svc (try
+                   (start-control-server! state-dir ctx conn-opts)
+                   (catch Exception e
+                     (binding [*out* *err*]
+                       (println (str "ERROR: Could not start control server: " (.getMessage e))))
+                     (when-let [st (:state-atom ctx)]
+                       (swap! st update-in [:diagnostics :control-server-fatal] (fnil inc 0)))
+                     nil))
         shutdown-hook (Thread. ^Runnable (fn []
                                            (when ctrl-svc
                                              (try ((:stop! ctrl-svc)) (catch Exception _ nil)))))
@@ -2798,7 +2938,8 @@
                                              sid)]
                            (doseq [sid reconn-sids]
                              (let [sess (get-in @state-atom [:sessions sid])
-                                   pref-cands (or (get-in sess [:p2p-meta :preferred-candidates])
+                                   pref-cands (or (get-in sess [:p2p-meta :local-candidates])
+                                                  (get-in sess [:p2p-meta :preferred-candidates])
                                                   (get-in sess [:p2p :local-candidates])
                                                   (:default-p2p-candidates @state-atom))
                                    pref-tr (or (get-in sess [:p2p-meta :preferred-transport]) "udp")
@@ -2923,11 +3064,135 @@
               (emit-json-line! out-writer (:response res))
               (:response res))))))))
 
+(defn- check-daemon-status
+  "Checks if a daemon is running and responsive via control.json. Returns parsed status map or nil."
+  [state-dir]
+  (let [ctrl-file (io/file state-dir "control.json")]
+    (when (.exists ctrl-file)
+      (try
+        (let [info (json/read-str (slurp ctrl-file))
+              port (get info "port")
+              token (get info "token")
+              pid (get info "pid")]
+          (when (and port token)
+            (let [client (-> (HttpClient/newBuilder)
+                             (.connectTimeout (Duration/ofMillis 1500))
+                             (.build))
+                  req (-> (HttpRequest/newBuilder)
+                          (.uri (URI/create (str "http://127.0.0.1:" port "/ctl")))
+                          (.header "Authorization" (str "Bearer " token))
+                          (.header "Content-Type" "application/json")
+                          (.timeout (Duration/ofMillis 2000))
+                          (.POST (HttpRequest$BodyPublishers/ofString (json/write-str {"cmd" "status"}) StandardCharsets/UTF_8))
+                          (.build))
+                  resp (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))]
+              (when (= 200 (.statusCode resp))
+                (let [st (try (json/read-str (.body resp)) (catch Exception _ nil))]
+                  (when (and (map? st) (get st "ok"))
+                    (assoc st "running" true "pid" pid "control_port" port)))))))
+        (catch Exception _ nil)))))
+
+(defn run-daemon!
+  "Zero-glue process supervisor managing the light-node serve daemon (start, stop, status, restart, ensure)."
+  [opts]
+  (let [state-dir (:state-dir opts)
+        _ (when state-dir (let [d (io/file state-dir)] (when-not (.exists d) (.mkdirs d))))
+        action (or (:daemon-action opts) "start")
+        pid-file (io/file state-dir "daemon.pid")
+        log-file (io/file state-dir "daemon.log")
+        out-writer (PrintWriter. System/out true)]
+    (case action
+      "status"
+      (if-let [st (check-daemon-status state-dir)]
+        (do (emit-json-line! out-writer st) st)
+        (let [res {"ok" false "running" false "error" "daemon-not-running"}]
+          (emit-json-line! out-writer res)
+          res))
+
+      "stop"
+      (let [ctrl-file (io/file state-dir "control.json")
+            pid (or (when (.exists pid-file)
+                      (try (Long/parseLong (str/trim (slurp pid-file))) (catch Exception _ nil)))
+                    (when (.exists ctrl-file)
+                      (try (get (json/read-str (slurp ctrl-file)) "pid") (catch Exception _ nil))))]
+        (if (and pid (pos? (long pid)))
+          (do
+            (try
+              (let [ph-opt (ProcessHandle/of (long pid))]
+                (when (.isPresent ph-opt)
+                  (let [ph (.get ph-opt)]
+                    (.destroy ph)
+                    (try (.get (.onExit ph) 3 java.util.concurrent.TimeUnit/SECONDS)
+                         (catch Exception _ (.destroyForcibly ph))))))
+              (catch Exception _ nil))
+            (when (.exists pid-file) (try (.delete pid-file) (catch Exception _ nil)))
+            (when (.exists ctrl-file) (try (.delete ctrl-file) (catch Exception _ nil)))
+            (let [res {"ok" true "stopped" true "pid" pid}]
+              (emit-json-line! out-writer res)
+              res))
+          (let [res {"ok" true "stopped" false "status" "not-running"}]
+            (emit-json-line! out-writer res)
+            res)))
+
+      ("start" "ensure")
+      (if-let [st (check-daemon-status state-dir)]
+        ;; Idempotent: already running and healthy
+        (let [res (assoc st "already_running" true)]
+          (emit-json-line! out-writer res)
+          res)
+        ;; Not running: spawn background serve daemon
+        (let [raw-args (or (:raw-args opts) [])
+              filtered-args (vec (remove #(or (= % "--daemon")
+                                              (= % "daemon")
+                                              (= % "ensure")
+                                              (= % "start")
+                                              (= % "ctl"))
+                                         raw-args))
+              serve-args (into ["serve"] (filter #(not= % "serve") filtered-args))
+              serve-args (if (some #{"--state-dir"} serve-args)
+                           serve-args
+                           (into serve-args ["--state-dir" state-dir]))
+              java-bin (str (System/getProperty "java.home") "/bin/java")
+              cp (System/getProperty "java.class.path")
+              cmd (into [java-bin "-cp" cp "clojure.main" "-m" "bitecho.shell.light-node"] serve-args)
+              pb (doto (ProcessBuilder. (into-array String cmd))
+                   (.redirectErrorStream true)
+                   (.redirectOutput (ProcessBuilder$Redirect/appendTo log-file)))
+              proc (.start pb)
+              pid (.pid proc)]
+          (spit pid-file (str pid "\n"))
+          ;; Wait up to 30s for daemon to become ready
+          (loop [attempts 0]
+            (if-let [st (check-daemon-status state-dir)]
+              (do
+                (emit-json-line! out-writer st)
+                st)
+              (if (not (.isAlive proc))
+                (let [exit-code (.exitValue proc)
+                      log-tail (try (slurp log-file) (catch Exception _ ""))
+                      err {"ok" false "error" "daemon-exited-early" "exit_code" exit-code "log" log-tail}]
+                  (emit-json-line! out-writer err)
+                  err)
+                (if (>= attempts 60)
+                  (let [err {"ok" false "error" "daemon-start-timeout" "pid" pid}]
+                    (emit-json-line! out-writer err)
+                    err)
+                  (do
+                    (Thread/sleep 500)
+                    (recur (inc attempts)))))))))
+
+      "restart"
+      (do
+        (run-daemon! (assoc opts :daemon-action "stop"))
+        (Thread/sleep 500)
+        (run-daemon! (assoc opts :daemon-action "start"))))))
+
 (defn run-light-node-cli!
   "Dispatches light-node CLI invocation based on parsed arguments."
   [args]
   (let [parsed (parse-light-node-args args)]
     (case (:mode parsed)
+      :daemon (run-daemon! parsed)
       :ctl (run-ctl! parsed)
       :serve (run-serve! parsed)
       :wait-event (run-wait-event! parsed)

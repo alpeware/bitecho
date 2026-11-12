@@ -574,7 +574,7 @@
 ;; 6. `bitecho.shell.smtp` Live TCP + STARTTLS -> Blob + `"mail/..."` Pointer
 ;; =============================================================================
 
-(deftest test-smtp-shell-starttls-and-mail-pointer-replication
+(deftest ^:integration test-smtp-shell-starttls-and-mail-pointer-replication
   (testing "bitecho.shell.smtp upgrades via STARTTLS, blocks open relay with counted :diagnose, stores .eml Blob in blob-fs, and replicates mail/<rcpt>/<ts>-<cid8> Pointer"
     (let [dir1 (make-temp-dir! "smtp-ns1-")
           dir2 (make-temp-dir! "smtp-ns2-")

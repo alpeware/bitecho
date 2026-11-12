@@ -439,6 +439,7 @@
         cfg2-initial {:domain "bitecho.org"
                       :state-dir tmp-dir2
                       :node-id :srv2
+                      :shared-secret "test-cluster-shared-secret"
                       :relay-atom relay-atom2
                       :relay-waiters-atom waiters2
                       :http {:bind-ip "127.0.0.1" :http-port 0 :https-port 0}}
@@ -447,6 +448,7 @@
         cfg1 {:domain "bitecho.org"
               :state-dir tmp-dir1
               :node-id :srv1
+              :shared-secret "test-cluster-shared-secret"
               :relay-atom relay-atom1
               :relay-waiters-atom waiters1
               :cluster {:nodes {:srv1 {:node-id :srv1 :ip "127.0.0.1" :http-port 0}

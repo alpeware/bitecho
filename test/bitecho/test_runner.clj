@@ -32,6 +32,7 @@
             [bitecho.shell.core-test]
             [bitecho.shell.discovery-test]
             [bitecho.shell.http-relay-test]
+            [bitecho.shell.http-test]
             [bitecho.shell.infra-shells-test]
             [bitecho.shell.light-node-test]
             [bitecho.shell.mesh-test]

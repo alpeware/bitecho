@@ -117,27 +117,28 @@
                        msg1-delivered?
                        msg2-delivered?))))
 
-(defspec ^{:doc "Property: 2-epoch skew tolerance and replay-protection enforcement in wire payload processing for non-open sessions"}
+(defspec ^{:doc "Property: 15-epoch skew tolerance and replay-protection enforcement in wire payload processing for non-open sessions"}
   prop-epoch-skew-and-replay-protection 25
-  (prop/for-all [skew (gen/choose -5 5)
+  (prop/for-all [skew (gen/choose -25 25)
                  duplicate? gen/boolean]
                 (let [alice (test-identity)
                       bob (test-identity)
                       callee (:pubkey-hex bob)
                       cmd {"cmd" "offer" "callee" callee "price" 10 "burn" 500}
-                      msg-epoch (+ 10 skew)
+                      msg-epoch (+ 50 skew)
                       st-alice (light-core/init-light-state (:identity alice) {:epoch msg-epoch})
                       res-offer (light-core/handle-command st-alice cmd (:privkey-bytes alice))
                       offer-env (first (filter gossip-env? (:net-envelopes res-offer)))
-                      st-bob (light-core/init-light-state (:identity bob) {:epoch 10})
+                      st-bob (light-core/init-light-state (:identity bob) {:epoch 50})
                       res-bob (light-core/handle-wire-payload st-bob offer-env (:privkey-bytes bob))
-                      within-tolerance? (<= (Math/abs skew) 2)]
+                      within-tolerance? (<= (Math/abs skew) 15)]
                   (if within-tolerance?
                     (let [accepted? (= 1 (count (:pending-offers (:state res-bob))))
                           res-replay (light-core/handle-wire-payload (:state res-bob) offer-env (:privkey-bytes bob))
                           replay-dropped? (= 1 (count (:pending-offers (:state res-replay))))]
                       (and accepted? (if duplicate? replay-dropped? true)))
                     (and (empty? (:pending-offers (:state res-bob)))
+                         (empty? (get-in res-bob [:state :pending-offers]))
                          (pos? (get-in (:state res-bob) [:diagnostics :epoch-skew-dropped] 0)))))))
 
 (defspec ^{:doc "Property: JSONL processor handles arbitrary strings without crashing and never leaks private keys"}
@@ -189,7 +190,7 @@
                       raw-msg (try (light-core/thaw-payload (get-in offer-env [:event :message :payload])) (catch Exception _ nil))
                       tampered-msg (case tamper-field
                                      :price (assoc raw-msg :price (inc price))
-                                     :epoch (assoc raw-msg :epoch (+ epoch 5))
+                                     :epoch (assoc raw-msg :epoch (+ epoch 20))
                                      :session-id (assoc raw-msg :session-id "sess-forged")
                                      :offer-hash (assoc raw-msg :offer-hash "hash-forged")
                                      :none raw-msg)
@@ -229,7 +230,7 @@
                        (= (get-in steps [:state :last-transfer-hash]) (get (last txs) "transfer_hash"))))))
 
 (deftest test-non-vacuous-epoch-skew-and-adoption
-  (testing "Light node adopts first epoch when uninitialized and rejects skew > 2 on non-open session even from epoch 0"
+  (testing "Light node adopts first epoch when uninitialized and rejects skew > 15 on non-open session even from epoch 0"
     (let [alice (test-identity)
           bob (test-identity)
           callee (:pubkey-hex bob)
@@ -241,10 +242,10 @@
           ;; 1. First offer arrives with epoch 0 -> node adopts epoch 0
           res1 (light-core/handle-wire-payload st0 (make-offer 0) (:privkey-bytes bob))
           st1 (:state res1)
-          ;; 2. Offer arrives with epoch 3 (> 2 skew from 0) -> dropped!
-          res2 (light-core/handle-wire-payload st1 (make-offer 3) (:privkey-bytes bob))
-          ;; 3. Offer arrives with epoch 2 (<= 2 skew from 0) -> accepted!
-          res3 (light-core/handle-wire-payload st1 (make-offer 2) (:privkey-bytes bob))]
+          ;; 2. Offer arrives with epoch 16 (> 15 skew from 0) -> dropped!
+          res2 (light-core/handle-wire-payload st1 (make-offer 16) (:privkey-bytes bob))
+          ;; 3. Offer arrives with epoch 15 (<= 15 skew from 0) -> accepted!
+          res3 (light-core/handle-wire-payload st1 (make-offer 15) (:privkey-bytes bob))]
       (is (false? (:epoch-initialized? st0)))
       (is (= 0 (:epoch st1)))
       (is (true? (:epoch-initialized? st1)))
@@ -2831,9 +2832,9 @@
                          (and (false? (:ok? d-res))
                               (= "validator-state-disagreement" (:error d-res))))
 
-             ;; 7. Excessive epoch skew (> 2) fails closed ("validator-epoch-skew-exceeded")
+             ;; 7. Excessive epoch skew (> 15) fails closed ("validator-epoch-skew-exceeded")
                        (let [skewed-snap (light-core/sign-chain-state-snapshot
-                                          (assoc base-snap :validator-pubkey (nth val-pubs 2) :finalized-epoch (+ fin-ep 5))
+                                          (assoc base-snap :validator-pubkey (nth val-pubs 2) :finalized-epoch (+ fin-ep 20))
                                           (:private (nth val-kps 2)))
                              sk-res (light-core/verify-chain-state-quorum [(nth signed-snaps 0) (nth signed-snaps 1) skewed-snap] opts)]
                          (and (false? (:ok? sk-res))
@@ -3530,11 +3531,13 @@
           sid "f6-auto-session"
           sess {:session-id sid :state "open" :peer pk-b
                 :p2p {:phase :closed :connected? false}
-                :p2p-meta {:mode :autonomous :preferred-candidates ["c1"] :reconnect-attempts 0}}
+                :p2p-meta {:mode :autonomous :preferred-candidates ["c1"] :reconnect-attempts 0 :reconnect-needed? true}}
           st (-> (light-core/init-light-state {:pubkey-hex pk-a} {:epoch 1})
                  (assoc-in [:sessions sid] sess))
           t0 1000000]
-      ;; Initially ready to re-offer
+      ;; Without reconnect-needed? true -> false
+      (is (false? (light-core/should-auto-reoffer? (assoc-in st [:sessions sid :p2p-meta :reconnect-needed?] false) sid t0 false)))
+      ;; Initially ready to re-offer when reconnect-needed? is true
       (is (true? (light-core/should-auto-reoffer? st sid t0 false)))
       ;; Record re-offer attempt 1 -> next reconnect is t0 + 1000ms
       (let [st1 (light-core/record-reoffer-attempt st sid t0)]
@@ -3554,6 +3557,103 @@
                             [(+ t0 3000) (+ t0 7000) (+ t0 15000) (+ t0 31000)])]
             (is (>= (get-in st5 [:sessions sid :p2p-meta :reconnect-attempts]) 5))
             (is (= 30000 (light-core/calculate-reconnect-backoff-ms 5)))))))))
+
+(deftest test-event-queue-bounding-and-overflow
+  (testing "F-P0-12..24: Event queue bounding to 256 and overflow diagnostic"
+    (let [id (test-identity)
+          st0 (light-core/init-light-state (:identity id) {})
+          events (mapv (fn [i] {"event" "message-received" "session_id" "s1" "text" (str "msg-" i)}) (range 300))
+          st-bounded (light-core/enqueue-actionable-events st0 events)]
+      (is (= 256 (count (:event-queue st-bounded))))
+      (is (= 44 (get-in st-bounded [:diagnostics :event-queue-overflow])))
+      (is (= 44 (get-in st-bounded [:diagnostics :dropped])))
+      (is (= 45 (get (first (:event-queue st-bounded)) "event_id")))
+      (is (= 300 (get (last (:event-queue st-bounded)) "event_id"))))))
+
+(deftest test-exec-wait-min-seq
+  (testing "exec-wait with min-seq filtering"
+    (let [id (test-identity)
+          st0 (light-core/init-light-state (:identity id) {})
+          events [{"event" "message-received" "session_id" "s1" "text" "m1"}
+                  {"event" "message-received" "session_id" "s1" "text" "m2"}
+                  {"event" "message-received" "session_id" "s1" "text" "m3"}]
+          st-queued (light-core/enqueue-actionable-events st0 events)
+          ;; Wait with min-seq 5 -> no events match -> park: true
+          res-park (light-core/handle-command st-queued {"cmd" "wait" "min_seq" 5} (:privkey-bytes id))]
+      (is (true? (get-in res-park [:response "park"])))
+      (is (empty? (get-in res-park [:response "events"])))
+      ;; Wait with min-seq 2 -> returns m2 and m3
+      (let [res-match (light-core/handle-command st-queued {"cmd" "wait" "min_seq" 2} (:privkey-bytes id))]
+        (is (= 2 (count (get-in res-match [:response "events"]))))
+        (is (= [2 3] (mapv #(get % "event_id") (get-in res-match [:response "events"]))))
+        ;; m1 remains in queue
+        (is (= 1 (count (:event-queue (:state res-match)))))
+        (is (= 1 (get (first (:event-queue (:state res-match))) "event_id")))))))
+
+(deftest test-p2p-offer-custom-candidates-persistence
+  (testing "p2p-offer persists custom candidates and reuses them when omitted"
+    (let [alice (test-identity)
+          bob (test-identity)
+          sid "sess-cands-test"
+          st0 (-> (light-core/init-light-state (:identity alice) {:epoch 1})
+                  (assoc-in [:sessions sid] {:session-id sid :state "open" :peer (:pubkey-hex bob)}))
+          custom-cands ["tcp://nexus.ingress.bitecho.org:443"]
+          ;; 1. Offer with explicit candidates
+          res1 (light-core/handle-command st0 {"cmd" "p2p-offer" "session_id" sid "candidates" custom-cands} (:privkey-bytes alice))
+          st1 (:state res1)
+          env1 (first (:net-envelopes res1))
+          payload1 (light-core/thaw-payload (get-in env1 [:event :message :payload]))]
+      (is (= custom-cands (:candidates payload1)))
+      (is (= custom-cands (get-in st1 [:sessions sid :p2p-meta :local-candidates])))
+      ;; 2. Subsequent offer without candidates reuses persisted local-candidates
+      (let [res2 (light-core/handle-command st1 {"cmd" "p2p-offer" "session_id" sid} (:privkey-bytes alice))
+            env2 (first (:net-envelopes res2))
+            payload2 (light-core/thaw-payload (get-in env2 [:event :message :payload]))]
+        (is (= custom-cands (:candidates payload2)))))))
+
+(deftest test-concurrent-ctl-wait-no-duplicate-events
+  (testing "F-P0-2: Concurrent ctl wait callers popping with cmd-lock receive zero duplicate events"
+    (let [id (test-identity)
+          events (mapv (fn [i]
+                         {"event" "message-received"
+                          "event_id" (inc i)
+                          "seq" (inc i)
+                          "text" (str "msg-" (inc i))})
+                       (range 50))
+          st0 (assoc (light-core/init-light-state (:identity id) {:epoch 1})
+                     :event-queue events)
+          st-atom (atom st0)
+          cmd-lock (Object.)
+          delivered-atom (atom [])
+          thread-count 10
+          latch (java.util.concurrent.CountDownLatch. thread-count)
+          start-gate (java.util.concurrent.CountDownLatch. 1)
+          _threads (mapv (fn [_]
+                           (doto (Thread.
+                                  ^Runnable
+                                  (fn []
+                                    (.await start-gate)
+                                    (loop []
+                                      (let [popped (locking cmd-lock
+                                                     (if (seq (:event-queue @st-atom))
+                                                       (let [res (light-core/handle-command @st-atom {"cmd" "wait"} (:privkey-bytes id))]
+                                                         (reset! st-atom (:state res))
+                                                         (get-in res [:response "events"] []))
+                                                       nil))]
+                                        (when (seq popped)
+                                          (swap! delivered-atom into popped)
+                                          (recur))))
+                                    (.countDown latch)))
+                             (.start)))
+                         (range thread-count))]
+      (.countDown start-gate)
+      (is (.await latch 5 java.util.concurrent.TimeUnit/SECONDS))
+      (let [delivered @delivered-atom
+            delivered-ids (mapv #(get % "event_id") delivered)]
+        (is (= 50 (count delivered)) "All 50 events delivered across concurrent threads")
+        (is (= (count delivered) (count (distinct delivered-ids))) "Zero duplicate event deliveries")
+        (is (empty? (:event-queue @st-atom)) "Event queue fully drained")
+        (is (= 50 (:event-ack-cursor @st-atom)) "Cursor advanced to 50")))))
 
 
 

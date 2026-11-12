@@ -334,6 +334,7 @@
    :subnet-id (str (or (:subnet-id opts) (:subnet-id identity-pub-map) "global"))
    :economy-enabled? (boolean (get opts :economy-enabled? (get-in opts [:bootstrap :economy-enabled?] true)))
    :burn-floor (long (or (:burn-floor opts) (get-in opts [:bootstrap :burn-floor]) 0))
+   :max-epoch-skew (max 1 (long (or (:max-epoch-skew opts) 15)))
    :diagnostics (merge {:subnet-mismatch-dropped 0
                         :p2p-relayed 0
                         :broadcast-duplicates-dropped 0
@@ -1181,7 +1182,7 @@
               (let [fin-epochs (mapv :finalized-epoch valid-snaps)
                     min-fin (apply min fin-epochs)
                     max-fin (apply max fin-epochs)
-                    max-skew (long (or (:max-epoch-skew opts) 2))]
+                    max-skew (max 1 (long (or (:max-epoch-skew opts) 15)))]
                 (if (> (- max-fin min-fin) max-skew)
                   {:ok? false :error "validator-epoch-skew-exceeded"}
                   (let [state-sig (fn [s]
@@ -2182,12 +2183,15 @@
           {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
           (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
                 transport (str (or (get cmd-map "transport") (:transport cmd-map) "udp"))
-                raw-cands (let [rc (or (get cmd-map "candidates") (:candidates cmd-map))]
-                            (if (or (nil? rc)
-                                    (and (coll? rc) (empty? rc))
-                                    (and (string? rc) (str/blank? rc)))
-                              (:default-p2p-candidates state [])
-                              rc))
+                explicit-cands? (let [c (or (get cmd-map "candidates") (:candidates cmd-map))]
+                                  (and (some? c)
+                                       (if (string? c) (not (str/blank? c)) (seq c))))
+                raw-cands (if explicit-cands?
+                            (or (get cmd-map "candidates") (:candidates cmd-map))
+                            (or (not-empty (get-in session [:p2p-meta :local-candidates]))
+                                (not-empty (get-in session [:p2p-meta :preferred-candidates]))
+                                (not-empty (get-in session [:p2p :local-candidates]))
+                                (:default-p2p-candidates state [])))
                 candidates (vec (map str (if (string? raw-cands)
                                            (remove str/blank? (str/split raw-cands #","))
                                            raw-cands)))
@@ -2257,9 +2261,10 @@
                                       :local-fingerprint fp
                                       :local-signal-seq signal-seq})
                     p2p-meta (merge (get session :p2p-meta {})
-                                    {:local-signal-seq signal-seq
-                                     :preferred-transport transport
-                                     :preferred-candidates candidates})
+                                    (cond-> {:local-signal-seq signal-seq
+                                             :preferred-transport transport
+                                             :preferred-candidates candidates}
+                                      explicit-cands? (assoc :local-candidates candidates)))
                     new-state (-> state
                                   (assoc-in [:sessions session-id :p2p] p2p-entry)
                                   (assoc-in [:sessions session-id :p2p-meta] p2p-meta))]
@@ -2291,12 +2296,15 @@
           {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
           (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
                 transport (str (or (get cmd-map "transport") (:transport cmd-map) (get-in session [:p2p :remote-transport]) "udp"))
-                raw-cands (let [rc (or (get cmd-map "candidates") (:candidates cmd-map))]
-                            (if (or (nil? rc)
-                                    (and (coll? rc) (empty? rc))
-                                    (and (string? rc) (str/blank? rc)))
-                              (:default-p2p-candidates state [])
-                              rc))
+                explicit-cands? (let [c (or (get cmd-map "candidates") (:candidates cmd-map))]
+                                  (and (some? c)
+                                       (if (string? c) (not (str/blank? c)) (seq c))))
+                raw-cands (if explicit-cands?
+                            (or (get cmd-map "candidates") (:candidates cmd-map))
+                            (or (not-empty (get-in session [:p2p-meta :local-candidates]))
+                                (not-empty (get-in session [:p2p-meta :preferred-candidates]))
+                                (not-empty (get-in session [:p2p :local-candidates]))
+                                (:default-p2p-candidates state [])))
                 candidates (vec (map str (if (string? raw-cands)
                                            (remove str/blank? (str/split raw-cands #","))
                                            raw-cands)))
@@ -2367,9 +2375,10 @@
                                       :local-fingerprint fp
                                       :local-signal-seq signal-seq})
                     p2p-meta (merge (get session :p2p-meta {})
-                                    {:local-signal-seq signal-seq
-                                     :preferred-transport transport
-                                     :preferred-candidates candidates})
+                                    (cond-> {:local-signal-seq signal-seq
+                                             :preferred-transport transport
+                                             :preferred-candidates candidates}
+                                      explicit-cands? (assoc :local-candidates candidates)))
                     new-state (-> state
                                   (assoc-in [:sessions session-id :p2p] p2p-entry)
                                   (assoc-in [:sessions session-id :p2p-meta] p2p-meta))
@@ -2410,18 +2419,19 @@
   "Returns true if session `sid` in `state` is eligible for an automatic P2P re-offer.
    Enforces:
    1. Mode gate: never re-offers in :shuttle mode; requires (= :autonomous mode) or (daemon-autonomous? and not :shuttle).
-   2. State: session must be 'open', not currently p2p-connected, and have candidate endpoints.
+   2. State: session must be 'open', have :reconnect-needed? true, not currently p2p-connected, and have candidate endpoints.
    3. Exponential backoff: now-ms >= :next-reconnect-ms.
    4. Glare / tie-breaker protection: only allows re-offer if local node has ingress/direct candidates,
       was the initiator, or wins the lexicographical pubkey tie-breaker."
   ([state sid]
-   (should-auto-reoffer? state sid #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)) (:autonomous? state false)))
+   (should-auto-reoffer? state sid (:epoch state 0) (:autonomous? state false)))
   ([state sid now-ms daemon-autonomous?]
    (let [sess (get-in state [:sessions sid])]
      (boolean
       (when (and sess (= "open" (:state sess)))
         (let [p2p (get sess :p2p {})
               p2p-meta (get sess :p2p-meta {})
+              reconnect-needed? (true? (:reconnect-needed? p2p-meta))
               mode (or (:mode p2p-meta) (:mode p2p))
               shuttle? (or (= mode :shuttle) (= mode "shuttle"))
               autonomous-allowed? (and (not shuttle?)
@@ -2430,17 +2440,23 @@
                                            (true? daemon-autonomous?)
                                            (true? (:autonomous? state))))
               connected? (true? (:connected? p2p))
-              has-cands? (boolean (or (seq (:preferred-candidates p2p-meta))
+              has-cands? (boolean (or (seq (:local-candidates p2p-meta))
+                                      (seq (:preferred-candidates p2p-meta))
                                       (seq (:local-candidates p2p))
                                       (seq (:default-p2p-candidates state))))
               now (long (or now-ms 0))
               next-reconn (long (or (:next-reconnect-ms p2p-meta) 0))
               backoff-ok? (>= now next-reconn)]
-          (when (and autonomous-allowed?
+          (when (and reconnect-needed?
+                     autonomous-allowed?
                      (not connected?)
                      has-cands?
                      backoff-ok?)
-            (let [local-cands (or (:preferred-candidates p2p-meta) (:local-candidates p2p) (:default-p2p-candidates state) [])
+            (let [local-cands (or (not-empty (:local-candidates p2p-meta))
+                                  (not-empty (:preferred-candidates p2p-meta))
+                                  (not-empty (:local-candidates p2p))
+                                  (not-empty (:default-p2p-candidates state))
+                                  [])
                   has-ingress? (boolean (some (fn [c] (or (str/starts-with? (str c) "tcp://")
                                                           (str/starts-with? (str c) "turn:")
                                                           (str/includes? (str c) "ingress")))
@@ -2457,7 +2473,7 @@
   "Updates session `sid` in `state` after an autonomous re-offer attempt,
    incrementing :reconnect-attempts and scheduling :next-reconnect-ms with exponential backoff."
   ([state sid]
-   (record-reoffer-attempt state sid #?(:clj (System/currentTimeMillis) :cljs (.now js/Date))))
+   (record-reoffer-attempt state sid (:epoch state 0)))
   ([state sid now-ms]
    (let [now (long (or now-ms 0))
          sess (get-in state [:sessions sid])
@@ -2479,7 +2495,7 @@
    or original gossip-env, preserving the original seq without re-minting.
    Returns {:state updated-state :net-envelopes retransmitted-envs :stdout-events evts :count count}."
   ([state sid]
-   (retransmit-unacked-outbox state sid #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)) 0))
+   (retransmit-unacked-outbox state sid (:epoch state 0) 0))
   ([state sid now-ms rto-ms]
    (let [sess (get-in state [:sessions sid])]
      (if-not sess
@@ -2561,7 +2577,7 @@
 
 (defn- exec-retransmit-outbox [state cmd-map]
   (let [resolved-sid (resolve-session-id state cmd-map :active)
-        now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)) 0))
+        now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") (:epoch state 0)))
         rto-ms (long (or (:rto-ms cmd-map) (get cmd-map "rto_ms") 0))]
     (cond
       (and (map? resolved-sid) (false? (:ok? resolved-sid)))
@@ -2621,7 +2637,7 @@
                     base-state (-> state
                                    (assoc-in [:sessions session-id :p2p] p2p-entry)
                                    (assoc-in [:sessions session-id :p2p-meta] p2p-meta))
-                    now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)) 0))
+                    now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") (:epoch state 0)))
                     retrans (retransmit-unacked-outbox base-state session-id now-ms 0)
                     new-state (:state retrans)
                     evt (cond-> {"event" "p2p-connected"
@@ -2789,7 +2805,7 @@
                     max-outbox (long (or (:max-outbox-size state) 64))
                     curr-outbox (or (:outbox session) {})
                     curr-order (or (:outbox-order session) [])
-                    sent-at (long (or (get cmd-map "now_ms") (:now-ms cmd-map) #?(:clj (System/currentTimeMillis) :cljs (.now js/Date))))
+                    sent-at (long (or (get cmd-map "now_ms") (:now-ms cmd-map) (:epoch state 0)))
                     next-order (conj curr-order seq-num)
                     next-outbox (assoc curr-outbox seq-num {:seq seq-num
                                                             :msg-payload msg-payload
@@ -3775,10 +3791,18 @@
   (if (actionable-event? ev)
     (let [next-id (inc (long (or (:last-event-id state) 0)))
           tagged (cond-> ev
-                   (map? ev) (assoc "event_id" next-id :event-id next-id))]
+                   (map? ev) (assoc "event_id" next-id :event-id next-id))
+          max-q (long (or (:max-event-queue-size state) 256))
+          q (conj (vec (or (:event-queue state) [])) tagged)
+          overflow? (> (count q) max-q)
+          dropped (if overflow? (- (count q) max-q) 0)
+          trimmed-q (if overflow? (subvec q dropped) q)]
       (-> state
           (assoc :last-event-id next-id)
-          (update :event-queue (fnil conj []) tagged)))
+          (assoc :event-queue trimmed-q)
+          (cond-> overflow?
+            (-> (update-in [:diagnostics :event-queue-overflow] (fnil + 0) dropped)
+                (update-in [:diagnostics :dropped] (fnil + 0) dropped)))))
     state))
 
 (defn enqueue-actionable-events
@@ -3787,16 +3811,28 @@
   (reduce tag-and-enqueue-event state events))
 
 (defn- exec-wait
-  "Pure reducer for 'wait' command. Pops all actionable events from :event-queue,
-   advancing the event-ack cursor. If queue is empty, returns park: true."
-  [state _cmd-map]
-  (let [q (:event-queue state [])
+  "Pure reducer for 'wait' command. Pops actionable events from :event-queue,
+   optionally filtered by min_seq. Advances event-ack cursor. If no matching events,
+   returns park: true."
+  [state cmd-map]
+  (let [min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
+                  (long ms))
+        raw-q (vec (or (:event-queue state) []))
+        eligible-evs (if min-seq
+                       (filterv (fn [ev]
+                                  (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "seq") (:seq ev) 0))]
+                                    (>= eid min-seq)))
+                                raw-q)
+                       raw-q)
         cursor (long (or (:event-ack-cursor state) 0))]
-    (if (seq q)
-      (let [new-cursor (long (or (get (last q) "event_id") (:event-id (last q)) (count q)))
-            new-state (assoc state :event-queue [] :event-ack-cursor new-cursor)]
+    (if (seq eligible-evs)
+      (let [new-cursor (long (or (get (last eligible-evs) "event_id") (:event-id (last eligible-evs)) (count eligible-evs)))
+            remaining (if min-seq
+                        (filterv (fn [ev] (not (contains? (set eligible-evs) ev))) raw-q)
+                        [])
+            new-state (assoc state :event-queue remaining :event-ack-cursor (max cursor new-cursor))]
         {:state new-state
-         :response {"ok" true "events" q "cursor" new-cursor}
+         :response {"ok" true "events" eligible-evs "cursor" (max cursor new-cursor)}
          :net-envelopes []
          :stdout-events []})
       {:state state
@@ -3918,7 +3954,7 @@
   [pubkey-hex ^bytes privkey-bytes ack-seq ack-bseq now-ms]
   (let [pk (normalize-pubkey-hex pubkey-hex)
         seq-num (long (or ack-seq 0))
-        ts (long (or now-ms #?(:clj (System/currentTimeMillis) :cljs (.now js/Date))))
+        ts (long (or now-ms 0))
         nonce (str "ack-" seq-num "-" (subs pk 0 (min 8 (count pk))) "-" ts)
         signing-str (str "bitecho-relay-poll-v1|" pk "|" seq-num "|" ts "|" nonce)
         sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes signing-str))
@@ -4031,7 +4067,8 @@
                              (:since_broadcast_seq cmd-map) (:since-broadcast-seq cmd-map)
                              (:last-broadcast-seq state) 0))
         ts (long (or (get cmd-map "now_ms") (:now-ms cmd-map)
-                     #?(:clj (System/currentTimeMillis) :cljs (.now js/Date))))
+                     (get cmd-map "timestamp_ms") (get cmd-map "timestamp-ms")
+                     (:epoch state 0)))
         nonce (str "poll-" since-seq "-" (subs pk 0 (min 8 (count pk))) "-" ts)
         signing-str (str "bitecho-relay-poll-v1|" pk "|" since-seq "|" ts "|" nonce)
         sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes signing-str))
@@ -4095,7 +4132,8 @@
                                         (:up_to_broadcast_seq cmd-map) (:up-to-broadcast-seq cmd-map))]
                          (long b))
             now-ms (long (or (get cmd-map "now_ms") (:now-ms cmd-map)
-                             #?(:clj (System/currentTimeMillis) :cljs (.now js/Date))))
+                             (get cmd-map "timestamp_ms") (get cmd-map "timestamp-ms")
+                             (:epoch state 0)))
             ack-req (build-ack-request-map (:pubkey state) privkey-bytes up-to-seq up-to-bseq now-ms)]
         {:state state
          :response {"ok" true
@@ -5170,9 +5208,9 @@
                                         "candidates" candidates}
                                  pname (assoc "from_petname" pname))]
                        (if already-connected?
-                         (let [now-ms (long (or (:now-ms msg) #?(:clj (System/currentTimeMillis) :cljs (.now js/Date))))
+                         (let [_now-ms (long (or (:now-ms msg) (:epoch state 0)))
                                answer-seq (inc (max (long (or (get-in session [:p2p-meta :local-signal-seq]) (get-in session [:p2p :local-signal-seq]) 0))
-                                                    now-ms))
+                                                    (long (or (:signal-seq msg) 0))))
                                tr (str (or (get-in session [:p2p :local-transport]) (get-in session [:p2p-meta :preferred-transport]) "udp"))
                                cands (vec (or (get-in session [:p2p :local-candidates]) (get-in session [:p2p-meta :preferred-candidates]) (:default-p2p-candidates state [])))
                                ice-u (str (or (get-in session [:p2p :local-ice-ufrag]) (get-in state [:ice-creds :ufrag]) "ufrag"))
@@ -5699,7 +5737,7 @@
                                           (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
                                     (:epoch state)
                                     (or sess-epoch msg-epoch))
-                        max-skew (long (or (:max-epoch-skew state) 2))
+                        max-skew (max 1 (long (or (:max-epoch-skew state) 15)))
                         skew-exceeded? (and (not open-session?)
                                             (not (contains? #{:chain-state-snapshot
                                                               :p2p-hub-relay

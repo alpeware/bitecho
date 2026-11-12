@@ -62,6 +62,11 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--turn-force-relay`: Force all WebRTC traffic through TURN relay (drops unrelayable packets rather than falling back to direct UDP).
 - `--trusted-dac-anchors <pk1,pk2,...>`: Comma-separated list of trusted DAC anchor public keys required for DAC admission and zero-burn broadcast validation.
 - `--relay-url <url>`: URL of HTTP Gateway Relay endpoint (e.g., `https://bitecho.org/relay/v1` or `http://127.0.0.1:8080/relay/v1`) for fallback ingress/egress, long-polling inbound envelope delivery, and validator chain-state synchronization in restricted network environments where direct UDP/TCP sockets are blocked.
+- `--daemon`: Spawns `serve` mode as a detached background daemon process, logging to `<state-dir>/daemon.log` and writing `<state-dir>/daemon.pid`.
+- `--control-port <port>`: Port for loopback HTTP control socket in `serve` mode (default: `5020`, falls back to ephemeral port if unavailable).
+- `--max-epoch-skew <skew>`: Maximum allowed epoch skew when validating chain state snapshots (default: `15`, minimum: `1`).
+- `--block`: Blocks indefinitely in `ctl wait` until at least 1 matching actionable event arrives (never exiting on an empty timeout).
+- `--until-event`: Alias for `--block` in `ctl wait`.
 
 ---
 
@@ -135,6 +140,25 @@ clojure -M:light-node wait-event \
 ```json
 {"event": "channel-opened", "session_id": "sess-8f3a9e...", "peer": "302a300506..."}
 ```
+
+---
+
+### Process Supervisor & Control (`ctl` / `daemon`)
+
+The light node includes an integrated zero-glue process supervisor managing detached background execution (`serve --daemon`), state recovery, and loopback control via `control.json`.
+
+#### `daemon <start|stop|status|restart>`
+- `clojure -M:light-node daemon start [--state-dir <dir>]`: Idempotently starts the background daemon process if not running, writing `<state-dir>/daemon.pid` and redirecting logs to `<state-dir>/daemon.log`.
+- `clojure -M:light-node daemon stop [--state-dir <dir>]`: Stops the running daemon process cleanly via SIGTERM with SIGKILL fallback.
+- `clojure -M:light-node daemon status [--state-dir <dir>]`: Queries the running daemon's status via loopback HTTP `/ctl` socket.
+- `clojure -M:light-node daemon restart [--state-dir <dir>]`: Stops and restarts the background daemon.
+
+#### `ctl <subcommand>`
+Executes commands directly against a running light node daemon over loopback HTTP `/ctl` socket authenticated with the session token in `<state-dir>/control.json`.
+- `clojure -M:light-node ctl ensure [--state-dir <dir>]`: Idempotently verifies the daemon is healthy or spawns it in the background, returning readiness status JSON.
+- `clojure -M:light-node ctl status [--state-dir <dir>]`: Returns current node status and diagnostics.
+- `clojure -M:light-node ctl send --session-id <sid> --text <msg>`: Enqueues a message for delivery. If immediate network send fails, returns `{"ok": true, "queued": true, "transport_error": err}` so the daemon's 30s RTO loop retransmits it automatically.
+- `clojure -M:light-node ctl wait [--timeout-ms <ms>] [--min-seq <n>] [--block|--until-event]`: Waits up to 30s (default, configurable via `--timeout-ms`), or indefinitely when `--block` (or `--until-event`) is passed, for incoming network events on the daemon's event queue. Delivers events atomically with exactly-once semantics across concurrent `ctl` clients.
 
 ---
 
