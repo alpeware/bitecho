@@ -325,15 +325,25 @@
     (:epoch-atom rt) @(:epoch-atom rt)
     :else nil))
 
+(declare submit-event!)
+
 (defn set-runtime-epoch!
   "Sets the authoritative runtime epoch on `rt` (e.g. from finalized validator chain state)."
   [rt epoch]
   (when-let [a (:epoch-atom rt)]
-    (reset! a (when (some? epoch) (long epoch)))))
+    (let [old-ep @a
+          new-ep (when (some? epoch) (long epoch))]
+      (reset! a new-ep)
+      (when (and (some? new-ep) (or (nil? old-ep) (> new-ep (long old-ep))))
+        (when (get-in (when-let [sa (:subnet-atom rt)] @sa) [:policy :subnet/anchoring])
+          (try
+            (submit-event! rt {:type :epoch-tick :epoch new-ep :now-ms (System/currentTimeMillis)})
+            (catch Exception _ nil)))))))
 
 (declare load-or-create-infra-peer-identity!)
 
-(defn- resolve-validator-bootstrap
+(defn resolve-validator-bootstrap
+  "Resolves a validator bootstrap descriptor from a map, file path, or URL."
   [bootstrap-or-source]
   (cond
     (and (map? bootstrap-or-source) (seq (:nodes bootstrap-or-source)))
@@ -345,6 +355,27 @@
       (catch Exception _ nil))
 
     :else nil))
+
+(defn fetch-validator-chain-state-snapshots!
+  "Queries validator nodes in parallel for chain-state snapshots for target-pubkey."
+  [rt validator-bootstrap target-pubkey nonce]
+  (let [bootstrap (resolve-validator-bootstrap validator-bootstrap)
+        nodes (vals (:nodes bootstrap))
+        ident (or (:peer-identity rt)
+                  (when (:state-dir rt)
+                    (try
+                      (load-or-create-infra-peer-identity! (:state-dir rt) (or (:node-id rt) :ns1))
+                      (catch Exception _ nil))))
+        privkey (or (:privkey-bytes ident) (:node-privkey rt))]
+    (if-not (and ident (:cert-data ident) target-pubkey privkey (seq nodes))
+      []
+      (->> nodes
+           (pmap (fn [node]
+                   (try
+                     (light-node/query-validator-chain-state!
+                      ident node target-pubkey privkey {:nonce nonce :timeout-ms 2500})
+                     (catch Exception _ nil))))
+           (filterv some?)))))
 
 (defn sync-runtime-epoch-from-validators!
   "Queries the validator cluster's authenticated `:5010` agent channel using the signed
@@ -370,8 +401,6 @@
          {:ok? false :error :validator-epoch-quorum-failed :detail "empty-bootstrap-nodes"})
        (let [pubkey (or (:pubkey-hex (:peer-identity rt))
                         (:default-sender rt))
-             privkey (or (:privkey-bytes (:peer-identity rt))
-                         (:node-privkey rt))
              nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
              snaps (if snapshot-fetcher-fn
                      (try
@@ -380,20 +409,7 @@
                                        (snapshot-fetcher-fn pubkey)))
                                 []))
                        (catch Exception _ []))
-                     (let [ident (or (:peer-identity rt)
-                                     (when (:state-dir rt)
-                                       (try
-                                         (load-or-create-infra-peer-identity! (:state-dir rt) (or (:node-id rt) :ns1))
-                                         (catch Exception _ nil))))]
-                       (if-not (and ident (:cert-data ident) pubkey privkey)
-                         []
-                         (->> nodes
-                              (pmap (fn [node]
-                                      (try
-                                        (light-node/query-validator-chain-state!
-                                         ident node pubkey privkey {:nonce nonce :timeout-ms 2500})
-                                        (catch Exception _ nil))))
-                              (filterv some?)))))
+                     (fetch-validator-chain-state-snapshots! rt bootstrap pubkey nonce))
              q-res (if (empty? snaps)
                      {:ok? false :error "no-inband-snapshots-returned"}
                      (light-core/verify-chain-state-quorum
@@ -545,6 +561,19 @@
 
         :policy-updated
         (save-pointers-snapshot! state-dir @subnet-atom)
+
+        :anchor-to-parent
+        (do
+          (when-let [cb (:on-anchor-to-parent rt)]
+            (try (cb eff) (catch Exception _ nil)))
+          (when-let [p-rt (:parent-runtime rt)]
+            (let [auth (or (get-in eff [:pointer :pointer/authority])
+                           (get-in eff [:pointer :authority]))]
+              (try
+                (submit-event! p-rt {:type :put-blob :blob (:blob eff) :sender auth})
+                (submit-event! p-rt {:type :publish-pointer :pointer (:pointer eff) :sender auth})
+                (catch Exception e
+                  (apply-shell-event! shell-atom {:type :diagnose :reason :parent-anchor-submission-failed :message (.getMessage e)}))))))
 
         nil))))
 

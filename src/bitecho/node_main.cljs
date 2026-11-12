@@ -5,6 +5,7 @@
    with the JVM `bitecho.shell.light-node` shell, backed by `bitecho.light-node.core`,
    `bitecho.fressian`, and `datachannel.api`."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
@@ -276,6 +277,213 @@
         (.on req "error" (fn [_] (done! nil))))
       (catch :default _
         (done! nil)))))
+
+(defn- http-get-json!
+  "Fetches `url-str` over HTTP/HTTPS with a timeout, reading body on any status code,
+   parsing JSON, attaching `:status (.-statusCode res)`, and invoking `(cb parsed-map)`."
+  [url-str timeout-ms cb]
+  (let [settled? (atom false)
+        done! (fn [res]
+                (when (compare-and-set! settled? false true)
+                  (cb res)))]
+    (try
+      (let [client (if (str/starts-with? (str/lower-case url-str) "https://")
+                     node-https
+                     node-http)
+            req (.get client url-str #js {:timeout (or timeout-ms 4000)}
+                      (fn [res]
+                        (let [status-code (.-statusCode res)
+                              chunks #js []]
+                          (.on res "data" (fn [c] (.push chunks c)))
+                          (.on res "end" (fn []
+                                           (try
+                                             (let [buf (js/Buffer.concat chunks)
+                                                   txt (.toString buf "utf8")
+                                                   parsed (try (js->clj (js/JSON.parse txt)) (catch :default _ nil))]
+                                               (done! (if (map? parsed)
+                                                        (assoc parsed :status status-code)
+                                                        {:status status-code :raw-body txt})))
+                                             (catch :default _
+                                               (done! {:status status-code :error "json-parse-failed"})))))
+                          (.on res "error" (fn [err] (done! {:error (str err) :status status-code}))))))]
+        (.on req "timeout" (fn [] (.destroy req) (done! {:error "timeout" :status 408})))
+        (.on req "error" (fn [err] (done! {:error (str err) :status 500}))))
+      (catch :default e
+        (done! {:error (str e) :status 500})))))
+
+(defn- http-post-json!
+  "Posts `json-body-str` to `url-str` over HTTP/HTTPS with a timeout, invoking `(cb body-or-nil)`."
+  [url-str json-body-str timeout-ms cb]
+  (let [settled? (atom false)
+        done! (fn [res]
+                (when (compare-and-set! settled? false true)
+                  (cb res)))]
+    (try
+      (let [client (if (str/starts-with? (str/lower-case url-str) "https://")
+                     node-https
+                     node-http)
+            body-buf (.from (.-Buffer js/globalThis) (str json-body-str) "utf8")
+            url-obj (js/URL. url-str)
+            options #js {:protocol (.-protocol url-obj)
+                         :hostname (.-hostname url-obj)
+                         :port (or (.-port url-obj) (if (= (.-protocol url-obj) "https:") 443 80))
+                         :path (str (.-pathname url-obj) (.-search url-obj))
+                         :method "POST"
+                         :timeout (or timeout-ms 5000)
+                         :headers #js {"Content-Type" "application/json"
+                                       "Content-Length" (.-length body-buf)}}
+            req (.request client options
+                          (fn [res]
+                            (let [chunks #js []]
+                              (.on res "data" (fn [c] (.push chunks c)))
+                              (.on res "end" (fn []
+                                               (let [buf (.concat (.-Buffer js/globalThis) chunks)]
+                                                 (done! (.toString buf "utf8")))))
+                              (.on res "error" (fn [_] (done! nil))))))]
+        (.on req "timeout" (fn [] (.destroy req) (done! nil)))
+        (.on req "error" (fn [_] (done! nil)))
+        (.write req body-buf)
+        (.end req))
+      (catch :default _
+        (done! nil)))))
+
+(defn- read-json-str
+  [s]
+  (try
+    (js->clj (js/JSON.parse s) :keywordize-keys true)
+    (catch :default _ nil)))
+
+;; -----------------------------------------------------------------------------
+;; HTTP Gateway Relay Client Helpers (/relay/v1/*)
+;; -----------------------------------------------------------------------------
+
+(defn submit-relay-envelope!
+  "Submits an envelope (hex string, bytes, or map) to HTTP relay at `relay-url`."
+  ([relay-url envelope] (submit-relay-envelope! relay-url envelope nil nil))
+  ([relay-url envelope arg]
+   (if (fn? arg)
+     (submit-relay-envelope! relay-url envelope nil arg)
+     (submit-relay-envelope! relay-url envelope arg nil)))
+  ([relay-url envelope opts cb]
+   (let [promise-fn
+         (fn [resolve _]
+           (let [url (str (str/replace relay-url #"/+$" "") "/relay/v1/send")
+                 env-hex (cond
+                           (fressian/bytes? envelope) (fressian/bytes->hex envelope)
+                           (string? envelope) envelope
+                           (map? envelope) (try (fressian/bytes->hex (fressian/encode-canonical envelope)) (catch :default _ nil))
+                           :else (str envelope))
+                 body-str (js/JSON.stringify #js {:envelope_hex env-hex})
+                 done (fn [res-str]
+                        (let [parsed (when res-str (read-json-str res-str))
+                              res (or parsed {:ok false :error "network-or-timeout"})]
+                          (if cb (cb res) (resolve res))))]
+             (http-post-json! url body-str (or (:timeout-ms opts) 5000) done)))]
+     (if (fn? cb)
+       (do (promise-fn nil nil) nil)
+       (js/Promise. promise-fn)))))
+
+(defn poll-relay-envelopes!
+  "Polls HTTP relay at `relay-url` for envelopes addressed to `pubkey`."
+  ([relay-url pubkey privkey] (poll-relay-envelopes! relay-url pubkey privkey nil nil))
+  ([relay-url pubkey privkey arg]
+   (if (fn? arg)
+     (poll-relay-envelopes! relay-url pubkey privkey nil arg)
+     (poll-relay-envelopes! relay-url pubkey privkey arg nil)))
+  ([relay-url pubkey privkey opts cb]
+   (let [promise-fn
+         (fn [resolve _]
+           (let [now-ms (.now js/Date)
+                 pk-hex (if (fressian/bytes? pubkey) (fressian/bytes->hex pubkey) (str pubkey))
+                 since-seq (long (or (:since-seq opts) (:seq-gte opts) 0))
+                 nonce (or (:nonce opts) (fressian/bytes->hex (crypto/random-bytes 16)))
+                 sig (relay/sign-poll-request privkey {:pubkey pk-hex
+                                                       :since-seq since-seq
+                                                       :timestamp-ms now-ms
+                                                       :nonce nonce})
+                 params (cond-> {"pubkey" pk-hex
+                                 "sig" sig
+                                 "signature" sig
+                                 "ts" (str now-ms)
+                                 "timestamp_ms" (str now-ms)
+                                 "nonce" nonce
+                                 "since_seq" (str since-seq)}
+                          (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
+                          (:limit opts) (assoc "limit" (str (:limit opts)))
+                          (:timeout-ms opts) (assoc "timeout_ms" (str (:timeout-ms opts))))
+                 q-str (str/join "&" (map (fn [[k v]] (str (js/encodeURIComponent (name k)) "=" (js/encodeURIComponent (str v)))) params))
+                 clean (str/replace (str relay-url) #"/+$" "")
+                 base-url (if (str/ends-with? clean "/relay/v1")
+                            (str clean "/poll")
+                            (str clean "/relay/v1/poll"))
+                 url (str base-url "?" q-str)
+                 done (fn [res]
+                        (if cb (cb res) (resolve res)))]
+             (http-get-json! url (+ (or (:timeout-ms opts) 0) 5000) done)))]
+     (if (fn? cb)
+       (do (promise-fn nil nil) nil)
+       (js/Promise. promise-fn)))))
+
+(defn ack-relay-envelopes!
+  "Acknowledges envelopes processed up to `up-to-seq` at `relay-url`."
+  ([relay-url pubkey privkey up-to-seq] (ack-relay-envelopes! relay-url pubkey privkey up-to-seq nil nil))
+  ([relay-url pubkey privkey up-to-seq arg]
+   (if (fn? arg)
+     (ack-relay-envelopes! relay-url pubkey privkey up-to-seq nil arg)
+     (ack-relay-envelopes! relay-url pubkey privkey up-to-seq arg nil)))
+  ([relay-url pubkey privkey up-to-seq opts cb]
+   (let [promise-fn
+         (fn [resolve _]
+           (let [now-ms (.now js/Date)
+                 pk-hex (if (fressian/bytes? pubkey) (fressian/bytes->hex pubkey) (str pubkey))
+                 ack-seq (long (or up-to-seq 0))
+                 nonce (or (:nonce opts) (fressian/bytes->hex (crypto/random-bytes 16)))
+                 sig (relay/sign-poll-request privkey {:pubkey pk-hex
+                                                       :since-seq ack-seq
+                                                       :timestamp-ms now-ms
+                                                       :nonce nonce})
+                 url (str (str/replace relay-url #"/+$" "") "/relay/v1/ack")
+                 payload (js/JSON.stringify #js {:pubkey pk-hex
+                                                 :sig sig
+                                                 :signature sig
+                                                 :ts now-ms
+                                                 :timestamp_ms now-ms
+                                                 :nonce nonce
+                                                 :ack_seq ack-seq
+                                                 :up_to_seq ack-seq})
+                 done (fn [res-str]
+                        (let [parsed (when res-str (read-json-str res-str))
+                              res (or parsed {:ok false :error "network-or-timeout"})]
+                          (if cb (cb res) (resolve res))))]
+             (http-post-json! url payload (or (:timeout-ms opts) 5000) done)))]
+     (if (fn? cb)
+       (do (promise-fn nil nil) nil)
+       (js/Promise. promise-fn)))))
+
+(defn fetch-relay-chain-state!
+  "Fetches chain-state and bootstrap info from `relay-url`."
+  ([relay-url] (fetch-relay-chain-state! relay-url nil nil))
+  ([relay-url arg]
+   (if (fn? arg)
+     (fetch-relay-chain-state! relay-url nil arg)
+     (fetch-relay-chain-state! relay-url arg nil)))
+  ([relay-url opts cb]
+   (let [promise-fn
+         (fn [resolve _]
+           (let [clean (str/replace (str relay-url) #"/+$" "")
+                 base-url (if (str/ends-with? clean "/relay/v1")
+                            (str clean "/chain-state")
+                            (str clean "/relay/v1/chain-state"))
+                 q-parts (cond-> []
+                           (:pubkey opts) (conj (str "pubkey=" (js/encodeURIComponent (str (:pubkey opts)))))
+                           (:nonce opts) (conj (str "nonce=" (js/encodeURIComponent (str (:nonce opts))))))
+                 url (if (seq q-parts) (str base-url "?" (str/join "&" q-parts)) base-url)
+                 done (fn [res]
+                        (if cb (cb res) (resolve res)))]
+             (http-get-json! url (or (:timeout-ms opts) 5000) done)))]
+     (if (fn? cb)
+       (do (promise-fn nil nil) nil)
+       (js/Promise. promise-fn)))))
 
 (defn load-bootstrap-descriptor!
   "Loads and verifies a bootstrap descriptor from a local file or HTTP/HTTPS URL,
@@ -560,6 +768,33 @@
                                  (cond-> m
                                    t (assoc "text" t)
                                    sub (assoc "subnet_id" sub)))
+                   "anchor-subnet" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                 (extract-flag-value args "--subnet" nil)
+                                                 (extract-flag-value args "--child-subnet" nil))
+                                         psub (or (extract-flag-value args "--parent-subnet" nil)
+                                                  (extract-flag-value args "--parent" nil))
+                                         ce (extract-long-flag args "--child-epoch" nil)
+                                         m {"cmd" "anchor-subnet"}]
+                                     (cond-> m
+                                       sub (assoc "subnet_id" sub)
+                                       psub (assoc "parent_subnet" psub)
+                                       ce (assoc "child_epoch" ce)))
+                   "epoch-tick" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                              (extract-flag-value args "--subnet" nil))
+                                      ep (extract-long-flag args "--epoch" nil)
+                                      m {"cmd" "epoch-tick"}]
+                                  (cond-> m
+                                    sub (assoc "subnet_id" sub)
+                                    ep (assoc "epoch" ep)))
+                   "verify-subnet-anchor" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                        (extract-flag-value args "--subnet" nil)
+                                                        (extract-flag-value args "--child-subnet" nil))
+                                                psub (or (extract-flag-value args "--parent-subnet" nil)
+                                                         (extract-flag-value args "--parent" nil))
+                                                m {"cmd" "verify-subnet-anchor"}]
+                                            (cond-> m
+                                              sub (assoc "subnet_id" sub)
+                                              psub (assoc "parent_subnet" psub)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -613,6 +848,7 @@
         ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
         proxy-cli (extract-flag-value clean-args "--proxy" nil)
         proxy-url (resolve-proxy-url proxy-cli)
+        relay-url (extract-flag-value clean-args "--relay-url" nil)
         subnet-id (extract-flag-value clean-args "--subnet-id" nil)
         trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
         trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
@@ -661,6 +897,7 @@
       ingress-tcp-port (assoc :ingress-tcp-port ingress-tcp-port)
       (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
       proxy-url (assoc :proxy proxy-url)
+      relay-url (assoc :relay-url relay-url)
       turn-config (assoc :turn-config turn-config))))
 
 ;; =============================================================================
@@ -1316,41 +1553,54 @@
   "Establishes WebRTC DataChannel connection to validators in `bootstrap-descriptor`,
    rotating through candidates and invoking `(cb res)`."
   [identity bootstrap-descriptor opts cb]
-  (if-let [err (validate-node-fingerprints bootstrap-descriptor)]
-    (cb err)
-    (if-let [dialer (:dialer-fn opts)]
-      (cb (dialer identity bootstrap-descriptor opts))
-      (let [home-set (or (:home-set opts)
-                         (when-let [sa (:state-atom opts)] (:home-set @sa)))
-            cursor (or (:validator-cursor opts)
-                       (when-let [ca (:conn-atom opts)] (:validator-cursor @ca 0))
-                       0)
-            candidates (ordered-validator-candidates bootstrap-descriptor home-set cursor)]
-        (if (empty? candidates)
-          (cb {:ok? false :error "no-nodes-in-descriptor"})
-          (letfn [(step [rem-candidates failed-nodes]
-                    (if-let [node (first rem-candidates)]
-                      (dial-single-node!
-                       identity node opts
-                       (fn [res]
-                         (cond
-                           (:ok? res)
-                           (cb (assoc res
-                                      :validator-id (:node-id node)
-                                      :failover-attempts (count failed-nodes)
-                                      :failed-nodes failed-nodes))
+  (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+    (cb {:ok? true
+         :node nil
+         :validator-id :http-relay
+         :transport :http-relay
+         :failover-attempts 0
+         :failed-nodes []
+         :send-fn (fn [env send-cb]
+                    (submit-relay-envelope! (:relay-url opts) env opts
+                                            (fn [r]
+                                              (let [ok? (true? (or (get r "ok") (:ok r)))]
+                                                (when (fn? send-cb) (send-cb ok?))
+                                                ok?))))})
+    (if-let [err (validate-node-fingerprints bootstrap-descriptor)]
+      (cb err)
+      (if-let [dialer (:dialer-fn opts)]
+        (cb (dialer identity bootstrap-descriptor opts))
+        (let [home-set (or (:home-set opts)
+                           (when-let [sa (:state-atom opts)] (:home-set @sa)))
+              cursor (or (:validator-cursor opts)
+                         (when-let [ca (:conn-atom opts)] (:validator-cursor @ca 0))
+                         0)
+              candidates (ordered-validator-candidates bootstrap-descriptor home-set cursor)]
+          (if (empty? candidates)
+            (cb {:ok? false :error "no-nodes-in-descriptor"})
+            (letfn [(step [rem-candidates failed-nodes]
+                      (if-let [node (first rem-candidates)]
+                        (dial-single-node!
+                         identity node opts
+                         (fn [res]
+                           (cond
+                             (:ok? res)
+                             (cb (assoc res
+                                        :validator-id (:node-id node)
+                                        :failover-attempts (count failed-nodes)
+                                        :failed-nodes failed-nodes))
 
-                           (= (:error res) "bad-fingerprint")
-                           (cb res)
+                             (= (:error res) "bad-fingerprint")
+                             (cb res)
 
-                           :else
-                           (step (rest rem-candidates)
-                                 (conj failed-nodes {:validator-id (:node-id node)
-                                                     :error (or (:error res) "listener-disabled")})))))
-                      (cb {:ok? false
-                           :error "listener-disabled"
-                           :failed-nodes failed-nodes})))]
-            (step candidates [])))))))
+                             :else
+                             (step (rest rem-candidates)
+                                   (conj failed-nodes {:validator-id (:node-id node)
+                                                       :error (or (:error res) "listener-disabled")})))))
+                        (cb {:ok? false
+                             :error "listener-disabled"
+                             :failed-nodes failed-nodes})))]
+              (step candidates []))))))))
 
 (defn query-validator-chain-state!
   "Dials a single validator node over Port 5010/DTLS, sends `:query-chain-state`,
@@ -1485,38 +1735,78 @@
 (defn maybe-sync-account-state!
   "Attempts in-band validator quorum sync over Port 5010/DTLS and falls back to HTTP `/accountz` if unreachable."
   [state-atom bootstrap pubkey privkey-bytes opts cb]
-  (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})]
-    (fetch-inband-chain-state-quorum!
-     id bootstrap pubkey privkey-bytes opts
-     (fn [inband-res]
-       (cond
-         (:ok? inband-res)
-         (let [snap (:snapshot inband-res)]
-           (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
-           (cb {:ok? true :state @state-atom :quorum-result inband-res}))
+  (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
+                       (when (and (string? u) (not (str/blank? u))) u))]
+    (let [nonce (str (js/Date.now) "-" (.toString (.randomBytes node-crypto 8) "hex"))
+          opts' (assoc opts :pubkey pubkey :nonce nonce)]
+      (fetch-relay-chain-state!
+       relay-url opts'
+       (fn [relay-resp]
+         (cond
+           (and (map? relay-resp) (sequential? (or (get relay-resp "snapshots") (get relay-resp :snapshots))))
+           (let [raw-snaps (vec (or (get relay-resp "snapshots") (get relay-resp :snapshots)))
+                 signed-snaps (mapv (fn [s]
+                                      (if (string? s)
+                                        (try (edn/read-string s) (catch :default _ s))
+                                        s))
+                                    raw-snaps)
+                 trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+                 verify-opts (assoc opts
+                                    :expected-pubkey pubkey
+                                    :expected-nonce nonce
+                                    :trusted-validators trusted
+                                    :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0)))
+                 q-res (light-core/verify-chain-state-quorum signed-snaps verify-opts)]
+             (if (:ok? q-res)
+               (do
+                 (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st (:snapshot q-res))))
+                 (cb {:ok? true :state @state-atom :quorum-result q-res}))
+               (cb {:ok? false :error (:error q-res)})))
 
-         (or (:inband-snapshot-fetcher opts)
-             (and (not= (:error inband-res) "no-inband-snapshots-returned")
-                  (not= (:error inband-res) "empty-bootstrap-nodes")))
-         (cb {:ok? false :error (:error inband-res)})
+           (or (true? (get relay-resp "ok")) (true? (get relay-resp :ok)))
+           (do
+             (swap! state-atom (fn [st]
+                                 (cond-> st
+                                   (or (get relay-resp "epoch") (get relay-resp :epoch))
+                                   (assoc :epoch (long (or (get relay-resp "epoch") (get relay-resp :epoch))))
+                                   (or (get relay-resp "min_signaling_burn") (get relay-resp :min-signaling-burn))
+                                   (assoc :burn-floor (long (or (get relay-resp "min_signaling_burn") (get relay-resp :min-signaling-burn)))))))
+             (cb {:ok? true :state @state-atom :relay-response relay-resp}))
 
-         :else
-         (fetch-validator-accountz!
-          bootstrap pubkey opts
-          (fn [resp]
-            (if resp
-              (if (:account resp)
-                (let [cmd {"cmd" "sync-account"
-                           "balance" (get-in resp [:account :balance] 0)
-                           "spendable" (:spendable resp)
-                           "seq" (get-in resp [:account :seq] 0)
-                           "deps" (vec (get-in resp [:account :deps] []))
-                           "finalized_epoch" (:finalized-epoch resp 0)}
-                      res (light-core/handle-command @state-atom cmd privkey-bytes)]
-                  (reset! state-atom (:state res))
-                  (cb {:ok? true :state @state-atom :accountz resp}))
-                (cb {:ok? false :error "no-account-in-accountz"}))
-              (cb {:ok? false :error (or (:error inband-res) "all-sync-methods-failed")})))))))))
+           :else
+           (cb {:ok? false :error (or (get relay-resp "error") (get relay-resp :error) "relay-chain-state-failed")})))))
+    (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})]
+      (fetch-inband-chain-state-quorum!
+       id bootstrap pubkey privkey-bytes opts
+       (fn [inband-res]
+         (cond
+           (:ok? inband-res)
+           (let [snap (:snapshot inband-res)]
+             (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
+             (cb {:ok? true :state @state-atom :quorum-result inband-res}))
+
+           (or (:inband-snapshot-fetcher opts)
+               (and (not= (:error inband-res) "no-inband-snapshots-returned")
+                    (not= (:error inband-res) "empty-bootstrap-nodes")))
+           (cb {:ok? false :error (:error inband-res)})
+
+           :else
+           (fetch-validator-accountz!
+            bootstrap pubkey opts
+            (fn [resp]
+              (if resp
+                (if (:account resp)
+                  (let [cmd {"cmd" "sync-account"
+                             "balance" (get-in resp [:account :balance] 0)
+                             "spendable" (:spendable resp)
+                             "seq" (get-in resp [:account :seq] 0)
+                             "deps" (vec (get-in resp [:account :deps] []))
+                             "finalized_epoch" (:finalized-epoch resp 0)}
+                        res (light-core/handle-command @state-atom cmd privkey-bytes)]
+                    (reset! state-atom (:state res))
+                    (cb {:ok? true :state @state-atom :accountz resp}))
+                  (cb {:ok? false :error "no-account-in-accountz"}))
+                (cb {:ok? false :error (or (:error inband-res) "all-sync-methods-failed")}))))))))))
 
 (defn fetch-directory-descriptor!
   "Fetches and parses a directory descriptor for `nickname` under `domain`."
@@ -2015,7 +2305,7 @@
                                               (some? sess)
                                               (= "open" (:state sess))
                                               (= norm-sender expected-peer)
-                                              (contains? #{:offered :offer-received :connecting :open nil} p2p-phase))]
+                                              (contains? #{:offered :offer-received :connecting :open :closed nil} p2p-phase))]
                               (if valid?
                                 (let [my-gen (inc (long (or (get-in @p2p-peers-atom [norm-sender :generation]) 0)))]
                                   (reset! bound-sender norm-sender)
@@ -2342,6 +2632,8 @@
                                   (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                   (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
                                   (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                  (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
+                                  (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
                                   (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                   (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                   (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
@@ -2458,12 +2750,75 @@
               (if (:ok? conn-res)
                 (emit-json-line! {"event" "ready"
                                   "connected" true
-                                  "transport" (name (or (:transport opts) :udp))}
+                                  "transport" (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                                                "http-relay"
+                                                (name (or (:transport opts) :udp)))}
                                  events-out)
                 (emit-json-line! {"event" "connection-failed"
                                   "connected" false
                                   "error" (:error conn-res)}
                                  events-out))
+              (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                (let [since-mseq (atom 0)
+                      since-bseq (atom 0)
+                      polling? (atom false)
+                      poll-tick!
+                      (fn poll-tick! []
+                        (when (compare-and-set! polling? false true)
+                          (poll-relay-envelopes!
+                           (:relay-url opts)
+                           (or (:pubkey-hex identity) (:pubkey identity))
+                           (:privkey-bytes identity)
+                           {:since-seq @since-mseq
+                            :since-broadcast-seq @since-bseq
+                            :timeout-ms 2000}
+                           (fn [poll-res]
+                             (try
+                               (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
+                                     bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                                     all-items (concat msgs bcasts)]
+                                 (when (seq msgs)
+                                   (let [last-m (last msgs)
+                                         mseq (or (get last-m "relay_seq") (get last-m "relay-seq")
+                                                  (get last-m :relay_seq) (get last-m :relay-seq))]
+                                     (when mseq (reset! since-mseq (long mseq)))))
+                                 (when (seq bcasts)
+                                   (let [last-b (last bcasts)
+                                         bseq (or (get last-b "broadcast_seq") (get last-b "broadcast-seq")
+                                                  (get last-b :broadcast_seq) (get last-b :broadcast-seq))]
+                                     (when bseq (reset! since-bseq (long bseq)))))
+                                 (doseq [item all-items]
+                                   (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                                                     (get item :envelope_hex) (get item :envelope))
+                                         wire-bytes (when env-raw
+                                                      (try (basalt/hex->bytes (str env-raw)) (catch :default _ nil)))]
+                                     (when wire-bytes
+                                       (let [st @state-atom
+                                             r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
+                                         (reset! state-atom (:state r))
+                                         (when state-file
+                                           (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
+                                         (doseq [ev (:stdout-events r)]
+                                           (event-out ev))
+                                         (when-let [dial-info (:p2p-dial r)]
+                                           (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
+                                         (when (seq (:net-envelopes r))
+                                           (send-routed-envelopes! (:net-envelopes r)
+                                                                   (:send-fn conn-res)
+                                                                   p2p-peers-atom
+                                                                   ingress-peers-atom
+                                                                   state-atom
+                                                                   (:privkey-bytes identity)))))))
+                                 (when (seq msgs)
+                                   (ack-relay-envelopes!
+                                    (:relay-url opts)
+                                    (or (:pubkey-hex identity) (:pubkey identity))
+                                    (:privkey-bytes identity)
+                                    @since-mseq)))
+                               (finally
+                                 (reset! polling? false)))))))]
+                  (poll-tick!)
+                  (js/setInterval poll-tick! 1000)))
               (when (boolean (:auto-sync? opts true))
                 (let [sync-interval-ms (max 1000 (or (:sync-interval-ms opts) 15000))]
                   (run-auto-sync-tick! state-atom bootstrap identity state-file conn-opts)
@@ -2514,6 +2869,8 @@
                                   (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                                   (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
                                   (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                  (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
+                                  (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
                                   (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                                   (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                                   (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
@@ -2547,27 +2904,45 @@
                                new-state (:state res)
                                needs-network? (and (seq (:net-envelopes res)) (:connect? opts true))]
                            (if needs-network?
-                             (connect-validators!
-                              identity bootstrap opts
-                              (fn [conn-res]
-                                (if-not (:ok? conn-res)
-                                  (do
-                                    (emit-json-line! {"ok" false "error" (or (:error conn-res) "listener-disabled")})
-                                    (.exit js/process 0))
-                                  (let [sent? (send-all-envelopes! (:send-fn conn-res) (:net-envelopes res))]
-                                    (js/setTimeout
-                                     (fn []
-                                       (when-let [n (:node conn-res)]
-                                         (try (api/close! n) (catch :default _ nil)))
-                                       (if sent?
-                                         (do
-                                           (save-light-state! state-file new-state)
-                                           (emit-json-line! (:response res))
-                                           (.exit js/process 0))
-                                         (do
-                                           (emit-json-line! {"ok" false "error" "connection-closed"})
-                                           (.exit js/process 0))))
-                                     50)))))
+                             (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
+                                                  (when (and (string? u) (not (str/blank? u))) u))]
+                               (let [relay-opts (assoc opts :timeout-ms (or (:timeout-ms opts) 5000))
+                                     promises (mapv (fn [env]
+                                                      (submit-relay-envelope! relay-url env relay-opts))
+                                                    (:net-envelopes res))]
+                                 (-> (js/Promise.all (clj->js promises))
+                                     (.then (fn [results]
+                                              (save-light-state! state-file new-state)
+                                              (let [res-clj (js->clj results :keywordize-keys true)
+                                                    failed (first (filter #(false? (or (get % :ok) (get % "ok"))) res-clj))]
+                                                (if failed
+                                                  (emit-json-line! {"ok" false "error" (or (:error failed) "relay-submit-failed")})
+                                                  (emit-json-line! (:response res))))
+                                              (.exit js/process 0)))
+                                     (.catch (fn [err]
+                                               (emit-json-line! {"ok" false "error" (str err)})
+                                               (.exit js/process 0)))))
+                               (connect-validators!
+                                identity bootstrap opts
+                                (fn [conn-res]
+                                  (if-not (:ok? conn-res)
+                                    (do
+                                      (emit-json-line! {"ok" false "error" (or (:error conn-res) "listener-disabled")})
+                                      (.exit js/process 0))
+                                    (let [sent? (send-all-envelopes! (:send-fn conn-res) (:net-envelopes res))]
+                                      (js/setTimeout
+                                       (fn []
+                                         (when-let [n (:node conn-res)]
+                                           (try (api/close! n) (catch :default _ nil)))
+                                         (if sent?
+                                           (do
+                                             (save-light-state! state-file new-state)
+                                             (emit-json-line! (:response res))
+                                             (.exit js/process 0))
+                                           (do
+                                             (emit-json-line! {"ok" false "error" "connection-closed"})
+                                             (.exit js/process 0))))
+                                       50))))))
                              (do
                                (save-light-state! state-file new-state)
                                (emit-json-line! (:response res))

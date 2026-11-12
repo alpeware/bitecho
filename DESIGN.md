@@ -615,6 +615,22 @@ Light nodes authenticate ledger balances, spendable sequences, and escrow status
    - **Multi-Subnet Multiplexer Automatic Anchor Propagation (`bitecho.light-node.core`)**:
      - Child subnets configured with `:on-change` or `:epoch` anchoring emit pure `{:effect :anchor-to-parent}` effects on state transitions.
      - Multiplexer intercepts anchor effects and feeds `:put-blob` followed by `:publish-pointer` directly into parent subnet instances hosted on the same node.
+   - **Decision Note (LOW-7: Settlement Anchoring Model)**:
+     - The unified architecture replaces pre-unification M12B challenge windows with the unified `Pointer` + `k-of-n` ACL threshold quorum model: child subnet state-roots are committed as immutable `Blob`s pinned by parent `Pointer`s under `:subnet/path-acl` governance (`path "anchor/<child-subnet-id>"`), authenticated by cryptographic inclusion proofs and authority/threshold quorum signatures. This eliminates complex fraud-proof dispute periods while preserving mathematical finality.
+
+4. **HTTP Gateway Relay Architecture (`/relay/v1/*`) (Milestone 12 Follow-Up / Gateway Protocol)**:
+   - **Pure Sans-IO Protocol (`bitecho.core.protocol.relay`)**:
+     - Manages bounded inboxes per recipient pubkey (`:max-inbox-size 256`, `:ttl-ms 86400000`) and a global ring buffer for mesh broadcasts (`:max-broadcast-size 256`).
+     - Enforces deterministic SHA-256 `:envelope-id` deduplication and outer Ed25519 signature verification fail-closed (Rule 5).
+     - Authenticates long-polling consumers via canonical Proof-of-Possession (`PoP`): `bitecho-relay-poll-v1|<pubkey>|<since-seq>|<timestamp-ms>|<nonce>` with bounded clock skew (`:max-skew-ms 300000`) and nonce replay protection (`:max-nonces 2048`).
+   - **Edge HTTP Shell Endpoints (`bitecho.shell.http`)**:
+     - Multiplexed on both port 80 and port 443 alongside existing ACME and web services.
+     - `POST /relay/v1/send`: Ingests JSON/Fressian envelopes, inboxes unicast messages, delivers to broadcast ring, forwards to validator network, and notifies parked long-polling threads.
+     - `GET / POST /relay/v1/poll`: Serves queued envelopes or parks virtual threads (up to `:wait-ms` 25000) for instant event delivery.
+     - `POST /relay/v1/ack`: Prunes acknowledged envelopes up to sequence number.
+     - `GET / POST /relay/v1/chain-state`: Returns signed validator snapshots allowing light nodes to verify 2-of-3 BFT quorum without direct WebRTC sockets.
+   - **3-Runtime Parity (`--relay-url`)**:
+     - JVM (`light_node.clj`), Node.js (`node_main.cljs`), and Browser (`browser_main.cljs`) light nodes support seamless fallback operation over HTTP Gateway Relay when direct UDP/TCP DataChannels are unavailable.
 
 
 

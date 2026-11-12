@@ -318,3 +318,169 @@
           "Deterministic empty-root matches cross-runtime golden vector")
       (is (= "20c736e1902498770d01fc85f51684e09658b641c586a4fdb7ef26d0361e8fca" branch-hash)
           "Deterministic branch-hash matches cross-runtime golden vector"))))
+
+;; -----------------------------------------------------------------------------
+;; 6. M12 Follow-Up Remediation Tests (LOW-1..LOW-5 & P2P Candidate Filter)
+;; -----------------------------------------------------------------------------
+
+(deftest test-low-1-prev-anchor-entry-normalization
+  (testing "LOW-1: verify-subnet-anchor normalizes {:blob ...} without :state-root and rejects epoch regression"
+    (let [kp-parent (crypto/generate-keypair)
+          pub-parent (basalt/bytes->hex (:public kp-parent))
+          kp-child (crypto/generate-keypair)
+          pub-child (basalt/bytes->hex (:public kp-child))
+          parent-sid "global"
+          child-sid "sub/child-low-1"
+          parent-policy {:subnet/id parent-sid
+                         :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{pub-parent}}
+                         :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                         :subnet/path-acl [{:pattern "anchor/*" :principal {:type :allowlist}}]
+                         :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          child-policy {:subnet/id child-sid
+                        :subnet/parent-id parent-sid
+                        :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{pub-child}}
+                        :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                        :subnet/path-acl [{:pattern "head/*" :principal {:type :allowlist}}]
+                        :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          parent-inst (:instance (subnet/init-subnet-instance parent-policy))
+          child-inst (:instance (subnet/init-subnet-instance child-policy))
+          parent-ctx (subnet/pointer-verify-ctx parent-inst pub-parent 1000)
+          ;; Anchor 1 at epoch 10
+          anc1 (subnet/build-subnet-anchor child-inst {:authority-privkey (:private kp-parent)
+                                                       :authority-pubkey pub-parent
+                                                       :parent-subnet parent-sid
+                                                       :child-epoch 10
+                                                       :anchor-seq 1
+                                                       :now-ms 1000})
+          v1 (subnet/verify-subnet-anchor (:pointer anc1) (:blob anc1) parent-ctx nil)
+          _ (is (true? (:ok? v1)) "First anchor verified successfully")
+          ;; Anchor 2 at epoch 5 (regressing) referencing anc1
+          anc2 (subnet/build-subnet-anchor child-inst {:authority-privkey (:private kp-parent)
+                                                       :authority-pubkey pub-parent
+                                                       :parent-subnet parent-sid
+                                                       :child-epoch 5
+                                                       :anchor-seq 2
+                                                       :prev-anchor-cid (:blob/cid (:blob anc1))
+                                                       :now-ms 2000})
+          ;; Pass {:blob (:blob anc1)} WITHOUT :state-root
+          v2 (subnet/verify-subnet-anchor (:pointer anc2) (:blob anc2) parent-ctx {:blob (:blob anc1)})]
+      (is (false? (:ok? v2)) "Epoch regression rejected with {:blob ...} entry")
+      (is (= :anchor-epoch-regression (:error v2)) "Error code is :anchor-epoch-regression"))))
+
+(deftest test-low-2-first-anchor-predecessor-mismatch-any-seq
+  (testing "LOW-2: First anchor with nil prev-anchor-entry and non-nil :prev-anchor-cid is rejected even with :pointer/seq 5"
+    (let [kp-parent (crypto/generate-keypair)
+          pub-parent (basalt/bytes->hex (:public kp-parent))
+          child-sid "sub/child-low-2"
+          parent-sid "global"
+          parent-policy {:subnet/id parent-sid
+                         :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{pub-parent}}
+                         :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                         :subnet/path-acl [{:pattern "anchor/*" :principal {:type :allowlist}}]
+                         :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          child-policy {:subnet/id child-sid
+                        :subnet/parent-id parent-sid
+                        :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{pub-parent}}
+                        :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                        :subnet/path-acl [{:pattern "head/*" :principal {:type :allowlist}}]
+                        :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          parent-inst (:instance (subnet/init-subnet-instance parent-policy))
+          child-inst (:instance (subnet/init-subnet-instance child-policy))
+          parent-ctx (subnet/pointer-verify-ctx parent-inst pub-parent 1000)
+          bogus-prev-cid (apply str (repeat 64 "f"))
+          anc (subnet/build-subnet-anchor child-inst {:authority-privkey (:private kp-parent)
+                                                      :authority-pubkey pub-parent
+                                                      :parent-subnet parent-sid
+                                                      :child-epoch 1
+                                                      :anchor-seq 5
+                                                      :prev-anchor-cid bogus-prev-cid
+                                                      :now-ms 1000})
+          res (subnet/verify-subnet-anchor (:pointer anc) (:blob anc) parent-ctx nil)]
+      (is (false? (:ok? res)) "Rejected because genesis anchor cannot have a predecessor")
+      (is (= :anchor-predecessor-mismatch (:error res)) "Error is :anchor-predecessor-mismatch"))))
+
+(deftest test-low-4-verify-pointer-missing-anchor-blob
+  (testing "LOW-4: data/verify-pointer on :anchor pointer returns {:ok? false :error :missing-anchor-blob} when blob missing"
+    (let [kp (crypto/generate-keypair)
+          pub (basalt/bytes->hex (:public kp))
+          target-cid (apply str (repeat 64 "a"))
+          dummy-mroot (apply str (repeat 64 "b"))
+          proof {:proof/type :anchor
+                 :child-subnet "child-sub"
+                 :merkle-root dummy-mroot
+                 :child-epoch 1
+                 :prev-anchor-cid nil}
+          raw-ptr {:pointer/authority pub
+                   :pointer/subnet "parent-sub"
+                   :pointer/path "anchor/child-sub"
+                   :pointer/seq 1
+                   :pointer/target target-cid
+                   :pointer/proof proof}
+          ptr (data/sign-pointer (:private kp) raw-ptr)
+          ctx {:subnet "parent-sub"
+               :path-acl [{:pattern "anchor/*" :principal {:type :allowlist}}]
+               :trust-anchors #{pub}
+               :blobs {:entries {}}}
+          res (data/verify-pointer ptr ctx)]
+      (is (false? (:ok? res)) "Rejected when blob is missing from context")
+      (is (= :missing-anchor-blob (:error res)) "Error is :missing-anchor-blob"))))
+
+(deftest test-low-5-commands-and-multiplexer
+  (testing "LOW-5: handle-command and dispatch-multiplexed-command for anchor-subnet and epoch-tick"
+    (let [kp-parent (crypto/generate-keypair)
+          pub-parent (basalt/bytes->hex (:public kp-parent))
+          kp-child (crypto/generate-keypair)
+          pub-child (basalt/bytes->hex (:public kp-child))
+          parent-sid "global"
+          child-sid "sub/child-low-5"
+          parent-policy {:subnet/id parent-sid
+                         :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{pub-parent}}
+                         :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                         :subnet/path-acl [{:pattern "anchor/*" :principal {:type :allowlist}}]
+                         :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+          child-policy {:subnet/id child-sid
+                        :subnet/parent-id parent-sid
+                        :subnet/gate {:gate/mode :permissioned :gate/admission :allowlist :gate/trust-anchors #{pub-child}}
+                        :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                        :subnet/path-acl [{:pattern "head/*" :principal {:type :allowlist}}]
+                        :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}
+                        :subnet/anchoring {:trigger :on-change
+                                           :authority-privkey (:private kp-parent)
+                                           :authority-pubkey pub-parent}}
+          parent-inst (:instance (subnet/init-subnet-instance parent-policy))
+          child-inst (:instance (subnet/init-subnet-instance child-policy))
+          mux (-> (light-core/init-multi-subnet-multiplexer {})
+                  (light-core/register-subnet-instance parent-sid parent-inst)
+                  (light-core/register-subnet-instance child-sid child-inst))
+          ;; Test command 'anchor-subnet' via handle-command on multiplexer
+          anc-cmd-res (light-core/handle-command mux {"cmd" "anchor-subnet" "subnet_id" child-sid} (:private kp-parent))]
+      (is (true? (get-in anc-cmd-res [:response "ok"])) "anchor-subnet command executed successfully")
+      (is (some? (get-in anc-cmd-res [:response "anchor"])) "Response contains anchor")
+      ;; Test command 'epoch-tick' via handle-command on multiplexer
+      (let [tick-cmd-res (light-core/handle-command (:state anc-cmd-res) {"cmd" "epoch-tick" "subnet_id" child-sid "epoch" 2} (:private kp-parent))]
+        (is (true? (get-in tick-cmd-res [:response "ok"])) "epoch-tick command executed successfully")))))
+
+(deftest test-p2p-self-candidate-filter
+  (testing "handle-wire-p2p-answer filters out local candidates so node does not self-dial"
+    (let [sid "session-test-p2p-1"
+          kp-local (crypto/generate-keypair)
+          pub-local (basalt/bytes->hex (:public kp-local))
+          kp-remote (crypto/generate-keypair)
+          pub-remote (basalt/bytes->hex (:public kp-remote))
+          gateway-cand "gateway.ingress.bitecho.org:443"
+          session-map {:session-id sid
+                       :peer pub-remote
+                       :p2p {:phase :offered
+                             :connected? false
+                             :local-candidates [gateway-cand]}}
+          state (assoc (light-core/init-light-state {:pubkey-hex pub-local :pubkey pub-local} {})
+                       :sessions {sid session-map})
+          ;; Responder echoes the initiator's own candidates
+          answer-msg {:type :p2p-answer
+                      :sender pub-remote
+                      :session-id sid
+                      :candidates [gateway-cand]
+                      :transport "tcp"}
+          res (light-core/handle-wire-payload state answer-msg (:private kp-local))]
+      (is (nil? (:p2p-dial res)) "p2p-dial is nil because dialable candidates were empty (filtered out self-candidate)")
+      (is (= :offered (get-in (:state res) [:sessions sid :p2p :phase])) "State remains in :offered waiting for inbound bind"))))

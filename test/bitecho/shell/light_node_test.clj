@@ -1262,7 +1262,8 @@
                   "--auto-sync" "--no-auto-sync" "--sync-interval-ms"
                   "--auto-register-home-set" "--no-auto-register-home-set"
                   "--cmd-file" "--events-out" "--min-seq" "--after-ts"
-                  "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"}]
+                  "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"
+                  "--relay-url"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))
@@ -1368,6 +1369,7 @@
       (is (= "hello world" (get-in (light-shell/parse-light-node-args ["send" "--text" "hello world"]) [:cmd-map "text"])))
       (is (= "010203" (get-in (light-shell/parse-light-node-args ["send" "--payload-hex" "010203"]) [:cmd-map "payload_hex"])))
       (is (= "recv-pub" (get-in (light-shell/parse-light-node-args ["transfer" "--receiver" "recv-pub"]) [:cmd-map "receiver"])))
+      (is (= "https://bitecho.org/relay/v1" (:relay-url (light-shell/parse-light-node-args ["serve" "--relay-url" "https://bitecho.org/relay/v1"]))))
       (is (= "rcpt-pub" (get-in (light-shell/parse-light-node-args ["transfer" "--recipient" "rcpt-pub"]) [:cmd-map "recipient"])))
       (is (= 100 (get-in (light-shell/parse-light-node-args ["transfer" "--amount" "100"]) [:cmd-map "amount"])))
       (is (= 7 (get-in (light-shell/parse-light-node-args ["transfer" "--seq" "7"]) [:cmd-map "seq"])))

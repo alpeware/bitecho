@@ -14,12 +14,16 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.protocol.acme :as acme-proto]
             [bitecho.core.protocol.dns :as dns-proto]
+            [bitecho.core.protocol.relay :as relay]
             [bitecho.core.subnet :as subnet]
             [bitecho.fressian :as fressian]
             [bitecho.shell.infra :as infra]
+            [bitecho.shell.light-node :as light-node]
+            [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [datachannel.api :as api])
   (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer HttpsConfigurator HttpsExchange HttpsParameters HttpsServer]
            [java.io ByteArrayInputStream ByteArrayOutputStream File InputStream OutputStream RandomAccessFile]
            [java.net InetSocketAddress ServerSocket Socket SocketException]
@@ -763,126 +767,475 @@
               (when (map? d) (:key-auth d)))
             (fressian/bytes->utf8 bs)))))))
 
-(defn- make-port-80-handler
-  [subnet-runtime https-port limiter-atom]
-  (reify HttpHandler
-    (handle [_ exchange]
-      (let [req (exchange->request exchange)
-            path (get-in req [:request/uri :path])
-            method (:request/method req)
-            now-ms (System/currentTimeMillis)]
-        (cond
-          (and (or (= method :GET) (= method :HEAD))
-               (str/starts-with? path "/.well-known/acme-challenge/"))
-          (let [token (subs path (count "/.well-known/acme-challenge/"))
-                key-auth (lookup-acme-http01-key-auth subnet-runtime token now-ms)]
-            (if key-auth
-              (send-response exchange
-                             {:response/status 200
-                              :response/headers {"Content-Type" "application/octet-stream"}
-                              :response/body (if (= method :HEAD) nil key-auth)})
-              (send-response exchange
-                             {:response/status 404
-                              :response/headers {"Content-Type" "text/plain; charset=utf-8"}
-                              :response/body "Not Found\n"})))
+;; =============================================================================
+;; 6. HTTP Gateway Relay Handlers (/relay/v1/*)
+;; =============================================================================
 
-          (and (or (= method :GET) (= method :HEAD)) (= path "/healthz"))
+(defn- parse-query-params
+  [^String raw-query]
+  (if (str/blank? raw-query)
+    {}
+    (into {}
+          (keep (fn [pair]
+                  (let [[k v] (str/split pair #"=" 2)]
+                    (when (and k (seq k))
+                      [(str/lower-case (java.net.URLDecoder/decode k StandardCharsets/UTF_8))
+                       (if v (java.net.URLDecoder/decode v StandardCharsets/UTF_8) "")]))))
+          (str/split raw-query #"&"))))
+
+(defn- handle-relay-send
+  [^HttpExchange exchange req relay-atom relay-waiters-atom config]
+  (let [body-bytes (with-open [is (.getRequestBody exchange)] (.readAllBytes is))
+        ct (first (get (:request/headers req) :header/content-type ""))
+        env (try
+              (cond
+                (and (string? ct) (str/includes? (str/lower-case ct) "application/json"))
+                (let [m (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))]
+                  (or (get m "envelope_hex") (get m "envelope") m))
+
+                (and (pos? (alength ^bytes body-bytes)) (= 0x7B (aget ^bytes body-bytes 0)))
+                (let [m (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))]
+                  (or (get m "envelope_hex") (get m "envelope") m))
+
+                :else
+                body-bytes)
+              (catch Exception _ body-bytes))
+        now-ms (System/currentTimeMillis)
+        res-box (atom nil)
+        _ (swap! relay-atom
+                 (fn [st]
+                   (let [r (relay/reduce-relay st {:type :relay-submit :envelope env :now-ms now-ms})]
+                     (reset! res-box r)
+                     (:state r))))
+        r @res-box]
+    (if (:ok? r)
+      (do
+        (when-let [forwarder (:on-relay-forward config)]
+          (doseq [eff (:effects r)]
+            (when (= :forward-to-validators (:effect eff))
+              (try (forwarder eff) (catch Exception _ nil)))))
+        (let [recip (or (get-in r [:response "recipient"])
+                        (when-let [eff (first (filter #(= :forward-to-validators (:effect %)) (:effects r)))]
+                          (:recipient eff)))
+              broadcast? (boolean (get-in r [:response "broadcast"]))]
+          (when (or recip broadcast?)
+            (let [to-wake (concat
+                           (when recip (get @relay-waiters-atom recip #{}))
+                           (get @relay-waiters-atom :broadcast #{}))]
+              (doseq [p to-wake]
+                (deliver p :notified)))))
+        (send-response exchange
+                       {:response/status 200
+                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                        :response/body (json/write-str (:response r))}))
+      (let [status (case (:error r)
+                     :payload-too-large 413
+                     :invalid-signature 403
+                     400)]
+        (send-response exchange
+                       {:response/status status
+                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                        :response/body (json/write-str (:response r))})))))
+
+(defn- handle-relay-poll
+  [^HttpExchange exchange req relay-atom relay-waiters-atom]
+  (let [body-bytes (when (= (:request/method req) :POST)
+                     (with-open [is (.getRequestBody exchange)] (.readAllBytes is)))
+        body-json (when (and body-bytes (pos? (alength ^bytes body-bytes)))
+                    (try (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))
+                         (catch Exception _ nil)))
+        query-params (parse-query-params (get-in req [:request/uri :query]))
+        headers (:request/headers req)
+        pubkey (or (get body-json "pubkey")
+                   (get query-params "pubkey")
+                   (first (get headers :header/x-bitecho-pubkey)))
+        since-seq (try (Long/parseLong (str (or (get body-json "since_seq")
+                                                (get body-json "since-seq")
+                                                (get query-params "since_seq")
+                                                (get query-params "since-seq")
+                                                (first (get headers :header/x-bitecho-since-seq))
+                                                0)))
+                       (catch Exception _ 0))
+        since-bseq (try (Long/parseLong (str (or (get body-json "since_broadcast_seq")
+                                                 (get body-json "since-broadcast-seq")
+                                                 (get query-params "since_broadcast_seq")
+                                                 (get query-params "since-broadcast-seq")
+                                                 (first (get headers :header/x-bitecho-since-broadcast-seq))
+                                                 0)))
+                        (catch Exception _ 0))
+        ts-ms (try (Long/parseLong (str (or (get body-json "timestamp_ms")
+                                            (get body-json "timestamp-ms")
+                                            (get body-json "ts")
+                                            (get query-params "timestamp_ms")
+                                            (get query-params "timestamp-ms")
+                                            (get query-params "ts")
+                                            (first (get headers :header/x-bitecho-timestamp-ms))
+                                            0)))
+                   (catch Exception _ 0))
+        nonce (or (get body-json "nonce")
+                  (get query-params "nonce")
+                  (first (get headers :header/x-bitecho-nonce)))
+        signature (or (get body-json "signature")
+                      (get body-json "sig")
+                      (get query-params "signature")
+                      (get query-params "sig")
+                      (first (get headers :header/x-bitecho-signature)))
+        raw-wait (try (Long/parseLong (str (or (get body-json "wait_ms")
+                                               (get body-json "wait-ms")
+                                               (get body-json "timeout_ms")
+                                               (get body-json "timeout-ms")
+                                               (get query-params "wait_ms")
+                                               (get query-params "wait-ms")
+                                               (get query-params "timeout_ms")
+                                               (get query-params "timeout-ms")
+                                               (first (get headers :header/x-bitecho-wait-ms))
+                                               0)))
+                      (catch Exception _ 0))
+        wait-ms (max 0 (min 25000 raw-wait))
+        now-ms (System/currentTimeMillis)
+        poll-event {:type :relay-poll
+                    :pubkey pubkey
+                    :since-seq since-seq
+                    :since-broadcast-seq since-bseq
+                    :timestamp-ms ts-ms
+                    :nonce nonce
+                    :signature signature
+                    :now-ms now-ms}
+        res-box (atom nil)
+        _ (swap! relay-atom
+                 (fn [st]
+                   (let [r (relay/reduce-relay st poll-event)]
+                     (reset! res-box r)
+                     (:state r))))
+        r @res-box]
+    (if-not (:ok? r)
+      (send-response exchange
+                     {:response/status 403
+                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                      :response/body (json/write-str (:response r))})
+      (let [msgs (get-in r [:response "messages"] [])
+            bcasts (get-in r [:response "broadcasts"] [])
+            norm-pk (get-in r [:response "pubkey"] pubkey)]
+        (if (and (empty? msgs) (empty? bcasts) (pos? wait-ms))
+          (let [p (promise)
+                _ (swap! relay-waiters-atom (fn [m]
+                                              (-> m
+                                                  (update norm-pk (fnil conj #{}) p)
+                                                  (update :broadcast (fnil conj #{}) p))))
+                _ (deref p wait-ms :timeout)
+                _ (swap! relay-waiters-atom (fn [m]
+                                              (-> m
+                                                  (update norm-pk disj p)
+                                                  (update :broadcast disj p))))
+                st @relay-atom
+                ttl-ms (long (get st :ttl-ms 86400000))
+                cutoff-ms (- (System/currentTimeMillis) ttl-ms)
+                fresh-msgs (filterv (fn [e] (and (> (long (:relay-seq e)) since-seq)
+                                                 (>= (long (:received-at e 0)) cutoff-ms)))
+                                    (get-in st [:inboxes norm-pk] []))
+                fresh-bcasts (filterv (fn [e] (> (long (:broadcast-seq e)) since-bseq))
+                                      (get st :broadcasts []))
+                resp {"ok" true
+                      "pubkey" norm-pk
+                      "messages" fresh-msgs
+                      "broadcasts" fresh-bcasts}]
+            (send-response exchange
+                           {:response/status 200
+                            :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                            :response/body (json/write-str resp)}))
           (send-response exchange
                          {:response/status 200
-                          :response/headers {"Content-Type" "text/plain; charset=utf-8"}
-                          :response/body (if (= method :HEAD) nil "ok\n")})
+                          :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str (:response r))}))))))
 
-          (and (or (= method :GET) (= method :HEAD))
-               (= path "/statusz")
-               (#{"127.0.0.1" "::1" "0:0:0:0:0:0:0:1"} (:request/remote-ip req)))
-          (let [st (when subnet-runtime (infra/runtime-status subnet-runtime))
-                sdf (SimpleDateFormat. "yyyy-MM")
-                month-key (.format sdf (Date. now-ms))
-                egress (get-in @limiter-atom [:egress-by-month month-key] 0)
-                body (format "role=%s leader=%s term=%s epoch=%s healthy=%d egress_bytes=%d\n"
-                             (name (or (:role st) :standalone))
-                             (str (or (:leader-id st) :none))
-                             (str (or (:term st) 0))
-                             (str (or (:epoch st) :none))
-                             (count (or (:healthy-nodes st) #{}))
-                             (long egress))]
-            (send-response exchange
-                           {:response/status 200
-                            :response/headers {"Content-Type" "text/plain; charset=utf-8"}
-                            :response/body (if (= method :HEAD) nil body)}))
+(defn- handle-relay-ack
+  [^HttpExchange exchange req relay-atom]
+  (let [body-bytes (with-open [is (.getRequestBody exchange)] (.readAllBytes is))
+        body-json (when (and body-bytes (pos? (alength ^bytes body-bytes)))
+                    (try (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))
+                         (catch Exception _ nil)))
+        query-params (parse-query-params (get-in req [:request/uri :query]))
+        headers (:request/headers req)
+        pubkey (or (get body-json "pubkey")
+                   (get query-params "pubkey")
+                   (first (get headers :header/x-bitecho-pubkey)))
+        ack-seq (try (Long/parseLong (str (or (get body-json "ack_seq")
+                                              (get body-json "ack-seq")
+                                              (get body-json "up_to_seq")
+                                              (get body-json "up-to-seq")
+                                              (get query-params "ack_seq")
+                                              (get query-params "ack-seq")
+                                              (get query-params "up_to_seq")
+                                              (get query-params "up-to-seq")
+                                              (first (get headers :header/x-bitecho-ack-seq))
+                                              0)))
+                     (catch Exception _ 0))
+        ts-ms (try (Long/parseLong (str (or (get body-json "timestamp_ms")
+                                            (get body-json "timestamp-ms")
+                                            (get body-json "ts")
+                                            (get query-params "timestamp_ms")
+                                            (get query-params "timestamp-ms")
+                                            (get query-params "ts")
+                                            (first (get headers :header/x-bitecho-timestamp-ms))
+                                            0)))
+                   (catch Exception _ 0))
+        nonce (or (get body-json "nonce")
+                  (get query-params "nonce")
+                  (first (get headers :header/x-bitecho-nonce)))
+        signature (or (get body-json "signature")
+                      (get body-json "sig")
+                      (get query-params "signature")
+                      (get query-params "sig")
+                      (first (get headers :header/x-bitecho-signature)))
+        now-ms (System/currentTimeMillis)
+        ack-event {:type :relay-ack
+                   :pubkey pubkey
+                   :ack-seq ack-seq
+                   :timestamp-ms ts-ms
+                   :nonce nonce
+                   :signature signature
+                   :now-ms now-ms}
+        res-box (atom nil)
+        _ (swap! relay-atom
+                 (fn [st]
+                   (let [r (relay/reduce-relay st ack-event)]
+                     (reset! res-box r)
+                     (:state r))))
+        r @res-box
+        status (if (:ok? r) 200 403)]
+    (send-response exchange
+                   {:response/status status
+                    :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                    :response/body (json/write-str (:response r))})))
 
-          :else
-          (let [host (get-in req [:request/uri :host] "localhost")
-                port-suffix (if (and https-port (not= https-port 443)) (str ":" https-port) "")
-                query (get-in req [:request/uri :query])
-                q-suffix (if (seq query) (str "?" query) "")
-                loc (str "https://" host port-suffix path q-suffix)]
-            (send-response exchange
-                           {:response/status 308
-                            :response/headers {"Location" loc "Connection" "close"}
-                            :response/body nil})))))))
+(defn- handle-relay-chain-state
+  [^HttpExchange exchange req config subnet-runtime]
+  (let [body-bytes (when (= (:request/method req) :POST)
+                     (with-open [is (.getRequestBody exchange)] (.readAllBytes is)))
+        body-json (when (and body-bytes (pos? (alength ^bytes body-bytes)))
+                    (try (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))
+                         (catch Exception _ nil)))
+        query-params (parse-query-params (get-in req [:request/uri :query]))
+        pubkey (or (get body-json "pubkey")
+                   (get query-params "pubkey")
+                   (first (get (:request/headers req) :header/x-bitecho-pubkey)))
+        nonce (or (get body-json "nonce")
+                  (get query-params "nonce"))
+        snapshots (cond
+                    (:chain-state-fetcher config)
+                    (try ((:chain-state-fetcher config) pubkey nonce) (catch Exception _ []))
+
+                    (and subnet-runtime (or (:validator-bootstrap config) (:validator-bootstrap subnet-runtime)))
+                    (let [v-snaps (try
+                                    (infra/fetch-validator-chain-state-snapshots!
+                                     subnet-runtime
+                                     (or (:validator-bootstrap config) (:validator-bootstrap subnet-runtime))
+                                     (or pubkey (:default-sender subnet-runtime))
+                                     (or nonce (str (System/currentTimeMillis))))
+                                    (catch Exception _ []))]
+                      (if (seq v-snaps)
+                        v-snaps
+                        (if-let [ep (infra/current-runtime-epoch subnet-runtime)]
+                          [{:pubkey (or pubkey "302a300506032b65700321000000000000000000000000000000000000000000000000000000000000000000")
+                            :finalized-epoch ep
+                            :balance 0
+                            :spendable 0
+                            :seq 0
+                            :nonce (or nonce "")}]
+                          [])))
+
+                    (and subnet-runtime (seq (:chain-state-snapshots @(:subnet-atom subnet-runtime))))
+                    (vec (:chain-state-snapshots @(:subnet-atom subnet-runtime)))
+
+                    subnet-runtime
+                    (let [ep (infra/current-runtime-epoch subnet-runtime)]
+                      (if ep
+                        [{:pubkey (or pubkey "302a300506032b65700321000000000000000000000000000000000000000000000000000000000000000000")
+                          :finalized-epoch ep
+                          :balance 0
+                          :spendable 0
+                          :seq 0
+                          :nonce (or nonce "")}]
+                        []))
+
+                    :else [])
+        burn-fl (long (or (get-in config [:burn-floor]) (get-in config [:min-signaling-burn]) 100))
+        st (when subnet-runtime (try (infra/runtime-status subnet-runtime) (catch Exception _ nil)))
+        resp (cond-> {"ok" true
+                      "pubkey" pubkey
+                      "snapshots" snapshots
+                      "min_signaling_burn" burn-fl
+                      "bootstrap" (or (:bootstrap config) (:domain config) "bitecho.org")}
+               subnet-runtime (assoc "epoch" (or (infra/current-runtime-epoch subnet-runtime) 1)
+                                     "tip_seq" (or (:last-applied-seq st) 0)
+                                     "root" (or (:state-root st) "")))]
+    (send-response exchange
+                   {:response/status 200
+                    :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                    :response/body (json/write-str resp)})))
+
+(defn handle-relay-endpoint
+  "Dispatches HTTP /relay/v1/* endpoints:
+   - POST /relay/v1/send
+   - GET/POST /relay/v1/poll (with virtual thread parking)
+   - POST /relay/v1/ack
+   - GET/POST /relay/v1/chain-state"
+  [^HttpExchange exchange req relay-atom relay-waiters-atom config subnet-runtime]
+  (let [path (get-in req [:request/uri :path])
+        method (:request/method req)
+        clean-path (str/replace path #"/+$" "")]
+    (cond
+      (and (= method :POST) (= clean-path "/relay/v1/send"))
+      (handle-relay-send exchange req relay-atom relay-waiters-atom config)
+
+      (and (or (= method :GET) (= method :POST)) (= clean-path "/relay/v1/poll"))
+      (handle-relay-poll exchange req relay-atom relay-waiters-atom)
+
+      (and (= method :POST) (= clean-path "/relay/v1/ack"))
+      (handle-relay-ack exchange req relay-atom)
+
+      (and (or (= method :GET) (= method :POST)) (= clean-path "/relay/v1/chain-state"))
+      (handle-relay-chain-state exchange req config subnet-runtime)
+
+      :else
+      (send-response exchange
+                     {:response/status 404
+                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                      :response/body (json/write-str {"ok" false "error" "not-found" "path" path})}))))
+
+(defn- make-port-80-handler
+  ([subnet-runtime https-port limiter-atom]
+   (make-port-80-handler {} subnet-runtime https-port limiter-atom (atom (relay/init-relay-state)) (atom {})))
+  ([config subnet-runtime https-port limiter-atom relay-atom relay-waiters-atom]
+   (reify HttpHandler
+     (handle [_ exchange]
+       (let [req (exchange->request exchange)
+             path (get-in req [:request/uri :path])
+             method (:request/method req)
+             now-ms (System/currentTimeMillis)]
+         (cond
+           (str/starts-with? path "/relay/v1/")
+           (handle-relay-endpoint exchange req relay-atom relay-waiters-atom config subnet-runtime)
+
+           (and (or (= method :GET) (= method :HEAD))
+                (str/starts-with? path "/.well-known/acme-challenge/"))
+           (let [token (subs path (count "/.well-known/acme-challenge/"))
+                 key-auth (lookup-acme-http01-key-auth subnet-runtime token now-ms)]
+             (if key-auth
+               (send-response exchange
+                              {:response/status 200
+                               :response/headers {"Content-Type" "application/octet-stream"}
+                               :response/body (if (= method :HEAD) nil key-auth)})
+               (send-response exchange
+                              {:response/status 404
+                               :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                               :response/body "Not Found\n"})))
+
+           (and (or (= method :GET) (= method :HEAD)) (= path "/healthz"))
+           (send-response exchange
+                          {:response/status 200
+                           :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                           :response/body (if (= method :HEAD) nil "ok\n")})
+
+           (and (or (= method :GET) (= method :HEAD))
+                (= path "/statusz")
+                (#{"127.0.0.1" "::1" "0:0:0:0:0:0:0:1"} (:request/remote-ip req)))
+           (let [st (when subnet-runtime (infra/runtime-status subnet-runtime))
+                 sdf (SimpleDateFormat. "yyyy-MM")
+                 month-key (.format sdf (Date. now-ms))
+                 egress (get-in @limiter-atom [:egress-by-month month-key] 0)
+                 body (format "role=%s leader=%s term=%s epoch=%s healthy=%d egress_bytes=%d\n"
+                              (name (or (:role st) :standalone))
+                              (str (or (:leader-id st) :none))
+                              (str (or (:term st) 0))
+                              (str (or (:epoch st) :none))
+                              (count (or (:healthy-nodes st) #{}))
+                              (long egress))]
+             (send-response exchange
+                            {:response/status 200
+                             :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                             :response/body (if (= method :HEAD) nil body)}))
+
+           :else
+           (let [host (get-in req [:request/uri :host] "localhost")
+                 port-suffix (if (and https-port (not= https-port 443)) (str ":" https-port) "")
+                 query (get-in req [:request/uri :query])
+                 q-suffix (if (seq query) (str "?" query) "")
+                 loc (str "https://" host port-suffix path q-suffix)]
+             (send-response exchange
+                            {:response/status 308
+                             :response/headers {"Location" loc "Connection" "close"}
+                             :response/body nil}))))))))
 
 (defn- make-port-443-handler
-  [config shell-atom default-runtime limiter-atom forwarded-ips-atom]
-  (let [host-subnets (get-in config [:http :host-subnets] {})]
-    (reify HttpHandler
-      (handle [_ exchange]
-        (let [req (exchange->request exchange forwarded-ips-atom)
-              path (get-in req [:request/uri :path])
-              method (:request/method req)
-              host (get-in req [:request/uri :host])
-              target-rt (or (get host-subnets host) default-runtime)
-              remote-ip (:request/remote-ip req)
-              subnet-key (dns-proto/ip->subnet-key remote-ip)
-              now-ms (System/currentTimeMillis)]
-          (if (and (or (= method :GET) (= method :HEAD)) (= path "/healthz"))
-            (send-response exchange
-                           {:response/status 200
-                            :response/headers {"Content-Type" "text/plain; charset=utf-8"}
-                            :response/body (if (= method :HEAD) nil "ok\n")})
-            (let [res-box (atom nil)
-                  _ (swap! limiter-atom
-                           (fn [st]
-                             (let [r (dns-proto/check-and-consume st subnet-key 1.0 now-ms)]
-                               (reset! res-box r)
-                               (:state r))))
-                  rl-res @res-box]
-              (if-not (:allowed? rl-res)
-                (let [retry-s (max 1 (long (Math/ceil (/ (long (:retry-after-ms rl-res 1000)) 1000.0))))]
-                  (infra/apply-shell-event! shell-atom {:type :drop :reason :https-rate-limited :detail subnet-key})
-                  (send-response exchange
-                                 {:response/status 429
-                                  :response/headers {"Retry-After" (str retry-s)
-                                                     "Content-Type" "text/plain; charset=utf-8"}
-                                  :response/body "Too Many Requests\n"}))
-                (let [resp (-> (serve-subnet-request config shell-atom target-rt req now-ms)
-                               (update :response/headers assoc
-                                       "Strict-Transport-Security" "max-age=31536000; includeSubDomains"))
-                      body (:response/body resp)
-                      body-len (cond
-                                 (bytes? body) (alength ^bytes body)
-                                 (string? body) (alength (.getBytes ^String body StandardCharsets/UTF_8))
-                                 (map? body) (long (or (:length body) 0))
-                                 (instance? File body) (.length ^File body)
-                                 :else 0)]
-                  (if (pos? body-len)
-                    (let [month-key (.format (SimpleDateFormat. "yyyy-MM") (Date. now-ms))
-                          eg-ok (atom true)
-                          _ (swap! limiter-atom
-                                   (fn [st]
-                                     (let [r (dns-proto/record-egress st body-len month-key)]
-                                       (reset! eg-ok (:allowed? r))
-                                       (:state r))))]
-                      (if-not @eg-ok
-                        (do
-                          (infra/apply-shell-event! shell-atom {:type :drop :reason :monthly-egress-exceeded})
-                          (send-response exchange
-                                         {:response/status 429
-                                          :response/headers {"Retry-After" "3600"
-                                                             "Content-Type" "text/plain; charset=utf-8"}
-                                          :response/body "Monthly egress limit exceeded\n"}))
-                        (send-response exchange resp)))
-                    (send-response exchange resp)))))))))))
+  ([config shell-atom default-runtime limiter-atom forwarded-ips-atom]
+   (make-port-443-handler config shell-atom default-runtime limiter-atom forwarded-ips-atom (atom (relay/init-relay-state)) (atom {})))
+  ([config shell-atom default-runtime limiter-atom forwarded-ips-atom relay-atom relay-waiters-atom]
+   (let [host-subnets (get-in config [:http :host-subnets] {})]
+     (reify HttpHandler
+       (handle [_ exchange]
+         (let [req (exchange->request exchange forwarded-ips-atom)
+               path (get-in req [:request/uri :path])
+               method (:request/method req)
+               host (get-in req [:request/uri :host])
+               target-rt (or (get host-subnets host) default-runtime)
+               remote-ip (:request/remote-ip req)
+               subnet-key (dns-proto/ip->subnet-key remote-ip)
+               now-ms (System/currentTimeMillis)]
+           (cond
+             (str/starts-with? path "/relay/v1/")
+             (handle-relay-endpoint exchange req relay-atom relay-waiters-atom config target-rt)
+
+             (and (or (= method :GET) (= method :HEAD)) (= path "/healthz"))
+             (send-response exchange
+                            {:response/status 200
+                             :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                             :response/body (if (= method :HEAD) nil "ok\n")})
+
+             :else
+             (let [res-box (atom nil)
+                   _ (swap! limiter-atom
+                            (fn [st]
+                              (let [r (dns-proto/check-and-consume st subnet-key 1.0 now-ms)]
+                                (reset! res-box r)
+                                (:state r))))
+                   rl-res @res-box]
+               (if-not (:allowed? rl-res)
+                 (let [retry-s (max 1 (long (Math/ceil (/ (long (:retry-after-ms rl-res 1000)) 1000.0))))]
+                   (infra/apply-shell-event! shell-atom {:type :drop :reason :https-rate-limited :detail subnet-key})
+                   (send-response exchange
+                                  {:response/status 429
+                                   :response/headers {"Retry-After" (str retry-s)
+                                                      "Content-Type" "text/plain; charset=utf-8"}
+                                   :response/body "Too Many Requests\n"}))
+                 (let [resp (-> (serve-subnet-request config shell-atom target-rt req now-ms)
+                                (update :response/headers assoc
+                                        "Strict-Transport-Security" "max-age=31536000; includeSubDomains"))
+                       body (:response/body resp)
+                       body-len (cond
+                                  (bytes? body) (alength ^bytes body)
+                                  (string? body) (alength (.getBytes ^String body StandardCharsets/UTF_8))
+                                  (map? body) (long (or (:length body) 0))
+                                  (instance? File body) (.length ^File body)
+                                  :else 0)]
+                   (if (pos? body-len)
+                     (let [month-key (.format (SimpleDateFormat. "yyyy-MM") (Date. now-ms))
+                           eg-ok (atom true)
+                           _ (swap! limiter-atom
+                                    (fn [st]
+                                      (let [r (dns-proto/record-egress st body-len month-key)]
+                                        (reset! eg-ok (:allowed? r))
+                                        (:state r))))]
+                       (if-not @eg-ok
+                         (do
+                           (infra/apply-shell-event! shell-atom {:type :drop :reason :monthly-egress-exceeded})
+                           (send-response exchange
+                                          {:response/status 429
+                                           :response/headers {"Retry-After" "3600"
+                                                              "Content-Type" "text/plain; charset=utf-8"}
+                                           :response/body "Monthly egress limit exceeded\n"}))
+                         (send-response exchange resp)))
+                     (send-response exchange resp))))))))))))
 
 (defn- pipe-stream!
   [^InputStream in ^OutputStream out ^Socket dst-sock ^Socket other-sock cleanup-fn]
@@ -1060,6 +1413,70 @@
         domain (:domain config)
         vthread-executor (Executors/newVirtualThreadPerTaskExecutor)
         forwarded-ips-atom (atom {})
+        relay-atom (or (:relay-atom config) (atom (relay/init-relay-state (get-in config [:http :relay]))))
+        relay-waiters-atom (or (:relay-waiters-atom config) (atom {}))
+        val-bootstrap (or (:validator-bootstrap config) (when subnet-runtime (:validator-bootstrap subnet-runtime)))
+        bridge-conn-atom (atom nil)
+        default-forwarder (when (and (nil? (:on-relay-forward config))
+                                     (:peer-identity subnet-runtime)
+                                     val-bootstrap)
+                            (fn [eff]
+                              (.submit vthread-executor
+                                       ^Runnable
+                                       (fn []
+                                         (try
+                                           (if-let [active-conn @bridge-conn-atom]
+                                             (when (:ok? active-conn)
+                                               (light-node/send-all-envelopes! (:send-fn active-conn) [(:wire-bytes eff)]))
+                                             (let [conn (light-node/connect-validators!
+                                                         (:peer-identity subnet-runtime)
+                                                         val-bootstrap
+                                                         {:timeout-ms 2000})]
+                                               (when (:ok? conn)
+                                                 (try
+                                                   (light-node/send-all-envelopes! (:send-fn conn) [(:wire-bytes eff)])
+                                                   (finally
+                                                     (when-let [n (:node conn)]
+                                                       (try (api/close! n) (catch Exception _ nil))))))))
+                                           (catch Exception _ nil))))))
+        effective-config (cond-> config
+                           default-forwarder (assoc :on-relay-forward default-forwarder))
+        bridge-enabled? (and (get-in config [:http :relay-validator-bridge?] true)
+                             (:peer-identity subnet-runtime)
+                             val-bootstrap)
+        _ (when bridge-enabled?
+            (.submit vthread-executor
+                     ^Runnable
+                     (fn []
+                       (try
+                         (let [on-msg (fn [payload]
+                                        (try
+                                          (swap! relay-atom
+                                                 (fn [st]
+                                                   (let [res (relay/reduce-relay st {:type :relay-submit
+                                                                                     :envelope payload
+                                                                                     :from-validator? true
+                                                                                     :now-ms (System/currentTimeMillis)})]
+                                                     (when (:ok? res)
+                                                       (let [recip (or (get-in res [:response "recipient"])
+                                                                       (get-in res [:response "pubkey"]))
+                                                             broadcast? (boolean (get-in res [:response "broadcast"]))]
+                                                         (when (or recip broadcast?)
+                                                           (let [to-wake (concat
+                                                                          (when recip (get @relay-waiters-atom recip #{}))
+                                                                          (get @relay-waiters-atom :broadcast #{}))]
+                                                             (doseq [p to-wake]
+                                                               (deliver p :notified))))))
+                                                     (:state res))))
+                                          (catch Exception _ nil)))
+                               c (light-node/connect-validators!
+                                  (:peer-identity subnet-runtime)
+                                  val-bootstrap
+                                  {:timeout-ms 5000
+                                   :on-message on-msg})]
+                           (when (:ok? c)
+                             (reset! bridge-conn-atom c)))
+                         (catch Exception _ nil)))))
         limiter-atom (atom (dns-proto/init-limiter
                             {:capacity 100.0
                              :refill-per-sec 20.0
@@ -1068,7 +1485,7 @@
       (let [https-server (HttpsServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
             _ (.setHttpsConfigurator https-server (make-https-configurator (:ssl-context-atom tls-manager)))
             _ (.setExecutor https-server vthread-executor)
-            _ (.createContext https-server "/" (make-port-443-handler config shell-atom subnet-runtime limiter-atom forwarded-ips-atom))
+            _ (.createContext https-server "/" (make-port-443-handler effective-config shell-atom subnet-runtime limiter-atom forwarded-ips-atom relay-atom relay-waiters-atom))
             _ (.start https-server)
             internal-https-port (.getPort (.getAddress https-server))
             passthrough-ctx {:domain domain
@@ -1099,10 +1516,13 @@
                                  (infra/apply-shell-event! shell-atom {:type :diagnose :reason :https-accept-error :detail (.getMessage t)})))))))
             http-server (HttpServer/create (InetSocketAddress. ^String bind-ip http-port) 0)
             _ (.setExecutor http-server vthread-executor)
-            _ (.createContext http-server "/" (make-port-80-handler subnet-runtime bound-https-port limiter-atom))
+            _ (.createContext http-server "/" (make-port-80-handler effective-config subnet-runtime bound-https-port limiter-atom relay-atom relay-waiters-atom))
             _ (.start http-server)
             bound-http-port (.getPort (.getAddress http-server))
             close-resources! (fn [{:keys [front http https exec]}]
+                               (when-let [c @bridge-conn-atom]
+                                 (when-let [n (:node c)]
+                                   (try (api/close! n) (catch Exception _ nil))))
                                (when front (try (.close ^ServerSocket front) (catch Exception _ nil)))
                                (when http (try (.stop ^HttpServer http 0) (catch Exception _ nil)))
                                (when https (try (.stop ^HttpsServer https 0) (catch Exception _ nil)))
@@ -1116,6 +1536,8 @@
          :http-port bound-http-port
          :https-port bound-https-port
          :limiter-atom limiter-atom
+         :relay-atom relay-atom
+         :relay-waiters-atom relay-waiters-atom
          :stop-fn (fn []
                     (infra/apply-shell-event! shell-atom {:type :stop} close-resources!))})
       (catch Exception e

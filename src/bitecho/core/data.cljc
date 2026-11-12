@@ -675,9 +675,11 @@
             :else
             (let [blob-entry (when (and target (:blobs ctx))
                                (get-in (:blobs ctx) [:entries target]))
-                  blob-bs (when blob-entry (:bytes blob-entry))]
+                  blob-bs (or (when blob-entry (or (:bytes blob-entry) (:blob/bytes blob-entry)))
+                              (get-in ctx [:blob :blob/bytes])
+                              (get-in ctx [:blob :bytes]))]
               (if-not (bytes? blob-bs)
-                {:ok? true}
+                {:ok? false :error :missing-anchor-blob}
                 (let [decoded (try (fressian/decode-wire blob-bs)
                                    (catch #?(:clj Exception :cljs :default) _ nil))]
                   (if-not (and (map? decoded)

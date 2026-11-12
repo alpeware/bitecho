@@ -3,6 +3,7 @@
    Handles CLI invocation, JSONL STDIN/STDOUT serve loop, state persistence
    with atomic rename (0600 permissions), and WebRTC DataChannel agent connections."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-core]
@@ -18,7 +19,7 @@
             [taoensso.nippy :as nippy])
   (:import [java.io BufferedReader InputStreamReader PrintWriter RandomAccessFile]
            [java.net URI]
-           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files StandardCopyOption]
            [java.nio.file.attribute PosixFilePermissions]
@@ -266,6 +267,33 @@
                                  (cond-> m
                                    t (assoc "text" t)
                                    sub (assoc "subnet_id" sub)))
+                   "anchor-subnet" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                 (extract-flag-value args "--subnet" nil)
+                                                 (extract-flag-value args "--child-subnet" nil))
+                                         psub (or (extract-flag-value args "--parent-subnet" nil)
+                                                  (extract-flag-value args "--parent" nil))
+                                         ce (extract-long-flag args "--child-epoch" nil)
+                                         m {"cmd" "anchor-subnet"}]
+                                     (cond-> m
+                                       sub (assoc "subnet_id" sub)
+                                       psub (assoc "parent_subnet" psub)
+                                       ce (assoc "child_epoch" ce)))
+                   "epoch-tick" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                              (extract-flag-value args "--subnet" nil))
+                                      ep (extract-long-flag args "--epoch" nil)
+                                      m {"cmd" "epoch-tick"}]
+                                  (cond-> m
+                                    sub (assoc "subnet_id" sub)
+                                    ep (assoc "epoch" ep)))
+                   "verify-subnet-anchor" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                        (extract-flag-value args "--subnet" nil)
+                                                        (extract-flag-value args "--child-subnet" nil))
+                                                psub (or (extract-flag-value args "--parent-subnet" nil)
+                                                         (extract-flag-value args "--parent" nil))
+                                                m {"cmd" "verify-subnet-anchor"}]
+                                            (cond-> m
+                                              sub (assoc "subnet_id" sub)
+                                              psub (assoc "parent_subnet" psub)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -320,6 +348,7 @@
         ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
         proxy-cli (extract-flag-value clean-args "--proxy" nil)
         proxy-url (resolve-proxy-url proxy-cli)
+        relay-url (extract-flag-value clean-args "--relay-url" nil)
         subnet-id (extract-flag-value clean-args "--subnet-id" nil)
         trusted-dac-anchors-raw (extract-flag-value clean-args "--trusted-dac-anchors" nil)
         trusted-dac-anchors (when (and (string? trusted-dac-anchors-raw) (not (str/blank? trusted-dac-anchors-raw)))
@@ -368,6 +397,7 @@
       ingress-tcp-port (assoc :ingress-tcp-port (int ingress-tcp-port))
       (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
       proxy-url (assoc :proxy proxy-url)
+      relay-url (assoc :relay-url relay-url)
       turn-config (assoc :turn-config turn-config))))
 
 ;; -----------------------------------------------------------------------------
@@ -510,6 +540,167 @@
                           (catch Exception _ nil)))))
                   (catch Exception _ nil))))
             candidates))))
+
+;; -----------------------------------------------------------------------------
+;; HTTP Gateway Relay Client Helpers (/relay/v1/*)
+;; -----------------------------------------------------------------------------
+
+(defn submit-relay-envelope!
+  "Submits an envelope (hex string, bytes, or map) to the HTTP relay at `relay-url`.
+   Returns parsed response map or {:ok false :error ...}."
+  ([relay-url envelope]
+   (submit-relay-envelope! relay-url envelope nil))
+  ([relay-url envelope opts]
+   (let [client (or (:http-client opts)
+                    (-> (HttpClient/newBuilder)
+                        (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
+                        (.build)))
+         url (str (str/replace relay-url #"/+$" "") "/relay/v1/send")
+         wire-hex (cond
+                    (string? envelope) envelope
+                    (bytes? envelope) (basalt/bytes->hex envelope)
+                    (map? envelope) (try (basalt/bytes->hex (fressian/encode-canonical envelope))
+                                         (catch Exception _ (basalt/bytes->hex (fressian/encode-wire envelope))))
+                    :else (str envelope))
+         payload (json/write-str {"envelope_hex" wire-hex})
+         req (-> (HttpRequest/newBuilder)
+                 (.uri (URI/create url))
+                 (.header "Content-Type" "application/json")
+                 (.timeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
+                 (.POST (HttpRequest$BodyPublishers/ofString payload StandardCharsets/UTF_8))
+                 (.build))]
+     (try
+       (let [resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+         (try
+           (json/read-str (.body resp))
+           (catch Exception _
+             {"ok" false "error" "invalid-json-response" "status" (.statusCode resp)})))
+       (catch Exception e
+         {"ok" false "error" (.getMessage e)})))))
+
+(defn poll-relay-envelopes!
+  "Polls the HTTP relay for envelopes addressed to `pubkey` (or broadcast).
+   Generates a proof-of-possession Ed25519 signature over pubkey + ts using `privkey`.
+   `opts`: {:seq-gte :limit :timeout-ms :since-ms :http-client}
+   Returns parsed response map or {:ok false :error ...}."
+  ([relay-url pubkey privkey]
+   (poll-relay-envelopes! relay-url pubkey privkey nil))
+  ([relay-url pubkey privkey opts]
+   (let [client (or (:http-client opts)
+                    (-> (HttpClient/newBuilder)
+                        (.connectTimeout (Duration/ofMillis (long (+ (or (:timeout-ms opts) 0) 5000))))
+                        (.build)))
+         base-url (str (str/replace relay-url #"/+$" "") "/relay/v1/poll")
+         pk-hex (if (bytes? pubkey) (basalt/bytes->hex pubkey) (str pubkey))
+         now-ms (System/currentTimeMillis)
+         since-seq (long (or (:since-seq opts) (:seq-gte opts) 0))
+         nonce (or (:nonce opts) (basalt/bytes->hex (crypto/random-bytes 16)))
+         sig (relay/sign-poll-request privkey {:pubkey pk-hex
+                                               :since-seq since-seq
+                                               :timestamp-ms now-ms
+                                               :nonce nonce})
+         params (cond-> {"pubkey" pk-hex
+                         "sig" sig
+                         "signature" sig
+                         "ts" (str now-ms)
+                         "timestamp_ms" (str now-ms)
+                         "nonce" nonce
+                         "since_seq" (str since-seq)}
+                  (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
+                  (:limit opts) (assoc "limit" (str (:limit opts)))
+                  (:timeout-ms opts) (assoc "timeout_ms" (str (:timeout-ms opts)))
+                  (:since-ms opts) (assoc "since_ms" (str (:since-ms opts))))
+         q-str (str/join "&" (map (fn [[k v]] (str (java.net.URLEncoder/encode (name k) StandardCharsets/UTF_8)
+                                                   "="
+                                                   (java.net.URLEncoder/encode (str v) StandardCharsets/UTF_8)))
+                                  params))
+         req (-> (HttpRequest/newBuilder)
+                 (.uri (URI/create (str base-url "?" q-str)))
+                 (.timeout (Duration/ofMillis (long (+ (or (:timeout-ms opts) 0) 5000))))
+                 (.GET)
+                 (.build))]
+     (try
+       (let [resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+         (try
+           (json/read-str (.body resp))
+           (catch Exception _
+             {"ok" false "error" "invalid-json-response" "status" (.statusCode resp)})))
+       (catch Exception e
+         {"ok" false "error" (.getMessage e)})))))
+
+(defn ack-relay-envelopes!
+  "Acknowledges envelopes processed up to `up-to-seq` at `relay-url`."
+  ([relay-url pubkey privkey up-to-seq]
+   (ack-relay-envelopes! relay-url pubkey privkey up-to-seq nil))
+  ([relay-url pubkey privkey up-to-seq opts]
+   (let [client (or (:http-client opts)
+                    (-> (HttpClient/newBuilder)
+                        (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
+                        (.build)))
+         url (str (str/replace relay-url #"/+$" "") "/relay/v1/ack")
+         pk-hex (if (bytes? pubkey) (basalt/bytes->hex pubkey) (str pubkey))
+         now-ms (System/currentTimeMillis)
+         ack-seq (long (or up-to-seq 0))
+         nonce (or (:nonce opts) (basalt/bytes->hex (crypto/random-bytes 16)))
+         sig (relay/sign-poll-request privkey {:pubkey pk-hex
+                                               :since-seq ack-seq
+                                               :timestamp-ms now-ms
+                                               :nonce nonce})
+         payload (json/write-str {"pubkey" pk-hex
+                                  "sig" sig
+                                  "signature" sig
+                                  "ts" now-ms
+                                  "timestamp_ms" now-ms
+                                  "nonce" nonce
+                                  "ack_seq" ack-seq
+                                  "up_to_seq" ack-seq})
+         req (-> (HttpRequest/newBuilder)
+                 (.uri (URI/create url))
+                 (.header "Content-Type" "application/json")
+                 (.timeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
+                 (.POST (HttpRequest$BodyPublishers/ofString payload StandardCharsets/UTF_8))
+                 (.build))]
+     (try
+       (let [resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+         (try
+           (json/read-str (.body resp))
+           (catch Exception _
+             {"ok" false "error" "invalid-json-response" "status" (.statusCode resp)})))
+       (catch Exception e
+         {"ok" false "error" (.getMessage e)})))))
+
+(defn fetch-relay-chain-state!
+  "Fetches chain-state and bootstrap info from `relay-url`."
+  ([relay-url]
+   (fetch-relay-chain-state! relay-url nil))
+  ([relay-url opts]
+   (let [client (or (:http-client opts)
+                    (-> (HttpClient/newBuilder)
+                        (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
+                        (.build)))
+         clean (str/replace (str relay-url) #"/+$" "")
+         base-url (if (str/ends-with? clean "/relay/v1")
+                    (str clean "/chain-state")
+                    (str clean "/relay/v1/chain-state"))
+         q-parts (cond-> []
+                   (:pubkey opts) (conj (str "pubkey=" (java.net.URLEncoder/encode (str (:pubkey opts)) StandardCharsets/UTF_8)))
+                   (:nonce opts) (conj (str "nonce=" (java.net.URLEncoder/encode (str (:nonce opts)) StandardCharsets/UTF_8))))
+         url (if (seq q-parts)
+               (str base-url "?" (str/join "&" q-parts))
+               base-url)
+         req (-> (HttpRequest/newBuilder)
+                 (.uri (URI/create url))
+                 (.timeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
+                 (.GET)
+                 (.build))]
+     (try
+       (let [resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+         (try
+           (json/read-str (.body resp))
+           (catch Exception _
+             {"ok" false "error" "invalid-json-response" "status" (.statusCode resp)})))
+       (catch Exception e
+         {"ok" false "error" (.getMessage e)})))))
 
 (defn query-validator-chain-state!
   "Dials a single validator node over Port 5010/DTLS, sends :query-chain-state,
@@ -658,33 +849,65 @@
    If in-band quorum verification fails, fails closed immediately and returns {:ok? false :error (:error inband-res)}.
    If zero in-band snapshots were reachable (and no inband fetcher provided), falls back to legacy HTTP fetch-validator-accountz!."
   [state-atom bootstrap pubkey privkey-bytes opts]
-  (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})
-        inband-res (fetch-inband-chain-state-quorum! id bootstrap pubkey privkey-bytes opts)]
-    (cond
-      (:ok? inband-res)
-      (let [snap (:snapshot inband-res)]
-        (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
-        {:ok? true :state @state-atom :quorum-result inband-res})
+  (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+    (let [nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
+          relay-resp (fetch-relay-chain-state! (:relay-url opts) {:pubkey pubkey :nonce nonce :timeout-ms (:timeout-ms opts)})
+          raw-snaps (or (get relay-resp "snapshots") (get relay-resp :snapshots) [])
+          signed-snaps (filterv #(or (get % "signature") (get % :signature)) raw-snaps)]
+      (cond
+        (seq signed-snaps)
+        (let [trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+              verify-opts (assoc opts
+                                 :expected-pubkey pubkey
+                                 :expected-nonce nonce
+                                 :trusted-validators trusted
+                                 :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0)))
+              q-res (light-core/verify-chain-state-quorum signed-snaps verify-opts)]
+          (if (:ok? q-res)
+            (do
+              (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st (:snapshot q-res))))
+              {:ok? true :state @state-atom :quorum-result q-res})
+            {:ok? false :error (:error q-res)}))
 
-      (or (:inband-snapshot-fetcher opts)
-          (and (not= (:error inband-res) "no-inband-snapshots-returned")
-               (not= (:error inband-res) "empty-bootstrap-nodes")))
-      {:ok? false :error (:error inband-res)}
+        (or (true? (get relay-resp "ok")) (true? (get relay-resp :ok)))
+        (do
+          (swap! state-atom (fn [st]
+                              (cond-> st
+                                (or (get relay-resp "epoch") (get relay-resp :epoch))
+                                (assoc :epoch (long (or (get relay-resp "epoch") (get relay-resp :epoch))))
+                                (or (get relay-resp "min_signaling_burn") (get relay-resp :min-signaling-burn))
+                                (assoc :burn-floor (long (or (get relay-resp "min_signaling_burn") (get relay-resp :min-signaling-burn)))))))
+          {:ok? true :state @state-atom :relay-response relay-resp})
 
-      :else
-      (if-let [resp (fetch-validator-accountz! bootstrap pubkey opts)]
-        (if (:account resp)
-          (let [cmd {"cmd" "sync-account"
-                     "balance" (get-in resp [:account :balance] 0)
-                     "spendable" (:spendable resp)
-                     "seq" (get-in resp [:account :seq] 0)
-                     "deps" (vec (get-in resp [:account :deps] []))
-                     "finalized_epoch" (:finalized-epoch resp 0)}
-                res (light-core/handle-command @state-atom cmd privkey-bytes)]
-            (reset! state-atom (:state res))
-            {:ok? true :state @state-atom :accountz resp})
-          {:ok? false :error "no-account-in-accountz"})
-        {:ok? false :error (or (:error inband-res) "all-sync-methods-failed")}))))
+        :else
+        {:ok? false :error (or (get relay-resp "error") (get relay-resp :error) "relay-chain-state-failed")}))
+    (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})
+          inband-res (fetch-inband-chain-state-quorum! id bootstrap pubkey privkey-bytes opts)]
+      (cond
+        (:ok? inband-res)
+        (let [snap (:snapshot inband-res)]
+          (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
+          {:ok? true :state @state-atom :quorum-result inband-res})
+
+        (or (:inband-snapshot-fetcher opts)
+            (and (not= (:error inband-res) "no-inband-snapshots-returned")
+                 (not= (:error inband-res) "empty-bootstrap-nodes")))
+        {:ok? false :error (:error inband-res)}
+
+        :else
+        (if-let [resp (fetch-validator-accountz! bootstrap pubkey opts)]
+          (if (:account resp)
+            (let [cmd {"cmd" "sync-account"
+                       "balance" (get-in resp [:account :balance] 0)
+                       "spendable" (:spendable resp)
+                       "seq" (get-in resp [:account :seq] 0)
+                       "deps" (vec (get-in resp [:account :deps] []))
+                       "finalized_epoch" (:finalized-epoch resp 0)}
+                  res (light-core/handle-command @state-atom cmd privkey-bytes)]
+              (reset! state-atom (:state res))
+              {:ok? true :state @state-atom :accountz resp})
+            {:ok? false :error "no-account-in-accountz"})
+          {:ok? false :error (or (:error inband-res) "all-sync-methods-failed")})))))
 
 (defn init-conn-state
   "Initializes the pure single-authority connection lifecycle state map."
@@ -1234,39 +1457,49 @@
    Rotates through candidates using home-set priority and validator-cursor.
    Returns connection result or error map (:bad-fingerprint or :listener-disabled)."
   [identity bootstrap-descriptor opts]
-  (if-let [err (validate-node-fingerprints bootstrap-descriptor)]
-    err
-    (if-let [dialer (:dialer-fn opts)]
-      (dialer identity bootstrap-descriptor opts)
-      (let [home-set (or (:home-set opts)
-                         (when-let [sa (:state-atom opts)] (:home-set @sa)))
-            cursor (or (:validator-cursor opts)
-                       (when-let [ca (:conn-atom opts)] (:validator-cursor @ca 0))
-                       0)
-            candidates (ordered-validator-candidates bootstrap-descriptor home-set cursor)]
-        (if (empty? candidates)
-          {:ok? false :error "no-nodes-in-descriptor"}
-          (loop [rem-candidates candidates
-                 failed-nodes []]
-            (if-let [node (first rem-candidates)]
-              (let [res (dial-single-node! identity node opts)]
-                (cond
-                  (:ok? res)
-                  (assoc res
-                         :validator-id (:node-id node)
-                         :failover-attempts (count failed-nodes)
-                         :failed-nodes failed-nodes)
+  (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+    {:ok? true
+     :node nil
+     :validator-id :http-relay
+     :transport :http-relay
+     :failover-attempts 0
+     :failed-nodes []
+     :send-fn (fn [env]
+                (let [r (submit-relay-envelope! (:relay-url opts) env opts)]
+                  (true? (get r "ok"))))}
+    (if-let [err (validate-node-fingerprints bootstrap-descriptor)]
+      err
+      (if-let [dialer (:dialer-fn opts)]
+        (dialer identity bootstrap-descriptor opts)
+        (let [home-set (or (:home-set opts)
+                           (when-let [sa (:state-atom opts)] (:home-set @sa)))
+              cursor (or (:validator-cursor opts)
+                         (when-let [ca (:conn-atom opts)] (:validator-cursor @ca 0))
+                         0)
+              candidates (ordered-validator-candidates bootstrap-descriptor home-set cursor)]
+          (if (empty? candidates)
+            {:ok? false :error "no-nodes-in-descriptor"}
+            (loop [rem-candidates candidates
+                   failed-nodes []]
+              (if-let [node (first rem-candidates)]
+                (let [res (dial-single-node! identity node opts)]
+                  (cond
+                    (:ok? res)
+                    (assoc res
+                           :validator-id (:node-id node)
+                           :failover-attempts (count failed-nodes)
+                           :failed-nodes failed-nodes)
 
-                  (= (:error res) "bad-fingerprint")
-                  res
+                    (= (:error res) "bad-fingerprint")
+                    res
 
-                  :else
-                  (recur (rest rem-candidates)
-                         (conj failed-nodes {:validator-id (:node-id node)
-                                             :error (or (:error res) "listener-disabled")}))))
-              {:ok? false
-               :error "listener-disabled"
-               :failed-nodes failed-nodes})))))))
+                    :else
+                    (recur (rest rem-candidates)
+                           (conj failed-nodes {:validator-id (:node-id node)
+                                               :error (or (:error res) "listener-disabled")}))))
+                {:ok? false
+                 :error "listener-disabled"
+                 :failed-nodes failed-nodes}))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; CLI Runner (Serve, Wait-Event & One-Shot Modes)
@@ -1721,7 +1954,7 @@
                                               (some? sess)
                                               (= "open" (:state sess))
                                               (= norm-sender expected-peer)
-                                              (contains? #{:offered :offer-received :connecting :open nil} p2p-phase))]
+                                              (contains? #{:offered :offer-received :connecting :open :closed nil} p2p-phase))]
                               (if valid?
                                 (let [my-gen (inc (long (or (get-in @p2p-peers-atom [norm-sender :generation]) 0)))]
                                   (reset! bound-sender norm-sender)
@@ -2024,6 +2257,8 @@
                            (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                            (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
                            (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                           (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
+                           (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
                            (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                            (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                            (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
@@ -2157,11 +2392,70 @@
                              (recur next-offset))))))
                 (.setDaemon true)
                 (.setName "bitecho-light-node-cmd-file")
-                (.start))))]
+                (.start))))
+        _ (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+            (doto (Thread.
+                   ^Runnable
+                   (fn []
+                     (loop [since-mseq 0
+                            since-bseq 0]
+                       (when @daemon-running?
+                         (let [poll-res (try
+                                          (poll-relay-envelopes! (:relay-url opts)
+                                                                 (:pubkey-hex identity)
+                                                                 (:privkey-bytes identity)
+                                                                 {:since-seq since-mseq
+                                                                  :since-broadcast-seq since-bseq
+                                                                  :wait-ms 5000})
+                                          (catch Exception _ nil))
+                               msgs (or (get poll-res "messages") (get poll-res :messages) [])
+                               bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                               all-items (concat msgs bcasts)
+                               new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") since-mseq))
+                               new-bseq (long (or (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))]
+                           (doseq [item all-items]
+                             (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                                               (get item :envelope_hex) (get item :envelope))
+                                   wire-bytes (when env-raw (try (basalt/hex->bytes (str env-raw)) (catch Exception _ nil)))]
+                               (when wire-bytes
+                                 (let [r-box (atom nil)
+                                       new-st (swap! state-atom
+                                                     (fn [st]
+                                                       (let [r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
+                                                         (reset! r-box r)
+                                                         (:state r))))
+                                       r @r-box]
+                                   (when state-file
+                                     (try (save-light-state! state-file new-st) (catch Exception _ nil)))
+                                   (when r
+                                     (doseq [ev (:stdout-events r)]
+                                       (event-out ev))
+                                     (when-let [dial-info (:p2p-dial r)]
+                                       (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
+                                     (when (seq (:net-envelopes r))
+                                       (send-routed-envelopes! (:net-envelopes r)
+                                                               (:send-fn conn-res)
+                                                               p2p-peers-atom
+                                                               ingress-peers-atom
+                                                               state-atom
+                                                               (:privkey-bytes identity))))))))
+                           (when (seq msgs)
+                             (try
+                               (ack-relay-envelopes! (:relay-url opts)
+                                                     (:pubkey-hex identity)
+                                                     (:privkey-bytes identity)
+                                                     new-mseq)
+                               (catch Exception _ nil)))
+                           (recur new-mseq new-bseq))))))
+              (.setDaemon true)
+              (.setName "bitecho-light-node-relay-poll")
+              (.start)))]
     (if (:ok? conn-res)
       (emit-json-line! out-writer {"event" "ready"
                                    "connected" true
-                                   "transport" (name (or (:transport opts) :udp))}
+                                   "transport" (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                                                 "http-relay"
+                                                 (name (or (:transport opts) :udp)))}
                        events-out)
       (emit-json-line! out-writer {"event" "connection-failed"
                                    "connected" false
@@ -2197,6 +2491,8 @@
                            (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
                            (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
                            (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                           (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
+                           (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
                            (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
                            (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
                            (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))

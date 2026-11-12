@@ -278,6 +278,10 @@
                                   (get-in event [:pointer :pointer/authority])
                                   (:from event)))]
     (cond
+      ;; Internal lifecycle events bypass gate admission
+      (contains? #{:anchor-subnet :epoch-tick} (:type event))
+      {:admitted? true :member (or sender :system)}
+
       ;; Cold governance key is always admitted for policy administration
       (and cold-pk sender (= sender cold-pk))
       {:admitted? true :member sender}
@@ -354,7 +358,9 @@
                                    :policy-rejected 0
                                    :anchor-rejected 0}}})))))
 
-(defn- pointer-verify-ctx
+(defn pointer-verify-ctx
+  "Builds a `bitecho.core.data/verify-pointer` context map from subnet `instance` state,
+   populating ACL, trust anchors, admitted members, governance, leader info, and Blobs."
   [instance admitted-member now-ms]
   (let [policy (:policy instance)
         le (:leader-election instance)
@@ -406,6 +412,7 @@
                                 :anchor-seq a-seq
                                 :merkle-root root
                                 :prev-anchor-cid prev-cid
+                                :timestamp (long (or now-ms 0))
                                 :active-pointer-count (count (data/active-subnet-pointers child-instance child-sid now-ms))}
                          p-epoch (assoc :parent-epoch p-epoch))
         blob-bytes (fressian/encode-canonical state-root-map)
@@ -483,22 +490,39 @@
                               (= child-sid (str (:child-subnet decoded)))
                               (= (str (:pointer/subnet pointer)) (str (:parent-subnet decoded))))
                    {:ok? false :error :invalid-state-root-blob}
-                   (let [prev-blob (when prev-anchor-entry (or (:blob prev-anchor-entry) (:state-root prev-anchor-entry)))
-                         prev-epoch (when prev-blob (long (or (:child-epoch prev-blob) -1)))
-                         curr-epoch (long (or (:child-epoch decoded) -1))
+                   (let [prev-decoded (when prev-anchor-entry
+                                        (cond
+                                          (map? (:state-root prev-anchor-entry)) (:state-root prev-anchor-entry)
+                                          (integer? (:child-epoch prev-anchor-entry)) prev-anchor-entry
+                                          (integer? (get-in prev-anchor-entry [:blob :child-epoch])) (:blob prev-anchor-entry)
+                                          :else (let [bs (or (get-in prev-anchor-entry [:blob :bytes])
+                                                             (get-in prev-anchor-entry [:blob :blob/bytes])
+                                                             (:bytes prev-anchor-entry)
+                                                             (:blob/bytes prev-anchor-entry))]
+                                                  (when (bytes? bs)
+                                                    (try (fressian/decode-wire bs) (catch #?(:clj Exception :cljs :default) _ nil))))))
+                         prev-epoch (when (and (map? prev-decoded) (integer? (:child-epoch prev-decoded)))
+                                      (long (:child-epoch prev-decoded)))
                          prev-cid (when prev-anchor-entry
-                                    (normalize-hex (or (:blob/cid prev-blob)
+                                    (normalize-hex (or (get-in prev-anchor-entry [:blob :blob/cid])
+                                                       (get-in prev-anchor-entry [:blob :cid])
+                                                       (:blob/cid prev-anchor-entry)
+                                                       (:cid prev-anchor-entry)
                                                        (get-in prev-anchor-entry [:pointer :pointer/target])
                                                        (:target prev-anchor-entry))))
+                         curr-epoch (long (or (:child-epoch decoded) -1))
                          curr-prev-cid (when-let [p (:prev-anchor-cid decoded)] (normalize-hex p))]
                      (cond
+                       (and (some? prev-anchor-entry) (or (nil? prev-epoch) (nil? prev-cid)))
+                       {:ok? false :error :invalid-prev-anchor-entry}
+
                        (and (some? prev-epoch) (<= curr-epoch prev-epoch))
                        {:ok? false :error :anchor-epoch-regression :current curr-epoch :previous prev-epoch}
 
                        (and (some? prev-cid) (not= curr-prev-cid prev-cid))
                        {:ok? false :error :anchor-predecessor-mismatch :expected prev-cid :actual curr-prev-cid}
 
-                       (and (nil? prev-anchor-entry) (some? curr-prev-cid) (= 1 (long (:pointer/seq pointer))))
+                       (and (nil? prev-anchor-entry) (some? curr-prev-cid))
                        {:ok? false :error :anchor-predecessor-mismatch :expected nil :actual curr-prev-cid}
 
                        :else
@@ -750,8 +774,11 @@
                   (let [anc-cfg (get-in policy [:subnet/anchoring])
                         cadence (or (:cadence anc-cfg) (:anchoring/cadence anc-cfg) (:trigger anc-cfg))
                         creds (merge anc-cfg (:anchoring-creds inst1))]
-                    (if (and (= cadence :epoch) (or (:authority-privkey creds) (:quorum-signers creds)))
-                      (let [interval (long (or (:interval-epochs event) (:interval-epochs anc-cfg) (:anchoring/interval-epochs anc-cfg) 1))
+                    (if (and (contains? #{:epoch-tick :epoch :on-change} cadence)
+                             (or (:authority-privkey creds) (:quorum-signers creds)))
+                      (let [interval (if (= cadence :on-change)
+                                       1
+                                       (long (or (:interval-epochs event) (:interval-epochs anc-cfg) (:anchoring/interval-epochs anc-cfg) 1)))
                             curr-root (data/compute-merkle-root inst1 sid now-ms)
                             prev-root (get-in inst1 [:anchoring-state :last-merkle-root])
                             last-ep (long (or (get-in inst1 [:anchoring-state :last-child-epoch]) 0))

@@ -6,6 +6,7 @@
             [bitecho.core.anchoring-test]
             [bitecho.core.data-test]
             [bitecho.core.protocol-test]
+            [bitecho.core.protocol.relay-test]
             [bitecho.core.subnet-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
@@ -55,6 +56,7 @@
              'bitecho.core.anchoring-test
              'bitecho.core.data-test
              'bitecho.core.protocol-test
+             'bitecho.core.protocol.relay-test
              'bitecho.core.subnet-test))
 
 (set! *main-cli-fn* -main)

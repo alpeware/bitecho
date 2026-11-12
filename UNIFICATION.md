@@ -188,7 +188,34 @@ Pointers resolve uniquely by `(subnet, path)`. To prevent competing authorities 
    - Parent-side non-circular anchor verification (`verify-subnet-anchor`) enforcing strict epoch monotonicity ($t_{i+1} > t_i$) and predecessor hash-chain continuity.
    - Automatic child-to-parent anchor propagation in the multi-subnet multiplexer (`handle-multiplexed-anchor-effects`).
    - Carried LOW items closed: validator-side burn floor centralization (`F-C1`, `O-2`), deduplicated `:p2p-dial-failed` diagnostics (`F-D1`), enforced burn floor in `exec-offer` (`F-D2`), and in-repo automated Node.js UDP accept test (`F-H2`).
+
+### 8.5 Automated `F-H2` Host UDP P2P Link-Bind Accept Verification
+To independently verify the `F-H2` live Node.js daemon UDP WebRTC DataChannel accept fix (confirming passive inbound P2P link-bind over UDP without relying on interactive multi-machine testing):
+- **Command**:
+  ```bash
+  clojure -J--add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+    -J--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+    -J--add-exports=java.base/sun.security.util=ALL-UNNAMED \
+    -Sdeps '{:paths ["src" "test"]}' \
+    -M -e "(require 'clojure.test 'bitecho.node-bundle-test) (clojure.test/run-tests 'bitecho.node-bundle-test)"
+  ```
+- **Output Summary**:
+  ```text
+  Testing bitecho.node-bundle-test
+
+  Ran 1 tests containing 6 assertions.
+  0 failures, 0 errors.
+  {:test 1, :pass 6, :fail 0, :error 0, :type :summary}
+  ```
+- **Automated In-Repo Test**:
+  The automated integration test `test-node-light-node-udp-p2p-link-bind-accept` (`^:integration`) in [`test/bitecho/node_bundle_test.clj`](file:///home/simonpure/src/alpeware/bitecho/test/bitecho/node_bundle_test.clj) runs the built Node.js distribution bundle (`dist/bitecho-light-node.cjs`) as a subprocess daemon with `--ingress-tcp-port <free-port>`, initiates a remote WebRTC DataChannel dial over UDP (`datachannel.api/start!`), sends a signed `:p2p-link-bind` envelope, and asserts `"p2p-connected"` with `"transport":"udp"` and `"zero_burn":true`.
+
 9. **Phase 4 M5:** Mobile Browser UI + RC-4 wake identity guard.
+10. **HTTP Gateway Relay (`/relay/v1/*`) & M12 Follow-Up LOWs (`LOW-1..LOW-10` + `F-H2`):**
+    - Pure Sans-IO Relay reducer (`bitecho.core.protocol.relay`) with PoP poll authentication, bounded inboxes, broadcast ring buffer, and SHA-256 deduplication.
+    - Live HTTP Gateway Relay endpoints (`/relay/v1/send`, `/relay/v1/poll` with virtual thread long-polling park, `/relay/v1/ack`, `/relay/v1/chain-state`) multiplexed on ports 80 and 443.
+    - 3-Runtime `--relay-url` support in JVM (`light_node.clj`), Node.js (`node_main.cljs`), and Browser (`browser_main.cljs`).
+    - Resolution of all 9 M12 follow-up LOWs (`LOW-1..LOW-5`, `LOW-7..LOW-10`), P2P self-candidate filter, and `:closed` phase guard.
 
 ---
 

@@ -61,6 +61,7 @@ java -jar target/bitecho.jar light-node <command|serve> [options]
 - `--turn-realm <realm>`: Authentication realm for TURN server.
 - `--turn-force-relay`: Force all WebRTC traffic through TURN relay (drops unrelayable packets rather than falling back to direct UDP).
 - `--trusted-dac-anchors <pk1,pk2,...>`: Comma-separated list of trusted DAC anchor public keys required for DAC admission and zero-burn broadcast validation.
+- `--relay-url <url>`: URL of HTTP Gateway Relay endpoint (e.g., `https://bitecho.org/relay/v1` or `http://127.0.0.1:8080/relay/v1`) for fallback ingress/egress, long-polling inbound envelope delivery, and validator chain-state synchronization in restricted network environments where direct UDP/TCP sockets are blocked.
 
 ---
 
@@ -815,5 +816,19 @@ Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across a
     "p2p": true
   }
   ```
+
+---
+
+## 13. HTTP Gateway Relay (`/relay/v1/*`)
+
+When running behind restrictive enterprise proxies, firewalls, or browser sandboxes where direct UDP/TCP WebRTC DataChannels are unavailable, nodes can route traffic via the HTTP Gateway Relay.
+
+### Endpoints
+
+- **`POST /relay/v1/send`**: Submit a signed Fressian envelope (`{"envelope_hex": "..."}` or raw `application/fressian`). Inboxes unicast envelopes for recipient and forwards to validator network.
+- **`GET / POST /relay/v1/poll`**: Long-poll queued inbound envelopes and broadcasts with virtual-thread parking (`?wait_ms=5000&since_seq=...&since_broadcast_seq=...`). Requires Proof-of-Possession Ed25519 signature over `"bitecho-relay-poll-v1|<pubkey>|<since_seq>|<ts>|<nonce>"`.
+- **`POST /relay/v1/ack`**: Prune processed inbox envelopes up to `:ack_seq` with Proof-of-Possession authentication.
+- **`GET / POST /relay/v1/chain-state`**: Fetch BFT validator chain-state quorum snapshots (`{"snapshots": [...]}`) over HTTP.
+
 
 

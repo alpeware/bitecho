@@ -4,6 +4,7 @@
   (:require [bitecho.anchor.core :as anchor]
             [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
+            [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.fressian :as fressian]
@@ -88,7 +89,7 @@
     (seq? x) (mapv redact-for-js x)
     :else x))
 
-(declare send-to-all-channels! send-chain-state-query!)
+(declare send-to-all-channels! send-chain-state-query! set-p2p-channel-state dial-browser-p2p-peer! handle-inbound-wire-envelope! route-browser-envelope! poll-relay-envelopes! ack-relay-envelopes! submit-relay-envelope!)
 
 (defn- prune-ghost-sessions
   "Removes restored sessions whose ephemeral/session keys (:tx-key, :ephemeral-priv)
@@ -483,6 +484,12 @@
                      (str "browser-" (fressian/bytes->hex (crypto/random-bytes 4))))
          subnet-id (or (:subnet-id opts-map) (:subnetId opts-map)
                        "global")
+         relay-url (or (:relay-url opts-map) (:relayUrl opts-map)
+                       (when (and (exists? js/window) (exists? js/URLSearchParams) (some? (.-location js/window)))
+                         (try
+                           (let [params (js/URLSearchParams. (.-search (.-location js/window)))]
+                             (or (.get params "relay-url") (.get params "relayUrl")))
+                           (catch :default _ nil))))
          keypair (crypto/generate-keypair)
          x25519 (sealed/generate-x25519-keypair)
          pubkey-hex (fressian/bytes->hex (:public-key keypair))
@@ -492,10 +499,12 @@
                                                   :economy-enabled? true
                                                   :burn-floor 100
                                                   :autonomous? false})
-         light-st (assoc init-light :petnames default-petnames :max-epoch-skew 15)
+         light-st (cond-> (assoc init-light :petnames default-petnames :max-epoch-skew 15)
+                    relay-url (assoc :relay-url relay-url))
          conn-state (browser/initial-conn-state {:peer-id node-id :subnet-id subnet-id})
          node-atom (atom {:peer-id node-id
                           :subnet-id subnet-id
+                          :relay-url relay-url
                           :keypair keypair
                           :x25519 x25519
                           :conn conn-state
@@ -512,6 +521,48 @@
      (reset! active-node-atom node-atom)
      (when (:persist? opts-map)
        (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom)))
+     (when relay-url
+       (let [since-mseq (atom 0)
+             since-bseq (atom 0)
+             polling? (atom false)
+             poll-tick!
+             (fn poll-tick! []
+               (when (compare-and-set! polling? false true)
+                 (let [st (:light-state @node-atom)
+                       pk-hex (or (:pubkey st) pubkey-hex)
+                       privkey (:private-key (:keypair @node-atom))]
+                   (-> (poll-relay-envelopes!
+                        relay-url pk-hex privkey
+                        {:since-seq @since-mseq
+                         :since-broadcast-seq @since-bseq
+                         :timeout-ms 2000})
+                       (.then (fn [poll-res]
+                                (try
+                                  (let [msgs (or (:messages poll-res) [])
+                                        bcasts (or (:broadcasts poll-res) [])
+                                        all-items (concat msgs bcasts)]
+                                    (when (seq msgs)
+                                      (let [last-m (last msgs)
+                                            mseq (or (:relay_seq last-m) (:relay-seq last-m))]
+                                        (when mseq (reset! since-mseq (long mseq)))))
+                                    (when (seq bcasts)
+                                      (let [last-b (last bcasts)
+                                            bseq (or (:broadcast_seq last-b) (:broadcast-seq last-b))]
+                                        (when bseq (reset! since-bseq (long bseq)))))
+                                    (doseq [item all-items]
+                                      (let [env-raw (or (:envelope_hex item) (:envelope item))
+                                            wire-bytes (when env-raw
+                                                         (try (basalt/hex->bytes (str env-raw)) (catch :default _ nil)))]
+                                        (when wire-bytes
+                                          (handle-inbound-wire-envelope! node-atom wire-bytes))))
+                                    (when (seq msgs)
+                                      (ack-relay-envelopes! relay-url pk-hex privkey @since-mseq)))
+                                  (finally
+                                    (reset! polling? false)))))
+                       (.catch (fn [_]
+                                 (reset! polling? false)))))))]
+         (poll-tick!)
+         (js/setInterval poll-tick! 1000)))
      (notify-ui-listeners!)
      node-atom)))
 
@@ -540,6 +591,7 @@
                  :epoch (or (:epoch light-st) 0)
                  :balance (or (get-in light-st [:account :balance]) (:balance light-st) 0)
                  :spendable (or (get-in light-st [:account :spendable]) (:spendable light-st) 0)
+                 :transport (if (:relay-url node) "http-relay" (name (or (:transport conn) :webrtc)))
                  :phase (name (or (:phase conn) :idle))
                  :generation (or (:generation conn) 0)
                  :visibilityState (or (:visibility-state conn) "visible")
@@ -558,8 +610,6 @@
                                :ignoredStale (or (:ignored-stale diag) 0)
                                :unsupportedFormatDropped (or (:unsupported-format-dropped diag) 0)
                                :backgroundThrottledEvents (or (:background-throttled-events diag) 0)}})))))
-
-(declare set-p2p-channel-state dial-browser-p2p-peer! handle-inbound-wire-envelope! route-browser-envelope!)
 
 (defn build-p2p-link-bind-envelope
   "Builds and signs a :p2p-link-bind envelope proving peer pubkey and session identity."
@@ -591,10 +641,13 @@
 (defn- send-to-all-channels!
   [node-atom env]
   (let [channels (:active-channels @node-atom)
-        wire-bytes (fressian/encode-wire env)]
-    (doseq [[_id dc] channels]
-      (when (and dc (= (.-readyState dc) "open"))
-        (try (.send dc wire-bytes) (catch :default _ nil))))))
+        wire-bytes (fressian/encode-wire env)
+        open-dcs (filter (fn [[_id dc]] (and dc (= (.-readyState dc) "open"))) channels)]
+    (if (seq open-dcs)
+      (doseq [[_id dc] open-dcs]
+        (try (.send dc wire-bytes) (catch :default _ nil)))
+      (when-let [relay-url (:relay-url @node-atom)]
+        (submit-relay-envelope! relay-url env nil)))))
 
 (defn route-browser-envelope!
   "Routes an outgoing envelope directly to open P2P channel(s) or falls back to validator mesh."
@@ -699,7 +752,7 @@
                  (some? sess)
                  (= "open" (:state sess))
                  (= sender-pk expected-peer)
-                 (contains? #{:offered :offer-received :connecting :open nil} p2p-phase))
+                 (contains? #{:offered :offer-received :connecting :open :closed nil} p2p-phase))
           (set-p2p-channel-state node-atom sid true nil)
           (swap! node-atom update-in [:light-state :diagnostics :p2p-signaling-rejected] (fnil inc 0))))
       (let [node @node-atom
@@ -1636,6 +1689,110 @@
                (apply-hardware-identity! res)
                (resolve (clj->js (redact-for-js res))))))))))))
 
+;; =============================================================================
+;; HTTP Gateway Relay Client Helpers (/relay/v1/*)
+;; =============================================================================
+
+(defn submit-relay-envelope!
+  "Submits an envelope (hex string, bytes, or map) to HTTP relay at `relay-url` via fetch. Returns a Promise."
+  ([relay-url envelope] (submit-relay-envelope! relay-url envelope nil))
+  ([relay-url envelope _opts]
+   (js/Promise.
+    (fn [resolve _]
+      (let [url (str (str/replace relay-url #"/+$" "") "/relay/v1/send")
+            env-hex (cond
+                      (fressian/bytes? envelope) (fressian/bytes->hex envelope)
+                      (string? envelope) envelope
+                      (map? envelope) (try (fressian/bytes->hex (fressian/encode-canonical envelope)) (catch :default _ nil))
+                      :else (str envelope))
+            body-str (js/JSON.stringify #js {:envelope_hex env-hex})]
+        (-> (js/fetch url #js {:method "POST"
+                               :headers #js {"Content-Type" "application/json"}
+                               :body body-str})
+            (.then (fn [res] (.json res)))
+            (.then (fn [data] (resolve (js->clj data :keywordize-keys true))))
+            (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
+
+(defn poll-relay-envelopes!
+  "Polls HTTP relay at `relay-url` for envelopes addressed to `pubkey`. Returns a Promise."
+  ([relay-url pubkey privkey] (poll-relay-envelopes! relay-url pubkey privkey nil))
+  ([relay-url pubkey privkey opts]
+   (js/Promise.
+    (fn [resolve _]
+      (let [now-ms (.now js/Date)
+            pk-hex (if (fressian/bytes? pubkey) (fressian/bytes->hex pubkey) (str pubkey))
+            since-seq (long (or (:since-seq opts) (:seq-gte opts) 0))
+            nonce (or (:nonce opts) (fressian/bytes->hex (crypto/random-bytes 16)))
+            sig (relay/sign-poll-request privkey {:pubkey pk-hex
+                                                  :since-seq since-seq
+                                                  :timestamp-ms now-ms
+                                                  :nonce nonce})
+            params (cond-> {"pubkey" pk-hex
+                            "sig" sig
+                            "signature" sig
+                            "ts" (str now-ms)
+                            "timestamp_ms" (str now-ms)
+                            "nonce" nonce
+                            "since_seq" (str since-seq)}
+                     (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
+                     (:limit opts) (assoc "limit" (str (:limit opts)))
+                     (:timeout-ms opts) (assoc "timeout_ms" (str (:timeout-ms opts))))
+            q-str (str/join "&" (map (fn [[k v]] (str (js/encodeURIComponent (name k)) "=" (js/encodeURIComponent (str v)))) params))
+            url (str (str/replace relay-url #"/+$" "") "/relay/v1/poll?" q-str)]
+        (-> (js/fetch url #js {:method "GET"})
+            (.then (fn [res] (.json res)))
+            (.then (fn [data] (resolve (js->clj data :keywordize-keys true))))
+            (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
+
+(defn ack-relay-envelopes!
+  "Acknowledges envelopes processed up to `up-to-seq` at `relay-url`. Returns a Promise."
+  ([relay-url pubkey privkey up-to-seq] (ack-relay-envelopes! relay-url pubkey privkey up-to-seq nil))
+  ([relay-url pubkey privkey up-to-seq opts]
+   (js/Promise.
+    (fn [resolve _]
+      (let [now-ms (.now js/Date)
+            pk-hex (if (fressian/bytes? pubkey) (fressian/bytes->hex pubkey) (str pubkey))
+            ack-seq (long (or up-to-seq 0))
+            nonce (or (:nonce opts) (fressian/bytes->hex (crypto/random-bytes 16)))
+            sig (relay/sign-poll-request privkey {:pubkey pk-hex
+                                                  :since-seq ack-seq
+                                                  :timestamp-ms now-ms
+                                                  :nonce nonce})
+            url (str (str/replace relay-url #"/+$" "") "/relay/v1/ack")
+            payload (js/JSON.stringify #js {:pubkey pk-hex
+                                            :sig sig
+                                            :signature sig
+                                            :ts now-ms
+                                            :timestamp_ms now-ms
+                                            :nonce nonce
+                                            :ack_seq ack-seq
+                                            :up_to_seq ack-seq})]
+        (-> (js/fetch url #js {:method "POST"
+                               :headers #js {"Content-Type" "application/json"}
+                               :body payload})
+            (.then (fn [res] (.json res)))
+            (.then (fn [data] (resolve (js->clj data :keywordize-keys true))))
+            (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
+
+(defn fetch-relay-chain-state!
+  "Fetches chain-state and bootstrap info from `relay-url`. Returns a Promise."
+  ([relay-url] (fetch-relay-chain-state! relay-url nil))
+  ([relay-url opts]
+   (js/Promise.
+    (fn [resolve _]
+      (let [clean (str/replace (str relay-url) #"/+$" "")
+            base-url (if (str/ends-with? clean "/relay/v1")
+                       (str clean "/chain-state")
+                       (str clean "/relay/v1/chain-state"))
+            q-parts (cond-> []
+                      (:pubkey opts) (conj (str "pubkey=" (js/encodeURIComponent (str (:pubkey opts)))))
+                      (:nonce opts) (conj (str "nonce=" (js/encodeURIComponent (str (:nonce opts))))))
+            url (if (seq q-parts) (str base-url "?" (str/join "&" q-parts)) base-url)]
+        (-> (js/fetch url #js {:method "GET"})
+            (.then (fn [res] (.json res)))
+            (.then (fn [data] (resolve (js->clj data :keywordize-keys true))))
+            (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
+
 (def api
   "Global BitechoBrowser API object."
   #js {:initNode init-node
@@ -1682,6 +1839,10 @@
        :encodeBech32m encode-bech32m-cmd
        :decodeBech32m decode-bech32m-cmd
        :runAnchorEndToEndDemo run-anchor-end-to-end-demo
+       :submitRelayEnvelope submit-relay-envelope!
+       :pollRelayEnvelopes poll-relay-envelopes!
+       :ackRelayEnvelopes ack-relay-envelopes!
+       :fetchRelayChainState fetch-relay-chain-state!
        :version "1.0.0-m16"})
 
 (when (exists? js/globalThis)

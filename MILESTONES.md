@@ -743,7 +743,27 @@ Per Simon's refactoring-first architecture decision (`2026-11-08` / `2026-11-09`
    - Parent-side non-circular verification (`verify-subnet-anchor`) enforcing CID integrity, path matching, strict epoch monotonicity ($t_{i+1} > t_i$), and predecessor hash-chain continuity (`:prev-anchor-cid`).
    - Pure multi-subnet multiplexer automatic anchor propagation (`handle-multiplexed-anchor-effects`) with `:on-change` and `:epoch` triggers, routing anchor Blobs and Pointers directly into parent subnet instances.
    - Carried LOW cleanups: validator-side `effective-signaling-burn-floor` centralization in `bitecho.economy.burn` (`F-C1` + `O-2`), eliminated duplicate `:p2p-dial-failed` counts in Node.js and JVM shells (`F-D1`), enforce `:burn-floor` in `exec-offer` (`F-D2`), and automated in-repo Node.js daemon UDP WebRTC DataChannel accept test (`test/bitecho/node_bundle_test.clj` for `F-H2`).
+   - **Decision Note (LOW-7: Settlement Anchoring Model)**: The unified architecture replaces pre-unification M12B challenge windows with the unified `Pointer` + `k-of-n` ACL threshold quorum model: child subnet state-roots are committed as immutable `Blob`s pinned by parent `Pointer`s under `:subnet/path-acl` governance (`path "anchor/<child-subnet-id>"`), authenticated by cryptographic inclusion proofs and authority/threshold quorum signatures. This eliminates complex fraud-proof dispute periods while preserving mathematical finality.
 9. **Milestone 17 (`M5`):**
    - Mobile Browser UI + RC-4 wake identity guard (`M5`).
+10. **HTTP Gateway Relay (`/relay/v1/*`) & M12 Follow-Up LOWs (`LOW-1..LOW-10` + `F-H2`) — `[BUILT & VERIFIED]`:**
+    - Closed all 9 M12 follow-up items:
+      - `LOW-1`: Canonical `prev-anchor-entry` normalization in `verify-subnet-anchor`.
+      - `LOW-2`: Genesis predecessor validation (`:prev-anchor-cid` nil/empty check when `anchor-seq == 1` and predecessor is genesis).
+      - `LOW-3`: Applied `effective-signaling-burn-floor` in `exec-rendezvous-offer`.
+      - `LOW-4`: Safe blob entry/context lookup in `data/verify-pointer-proof` returning `:missing-anchor-blob` fail-closed.
+      - `LOW-5`: Wired `:anchor-to-parent` and `:epoch-tick` in `bitecho.shell.infra`.
+      - `LOW-7`: Settlement anchoring architectural consolidation note documented in `DESIGN.md` §T.3 and `MILESTONES.md` §12.8.
+      - `LOW-8`: Attached millisecond timestamp `:timestamp-ms` to `build-subnet-anchor`.
+      - `LOW-9`: Subnet gate admission for internal lifecycle events (`#{:epoch-tick :epoch :on-change}`).
+      - `LOW-10`: Exported public `pointer-verify-ctx` in `bitecho.core.subnet`.
+      - `F-H2`: Node UDP accept test tagged `^:integration` in `test/bitecho/node_bundle_test.clj`.
+    - P2P Candidate Filter: Rejected self-candidates in `handle-wire-p2p-answer` and added `:closed` to `:p2p-link-bind` phase guard across JVM, Node.js, and Browser runtimes.
+    - Pure Sans-IO HTTP Gateway Relay Protocol (`bitecho.core.protocol.relay`):
+      - Manages inboxes for unicast envelopes (`max-inbox-size 256`), ring for broadcasts (`max-broadcast-size 256`), SHA-256 deduplication, Ed25519 outer signature verification, Proof-of-Possession poll authentication (`bitecho-relay-poll-v1|...`), clock skew checks, and nonce replay protection.
+    - Edge HTTP Shell Endpoints (`bitecho.shell.http`):
+      - `/relay/v1/send`, `/relay/v1/poll` (with virtual thread long polling park), `/relay/v1/ack`, `/relay/v1/chain-state` served on both `:80` and `:443`.
+    - 3-Runtime `--relay-url` support in `light_node.clj`, `node_main.cljs`, and `browser_main.cljs`.
+    - Full integration tests (`test/bitecho/shell/http_relay_test.clj`), generative property tests (`test/bitecho/core/protocol/relay_test.cljc`), 100% test pass on JVM and Node CLJS.
 
 

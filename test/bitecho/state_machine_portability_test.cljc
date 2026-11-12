@@ -260,7 +260,7 @@
           ;; 4f. rendezvous-offer
           rdv-res (light-core/handle-command st0 {"cmd" "rendezvous-offer"
                                                   "callee" peer-pub-hex
-                                                  "burn" 25
+                                                  "burn" 150
                                                   "topic" "chat"} priv)
           _ (is (= true (get-in rdv-res [:response "ok"])))
           _ (is (= 1 (count (:net-envelopes rdv-res))))

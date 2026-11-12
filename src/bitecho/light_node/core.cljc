@@ -1511,7 +1511,7 @@
        :net-envelopes []
        :stdout-events []}
       (let [econ? (get state :economy-enabled? true)
-            floor (if econ? (long (get state :burn-floor 0)) 0)
+            floor (effective-signaling-burn-floor state)
             default-burn (if econ? (max floor 500) 0)
             raw-burn (or (get cmd-map "burn") (:burn cmd-map))
             parsed-burn (if (some? raw-burn) (parse-long-safe raw-burn :invalid) default-burn)]
@@ -3307,6 +3307,87 @@
      :net-envelopes []
      :stdout-events []}))
 
+(declare dispatch-multiplexed-command)
+
+(defn- exec-anchor-subnet
+  [state effective-map privkey-bytes sub-id]
+  (cond
+    (contains? (:subnets state) sub-id)
+    (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :anchor-subnet) privkey-bytes)]
+      {:state (:mux res)
+       :response (:response res)
+       :effects (or (:effects res) [])
+       :net-envelopes (or (:net-envelopes res) [])
+       :stdout-events (or (:stdout-events res) [])})
+
+    (:bitecho.subnet/unified? state)
+    (let [res (core-subnet/reduce-subnet state (assoc effective-map :type :anchor-subnet))]
+      {:state (:state res)
+       :response (if (:applied? res)
+                   (cond-> {"ok" true "subnet" (:subnet/id (:policy state))}
+                     (:anchor res) (assoc "anchor" (:anchor res)))
+                   {"ok" false "error" (str (:error res))})
+       :effects (or (:effects res) [])
+       :net-envelopes []
+       :stdout-events []})
+
+    :else
+    {:state state :response {"ok" false "error" "subnet-not-found" "subnet" sub-id} :net-envelopes [] :stdout-events []}))
+
+(defn- exec-epoch-tick
+  [state effective-map privkey-bytes sub-id]
+  (cond
+    (contains? (:subnets state) sub-id)
+    (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :epoch-tick) privkey-bytes)]
+      {:state (:mux res)
+       :response (:response res)
+       :effects (or (:effects res) [])
+       :net-envelopes (or (:net-envelopes res) [])
+       :stdout-events (or (:stdout-events res) [])})
+
+    (:bitecho.subnet/unified? state)
+    (let [res (core-subnet/reduce-subnet state (assoc effective-map :type :epoch-tick))]
+      {:state (:state res)
+       :response (if (:applied? res)
+                   (cond-> {"ok" true "subnet" (:subnet/id (:policy state))}
+                     (:anchor res) (assoc "anchor" (:anchor res)))
+                   {"ok" true "subnet" (:subnet/id (:policy state)) "unchanged" true})
+       :effects (or (:effects res) [])
+       :net-envelopes []
+       :stdout-events []})
+
+    :else
+    (let [next-ep (inc (long (or (:epoch state) 0)))]
+      {:state (assoc state :epoch next-ep)
+       :response {"ok" true "epoch" next-ep}
+       :net-envelopes []
+       :stdout-events []})))
+
+(defn- exec-verify-subnet-anchor
+  [state effective-map sub-id]
+  (let [ptr (or (:pointer effective-map) (get effective-map "pointer"))
+        blob (or (:blob effective-map) (get effective-map "blob"))
+        prev-anchor (or (:prev-anchor effective-map) (:prev-anchor-entry effective-map) (get effective-map "prev_anchor"))
+        parent-sid (or (get effective-map "parent_subnet") (get effective-map "parent-subnet") (:parent-subnet effective-map) sub-id "global")
+        parent-inst (when (:subnets state) (get-in state [:subnets parent-sid]))
+        now-ms (long (or (:now-ms effective-map) 0))
+        parent-ctx (cond
+                     (and parent-inst (:bitecho.subnet/unified? parent-inst))
+                     (core-subnet/pointer-verify-ctx parent-inst nil now-ms)
+
+                     (:bitecho.subnet/unified? state)
+                     (core-subnet/pointer-verify-ctx state nil now-ms)
+
+                     :else
+                     (or (:parent-ctx effective-map) (get effective-map "parent_ctx") {}))
+        res (core-subnet/verify-subnet-anchor ptr blob parent-ctx prev-anchor)]
+    {:state state
+     :response (if (:ok? res)
+                 {"ok" true "verified" true "child_subnet" (:child-subnet res) "merkle_root" (:merkle-root res) "child_epoch" (:child-epoch res) "anchor_seq" (:anchor-seq res)}
+                 {"ok" false "error" (str (:error res))})
+     :net-envelopes []
+     :stdout-events []}))
+
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
    Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps.
@@ -3360,6 +3441,9 @@
               "directory-verify" (exec-directory-verify state effective-map)
               "directory-register" (exec-directory-register state effective-map privkey-bytes)
               "directory-lookup" (exec-directory-lookup state effective-map)
+              "anchor-subnet" (exec-anchor-subnet state effective-map privkey-bytes sub-id)
+              "epoch-tick" (exec-epoch-tick state effective-map privkey-bytes sub-id)
+              "verify-subnet-anchor" (exec-verify-subnet-anchor state effective-map sub-id)
               "status" (exec-status state)
               {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})]
     (if (seq (:net-envelopes res))
@@ -4203,7 +4287,9 @@
                :stdout-events [diag-evt]})
             (let [norm-sender (normalize-pubkey-hex (:sender msg))
                   already-connected? (boolean (get-in session [:p2p :connected?]))
-                  has-candidates? (boolean (seq candidates))
+                  local-cands-set (set (get-in session [:p2p :local-candidates]))
+                  dialable-candidates (vec (remove #(contains? local-cands-set %) candidates))
+                  has-candidates? (boolean (seq dialable-candidates))
                   has-local-candidates? (boolean (seq (get-in session [:p2p :local-candidates])))
                   p2p-base (get session :p2p {})
                   pname (pubkey->petname state norm-sender)
@@ -4248,7 +4334,7 @@
                                 :role :initiator
                                 :transport transport
                                 :local-candidates (get-in session [:p2p :local-candidates])
-                                :remote-candidates candidates
+                                :remote-candidates dialable-candidates
                                 :remote-ice-ufrag ice-ufrag
                                 :remote-ice-pwd ice-pwd
                                 :remote-fingerprint fp}]
@@ -4760,8 +4846,11 @@
                                                          now-ms)]
           {:mux (:mux handled)
            :response (if (:applied? res)
-                       {"ok" true "subnet" sub-id}
-                       {"ok" false "error" (str (:error res)) "subnet" sub-id})
+                       (cond-> {"ok" true "subnet" sub-id}
+                         (:anchor res) (assoc "anchor" (:anchor res)))
+                       (if (= :epoch-tick (:type cmd-map))
+                         {"ok" true "subnet" sub-id "unchanged" true}
+                         {"ok" false "error" (str (:error res)) "subnet" sub-id}))
            :effects (:effs handled)
            :net-envelopes []
            :stdout-events []})

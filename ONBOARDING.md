@@ -44,6 +44,11 @@ cd bitecho
   --cmd-file ~/.bitecho/light-node/cmd.jsonl \
   --events-out ~/.bitecho/light-node/events.jsonl
 
+# In restricted enterprise or web environments with no UDP/TCP socket access, route over HTTP Gateway Relay:
+./scripts/light-node.sh serve \
+  --state-dir ~/.bitecho/light-node \
+  --relay-url https://bitecho.org/relay/v1
+
 # Send commands by appending JSONL to --cmd-file, and await incoming offers/messages via wait-event:
 echo '{"cmd":"send","session_id":"<sid>","text":"Hello Bitecho!"}' >> ~/.bitecho/light-node/cmd.jsonl
 ./scripts/light-node.sh wait-event \

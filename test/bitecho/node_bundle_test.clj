@@ -17,7 +17,7 @@
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]))
 
-(deftest test-node-light-node-udp-p2p-link-bind-accept
+(deftest ^:integration test-node-light-node-udp-p2p-link-bind-accept
   (testing "F-H2: Live Node.js daemon accepts UDP WebRTC DataChannel connection and emits p2p-connected with transport udp"
     (let [temp-dir (Files/createTempDirectory "node-bundle-test-" (into-array FileAttribute []))
           dir-node (str (.resolve temp-dir "node-daemon"))
