@@ -772,10 +772,12 @@
      (assoc res :state (assoc state :blobs (:store res))))))
 
 (defn pointer-order-tuple
-  "Returns `[leader-term seq]` for deterministic supersession comparison."
+  "Returns `[leader-term seq target sig]` for deterministic supersession comparison."
   [pointer]
   [(long (or (:pointer/leader-term pointer) 0))
-   (long (or (:pointer/seq pointer) 0))])
+   (long (or (:pointer/seq pointer) 0))
+   (str (or (:pointer/target pointer) ""))
+   (str (or (:pointer/sig pointer) ""))])
 
 (defn apply-pointer
   "Verifies and applies a Pointer to `state` keyed by `[subnet path]`:

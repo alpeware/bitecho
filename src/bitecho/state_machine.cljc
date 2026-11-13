@@ -187,17 +187,22 @@
                              0 pending)
         lock-debit (reduce (fn [acc r]
                              (if (and (= (:type r) :lock-intent) (= (:payer r) pk))
-                               (+ acc (long (or (:amount r) 0)))
+                               (+ acc (long (or (:amount r) 0)) (long (or (:burn-amount r) 0)))
                                acc))
                            0 pending)
-        voucher-tuples (reduce (fn [acc r]
-                                 (if (and (= (:type r) :voucher) (= (:callee r) pk))
-                                   (let [k [(:callee r) (rendezvous/normalize-home-node (:home-node r)) (:epoch r)]
-                                         prev (get acc k 0)
-                                         curr (long (or (:cumulative-debit r) 0))]
-                                     (assoc acc k (max prev curr)))
-                                   acc))
-                               {} pending)
+        voucher-tuples (reduce (fn [acc v]
+                                 (let [c (let [c' (:callee v)] (if (string? c') c' (when c' (basalt/bytes->hex c'))))]
+                                   (if (= c pk)
+                                     (let [caller (or (:caller v) (when-let [hn (:home-node v)] (rendezvous/normalize-home-node hn)) (:sender v))
+                                           s-id (or (:session-id v) (:session_id v) (:offer-hash v) (:epoch v))
+                                           k [caller s-id]
+                                           prev (get acc k 0)
+                                           curr (long (or (:cumulative-debit v) (:amount v) (:debit v) 0))]
+                                       (assoc acc k (max prev curr)))
+                                     acc)))
+                               {}
+                               (concat (or (:pending-vouchers state) [])
+                                       pending))
         voucher-debit (reduce + 0 (vals voucher-tuples))
         total-debit (+ burn-debit transfer-debit intent-debit lock-debit voucher-debit)]
     (- auth-bal total-debit)))
@@ -276,6 +281,7 @@
      :bootstrap-sunset-epoch (or (:bootstrap-sunset-epoch state)
                                  (:bootstrap-sunset-epoch cfg)
                                  treasury/default-bootstrap-sunset-epoch)
+     :sunset-custody-burned (or (:sunset-custody-burned state) 0)
      :treasury-pubkey (or (:treasury-pubkey state) (:treasury-pubkey cfg))
      :treasury-privkey (or (:treasury-privkey state) (:treasury-privkey cfg))}))
 
@@ -382,7 +388,7 @@
         (assoc :pending-vouchers retained-pending)
         (dissoc :retry-vouchers))))
 
-(defn- apply-epoch-treasury-boundary
+(defn apply-epoch-treasury-boundary
   "Executes treasury epoch boundary calculations, applying demand-gated mint
    and custody drawdowns or sunset burns to the state."
   [state new-epoch]
@@ -398,7 +404,11 @@
                                  (assoc state :ledger l)
                                  state)
                                (assoc :skipped-custody-allocations
-                                      (or (:skipped-allocations res) [])))
+                                      (or (:skipped-allocations res) []))
+                               (assoc :sunset-custody-burned
+                                      (long (or (:sunset-custody-burned res)
+                                                (:sunset-custody-burned state)
+                                                0))))
         t-priv (or (:treasury-privkey state) (get-in state [:config :treasury-privkey]))
         t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
     (cond
@@ -413,7 +423,23 @@
                                     :treasury-pubkey t-pub
                                     :signature sig}))
 
-      (and (pos? epoch-mint) (zero? actual-minted) t-priv t-pub)
+      (and (seq all-mint-shares) (pos? actual-minted) t-pub)
+      ;; JEP-04: Deterministic SMR follower or consensus epoch boundary without local treasury private key
+      (let [total-minted (or (:total-minted state-with-custody) 0)
+            max-cap treasury/max-conditional-mint-supply]
+        (if (<= (+ total-minted actual-minted) max-cap)
+          (let [new-ledger (account/apply-mint (or (:ledger state-with-custody) {}) all-mint-shares)]
+            (-> state-with-custody
+                (assoc :ledger new-ledger)
+                (assoc :total-minted (+ total-minted actual-minted))
+                (update :minted-epochs (fnil conj #{}) new-epoch)
+                (assoc :mint-dust mint-dust)
+                (assoc-in [:epoch-mint-dust new-epoch] mint-dust)
+                (update :unclaimed-mint (fnil + 0) unclaimed-mint)
+                (assoc-in [:epoch-unclaimed-mint new-epoch] unclaimed-mint)))
+          state-with-custody))
+
+      (and (pos? epoch-mint) t-pub)
       (-> state-with-custody
           (assoc :mint-dust mint-dust)
           (assoc-in [:epoch-mint-dust new-epoch] mint-dust)
@@ -1425,53 +1451,101 @@
              ledger)
            ledger)
 
+         :lock-intent
+         (let [payer (:payer r)
+               amount (long (or (:amount r) 0))
+               burn-amt (long (or (:burn-amount r) 0))
+               total-deduct (+ amount burn-amt)
+               payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
+               payer-acct (when payer-hex (get ledger payer-hex))
+               payer-bal (or (:balance payer-acct) 0)]
+           (if (and payer-hex (pos? total-deduct) payer-acct (>= payer-bal total-deduct))
+             (assoc ledger payer-hex (assoc payer-acct :balance (- payer-bal total-deduct)))
+             ledger))
+
          ledger))
      base-ledger
      pending)))
 
-(defn- canonical-unexecuted-finalized-chain
+(defn canonical-unexecuted-finalized-chain
   "Walks the canonical ancestor chain from :latest-finalized-block-hash backwards via :parent-hash,
    stopping at genesis or an executed finalized block.
    Returns unexecuted canonical blocks in oldest-first order."
-  [state]
-  (let [latest-hash (:latest-finalized-block-hash state)
-        executed-hashes (or (:executed-finalized-blocks state) #{})
-        blocks (or (:blocks state) {})
-        genesis-equiv? (fn [h]
-                         (or (nil? h)
-                             (= h "genesis")
-                             (= h "0000000000000000000000000000000000000000000000000000000000000000")))
-        valid-root? (fn [h]
-                      (or (genesis-equiv? h)
-                          (contains? executed-hashes h)))
-        walk-rooted-chain (fn [start-hash]
-                            (loop [curr start-hash
-                                   visited #{}
-                                   acc ()]
-                              (cond
-                                (valid-root? curr)
-                                (vec acc)
+  ([state]
+   (let [latest-hash (:latest-finalized-block-hash state)
+         finalized-set (or (:finalized-blocks state) #{})
+         executed-hashes (or (:executed-finalized-blocks state) #{})
+         blocks (or (:blocks state) {})
+         genesis-equiv? (fn [h]
+                          (or (nil? h)
+                              (= h "genesis")
+                              (= h "0000000000000000000000000000000000000000000000000000000000000000")))
+         valid-root? (fn [h]
+                       (or (genesis-equiv? h)
+                           (contains? executed-hashes h)))
+         max-sync-depth (long (or (get-in state [:config :max-ancestor-sync-depth]) 16))
+         last-exec (long (or (:last-executed-finalized-epoch state) 0))
+         walk-rooted-chain (fn [start-hash]
+                             (loop [curr start-hash
+                                    visited #{}
+                                    acc ()]
+                               (cond
+                                 (valid-root? curr)
+                                 (vec acc)
 
-                                (contains? visited curr)
-                                []
+                                 (contains? visited curr)
+                                 []
 
-                                :else
-                                (if-let [b (get blocks curr)]
-                                  (recur (:parent-hash b)
-                                         (conj visited curr)
-                                         (cons (assoc b :hash curr) acc))
-                                  []))))]
-    (if (and latest-hash (get blocks latest-hash))
-      (walk-rooted-chain latest-hash)
-      ;; Fallback if :latest-finalized-block-hash not set or not in :blocks
-      (let [pending-hashes (set/difference (or (:finalized-blocks state) #{}) executed-hashes)]
-        (->> pending-hashes
-             (keep (fn [h]
-                     (when (seq (walk-rooted-chain h))
-                       (when-let [b (get blocks h)]
-                         (assoc b :hash h)))))
-             (sort-by (juxt (comp long :epoch) :hash))
-             vec)))))
+                                 :else
+                                 (if-let [b (get blocks curr)]
+                                   (recur (:parent-hash b)
+                                          (conj visited curr)
+                                          (cons (assoc b :hash curr) acc))
+                                   (let [oldest-epoch (long (or (:epoch (first acc)) 0))
+                                         gap-depth (- oldest-epoch last-exec)]
+                                     (if (and (seq acc)
+                                              (contains? finalized-set latest-hash)
+                                              (> gap-depth max-sync-depth))
+                                      ;; JEP-03: Healed after partition exceeding max-ancestor-sync-depth
+                                       (assoc-in (vec acc) [0 :gap-jumped?] true)
+                                       []))))))
+         walk-res (when (and latest-hash (get blocks latest-hash))
+                    (walk-rooted-chain latest-hash))
+         rooted-fallback (fn []
+                           (let [pending-hashes (set/difference finalized-set executed-hashes)]
+                             (->> pending-hashes
+                                  (keep (fn [h]
+                                          (let [chain (walk-rooted-chain h)]
+                                            (when (and (seq chain) (not (:gap-jumped? (first chain))))
+                                              (when-let [b (get blocks h)]
+                                                (assoc b :hash h))))))
+                                  (sort-by (juxt (comp long :epoch) :hash))
+                                  vec)))]
+     (cond
+       (and (seq walk-res) (not (:gap-jumped? (first walk-res))))
+       walk-res
+
+       (seq (rooted-fallback))
+       (rooted-fallback)
+
+       (seq walk-res)
+       walk-res
+
+        ;; Fallback if :latest-finalized-block-hash not set or not in :blocks
+       :else
+       (let [pending-hashes (set/difference finalized-set executed-hashes)]
+         (->> pending-hashes
+              (keep (fn [h]
+                      (when (seq (walk-rooted-chain h))
+                        (when-let [b (get blocks h)]
+                          (assoc b :hash h)))))
+              (sort-by (juxt (comp long :epoch) :hash))
+              vec)))))
+  ([blocks finalized-set executed latest-hash]
+   (canonical-unexecuted-finalized-chain {:blocks blocks
+                                          :finalized-blocks finalized-set
+                                          :executed-finalized-blocks executed
+                                          :latest-finalized-block-hash latest-hash})))
 
 (defn execute-finalized-blocks
   "Executes finalized Streamlet blocks along the canonical chain in ascending order.
@@ -1481,7 +1555,10 @@
         max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))]
     (reduce
      (fn [st b]
-       (let [b-hash (:hash b)
+       (let [st (if (:gap-jumped? b)
+                  (update-in st [:diagnostics :finalized-ancestor-gap-recovered] (fnil inc 0))
+                  st)
+             b-hash (:hash b)
              b-epoch (long (:epoch b))
              last-exec (long (or (:last-executed-finalized-epoch st) 0))
              closing-ep (max 0 (dec b-epoch))
@@ -2542,7 +2619,7 @@
                    :commands []})
                 {:state state :commands []}))))))))
 
-(defn- handle-release-intent
+(defn handle-release-intent
   "Handles request to release escrowed funds upon verified outcome or payer authorization."
   [state event]
   (if-not (or (nil? (:epoch event)) (integer? (:epoch event)))
@@ -2573,16 +2650,22 @@
           (if-not (or payer-auth? preimage-auth?)
             {:state state :commands []}
             (if (consensus-mode? state)
-              (let [rid (or (:receipt-id event) (str "release:" escrow-id))
-                    staged (stage-receipt state {:receipt-id rid
-                                                 :type :release-intent
-                                                 :escrow-id escrow-id
-                                                 :preimage preimage
-                                                 :payer-signature payer-sig
-                                                 :sender sender-hex})]
-                (if (:ok? staged)
-                  {:state (:state staged) :commands []}
-                  {:state state :commands []}))
+              (let [pending-receipts (or (:pending-receipts state) [])
+                    conflicting? (or (contains? (or (:known-receipt-ids state) #{}) (str "refund:" escrow-id))
+                                     (some (fn [r] (and (= (:type r) :refund-intent) (= (:escrow-id r) escrow-id))) pending-receipts))]
+                (if conflicting?
+                  {:state (update-in state [:diagnostics :conflicting-escrow-intent] (fnil inc 0))
+                   :commands []}
+                  (let [rid (or (:receipt-id event) (str "release:" escrow-id))
+                        staged (stage-receipt state {:receipt-id rid
+                                                     :type :release-intent
+                                                     :escrow-id escrow-id
+                                                     :preimage preimage
+                                                     :payer-signature payer-sig
+                                                     :sender sender-hex})]
+                    (if (:ok? staged)
+                      {:state (:state staged) :commands []}
+                      {:state state :commands []}))))
               (let [configured-bps (or (:settlement-take-bps state)
                                        (get-in state [:config :settlement-take-bps])
                                        burn/default-settlement-take-bps)
@@ -2634,14 +2717,20 @@
           (if-not (or timeout? receiver-voluntary?)
             {:state state :commands []}
             (if (consensus-mode? state)
-              (let [rid (or (:receipt-id event) (str "refund:" escrow-id))
-                    staged (stage-receipt state {:receipt-id rid
-                                                 :type :refund-intent
-                                                 :escrow-id escrow-id
-                                                 :sender sender-hex})]
-                (if (:ok? staged)
-                  {:state (:state staged) :commands []}
-                  {:state state :commands []}))
+              (let [pending-receipts (or (:pending-receipts state) [])
+                    conflicting? (or (contains? (or (:known-receipt-ids state) #{}) (str "release:" escrow-id))
+                                     (some (fn [r] (and (= (:type r) :release-intent) (= (:escrow-id r) escrow-id))) pending-receipts))]
+                (if conflicting?
+                  {:state (update-in state [:diagnostics :conflicting-escrow-intent] (fnil inc 0))
+                   :commands []}
+                  (let [rid (or (:receipt-id event) (str "refund:" escrow-id))
+                        staged (stage-receipt state {:receipt-id rid
+                                                     :type :refund-intent
+                                                     :escrow-id escrow-id
+                                                     :sender sender-hex})]
+                    (if (:ok? staged)
+                      {:state (:state staged) :commands []}
+                      {:state state :commands []}))))
               (let [payer-acct (get-in state [:ledger payer]
                                        (account/map->AccountState {:balance 0 :seq 0 :deps []}))
                     new-payer (assoc payer-acct :balance (+ (or (:balance payer-acct) 0) amount))

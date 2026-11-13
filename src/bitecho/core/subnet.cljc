@@ -16,6 +16,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
+            [clojure.set :as set]
             [clojure.string :as str]))
 
 (def ^:private bytes? fressian/bytes?)
@@ -192,7 +193,13 @@
               :heartbeat
               (let [from (:from event)]
                 (cond-> (assoc le-state :term base-term)
-                  from (assoc-in [:peers from] {:last-seen-ms t :connected? true})))
+                  from (update-in [:peers from]
+                                  (fn [pinfo]
+                                    (merge pinfo
+                                           {:last-seen-ms t
+                                            :connected? true
+                                            :leader-id remote-leader
+                                            :term remote-term})))))
 
               :peer-connected
               (let [pid (:peer-id event)]
@@ -208,15 +215,47 @@
               le-state)
         healthy (compute-healthy-nodes st1 t)
         prev-leader (:leader-id st1)
-        leader (elect-leader healthy (count (:all-nodes st1)))
+        all-nodes-set (set (:all-nodes st1))
+        adopt-higher? (and (= etype :heartbeat)
+                           (> remote-term local-term)
+                           remote-leader
+                           (contains? all-nodes-set remote-leader)
+                           (contains? healthy remote-leader))
+        has-quorum? (if (<= (count all-nodes-set) 1)
+                      (seq healthy)
+                      (>= (count healthy) 2))
+        valid-node-id? (fn [id] (or (string? id) (keyword? id)))
+        keep-incumbent? (and has-quorum?
+                             (or adopt-higher?
+                                 (and (= etype :heartbeat)
+                                      (= remote-term local-term)
+                                      (valid-node-id? remote-leader)
+                                      (= remote-leader prev-leader)
+                                      (contains? all-nodes-set remote-leader)
+                                      (contains? healthy remote-leader))
+                                 (and (:adopted-incumbent? st1)
+                                      (valid-node-id? prev-leader)
+                                      (contains? all-nodes-set prev-leader)
+                                      (contains? healthy prev-leader)
+                                      (< (count healthy) (count all-nodes-set)))))
+        leader (cond
+                 keep-incumbent? (if adopt-higher? remote-leader prev-leader)
+                 has-quorum? (elect-leader healthy (count (:all-nodes st1)))
+                 :else nil)
         leader-changed? (and (some? leader) (not= leader prev-leader))
-        adopted-remote-term? (and (= etype :heartbeat)
-                                  (> remote-term local-term)
-                                  (or (nil? remote-leader) (= remote-leader leader)))
+        adopted-remote-term? (or adopt-higher?
+                                 (and (= etype :heartbeat)
+                                      (> remote-term local-term)
+                                      (or (nil? remote-leader) (= remote-leader leader))))
         new-role (if (and leader (= leader (:node-id st1))) :leader :follower)
         new-term (if (and leader-changed? (not adopted-remote-term?))
                    (inc base-term)
                    base-term)
+        adopted-incumbent? (cond
+                             adopt-higher? true
+                             (or (not (contains? healthy prev-leader))
+                                 (= (count healthy) (count all-nodes-set))) false
+                             :else (boolean (:adopted-incumbent? st1)))
         effects (cond-> []
                   leader-changed?
                   (conj {:effect :leader-elected :leader-id leader :term new-term})
@@ -225,11 +264,14 @@
                          :from (:node-id st1)
                          :term new-term
                          :leader-id leader}))]
-    {:state (assoc st1
-                   :healthy-nodes healthy
-                   :leader-id leader
-                   :role new-role
-                   :term new-term)
+    {:state (cond-> (assoc st1
+                           :healthy-nodes healthy
+                           :leader-id leader
+                           :role new-role
+                           :term new-term
+                           :adopted-incumbent? adopted-incumbent?)
+              adopt-higher? (-> (assoc :last-heartbeat-ms t)
+                                (update-in [:diagnostics :adopted-higher-term-leader] (fnil inc 0))))
      :effects effects}))
 
 ;; =============================================================================
@@ -730,13 +772,42 @@
                                                :applied? false
                                                :error :invalid-policy-update
                                                :effects [diag]})
-                                            (let [new-anchors (set (map normalize-hex (get-in merged-pol [:subnet/gate :gate/trust-anchors] #{})))
+                                            (let [old-anchors (set (concat (map normalize-hex (get-in policy [:subnet/gate :gate/trust-anchors] #{}))
+                                                                           (map normalize-hex (get-in inst2 [:config :subnet/trust-anchors] #{}))))
+                                                  new-anchors (set (map normalize-hex (get-in merged-pol [:subnet/gate :gate/trust-anchors] #{})))
+                                                  removed-anchors (set/difference old-anchors new-anchors)
+                                                  evicted-cnt (count removed-anchors)
                                                   final-pol (cond-> merged-pol
                                                               (:subnet/genesis-policy-cid policy)
-                                                              (assoc :subnet/genesis-policy-cid (:subnet/genesis-policy-cid policy)))]
-                                              {:state (-> inst2
-                                                          (assoc :policy final-pol)
-                                                          (update :admitted-members into new-anchors))
+                                                              (assoc :subnet/genesis-policy-cid (:subnet/genesis-policy-cid policy)))
+                                                  updated-le (when-let [le (:leader-election inst2)]
+                                                               (let [cur-all (or (:all-nodes le) [])
+                                                                     updated-all (vec (distinct (into (vec (remove #(contains? removed-anchors %) cur-all)) new-anchors)))
+                                                                     updated-healthy (set/difference (set (:healthy-nodes le #{})) removed-anchors)
+                                                                     cur-node-id (:node-id le)
+                                                                     cur-peers (:peers le {})
+                                                                     peers-without-removed (reduce dissoc cur-peers removed-anchors)
+                                                                     new-peer-ids (remove #(= % cur-node-id) new-anchors)
+                                                                     updated-peers (reduce (fn [p nid]
+                                                                                             (if (contains? p nid)
+                                                                                               p
+                                                                                               (assoc p nid {:last-seen-ms nil :connected? false})))
+                                                                                           peers-without-removed
+                                                                                           new-peer-ids)
+                                                                     revoked-leader? (contains? removed-anchors (:leader-id le))]
+                                                                 (cond-> le
+                                                                   true (assoc :all-nodes updated-all
+                                                                               :healthy-nodes updated-healthy
+                                                                               :peers updated-peers)
+                                                                   revoked-leader? (assoc :leader-id nil :role :follower))))]
+                                              {:state (cond-> (-> inst2
+                                                                  (assoc :policy final-pol)
+                                                                  (update :admitted-members (fn [m]
+                                                                                              (-> (or m #{})
+                                                                                                  (set/difference removed-anchors)
+                                                                                                  (into new-anchors)))))
+                                                        updated-le (assoc :leader-election updated-le)
+                                                        (pos? evicted-cnt) (update-in [:diagnostics :revoked-trust-anchors-evicted] (fnil + 0) evicted-cnt))
                                                :applied? true
                                                :effects [{:effect :policy-updated :subnet sid :seq (:pointer/seq valid-ptr)}]}))))))))))))))
 

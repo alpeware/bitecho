@@ -107,6 +107,7 @@
   "Calculates the length of the chain ending at block-hash.
    Guards against cycles using a visited set: returns -1 if a cycle is detected,
    indicating an invalid cyclic chain.
+   Returns -1 if chain terminates at an unknown/unrooted parent (orphan fragment).
    Optional 3-arity accepts block-depths map for O(1) cached lookups."
   ([blocks block-hash]
    (chain-length blocks block-hash nil))
@@ -122,10 +123,10 @@
          (if (>= d 0) (+ d len) -1))
        :else (if-let [block (get blocks curr)]
                (recur (:parent-hash block) (conj visited curr) (inc len))
-               len)))))
+               -1)))))
 
 (defn record-block-depth
-  "Records the chain depth of block-hash in (:block-depths state) if it roots to genesis.
+  "Records the chain depth of block-hash in (:block-depths state) if it roots to genesis or an executed root.
    If parent-hash is genesis, depth is 1.
    If parent-hash has a cached depth d, depth is (inc d).
    Otherwise walks ancestors in :blocks; if walk reaches genesis or a cached depth,
@@ -133,7 +134,8 @@
    Does not cache depths for unrooted orphan chains or cyclic chains."
   [state block-hash]
   (let [blocks (:blocks state)
-        depths (get state :block-depths {})]
+        depths (get state :block-depths {})
+        executed-roots (or (:executed-finalized-blocks state) #{})]
     (cond
       (or (nil? block-hash) (= block-hash "genesis") (contains? depths block-hash))
       state
@@ -144,6 +146,12 @@
           (cond
             (= p-hash "genesis")
             (assoc-in state [:block-depths block-hash] 1)
+
+            (contains? executed-roots p-hash)
+            (let [d (max 1 (long (or (:last-executed-finalized-epoch state) 1)))]
+              (-> state
+                  (assoc-in [:block-depths p-hash] d)
+                  (assoc-in [:block-depths block-hash] (inc d))))
 
             (and (contains? depths p-hash) (pos? (long (get depths p-hash 0))))
             (assoc-in state [:block-depths block-hash] (inc (long (get depths p-hash))))
@@ -156,6 +164,12 @@
                 (= curr "genesis")
                 (let [path-rev (vec (rseq path))
                       new-depths (into {} (map-indexed (fn [idx h] [h (inc idx)]) path-rev))]
+                  (update state :block-depths (fnil merge {}) new-depths))
+
+                (contains? executed-roots curr)
+                (let [d (max 1 (long (or (:last-executed-finalized-epoch state) 1)))
+                      path-rev (vec (rseq path))
+                      new-depths (into {curr d} (map-indexed (fn [idx h] [h (+ d (inc idx))]) path-rev))]
                   (update state :block-depths (fnil merge {}) new-depths))
 
                 (contains? visited curr)
@@ -223,19 +237,30 @@
 
 (defn accumulate-vote
   "Validates a vote and accumulates it into the block's vote set.
+   Rejects Byzantine vote equivocations where a validator votes for two distinct blocks in the same epoch.
    If the accumulated valid votes reach the 2n/3 threshold, adds the block to the :notarized-blocks set."
   [state vote voter-pubkey-bytes n]
   (let [b-hash (when (map? vote) (:block-hash vote))]
     (if (and b-hash (verify-vote-signature vote voter-pubkey-bytes))
       (let [pubkey-hex (bytes->hex voter-pubkey-bytes)
-            current-votes (get-in state [:block-votes b-hash] #{})
-            new-votes (conj current-votes pubkey-hex)
-            state-with-vote (-> state
-                                (assoc-in [:block-votes b-hash] new-votes)
-                                (assoc-in [:block-vote-proofs b-hash pubkey-hex] vote))]
-        (if (>= (count new-votes) (quorum-threshold n))
-          (update state-with-vote :notarized-blocks (fnil conj #{}) b-hash)
-          state-with-vote))
+            v-epoch (or (:epoch vote) (get-in state [:blocks b-hash :epoch]))
+            prev-b-hash (when v-epoch (get-in state [:epoch-voters v-epoch pubkey-hex]))]
+        (if (and prev-b-hash (not= prev-b-hash b-hash))
+          ;; JEP-01: Reject Byzantine vote equivocation fail-closed
+          (-> state
+              (update-in [:diagnostics :vote-equivocations] (fnil inc 0))
+              (update :equivocated-voters (fnil conj #{}) pubkey-hex))
+          (let [current-votes (get-in state [:block-votes b-hash] #{})
+                new-votes (conj current-votes pubkey-hex)
+                state-with-voter (if v-epoch
+                                   (assoc-in state [:epoch-voters v-epoch pubkey-hex] b-hash)
+                                   state)
+                state-with-vote (-> state-with-voter
+                                    (assoc-in [:block-votes b-hash] new-votes)
+                                    (assoc-in [:block-vote-proofs b-hash pubkey-hex] vote))]
+            (if (>= (count new-votes) (quorum-threshold n))
+              (update state-with-vote :notarized-blocks (fnil conj #{}) b-hash)
+              state-with-vote))))
       state)))
 
 (defn get-ancestors
@@ -398,10 +423,14 @@
                                                     (not (contains? protected-hashes h)))
                                            h)))
                                  blocks)
-            voted-epochs (into #{} (filter #(>= (long %) cutoff)) (get state-with-depths :voted-epochs #{}))]
+            voted-epochs (into #{} (filter #(>= (long %) cutoff)) (get state-with-depths :voted-epochs #{}))
+            epoch-voters (into {} (filter (fn [[ep _]] (>= (long ep) cutoff))) (get state-with-depths :epoch-voters {}))]
         (if (empty? expired-hashes)
-          (assoc state-with-depths :voted-epochs voted-epochs)
-          (let [notarized (get state-with-depths :notarized-blocks #{})
+          (assoc state-with-depths :voted-epochs voted-epochs :epoch-voters epoch-voters)
+          (let [retained-blocks (reduce dissoc blocks expired-hashes)
+                parent-boundary-hashes (set (keep :parent-hash (vals retained-blocks)))
+                expired-depth-hashes (set/difference expired-hashes parent-boundary-hashes)
+                notarized (get state-with-depths :notarized-blocks #{})
                 finalized (get state-with-depths :finalized-blocks #{})
                 pruned-notarized (count (set/intersection notarized expired-hashes))
                 pruned-finalized (count (set/intersection finalized expired-hashes))
@@ -413,8 +442,9 @@
                 (update :finalized-blocks #(set/difference (or % #{}) expired-hashes))
                 (update :block-votes #(reduce dissoc (or % {}) expired-hashes))
                 (update :block-vote-proofs #(reduce dissoc (or % {}) expired-hashes))
-                (update :block-depths #(reduce dissoc (or % {}) expired-hashes))
+                (update :block-depths #(reduce dissoc (or % {}) expired-depth-hashes))
                 (assoc :voted-epochs voted-epochs
+                       :epoch-voters epoch-voters
                        :pruned-notarized-count cum-pruned-notarized
                        :pruned-finalized-count cum-pruned-finalized))))))))
 
@@ -634,10 +664,16 @@
               (let [res (verify-ancestor-quorum s entry)]
                 (if (:valid? res)
                   (let [b-hash (:b-hash res)
-                        block (:block res)]
-                    (-> s
-                        (assoc-in [:blocks b-hash] block)
-                        (record-block-depth b-hash)
+                        block (:block res)
+                        s-with-depth (-> s
+                                         (assoc-in [:blocks b-hash] block)
+                                         (record-block-depth b-hash))
+                        s-anchored (if (not (contains? (:block-depths s-with-depth) b-hash))
+                                     (-> s-with-depth
+                                         (assoc-in [:block-depths (:parent-hash block)] (max 1 (dec (long (:epoch block 1)))))
+                                         (assoc-in [:block-depths b-hash] (max 1 (long (:epoch block 1)))))
+                                     s-with-depth)]
+                    (-> s-anchored
                         (update-in [:block-votes b-hash] (fnil into #{}) (:voter-set res))
                         (update-in [:block-vote-proofs b-hash] merge (:vote-proofs res))
                         (update :notarized-blocks (fnil conj #{}) b-hash)

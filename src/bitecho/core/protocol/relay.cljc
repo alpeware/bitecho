@@ -600,9 +600,19 @@
                             cur-inboxes (get capped-st :inboxes {})
                             inboxes-full? (and (not (contains? cur-inboxes recipient))
                                                (>= (count cur-inboxes) max-recipients))
-                            pruned-inboxes (if inboxes-full?
-                                             (dissoc cur-inboxes (first (keys cur-inboxes)))
+                            victim-recipient (when inboxes-full?
+                                               (first (first (sort-by (fn [[k v]]
+                                                                        [(or (:relay-seq (if (map? v) (first (:queue v)) (first v)))
+                                                                             (:relay_seq (if (map? v) (first (:queue v)) (first v)))
+                                                                             #?(:clj Long/MAX_VALUE :cljs 9007199254740991))
+                                                                         (str k)])
+                                                                      cur-inboxes))))
+                            pruned-inboxes (if (and inboxes-full? victim-recipient)
+                                             (dissoc cur-inboxes victim-recipient)
                                              cur-inboxes)
+                            inbox-evict-effects (if (and inboxes-full? victim-recipient)
+                                                  [{:effect :diagnose :reason :inbox-evicted :recipient victim-recipient}]
+                                                  [])
                             existing-inbox (filterv (fn [e] (>= (long (:received-at e 0)) cutoff-ms))
                                                     (get pruned-inboxes recipient []))
                             new-entry {:relay-seq next-seq
@@ -629,6 +639,7 @@
                                        (assoc-in [:inbox-seqs recipient] next-seq)
                                        (update-in [:diagnostics :submitted] (fnil inc 0))
                                        (update-in [:diagnostics :delivered] (fnil inc 0))
+                                       (cond-> inboxes-full? (update-in [:diagnostics :evicted-recipient-inboxes] (fnil inc 0)))
                                        (cond-> (pos? evicted-count) (update-in [:diagnostics :evicted] (fnil + 0) evicted-count)))
                             eff {:effect :forward-to-validators
                                  :envelope decoded
@@ -642,7 +653,7 @@
                          :duplicate? false
                          :envelope-id envelope-id
                          :response {"ok" true "envelope_id" envelope-id "seq" next-seq "recipient" recipient "broadcast" false "status" "accepted"}
-                         :effects (into (vec cap-effects) (if from-val? [] [eff]))})))))))))
+                         :effects (into (into (vec cap-effects) inbox-evict-effects) (if from-val? [] [eff]))})))))))))
 
       :relay-poll
       (let [v (verify-poll-request state event)]
@@ -728,3 +739,10 @@
          :error :unknown-relay-event
          :response {"ok" false "error" "unknown-relay-event"}
          :effects [diag]}))))
+
+(defn submit-envelope
+  "Submits an envelope into relay state using `reduce-relay` `:relay-submit`."
+  ([state event]
+   (reduce-relay state (assoc event :type :relay-submit)))
+  ([state envelope now-ms]
+   (reduce-relay state {:type :relay-submit :envelope envelope :now-ms now-ms})))

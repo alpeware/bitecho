@@ -247,3 +247,20 @@
                             (recur w' t s))
                           false))
                       true)))))
+
+;; =============================================================================
+;; 7. Jepsen Campaign Bug-Hunt Verification (JEP-01..JEP-12)
+;; =============================================================================
+
+(deftest test-jepsen-bug-hunting-campaign
+  (testing "D14 Jepsen Bug-Hunt campaign: all 12 production bugs (JEP-01..JEP-12) remediated and mutants caught"
+    (let [res (vopr/run-jepsen-campaign {:seed 20261113})]
+      (is (true? (:ok? res)))
+      (is (= 12 (:remediated-count res)))
+      (doseq [jep [:JEP-01 :JEP-02 :JEP-03 :JEP-04 :JEP-05 :JEP-06
+                   :JEP-07 :JEP-08 :JEP-09 :JEP-10 :JEP-11 :JEP-12]]
+        (let [bug (get-in res [:results jep])]
+          (is (some? bug) (str "Missing result for bug " jep))
+          (is (true? (:remediated-valid? bug)) (str "Bug " jep " failed remediated check: " bug))
+          (is (true? (:pre-fix-caught? bug)) (str "Bug " jep " failed pre-fix caught check: " bug))
+          (is (true? (:bug-reproduced? bug)) (str "Bug " jep " failed reproduction: " bug)))))))

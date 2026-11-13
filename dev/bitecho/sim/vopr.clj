@@ -12,14 +12,17 @@
        3. Tokenomics v2.1 Conservation & Deflation Fold
    - Active Byzantine Equivocation Nemesis (f < n/3)
    - Zero-pollution non-vacuity mutation testing gate (MUT-01..MUT-08 via with-redefs)"
-  (:require [bitecho.config :as config]
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.core.data :as data]
+            [bitecho.core.protocol.relay :as relay]
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.treasury :as treasury]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-node]
+            [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.browser :as browser]
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
@@ -1184,3 +1187,624 @@
       nil)
 
     @results))
+
+;; =============================================================================
+;; 7. Jepsen Campaign Remediation Verification Suite (JEP-01..JEP-12)
+;; =============================================================================
+
+(defn- verify-jepsen-bug
+  [jep-id bug-name scenario-fn mutated-runner-fn]
+  (let [m (verify-mutant-killed jep-id scenario-fn mutated-runner-fn)]
+    {:id jep-id
+     :name bug-name
+     :remediated-valid? (:baseline-valid? m)
+     :pre-fix-caught? (:caught? m)
+     :bug-reproduced? (:caught? m)
+     :baseline (:baseline m)
+     :mutated (:mutated m)}))
+
+(defn run-jepsen-campaign
+  "Executes the D14 Jepsen Bug-Hunt campaign covering all 12 production bugs (JEP-01..JEP-12).
+   For each bug, runs both the remediated code and a pre-fix mutant to verify:
+   - :remediated-valid? true
+   - :pre-fix-caught? true
+   - :bug-reproduced? true"
+  [& [{:keys [seed] :or {seed 20261113}}]]
+  (let [results (atom {})]
+
+    ;; JEP-01: Byzantine Vote Equivocation in accumulate-vote
+    (let [kp (crypto/generate-keypair)
+          pub (:public kp)
+          pub-hex (streamlet/bytes->hex pub)
+          priv (:private kp)
+          b1 {:epoch 1 :parent-hash "genesis"}
+          b2 {:epoch 1 :parent-hash "genesis"}
+          b1-hash "b1-hash-1111"
+          b2-hash "b2-hash-2222"
+          sig1 (crypto/sign priv (fressian/utf8->bytes b1-hash))
+          sig2 (crypto/sign priv (fressian/utf8->bytes b2-hash))
+          v1 (streamlet/->Vote b1-hash 1 (streamlet/bytes->hex sig1))
+          v2 (streamlet/->Vote b2-hash 1 (streamlet/bytes->hex sig2))
+          st0 {:blocks {b1-hash b1 b2-hash b2}
+               :peers-map {pub-hex pub}
+               :block-votes {}
+               :diagnostics {}}
+          scenario-01
+          (fn []
+            (let [st (-> st0
+                         (streamlet/accumulate-vote v1 pub 1)
+                         (streamlet/accumulate-vote v2 pub 1))
+                  notarized-cnt (+ (if (contains? (:notarized-blocks st) b1-hash) 1 0)
+                                   (if (contains? (:notarized-blocks st) b2-hash) 1 0))]
+              {:valid? (and (< notarized-cnt 2)
+                            (= 1 (get-in st [:diagnostics :vote-equivocations]))
+                            (contains? (:equivocated-voters st) pub-hex))
+               :notarized-count notarized-cnt}))
+          mutated-01
+          (fn [sc-fn]
+            (with-redefs [streamlet/accumulate-vote
+                          (fn [state vote voter-pubkey-bytes n]
+                            (let [b-hash (when (map? vote) (:block-hash vote))]
+                              (if (and b-hash (streamlet/verify-vote-signature vote voter-pubkey-bytes))
+                                (let [pubkey-hex (streamlet/bytes->hex voter-pubkey-bytes)
+                                      current-votes (get-in state [:block-votes b-hash] #{})
+                                      new-votes (conj current-votes pubkey-hex)
+                                      state-with-vote (-> state
+                                                          (assoc-in [:block-votes b-hash] new-votes)
+                                                          (assoc-in [:block-vote-proofs b-hash pubkey-hex] vote))]
+                                  (if (>= (count new-votes) (streamlet/quorum-threshold n))
+                                    (update state-with-vote :notarized-blocks (fnil conj #{}) b-hash)
+                                    state-with-vote))
+                                state)))]
+              (sc-fn)))]
+      (swap! results assoc :JEP-01 (verify-jepsen-bug :JEP-01 "streamlet/equivocation-rejection" scenario-01 mutated-01)))
+
+    ;; JEP-02: Orphan detection in chain-length & parent boundary depth retention
+    (let [orphan-blocks {"orphan-2" {:epoch 2 :parent-hash "orphan-1"}}
+          st-prune {:blocks {"b1" {:epoch 1 :parent-hash "genesis"}
+                             "b2" {:epoch 2 :parent-hash "b1"}}
+                    :notarized-blocks #{"b1" "b2"}
+                    :finalized-blocks #{"b2"}
+                    :executed-finalized-blocks #{"genesis"}
+                    :head-hash "b2"
+                    :epoch 100
+                    :streamlet-retention-epochs 10}
+          kp (crypto/generate-keypair)
+          pub-bytes (:public kp)
+          pub-hex (streamlet/bytes->hex pub-bytes)
+          priv (:private kp)
+          raw-gap (streamlet/->Block 10 "gap-parent" [] pub-hex)
+          gap-block (streamlet/sign-block raw-gap priv)
+          gap-hash (streamlet/hash-block gap-block)
+          vote-sig (crypto/sign priv (fressian/utf8->bytes gap-hash))
+          gap-vote (streamlet/->Vote gap-hash 10 (streamlet/bytes->hex vote-sig))
+          gap-bundle [{:block gap-block :votes {pub-hex gap-vote}}]
+          init-st {:peers-map {pub-hex pub-bytes}
+                   :epoch 1
+                   :blocks {}
+                   :block-depths {}}
+          scenario-02
+          (fn []
+            (let [orphan-len (streamlet/chain-length orphan-blocks "orphan-2" {})
+                  orphan-ok? (= -1 orphan-len)
+                  pruned (streamlet/prune-streamlet-state st-prune)
+                  pruned-len (streamlet/chain-length (:blocks pruned) "b2" (:block-depths pruned))
+                  pruned-ok? (pos? (long pruned-len))
+                  ingested (streamlet/ingest-verified-ancestors init-st gap-bundle)
+                  gap-len (streamlet/chain-length (:blocks ingested) gap-hash (:block-depths ingested))
+                  gap-ok? (pos? (long gap-len))]
+              {:valid? (boolean (and orphan-ok? pruned-ok? gap-ok?))
+               :orphan-len orphan-len
+               :pruned-len pruned-len
+               :gap-len gap-len}))
+          mutated-02
+          (fn [sc-fn]
+            (with-redefs [streamlet/chain-length
+                          (fn
+                            ([blks b-hash] (streamlet/chain-length blks b-hash nil))
+                            ([blks b-hash _depths]
+                             (loop [curr b-hash visited #{} len 0]
+                               (cond
+                                 (= curr "genesis") len
+                                 (contains? visited curr) -1
+                                 :else (if-let [b (get blks curr)]
+                                         (recur (:parent-hash b) (conj visited curr) (inc len))
+                                         (inc len))))))]
+              (sc-fn)))]
+      (swap! results assoc :JEP-02 (verify-jepsen-bug :JEP-02 "streamlet/orphan-chain-detection" scenario-02 mutated-02)))
+
+    ;; JEP-03: Finalized ancestor gap recovery in canonical-unexecuted-finalized-chain
+    (let [kp (crypto/generate-keypair)
+          pub-bytes (:public kp)
+          pub-hex (streamlet/bytes->hex pub-bytes)
+          priv (:private kp)
+          raw1 (streamlet/->Block 50 "gap-parent" [] pub-hex)
+          b1 (streamlet/sign-block raw1 priv)
+          b1-hash (streamlet/hash-block b1)
+          raw2 (streamlet/->Block 51 b1-hash [] pub-hex)
+          b2 (streamlet/sign-block raw2 priv)
+          b2-hash (streamlet/hash-block b2)
+          raw3 (streamlet/->Block 52 b2-hash [] pub-hex)
+          b3 (streamlet/sign-block raw3 priv)
+          b3-hash (streamlet/hash-block b3)
+          v1-sig (crypto/sign priv (fressian/utf8->bytes b1-hash))
+          v2-sig (crypto/sign priv (fressian/utf8->bytes b2-hash))
+          v3-sig (crypto/sign priv (fressian/utf8->bytes b3-hash))
+          v1 (streamlet/->Vote b1-hash 50 (streamlet/bytes->hex v1-sig))
+          v2 (streamlet/->Vote b2-hash 51 (streamlet/bytes->hex v2-sig))
+          v3 (streamlet/->Vote b3-hash 52 (streamlet/bytes->hex v3-sig))
+          bundle [{:block b1 :votes {pub-hex v1}}
+                  {:block b2 :votes {pub-hex v2}}
+                  {:block b3 :votes {pub-hex v3}}]
+          st-init {:peers-map {pub-hex pub-bytes}
+                   :epoch 1
+                   :last-executed-finalized-epoch 0
+                   :config {:max-ancestor-sync-depth 16}
+                   :blocks {}
+                   :block-depths {}}
+          scenario-03
+          (fn []
+            (let [st-ingested (streamlet/ingest-verified-ancestors st-init bundle)
+                  st-finalized (-> (streamlet/finalize-prefix st-ingested)
+                                   (assoc :latest-finalized-block-hash b1-hash))
+                  st-exec (sm/execute-finalized-blocks st-finalized)
+                  gap-recov (get-in st-exec [:diagnostics :finalized-ancestor-gap-recovered] 0)
+                  exec-set (:executed-finalized-blocks st-exec)]
+              {:valid? (boolean (and (pos? (long gap-recov))
+                                     (contains? exec-set b1-hash)))
+               :gap-recovered gap-recov
+               :executed-finalized exec-set}))
+          mutated-03
+          (fn [sc-fn]
+            (with-redefs [sm/canonical-unexecuted-finalized-chain
+                          (fn [& _] [])]
+              (sc-fn)))]
+      (swap! results assoc :JEP-03 (verify-jepsen-bug :JEP-03 "state-machine/finalized-ancestor-gap-recovery" scenario-03 mutated-03)))
+
+    ;; JEP-04: SMR divergence on t-priv in apply-epoch-treasury-boundary
+    (let [kp (crypto/generate-keypair)
+          pub (streamlet/bytes->hex (:public kp))
+          t-kp (crypto/generate-keypair)
+          t-pub (streamlet/bytes->hex (:public t-kp))
+          t-priv (:private t-kp)
+          base-st {:epoch 1
+                   :validators [pub]
+                   :ledger {pub {:balance 1000}}
+                   :treasury-pubkey t-pub
+                   :epoch-burns {1 10000000}
+                   :config {:treasury-trailing-epochs 1}
+                   :mint-dust 0
+                   :total-minted 0
+                   :unclaimed-mint 0}
+          leader-st (assoc base-st :treasury-privkey t-priv)
+          follower-st (assoc base-st :treasury-privkey nil)
+          scenario-04
+          (fn []
+            (let [res-leader (sm/apply-epoch-treasury-boundary leader-st 2)
+                  res-follower (sm/apply-epoch-treasury-boundary follower-st 2)
+                  ledger-lead (:ledger res-leader)
+                  ledger-foll (:ledger res-follower)
+                  mints-lead (:total-minted res-leader 0)
+                  mints-foll (:total-minted res-follower 0)
+                  converged? (and (= ledger-lead ledger-foll)
+                                  (= mints-lead mints-foll)
+                                  (pos? (long mints-lead))
+                                  (> (long (get-in res-leader [:ledger pub :balance] 0)) 1000))]
+              {:valid? (boolean converged?)
+               :leader-minted mints-lead
+               :follower-minted mints-foll}))
+          mutated-04
+          (fn [sc-fn]
+            (let [orig-apply sm/apply-epoch-treasury-boundary]
+              (with-redefs [sm/apply-epoch-treasury-boundary
+                            (fn [st ep]
+                              (if (nil? (:treasury-privkey st))
+                                st
+                                (orig-apply st ep)))]
+                (sc-fn))))]
+      (swap! results assoc :JEP-04 (verify-jepsen-bug :JEP-04 "state-machine/treasury-smr-follower-minting" scenario-04 mutated-04)))
+
+    ;; JEP-05: Sunset custody burn conservation in burn-unspent-bootstrap-custody & process-treasury-epoch
+    (let [cust-kp (crypto/generate-keypair)
+          cust-pub (streamlet/bytes->hex (:public cust-kp))
+          init-custody 5000000000
+          base-st {:epoch 100
+                   :bootstrap-sunset-epoch 100
+                   :custody-pubkey cust-pub
+                   :initial-custody init-custody
+                   :ledger {cust-pub {:balance init-custody}}
+                   :sunset-custody-burned 0
+                   :total-minted 0
+                   :trailing-burns [0]}
+          scenario-05
+          (fn []
+            (let [st' (sm/apply-epoch-treasury-boundary base-st 100)
+                  world {:nodes {"node1" {:state st'}}}
+                  conservation-res (check-tokenomics-conservation world)]
+              {:valid? (boolean (and (:valid? conservation-res)
+                                     (= init-custody (long (:sunset-custody-burned st' 0)))
+                                     (= 0 (long (get-in st' [:ledger cust-pub :balance] 0)))))
+               :conservation conservation-res}))
+          mutated-05
+          (fn [sc-fn]
+            (let [orig-proc treasury/process-treasury-epoch]
+              (with-redefs [treasury/process-treasury-epoch
+                            (fn [ctx]
+                              (let [res (orig-proc ctx)]
+                                (assoc res :sunset-custody-burned 0)))]
+                (sc-fn))))]
+      (swap! results assoc :JEP-05 (verify-jepsen-bug :JEP-05 "treasury/sunset-custody-burned-conservation" scenario-05 mutated-05)))
+
+    ;; JEP-06: Preserve carry-dust when pool share rounds to zero in process-treasury-epoch
+    (let [v1 "v1" v2 "v2" v3 "v3" v4 "v4"
+          base-st {:validators [v1 v2 v3 v4]
+                   :mesh-nodes []
+                   :mint-dust 3
+                   :total-minted 0
+                   :epoch 1
+                   :trailing-burns [0]
+                   :treasury-pubkey "t-pub"}
+          scenario-06
+          (fn []
+            (let [st' (with-redefs [treasury/split-mint (constantly {:streamlet 3 :mesh 0})]
+                        (sm/apply-epoch-treasury-boundary base-st 2))
+                  dust (long (:mint-dust st' 0))
+                  unclaimed (long (:unclaimed-mint st' 0))]
+              {:valid? (boolean (and (> dust 0) (= unclaimed 0)))
+               :mint-dust dust
+               :unclaimed-mint unclaimed}))
+          mutated-06
+          (fn [sc-fn]
+            (let [orig-proc treasury/process-treasury-epoch]
+              (with-redefs [treasury/process-treasury-epoch
+                            (fn [ctx]
+                              (let [res (orig-proc ctx)]
+                                (assoc res :mint-dust 0 :unclaimed-mint (or (:mint-dust res) 3))))]
+                (sc-fn))))]
+      (swap! results assoc :JEP-06 (verify-jepsen-bug :JEP-06 "treasury/carry-dust-preservation" scenario-06 mutated-06)))
+
+    ;; JEP-07: Multi-intent double-spend isolation across vouchers & escrows
+    (let [callee-kp (crypto/generate-keypair)
+          callee (basalt/bytes->hex (:public callee-kp))
+          priv (:private callee-kp)
+          caller "caller-node"
+          home-node "home-1"
+          ack (rendezvous/create-delivery-ack priv callee home-node 1 "offer-1" 1 80)
+          voucher-rcpt {:receipt-id "voucher-rcpt-1"
+                        :type :voucher
+                        :callee callee
+                        :caller caller
+                        :home-node home-node
+                        :epoch 1
+                        :seq 1
+                        :cumulative-debit 80
+                        :ack ack}
+          block-1 {:epoch 1
+                   :parent-hash "genesis"
+                   :hash "b-voucher-1"
+                   :payload [voucher-rcpt]}
+          st0 {:blocks {"b-voucher-1" block-1}
+               :finalized-blocks #{"genesis" "b-voucher-1"}
+               :executed-finalized-blocks #{"genesis"}
+               :latest-finalized-block-hash "b-voucher-1"
+               :peers-map {"p1" {:ip "127.0.0.1"}}
+               :home-sets {[callee 1] {:candidates [{:node-id home-node}] :price 80 :status :registered}}
+               :ledger {callee {:balance 100}}
+               :pending-receipts []
+               :pending-vouchers []}
+          scenario-07
+          (fn []
+            (let [st-exec (sm/execute-finalized-blocks st0)
+                  settle-ev {:type :settle-intent :payer callee :receiver "other-node" :amount 50}
+                  r-intent (sm/handle-event st-exec settle-ev)
+                  st-after (:state r-intent)
+                  vouchers-cnt (count (:pending-vouchers st-after))
+                  receipts-cnt (count (:pending-receipts st-after))
+                  double-spend-rejected? (and (= 1 vouchers-cnt)
+                                              (= 0 receipts-cnt))]
+              {:valid? (boolean double-spend-rejected?)
+               :pending-vouchers vouchers-cnt
+               :pending-receipts receipts-cnt}))
+          mutated-07
+          (fn [sc-fn]
+            (with-redefs [sm/spendable-balance
+                          (fn [st pk]
+                            (long (or (get-in st [:ledger pk :balance]) 0)))]
+              (sc-fn)))]
+      (swap! results assoc :JEP-07 (verify-jepsen-bug :JEP-07 "state-machine/multi-intent-double-spend-isolation" scenario-07 mutated-07)))
+
+    ;; JEP-08: Pointer lexicographic canonical sort tuple [term seq target sig]
+    (let [kp (crypto/generate-keypair)
+          pub (streamlet/bytes->hex (:public kp))
+          priv (:private kp)
+          k ["sub1" "test"]
+          ctx {:path-acl [{:pattern "test" :principal {:type :pubkey :pubkey pub}}]}
+          p1 (data/sign-pointer priv {:pointer/authority pub
+                                      :pointer/subnet "sub1"
+                                      :pointer/path "test"
+                                      :pointer/leader-term 1
+                                      :pointer/seq 1
+                                      :pointer/target "alpha"
+                                      :pointer/proof {:proof/type :self}})
+          p2 (data/sign-pointer priv {:pointer/authority pub
+                                      :pointer/subnet "sub1"
+                                      :pointer/path "test"
+                                      :pointer/leader-term 1
+                                      :pointer/seq 1
+                                      :pointer/target "beta"
+                                      :pointer/proof {:proof/type :self}})
+          scenario-08
+          (fn []
+            (let [node-a (-> (data/init-data-state {})
+                             (data/apply-pointer p1 ctx)
+                             :state
+                             (data/apply-pointer p2 ctx)
+                             :state)
+                  node-b (-> (data/init-data-state {})
+                             (data/apply-pointer p2 ctx)
+                             :state
+                             (data/apply-pointer p1 ctx)
+                             :state)
+                  ptr-a (get-in node-a [:pointers k])
+                  ptr-b (get-in node-b [:pointers k])
+                  converged? (and (some? ptr-a)
+                                  (some? ptr-b)
+                                  (= ptr-a ptr-b))]
+              {:valid? (boolean converged?)
+               :ptr-a ptr-a
+               :ptr-b ptr-b}))
+          mutated-08
+          (fn [sc-fn]
+            (with-redefs [data/pointer-order-tuple
+                          (fn [p] [(long (or (:pointer/leader-term p) 0))
+                                   (long (or (:pointer/seq p) 0))])]
+              (sc-fn)))]
+      (swap! results assoc :JEP-08 (verify-jepsen-bug :JEP-08 "data/pointer-canonical-sort-tuple" scenario-08 mutated-08)))
+
+    ;; JEP-09: Subnet leader election multi-leader convergence on higher-term heartbeat
+    (let [pol {:subnet/id "infra"
+               :subnet/parent-id "global"
+               :subnet/gate {:gate/mode :permissioned
+                             :gate/admission :allowlist
+                             :gate/trust-anchors #{"node1" "node2" "node3"}}
+               :subnet/replication {:replication/pointers :leader-election :replication/blobs :eager-push}
+               :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}}
+          gen-cid (subnet/policy-cid pol)
+          policy-v1 (assoc pol :subnet/genesis-policy-cid gen-cid)
+          inst0 (:instance (subnet/init-subnet-instance policy-v1 {:node-id "node1"
+                                                                   :all-nodes #{"node1" "node2" "node3"}
+                                                                   :now-ms 1000}))
+          st0 (assoc-in inst0 [:leader-election]
+                        {:node-id "node1"
+                         :term 1
+                         :leader-id "node1"
+                         :role :leader
+                         :all-nodes #{"node1" "node2" "node3"}
+                         :healthy-nodes #{"node1" "node2"}
+                         :peers {"node2" {:last-seen-ms 1000 :connected? true}
+                                 "node3" {:last-seen-ms nil :connected? false}}
+                         :heartbeat-timeout-ms 6000})
+          hb1 {:type :leader-heartbeat :from "node2" :term 5 :leader-id "node2" :now-ms 1000}
+          tick-ev {:type :leader-tick :now-ms 1100}
+          hb2 {:type :leader-heartbeat :from "node2" :term 5 :leader-id "node2" :now-ms 1200}
+          scenario-09
+          (fn []
+            (let [r1 (subnet/reduce-subnet st0 hb1)
+                  st1 (:state r1)
+                  r2 (subnet/reduce-subnet st1 tick-ev)
+                  st2 (:state r2)
+                  r3 (subnet/reduce-subnet st2 hb2)
+                  st3 (:state r3)
+                  le1 (:leader-election st1)
+                  le2 (:leader-election st2)
+                  le3 (:leader-election st3)
+                  ok? (and (= "node2" (:leader-id le1))
+                           (= 5 (:term le1))
+                           (= :follower (:role le1))
+                           (= "node2" (:leader-id le2))
+                           (= 5 (:term le2))
+                           (= :follower (:role le2))
+                           (= "node2" (:leader-id le3))
+                           (= 5 (:term le3))
+                           (= :follower (:role le3)))]
+              {:valid? (boolean ok?)
+               :le1 le1
+               :le2 le2
+               :le3 le3}))
+          mutated-09
+          (fn [sc-fn]
+            (let [orig-step subnet/step-leader-election]
+              (with-redefs [subnet/step-leader-election
+                            (fn [s ev now]
+                              (if (= (:type ev) :tick)
+                                {:state (assoc s :term (inc (long (:term s 0)))
+                                               :leader-id (:node-id s)
+                                               :role :leader)
+                                 :effects []}
+                                (orig-step s ev now)))]
+                (sc-fn))))]
+      (swap! results assoc :JEP-09 (verify-jepsen-bug :JEP-09 "subnet/higher-term-leader-convergence" scenario-09 mutated-09)))
+
+    ;; JEP-10: Dynamic trust-anchor revocation in reduce-subnet
+    (let [kp-a1 (crypto/generate-keypair)
+          kp-a2 (crypto/generate-keypair)
+          a1 (basalt/bytes->hex (:public kp-a1))
+          a2 (basalt/bytes->hex (:public kp-a2))
+          base-pol {:subnet/id "infra-10"
+                    :subnet/parent-id "global"
+                    :subnet/gate {:gate/mode :permissioned
+                                  :gate/admission :allowlist
+                                  :gate/trust-anchors #{a1 a2}
+                                  :gate/governance {:governance/type :quorum
+                                                    :threshold 1}}
+                    :subnet/path-acl [{:pattern "subnet/policy" :principal {:type :governance}}
+                                      {:pattern "head/<pubkey>/*" :principal {:type :self-path-owner}}]
+                    :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                    :subnet/replication {:replication/pointers :leader-election :replication/blobs :eager-push}}
+          gen-cid (subnet/policy-cid base-pol)
+          policy-v1 (assoc base-pol :subnet/genesis-policy-cid gen-cid)
+          inst0 (:instance (subnet/init-subnet-instance policy-v1 {:node-id a1 :all-nodes #{a1 a2} :now-ms 1000}))
+          st0 (assoc inst0 :admitted-members #{a1 a2})
+          next-policy (assoc-in base-pol [:subnet/gate :gate/trust-anchors] #{a1})
+          next-blob (data/make-blob (fressian/encode-canonical next-policy) "application/fressian")
+          st-blob (:state (subnet/reduce-subnet st0 {:type :put-blob :sender a1 :blob next-blob :now-ms 1100}))
+          q-proof (data/create-quorum-proof [{:pubkey a1 :privkey (:private kp-a1)}]
+                                            "infra-10" "subnet/policy" 1 (:blob/cid next-blob))
+          policy-ptr (data/sign-pointer (:private kp-a1)
+                                        {:pointer/authority a1
+                                         :pointer/subnet "infra-10"
+                                         :pointer/path "subnet/policy"
+                                         :pointer/seq 1
+                                         :pointer/target (:blob/cid next-blob)
+                                         :pointer/proof q-proof})
+          a2-blob (data/make-blob (fressian/utf8->bytes "data-by-a2") "application/octet-stream")
+          a2-ptr (data/sign-pointer (:private kp-a2)
+                                    {:pointer/authority a2
+                                     :pointer/subnet "infra-10"
+                                     :pointer/path (str "head/" a2 "/status")
+                                     :pointer/seq 1
+                                     :pointer/target (:blob/cid a2-blob)
+                                     :pointer/proof {:proof/type :self}})
+          scenario-10
+          (fn []
+            (let [r-policy (subnet/reduce-subnet st-blob {:type :publish-pointer :sender a1 :pointer policy-ptr :now-ms 1200})
+                  st-rot (:state r-policy)
+                  r-blob (subnet/reduce-subnet st-rot {:type :put-blob :sender a2 :blob a2-blob :now-ms 1250})
+                  r-pub (subnet/reduce-subnet (:state r-blob) {:type :publish-pointer :sender a2 :pointer a2-ptr :now-ms 1300})
+                  admitted? (contains? (:admitted-members st-rot) a2)
+                  in-le-all? (contains? (set (get-in st-rot [:leader-election :all-nodes])) a2)
+                  publish-rejected? (false? (:applied? r-pub))]
+              {:valid? (boolean (and (:applied? r-policy)
+                                     (not admitted?)
+                                     (not in-le-all?)
+                                     publish-rejected?))
+               :admitted? admitted?
+               :in-le-all? in-le-all?
+               :publish-rejected? publish-rejected?}))
+          mutated-10
+          (fn [sc-fn]
+            (let [orig-reduce subnet/reduce-subnet]
+              (with-redefs [subnet/reduce-subnet
+                            (fn [inst ev]
+                              (let [res (orig-reduce inst ev)]
+                                (if (and (= (:type ev) :publish-pointer)
+                                         (= (:pointer/path (:pointer ev)) "subnet/policy"))
+                                  (update res :state (fn [s]
+                                                       (-> s
+                                                           (update :admitted-members conj a2)
+                                                           (update-in [:leader-election :all-nodes] (fn [an] (vec (conj (or an []) a2)))))))
+                                  res)))]
+                (sc-fn))))]
+      (swap! results assoc :JEP-10 (verify-jepsen-bug :JEP-10 "subnet/dynamic-trust-anchor-revocation" scenario-10 mutated-10)))
+
+    ;; JEP-11: Mutually exclusive escrow release/refund intents
+    (let [escrow-id "esc-1"
+          payer "payer-pub-1"
+          receiver "receiver-pub-1"
+          st0 {:peers-map {"p1" {:ip "127.0.0.1"}}
+               :known-receipt-ids #{}
+               :pending-receipts []
+               :escrows {escrow-id {:status :locked
+                                    :payer payer
+                                    :receiver receiver
+                                    :amount 100
+                                    :deliverable-hash "abc"
+                                    :expires-epoch 100}}
+               :ledger {payer {:balance 1000}}
+               :diagnostics {}}
+          release-ev {:type :release-intent :escrow-id escrow-id :sender payer}
+          refund-ev {:type :refund-intent :escrow-id escrow-id :sender receiver}
+          scenario-11
+          (fn []
+            (let [r1 (sm/handle-event st0 release-ev)
+                  st1 (:state r1)
+                  r2 (sm/handle-event st1 refund-ev)
+                  st2 (:state r2)
+                  pending (:pending-receipts st2)
+                  conflicting-cnt (get-in st2 [:diagnostics :conflicting-escrow-intent] 0)]
+              {:valid? (boolean (and (= 1 (count pending))
+                                     (= (str "release:" escrow-id) (:receipt-id (first pending)))
+                                     (= 1 conflicting-cnt)))
+               :pending-count (count pending)
+               :conflicting-diagnostics conflicting-cnt}))
+          mutated-11
+          (fn [sc-fn]
+            (let [orig-event sm/handle-event]
+              (with-redefs [sm/handle-event
+                            (fn [st ev]
+                              (if (= (:type ev) :refund-intent)
+                                {:state (update st :pending-receipts conj {:receipt-id (str "refund:" (:escrow-id ev))
+                                                                           :type :refund-intent
+                                                                           :escrow-id (:escrow-id ev)})
+                                 :commands []}
+                                (orig-event st ev)))]
+                (sc-fn))))]
+      (swap! results assoc :JEP-11 (verify-jepsen-bug :JEP-11 "state-machine/mutually-exclusive-escrow-intents" scenario-11 mutated-11)))
+
+    ;; JEP-12: Bounded inbox eviction deterministic tie-breaking
+    (let [kp-sender (crypto/generate-keypair)
+          kp-recip-a (crypto/generate-keypair)
+          kp-recip-b (crypto/generate-keypair)
+          kp-recip-c (crypto/generate-keypair)
+          sender (streamlet/bytes->hex (:public kp-sender))
+          recip-a (streamlet/bytes->hex (:public kp-recip-a))
+          recip-b (streamlet/bytes->hex (:public kp-recip-b))
+          recip-c (streamlet/bytes->hex (:public kp-recip-c))
+          payload (fressian/utf8->bytes "payload-c")
+          sig (crypto/sign (:private kp-sender) payload)
+          env-c {:sender sender :recipient recip-c :payload payload :signature (streamlet/bytes->hex sig)}
+          entry-a {:relay-seq 5 :relay_seq 5 :received-at 1000 :received_at 1000 :byte-size 50 :envelope-id "ea"}
+          entry-b {:relay-seq 10 :relay_seq 10 :received-at 1000 :received_at 1000 :byte-size 50 :envelope-id "eb"}
+          base-relay (relay/init-relay-state {:max-recipients 2 :max-inbox-size 10})
+          st-a (assoc base-relay
+                      :inboxes (array-map recip-a [entry-a] recip-b [entry-b])
+                      :inbox-seqs {recip-a 5 recip-b 10})
+          st-b (assoc base-relay
+                      :inboxes (array-map recip-b [entry-b] recip-a [entry-a])
+                      :inbox-seqs {recip-b 10 recip-a 5})
+          scenario-12
+          (fn []
+            (let [res-a (relay/submit-envelope st-a {:type :relay-submit :envelope env-c :now-ms 2000})
+                  res-b (relay/submit-envelope st-b {:type :relay-submit :envelope env-c :now-ms 2000})
+                  sta (:state res-a)
+                  stb (:state res-b)
+                  keys-a (set (keys (:inboxes sta)))
+                  keys-b (set (keys (:inboxes stb)))
+                  diag-a (get-in sta [:diagnostics :evicted-recipient-inboxes] 0)
+                  diag-b (get-in stb [:diagnostics :evicted-recipient-inboxes] 0)
+                  deterministic? (and (= #{recip-b recip-c} keys-a)
+                                      (= #{recip-b recip-c} keys-b)
+                                      (= keys-a keys-b)
+                                      (= 1 diag-a)
+                                      (= 1 diag-b))]
+              {:valid? (boolean deterministic?)
+               :keys-a keys-a
+               :keys-b keys-b
+               :diag-a diag-a
+               :diag-b diag-b}))
+          mutated-12
+          (fn [sc-fn]
+            (let [orig-submit relay/submit-envelope]
+              (with-redefs [relay/submit-envelope
+                            (fn [st ev]
+                              (let [res (orig-submit st ev)]
+                                (update res :state (fn [s]
+                                                     (let [inb (:inboxes s)]
+                                                       (-> s
+                                                           (update-in [:diagnostics] dissoc :evicted-recipient-inboxes)
+                                                           (cond-> (contains? inb recip-c)
+                                                             (assoc :inboxes (let [first-k (first (keys (:inboxes st)))]
+                                                                               (assoc (dissoc inb first-k) recip-c []))))))))))]
+                (sc-fn))))]
+      (swap! results assoc :JEP-12 (verify-jepsen-bug :JEP-12 "relay/deterministic-inbox-eviction" scenario-12 mutated-12)))
+
+    (let [res-map @results
+          all-valid? (and (= 12 (count res-map))
+                          (every? (fn [[_ r]] (and (:remediated-valid? r)
+                                                   (:pre-fix-caught? r)
+                                                   (:bug-reproduced? r)))
+                                  res-map))]
+      {:ok? all-valid?
+       :seed seed
+       :remediated-count (count (filter (fn [[_ r]] (:remediated-valid? r)) res-map))
+       :results res-map})))
