@@ -463,6 +463,7 @@
          serve? (= verb "serve")
          daemon? (= verb "daemon")
          wait-event? (= verb "wait-event")
+         keep-alive-eof? (boolean (some #{"--keep-alive-eof"} clean-args))
          serve-daemon? (and serve? (boolean (some #{"--daemon"} clean-args)))
          ctl-sub (when ctl? (extract-subverb-and-args (rest clean-args)))
          daemon-sub (when daemon? (extract-subverb-and-args (rest clean-args)))
@@ -534,6 +535,7 @@
               :autonomous? autonomous?
               :auto-sync? (boolean auto-sync?)
               :auto-register-home-set? (boolean auto-register-home-set?)
+              :keep-alive-eof? keep-alive-eof?
               :transport transport
               :cmd-map (let [m (when-not (or ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
                                  (build-one-shot-cmd-map verb (if (and (string? first-tok) (str/starts-with? first-tok "--"))
@@ -2969,11 +2971,15 @@
       (binding [*out* *err*]
         (let [reader (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
           (loop []
-            (when-let [line (.readLine reader)]
-              (when-not (str/blank? line)
-                (locking serve-cmd-lock
-                  (handle-serve-line! line ctx)))
-              (recur)))))
+            (if-let [line (.readLine reader)]
+              (do
+                (when-not (str/blank? line)
+                  (locking serve-cmd-lock
+                    (handle-serve-line! line ctx)))
+                (recur))
+              (when (or (:keep-alive-eof? opts) (and cmd-file (not (str/blank? (str cmd-file)))))
+                (while @daemon-running?
+                  (try (Thread/sleep 1000) (catch InterruptedException _ (reset! daemon-running? false)))))))))
       (finally
         (reset! daemon-running? false)
         (when ctrl-svc
@@ -3148,13 +3154,17 @@
                                               (= % "start")
                                               (= % "ctl"))
                                          raw-args))
-              serve-args (into ["serve"] (filter #(not= % "serve") filtered-args))
+              serve-args (into ["serve" "--keep-alive-eof"] (filter #(not= % "serve") filtered-args))
               serve-args (if (some #{"--state-dir"} serve-args)
                            serve-args
                            (into serve-args ["--state-dir" state-dir]))
               java-bin (str (System/getProperty "java.home") "/bin/java")
               cp (System/getProperty "java.class.path")
-              cmd (into [java-bin "-cp" cp "clojure.main" "-m" "bitecho.shell.light-node"] serve-args)
+              jvm-flags ["--enable-native-access=ALL-UNNAMED"
+                         "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
+                         "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]
+              cmd (into (into [java-bin] jvm-flags)
+                        (into ["-cp" cp "clojure.main" "-m" "bitecho.main" "light-node"] serve-args))
               pb (doto (ProcessBuilder. (into-array String cmd))
                    (.redirectErrorStream true)
                    (.redirectOutput (ProcessBuilder$Redirect/appendTo log-file)))
