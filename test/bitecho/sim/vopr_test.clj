@@ -266,6 +266,23 @@
           (is (true? (:bug-reproduced? bug)) (str "Bug " jep " failed reproduction: " bug)))))))
 
 ;; =============================================================================
+;; 7b. Transport-Layer Jepsen Bug-Hunt Verification (DCT-01..DCT-12)
+;; =============================================================================
+
+(deftest test-datachannel-jepsen-campaign
+  (testing "Transport-Layer Jepsen Bug-Hunt campaign: all 12 transport bugs (DCT-01..DCT-12) remediated and mutants caught"
+    (let [res (vopr/run-datachannel-jepsen-campaign {:seed 20261115})]
+      (is (true? (:ok? res)))
+      (is (= 12 (:remediated-count res)))
+      (doseq [dct [:DCT-01 :DCT-02 :DCT-03 :DCT-04 :DCT-05 :DCT-06
+                   :DCT-07 :DCT-08 :DCT-09 :DCT-10 :DCT-11 :DCT-12]]
+        (let [bug (get-in res [:results dct])]
+          (is (some? bug) (str "Missing result for bug " dct))
+          (is (true? (:remediated-valid? bug)) (str "Bug " dct " failed remediated check: " bug))
+          (is (true? (:pre-fix-caught? bug)) (str "Bug " dct " failed pre-fix caught check: " bug))
+          (is (true? (:bug-reproduced? bug)) (str "Bug " dct " failed reproduction: " bug)))))))
+
+;; =============================================================================
 ;; 8. WebRTC DataChannel Sans-IO Packet-Drop & Retransmission Simulation
 ;; =============================================================================
 

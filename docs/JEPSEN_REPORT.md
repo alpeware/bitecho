@@ -4,6 +4,8 @@
 > **Executive Summary:** Following completion of the full-stack deterministic simulation and Jepsen verification engine ([`dev/bitecho/sim/vopr.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/sim/vopr.clj)), we executed an adversarial Jepsen bug-hunting campaign across Bitecho's production state machines using our multi-model verification pipeline (**Claude Opus 5.5**, **Gemini 4 Carbon**, and **Gemini 4 Hydrogen**).
 >
 > The campaign uncovered and remediated **12 genuine, previously unknown distributed-systems bugs (`JEP-01` through `JEP-12`)**—including **4 Critical consensus safety & tokenomics conservation flaws**, **6 High-severity liveness, split-brain, CRDT convergence & revocation bypass bugs**, and **2 Medium fairness & resource-isolation defects**—validated by an 8-mutant non-vacuity gate (`MUT-01`..`MUT-08`), clean build isolation (`deps.edn`), and a pure WebRTC DataChannel packet-drop simulation suite ([`run-datachannel-packet-drop-sim`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/sim/vopr.clj#L1827)).
+>
+> In addition to protocol bugs `JEP-01..JEP-12`, the team executed the transport-layer Jepsen campaign (**`DCT-01` through `DCT-12`**) across `clj-datachannel` and Bitecho light-node event streams. See the companion report: [**`docs/JEPSEN_DATACHANNEL_REPORT.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/JEPSEN_DATACHANNEL_REPORT.md).
 
 ---
 

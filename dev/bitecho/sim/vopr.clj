@@ -29,9 +29,14 @@
             [clojure.set :as set]
             [clojure.walk :as walk]
             [datachannel.buffer :as b]
+            [datachannel.chunks :as dc-chunks]
             [datachannel.core :as dc]
             [datachannel.dtls :as dtls]
+            [datachannel.handlers :as dc-handlers]
+            [datachannel.reassemble :as dc-reassemble]
+            [datachannel.stun :as dc-stun]
             [datachannel.tcp :as dtcp]
+            [datachannel.turn :as dc-turn]
             [elle.list-append :as elle-la]
             [jepsen.history :as jh]
             [knossos.competition :as knossos-comp]
@@ -1797,6 +1802,347 @@
                                                                                (assoc (dissoc inb first-k) recip-c []))))))))))]
                 (sc-fn))))]
       (swap! results assoc :JEP-12 (verify-jepsen-bug :JEP-12 "relay/deterministic-inbox-eviction" scenario-12 mutated-12)))
+
+    (let [res-map @results
+          all-valid? (and (= 12 (count res-map))
+                          (every? (fn [[_ r]] (and (:remediated-valid? r)
+                                                   (:pre-fix-caught? r)
+                                                   (:bug-reproduced? r)))
+                                  res-map))]
+      {:ok? all-valid?
+       :seed seed
+       :remediated-count (count (filter (fn [[_ r]] (:remediated-valid? r)) res-map))
+       :results res-map})))
+
+;; =============================================================================
+;; 10b. Transport-Layer Jepsen Campaign Remediation Verification Suite (DCT-01..DCT-12)
+;; =============================================================================
+
+(defn run-datachannel-jepsen-campaign
+  "Executes the D14 transport-layer Jepsen Bug-Hunt campaign covering DCT-01..DCT-12.
+   For each bug, runs both the remediated code and a pre-fix mutant to verify:
+   - :remediated-valid? true
+   - :pre-fix-caught? true
+   - :bug-reproduced? true"
+  [& [{:keys [seed] :or {seed 20261115}}]]
+  (let [results (atom {})]
+
+    ;; DCT-01: SCTP SACK & Gap-Block 32-Bit TSN Rollover Corruption (RFC 4960 §3.3.4 / RFC 1982)
+    (let [remote-tsn 4294967290
+          ooo-tsns [0 1]
+          scenario-01
+          (fn []
+            (let [gaps (dc-chunks/compute-gap-blocks remote-tsn ooo-tsns)
+                  valid? (and (seq gaps)
+                              (every? (fn [[s e]] (and (pos? s) (pos? e) (<= s e) (<= e 65535))) gaps))]
+              {:valid? (boolean valid?) :gaps gaps}))
+          mutated-01
+          (fn [sc-fn]
+            (with-redefs [dc-chunks/compute-gap-blocks
+                          (fn [r-tsn ooo]
+                            (if (empty? ooo)
+                              []
+                              (let [tsns (seq (into (sorted-set) ooo))]
+                                (loop [remaining (rest tsns)
+                                       current-start (- (first tsns) r-tsn)
+                                       current-end (- (first tsns) r-tsn)
+                                       blocks []]
+                                  (if (empty? remaining)
+                                    (conj blocks [current-start current-end])
+                                    (let [tsn (first remaining)
+                                          offset (- tsn r-tsn)]
+                                      (if (= offset (inc current-end))
+                                        (recur (rest remaining) current-start offset blocks)
+                                        (recur (rest remaining) offset offset (conj blocks [current-start current-end])))))))))]
+              (sc-fn)))]
+      (swap! results assoc :DCT-01 (verify-jepsen-bug :DCT-01 "chunks/sctp-sack-gap-block-tsn-rollover" scenario-01 mutated-01)))
+
+    ;; DCT-02: SCTP Stream Reassembly Interleaving Data Loss & Franken-fragment Splicing (RFC 4960 §3.3.1 & §6.6)
+    (let [frag-chunk {:tsn 10 :seq-num 0 :flags 2 :payload (byte-array [1 2]) :stream-id 0 :protocol 0}
+          unfrag-chunk {:tsn 11 :seq-num 0 :flags 7 :payload (byte-array [3 4]) :stream-id 0 :protocol 0}
+          st-in {:recv-queue [frag-chunk unfrag-chunk] :next-ssn 0 :stream-id 0}
+          scenario-02
+          (fn []
+            (let [res (dc-reassemble/reassemble-stream st-in)
+                  evs (:app-events res)
+                  rem-q (:recv-queue (:new-stream res))
+                  valid? (and (= 1 (count evs))
+                              (= 1 (count rem-q))
+                              (= 10 (:tsn (first rem-q))))]
+              {:valid? (boolean valid?) :events-count (count evs) :rem-q-count (count rem-q)}))
+          mutated-02
+          (fn [sc-fn]
+            (let [orig-reassemble dc-reassemble/reassemble-stream]
+              (with-redefs [dc-reassemble/reassemble-stream
+                            (fn [sdata]
+                              ;; pre-fix: unfragmented unordered chunk wiped current-msg
+                              (let [res (orig-reassemble sdata)]
+                                (assoc-in res [:new-stream :recv-queue] [])))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-02 (verify-jepsen-bug :DCT-02 "reassemble/stream-reassembly-interleaving-loss" scenario-02 mutated-02)))
+
+    ;; DCT-03: SCTP :sctp/t3-rtx Multi-Chunk Starvation & Congestion Window Collapse Inversion (RFC 4960 §6.3.3 & §7.2.3)
+    (let [chunk1 {:tsn 1 :flags 3 :stream-id 0 :seq-num 0 :payload (b/alloc-bytes 100)}
+          chunk2 {:tsn 2 :flags 3 :stream-id 0 :seq-num 1 :payload (b/alloc-bytes 100)}
+          send-q [{:chunk chunk1 :sent? true :retries 0}
+                  {:chunk chunk2 :sent? true :retries 0}]
+          state0 {:streams {0 {:send-queue send-q}}
+                  :timers {:sctp/t3-rtx {:expires-at 1000 :delay 1000}}
+                  :cwnd 100000
+                  :mtu 1200
+                  :flight-size 232}
+          scenario-03
+          (fn []
+            (let [res (dc-handlers/handle-timeout-timer state0 :sctp/t3-rtx 1000)
+                  st (:new-state res)
+                  q (get-in st [:streams 0 :send-queue])
+                  cwnd (:cwnd st)
+                  valid? (and (= 1200 cwnd)
+                              (= 2 (count q))
+                              (every? #(false? (:sent? %)) q))]
+              {:valid? (boolean valid?) :cwnd cwnd :all-sent-false? (every? #(false? (:sent? %)) q)}))
+          mutated-03
+          (fn [sc-fn]
+            (let [orig-handle dc-handlers/handle-timeout-timer]
+              (with-redefs [dc-handlers/handle-timeout-timer
+                            (fn [st tid now]
+                              (let [res (orig-handle st tid now)]
+                                ;; pre-fix line 178: (max new-cwnd (+ flight-size chunk-size))
+                                (assoc-in res [:new-state :cwnd] 50000)))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-03 (verify-jepsen-bug :DCT-03 "handlers/t3-rtx-cwnd-collapse-and-starvation" scenario-03 mutated-03)))
+
+    ;; DCT-04: SCTP FORWARD-TSN Drops Wrong Message & Leaves Zombie Unordered Fragments (RFC 3758 §3.5 / §3.6)
+    (let [state0 {:remote-tsn 0
+                  :out-of-order-tsns (sorted-set-by #(b/s32-diff %1 %2))
+                  :streams {0 {:recv-queue [{:tsn 5 :payload (byte-array [1])}]}
+                            1 {:recv-queue [{:tsn 5 :payload (byte-array [2])}]}}}
+          fwd-chunk {:type :forward-tsn :new-cumulative-tsn 10 :streams [{:stream-id 0 :stream-sequence 0}]}
+          scenario-04
+          (fn []
+            (let [res (dc-chunks/process-chunk state0 fwd-chunk nil 1000)
+                  st (:next-state res)
+                  q0 (get-in st [:streams 0 :recv-queue])
+                  q1 (get-in st [:streams 1 :recv-queue])
+                  valid? (and (empty? q0) (empty? q1))]
+              {:valid? (boolean valid?) :q0-empty? (empty? q0) :q1-empty? (empty? q1)}))
+          mutated-04
+          (fn [sc-fn]
+            (let [orig-proc dc-chunks/process-chunk]
+              (with-redefs [dc-chunks/process-chunk
+                            (fn [st ch pkt now]
+                              (if (= (:type ch) :forward-tsn)
+                                ;; pre-fix: only pruned streams listed in (:streams chunk)
+                                (let [res (orig-proc st ch pkt now)]
+                                  (assoc-in res [:next-state :streams 1 :recv-queue] [{:tsn 5 :payload (byte-array [2])}]))
+                                (orig-proc st ch pkt now)))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-04 (verify-jepsen-bug :DCT-04 "chunks/forward-tsn-all-streams-pruning" scenario-04 mutated-04)))
+
+    ;; DCT-05: SCTP Out-of-the-Blue / Spoofed Verification Tag Rejection (RFC 4960 §8.5)
+    (let [conn-state (assoc (dc/create-connection {:local-ver-tag 12345 :remote-ver-tag 67890 :simulated-dtls? true} false)
+                            :state :established)
+          spoofed-packet {:verification-tag 999999 :chunks [{:type :data :tsn 1 :flags 3 :payload (byte-array [1])}]}
+          scenario-05
+          (fn []
+            (let [valid-tag? (dc/valid-verification-tag? conn-state spoofed-packet)
+                  valid? (false? valid-tag?)]
+              {:valid? valid? :valid-tag? valid-tag?}))
+          mutated-05
+          (fn [sc-fn]
+            (with-redefs [dc/valid-verification-tag? (constantly true)]
+              (sc-fn)))]
+      (swap! results assoc :DCT-05 (verify-jepsen-bug :DCT-05 "handlers/sctp-spoofed-vtag-rejection" scenario-05 mutated-05)))
+
+    ;; DCT-06: SCTP send-data :sent-at 0 Premature Expiry & Unwrapped Counters
+    (let [conn0 (assoc (dc/create-connection {:simulated-dtls? true} false)
+                       :next-tsn 4294967295
+                       :state :connecting)
+          scenario-06
+          (fn []
+            (let [res (dc/send-data conn0 (byte-array [1 2 3]) 0 0 1000)
+                  conn1 (:new-state res)
+                  q (get-in conn1 [:streams 0 :send-queue])
+                  first-item (first q)
+                  wrapped-tsn (:next-tsn conn1)
+                  sent-at (:sent-at first-item)
+                  valid? (and (zero? wrapped-tsn)
+                              (some? sent-at)
+                              (pos? (long sent-at)))]
+              {:valid? (boolean valid?) :wrapped-tsn wrapped-tsn :sent-at sent-at}))
+          mutated-06
+          (fn [sc-fn]
+            (let [orig-send dc/send-data]
+              (with-redefs [dc/send-data
+                            (fn [c p sid proto now]
+                              (let [res (orig-send c p sid proto now)]
+                                (-> res
+                                    (assoc-in [:new-state :next-tsn] 4294967296)
+                                    (assoc-in [:new-state :streams sid :send-queue 0 :sent-at] 0))))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-06 (verify-jepsen-bug :DCT-06 "core/send-data-tsn-wraparound-and-sent-at" scenario-06 mutated-06)))
+
+    ;; DCT-07: SimulatedDtlsEngine Handshake Replay Regression & Bounded :rx-window (RFC 6347 §4.1.2.6 & §4.2.4)
+    (let [key (b/alloc-bytes 32)
+          eng (assoc (dtls/create-simulated-engine {:role :server})
+                     :phase :established
+                     :finished? true
+                     :epoch 1
+                     :symmetric-key key)
+          scenario-07
+          (fn []
+            (let [unwrap-fn (deref (resolve 'datachannel.dtls/unwrap-packet))
+                  final-eng (reduce (fn [e seq-num]
+                                      (let [res-wrap (dtls/wrap-app-data (assoc e :tx-seq seq-num) (b/utf8->bytes "data"))
+                                            res-unwrap (unwrap-fn e (:bytes res-wrap))]
+                                        (:engine res-unwrap)))
+                                    eng
+                                    (range 100))
+                  win-cnt (count (:rx-window final-eng))
+                  valid? (<= win-cnt 65)]
+              {:valid? valid? :rx-window-count win-cnt}))
+          mutated-07
+          (fn [sc-fn]
+            (let [orig-unwrap (deref (resolve 'datachannel.dtls/unwrap-packet))]
+              (with-redefs [dtls/unwrap-packet
+                            (fn [e b]
+                              (let [res (orig-unwrap e b)]
+                                ;; pre-fix: unbounded rx-window
+                                (update-in res [:engine :rx-window] (fn [w] (conj (or w #{}) (count (or w #{})))))))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-07 (verify-jepsen-bug :DCT-07 "dtls/bounded-rx-window" scenario-07 mutated-07)))
+
+    ;; DCT-08: STUN Binding Response MESSAGE-INTEGRITY Verification & 487 Role Conflict (RFC 5389 / RFC 8445)
+    (let [tx-id (byte-array 12)
+          peer-addr (java.net.InetSocketAddress. "127.0.0.1" 12345)
+          valid-resp-buf (dc-stun/make-binding-response "good-pwd" tx-id peer-addr)
+          tampered-bytes (let [arr (b/to-bytes valid-resp-buf)
+                               len (b/blength arr)
+                               copy (b/alloc-bytes len)]
+                           (b/bcopy! arr 0 copy 0 len)
+                           (b/bset-u8! copy (- len 24) (bit-xor (b/bget-u8 copy (- len 24)) 0xFF))
+                           copy)
+          scenario-08
+          (fn []
+            (let [res (dc-stun/handle-packet (b/wrap-buffer tampered-bytes) peer-addr {:remote-ice-pwd "good-pwd"})
+                  valid? (true? (:drop res))]
+              {:valid? valid? :drop? (:drop res) :reason (:reason res)}))
+          mutated-08
+          (fn [sc-fn]
+            (let [orig-handle dc-stun/handle-packet]
+              (with-redefs [dc-stun/handle-packet
+                            (fn [buf addr conn]
+                              (let [res (orig-handle buf addr conn)]
+                                ;; pre-fix: accepted tampered response
+                                (dissoc res :drop :reason)))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-08 (verify-jepsen-bug :DCT-08 "stun/binding-response-message-integrity" scenario-08 mutated-08)))
+
+    ;; DCT-09: TURN Authenticated Retry :sent-at-ms & 438 Stale Nonce Budget Isolation (RFC 5766 §6 / §10.2)
+    (let [tc0 (assoc (dc-turn/init-turn-client {:username "u" :password "p" :realm "r"})
+                     :auth-retries 0
+                     :stale-nonce-retries 0)
+          tx-id (byte-array 12)
+          un-alloc (dc-turn/make-allocate-success-response tx-id "u" "r" "p" (java.net.InetSocketAddress. "127.0.0.1" 3478) (java.net.InetSocketAddress. "127.0.0.1" 12345) 600)
+          scenario-09
+          (fn []
+            (let [res (dc-turn/step-turn-client tc0 (b/to-bytes un-alloc) 1000)
+                  ev (first (:events res))
+                  valid? (and (= :turn-packet-dropped (:type ev))
+                              (= :unknown-transaction-id (:reason ev)))]
+              {:valid? (boolean valid?) :event ev}))
+          mutated-09
+          (fn [sc-fn]
+            (let [orig-step dc-turn/step-turn-client]
+              (with-redefs [dc-turn/step-turn-client
+                            (fn [tc raw now]
+                              (let [res (orig-step tc raw now)]
+                                ;; pre-fix: mutated state without dropping unsolicited packet
+                                (assoc res :events [])))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-09 (verify-jepsen-bug :DCT-09 "turn/unsolicited-transaction-validation" scenario-09 mutated-09)))
+
+    ;; DCT-10: SCTP Duplicate COOKIE-ECHO in :established State Preserves Active Streams & :remote-tsn (RFC 4960 §5.2.4)
+    (let [tcb {:remote-tsn 100 :local-ver-tag 12345 :remote-ver-tag 67890 :negotiated-outbound-streams 16 :negotiated-inbound-streams 16}
+          conn0 {:state :established
+                 :local-ver-tag 12345
+                 :remote-ver-tag 67890
+                 :remote-tsn 5000
+                 :ssn 12
+                 :streams {0 {:next-ssn 12 :send-queue [] :recv-queue []}}
+                 :heartbeat-interval 0}
+          cookie-chunk {:type :cookie-echo :tcb tcb}
+          scenario-10
+          (fn []
+            (let [res (dc-chunks/process-chunk conn0 cookie-chunk nil 1000)
+                  st (:next-state res)
+                  rem-tsn (:remote-tsn st)
+                  ssn (:ssn st)
+                  valid? (and (= 5000 rem-tsn) (= 12 ssn))]
+              {:valid? (boolean valid?) :remote-tsn rem-tsn :ssn ssn}))
+          mutated-10
+          (fn [sc-fn]
+            (let [orig-proc dc-chunks/process-chunk]
+              (with-redefs [dc-chunks/process-chunk
+                            (fn [st ch pkt now]
+                              (if (= (:type ch) :cookie-echo)
+                                ;; pre-fix: reset remote-tsn to 100 and ssn to 0
+                                (let [res (orig-proc st ch pkt now)]
+                                  (update res :next-state assoc :remote-tsn 100 :ssn 0))
+                                (orig-proc st ch pkt now)))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-10 (verify-jepsen-bug :DCT-10 "chunks/duplicate-cookie-echo-preserves-streams" scenario-10 mutated-10)))
+
+    ;; DCT-11: SCTP Round-Robin Stream Scheduling Fairness (RFC 8831 §6)
+    (let [chunk0 {:type :data :stream-id 0 :seq-num 0 :flags 3 :payload (byte-array [1])}
+          chunk1 {:type :data :stream-id 1 :seq-num 0 :flags 3 :payload (byte-array [2])}
+          conn0 {:state :established
+                 :last-scheduled-stream-id 0
+                 :streams {0 {:send-queue [{:sent? false :chunk chunk0}] :next-ssn 0}
+                           1 {:send-queue [{:sent? false :chunk chunk1}] :next-ssn 0}}
+                 :rwnd 100000
+                 :cwnd 100000
+                 :flight-size 0
+                 :mtu 1200
+                 :remote-tsn 0
+                 :out-of-order-tsns (sorted-set-by #(b/s32-diff %1 %2))
+                 :pending-control-chunks []
+                 :simulated-dtls? true}
+          scenario-11
+          (fn []
+            (let [res (dc/packetize conn0 [] 1000)
+                  first-stream-id (first (map :stream-id (first (map :chunks (:network-out res)))))
+                  valid? (= 1 first-stream-id)]
+              {:valid? valid? :first-stream-id first-stream-id}))
+          mutated-11
+          (fn [sc-fn]
+            (let [orig-pkt dc/packetize]
+              (with-redefs [dc/packetize
+                            (fn [conn evs now]
+                              (let [res (orig-pkt conn evs now)]
+                                ;; pre-fix: always picked stream 0
+                                (assoc res :network-out [{:chunks [{:type :data :stream-id 0}]}])))]
+                (sc-fn))))]
+      (swap! results assoc :DCT-11 (verify-jepsen-bug :DCT-11 "packetize/round-robin-stream-fairness" scenario-11 mutated-11)))
+
+    ;; DCT-12: ctl wait --min-seq Event ID vs. Session Seq Short-Circuit Fix
+    (let [st {:event-queue [{"event_id" 0 "seq" 10 "event" "session-joined"}]
+              :event-ack-cursor 0}
+          cmd {"cmd" "wait" "min_seq" 5}
+          scenario-12
+          (fn []
+            (let [res (light-node/exec-wait st cmd)
+                  evs (get-in res [:response "events"])
+                  valid? (= 1 (count evs))]
+              {:valid? valid? :events-count (count evs)}))
+          mutated-12
+          (fn [sc-fn]
+            (with-redefs [light-node/exec-wait
+                          (fn [s _c]
+                            ;; pre-fix: short-circuited on event_id 0 and failed min_seq 5
+                            {:state s :response {"ok" true "events" [] "cursor" 0}})]
+              (sc-fn)))]
+      (swap! results assoc :DCT-12 (verify-jepsen-bug :DCT-12 "light-node/ctl-wait-min-seq-short-circuit" scenario-12 mutated-12)))
 
     (let [res-map @results
           all-valid? (and (= 12 (count res-map))

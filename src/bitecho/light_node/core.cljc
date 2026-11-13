@@ -3810,7 +3810,7 @@
   [state events]
   (reduce tag-and-enqueue-event state events))
 
-(defn- exec-wait
+(defn exec-wait
   "Pure reducer for 'wait' command. Pops actionable events from :event-queue,
    optionally filtered by min_seq. Advances event-ack cursor. If no matching events,
    returns park: true."
@@ -3820,8 +3820,9 @@
         raw-q (vec (or (:event-queue state) []))
         eligible-evs (if min-seq
                        (filterv (fn [ev]
-                                  (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "seq") (:seq ev) 0))]
-                                    (>= eid min-seq)))
+                                  (let [eid (long (or (get ev "event_id") (:event-id ev) 0))
+                                        s   (long (or (get ev "seq") (:seq ev) 0))]
+                                    (or (>= eid min-seq) (>= s min-seq))))
                                 raw-q)
                        raw-q)
         cursor (long (or (:event-ack-cursor state) 0))]

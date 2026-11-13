@@ -2484,8 +2484,9 @@
                                                              (let [q (:event-queue @state-atom)
                                                                    has-events? (if min-seq
                                                                                  (some (fn [ev]
-                                                                                         (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "seq") (:seq ev) 0))]
-                                                                                           (>= eid min-seq)))
+                                                                                         (let [eid (long (or (get ev "event_id") (:event-id ev) 0))
+                                                                                               s   (long (or (get ev "seq") (:seq ev) 0))]
+                                                                                           (or (>= eid min-seq) (>= s min-seq))))
                                                                                        q)
                                                                                  (seq q))]
                                                                (if has-events?
