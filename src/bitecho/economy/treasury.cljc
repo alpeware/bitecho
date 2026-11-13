@@ -40,6 +40,10 @@
   "Canonical v2.1 maximum conditional mintable supply: 23,100,000,000 ECHO (55% conditional mint)."
   23100000000)
 
+(def conditional-mint-cap
+  "Canonical v2.1 maximum conditional mintable supply (23.1B)."
+  max-conditional-mint-supply)
+
 (defn calculate-trailing-revenue
   "Calculates average trailing burn revenue over N epochs:
      R_trailing = (quot (reduce + trailing-N-burns) N)

@@ -771,7 +771,7 @@
    (let [res (put-blob (:blobs state) blob now-ms)]
      (assoc res :state (assoc state :blobs (:store res))))))
 
-(defn- pointer-order-tuple
+(defn pointer-order-tuple
   "Returns `[leader-term seq]` for deterministic supersession comparison."
   [pointer]
   [(long (or (:pointer/leader-term pointer) 0))

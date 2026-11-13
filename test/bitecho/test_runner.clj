@@ -38,6 +38,7 @@
             [bitecho.shell.mesh-test]
             [bitecho.shell.persistence-test]
             [bitecho.sieve.core-test]
+            [bitecho.sim.vopr-test]
             [bitecho.simulator-config-test]
             [bitecho.simulator-test]
             [bitecho.state-machine-fuzz-test]

@@ -5,8 +5,10 @@
         com.taoensso/nippy {:mvn/version "3.6.0"}
         alpeware/clj-fressian {:git/url "https://bitecho.org/git/clj-fressian.git"
                                :git/sha "4c56c12c8f94efed4324c8f0a4ed340337bdbc54"}
-        alpeware/clj-datachannel {:git/url "https://bitecho.org/git/clj-datachannel.git"
-                                  :git/sha "310b2878bf7618d78d6abba84e9cd26609ae6a50"}}
+        alpeware/clj-datachannel {:local/root "../clj-datachannel"}
+        elle/elle {:mvn/version "0.2.1"}
+        spootnik/unilog {:mvn/version "0.7.31"}
+        knossos/knossos {:mvn/version "0.3.8"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]
@@ -23,7 +25,9 @@
                                  "-Dclojure.core.async.pool-size=32"]}
            :test {:extra-paths ["test" "dev"]
                   :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}
-                               org.clojure/data.fressian {:mvn/version "1.1.0"}}
+                               org.clojure/data.fressian {:mvn/version "1.1.0"}
+                               elle/elle {:mvn/version "0.2.1"}
+                               knossos/knossos {:mvn/version "0.3.8"}}
                   :main-opts ["-m" "bitecho.test-runner"]
                   :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"
                              "--enable-native-access=ALL-UNNAMED"
@@ -35,7 +39,9 @@
                        :main-opts ["-m" "bitecho.cljs-runner"]}
            :build-browser {:extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}}
            :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.01.19"}
-                                 org.clojure/test.check {:mvn/version "1.1.1"}}
+                                 org.clojure/test.check {:mvn/version "1.1.1"}
+                                 elle/elle {:mvn/version "0.2.1"}
+                                 knossos/knossos {:mvn/version "0.3.8"}}
                   :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "dev/bitecho/simulator"]}
            :format {:replace-deps {dev.weavejester/cljfmt {:mvn/version "0.16.1"}}
                     :main-opts ["-m" "cljfmt.main" "fix" "src" "test" "dev/bitecho/simulator"]}

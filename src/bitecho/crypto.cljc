@@ -143,14 +143,148 @@
   (fressian/bytes->hex (sha256 input)))
 
 ;; =============================================================================
-;; Portable Seeded PRNG Protocol (IRandom)
+;; Portable Seeded PRNG Protocol (IRandom) & SplitMix64
 ;; =============================================================================
 
 (defprotocol IRandom
   (next-int [this] [this bound])
   (next-long [this])
   (next-double [this])
-  (next-bytes [this byte-arr]))
+  (next-bytes [this byte-arr])
+  (random-state [this])
+  (fork-random [this] [this branch-id]))
+
+#?(:clj
+   (do
+     (def ^:private ^:const SPLITMIX_GAMMA (long -7046029254386353131))
+     (def ^:private ^:const SPLITMIX_MIX1  (long -4658895280553007687))
+     (def ^:private ^:const SPLITMIX_MIX2  (long -7723592293110705685))
+
+     (defn- mix64-step
+       ^long [^long z]
+       (let [z1 (unchecked-multiply (bit-xor z (unsigned-bit-shift-right z 30)) SPLITMIX_MIX1)
+             z2 (unchecked-multiply (bit-xor z1 (unsigned-bit-shift-right z1 27)) SPLITMIX_MIX2)]
+         (bit-xor z2 (unsigned-bit-shift-right z2 31))))
+
+     (defn- branch-id->long [branch-id]
+       (cond
+         (nil? branch-id) (long 0)
+         (number? branch-id) (.longValue ^Number branch-id)
+         (keyword? branch-id) (branch-id->long (name branch-id))
+         (string? branch-id)
+         (let [bs (fressian/utf8->bytes branch-id)
+               len (alength ^bytes bs)]
+           (loop [i 0
+                  h (long -3750763034362895579)]
+             (if (= i len)
+               h
+               (let [b (aget ^bytes bs i)]
+                 (recur (inc i)
+                        (unchecked-multiply (bit-xor h (bit-and (int b) 0xFF)) (long 1099511628211)))))))
+         :else (long (hash branch-id))))))
+
+#?(:cljs
+   (do
+     (defn- branch-id->bi [branch-id]
+       (cond
+         (nil? branch-id) (js/BigInt 0)
+         (js* "typeof ~{} === 'bigint'" branch-id) branch-id
+         (number? branch-id) (js/BigInt (str (long branch-id)))
+         (keyword? branch-id) (branch-id->bi (name branch-id))
+         (string? branch-id)
+         (let [bs (fressian/utf8->bytes branch-id)
+               len (.-length bs)]
+           (loop [i 0
+                  h (js/BigInt "14695981039346656037")]
+             (if (= i len)
+               (js* "~{} & 18446744073709551615n" h)
+               (let [b (js/BigInt (aget bs i))]
+                 (recur (inc i)
+                        (js* "((~{} ^ ~{}) * 1099511628211n) & 18446744073709551615n" h b))))))
+         :else (js/BigInt (str (hash branch-id)))))
+
+     (defn- mix64-bi [z]
+       (let [u (js/BigInt.asUintN 64 z)
+             z1 (js* "((~{} ^ (~{} >> 30n)) * 13787848793156543929n) & 18446744073709551615n" u u)
+             z2 (js* "((~{} ^ (~{} >> 27n)) * 10723151780598845931n) & 18446744073709551615n" z1 z1)
+             z3 (js* "(~{} ^ (~{} >> 31n)) & 18446744073709551615n" z2 z2)]
+         z3))))
+
+#?(:clj
+   (deftype SplitMix64PRNG [state-atom]
+     IRandom
+     (next-long [_]
+       (let [s (swap! state-atom (fn [^long s] (unchecked-add s SPLITMIX_GAMMA)))]
+         (mix64-step s)))
+     (next-int [this]
+       (unchecked-int (next-long this)))
+     (next-int [this bound]
+       (let [n (bit-and (next-int this) 0x7fffffff)]
+         (mod n bound)))
+     (next-double [this]
+       (let [n (bit-and (next-int this) 0x7fffffff)]
+         (/ (double n) 2147483647.0)))
+     (next-bytes [this byte-arr]
+       (let [len (alength ^bytes byte-arr)]
+         (dotimes [i len]
+           (aset-byte ^bytes byte-arr i (unchecked-byte (bit-and (next-int this) 0xff))))
+         byte-arr))
+     (random-state [_]
+       @state-atom)
+     (fork-random [this]
+       (fork-random this nil))
+     (fork-random [_ branch-id]
+       (let [cur (long @state-atom)
+             salt (branch-id->long branch-id)
+             new-seed (mix64-step (bit-xor cur salt))]
+         (SplitMix64PRNG. (atom new-seed))))
+
+     clojure.lang.IDeref
+     (deref [_]
+       @state-atom)))
+
+#?(:cljs
+   (deftype SplitMix64PRNG [state-atom]
+     IRandom
+     (next-long [_]
+       (let [s (swap! state-atom
+                      (fn [s]
+                        (let [cur (if (js* "typeof ~{} === 'bigint'" s) s (js/BigInt (str (or s 0))))]
+                          (js/BigInt.asIntN 64 (js* "(~{} + 11400714819323198485n) & 18446744073709551615n" cur)))))
+             z3 (mix64-bi s)]
+         (js/Number (js/BigInt.asIntN 53 z3))))
+     (next-int [_]
+       (let [s (swap! state-atom
+                      (fn [s]
+                        (let [cur (if (js* "typeof ~{} === 'bigint'" s) s (js/BigInt (str (or s 0))))]
+                          (js/BigInt.asIntN 64 (js* "(~{} + 11400714819323198485n) & 18446744073709551615n" cur)))))
+             z3 (mix64-bi s)]
+         (js/Number (js/BigInt.asIntN 32 z3))))
+     (next-int [this bound]
+       (let [n (bit-and (next-int this) 0x7fffffff)]
+         (mod n bound)))
+     (next-double [this]
+       (let [n (bit-and (next-int this) 0x7fffffff)]
+         (/ n 0x7fffffff)))
+     (next-bytes [this byte-arr]
+       (let [len (.-length byte-arr)]
+         (dotimes [i len]
+           (aset byte-arr i (bit-and (next-int this) 0xff)))
+         byte-arr))
+     (random-state [_]
+       (let [cur @state-atom]
+         (if (js* "typeof ~{} === 'bigint'" cur) cur (js/BigInt (str (or cur 0))))))
+     (fork-random [this]
+       (fork-random this nil))
+     (fork-random [_ branch-id]
+       (let [cur (if (js* "typeof ~{} === 'bigint'" @state-atom) @state-atom (js/BigInt (str (or @state-atom 0))))
+             salt (branch-id->bi branch-id)
+             new-seed (mix64-bi (js* "(~{} ^ ~{}) & 18446744073709551615n" cur salt))]
+         (SplitMix64PRNG. (atom (js/BigInt.asIntN 64 new-seed)))))
+
+     IDeref
+     (-deref [_]
+       @state-atom)))
 
 #?(:clj
    (extend-type Random
@@ -162,42 +296,44 @@
      (next-double [this] (.nextDouble this))
      (next-bytes [this byte-arr]
        (.nextBytes this ^bytes byte-arr)
-       byte-arr)))
-
-#?(:cljs
-   (deftype SplitMix64PRNG [^:mutable state]
-     IRandom
-     (next-long [_]
-       (let [s (.asUintN js/BigInt 64 (+ state (js/BigInt "0x9e3779b97f4a7c15")))]
-         (set! state s)
-         (let [z1 (.asUintN js/BigInt 64 (* (bit-xor s (bit-shift-right s (js/BigInt 30)))
-                                            (js/BigInt "0xbf58476d1ce4e5b9")))
-               z2 (.asUintN js/BigInt 64 (* (bit-xor z1 (bit-shift-right z1 (js/BigInt 27)))
-                                            (js/BigInt "0x94d049bb133111eb")))
-               z3 (bit-xor z2 (bit-shift-right z2 (js/BigInt 31)))]
-           (js/Number (.asIntN js/BigInt 64 z3)))))
-     (next-int [this]
-       (bit-or (int (next-long this)) 0))
-     (next-int [this bound]
-       (let [n (bit-and (next-int this) 0x7fffffff)]
-         (mod n bound)))
-     (next-double [this]
-       (let [n (bit-and (next-int this) 0x7fffffff)]
-         (/ n 0x7fffffff)))
-     (next-bytes [this byte-arr]
-       (let [len (.-length byte-arr)]
-         (dotimes [i len]
-           (aset byte-arr i (bit-and (next-int this) 0xff)))
-         byte-arr))))
+       byte-arr)
+     (random-state [_] nil)
+     (fork-random
+       ([this] (Random. (.nextLong this)))
+       ([this _branch-id] (Random. (.nextLong this))))))
 
 (defn make-random
-  "Constructs an IRandom seeded PRNG instance."
+  "Constructs an IRandom seeded SplitMix64 PRNG instance."
   ([]
-   #?(:clj  (Random.)
-      :cljs (SplitMix64PRNG. (js/BigInt (.now js/Date)))))
+   #?(:clj  (SplitMix64PRNG. (atom (System/nanoTime)))
+      :cljs (SplitMix64PRNG. (atom (js/BigInt (.now js/Date))))))
   ([seed]
-   #?(:clj  (Random. (long seed))
-      :cljs (SplitMix64PRNG. (js/BigInt seed)))))
+   (cond
+     (instance? SplitMix64PRNG seed)
+     (SplitMix64PRNG. (atom @seed))
+
+     #?@(:clj
+         [(instance? Random seed)
+          (SplitMix64PRNG. (atom (.nextLong ^Random seed)))
+          (number? seed)
+          (SplitMix64PRNG. (atom (.longValue ^Number seed)))
+          (string? seed)
+          (SplitMix64PRNG. (atom (try (Long/parseLong seed) (catch Exception _ (branch-id->long seed)))))
+          (nil? seed)
+          (SplitMix64PRNG. (atom (long 0)))
+          :else
+          (SplitMix64PRNG. (atom (long (hash seed))))]
+         :cljs
+         [(js* "typeof ~{} === 'bigint'" seed)
+          (SplitMix64PRNG. (atom seed))
+          (number? seed)
+          (SplitMix64PRNG. (atom (js/BigInt (str (long seed)))))
+          (string? seed)
+          (SplitMix64PRNG. (atom (try (js/BigInt seed) (catch :default _ (branch-id->bi seed)))))
+          (nil? seed)
+          (SplitMix64PRNG. (atom (js/BigInt 0)))
+          :else
+          (SplitMix64PRNG. (atom (js/BigInt (str (hash seed)))))]))))
 
 (defn random-bytes
   "Generates n cryptographically secure random bytes.
@@ -634,23 +770,38 @@
 
 (defn generate-keypair
   "Generates an Ed25519 keypair.
+   When seed-or-rng is provided, generates deterministically across JVM and CLJS.
    Returns a map with :public (X.509 SPKI DER) and :private (PKCS#8 DER) byte arrays."
-  []
-  #?(:clj
-     (let [kpg (KeyPairGenerator/getInstance "Ed25519")
-           kp (.generateKeyPair kpg)
-           pub (.getEncoded (.getPublic kp))
-           priv (.getEncoded (.getPrivate kp))]
-       {:public pub :private priv :public-key pub :private-key priv})
-     :cljs
-     (if node-crypto
-       (let [kp (.generateKeyPairSync node-crypto "ed25519")
-             pub-der (.export (.-publicKey kp) #js {:type "spki" :format "der"})
-             priv-der (.export (.-privateKey kp) #js {:type "pkcs8" :format "der"})
-             pub (js/Uint8Array. pub-der)
-             priv (js/Uint8Array. priv-der)]
-         {:public pub :private priv :public-key pub :private-key priv})
-       (pure-ed25519-keypair))))
+  ([] (generate-keypair nil))
+  ([seed-or-rng]
+   (if seed-or-rng
+     (let [seed32 (cond
+                    (fressian/bytes? seed-or-rng) seed-or-rng
+                    (satisfies? IRandom seed-or-rng)
+                    (let [ba #?(:clj (byte-array 32) :cljs (js/Uint8Array. 32))]
+                      (next-bytes seed-or-rng ba)
+                      ba)
+                    :else
+                    (let [r (make-random seed-or-rng)
+                          ba #?(:clj (byte-array 32) :cljs (js/Uint8Array. 32))]
+                      (next-bytes r ba)
+                      ba))]
+       (pure-ed25519-keypair seed32))
+     #?(:clj
+        (let [kpg (KeyPairGenerator/getInstance "Ed25519")
+              kp (.generateKeyPair kpg)
+              pub (.getEncoded (.getPublic kp))
+              priv (.getEncoded (.getPrivate kp))]
+          {:public pub :private priv :public-key pub :private-key priv})
+        :cljs
+        (if node-crypto
+          (let [kp (.generateKeyPairSync node-crypto "ed25519")
+                pub-der (.export (.-publicKey kp) #js {:type "spki" :format "der"})
+                priv-der (.export (.-privateKey kp) #js {:type "pkcs8" :format "der"})
+                pub (js/Uint8Array. pub-der)
+                priv (js/Uint8Array. priv-der)]
+            {:public pub :private priv :public-key pub :private-key priv})
+          (pure-ed25519-keypair))))))
 
 (defn- ensure-bytes [x]
   (cond

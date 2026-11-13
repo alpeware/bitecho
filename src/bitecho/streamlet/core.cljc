@@ -262,7 +262,7 @@
          acc
          (recur parent-hash (conj visited parent-hash) (conj acc parent-hash)))))))
 
-(defn- find-consecutive-epoch-head
+(defn find-consecutive-epoch-head
   "Finds the middle block's hash of any 3 consecutive notarized blocks.
    Returns a sequence of such hashes.
    When existing-finalized is provided, skips candidate if parent-hash is already finalized."
@@ -328,7 +328,7 @@
   "Default maximum encoded wire byte budget (32 KiB) for a :send-propose command."
   32768)
 
-(defn- protected-ancestor-chain-hashes
+(defn protected-ancestor-chain-hashes
   "When state tracks :executed-finalized-blocks or :last-executed-finalized-epoch,
    returns the set of block hashes along the ancestor chain from :head-hash,
    :latest-finalized-block-hash, and any unexecuted :finalized-blocks back to
