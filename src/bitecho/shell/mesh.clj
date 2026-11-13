@@ -557,23 +557,46 @@
                                    loaded-ledger
                                    genesis-ledger)
                         loaded-ledger)
-        merged-config (merge (or (:config loaded-state) {})
-                             (get config :protocol {})
-                             (get cluster-cfg :protocol {})
-                             overrides)]
+        pubkey-bytes (resolve-pubkey-bytes (get-in identity [:keypair :public]))
+        nodes-cfg (get cluster-cfg :nodes {})
+        raw-validators (or (:validators cluster-cfg) (keys nodes-cfg))
+        cfg-validators (vec (sort (keep (fn [v] (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)) raw-validators)))
+        effective-validators (if (seq cfg-validators) cfg-validators (:validators loaded-state))
+        effective-mesh-nodes (or (:mesh-nodes cluster-cfg)
+                                 (when (seq effective-validators)
+                                   (into {} (map (fn [pk] [pk 1.0]) effective-validators)))
+                                 (:mesh-nodes loaded-state))
+        peer-entries (for [[_ ninfo] nodes-cfg
+                           :let [pk (:pubkey ninfo)
+                                 pk-bytes (resolve-pubkey-bytes pk)]
+                           :when (some? pk-bytes)]
+                       [(if (string? pk) pk (basalt/bytes->hex pk-bytes))
+                        pk-bytes])
+        effective-peers-map (into (or (:peers-map loaded-state) {})
+                                  (cond-> peer-entries
+                                    pubkey-bytes (conj [pubkey-hex pubkey-bytes])))
+        merged-config (cond-> (merge (or (:config loaded-state) {})
+                                     (get config :protocol {})
+                                     (get cluster-cfg :protocol {})
+                                     overrides)
+                        (seq effective-validators) (assoc :validators effective-validators)
+                        (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes))]
     (merge loaded-state
            overrides
-           {:config merged-config
-            :node-pubkey pubkey-hex
-            :node-private-key privkey-bytes
-            :keypair (:keypair identity)
-            :last-executed-finalized-epoch (long (or (:last-executed-finalized-epoch loaded-state)
-                                                     (:epoch loaded-state)
-                                                     0))
-            :executed-finalized-blocks (or (:executed-finalized-blocks loaded-state)
-                                           (:finalized-blocks loaded-state)
-                                           #{})
-            :ledger merged-ledger})))
+           (cond-> {:config merged-config
+                    :node-pubkey pubkey-hex
+                    :node-private-key privkey-bytes
+                    :keypair (:keypair identity)
+                    :last-executed-finalized-epoch (long (or (:last-executed-finalized-epoch loaded-state)
+                                                             (:epoch loaded-state)
+                                                             0))
+                    :executed-finalized-blocks (or (:executed-finalized-blocks loaded-state)
+                                                   (:finalized-blocks loaded-state)
+                                                   #{})
+                    :ledger merged-ledger}
+             (seq effective-validators) (assoc :validators effective-validators)
+             (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes)
+             (seq effective-peers-map) (assoc :peers-map effective-peers-map)))))
 
 (defn- validate-peer-node-entry
   "Validates a single peer node entry in cluster config.

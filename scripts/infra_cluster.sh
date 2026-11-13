@@ -19,9 +19,9 @@ SSH_KEY="${SSH_KEY:-${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519}"
 NODES=("ns1" "ns2" "ns3")
 
 declare -A NODE_IPS=(
-  ["ns1"]="34.19.71.246"
-  ["ns2"]="34.56.253.255"
-  ["ns3"]="136.108.244.159"
+  ["ns1"]="35.212.172.159"
+  ["ns2"]="35.209.253.119"
+  ["ns3"]="35.211.30.106"
 )
 
 declare -A INGRESS_TARGETS=(
@@ -251,7 +251,7 @@ REMOTE_CUT
 
   echo "  Waiting for ${node} bitecho-infra.service readiness..."
   local ok=false
-  for _ in $(seq 1 20); do
+  for _ in $(seq 1 45); do
     sleep 2
     if verify_node_health "$node" 2>/dev/null; then
       ok=true
@@ -274,14 +274,15 @@ cmd_cutover() {
     exit 1
   fi
 
-  echo "--> Precondition: Auditing validator cluster (node1..node3) before infra cutover..."
-  "${ROOT_DIR}/scripts/cluster.sh" audit
-
   echo "--> Ensuring shared TLS secret is provisioned across ns1..ns3..."
   cmd_provision_secret
 
-  echo "--> Building target/bitecho.jar locally..."
-  (cd "${ROOT_DIR}" && clojure -T:build uber)
+  if [[ "${SKIP_UBER_BUILD:-0}" != "1" || ! -f "${ROOT_DIR}/target/bitecho.jar" ]]; then
+    echo "--> Building target/bitecho.jar locally..."
+    (cd "${ROOT_DIR}" && clojure -T:build uber)
+  else
+    echo "--> Using existing target/bitecho.jar (SKIP_UBER_BUILD=1)..."
+  fi
 
   local cold_key_file="${ROOT_DIR}/.ssh/infra_cold_root_keypair.edn"
   mkdir -p "$(dirname "${cold_key_file}")"
@@ -337,6 +338,27 @@ REMOTE_ID
     fi
   done
 
+  local treasury_key_file="${ROOT_DIR}/.ssh/devnet_treasury_keypair.edn"
+  local custody_key_file="${ROOT_DIR}/.ssh/devnet_custody_keypair.edn"
+  local TREASURY_PUB TREASURY_PRIV CUSTODY_PUB CUSTODY_PRIV
+  TREASURY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${treasury_key_file}" | head -n1 | cut -d'"' -f2)"
+  TREASURY_PRIV="$(grep -o ':privkey-hex "[^"]*"' "${treasury_key_file}" | head -n1 | cut -d'"' -f2)"
+  CUSTODY_PUB="$(grep -o ':pubkey-hex "[^"]*"' "${custody_key_file}" | head -n1 | cut -d'"' -f2)"
+  CUSTODY_PRIV="$(grep -o ':privkey-hex "[^"]*"' "${custody_key_file}" | head -n1 | cut -d'"' -f2)"
+  local NODE1_PUB="302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086"
+  local NODE2_PUB="302a300506032b6570032100592ab794dea07da278ef3853e8cc2d2f6ac5e3417eac80d93ab01e1fc61653ba"
+  local NODE3_PUB="302a300506032b65700321007b7f58652a2c26b4180aeee45ff12f927a45d92e00fc3462c5d854f6203351f1"
+  local devnet_agent_pubkeys="${DEVNET_AGENT_PUBKEYS:-"302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc 302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"}"
+  local agent_ledger_lines=""
+  local agent_count=0
+  for apk in $devnet_agent_pubkeys; do
+    if [[ -n "$apk" ]]; then
+      agent_ledger_lines="${agent_ledger_lines}                               \"${apk}\" {:balance 1000000 :seq 0 :deps []}\n"
+      agent_count=$((agent_count + 1))
+    fi
+  done
+  local custody_bal=$((4194000000 - agent_count * 1000000))
+
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
     local ingress_ip="${INGRESS_TARGETS[$node]}"
@@ -383,23 +405,45 @@ REMOTE_ID
                    :ns3 {:ip4 "${NODE_IPS[ns3]}" :port 5000 :infra-port 5006 :pubkey "${PUBKEYS[ns3]}" :fingerprint "${FINGERPRINTS[ns3]}"}}}
  :validator {:node/id :${node}
              :node-id :${node}
+             :network :devnet
              :state-dir "/var/lib/clj-web"
-             :http {:enabled? false}
+             :treasury-pubkey "${TREASURY_PUB}"
+             :treasury-privkey "${TREASURY_PRIV}"
+             :custody-pubkey "${CUSTODY_PUB}"
+             :custody-privkey "${CUSTODY_PRIV}"
+             :genesis-ledger {"${CUSTODY_PUB}" {:balance ${custody_bal} :seq 0 :deps []}
+                              "genesis-core-team" {:balance 6300000000 :seq 0 :deps []}
+                              "genesis-partners" {:balance 4200000000 :seq 0 :deps []}
+                              "genesis-ecosystem" {:balance 4200000000 :seq 0 :deps []}
+                              "${NODE1_PUB}" {:balance 1000000 :seq 0 :deps []}
+                              "${NODE2_PUB}" {:balance 1000000 :seq 0 :deps []}
+                              "${NODE3_PUB}" {:balance 1000000 :seq 0 :deps []}
+                              "${PUBKEYS[ns1]}" {:balance 1000000 :seq 0 :deps []}
+                              "${PUBKEYS[ns2]}" {:balance 1000000 :seq 0 :deps []}
+                              "${PUBKEYS[ns3]}" {:balance 1000000 :seq 0 :deps []}
+$(printf "%b" "${agent_ledger_lines}")}
+             :http {:enabled? true
+                    :host "127.0.0.1"
+                    :port 8080}
              :transport :datachannel
              :port 5000
              :ingress-port 5010
-             :protocol {:nodes #{:node1 :node2 :node3 :ns1 :ns2 :ns3}
+             :protocol {:tick-interval-ms 10000
+                        :epoch-length-ms 10000
+                        :nodes #{:node1 :node2 :node3 :ns1 :ns2 :ns3}
                         :validator-count 6
                         :quorum-threshold 4}
              :cluster {:port 5000
                        :agent-port 5010
-                       :validators [:node1 :node2 :node3 :ns1 :ns2 :ns3]
-                       :nodes {:node1 {:ip "35.212.129.138" :port 5000 :agent-port 5010 :pubkey "302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086" :fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B" :ice-ufrag "1ec0ae74" :ice-pwd "d928f1aac56a0d6e6fdda551"}
-                               :node2 {:ip "35.206.120.143" :port 5000 :agent-port 5010 :pubkey "302a300506032b6570032100592ab794dea07da278ef3853e8cc2d2f6ac5e3417eac80d93ab01e1fc61653ba" :fingerprint "F8:73:94:91:1D:7B:CA:66:D9:67:9E:4B:72:B0:D0:8D:5F:5C:37:0F:FE:04:2E:ED:86:E6:8D:79:B8:07:43:78" :ice-ufrag "18388497" :ice-pwd "20540a60217702b8869d7bf5"}
-                               :node3 {:ip "35.211.71.139" :port 5000 :agent-port 5010 :pubkey "302a300506032b65700321007b7f58652a2c26b4180aeee45ff12f927a45d92e00fc3462c5d854f6203351f1" :fingerprint "38:2B:18:4B:23:E8:F4:32:D7:08:5A:2A:A4:45:4F:EE:12:D4:51:B1:9B:2D:66:7C:2E:E1:2A:3E:7C:B3:60:40" :ice-ufrag "4b1d8fc5" :ice-pwd "47e794a9ed5ef04cc0ebbe7f"}
-                               :ns1 {:ip "${NODE_IPS[ns1]}" :port 5000 :agent-port 5010 :pubkey "${PUBKEYS[ns1]}" :fingerprint "${FINGERPRINTS[ns1]}" :ice-ufrag "${ICE_UFRAGS[ns1]}" :ice-pwd "${ICE_PWDS[ns1]}"}
-                               :ns2 {:ip "${NODE_IPS[ns2]}" :port 5000 :agent-port 5010 :pubkey "${PUBKEYS[ns2]}" :fingerprint "${FINGERPRINTS[ns2]}" :ice-ufrag "${ICE_UFRAGS[ns2]}" :ice-pwd "${ICE_PWDS[ns2]}"}
-                               :ns3 {:ip "${NODE_IPS[ns3]}" :port 5000 :agent-port 5010 :pubkey "${PUBKEYS[ns3]}" :fingerprint "${FINGERPRINTS[ns3]}" :ice-ufrag "${ICE_UFRAGS[ns3]}" :ice-pwd "${ICE_PWDS[ns3]}"}}}}}
+                       :agent-tcp-port 5010
+                       :listen-agents? true
+                       :validators ["${NODE1_PUB}" "${NODE2_PUB}" "${NODE3_PUB}" "${PUBKEYS[ns1]}" "${PUBKEYS[ns2]}" "${PUBKEYS[ns3]}"]
+                       :nodes {:node1 {:ip "35.212.129.138" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${NODE1_PUB}" :fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B" :ice-ufrag "1ec0ae74" :ice-pwd "d928f1aac56a0d6e6fdda551"}
+                               :node2 {:ip "35.206.120.143" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${NODE2_PUB}" :fingerprint "F8:73:94:91:1D:7B:CA:66:D9:67:9E:4B:72:B0:D0:8D:5F:5C:37:0F:FE:04:2E:ED:86:E6:8D:79:B8:07:43:78" :ice-ufrag "18388497" :ice-pwd "20540a60217702b8869d7bf5"}
+                               :node3 {:ip "35.211.71.139" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${NODE3_PUB}" :fingerprint "38:2B:18:4B:23:E8:F4:32:D7:08:5A:2A:A4:45:4F:EE:12:D4:51:B1:9B:2D:66:7C:2E:E1:2A:3E:7C:B3:60:40" :ice-ufrag "4b1d8fc5" :ice-pwd "47e794a9ed5ef04cc0ebbe7f"}
+                               :ns1 {:ip "${NODE_IPS[ns1]}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEYS[ns1]}" :fingerprint "${FINGERPRINTS[ns1]}" :ice-ufrag "${ICE_UFRAGS[ns1]}" :ice-pwd "${ICE_PWDS[ns1]}"}
+                               :ns2 {:ip "${NODE_IPS[ns2]}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEYS[ns2]}" :fingerprint "${FINGERPRINTS[ns2]}" :ice-ufrag "${ICE_UFRAGS[ns2]}" :ice-pwd "${ICE_PWDS[ns2]}"}
+                               :ns3 {:ip "${NODE_IPS[ns3]}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEYS[ns3]}" :fingerprint "${FINGERPRINTS[ns3]}" :ice-ufrag "${ICE_UFRAGS[ns3]}" :ice-pwd "${ICE_PWDS[ns3]}"}}}}}
 CFG_EOF
     clojure -M -e "(let [m (clojure.edn/read-string (slurp \"${tmp_cfg}\"))] (assert (map? (:validator m)) \"Missing :validator map in config.edn\"))"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \

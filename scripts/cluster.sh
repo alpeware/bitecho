@@ -98,9 +98,9 @@ declare -A ADDRESS_NAME=(
 )
 
 declare -A STATIC_IPS=(
-  [ns1]="34.19.71.246"
-  [ns2]="34.56.253.255"
-  [ns3]="136.108.244.159"
+  [ns1]="35.212.172.159"
+  [ns2]="35.209.253.119"
+  [ns3]="35.211.30.106"
 )
 
 # ------------------------------------------------------------------------------
@@ -551,8 +551,8 @@ cmd_deploy() {
   echo "Directory Pubkey: ${DIRECTORY_PUB}"
   export DIRECTORY_PUB
 
-  # 3. Upload uberjar to all 3 VMs
-  echo "--> Step 3/7: Uploading uberjar to all nodes via rsync..."
+  # 3. Upload uberjar to all 6 VMs (node1..node3 + ns1..ns3)
+  echo "--> Step 3/7: Uploading uberjar to all 6 nodes via rsync..."
   for node in "${NODES[@]}"; do
     local ip
     ip="$(get_ip "$node")"
@@ -560,20 +560,44 @@ cmd_deploy() {
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
       "${ROOT_DIR}/target/bitecho.jar" "${SSH_USER}@${ip}:/opt/bitecho/bitecho.jar"
   done
+  local infra_ssh_key="${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519"
+  for node in "${INFRA_NODES[@]}"; do
+    local ip
+    ip="$(get_ip "$node")"
+    echo "Uploading to ${node} (${ip})..."
+    ssh_cmd "$node" "mkdir -p /opt/bitecho-infra /etc/bitecho-infra"
+    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${infra_ssh_key}" \
+      "${ROOT_DIR}/target/bitecho.jar" "cljweb@${ip}:/opt/bitecho-infra/bitecho.jar"
+  done
 
   # 4. Fetch persistent node identities
-  echo "--> Step 4/7: Fetching persistent node identities from all nodes..."
+  echo "--> Step 4/7: Fetching persistent node identities from all 6 nodes (node1..node3 + ns1..ns3)..."
   declare -A PUBKEY=()
   declare -A FINGERPRINT=()
   declare -A ICE_UFRAG=()
   declare -A ICE_PWD=()
 
-  for node in "${NODES[@]}"; do
+  for node in "${ALL_NODES[@]}"; do
     local ip
     ip="$(get_ip "$node")"
     echo "Fetching identity on ${node} (${ip})..."
     local id_out
-    id_out="$(ssh_cmd "$node" bash -s << REMOTE_ID
+    if [[ "$node" == ns* ]]; then
+      id_out="$(ssh_cmd "$node" bash -s << REMOTE_NS_ID
+set -euo pipefail
+TMP_CFG="/tmp/bootstrap-ns-config.edn"
+echo "{:node/id :${node} :domain \"bitecho.org\" :state-dir \"/var/lib/clj-web\"}" > "\$TMP_CFG"
+/opt/jdk-25/bin/java \
+  -Xms64m -Xmx128m \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho-infra/bitecho.jar print-fingerprint "\$TMP_CFG"
+rm -f "\$TMP_CFG"
+REMOTE_NS_ID
+)"
+    else
+      id_out="$(ssh_cmd "$node" bash -s << REMOTE_ID
 set -euo pipefail
 CFG_FILE="/etc/bitecho/config.edn"
 if [ ! -f "\$CFG_FILE" ]; then
@@ -590,6 +614,7 @@ fi
 rm -f /tmp/bootstrap-config.edn
 REMOTE_ID
 )"
+    fi
     PUBKEY[$node]="$(echo "$id_out" | grep '^Ed25519 Pubkey:' | awk '{print $NF}')"
     FINGERPRINT[$node]="$(echo "$id_out" | grep '^SHA-256 Fingerprint:' | awk '{print $NF}')"
     ICE_UFRAG[$node]="$(echo "$id_out" | grep '^ICE ufrag:' | awk '{print $NF}')"
@@ -615,8 +640,12 @@ REMOTE_ID
       agent_count=$((agent_count + 1))
     fi
   done
-  local custody_bal=$((4197000000 - agent_count * 1000000))
-  echo "Devnet Agent Pubkeys: ${agent_count} agent(s) configured (Custody allocation: ${custody_bal} ECH)."
+  local custody_bal=$((4194000000 - agent_count * 1000000))
+  local ip_ns1 ip_ns2 ip_ns3
+  ip_ns1="$(get_ip ns1)"
+  ip_ns2="$(get_ip ns2)"
+  ip_ns3="$(get_ip ns3)"
+  echo "Devnet Agent Pubkeys: ${agent_count} agent(s) configured across 6-validator mesh (Custody allocation: ${custody_bal} ECH)."
 
   for node in "${NODES[@]}"; do
     local ip
@@ -648,9 +677,15 @@ REMOTE_ID
                   "${PUBKEY[node1]}" {:balance 1000000 :seq 0 :deps []}
                   "${PUBKEY[node2]}" {:balance 1000000 :seq 0 :deps []}
                   "${PUBKEY[node3]}" {:balance 1000000 :seq 0 :deps []}
+                  "${PUBKEY[ns1]}" {:balance 1000000 :seq 0 :deps []}
+                  "${PUBKEY[ns2]}" {:balance 1000000 :seq 0 :deps []}
+                  "${PUBKEY[ns3]}" {:balance 1000000 :seq 0 :deps []}
 $(printf "%b" "${agent_ledger_lines}")}
  :protocol {:tick-interval-ms ${TICK_INTERVAL_MS}
-            :epoch-length-ms ${TICK_INTERVAL_MS}}
+            :epoch-length-ms ${TICK_INTERVAL_MS}
+            :nodes #{:node1 :node2 :node3 :ns1 :ns2 :ns3}
+            :validator-count 6
+            :quorum-threshold 4}
  :http {:enabled? true
         :host "127.0.0.1"
         :port 8080}
@@ -658,10 +693,13 @@ $(printf "%b" "${agent_ledger_lines}")}
            :agent-port 5010
            :agent-tcp-port 5010
            :listen-agents? ${LISTEN_AGENTS:-false}
-           :validators ["${PUBKEY[node1]}" "${PUBKEY[node2]}" "${PUBKEY[node3]}"]
+           :validators ["${PUBKEY[node1]}" "${PUBKEY[node2]}" "${PUBKEY[node3]}" "${PUBKEY[ns1]}" "${PUBKEY[ns2]}" "${PUBKEY[ns3]}"]
            :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
                    :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
-                   :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}}}}
+                   :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}
+                   :ns1 {:ip "${ip_ns1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[ns1]}" :fingerprint "${FINGERPRINT[ns1]}" :ice-ufrag "${ICE_UFRAG[ns1]}" :ice-pwd "${ICE_PWD[ns1]}"}
+                   :ns2 {:ip "${ip_ns2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[ns2]}" :fingerprint "${FINGERPRINT[ns2]}" :ice-ufrag "${ICE_UFRAG[ns2]}" :ice-pwd "${ICE_PWD[ns2]}"}
+                   :ns3 {:ip "${ip_ns3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[ns3]}" :fingerprint "${FINGERPRINT[ns3]}" :ice-ufrag "${ICE_UFRAG[ns3]}" :ice-pwd "${ICE_PWD[ns3]}"}}}}
 CFG_EOF
 
     chmod 600 "$tmp_cfg"
@@ -710,7 +748,10 @@ REMOTE_CFG
  :directory-pubkey "${DIRECTORY_PUB}"
  :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node1.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
          :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node2.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
-         :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}}}
+         :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}
+         :ns1 {:ip "${ip_ns1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns1.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[ns1]}" :fingerprint "${FINGERPRINT[ns1]}" :ice-ufrag "${ICE_UFRAG[ns1]}" :ice-pwd "${ICE_PWD[ns1]}"}
+         :ns2 {:ip "${ip_ns2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns2.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[ns2]}" :fingerprint "${FINGERPRINT[ns2]}" :ice-ufrag "${ICE_UFRAG[ns2]}" :ice-pwd "${ICE_PWD[ns2]}"}
+         :ns3 {:ip "${ip_ns3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns3.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[ns3]}" :fingerprint "${FINGERPRINT[ns3]}" :ice-ufrag "${ICE_UFRAG[ns3]}" :ice-pwd "${ICE_PWD[ns3]}"}}}
 EDN_BOOTSTRAP_EOF
 
   local BOOTSTRAP_SIG
@@ -729,7 +770,10 @@ EDN_BOOTSTRAP_EOF
  :directory-pubkey "${DIRECTORY_PUB}"
  :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node1.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
          :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node2.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
-         :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}}}
+         :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}
+         :ns1 {:ip "${ip_ns1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns1.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[ns1]}" :fingerprint "${FINGERPRINT[ns1]}" :ice-ufrag "${ICE_UFRAG[ns1]}" :ice-pwd "${ICE_PWD[ns1]}"}
+         :ns2 {:ip "${ip_ns2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns2.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[ns2]}" :fingerprint "${FINGERPRINT[ns2]}" :ice-ufrag "${ICE_UFRAG[ns2]}" :ice-pwd "${ICE_PWD[ns2]}"}
+         :ns3 {:ip "${ip_ns3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns3.bitecho.org" :ingress-port 443 :pubkey "${PUBKEY[ns3]}" :fingerprint "${FINGERPRINT[ns3]}" :ice-ufrag "${ICE_UFRAG[ns3]}" :ice-pwd "${ICE_PWD[ns3]}"}}}
 EDN_BOOTSTRAP_SIGNED_EOF
 
   cat > "${ROOT_DIR}/devnet/bootstrap.txt" << TXT_BOOTSTRAP_EOF
@@ -738,7 +782,7 @@ Bitecho Genesis Devnet - Bootstrap Peer & WebRTC Connection Descriptor
 Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 ================================================================================
 
-Network: devnet (3-node Streamlet BFT validator quorum, N=3, quorum=2 of 3)
+Network: devnet (6-node Streamlet BFT validator quorum, N=6, quorum=4 of 6)
 Domain: bitecho.org
 Authority Pubkey: ${DIRECTORY_PUB}
 Issued Epoch: 0
@@ -779,6 +823,36 @@ Node: node3 (us-east1)
   Ed25519 Pubkey:    ${PUBKEY[node3]}
   DTLS Fingerprint:  ${FINGERPRINT[node3]}
   ICE Credentials:   ufrag=${ICE_UFRAG[node3]} pwd=${ICE_PWD[node3]}
+
+Node: ns1 (us-west1)
+  Cluster Address:   ${ip_ns1}:5000 (UDP DataChannel)
+  Agent Ingress:     ${ip_ns1}:5010 (UDP DataChannel)
+  Agent TCP Ingress: ${ip_ns1}:5010 (TCP DataChannel)
+  Agent HTTPS/Proxy Ingress: ns1.bitecho.org:443 (TCP DataChannel)
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz, /burnsz (bound to localhost)
+  Ed25519 Pubkey:    ${PUBKEY[ns1]}
+  DTLS Fingerprint:  ${FINGERPRINT[ns1]}
+  ICE Credentials:   ufrag=${ICE_UFRAG[ns1]} pwd=${ICE_PWD[ns1]}
+
+Node: ns2 (us-central1)
+  Cluster Address:   ${ip_ns2}:5000 (UDP DataChannel)
+  Agent Ingress:     ${ip_ns2}:5010 (UDP DataChannel)
+  Agent TCP Ingress: ${ip_ns2}:5010 (TCP DataChannel)
+  Agent HTTPS/Proxy Ingress: ns2.bitecho.org:443 (TCP DataChannel)
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz, /burnsz (bound to localhost)
+  Ed25519 Pubkey:    ${PUBKEY[ns2]}
+  DTLS Fingerprint:  ${FINGERPRINT[ns2]}
+  ICE Credentials:   ufrag=${ICE_UFRAG[ns2]} pwd=${ICE_PWD[ns2]}
+
+Node: ns3 (us-east1)
+  Cluster Address:   ${ip_ns3}:5000 (UDP DataChannel)
+  Agent Ingress:     ${ip_ns3}:5010 (UDP DataChannel)
+  Agent TCP Ingress: ${ip_ns3}:5010 (TCP DataChannel)
+  Agent HTTPS/Proxy Ingress: ns3.bitecho.org:443 (TCP DataChannel)
+  HTTP Diagnostics:  http://127.0.0.1:8080/healthz, /statusz, /burnsz (bound to localhost)
+  Ed25519 Pubkey:    ${PUBKEY[ns3]}
+  DTLS Fingerprint:  ${FINGERPRINT[ns3]}
+  ICE Credentials:   ufrag=${ICE_UFRAG[ns3]} pwd=${ICE_PWD[ns3]}
 
 Connection Instructions for Agents / Light Nodes:
 Agent Ingress (UDP port 5010) is enabled on Devnet (:listen-agents? ${LISTEN_AGENTS:-true}).
@@ -936,7 +1010,7 @@ cmd_status() {
         local raw_metrics
         raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_STATUS' 2>/dev/null || echo "SSH_FAILED"
 set -o pipefail
-svc=$(systemctl is-active bitecho bitecho-infra 2>/dev/null | grep active | head -n1 || echo "inactive")
+svc=$(if systemctl is-active --quiet bitecho.service 2>/dev/null || systemctl is-active --quiet bitecho-infra.service 2>/dev/null; then echo "active"; else echo "inactive"; fi)
 cpu=$(ps -o %cpu= -C java 2>/dev/null | awk '{s+=$1} END {if (NR>0) printf "%.1f%%", s; else print "0.0%"}' || echo "N/A")
 mem=$(free -m 2>/dev/null | awk '/Mem:/ {print $3 "/" $2 "M"}' || echo "N/A")
 disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}' || echo "N/A")
