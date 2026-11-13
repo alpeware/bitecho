@@ -893,14 +893,14 @@ Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across a
 ### `storage-put`
 Encrypts arbitrary UTF-8 (`--data`) or hex (`--data-hex`) state with a domain-separated XSalsa20-Poly1305 key derived from the node's seed and `--slot-id` (`SHA-256("bitecho-e2ee-storage-v1:" || seed || ":" || slot-id)`), wraps the ciphertext in a content-addressed `Blob` + signed monotonic `Pointer`, stores it locally, and broadcasts a `:storage-replicate` envelope to the network. See [`docs/STORAGE.md`](../docs/STORAGE.md).
 
-- **CLI**: `clojure -M:light-node storage-put --slot-id browser-wallet --data '{"theme":"dark"}' [--subnet-id nexus] [--seq <n>]`
-- **JSONL**: `{"cmd": "storage-put", "slot_id": "browser-wallet", "data": "{\"theme\":\"dark\"}", "subnet_id": "nexus"}`
+- **CLI**: `clojure -M:light-node storage-put --slot-id browser-wallet --data '{"theme":"dark"}' [--subnet-id global] [--seq <n>]`
+- **JSONL**: `{"cmd": "storage-put", "slot_id": "browser-wallet", "data": "{\"theme\":\"dark\"}", "subnet_id": "global"}`
 - **Response**:
   ```json
   {
     "ok": true,
     "slot_id": "browser-wallet",
-    "subnet_id": "nexus",
+    "subnet_id": "global",
     "path": "storage/<pubkey-hex>/browser-wallet",
     "cid": "<64-char-hex-blob-cid>",
     "seq": 1,
@@ -913,14 +913,14 @@ Encrypts arbitrary UTF-8 (`--data`) or hex (`--data-hex`) state with a domain-se
 ### `storage-get`
 Verifies the `Blob` CID, `Pointer` Ed25519 signature, and anti-rollback sequence number (`--min-seq`), then decrypts the slot's E2EE ciphertext using the node's derived slot key.
 
-- **CLI**: `clojure -M:light-node storage-get --slot-id browser-wallet [--subnet-id nexus] [--min-seq 1]`
-- **JSONL**: `{"cmd": "storage-get", "slot_id": "browser-wallet", "subnet_id": "nexus", "min_seq": 1}`
+- **CLI**: `clojure -M:light-node storage-get --slot-id browser-wallet [--subnet-id global] [--min-seq 1]`
+- **JSONL**: `{"cmd": "storage-get", "slot_id": "browser-wallet", "subnet_id": "global", "min_seq": 1}`
 - **Response**:
   ```json
   {
     "ok": true,
     "slot_id": "browser-wallet",
-    "subnet_id": "nexus",
+    "subnet_id": "global",
     "cid": "<64-char-hex-blob-cid>",
     "seq": 1,
     "data": "{\"theme\":\"dark\"}",
@@ -933,8 +933,8 @@ Verifies the `Blob` CID, `Pointer` Ed25519 signature, and anti-rollback sequence
 ### `storage-list`
 Lists all local and network-replicated E2EE storage slots and pointer versions (optionally filtered by `--subnet-id`).
 
-- **CLI**: `clojure -M:light-node storage-list [--subnet-id nexus]`
-- **JSONL**: `{"cmd": "storage-list", "subnet_id": "nexus"}`
+- **CLI**: `clojure -M:light-node storage-list [--subnet-id global]`
+- **JSONL**: `{"cmd": "storage-list", "subnet_id": "global"}`
 - **Response**:
   ```json
   {
@@ -942,7 +942,7 @@ Lists all local and network-replicated E2EE storage slots and pointer versions (
     "count": 1,
     "slots": [
       {
-        "subnet_id": "nexus",
+        "subnet_id": "global",
         "path": "storage/<pubkey-hex>/browser-wallet",
         "slot_id": "browser-wallet",
         "cid": "<64-char-hex-blob-cid>",
@@ -959,8 +959,8 @@ Lists all local and network-replicated E2EE storage slots and pointer versions (
 ### `capability-publish`
 Packs and signs a Fractal Capability Descriptor (`:storage/blob-pinning`, `:compute/uop-kernel`, `:compute/gpu-access`, `:model/weights`, `:network/turn-relay`, or `:network/gateway`) as a content-addressed `Blob` + signed `Pointer`, stores it locally, and broadcasts a `:capability-replicate` envelope to the network. See [`docs/CAPABILITIES.md`](../docs/CAPABILITIES.md).
 
-- **CLI**: `clojure -M:light-node capability-publish --capability-id uop-matmul-fp16 --capability-type compute/uop-kernel --price 25 [--burn-floor 5] [--subnet-id nexus] [--target-cid <64-hex>] [--metadata '{"shape":[4096,4096]}']`
-- **JSONL**: `{"cmd": "capability-publish", "capability_id": "uop-matmul-fp16", "capability_type": "compute/uop-kernel", "price_echo": 25, "burn_floor": 5, "subnet_id": "nexus", "metadata": {"shape": [4096, 4096]}}`
+- **CLI**: `clojure -M:light-node capability-publish --capability-id uop-matmul-fp16 --capability-type compute/uop-kernel --price 25 [--burn-floor 5] [--subnet-id global] [--target-cid <64-hex>] [--metadata '{"shape":[4096,4096]}']`
+- **JSONL**: `{"cmd": "capability-publish", "capability_id": "uop-matmul-fp16", "capability_type": "compute/uop-kernel", "price_echo": 25, "burn_floor": 5, "subnet_id": "global", "metadata": {"shape": [4096, 4096]}}`
 - **Response**:
   ```json
   {
@@ -968,7 +968,7 @@ Packs and signs a Fractal Capability Descriptor (`:storage/blob-pinning`, `:comp
     "capability_id": "uop-matmul-fp16",
     "capability_type": "compute/uop-kernel",
     "price_echo": 25,
-    "subnet_id": "nexus",
+    "subnet_id": "global",
     "path": "capability/<provider-pubkey>/uop-matmul-fp16",
     "cid": "<64-char-hex-blob-cid>",
     "seq": 1
@@ -980,8 +980,8 @@ Packs and signs a Fractal Capability Descriptor (`:storage/blob-pinning`, `:comp
 ### `capability-resolve`
 Resolves and cryptographically verifies a published capability descriptor by `--capability-id` and `--authority <pubkey-or-petname>` (or explicit `--path`), enforcing `Blob` hash integrity, `Pointer` signature validity, and `--min-seq` anti-rollback protection.
 
-- **CLI**: `clojure -M:light-node capability-resolve --capability-id uop-matmul-fp16 [--authority <pubkey-or-petname>] [--subnet-id nexus] [--min-seq 1]`
-- **JSONL**: `{"cmd": "capability-resolve", "capability_id": "uop-matmul-fp16", "authority": "<pubkey-or-petname>", "subnet_id": "nexus", "min_seq": 1}`
+- **CLI**: `clojure -M:light-node capability-resolve --capability-id uop-matmul-fp16 [--authority <pubkey-or-petname>] [--subnet-id global] [--min-seq 1]`
+- **JSONL**: `{"cmd": "capability-resolve", "capability_id": "uop-matmul-fp16", "authority": "<pubkey-or-petname>", "subnet_id": "global", "min_seq": 1}`
 - **Response**:
   ```json
   {
@@ -993,7 +993,7 @@ Resolves and cryptographically verifies a published capability descriptor by `--
       "capability_id": "uop-matmul-fp16",
       "capability_type": "compute/uop-kernel",
       "provider": "<provider-pubkey>",
-      "subnet_id": "nexus",
+      "subnet_id": "global",
       "price_echo": 25,
       "burn_floor": 5,
       "metadata": {"shape": [4096, 4096]}
@@ -1006,8 +1006,8 @@ Resolves and cryptographically verifies a published capability descriptor by `--
 ### `capability-list`
 Lists and unpacks all local and network-replicated capability descriptors, optionally filtered by `--subnet-id`, `--capability-type`, or `--authority <pubkey-or-petname>`.
 
-- **CLI**: `clojure -M:light-node capability-list [--subnet-id nexus] [--capability-type compute/uop-kernel] [--authority <pubkey-or-petname>]`
-- **JSONL**: `{"cmd": "capability-list", "subnet_id": "nexus", "capability_type": "compute/uop-kernel"}`
+- **CLI**: `clojure -M:light-node capability-list [--subnet-id global] [--capability-type compute/uop-kernel] [--authority <pubkey-or-petname>]`
+- **JSONL**: `{"cmd": "capability-list", "subnet_id": "global", "capability_type": "compute/uop-kernel"}`
 - **Response**:
   ```json
   {
@@ -1022,7 +1022,7 @@ Lists and unpacks all local and network-replicated capability descriptors, optio
           "capability_id": "uop-matmul-fp16",
           "capability_type": "compute/uop-kernel",
           "provider": "<provider-pubkey>",
-          "subnet_id": "nexus",
+          "subnet_id": "global",
           "price_echo": 25,
           "burn_floor": 5,
           "metadata": {"shape": [4096, 4096]}

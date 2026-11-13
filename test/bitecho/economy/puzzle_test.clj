@@ -15,13 +15,68 @@
             [clojure.test.check.properties :as prop]))
 
 (deftest test-puzzle-cid-content-addressing
-  (testing "puzzle-cid computes canonical SHA-256 matching Blob CID"
+  (testing "puzzle-cid computes canonical SHA-256 matching canonical AST Blob CID"
     (let [src "(and (= (get solution :x) 42) true)"
           cid (puzzle/puzzle-cid src)
-          blob (data/make-blob (fressian/utf8->bytes src) "application/x-bitecho-sci-puzzle")]
+          ast (puzzle/canonicalize-puzzle-ast src)
+          blob (data/make-blob (fressian/encode-canonical ast) "application/x-bitecho-sci-puzzle")]
       (is (= 64 (count cid)))
       (is (= cid (:blob/cid blob)))
       (is (re-matches #"[0-9a-f]{64}" cid)))))
+
+(deftest test-puzzle-ast-canonicalization-invariants
+  (testing "Comments, extra whitespace, newlines, and map key reordering produce exact same puzzle-cid"
+    (let [src1 "(fn [env solution]\n  ;; author comment\n  {:b 2 :a 1})"
+          src2 "   (fn [env solution] {:a 1 :b 2}   )\n\n"
+          src3 "(fn [env solution] {:b 2 :a 1})"
+          cid1 (puzzle/puzzle-cid src1)
+          cid2 (puzzle/puzzle-cid src2)
+          cid3 (puzzle/puzzle-cid src3)]
+      (is (= cid1 cid2))
+      (is (= cid1 cid3))))
+
+  (testing "Disjoint tagged collections: list (+ 1 2) vs vector [+ 1 2] produce different puzzle-cid"
+    (let [cid-list (puzzle/puzzle-cid "(+ 1 2)")
+          cid-vec (puzzle/puzzle-cid "[+ 1 2]")]
+      (is (not= cid-list cid-vec))))
+
+  (testing "Symbol, keyword, and literal changes produce different puzzle-cid"
+    (let [c1 (puzzle/puzzle-cid "(fn [env sol] 42)")
+          c2 (puzzle/puzzle-cid "(fn [env sol] 43)")
+          c3 (puzzle/puzzle-cid "(fn [env sol] :foo)")
+          c4 (puzzle/puzzle-cid "(fn [env sol] :bar)")]
+      (is (not= c1 c2))
+      (is (not= c3 c4))
+      (is (not= c1 c3)))))
+
+(deftest test-standard-htlc-puzzle-evaluation
+  (testing "standard-htlc-cid is deterministic and 64 hex characters"
+    (let [cid (puzzle/standard-htlc-cid)]
+      (is (string? cid))
+      (is (= 64 (count cid)))
+      (is (= cid (puzzle/puzzle-cid puzzle/standard-htlc-puzzle-source)))))
+
+  (testing "standard-htlc-puzzle-source evaluates payer-authorized release"
+    (let [env {:amount 1000 :receiver "alice" :payer "bob"}
+          sol {:mode :payer-authorized}
+          res (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source sol env)]
+      (is (true? (:valid? res)))
+      (is (= [{:type :release :amount 1000 :receiver "alice"}] (:conditions res)))))
+
+  (testing "standard-htlc-puzzle-source evaluates deliverable preimage release"
+    (let [secret "bitecho-secret-deliverable-data"
+          d-hash (str/lower-case (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes secret))))
+          env {:amount 1000 :receiver "alice" :payer "bob" :deliverable-hash d-hash}
+          sol {:mode :preimage :preimage secret}
+          res (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source sol env)]
+      (is (true? (:valid? res)))
+      (is (= [{:type :release :amount 1000 :receiver "alice"}] (:conditions res))))
+
+    (let [env {:amount 1000 :receiver "alice" :payer "bob" :deliverable-hash "d04b98f48e8f8bcc15c6ae5ac050801cd6dcfd428fb5f9e65c4e16e7807340fa"}
+          sol {:mode :preimage :preimage "wrong-preimage"}
+          res (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source sol env)]
+      (is (false? (:valid? res)))
+      (is (= :invalid-puzzle-conditions (:error res))))))
 
 (deftest test-eval-puzzle-boolean-return
   (testing "Boolean true returns default release condition"
@@ -185,11 +240,21 @@
                              total-cond-sum (reduce + 0 (map :amount conds))]
                          (= total-amount total-cond-sum))))))
 
-(defspec ^{:doc "Invariantly detects and rejects any tampering with puzzle source content-address."}
+(defspec ^{:doc "Invariantly preserves canonical puzzle-cid under arbitrary comments and whitespace additions."}
+  prop-puzzle-comments-and-whitespace-invariance 30
+  (prop/for-all [comment-text (gen/fmap (partial apply str) (gen/vector gen/char-alphanumeric 0 32))
+                 whitespace (gen/elements [" " "   " "\n  \t\n" "\n\n   "])]
+                (let [base-src "(fn [env solution] [[:release (:amount env) (:receiver env)]])"
+                      decorated-src (str whitespace base-src " ;; " comment-text "\n" whitespace)
+                      base-cid (puzzle/puzzle-cid base-src)
+                      dec-cid (puzzle/puzzle-cid decorated-src)]
+                  (= base-cid dec-cid))))
+
+(defspec ^{:doc "Invariantly detects and rejects any tampering with puzzle source AST forms."}
   prop-puzzle-content-address-tamper-resistance 30
-  (prop/for-all [tail-str (gen/not-empty gen/string-alphanumeric)]
+  (prop/for-all [val (gen/choose 1 1000)]
                 (let [base-src "(and true true)"
-                      tampered-src (str base-src " ;; " tail-str)
+                      tampered-src (str "(and true " val ")")
                       canonical-cid (puzzle/puzzle-cid base-src)
                       env {:amount 100 :receiver "alice" :payer "bob" :puzzle-hash canonical-cid}
                       res (puzzle/eval-puzzle tampered-src {} env)]

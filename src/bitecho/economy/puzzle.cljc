@@ -9,6 +9,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
             [clojure.string :as str]
+            [edamame.core :as edamame]
             [sci.core :as sci]))
 
 (def default-max-steps
@@ -19,13 +20,82 @@
   "Default byte limit for puzzle source and solution payloads."
   16384)
 
-(defn puzzle-cid
-  "Computes canonical lowercase 64-character SHA-256 hex CID for a puzzle source string."
+(defn- canonicalize-node
+  "Recursively converts parsed AST node into a metadata-free, type-tagged canonical representation."
+  [x]
+  (cond
+    (seq? x)
+    [:list (mapv canonicalize-node x)]
+
+    (vector? x)
+    [:vec (mapv canonicalize-node x)]
+
+    (set? x)
+    [:set (vec (sort-by (fn [node] (basalt/bytes->hex (fressian/encode-canonical node)))
+                        (mapv canonicalize-node x)))]
+
+    (map? x)
+    [:map (vec (sort-by (fn [[k-node _]] (basalt/bytes->hex (fressian/encode-canonical k-node)))
+                        (map (fn [[k v]] [(canonicalize-node k) (canonicalize-node v)]) x)))]
+
+    (symbol? x)
+    [:sym (some-> (namespace x) str) (name x)]
+
+    (keyword? x)
+    [:kw (some-> (namespace x) str) (name x)]
+
+    (integer? x)
+    (long x)
+
+    (string? x)
+    (str x)
+
+    :else
+    x))
+
+(defn canonicalize-puzzle-ast
+  "Parses puzzle-source string using edamame, strips comments, whitespace, and line/col metadata,
+   and constructs a canonical tagged tree for deterministic content-addressing."
   [puzzle-source]
-  (let [bs (if (string? puzzle-source)
-             (fressian/utf8->bytes puzzle-source)
-             puzzle-source)]
-    (data/compute-cid bs)))
+  (try
+    (let [forms (edamame/parse-string-all (str puzzle-source) {:all true})]
+      [:puzzle-ast-v1 (mapv canonicalize-node forms)])
+    (catch #?(:clj Throwable :cljs :default) _
+      nil)))
+
+(defn puzzle-cid
+  "Computes canonical lowercase 64-character SHA-256 hex CID for a puzzle source string
+   using AST-level canonicalization (comments, whitespace, and metadata stripped)."
+  [puzzle-source]
+  (if (string? puzzle-source)
+    (if-let [ast (canonicalize-puzzle-ast puzzle-source)]
+      (data/compute-cid (fressian/encode-canonical ast))
+      (data/compute-cid (fressian/utf8->bytes (str/trim puzzle-source))))
+    (data/compute-cid puzzle-source)))
+
+(def ^{:doc "Canonical source code of the standard HTLC puzzle."}
+  standard-htlc-puzzle-source
+  "(fn [env solution]
+     (cond
+       (= (:mode solution) :payer-authorized)
+       [[:release (:amount env) (:receiver env)]]
+
+       (and (= (:mode solution) :preimage)
+            (some? (:deliverable-hash env))
+            (some? (:preimage solution))
+            (= (sha256-hex (:preimage solution)) (:deliverable-hash env)))
+       [[:release (:amount env) (:receiver env)]]
+
+       :else []))")
+
+(def ^{:doc "Delayed canonical CID calculation for standard-htlc-puzzle-source."}
+  standard-htlc-puzzle-cid
+  (delay (puzzle-cid standard-htlc-puzzle-source)))
+
+(defn standard-htlc-cid
+  "Returns the canonical CID of the standard HTLC puzzle source."
+  []
+  @standard-htlc-puzzle-cid)
 
 (def ^:private metered-fn-macro
   (with-meta
@@ -174,6 +244,21 @@
      'some (coll some)
      'range safe-range}))
 
+(defn- to-cond-map
+  "Coerces vector conditions like [:release amt rec] or [:release rec amt] into condition maps."
+  [c]
+  (cond
+    (map? c) c
+    (and (sequential? c) (= :release (first c)))
+    (if (number? (second c))
+      {:type :release :amount (second c) :receiver (nth c 2 nil)}
+      {:type :release :receiver (second c) :amount (nth c 2 nil)})
+    (and (sequential? c) (= :refund (first c)))
+    (if (number? (second c))
+      {:type :refund :amount (second c) :receiver (nth c 2 nil)}
+      {:type :refund :receiver (second c) :amount (nth c 2 nil)})
+    :else c))
+
 (defn- normalize-conditions
   [res env-ctx]
   (cond
@@ -184,8 +269,11 @@
     (or (false? res) (nil? res))
     {:valid? false :error :puzzle-returned-false}
 
-    (or (map? res) (vector? res))
-    (let [conditions (if (map? res) (or (:conditions res) [res]) (vec res))
+    (or (map? res) (vector? res) (seq? res))
+    (let [raw-conds (cond (map? res) (or (:conditions res) [res])
+                          (or (vector? res) (seq? res)) (vec res)
+                          :else [res])
+          conditions (mapv to-cond-map raw-conds)
           env-epoch (long (or (:epoch env-ctx) 0))
           env-amount (long (or (:amount env-ctx) 0))]
       (if-not (and (sequential? conditions) (seq conditions) (every? map? conditions))
@@ -319,7 +407,10 @@
                        :bindings bindings}]
          (try
            (let [ctx (sci/init sci-opts)
-                 res (sci/eval-string* ctx puzzle-source)]
+                 raw-res (sci/eval-string* ctx puzzle-source)
+                 res (if (fn? raw-res)
+                       (raw-res (or env-ctx {}) (or solution {}))
+                       raw-res)]
              (normalize-conditions res env-ctx))
            (catch #?(:clj Throwable :cljs :default) e
              (let [d (ex-data e)

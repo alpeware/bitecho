@@ -1685,26 +1685,33 @@
                                                  p-hash (:puzzle-hash escrow)
                                                  expires-epoch (long (or (:expires-epoch escrow) 0))
                                                  amount (long (:amount escrow))
+                                                 htlc-cid (puzzle/standard-htlc-cid)
+                                                 custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
+                                                 env-ctx {:amount amount
+                                                          :receiver receiver
+                                                          :payer payer
+                                                          :deliverable-hash d-hash
+                                                          :puzzle-hash p-hash
+                                                          :epoch closing-ep
+                                                          :escrow-id escrow-id}
                                                  puzzle-res (when (and p-hash puzzle-src (<= closing-ep expires-epoch))
-                                                              (puzzle/eval-puzzle puzzle-src
-                                                                                  solution
-                                                                                  {:amount amount
-                                                                                   :receiver receiver
-                                                                                   :payer payer
-                                                                                   :deliverable-hash d-hash
-                                                                                   :puzzle-hash p-hash
-                                                                                   :epoch closing-ep
-                                                                                   :escrow-id escrow-id}))
+                                                              (puzzle/eval-puzzle puzzle-src solution env-ctx))
                                                  puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
-                                                 payer-auth? (and (nil? p-hash)
-                                                                  (or (= sender-hex payer)
-                                                                      (and (string? payer-sig)
-                                                                           (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig))))
-                                                 preimage-auth? (and (nil? p-hash)
-                                                                     (string? preimage)
-                                                                     (escrow/verify-deliverable-preimage preimage d-hash)
-                                                                     (<= closing-ep expires-epoch)
-                                                                     (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))]
+                                                 payer-sig-valid? (and (not custom-puzzle?)
+                                                                       (or (= sender-hex payer)
+                                                                           (and (string? payer-sig)
+                                                                                (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig))))
+                                                 preimage-sig-valid? (and (not custom-puzzle?)
+                                                                          (string? preimage)
+                                                                          (<= closing-ep expires-epoch)
+                                                                          (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))
+                                                 payer-auth? (and payer-sig-valid?
+                                                                  (not puzzle-auth?)
+                                                                  (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :payer-authorized} env-ctx)))
+                                                 preimage-auth? (and preimage-sig-valid?
+                                                                     (not puzzle-auth?)
+                                                                     (not payer-auth?)
+                                                                     (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :preimage :preimage preimage} env-ctx)))]
                                              (if (or payer-auth? preimage-auth? puzzle-auth?)
                                                (if puzzle-auth?
                                                  (let [conditions (:conditions puzzle-res)
@@ -2708,26 +2715,33 @@
               p-hash (:puzzle-hash escrow)
               expires-epoch (long (or (:expires-epoch escrow) 0))
               amount (long (:amount escrow))
+              htlc-cid (puzzle/standard-htlc-cid)
+              custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
+              env-ctx {:amount amount
+                       :receiver receiver
+                       :payer payer
+                       :deliverable-hash d-hash
+                       :puzzle-hash p-hash
+                       :epoch current-epoch
+                       :escrow-id escrow-id}
               puzzle-res (when (and p-hash puzzle-src (<= current-epoch expires-epoch))
-                           (puzzle/eval-puzzle puzzle-src
-                                               solution
-                                               {:amount amount
-                                                :receiver receiver
-                                                :payer payer
-                                                :deliverable-hash d-hash
-                                                :puzzle-hash p-hash
-                                                :epoch current-epoch
-                                                :escrow-id escrow-id}))
+                           (puzzle/eval-puzzle puzzle-src solution env-ctx))
               puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
-              payer-auth? (and (nil? p-hash)
-                               (or (= sender-hex payer)
-                                   (and (string? payer-sig)
-                                        (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig))))
-              preimage-auth? (and (nil? p-hash)
-                                  (string? preimage)
-                                  (escrow/verify-deliverable-preimage preimage d-hash)
-                                  (<= current-epoch expires-epoch)
-                                  (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))]
+              payer-sig-valid? (and (not custom-puzzle?)
+                                    (or (= sender-hex payer)
+                                        (and (string? payer-sig)
+                                             (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig))))
+              preimage-sig-valid? (and (not custom-puzzle?)
+                                       (string? preimage)
+                                       (<= current-epoch expires-epoch)
+                                       (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))
+              payer-auth? (and payer-sig-valid?
+                               (not puzzle-auth?)
+                               (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :payer-authorized} env-ctx)))
+              preimage-auth? (and preimage-sig-valid?
+                                  (not puzzle-auth?)
+                                  (not payer-auth?)
+                                  (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :preimage :preimage preimage} env-ctx)))]
           (if-not (or payer-auth? preimage-auth? puzzle-auth?)
             {:state (-> state
                         (update-in [:diagnostics :rejected-release-intents] (fnil inc 0))

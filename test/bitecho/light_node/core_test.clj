@@ -3802,18 +3802,18 @@
         st1 (:state put-res)]
     (is (true? (get-in put-res [:response "ok"])))
     (is (= "cfg" (get-in put-res [:response "slot_id"])))
-    (is (= "nexus" (get-in put-res [:response "subnet_id"])))
+    (is (= "global" (get-in put-res [:response "subnet_id"])))
     (is (pos? (get-in put-res [:response "size_bytes"])))
     (is (some? rep-env))
     (is (= :storage-replicate (:bitecho/type rep-env)))
 
     ;; storage-list
-    (let [list-res (light-core/handle-command st1 {"cmd" "storage-list" "subnet_id" "nexus"} priv-a)
+    (let [list-res (light-core/handle-command st1 {"cmd" "storage-list" "subnet_id" "global"} priv-a)
           slots (get-in list-res [:response "slots"])]
       (is (true? (get-in list-res [:response "ok"])))
       (is (= 1 (get-in list-res [:response "count"])))
       (is (= "cfg" (get (first slots) "slot_id")))
-      (is (= "nexus" (get (first slots) "subnet_id")))
+      (is (= "global" (get (first slots) "subnet_id")))
       (is (= (:pubkey-hex alice) (get (first slots) "authority"))))
 
     ;; Wire replication on Bob
@@ -3823,7 +3823,7 @@
           events (:stdout-events wire-res)]
       (is (= 1 (count events)))
       (is (= "storage-replicated" (get (first events) "event")))
-      (is (= "nexus" (get (first events) "subnet_id")))
+      (is (= "global" (get (first events) "subnet_id")))
       (is (some? (get-in st-bob' [:storage-blobs (get-in put-res [:response "cid"])])))
 
       ;; Stale sequence rejected

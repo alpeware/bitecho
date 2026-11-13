@@ -40,41 +40,67 @@ TICK_INTERVAL_MS="${TICK_INTERVAL_MS:-10000}"
 LISTEN_AGENTS="${LISTEN_AGENTS:-true}"
 
 NODES=("node1" "node2" "node3")
+INFRA_NODES=("ns1" "ns2" "ns3")
+ALL_NODES=("node1" "node2" "node3" "ns1" "ns2" "ns3")
 
 declare -A DEFAULT_PROJECT=(
   [node1]="bitecho-node1"
   [node2]="bitecho-node2"
   [node3]="bitecho-node3"
+  [ns1]="bitecho-ns1"
+  [ns2]="bitecho-ns2"
+  [ns3]="bitecho-ns3"
 )
 
 declare -A FALLBACK_PROJECT=(
   [node1]="alpeware-bitecho-node1"
   [node2]="alpeware-bitecho-node2"
   [node3]="alpeware-bitecho-node3"
+  [ns1]="alpeware-bitecho-ns1"
+  [ns2]="alpeware-bitecho-ns2"
+  [ns3]="alpeware-bitecho-ns3"
 )
 
 declare -A REGION=(
   [node1]="us-west1"
   [node2]="us-central1"
   [node3]="us-east1"
+  [ns1]="us-west1"
+  [ns2]="us-central1"
+  [ns3]="us-east1"
 )
 
 declare -A ZONE=(
   [node1]="us-west1-b"
   [node2]="us-central1-a"
   [node3]="us-east1-b"
+  [ns1]="us-west1-b"
+  [ns2]="us-central1-a"
+  [ns3]="us-east1-b"
 )
 
 declare -A INSTANCE=(
   [node1]="bitecho-node1"
   [node2]="bitecho-node2"
   [node3]="bitecho-node3"
+  [ns1]="bitecho-ns1"
+  [ns2]="bitecho-ns2"
+  [ns3]="bitecho-ns3"
 )
 
 declare -A ADDRESS_NAME=(
   [node1]="bitecho-node1-ip"
   [node2]="bitecho-node2-ip"
   [node3]="bitecho-node3-ip"
+  [ns1]="bitecho-ns1-ip"
+  [ns2]="bitecho-ns2-ip"
+  [ns3]="bitecho-ns3-ip"
+)
+
+declare -A STATIC_IPS=(
+  [ns1]="34.19.71.246"
+  [ns2]="34.56.253.255"
+  [ns3]="136.108.244.159"
 )
 
 # ------------------------------------------------------------------------------
@@ -103,6 +129,10 @@ get_ip() {
     echo "${!env_var}"
     return
   fi
+  if [[ -n "${STATIC_IPS[$node]:-}" ]]; then
+    echo "${STATIC_IPS[$node]}"
+    return
+  fi
   local proj
   proj="$(get_project "$node")"
   local reg="${REGION[$node]}"
@@ -119,7 +149,15 @@ ssh_cmd() {
     echo "Error: IP address for node ${node} could not be resolved. Run 'cluster.sh init' first." >&2
     return 1
   fi
-  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR -i "${SSH_KEY}" "${SSH_USER}@${ip}" "$@"
+  local user="${SSH_USER}"
+  local key="${SSH_KEY}"
+  if [[ "$node" == ns* ]]; then
+    user="${INFRA_SSH_USER:-cljweb}"
+    if [[ -f "${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519" ]]; then
+      key="${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519"
+    fi
+  fi
+  ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR -i "${key}" "${user}@${ip}" "$@"
 }
 
 ensure_firewall_rule() {
@@ -223,7 +261,7 @@ cmd_init() {
     local proj="${RESOLVED_PROJECTS[$node]}"
     echo "--> Configuring firewall rules in ${proj}..."
     ensure_firewall_rule "$proj" "bitecho-ssh" "tcp:22" "0.0.0.0/0" "bitecho"
-    ensure_firewall_rule "$proj" "bitecho-cluster" "udp:5000-5005" "$cluster_ranges" "bitecho"
+    ensure_firewall_rule "$proj" "bitecho-cluster" "udp:5000-5008" "$cluster_ranges" "bitecho"
     ensure_firewall_rule "$proj" "bitecho-agent" "udp:5010,tcp:5010" "0.0.0.0/0" "bitecho"
   done
 
@@ -336,7 +374,7 @@ LimitNOFILE=65536
 Restart=always
 RestartSec=3
 ExecStart=/opt/jdk-25/bin/java \
-  -Xms128m -Xmx320m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m \
+  -Xms128m -Xmx448m -XX:MaxMetaspaceSize=112m -XX:MaxDirectMemorySize=64m \
   -XX:+UseCompactObjectHeaders -XX:+UseG1GC \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
@@ -783,7 +821,7 @@ LimitNOFILE=65536
 Restart=always
 RestartSec=3
 ExecStart=/opt/jdk-25/bin/java \
-  -Xms128m -Xmx320m -XX:MaxMetaspaceSize=96m -XX:MaxDirectMemorySize=64m \
+  -Xms128m -Xmx448m -XX:MaxMetaspaceSize=112m -XX:MaxDirectMemorySize=64m \
   -XX:+UseCompactObjectHeaders -XX:+UseG1GC \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
@@ -851,13 +889,28 @@ SERVICE_UNIT
 # ------------------------------------------------------------------------------
 
 cmd_status() {
-  echo "=== 3-Node Bitecho Devnet Cluster Status ==="
+  local include_infra=false
+  for arg in "$@"; do
+    if [[ "$arg" == "--include-infra" || "$arg" == "--all" || "$arg" == "6-node" ]]; then
+      include_infra=true
+    fi
+  done
+  if [[ "${INFRA_VALIDATORS:-0}" == "1" ]]; then
+    include_infra=true
+  fi
+
+  local target_nodes=("${NODES[@]}")
+  if [[ "$include_infra" == true ]]; then
+    target_nodes=("${ALL_NODES[@]}")
+  fi
+
+  echo "=== Bitecho Devnet Cluster Status (${#target_nodes[@]}-Node Mesh) ==="
   printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %-16s %s\n" \
     "Node" "IP" "State" "CPU" "Memory" "Disk" "Egress(NIC)" "Epoch" "Blocks(N/F)" "Peers" "Supply / Minted / Burns" "FinEpoch" "BurnDigest" "Pending/Failed" "Conn(Drop/Stale)"
   printf "%-6s %-16s %-10s %-8s %-12s %-16s %-12s %-6s %-12s %-8s %-25s %-10s %-18s %-16s %s\n" \
     "------" "----------------" "----------" "--------" "------------" "----------------" "------------" "------" "------------" "--------" "-------------------------" "----------" "------------------" "--------------" "----------------"
 
-  for node in "${NODES[@]}"; do
+  for node in "${target_nodes[@]}"; do
     local ip vm_state state cpu_usage mem_usage disk_usage egress_nic epoch blocks peers tokenomics fin_epoch burn_dig pending_failed conn_diag
     ip="$(get_ip "$node")"
     if [[ -z "$ip" ]]; then
@@ -879,18 +932,18 @@ cmd_status() {
       local proj
       proj="$(get_project "$node")"
       vm_state="$(gcloud compute instances describe "${INSTANCE[$node]}" --project="$proj" --zone="${ZONE[$node]}" --format='value(status)' 2>/dev/null || echo "UNKNOWN")"
-      if [[ "$vm_state" == "RUNNING" ]]; then
+      if [[ "$vm_state" == "RUNNING" || -n "${STATIC_IPS[$node]:-}" ]]; then
         local raw_metrics
         raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_STATUS' 2>/dev/null || echo "SSH_FAILED"
 set -o pipefail
-svc=$(systemctl is-active bitecho 2>/dev/null || echo "inactive")
+svc=$(systemctl is-active bitecho bitecho-infra 2>/dev/null | grep active | head -n1 || echo "inactive")
 cpu=$(ps -o %cpu= -C java 2>/dev/null | awk '{s+=$1} END {if (NR>0) printf "%.1f%%", s; else print "0.0%"}' || echo "N/A")
 mem=$(free -m 2>/dev/null | awk '/Mem:/ {print $3 "/" $2 "M"}' || echo "N/A")
 disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}' || echo "N/A")
 dev=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
 dev=${dev:-ens4}
 nic_raw=$(cat /sys/class/net/"$dev"/statistics/tx_bytes 2>/dev/null || echo 0)
-statusz=$(curl -fsSL --max-time 2 http://127.0.0.1:8080/statusz 2>/dev/null || true)
+statusz=$(curl -fsSL --max-time 2 http://127.0.0.1:8080/statusz 2>/dev/null || curl -fsSL --max-time 2 http://127.0.0.1/statusz 2>/dev/null || true)
 
 echo "${svc}|${cpu}|${mem}|${disk}|${nic_raw}|${statusz}"
 REMOTE_STATUS
@@ -986,7 +1039,22 @@ REMOTE_STATUS
 # ------------------------------------------------------------------------------
 
 cmd_audit() {
-  echo "=== Bitecho 3-Node Cluster Convergence & Soak Audit ==="
+  local include_infra=false
+  for arg in "$@"; do
+    if [[ "$arg" == "--include-infra" || "$arg" == "--all" || "$arg" == "6-node" ]]; then
+      include_infra=true
+    fi
+  done
+  if [[ "${INFRA_VALIDATORS:-0}" == "1" ]]; then
+    include_infra=true
+  fi
+
+  local target_nodes=("${NODES[@]}")
+  if [[ "$include_infra" == true ]]; then
+    target_nodes=("${ALL_NODES[@]}")
+  fi
+
+  echo "=== Bitecho ${#target_nodes[@]}-Node Cluster Convergence & Soak Audit ==="
   local tmp_data
   tmp_data="$(mktemp -d /tmp/bitecho-audit-XXXXXX)"
 
@@ -997,7 +1065,7 @@ cmd_audit() {
   printf "%-6s %-16s %-10s %-8s %-10s %-10s %-10s %-18s %-10s %-14s %s\n" \
     "------" "----------------" "----------" "--------" "----------" "----------" "----------" "------------------" "----------" "--------------" "------"
 
-  for node in "${NODES[@]}"; do
+  for node in "${target_nodes[@]}"; do
     local ip
     ip="$(get_ip "$node")"
     if [[ -z "$ip" ]]; then
@@ -1009,10 +1077,10 @@ cmd_audit() {
     # Fetch statusz, burnsz, accountz, connz, rss from node
     local raw_metrics
     raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_AUDIT' 2>/dev/null || echo "SSH_FAILED"
-statusz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/statusz 2>/dev/null || true)
-burnsz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/burnsz 2>/dev/null || true)
-accountz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/accountz 2>/dev/null || true)
-connz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/connz 2>/dev/null || true)
+statusz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/statusz 2>/dev/null || curl -fsSL --max-time 3 http://127.0.0.1/statusz 2>/dev/null || true)
+burnsz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/burnsz 2>/dev/null || curl -fsSL --max-time 3 http://127.0.0.1/burnsz 2>/dev/null || true)
+accountz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/accountz 2>/dev/null || curl -fsSL --max-time 3 http://127.0.0.1/accountz 2>/dev/null || true)
+connz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/connz 2>/dev/null || curl -fsSL --max-time 3 http://127.0.0.1/connz 2>/dev/null || true)
 rss=$(ps -o rss= -C java 2>/dev/null | awk '{printf "%.1fMB", $1/1024}' || echo "N/A")
 echo "METRIC_DELIM"
 echo "$statusz"
@@ -1056,7 +1124,7 @@ if len(parts) >= 6:
   python3 -c "
 import glob, sys, re
 
-nodes = ['node1', 'node2', 'node3']
+nodes = '${target_nodes[*]}'.split()
 data = {}
 for n in nodes:
     try:
@@ -1548,6 +1616,15 @@ MD_EOF
   fi
 }
 
+cmd_reprovision_infra_standard() {
+  if [[ -f "${ROOT_DIR}/scripts/infra_cluster.sh" ]]; then
+    "${ROOT_DIR}/scripts/infra_cluster.sh" reprovision-infra-standard "$@"
+  else
+    echo "Error: scripts/infra_cluster.sh not found." >&2
+    return 1
+  fi
+}
+
 # ------------------------------------------------------------------------------
 # CLI Dispatcher & Usage
 # ------------------------------------------------------------------------------
@@ -1564,8 +1641,9 @@ Commands:
   deploy [--reset-state] [--skip-e2e-gate]
                                       Build local uberjar, run pre/post-deploy E2E transfer gates, sync configs, and restart
   verify-e2e                          Run pre-deploy E2E transfer & 3-epoch Streamlet finalization gate (60s bound)
-  status                              Display live status table across all 3 cluster nodes
-  audit                               Audit /statusz, /burnsz, /accountz, /connz, and memory convergence across all 3 nodes
+  status                              Display live status table across all 3 (or 6 with --include-infra) cluster nodes
+  audit                               Audit /statusz, /burnsz, /accountz, /connz, and memory convergence across all nodes (supports --include-infra)
+  reprovision-infra-standard          Reserve Standard-tier static IPs and reprovision ns1..ns3 with Standard networking
   simulate [--agents N] [--messages M] [--burn B] Run light agent swarm simulator against Devnet
   fund <recipient> [amount]           Send ECH from Devnet custody to an agent public key (default: 1000000)
   register-directory <nickname> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]
@@ -1579,6 +1657,7 @@ Commands:
 Environment Variables & Overrides:
   BILLING_ACCOUNT                     GCP Billing Account (default: 00A760-ADD23B-93C934)
   SSH_USER                            Remote SSH username (default: bitecho)
+  INFRA_VALIDATORS                    Set to 1 to enable unified 6-node status/audit by default
   TICK_INTERVAL_MS                    Streamlet & Treasury tick interval in ms (default: 10000)
 USAGE_EOF
 }
@@ -1595,6 +1674,9 @@ main() {
   case "$cmd" in
     init)
       cmd_init "$@"
+      ;;
+    reprovision-infra-standard|reprovision_infra_standard)
+      cmd_reprovision_infra_standard "$@"
       ;;
     deploy)
       cmd_deploy "$@"

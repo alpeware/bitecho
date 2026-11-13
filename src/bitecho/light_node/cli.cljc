@@ -590,7 +590,7 @@
       "storage-put"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
-                    "nexus")
+                    "global")
             slot (or (extract-flag-value clean-tokens "--slot-id" nil)
                      (extract-flag-value clean-tokens "--slot" nil)
                      "default")
@@ -610,7 +610,7 @@
       "storage-get"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
-                    "nexus")
+                    "global")
             slot (or (extract-flag-value clean-tokens "--slot-id" nil)
                      (extract-flag-value clean-tokens "--slot" nil)
                      "default")
@@ -632,7 +632,7 @@
       "capability-publish"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
-                    "nexus")
+                    "global")
             cap-id (or (extract-flag-value clean-tokens "--capability-id" nil)
                        (extract-flag-value clean-tokens "--cap-id" nil))
             cap-type (or (extract-flag-value clean-tokens "--capability-type" nil)
@@ -662,7 +662,7 @@
       "capability-resolve"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
-                    "nexus")
+                    "global")
             cap-id (or (extract-flag-value clean-tokens "--capability-id" nil)
                        (extract-flag-value clean-tokens "--cap-id" nil))
             auth (or (extract-flag-value clean-tokens "--authority" nil)

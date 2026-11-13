@@ -455,6 +455,25 @@
                   :quorum-count (:quorum-count q-res)
                   :validators (:validators q-res)})))))))))
 
+(defn ingest-validator-chain-state!
+  "Directly ingests an in-memory or wire validator chain-state snapshot into rt.
+   Guards against regressive finalized epochs per Rule 5."
+  [rt snapshot]
+  (let [fin-ep (or (:finalized-epoch snapshot) (get snapshot "finalized_epoch"))
+        cur-ep (current-runtime-epoch rt)]
+    (if (and (integer? fin-ep) (integer? cur-ep) (< (long fin-ep) (long cur-ep)))
+      (do
+        (apply-shell-event! (:shell-atom rt)
+                            {:type :diagnose
+                             :reason :validator-epoch-regressive
+                             :current (long cur-ep)
+                             :proposed (long fin-ep)})
+        {:ok? false :error :validator-epoch-regressive :epoch (long cur-ep)})
+      (do
+        (when (some? fin-ep)
+          (set-runtime-epoch! rt (long fin-ep)))
+        {:ok? true :finalized-epoch (some-> fin-ep long)}))))
+
 (defn- active-peer-sender
   [rt]
   (or (:send-to-peers! rt)
@@ -761,15 +780,17 @@
                                    (when (string? (:node-id opts)) (:node-id opts))
                                    (first (get-in (:policy opts) [:subnet/gate :gate/trust-anchors])))
                 validator-bootstrap (:validator-bootstrap opts)
+                val-node (:validator-node opts)
                 poll-ms (long (or (:validator-poll-interval-ms opts) 10000))
                 last-poll-atom (atom 0)
-                ticker (when (or (:heartbeat-ticker? opts) (some? validator-bootstrap))
+                ticker (when (or (:heartbeat-ticker? opts) (some? validator-bootstrap) (some? val-node))
                          (Executors/newSingleThreadScheduledExecutor))
                 rt {:shell-atom shell-atom
                     :subnet-atom subnet-atom
                     :epoch-atom (atom (:initial-epoch opts))
                     :epoch-fn (:epoch-fn opts)
                     :peer-identity (:peer-identity opts)
+                    :validator-node val-node
                     :validator-bootstrap validator-bootstrap
                     :state-dir state-dir
                     :node-id (:node-id opts)
@@ -783,10 +804,21 @@
                     :on-fetch-blob (:on-fetch-blob opts)
                     :on-fetch-blob-atom (atom nil)
                     :ticker ticker}]
-            (when (some? validator-bootstrap)
-              (reset! last-poll-atom (System/currentTimeMillis))
-              (try (sync-runtime-epoch-from-validators! rt validator-bootstrap (:inband-snapshot-fetcher opts))
-                   (catch Exception _ nil)))
+            (if val-node
+              (try
+                (let [st @(:state-atom val-node)
+                      pub (or (:pubkey-hex (:peer-identity rt)) (:default-sender rt))
+                      nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
+                      snap (when (and st (:identity val-node))
+                             ((requiring-resolve 'bitecho.shell.mesh/build-validator-chain-state-snapshot)
+                              st (:identity val-node) pub nonce))]
+                  (when snap
+                    (ingest-validator-chain-state! rt snap)))
+                (catch Exception _ nil))
+              (when (some? validator-bootstrap)
+                (reset! last-poll-atom (System/currentTimeMillis))
+                (try (sync-runtime-epoch-from-validators! rt validator-bootstrap (:inband-snapshot-fetcher opts))
+                     (catch Exception _ nil))))
             (when ticker
               (let [hb-ms (long (get-in inst0 [:leader-election :heartbeat-interval-ms] 2000))]
                 (.scheduleAtFixedRate ^ScheduledExecutorService ticker
@@ -794,12 +826,24 @@
                                                   (try
                                                     (when (:heartbeat-ticker? opts)
                                                       (tick-runtime! rt))
-                                                    (when (some? validator-bootstrap)
+                                                    (if val-node
                                                       (let [now (System/currentTimeMillis)]
                                                         (when (>= (- now @last-poll-atom) poll-ms)
                                                           (reset! last-poll-atom now)
-                                                          (sync-runtime-epoch-from-validators!
-                                                           rt validator-bootstrap (:inband-snapshot-fetcher opts)))))
+                                                          (let [st @(:state-atom val-node)
+                                                                pub (or (:pubkey-hex (:peer-identity rt)) (:default-sender rt))
+                                                                nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
+                                                                snap (when (and st (:identity val-node))
+                                                                       ((requiring-resolve 'bitecho.shell.mesh/build-validator-chain-state-snapshot)
+                                                                        st (:identity val-node) pub nonce))]
+                                                            (when snap
+                                                              (ingest-validator-chain-state! rt snap)))))
+                                                      (when (some? validator-bootstrap)
+                                                        (let [now (System/currentTimeMillis)]
+                                                          (when (>= (- now @last-poll-atom) poll-ms)
+                                                            (reset! last-poll-atom now)
+                                                            (sync-runtime-epoch-from-validators!
+                                                             rt validator-bootstrap (:inband-snapshot-fetcher opts))))))
                                                     (catch Exception _ nil)))
                                       hb-ms hb-ms TimeUnit/MILLISECONDS)))
             (apply-shell-event! shell-atom {:type :started :generation gen :resources {:ticker ticker}})
@@ -910,6 +954,31 @@
                   :sender (:pointer/authority ptr)
                   :pointer ptr}))))
 
+(defn calculate-infra-ports
+  "Calculates {:local-port ... :remote-port ...} for datachannel communication between node-id and peer-id.
+   Respects :infra-port in config/nodes-cfg, defaulting to :port or 5000."
+  ([config node-id peer-id]
+   (calculate-infra-ports config node-id peer-id (get-in config [:cluster :nodes] {})))
+  ([config node-id peer-id nodes-cfg]
+   (let [sorted-ids (vec (sort-by name (keys nodes-cfg)))
+         node-idx (into {} (map-indexed (fn [i k] [k i]) sorted-ids))
+         multi-peer? (> (count nodes-cfg) 2)
+         peer-cfg (get nodes-cfg peer-id)
+         base-peer-port (int (or (:infra-port peer-cfg) (:port peer-cfg) (:infra-port config) (:port config) 5000))
+         peer-port (if multi-peer?
+                     (+ base-peer-port (int (get node-idx node-id 0)))
+                     base-peer-port)
+         base-local-port (int (or (get-in nodes-cfg [node-id :infra-port])
+                                  (get-in nodes-cfg [node-id :port])
+                                  (:infra-port config)
+                                  (:port config)
+                                  5000))
+         local-port (if multi-peer?
+                      (+ base-local-port (int (get node-idx peer-id 0)))
+                      base-local-port)]
+     {:local-port local-port
+      :remote-port peer-port})))
+
 (defn start-datachannel-peer-mesh!
   "Starts mutual-DTLS-authenticated `clj-datachannel` UDP peer connections across `[:cluster :nodes]`
    and wires `rt` to broadcast heartbeats, Blobs, Pointers, and `:fetch-blob` peer pulls."
@@ -929,9 +998,6 @@
         peer-conns-atom (atom {})
         local-ident (load-or-create-infra-peer-identity! state-dir node-id)
         local-fp (identity/normalize-fingerprint (:fingerprint local-ident))
-        sorted-ids (vec (sort-by name (keys nodes-cfg)))
-        node-idx (into {} (map-indexed (fn [i k] [k i]) sorted-ids))
-        multi-peer? (> (count nodes-cfg) 2)
         send-to-conn! (fn [conn msg]
                         (when-let [dc-node (:node conn)]
                           (let [ch-id (if (= :peer-heartbeat (:type msg))
@@ -958,14 +1024,8 @@
                                 (try (api/close! old) (catch Exception _ nil))
                                 (Thread/sleep 25))
                               (let [peer-ip (or (:ip4 peer-cfg) (:ip peer-cfg) "127.0.0.1")
-                                    base-peer-port (int (or (:port peer-cfg) 5000))
-                                    peer-port (if multi-peer?
-                                                (+ base-peer-port (int (get node-idx node-id 0)))
-                                                base-peer-port)
-                                    base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))
-                                    local-port (if multi-peer?
-                                                 (+ base-local-port (int (get node-idx pid 0)))
-                                                 base-local-port)
+                                    {:keys [local-port remote-port]} (calculate-infra-ports config node-id pid nodes-cfg)
+                                    peer-port remote-port
                                     active? (neg? (compare (name node-id) (name pid)))
                                     setup (if active? "active" "passive")
                                     local-ice (identity/deterministic-ice-creds node-id local-fp)

@@ -105,6 +105,15 @@
       (is (= (str "storage/" pub "/state") (:path pack-res)))
       (is (string? (:blob/cid blob)))
 
+      ;; Default subnet fallback is "global"
+      (let [default-pack (storage/pack-encrypted-state {:privkey priv
+                                                        :pubkey pub
+                                                        :slot "state"
+                                                        :seq 1
+                                                        :state-data state-data})]
+        (is (= "global" (:subnet-id default-pack)))
+        (is (= "global" (get-in default-pack [:pointer :pointer/subnet]))))
+
       ;; Successful unpack at min-expected-seq 5
       (let [unpack-res (storage/unpack-encrypted-state {:privkey priv
                                                         :pubkey pub
@@ -169,7 +178,7 @@
           cap-pack (storage/pack-capability-descriptor
                     {:privkey priv
                      :pubkey pub
-                     :subnet-id "nexus"
+                     :subnet-id "global"
                      :capability-id "uop-kernel-gemm"
                      :capability-type :compute/uop-kernel
                      :price-echo 500
@@ -181,6 +190,17 @@
           ptr (:pointer cap-pack)]
       (is (true? (:ok? cap-pack)))
       (is (= (str "capability/" pub "/uop-kernel-gemm") (:path cap-pack)))
+
+      ;; Named subnet (e.g. "nexus") prefixes path with "subnet/<id>/"
+      (let [nexus-pack (storage/pack-capability-descriptor
+                        {:privkey priv
+                         :pubkey pub
+                         :subnet-id "nexus"
+                         :capability-id "uop-kernel-gemm"
+                         :capability-type :compute/uop-kernel
+                         :price-echo 500
+                         :seq 1})]
+        (is (= (str "subnet/nexus/capability/" pub "/uop-kernel-gemm") (:path nexus-pack))))
 
       ;; Successful resolve
       (let [cap-res (storage/unpack-capability-descriptor {:blob blob :pointer ptr :min-expected-seq 1})]

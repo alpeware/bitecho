@@ -498,7 +498,7 @@
                                  :let [pk (:pubkey ninfo)
                                        pk-bytes (resolve-pubkey-bytes pk)]
                                  :when (some? pk-bytes)]
-                             (basalt/make-peer (or (:ip ninfo) "127.0.0.1")
+                             (basalt/make-peer (or (:ip ninfo) (:ip4 ninfo) "127.0.0.1")
                                                (or (:port ninfo) 8000)
                                                pk-bytes)))
         overrides (extract-top-level-overrides cfg cluster-cfg)
@@ -579,30 +579,31 @@
   "Validates a single peer node entry in cluster config.
    Returns nil if valid, or an error string."
   [pid pcfg]
-  (cond
-    (not (map? pcfg))
-    (format "Peer %s configuration must be a map" pid)
+  (let [peer-ip (or (:ip pcfg) (:ip4 pcfg))]
+    (cond
+      (not (map? pcfg))
+      (format "Peer %s configuration must be a map" pid)
 
-    (or (not (string? (:ip pcfg))) (str/blank? (:ip pcfg)))
-    (format "Peer %s missing or invalid :ip" pid)
+      (or (not (string? peer-ip)) (str/blank? peer-ip))
+      (format "Peer %s missing or invalid :ip" pid)
 
-    (or (not (integer? (:port pcfg))) (not (pos? (:port pcfg))))
-    (format "Peer %s missing or invalid :port" pid)
+      (or (not (integer? (:port pcfg))) (not (pos? (:port pcfg))))
+      (format "Peer %s missing or invalid :port" pid)
 
-    (let [pk (:pubkey pcfg)]
-      (not (and (string? pk) (= 88 (count pk)) (re-matches #"^[0-9a-fA-F]{88}$" pk))))
-    (format "Peer %s has invalid :pubkey (must be 88-char hex)" pid)
+      (let [pk (:pubkey pcfg)]
+        (not (and (string? pk) (= 88 (count pk)) (re-matches #"^[0-9a-fA-F]{88}$" pk))))
+      (format "Peer %s has invalid :pubkey (must be 88-char hex)" pid)
 
-    (not (identity/verify-peer-fingerprint? (:fingerprint pcfg) (:fingerprint pcfg)))
-    (format "Peer %s has invalid DTLS :fingerprint" pid)
+      (not (identity/verify-peer-fingerprint? (:fingerprint pcfg) (:fingerprint pcfg)))
+      (format "Peer %s has invalid DTLS :fingerprint" pid)
 
-    (or (not (string? (:ice-ufrag pcfg))) (str/blank? (:ice-ufrag pcfg)))
-    (format "Peer %s missing or invalid :ice-ufrag" pid)
+      (or (not (string? (:ice-ufrag pcfg))) (str/blank? (:ice-ufrag pcfg)))
+      (format "Peer %s missing or invalid :ice-ufrag" pid)
 
-    (or (not (string? (:ice-pwd pcfg))) (str/blank? (:ice-pwd pcfg)))
-    (format "Peer %s missing or invalid :ice-pwd" pid)
+      (or (not (string? (:ice-pwd pcfg))) (str/blank? (:ice-pwd pcfg)))
+      (format "Peer %s missing or invalid :ice-pwd" pid)
 
-    :else nil))
+      :else nil)))
 
 (defn validate-node-config
   "Validates a Bitecho node configuration map fail-closed:
@@ -1626,7 +1627,7 @@
 
         :else
         (let [next-gen (inc (long (get-in @peer-conns [peer-hex :generation] 0)))
-              peer-ip (or (:ip peer-cfg) "127.0.0.1")
+              peer-ip (or (:ip peer-cfg) (:ip4 peer-cfg) "127.0.0.1")
               base-peer-port (int (or (:port peer-cfg) 5000))
               peer-port (+ base-peer-port (int (get node-idx node-id 0)))
               base-local-port (int (or (get-in nodes-cfg [node-id :port]) 5000))

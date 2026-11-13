@@ -343,6 +343,40 @@ When operating in restricted enterprise networks, sandboxed containers, or web b
 - **Public Mesh-Member Relay (`https://bitecho.org/relay/v1/*` / `https://bitecho.org/relay.html`)**: Connected to the validator mesh (`:validator-bootstrap` enabled, `:min-signaling-burn 100`). Discovery and initial handshake messages (`offer` / `accept`) submitted to the public relay are forwarded to the validator mesh (`:on-relay-forward`), settling signaling burns (`500 ECH` standard) on-chain.
 - **Peer Zero-Burn Leg Gateway (e.g. `https://nexus.ingress.bitecho.org/relay/v1/*` / `https://nexus.ingress.bitecho.org/relay.html`)**: Peers with an ingress endpoint can expose a personal `/relay/v1/*` leg gateway (`:min-signaling-burn 0`, no validator forwarding). Once a sandboxed/browser-ferry peer (such as Lumen) completes its single funded `offer` / `accept` handshake over the public relay, it switches session transport to the peer's leg gateway where all subsequent sealed messages and subnet broadcasts flow at **zero burn (`0 ECH`)**, identical to a direct WebRTC/TCP P2P leg.
 
+---
+
+## 11. Unified 6-VM / 6-Validator Mesh Architecture & Onboarding Taxonomy
+
+### 11.1 4-Role Node Onboarding Taxonomy
+
+Every participant in the Bitecho network assumes one or more of four well-defined roles:
+
+| Role | Responsibilities | Consensus State Required? | Primary Protocols & Endpoints |
+| :--- | :--- | :--- | :--- |
+| **1. Light Node** | Client wallet, agent runtime, interactive messaging, local E2EE storage | None (queries $\lceil 2n/3 \rceil$ BFT snapshot quorum) | WebRTC DataChannel (UDP/TCP `:5010`), HTTP Gateway Relay (`/relay/v1/*`) |
+| **2. Capability Provider / Subnet Host** | Offers services (`:storage-service`, `:compute/uop-kernel`, `:network/turn-relay`), pins Blobs, hosts subnets | Local Subnet instance only | Fressian wire envelopes, Blob disk CAS (`bitecho.shell.blob-fs`), WebRTC |
+| **3. Core Validator** | Executes Streamlet BFT consensus, notarizes blocks, executes finalized blocks, meters smart contracts | Full Streamlet ledger & block tree | Streamlet BFT (UDP `:5000..5005`), Authenticated Agent Channel (`:5010`) |
+| **4. Edge Infra / Nameserver (`ns1..ns3`)** | Terminates authoritative DNS, HTTP/HTTPS, ACME TLS, SMTP, and runs co-located validator | Full Streamlet ledger + Edge Subnet runtime | DNS (UDP/TCP `:53`), HTTP (`:80`), HTTPS (`:443`), SMTP (`:25`), Bully (`:5006..5008`) |
+
+### 11.2 Unified 6-Node Mesh Topology (`N = 6`, Quorum = 4)
+
+Unification II unifies the 3 Core Validators (`node1..node3`) and the 3 Edge Nameserver Nodes (`ns1..ns3`) into a single, cohesive 6-validator BFT mesh:
+- **Validator Count ($N=6$):** Quorum threshold is $M = 4$ ($\lceil 2N/3 \rceil = 4$). Any 4 of the 6 nodes agree on Streamlet epoch blocks, giving fault tolerance $f=1$ byzantine or crash failure while keeping 2 live nameservers during rolling deployments.
+- **Port Separation:**
+  - **Streamlet BFT Ports (`5000..5005`):** Reserved strictly for validator block proposals, votes, and notarizations.
+  - **Infra Bully Mesh Ports (`5006..5008`):** Reserved strictly for edge nameserver cluster heartbeats and pointer anti-entropy.
+  - **Zero UDP Collisions:** Edge nodes run the edge stack and co-located validator in the **same JVM process** without socket contention or duplicate ICE `ufrag` collisions.
+- **Standard Tier Networking:** Both `node1..node3` and `ns1..ns3` utilize Google Cloud Standard Tier networking (`200 GB/month` free egress per region vs. `1 GB` on Premium tier), preserving budget while providing geographically distributed nodes across `us-west1`, `us-central1`, and `us-east1`.
+- **Zero Cross-Internet Forwarding Hop:** When external agents connect to `ns1..ns3` via HTTPS ingress or agent channels, state snapshots and transactions are ingested directly in-memory via loopback (`127.0.0.1:5010`), eliminating the cross-datacenter forwarding latency of older architectures.
+
+### 11.3 Key Custody & Offline Treasury Architecture
+
+To protect the network against cloud infrastructure compromise:
+- **Cold Treasury Keys (`genesis-treasury-key.edn` / `devnet_treasury_keypair.edn`):** Air-gapped offline keys held by human operators on secure local hardware. Treasury keys are **never** stored as daemon keys or environment variables on the cloud VMs.
+- **Offline Directory Authority Key:** Stored offline in `.ssh/directory/identity/node-identity.edn`. It is only used to sign verified Proofs-of-Possession and directory attestations.
+- **Hot VM Operational Identities:** VMs only hold operational Ed25519 node identities (`data/identity/node-identity.edn`). In the event of VM compromise, an attacker cannot steal the treasury supply or forge Directory Authority signatures.
+
+
 
 
 

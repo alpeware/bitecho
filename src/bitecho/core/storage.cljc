@@ -104,7 +104,7 @@
   "Encodes and encrypts user state data on-device into a content-addressed Blob
    and monotonic authority-signed Pointer."
   [{:keys [privkey pubkey subnet-id slot seq leader-term nonce-bytes state-data context]}]
-  (let [sub-id (str (or subnet-id "nexus"))
+  (let [sub-id (str (or subnet-id "global"))
         slot-name (str (or slot "default"))
         ctx-str (str (or context slot-name "state"))
         seq-num (long (or seq 1))
@@ -192,7 +192,7 @@
         cap-id (str capability-id)
         pubkey-str (str pubkey)
         cap-path (or path
-                     (if (and subnet-id (not= subnet-id "nexus") (not= subnet-id "global"))
+                     (if (and subnet-id (not= subnet-id "global"))
                        (str "subnet/" subnet-id "/capability/" pubkey-str "/" cap-id)
                        (str "capability/" pubkey-str "/" cap-id)))
         seq-num (long (or seq 1))

@@ -37,6 +37,7 @@ Usage: ./scripts/infra_cluster.sh <command> [args]
 Commands:
   snapshot                       Snapshot /var/lib/clj-web & /etc/clj-web from ns1..ns3 with SHA-256 verification
   provision-secret               Provision shared 32-byte /etc/clj-web/tls-secret.key (0600) across ns1..ns3 (F-B2)
+  reprovision-infra-standard     Reserve Standard-tier static IPs and reprovision ns1..ns3 with Standard networking
   cutover <ns3|ns2|ns1|rolling>  Build bitecho.jar, migrate state, and cut over node(s) one at a time with rollback guard
   retire-clj-web                 Phase D: remove public clj-web.git on ns1..ns3 and roll updated bitecho.jar across ns3 -> ns2 -> ns1
   publish-git                    Sign 'verified' release tags and sync bare git repos (bitecho, clj-datachannel, clj-fressian) to ns1..ns3
@@ -232,7 +233,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 WorkingDirectory=/var/lib/clj-web
-ExecStart=/opt/jdk-25/bin/java -Xms128m -Xmx384m -XX:+UseCompactObjectHeaders --enable-native-access=ALL-UNNAMED --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED --add-exports=java.base/sun.security.x509=ALL-UNNAMED -jar /opt/bitecho-infra/bitecho.jar infra-node /etc/bitecho-infra/config.edn
+ExecStart=/opt/jdk-25/bin/java -Xms128m -Xmx448m -XX:MaxMetaspaceSize=112m -XX:MaxDirectMemorySize=64m -XX:+UseCompactObjectHeaders --enable-native-access=ALL-UNNAMED --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED --add-exports=java.base/sun.security.x509=ALL-UNNAMED -jar /opt/bitecho-infra/bitecho.jar infra-node /etc/bitecho-infra/config.edn
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -301,6 +302,8 @@ cmd_cutover() {
 
   declare -A PUBKEYS=()
   declare -A FINGERPRINTS=()
+  declare -A ICE_UFRAGS=()
+  declare -A ICE_PWDS=()
 
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
@@ -322,8 +325,10 @@ REMOTE_ID
 )"
     PUBKEYS[$node]="$(echo "$id_out" | awk '/Ed25519 Pubkey:/ {print $NF}')"
     FINGERPRINTS[$node]="$(echo "$id_out" | awk '/SHA-256 Fingerprint:/ {print $NF}')"
-    if [[ -z "${PUBKEYS[$node]}" || -z "${FINGERPRINTS[$node]}" ]]; then
-      echo "FATAL: Failed to extract pubkey/fingerprint on ${node}" >&2
+    ICE_UFRAGS[$node]="$(echo "$id_out" | awk '/ICE ufrag:/ {print $NF}')"
+    ICE_PWDS[$node]="$(echo "$id_out" | awk '/ICE pwd:/ {print $NF}')"
+    if [[ -z "${PUBKEYS[$node]}" || -z "${FINGERPRINTS[$node]}" || -z "${ICE_UFRAGS[$node]}" || -z "${ICE_PWDS[$node]}" ]]; then
+      echo "FATAL: Failed to extract complete identity (pubkey/fingerprint/ice) on ${node}" >&2
       exit 1
     fi
     if [[ "${PUBKEYS[$node]}" == "${cold_pubkey}" ]]; then
@@ -362,7 +367,7 @@ REMOTE_ID
         :bind-ip "0.0.0.0"
         :http-port 80
         :https-port 443
-        :ingress-target {:host "${ingress_ip}" :port 5010}
+        :ingress-target {:host "127.0.0.1" :port 5010}
         :content-root "/var/www/clj-web/public"
         :directory-listing? true}
  :smtp {:enabled? true
@@ -372,10 +377,31 @@ REMOTE_ID
  :cluster {:enabled? true
            :heartbeat-interval-ms 2000
            :heartbeat-timeout-ms 6000
-           :nodes {:ns1 {:ip4 "${NODE_IPS[ns1]}" :port 5000 :pubkey "${PUBKEYS[ns1]}" :fingerprint "${FINGERPRINTS[ns1]}"}
-                   :ns2 {:ip4 "${NODE_IPS[ns2]}" :port 5000 :pubkey "${PUBKEYS[ns2]}" :fingerprint "${FINGERPRINTS[ns2]}"}
-                   :ns3 {:ip4 "${NODE_IPS[ns3]}" :port 5000 :pubkey "${PUBKEYS[ns3]}" :fingerprint "${FINGERPRINTS[ns3]}"}}}}
+           :infra-port 5006
+           :nodes {:ns1 {:ip4 "${NODE_IPS[ns1]}" :port 5000 :infra-port 5006 :pubkey "${PUBKEYS[ns1]}" :fingerprint "${FINGERPRINTS[ns1]}"}
+                   :ns2 {:ip4 "${NODE_IPS[ns2]}" :port 5000 :infra-port 5006 :pubkey "${PUBKEYS[ns2]}" :fingerprint "${FINGERPRINTS[ns2]}"}
+                   :ns3 {:ip4 "${NODE_IPS[ns3]}" :port 5000 :infra-port 5006 :pubkey "${PUBKEYS[ns3]}" :fingerprint "${FINGERPRINTS[ns3]}"}}}
+ :validator {:node/id :${node}
+             :node-id :${node}
+             :state-dir "/var/lib/clj-web"
+             :http {:enabled? false}
+             :transport :datachannel
+             :port 5000
+             :ingress-port 5010
+             :protocol {:nodes #{:node1 :node2 :node3 :ns1 :ns2 :ns3}
+                        :validator-count 6
+                        :quorum-threshold 4}
+             :cluster {:port 5000
+                       :agent-port 5010
+                       :validators [:node1 :node2 :node3 :ns1 :ns2 :ns3]
+                       :nodes {:node1 {:ip "35.212.129.138" :port 5000 :agent-port 5010 :pubkey "302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086" :fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B" :ice-ufrag "1ec0ae74" :ice-pwd "d928f1aac56a0d6e6fdda551"}
+                               :node2 {:ip "35.206.120.143" :port 5000 :agent-port 5010 :pubkey "302a300506032b6570032100592ab794dea07da278ef3853e8cc2d2f6ac5e3417eac80d93ab01e1fc61653ba" :fingerprint "F8:73:94:91:1D:7B:CA:66:D9:67:9E:4B:72:B0:D0:8D:5F:5C:37:0F:FE:04:2E:ED:86:E6:8D:79:B8:07:43:78" :ice-ufrag "18388497" :ice-pwd "20540a60217702b8869d7bf5"}
+                               :node3 {:ip "35.211.71.139" :port 5000 :agent-port 5010 :pubkey "302a300506032b65700321007b7f58652a2c26b4180aeee45ff12f927a45d92e00fc3462c5d854f6203351f1" :fingerprint "38:2B:18:4B:23:E8:F4:32:D7:08:5A:2A:A4:45:4F:EE:12:D4:51:B1:9B:2D:66:7C:2E:E1:2A:3E:7C:B3:60:40" :ice-ufrag "4b1d8fc5" :ice-pwd "47e794a9ed5ef04cc0ebbe7f"}
+                               :ns1 {:ip "${NODE_IPS[ns1]}" :port 5000 :agent-port 5010 :pubkey "${PUBKEYS[ns1]}" :fingerprint "${FINGERPRINTS[ns1]}" :ice-ufrag "${ICE_UFRAGS[ns1]}" :ice-pwd "${ICE_PWDS[ns1]}"}
+                               :ns2 {:ip "${NODE_IPS[ns2]}" :port 5000 :agent-port 5010 :pubkey "${PUBKEYS[ns2]}" :fingerprint "${FINGERPRINTS[ns2]}" :ice-ufrag "${ICE_UFRAGS[ns2]}" :ice-pwd "${ICE_PWDS[ns2]}"}
+                               :ns3 {:ip "${NODE_IPS[ns3]}" :port 5000 :agent-port 5010 :pubkey "${PUBKEYS[ns3]}" :fingerprint "${FINGERPRINTS[ns3]}" :ice-ufrag "${ICE_UFRAGS[ns3]}" :ice-pwd "${ICE_PWDS[ns3]}"}}}}}
 CFG_EOF
+    clojure -M -e "(let [m (clojure.edn/read-string (slurp \"${tmp_cfg}\"))] (assert (map? (:validator m)) \"Missing :validator map in config.edn\"))"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${tmp_cfg}" "${SSH_USER}@${ip}:/etc/bitecho-infra/config.edn"
     rm -f "${tmp_cfg}"
@@ -749,6 +775,68 @@ REMOTE_PUBLISH_MIGRATE
   echo "=== Canonical Git Repositories & Web Docs Published to ns1..ns3 ==="
 }
 
+cmd_reprovision_infra_standard() {
+  echo "=============================================================================="
+  echo ">>> Re-provisioning ns1..ns3 on Google Cloud Standard Tier Networking <<<"
+  echo "=============================================================================="
+  echo "Standard Tier provides 200 GB/month free egress per region (vs 1 GB Premium)."
+  echo ""
+
+  declare -A NS_PROJ=(
+    [ns1]="bitecho-ns1"
+    [ns2]="bitecho-ns2"
+    [ns3]="bitecho-ns3"
+  )
+  declare -A NS_FALLBACK_PROJ=(
+    [ns1]="alpeware-bitecho-ns1"
+    [ns2]="alpeware-bitecho-ns2"
+    [ns3]="alpeware-bitecho-ns3"
+  )
+  declare -A NS_REG=(
+    [ns1]="us-west1"
+    [ns2]="us-central1"
+    [ns3]="us-east1"
+  )
+
+  declare -A NEW_IPS
+
+  for node in "${NODES[@]}"; do
+    local def_proj="${NS_PROJ[$node]}"
+    local proj
+    if gcloud projects describe "$def_proj" &>/dev/null; then
+      proj="$def_proj"
+    else
+      proj="${NS_FALLBACK_PROJ[$node]}"
+    fi
+    local reg="${NS_REG[$node]}"
+    local addr="${node}-standard-ip"
+
+    echo "--> [${node}] Checking Standard Tier static IP ${addr} in ${proj} (${reg})..."
+    if ! gcloud compute addresses describe "$addr" --project="$proj" --region="$reg" &>/dev/null; then
+      echo "    Reserving static external IPv4 ${addr} with --network-tier=STANDARD..."
+      gcloud compute addresses create "$addr" \
+        --project="$proj" \
+        --region="$reg" \
+        --network-tier=STANDARD \
+        --quiet
+    fi
+    local ip
+    ip="$(gcloud compute addresses describe "$addr" --project="$proj" --region="$reg" --format='value(address)' 2>/dev/null || echo "UNRESOLVED")"
+    NEW_IPS[$node]="$ip"
+    echo "    Reserved IP for ${node}: ${ip}"
+  done
+
+  echo ""
+  echo "=============================================================================="
+  echo ">>> STANDARD TIER IP RESERVATIONS COMPLETE <<<"
+  echo "=============================================================================="
+  echo "Update authoritative .org TLD glue records at your domain registrar with:"
+  echo "  ns1.bitecho.org -> ${NEW_IPS[ns1]:-34.19.71.246}"
+  echo "  ns2.bitecho.org -> ${NEW_IPS[ns2]:-34.56.253.255}"
+  echo "  ns3.bitecho.org -> ${NEW_IPS[ns3]:-136.108.244.159}"
+  echo "=============================================================================="
+}
+
 cmd_audit() {
   assert_preconditions
   echo "=== Auditing Infra Edge Cluster (ns1..ns3) ==="
@@ -767,6 +855,9 @@ case "${1:-}" in
   provision-secret)
     cmd_provision_secret
     ;;
+  reprovision-infra-standard)
+    cmd_reprovision_infra_standard
+    ;;
   cutover)
     shift
     cmd_cutover "$@"
@@ -784,6 +875,10 @@ case "${1:-}" in
     ;;
   audit)
     cmd_audit
+    ;;
+  help|-h|--help)
+    print_usage
+    exit 0
     ;;
   *)
     print_usage

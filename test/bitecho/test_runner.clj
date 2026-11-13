@@ -37,6 +37,7 @@
             [bitecho.shell.http-relay-test]
             [bitecho.shell.http-test]
             [bitecho.shell.infra-shells-test]
+            [bitecho.shell.infra-test]
             [bitecho.shell.light-node-test]
             [bitecho.shell.mesh-test]
             [bitecho.shell.persistence-test]

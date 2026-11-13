@@ -1,13 +1,13 @@
 # Bitecho Fractal Capability Descriptors (The Agent Intent Economy)
 
-Bitecho supports a unified, content-addressed **Capability Descriptor** mechanism (`bitecho.core.storage`) built directly on `Blob` + `Pointer` + `Subnet`. Providers across the global Nexus network or any specialized Subnet advertise services — **E2EE storage, optimized UOp compute kernels, local GPU access, open or proprietary model weights, WebRTC TURN relays, and ingress gateways** — using the exact same signed, versioned descriptor envelope.
+Bitecho supports a unified, content-addressed **Capability Descriptor** mechanism (`bitecho.core.storage`) built directly on `Blob` + `Pointer` + `Subnet`. Providers across the default "global" network or any specialized Subnet advertise services — **E2EE storage, optimized UOp compute kernels, local GPU access, open or proprietary model weights, WebRTC TURN relays, and ingress gateways** — using the exact same signed, versioned descriptor envelope.
 
 ---
 
 ## 1. The Advertise–Discover–Pay–Serve–Verify Loop
 
 1. **Advertise (`capability-publish`):** A provider serializes a canonical capability descriptor into a content-addressed `Blob` (`mime = "application/edn"`) and signs a mutable `Pointer` (`seq` monotonic) at:
-   - Global Nexus: `"capability/<provider-pubkey>/<capability-id>"`
+   - Root network ("global"): `"capability/<provider-pubkey>/<capability-id>"`
    - Subnet-scoped: `"subnet/<subnet-id>/capability/<provider-pubkey>/<capability-id>"`
 2. **Discover & Verify (`capability-list` / `capability-resolve`):** A client or autonomous agent discovers published capabilities and cryptographically verifies `data/verify-blob`, `data/verify-pointer`, `pointer.target == blob.cid`, anti-rollback `pointer.seq >= min-expected-seq`, and schema validity (`storage/valid-capability-descriptor?`).
 3. **Lock Intent (`lock-intent`):** For paid capabilities (`:price-echo > 0`), the consumer locks ECHO into an escrow intent (using either standard hash/signature lock or a [ChiaLisp-style `sci` smart contract](SMART_CONTRACTS.md) committed via `--puzzle-hash`).
@@ -22,7 +22,7 @@ Implemented in [`src/bitecho/core/storage.cljc`](../src/bitecho/core/storage.clj
 ### 2.1 Allowed `:capability-type` Values
 | Capability Type | Category | Typical Use Case |
 | :--- | :--- | :--- |
-| **`:storage/blob-pinning`** | Bytes at Rest | Paid or free E2EE `Blob` + `Pointer` persistence and replication on Nexus or a storage subnet. |
+| **`:storage/blob-pinning`** | Bytes at Rest | Paid or free E2EE `Blob` + `Pointer` persistence and replication on the "global" network or a storage subnet. |
 | **`:compute/uop-kernel`** | Compute | Paid or free hardware-tuned UOp kernels (e.g., Metal/CUDA/WebGPU matmul or attention kernels for a specific tensor shape). |
 | **`:compute/gpu-access`** | Compute | Paid or free GPU compute hours / inference slots (e.g., local Gemma or LLM execution on a provider node). |
 | **`:model/weights`** | AI / Weights | Open or proprietary model weights (full checkpoints, LoRA adapters, or quantized shards) referenced via `:target-cid`. |
@@ -35,7 +35,7 @@ Implemented in [`src/bitecho/core/storage.cljc`](../src/bitecho/core/storage.clj
  :capability-id   "gemma-3-27b-q4-weights"
  :capability-type :model/weights
  :provider        "<64-char-lowercase-hex-ed25519-pubkey>"
- :subnet-id       "nexus"         ;; or nil / custom subnet ID
+ :subnet-id       "global"        ;; or nil / custom subnet ID
  :price-echo      50              ;; 0 for free tier, >0 for paid tier
  :burn-floor      10              ;; optional minimum protocol burn requirement
  :target-cid      "<64-hex-cid>"  ;; optional Blob CID of weights / UOp kernel / SLA puzzle
@@ -58,7 +58,7 @@ Packs and signs the capability descriptor as a `Blob` + `Pointer`, stores it loc
     --capability-type compute/uop-kernel \
     --price 25 \
     --burn-floor 5 \
-    --subnet-id nexus \
+    --subnet-id global \
     --target-cid a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 \
     --metadata '{"shape":[4096,4096],"backend":"cuda"}'
   ```
@@ -70,7 +70,7 @@ Packs and signs the capability descriptor as a `Blob` + `Pointer`, stores it loc
     "capability_type": "compute/uop-kernel",
     "price_echo": 25,
     "burn_floor": 5,
-    "subnet_id": "nexus",
+    "subnet_id": "global",
     "target_cid": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
     "metadata": {"shape": [4096, 4096], "backend": "cuda"}
   }
@@ -82,7 +82,7 @@ Packs and signs the capability descriptor as a `Blob` + `Pointer`, stores it loc
     "capability_id": "uop-matmul-fp16",
     "capability_type": "compute/uop-kernel",
     "price_echo": 25,
-    "subnet_id": "nexus",
+    "subnet_id": "global",
     "path": "capability/<provider-pubkey>/uop-matmul-fp16",
     "cid": "<64-char-hex-blob-cid>",
     "seq": 1
@@ -97,7 +97,7 @@ Resolves a capability by `--capability-id` and `--authority <pubkey-or-petname>`
   capability-resolve \
     --capability-id uop-matmul-fp16 \
     --authority <provider-pubkey-or-petname> \
-    --subnet-id nexus \
+    --subnet-id global \
     --min-seq 1
   ```
 - **JSONL (`serve` stdin / `ctl`):**
@@ -106,7 +106,7 @@ Resolves a capability by `--capability-id` and `--authority <pubkey-or-petname>`
     "cmd": "capability-resolve",
     "capability_id": "uop-matmul-fp16",
     "authority": "<provider-pubkey-or-petname>",
-    "subnet_id": "nexus",
+    "subnet_id": "global",
     "min_seq": 1
   }
   ```
@@ -121,7 +121,7 @@ Resolves a capability by `--capability-id` and `--authority <pubkey-or-petname>`
       "capability_id": "uop-matmul-fp16",
       "capability_type": "compute/uop-kernel",
       "provider": "<provider-pubkey>",
-      "subnet_id": "nexus",
+      "subnet_id": "global",
       "price_echo": 25,
       "burn_floor": 5,
       "target_cid": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
@@ -135,13 +135,13 @@ Lists all local and network-replicated capability descriptors, optionally filter
 
 - **CLI (JVM / Node.js / Browser `ctl`):**
   ```bash
-  capability-list --subnet-id nexus --capability-type compute/uop-kernel
+  capability-list --subnet-id global --capability-type compute/uop-kernel
   ```
 - **JSONL (`serve` stdin / `ctl`):**
   ```json
   {
     "cmd": "capability-list",
-    "subnet_id": "nexus",
+    "subnet_id": "global",
     "capability_type": "compute/uop-kernel"
   }
   ```
@@ -159,7 +159,7 @@ Lists all local and network-replicated capability descriptors, optionally filter
           "capability_id": "uop-matmul-fp16",
           "capability_type": "compute/uop-kernel",
           "provider": "<provider-pubkey>",
-          "subnet_id": "nexus",
+          "subnet_id": "global",
           "price_echo": 25,
           "burn_floor": 5,
           "target_cid": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",

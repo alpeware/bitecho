@@ -59,60 +59,91 @@
   (println "  bitecho demo-angels"))
 
 (defn- build-infra-runtime-from-config!
-  [cfg tls-mgr require-secret?]
-  (let [state-dir (or (:state-dir cfg) "data/infra")
-        node-id (or (:node/id cfg) (:node-id cfg) :ns1)
-        ident (infra/load-or-create-infra-peer-identity! state-dir node-id)
-        pub-hex (:pubkey-hex ident)
-        priv-bytes (:privkey-bytes ident)
-        nodes-map (get-in cfg [:cluster :nodes] {})
-        peer-pubs (keep (fn [[_ v]] (:pubkey v)) nodes-map)
-        anchors (set (concat [pub-hex] (:trust-anchors cfg) peer-pubs))
-        all-nodes (or (:all-nodes cfg)
-                      (when (seq nodes-map) (set (keys nodes-map)))
-                      #{node-id})
-        multi-node? (> (count all-nodes) 1)
-        acme-enabled? (boolean (get-in cfg [:acme :enabled?] false))
-        acme-thumb (acme-shell/account-keypair-thumbprint! state-dir acme-enabled?)
-        policy (or (:policy cfg)
-                   (infra/default-infra-policy {:subnet-id (or (:subnet-id cfg) "bitecho.org/infra")
-                                                :trust-anchors anchors
-                                                :cold-pubkey (or (:cold-pubkey cfg)
-                                                                 (when-not multi-node? pub-hex))
-                                                :domain-pubkey (:domain-pubkey cfg)
-                                                :acme-thumbprint acme-thumb}))
-        rt (infra/start-subnet-runtime! {:state-dir state-dir
-                                         :policy policy
-                                         :node-id node-id
-                                         :default-sender pub-hex
-                                         :node-privkey priv-bytes
-                                         :peer-identity ident
-                                         :all-nodes all-nodes
-                                         :heartbeat-ticker? (boolean (get cfg :heartbeat-ticker? true))
-                                         :validator-bootstrap (:validator-bootstrap cfg)
-                                         :validator-poll-interval-ms (:validator-poll-interval-ms cfg)
-                                         :inband-snapshot-fetcher (:inband-snapshot-fetcher cfg)
-                                         :tls-manager tls-mgr
-                                         :tls-secret (:tls-secret cfg)
-                                         :tls-secret-file (:tls-secret-file cfg)
-                                         :require-tls-secret? require-secret?
-                                         :initial-epoch (:initial-epoch cfg)})]
-    {:node-id node-id
-     :pubkey pub-hex
-     :identity ident
-     :all-nodes all-nodes
-     :runtime rt}))
+  ([cfg tls-mgr require-secret?]
+   (build-infra-runtime-from-config! cfg tls-mgr require-secret? nil nil))
+  ([cfg tls-mgr require-secret? val-node]
+   (build-infra-runtime-from-config! cfg tls-mgr require-secret? val-node nil))
+  ([cfg tls-mgr require-secret? val-node ident]
+   (let [state-dir (or (:state-dir cfg) "data/infra")
+         node-id (or (:node/id cfg) (:node-id cfg) :ns1)
+         node-id (if (keyword? node-id) node-id (keyword (str node-id)))
+         ident (or ident (infra/load-or-create-infra-peer-identity! state-dir node-id))
+         pub-hex (:pubkey-hex ident)
+         priv-bytes (:privkey-bytes ident)
+         nodes-map (get-in cfg [:cluster :nodes] {})
+         peer-pubs (keep (fn [[_ v]] (:pubkey v)) nodes-map)
+         anchors (set (concat [pub-hex] (:trust-anchors cfg) peer-pubs))
+         all-nodes (or (:all-nodes cfg)
+                       (when (seq nodes-map) (set (keys nodes-map)))
+                       #{node-id})
+         multi-node? (> (count all-nodes) 1)
+         acme-enabled? (boolean (get-in cfg [:acme :enabled?] false))
+         acme-thumb (acme-shell/account-keypair-thumbprint! state-dir acme-enabled?)
+         policy (or (:policy cfg)
+                    (infra/default-infra-policy {:subnet-id (or (:subnet-id cfg) "bitecho.org/infra")
+                                                 :trust-anchors anchors
+                                                 :cold-pubkey (or (:cold-pubkey cfg)
+                                                                  (when-not multi-node? pub-hex))
+                                                 :domain-pubkey (:domain-pubkey cfg)
+                                                 :acme-thumbprint acme-thumb}))
+         rt (infra/start-subnet-runtime! {:state-dir state-dir
+                                          :policy policy
+                                          :node-id node-id
+                                          :default-sender pub-hex
+                                          :node-privkey priv-bytes
+                                          :peer-identity ident
+                                          :all-nodes all-nodes
+                                          :heartbeat-ticker? (boolean (get cfg :heartbeat-ticker? true))
+                                          :validator-bootstrap (:validator-bootstrap cfg)
+                                          :validator-poll-interval-ms (:validator-poll-interval-ms cfg)
+                                          :inband-snapshot-fetcher (:inband-snapshot-fetcher cfg)
+                                          :epoch-fn (:epoch-fn cfg)
+                                          :validator-node val-node
+                                          :tls-manager tls-mgr
+                                          :tls-secret (:tls-secret cfg)
+                                          :tls-secret-file (:tls-secret-file cfg)
+                                          :require-tls-secret? require-secret?
+                                          :initial-epoch (:initial-epoch cfg)})]
+     {:node-id node-id
+      :pubkey pub-hex
+      :identity ident
+      :all-nodes all-nodes
+      :runtime rt})))
 
 (defn start-infra-node!
   "Starts a unified `\"bitecho.org/infra\"` edge node stack (`infra` Subnet runtime + `tls-manager`
-   + optional 3-node `clj-datachannel` peer mesh, `dns`, `http`, `smtp`, and `acme` shells) from `cfg`.
+   + optional co-located validator, 3-node `clj-datachannel` peer mesh, `dns`, `http`, `smtp`, and `acme` shells) from `cfg`.
    Fails fast (`F-B2`) on multi-node configs lacking an explicit shared `:tls-secret` / `:tls-secret-file`."
   [cfg]
   (let [state-dir (or (:state-dir cfg) "data/infra")
+        node-id (or (:node/id cfg) (:node-id cfg) :ns1)
+        node-id (if (keyword? node-id) node-id (keyword (str node-id)))
+        ident (infra/load-or-create-infra-peer-identity! state-dir node-id)
+        raw-val-cfg (or (:validator cfg) (when (:enable-validator? cfg) {}))
+        val-node (when (map? raw-val-cfg)
+                   (let [val-cfg (assoc raw-val-cfg
+                                        :node/id (or (:node/id raw-val-cfg) (:node-id raw-val-cfg) node-id)
+                                        :node-id (or (:node-id raw-val-cfg) (:node/id raw-val-cfg) node-id)
+                                        :state-dir (or (:state-dir raw-val-cfg) state-dir)
+                                        :http (merge {:enabled? false} (:http raw-val-cfg)))]
+                     (mesh/start-mesh-node! val-cfg {:identity ident})))
+        epoch-fn (when val-node
+                   (or (:epoch-fn cfg)
+                       (fn [] (long (or (:last-executed-finalized-epoch @(:state-atom val-node)) 0)))))
+        inband-fetcher (when val-node
+                         (or (:inband-snapshot-fetcher cfg)
+                             (fn [pubkey nonce]
+                               (when-let [st (some-> (:state-atom val-node) deref)]
+                                 (when-let [snap (mesh/build-validator-chain-state-snapshot
+                                                  st (:identity val-node) pubkey nonce)]
+                                   [snap])))))
+        cfg (cond-> cfg
+              epoch-fn (assoc :epoch-fn epoch-fn)
+              inband-fetcher (assoc :inband-snapshot-fetcher inband-fetcher))
         tls-mgr (http-shell/init-tls-manager! {:state-dir state-dir
                                                :domain (or (:domain cfg) "localhost")})
-        {:keys [node-id pubkey identity all-nodes runtime]}
-        (build-infra-runtime-from-config! cfg tls-mgr true)
+        {:keys [pubkey identity all-nodes runtime]}
+        (build-infra-runtime-from-config! cfg tls-mgr true val-node ident)
         peer-mesh (when (and (get-in cfg [:cluster :enabled?] true)
                              (> (count (get-in cfg [:cluster :nodes] {})) 1))
                     (infra/start-datachannel-peer-mesh! cfg runtime))
@@ -152,6 +183,7 @@
      :all-nodes all-nodes
      :identity identity
      :runtime runtime
+     :validator val-node
      :peer-mesh peer-mesh
      :tls-manager tls-mgr
      :dns dns-srv
@@ -160,6 +192,7 @@
      :upnp upnp-res
      :acme acme-mgr
      :stop! (fn []
+              (when val-node (mesh/stop-mesh-node! val-node))
               (when acme-mgr (acme-shell/stop-acme-loop! acme-mgr))
               (when (and upnp-res (:gateway upnp-res))
                 (upnp/teardown-ingress-port-mappings! (:gateway upnp-res) (:mappings upnp-res) upnp-cfg))
@@ -410,7 +443,9 @@
     (println (str "Node: " (name node-id)))
     (println (str "State directory: " state-dir))
     (println (str "Ed25519 Pubkey: " (:pubkey-hex ident)))
-    (println (str "SHA-256 Fingerprint: " (:fingerprint ident)))))
+    (println (str "SHA-256 Fingerprint: " (:fingerprint ident)))
+    (println (str "ICE ufrag: " (get-in ident [:ice-creds :ufrag])))
+    (println (str "ICE pwd: " (get-in ident [:ice-creds :pwd])))))
 
 (defn- cmd-list-mail
   "Lists active `mail/*` Pointers in an infra node's Subnet store."

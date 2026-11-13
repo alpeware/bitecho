@@ -2470,7 +2470,9 @@
                                     :gate/admission :allowlist
                                     :gate/trust-anchors #{user-pub}}
                       :subnet/path-acl [{:pattern "storage/<pubkey>/*" :principal {:type :self-path-owner}}
-                                        {:pattern "capability/<pubkey>/*" :principal {:type :self-path-owner}}]
+                                        {:pattern "capability/<pubkey>/*" :principal {:type :self-path-owner}}
+                                        {:pattern "subnet/nexus/storage/<pubkey>/*" :principal {:type :self-path-owner}}
+                                        {:pattern "subnet/nexus/capability/<pubkey>/*" :principal {:type :self-path-owner}}]
                       :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
                       :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
         sub-inst0 (:instance (subnet/init-subnet-instance nexus-policy {:now-ms 1000}))

@@ -99,6 +99,36 @@
           :delivery-threshold   2}))
 
 ;; ---------------------------------------------------------------------------
+;; Unified 6-Validator Devnet preset (N = 6, quorum = 4)
+;; ---------------------------------------------------------------------------
+
+(def devnet-6-nodes
+  "Canonical validator set for the unified 6-node Devnet mesh."
+  #{:node1 :node2 :node3 :ns1 :ns2 :ns3})
+
+(defn devnet-6-config
+  "Protocol parameters tuned for the unified 6-validator mesh (N = 6, quorum = 4).
+   Includes both core validators (:node1..:node3) and co-located edge infra validators (:ns1..:ns3)."
+  ([]
+   (devnet-6-config {}))
+  ([overrides]
+   (merge default-config
+          {:nodes                devnet-6-nodes
+           :validator-count      6
+           :quorum-threshold     4
+           :epoch-length-ms      10000
+           :tick-interval-ms     10000
+           :murmur-k             3
+           :basalt-max-view-size 10
+           :echo-sample-size     5
+           :echo-threshold       4
+           :ready-sample-size    5
+           :ready-threshold      2
+           :delivery-sample-size 5
+           :delivery-threshold   4}
+          overrides)))
+
+;; ---------------------------------------------------------------------------
 ;; Constructor
 ;; ---------------------------------------------------------------------------
 
