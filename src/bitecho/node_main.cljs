@@ -832,6 +832,7 @@
                                                 (extract-flag-value args "--to" nil))
                                        amt (extract-long-flag args "--amount" nil)
                                        dh (extract-flag-value args "--deliverable-hash" nil)
+                                       ph (extract-flag-value args "--puzzle-hash" nil)
                                        ep (extract-long-flag args "--expires-epoch" nil)
                                        eid (extract-flag-value args "--escrow-id" nil)
                                        m {"cmd" "lock-intent"}]
@@ -839,18 +840,78 @@
                                      recv (assoc "receiver" recv "recipient" recv)
                                      amt (assoc "amount" amt)
                                      dh (assoc "deliverable_hash" dh)
+                                     ph (assoc "puzzle_hash" ph)
                                      ep (assoc "expires_epoch" ep)
                                      eid (assoc "escrow_id" eid)))
                    "release-intent" (let [eid (extract-flag-value args "--escrow-id" nil)
                                           pre (extract-flag-value args "--preimage" nil)
+                                          psrc (extract-flag-value args "--puzzle-source" nil)
+                                          sol (extract-flag-value args "--solution" nil)
                                           m {"cmd" "release-intent"}]
                                       (cond-> m
                                         eid (assoc "escrow_id" eid)
-                                        pre (assoc "preimage" pre)))
+                                        pre (assoc "preimage" pre)
+                                        psrc (assoc "puzzle_source" psrc)
+                                        sol (assoc "solution" sol)))
                    "refund-intent" (let [eid (extract-flag-value args "--escrow-id" nil)
                                          m {"cmd" "refund-intent"}]
                                      (cond-> m
                                        eid (assoc "escrow_id" eid)))
+                   "storage-put" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                               (extract-flag-value args "--subnet" nil)
+                                               "nexus")
+                                       slot (or (extract-flag-value args "--slot" nil) "default")
+                                       data (extract-flag-value args "--data" nil)
+                                       seq-num (extract-long-flag args "--seq" nil)
+                                       min-seq (extract-long-flag args "--min-seq" nil)
+                                       out-file (extract-flag-value args "--out-file" nil)
+                                       m {"cmd" "storage-put" "subnet_id" sub "slot" slot}]
+                                   (cond-> m
+                                     data (assoc "data" data)
+                                     seq-num (assoc "seq" seq-num)
+                                     min-seq (assoc "min_seq" min-seq)
+                                     out-file (assoc "out_file" out-file)))
+                   "storage-get" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                               (extract-flag-value args "--subnet" nil)
+                                               "nexus")
+                                       slot (or (extract-flag-value args "--slot" nil) "default")
+                                       min-seq (extract-long-flag args "--min-seq" nil)
+                                       out-file (extract-flag-value args "--out-file" nil)
+                                       m {"cmd" "storage-get" "subnet_id" sub "slot" slot}]
+                                   (cond-> m
+                                     min-seq (assoc "min_seq" min-seq)
+                                     out-file (assoc "out_file" out-file)))
+                   "capability-publish" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                      (extract-flag-value args "--subnet" nil)
+                                                      "nexus")
+                                              cap-id (or (extract-flag-value args "--capability-id" nil)
+                                                         (extract-flag-value args "--cap-id" nil))
+                                              cap-type (or (extract-flag-value args "--capability-type" nil)
+                                                           (extract-flag-value args "--type" nil))
+                                              cap-path (or (extract-flag-value args "--capability-path" nil)
+                                                           (extract-flag-value args "--path" nil))
+                                              cap-terms (or (extract-flag-value args "--capability-terms" nil)
+                                                            (extract-flag-value args "--terms" nil))
+                                              price (extract-long-flag args "--price-echo"
+                                                                       (extract-long-flag args "--price" nil))
+                                              m {"cmd" "capability-publish" "subnet_id" sub}]
+                                          (cond-> m
+                                            cap-id (assoc "capability_id" cap-id)
+                                            cap-type (assoc "capability_type" cap-type)
+                                            cap-path (assoc "capability_path" cap-path)
+                                            cap-terms (assoc "capability_terms" cap-terms)
+                                            price (assoc "price_echo" price)))
+                   "capability-resolve" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                      (extract-flag-value args "--subnet" nil)
+                                                      "nexus")
+                                              cap-id (or (extract-flag-value args "--capability-id" nil)
+                                                         (extract-flag-value args "--cap-id" nil))
+                                              auth (or (extract-flag-value args "--authority" nil)
+                                                       (extract-flag-value args "--pubkey" nil))
+                                              m {"cmd" "capability-resolve" "subnet_id" sub}]
+                                          (cond-> m
+                                            cap-id (assoc "capability_id" cap-id)
+                                            auth (assoc "authority" auth)))
                    "escrows" (let [sync? (boolean (some #{"--sync"} args))]
                                (cond-> {"cmd" "escrows"}
                                  sync? (assoc "sync" true)))

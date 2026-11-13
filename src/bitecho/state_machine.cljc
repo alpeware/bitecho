@@ -12,6 +12,7 @@
             [bitecho.economy.bundle :as bundle]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
+            [bitecho.economy.puzzle :as puzzle]
             [bitecho.economy.treasury :as treasury]
             [bitecho.fressian :as fressian]
             [bitecho.murmur.core :as murmur]
@@ -1628,6 +1629,8 @@
                                              receiver (:receiver r)
                                              amount (if (integer? (:amount r)) (long (:amount r)) 0)
                                              deliverable-hash (:deliverable-hash r)
+                                             puzzle-hash (:puzzle-hash r)
+                                             effective-d-hash (or deliverable-hash puzzle-hash)
                                              created-epoch (if (integer? (:created-epoch r)) (long (:created-epoch r)) closing-ep)
                                              expires-epoch (if (integer? (:expires-epoch r)) (long (:expires-epoch r)) 0)
                                              payer-hex (when payer (if (string? payer) payer (basalt/bytes->hex payer)))
@@ -1641,7 +1644,8 @@
                                                   (not already-exists?)
                                                   payer-hex receiver-hex (not= payer-hex receiver-hex)
                                                   (pos? amount)
-                                                  (escrow/valid-deliverable-hash? deliverable-hash)
+                                                  effective-d-hash
+                                                  (escrow/valid-deliverable-hash? effective-d-hash)
                                                   (integer? (:expires-epoch r))
                                                   (> expires-epoch created-epoch)
                                                   (>= created-epoch (- closing-ep 168))
@@ -1652,7 +1656,8 @@
                                                                :payer payer-hex
                                                                :receiver receiver-hex
                                                                :amount amount
-                                                               :deliverable-hash (escrow/normalize-hex deliverable-hash)
+                                                               :deliverable-hash (escrow/normalize-hex effective-d-hash)
+                                                               :puzzle-hash (when puzzle-hash (escrow/normalize-hex puzzle-hash))
                                                                :created-epoch created-epoch
                                                                :expires-epoch expires-epoch
                                                                :status :locked}]
@@ -1666,6 +1671,8 @@
                                              escrow (get-in s [:escrows escrow-id])
                                              preimage (:preimage r)
                                              payer-sig (:payer-signature r)
+                                             puzzle-src (:puzzle-source r)
+                                             solution (:solution r)
                                              sender (:sender r)
                                              sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))
                                              configured-bps (or (:settlement-take-bps s)
@@ -1675,37 +1682,90 @@
                                            (let [payer (:payer escrow)
                                                  receiver (:receiver escrow)
                                                  d-hash (:deliverable-hash escrow)
+                                                 p-hash (:puzzle-hash escrow)
                                                  expires-epoch (long (or (:expires-epoch escrow) 0))
                                                  amount (long (:amount escrow))
+                                                 puzzle-res (when (and p-hash puzzle-src (<= closing-ep expires-epoch))
+                                                              (puzzle/eval-puzzle puzzle-src
+                                                                                  solution
+                                                                                  {:amount amount
+                                                                                   :receiver receiver
+                                                                                   :payer payer
+                                                                                   :deliverable-hash d-hash
+                                                                                   :puzzle-hash p-hash
+                                                                                   :epoch closing-ep
+                                                                                   :escrow-id escrow-id}))
+                                                 puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
                                                  payer-auth? (or (= sender-hex payer)
                                                                  (and (string? payer-sig)
                                                                       (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig)))
-                                                 preimage-auth? (and (string? preimage)
+                                                 preimage-auth? (and (nil? p-hash)
+                                                                     (string? preimage)
                                                                      (escrow/verify-deliverable-preimage preimage d-hash)
                                                                      (<= closing-ep expires-epoch)
                                                                      (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))]
-                                             (if (or payer-auth? preimage-auth?)
-                                               (let [take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
-                                                     net-amt (- amount take-amt)
-                                                     receiver-acct (get-in s [:ledger receiver]
-                                                                           (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                                     new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
-                                                     updated-escrow (assoc escrow
-                                                                           :status :released
-                                                                           :settled-epoch closing-ep
-                                                                           :take-amount take-amt
-                                                                           :net-amount net-amt
-                                                                           :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))
-                                                     [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
-                                                                                                     (:settled-escrow-order s)
-                                                                                                     escrow-id
-                                                                                                     max-tracked)]
-                                                 (-> s
-                                                     (assoc-in [:ledger receiver] new-receiver)
-                                                     (assoc-in [:escrows escrow-id] updated-escrow)
-                                                     (assoc :settled-escrow-ids next-settled-ids
-                                                            :settled-escrow-order next-settled-ord)
-                                                     (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt)))
+                                             (if (or payer-auth? preimage-auth? puzzle-auth?)
+                                               (if puzzle-auth?
+                                                 (let [conditions (:conditions puzzle-res)
+                                                       settled-res (reduce
+                                                                    (fn [acc c]
+                                                                      (let [rec (:receiver c)
+                                                                            amt (long (:amount c))
+                                                                            is-release? (= :release (:type c))
+                                                                            take-amt (if is-release?
+                                                                                       (escrow/calculate-escrow-settlement-take amt configured-bps)
+                                                                                       0)
+                                                                            net-amt (- amt take-amt)
+                                                                            rec-acct (get-in (:ledger acc) [rec]
+                                                                                             (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                                                            new-rec (assoc rec-acct :balance (+ (or (:balance rec-acct) 0) net-amt))]
+                                                                        (-> acc
+                                                                            (assoc-in [:ledger rec] new-rec)
+                                                                            (update :total-take + take-amt)
+                                                                            (update :total-net + net-amt))))
+                                                                    {:ledger (:ledger s) :total-take 0 :total-net 0}
+                                                                    conditions)
+                                                       total-take (:total-take settled-res)
+                                                       total-net (:total-net settled-res)
+                                                       updated-escrow (assoc escrow
+                                                                             :status :released
+                                                                             :settled-epoch closing-ep
+                                                                             :take-amount total-take
+                                                                             :net-amount total-net
+                                                                             :conditions conditions
+                                                                             :settlement-mode :puzzle-verified)
+                                                       max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
+                                                       [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
+                                                                                                       (:settled-escrow-order s)
+                                                                                                       escrow-id
+                                                                                                       max-tracked)]
+                                                   (-> s
+                                                       (assoc :ledger (:ledger settled-res))
+                                                       (assoc-in [:escrows escrow-id] updated-escrow)
+                                                       (assoc :settled-escrow-ids next-settled-ids
+                                                              :settled-escrow-order next-settled-ord)
+                                                       (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) total-take)))
+                                                 (let [take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
+                                                       net-amt (- amount take-amt)
+                                                       receiver-acct (get-in s [:ledger receiver]
+                                                                             (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                                       new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+                                                       updated-escrow (assoc escrow
+                                                                             :status :released
+                                                                             :settled-epoch closing-ep
+                                                                             :take-amount take-amt
+                                                                             :net-amount net-amt
+                                                                             :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))
+                                                       [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids s)
+                                                                                                       (:settled-escrow-order s)
+                                                                                                       escrow-id
+                                                                                                       max-tracked)]
+                                                   (-> s
+                                                       (assoc-in [:ledger receiver] new-receiver)
+                                                       (assoc-in [:escrows escrow-id] updated-escrow)
+                                                       (assoc :settled-escrow-ids next-settled-ids
+                                                              :settled-escrow-order next-settled-ord)
+                                                       (update-in [:epoch-settlement-takes closing-ep] (fnil + 0) take-amt))))
                                                (update s :failed-receipts-count (fnil inc 0))))
                                            (update s :failed-receipts-count (fnil inc 0))))
 
@@ -2545,7 +2605,7 @@
 
 (defn- handle-lock-intent
   "Handles request to lock funds into deterministic verified-outcome escrow.
-   Enforces sender authentication, positive integer amount, valid deliverable-hash,
+   Enforces sender authentication, positive integer amount, valid deliverable-hash or puzzle-hash,
    expires-epoch > created-epoch, and sufficient payer balance."
   [state event]
   (if-not (and (or (nil? (:epoch event)) (integer? (:epoch event)))
@@ -2556,6 +2616,8 @@
           receiver (:receiver event)
           amount (:amount event)
           deliverable-hash (:deliverable-hash event)
+          puzzle-hash (:puzzle-hash event)
+          effective-d-hash (or deliverable-hash puzzle-hash)
           current-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
                                 (:epoch state)
                                 (or (:epoch event) (:epoch state) 0)))
@@ -2568,16 +2630,16 @@
           receiver-hex (when receiver (if (string? receiver) receiver (basalt/bytes->hex receiver)))
           escrow-id (or (:escrow-id event)
                         (when (and payer-hex receiver-hex (integer? amount) (pos? amount)
-                                   deliverable-hash (escrow/valid-deliverable-hash? deliverable-hash)
+                                   effective-d-hash (escrow/valid-deliverable-hash? effective-d-hash)
                                    (> expires-epoch created-epoch))
-                          (escrow/compute-escrow-id payer-hex receiver-hex amount deliverable-hash created-epoch expires-epoch nonce)))
+                          (escrow/compute-escrow-id payer-hex receiver-hex amount effective-d-hash created-epoch expires-epoch nonce)))
           already-exists? (or (contains? (or (:escrows state) #{}) escrow-id)
                               (contains? (or (:settled-escrow-ids state) #{}) escrow-id))]
       (if-not (or (nil? sender-hex) (= payer-hex sender-hex))
         {:state state :commands []}
         (if (or (nil? payer-hex) (nil? receiver-hex) (= payer-hex receiver-hex)
                 (not (integer? amount)) (not (pos? amount))
-                (not (escrow/valid-deliverable-hash? deliverable-hash))
+                (not (escrow/valid-deliverable-hash? effective-d-hash))
                 (<= expires-epoch created-epoch)
                 (< created-epoch (- current-epoch 168))
                 (> (- expires-epoch created-epoch) 168)
@@ -2594,7 +2656,8 @@
                                                    :payer payer-hex
                                                    :receiver receiver-hex
                                                    :amount amount
-                                                   :deliverable-hash (escrow/normalize-hex deliverable-hash)
+                                                   :deliverable-hash (when deliverable-hash (escrow/normalize-hex deliverable-hash))
+                                                   :puzzle-hash (when puzzle-hash (escrow/normalize-hex puzzle-hash))
                                                    :created-epoch created-epoch
                                                    :expires-epoch expires-epoch})]
                   (if (:ok? staged)
@@ -2609,7 +2672,8 @@
                                     :payer payer-hex
                                     :receiver receiver-hex
                                     :amount amount
-                                    :deliverable-hash (escrow/normalize-hex deliverable-hash)
+                                    :deliverable-hash (escrow/normalize-hex effective-d-hash)
+                                    :puzzle-hash (when puzzle-hash (escrow/normalize-hex puzzle-hash))
                                     :created-epoch created-epoch
                                     :expires-epoch expires-epoch
                                     :status :locked}]
@@ -2628,6 +2692,8 @@
           escrow (get-in state [:escrows escrow-id])
           preimage (:preimage event)
           payer-sig (:payer-signature event)
+          puzzle-src (:puzzle-source event)
+          solution (:solution event)
           event-sender (:sender event)
           sender-hex (when event-sender (if (string? event-sender) event-sender (basalt/bytes->hex event-sender)))
           current-epoch (long (if (and (consensus-mode? state) (pos? (long (or (:epoch state) 0))))
@@ -2638,17 +2704,34 @@
         (let [payer (:payer escrow)
               receiver (:receiver escrow)
               d-hash (:deliverable-hash escrow)
+              p-hash (:puzzle-hash escrow)
               expires-epoch (long (or (:expires-epoch escrow) 0))
               amount (long (:amount escrow))
+              puzzle-res (when (and p-hash puzzle-src (<= current-epoch expires-epoch))
+                           (puzzle/eval-puzzle puzzle-src
+                                               solution
+                                               {:amount amount
+                                                :receiver receiver
+                                                :payer payer
+                                                :deliverable-hash d-hash
+                                                :puzzle-hash p-hash
+                                                :epoch current-epoch
+                                                :escrow-id escrow-id}))
+              puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
               payer-auth? (or (= sender-hex payer)
                               (and (string? payer-sig)
                                    (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig)))
-              preimage-auth? (and (string? preimage)
+              preimage-auth? (and (nil? p-hash)
+                                  (string? preimage)
                                   (escrow/verify-deliverable-preimage preimage d-hash)
                                   (<= current-epoch expires-epoch)
                                   (or (nil? sender-hex) (= sender-hex receiver) (= sender-hex payer)))]
-          (if-not (or payer-auth? preimage-auth?)
-            {:state state :commands []}
+          (if-not (or payer-auth? preimage-auth? puzzle-auth?)
+            {:state (-> state
+                        (update-in [:diagnostics :rejected-release-intents] (fnil inc 0))
+                        (cond-> (and puzzle-res (not (:valid? puzzle-res)))
+                          (assoc-in [:diagnostics :last-puzzle-error] (:error puzzle-res))))
+             :commands []}
             (if (consensus-mode? state)
               (let [pending-receipts (or (:pending-receipts state) [])
                     conflicting? (or (contains? (or (:known-receipt-ids state) #{}) (str "refund:" escrow-id))
@@ -2662,36 +2745,79 @@
                                                      :escrow-id escrow-id
                                                      :preimage preimage
                                                      :payer-signature payer-sig
+                                                     :puzzle-source puzzle-src
+                                                     :solution solution
                                                      :sender sender-hex})]
                     (if (:ok? staged)
                       {:state (:state staged) :commands []}
                       {:state state :commands []}))))
               (let [configured-bps (or (:settlement-take-bps state)
                                        (get-in state [:config :settlement-take-bps])
-                                       burn/default-settlement-take-bps)
-                    take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
-                    net-amt (- amount take-amt)
-                    receiver-acct (get-in state [:ledger receiver]
-                                          (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                    new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
-                    updated-escrow (assoc escrow
-                                          :status :released
-                                          :settled-epoch current-epoch
-                                          :take-amount take-amt
-                                          :net-amount net-amt
-                                          :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))
-                    max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
-                    [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids state)
-                                                                    (:settled-escrow-order state)
-                                                                    escrow-id
-                                                                    max-tracked)]
-                {:state (-> state
-                            (assoc-in [:ledger receiver] new-receiver)
-                            (assoc-in [:escrows escrow-id] updated-escrow)
-                            (assoc :settled-escrow-ids next-settled-ids
-                                   :settled-escrow-order next-settled-ord)
-                            (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
-                 :commands []}))))))))
+                                       burn/default-settlement-take-bps)]
+                (if puzzle-auth?
+                  (let [conditions (:conditions puzzle-res)
+                        settled-res (reduce
+                                     (fn [acc c]
+                                       (let [rec (:receiver c)
+                                             amt (long (:amount c))
+                                             is-release? (= :release (:type c))
+                                             take-amt (if is-release?
+                                                        (escrow/calculate-escrow-settlement-take amt configured-bps)
+                                                        0)
+                                             net-amt (- amt take-amt)
+                                             rec-acct (get-in (:ledger acc) [rec]
+                                                              (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                             new-rec (assoc rec-acct :balance (+ (or (:balance rec-acct) 0) net-amt))]
+                                         (-> acc
+                                             (assoc-in [:ledger rec] new-rec)
+                                             (update :total-take + take-amt)
+                                             (update :total-net + net-amt))))
+                                     {:ledger (:ledger state) :total-take 0 :total-net 0}
+                                     conditions)
+                        total-take (:total-take settled-res)
+                        total-net (:total-net settled-res)
+                        updated-escrow (assoc escrow
+                                              :status :released
+                                              :settled-epoch current-epoch
+                                              :take-amount total-take
+                                              :net-amount total-net
+                                              :conditions conditions
+                                              :settlement-mode :puzzle-verified)
+                        max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
+                        [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids state)
+                                                                        (:settled-escrow-order state)
+                                                                        escrow-id
+                                                                        max-tracked)]
+                    {:state (-> state
+                                (assoc :ledger (:ledger settled-res))
+                                (assoc-in [:escrows escrow-id] updated-escrow)
+                                (assoc :settled-escrow-ids next-settled-ids
+                                       :settled-escrow-order next-settled-ord)
+                                (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) total-take))
+                     :commands []})
+                  (let [take-amt (escrow/calculate-escrow-settlement-take amount configured-bps)
+                        net-amt (- amount take-amt)
+                        receiver-acct (get-in state [:ledger receiver]
+                                              (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                        new-receiver (assoc receiver-acct :balance (+ (or (:balance receiver-acct) 0) net-amt))
+                        updated-escrow (assoc escrow
+                                              :status :released
+                                              :settled-epoch current-epoch
+                                              :take-amount take-amt
+                                              :net-amount net-amt
+                                              :settlement-mode (if payer-auth? :payer-authorized :preimage-verified))
+                        max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
+                        [next-settled-ids next-settled-ord] (fifo-track (:settled-escrow-ids state)
+                                                                        (:settled-escrow-order state)
+                                                                        escrow-id
+                                                                        max-tracked)]
+                    {:state (-> state
+                                (assoc-in [:ledger receiver] new-receiver)
+                                (assoc-in [:escrows escrow-id] updated-escrow)
+                                (assoc :settled-escrow-ids next-settled-ids
+                                       :settled-escrow-order next-settled-ord)
+                                (update-in [:epoch-settlement-takes current-epoch] (fnil + 0) take-amt))
+                     :commands []}))))))))))
 
 (defn- handle-refund-intent
   "Handles request to refund escrowed funds on timeout or receiver voluntary refund."

@@ -12,6 +12,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-node]
             [clojure.string :as str]))
 
@@ -323,7 +324,7 @@
     "inbox" "inbox-count" "outbox" "chat-history" "messages" "messages-exchanged" "messages-received" "last-message"
     "msg-payload" "gossip-env" "message-id" "payload" "payload-hex" "frame-type" "nonce" "ciphertext" "sealed-frame"
     "burned-ech" "total-burned-ech" "alice-burned" "bob-burned" "vouchers" "vouchers-count" "voucher-id"
-    "escrows" "escrows-count" "escrow-id" "deliverable-hash" "last-transfer-hash"
+    "escrows" "escrows-count" "escrow-id" "deliverable-hash" "puzzle-hash" "last-transfer-hash"
     "settled-epoch" "net-amount" "settlement-mode" "take-amount" "take-burned"
     "refund-amount" "refund-reason" "payer-signature" "preimage" "deliverable"
     "release-submitted" "refund-submitted" "settled-escrow-ids" "settled-escrow-order" "canonical-escrows"
@@ -929,3 +930,34 @@
      :background-throttled-events (get-in bob-final [:diagnostics :background-throttled-events])
      :stale-generation-ignored (get-in bob-final [:diagnostics :ignored-stale])
      :diagnostics (:diagnostics bob-final)}))
+
+;; =============================================================================
+;; 11. Pure Browser CLI Execution Interface (Priority 4 / Rules 1, 2, 5, 6)
+;; =============================================================================
+
+(defn exec-browser-cli
+  "Pure CLI execution engine for browser node state conforming to Rules 1, 2, 5, 6.
+   Executes a parsed CLI command against browser node state and returns:
+   {:ok? bool :state updated-state :response map :net-envelopes vector :verb str}."
+  [state cmd-or-args privkey-bytes]
+  (let [parse-res (cli/parse-cli-command cmd-or-args)]
+    (if-not (:ok? parse-res)
+      {:ok? false
+       :error (:error parse-res)
+       :verb (:verb parse-res)
+       :state state
+       :response {"ok" false "error" (name (or (:error parse-res) :invalid-verb))}
+       :net-envelopes []
+       :stdout-events []}
+      (let [target-state (if (map? (:light-state state)) (:light-state state) state)
+            res (light-node/handle-command target-state (:cmd-map parse-res) privkey-bytes)
+            updated-state (if (map? (:light-state state))
+                            (assoc state :light-state (:state res))
+                            (:state res))]
+        {:ok? (boolean (get-in res [:response "ok"] true))
+         :state updated-state
+         :verb (:verb parse-res)
+         :response (:response res)
+         :net-envelopes (or (:net-envelopes res) [])
+         :stdout-events (or (:stdout-events res) [])}))))
+

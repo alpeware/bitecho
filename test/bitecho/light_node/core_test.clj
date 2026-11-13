@@ -3655,6 +3655,61 @@
         (is (empty? (:event-queue @st-atom)) "Event queue fully drained")
         (is (= 50 (:event-ack-cursor @st-atom)) "Cursor advanced to 50")))))
 
+;; =============================================================================
+;; E2EE Storage & Capability Command Tests (Priority 2)
+;; =============================================================================
+
+(deftest test-light-node-storage-and-capability-commands
+  (testing "handle-command: storage-put, storage-get, capability-publish, capability-resolve"
+    (let [alice (test-identity)
+          st0 (light-core/init-light-state (:identity alice) {})
+          priv (:privkey-bytes alice)
+          data {:theme "dark" :petnames {"bob" "1234"}}
+          ;; 1. storage-put
+          put-res (light-core/handle-command st0 {"cmd" "storage-put" "slot" "prefs" "data" data} priv)
+          st1 (:state put-res)
+          resp-put (:response put-res)]
+      (is (true? (get resp-put "ok")))
+      (is (= 1 (get resp-put "seq")))
+      (is (string? (get resp-put "cid")))
+      (is (string? (get resp-put "path")))
+
+      ;; 2. storage-get
+      (let [get-res (light-core/handle-command st1 {"cmd" "storage-get" "slot" "prefs"} priv)
+            resp-get (:response get-res)]
+        (is (true? (get resp-get "ok")))
+        (is (= data (get resp-get "data")))
+        (is (= 1 (get resp-get "seq"))))
+
+      ;; 3. update storage-put with seq 2
+      (let [put-res2 (light-core/handle-command st1 {"cmd" "storage-put" "slot" "prefs" "data" (assoc data :theme "light")} priv)
+            st2 (:state put-res2)
+            get-res2 (light-core/handle-command st2 {"cmd" "storage-get" "slot" "prefs"} priv)]
+        (is (true? (get (:response put-res2) "ok")))
+        (is (= 2 (get (:response put-res2) "seq")))
+        (is (= "light" (get-in (:response get-res2) ["data" :theme]))))
+
+      ;; 4. capability-publish
+      (let [pub-res (light-core/handle-command st1 {"cmd" "capability-publish"
+                                                    "capability_id" "uop-kernel-1"
+                                                    "capability_type" ":compute/uop-kernel"
+                                                    "price_echo" 250
+                                                    "burn_floor" 5
+                                                    "metadata" {"isa" "rv64"}} priv)
+            st-cap (:state pub-res)
+            path (get-in pub-res [:response "path"])
+            cid (get-in pub-res [:response "cid"])]
+        (is (true? (get-in pub-res [:response "ok"])))
+        (is (string? cid))
+        (is (string? path))
+
+        ;; 5. capability-resolve
+        (let [res-cap (light-core/handle-command st-cap {"cmd" "capability-resolve" "path" path} priv)]
+          (is (true? (get-in res-cap [:response "ok"])))
+          (is (= :compute/uop-kernel (get-in res-cap [:response "capability" :capability/type])))
+          (is (= 250 (get-in res-cap [:response "capability" :capability/price-echo])))
+          (is (= 5 (get-in res-cap [:response "capability" :capability/burn-floor]))))))))
+
 
 
 

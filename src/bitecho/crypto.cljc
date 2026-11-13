@@ -9,7 +9,7 @@
   #?(:clj
      (:import [java.security MessageDigest KeyPairGenerator KeyFactory Signature]
               [java.security.spec X509EncodedKeySpec PKCS8EncodedKeySpec]
-              [java.util Random])))
+              [java.util Random Arrays])))
 
 ;; =============================================================================
 ;; Pure Synchronous SHA-256
@@ -336,26 +336,34 @@
           (SplitMix64PRNG. (atom (js/BigInt (str (hash seed)))))]))))
 
 (defn random-bytes
-  "Generates n cryptographically secure random bytes.
-   Uses SecureRandom on JVM, globalThis.crypto.getRandomValues in Browser,
+  "Generates n random bytes.
+   When rng (implementing IRandom) is provided, fills deterministically from rng.
+   Otherwise uses SecureRandom on JVM, globalThis.crypto.getRandomValues in Browser,
    or node:crypto randomBytes on Node.js. Fails closed if no CSPRNG is available."
-  [n]
-  #?(:clj
-     (let [ba (byte-array n)]
-       (.nextBytes (java.security.SecureRandom.) ba)
+  ([n]
+   #?(:clj
+      (let [ba (byte-array n)]
+        (.nextBytes (java.security.SecureRandom.) ba)
+        ba)
+      :cljs
+      (cond
+        (and (exists? js/globalThis) (.-crypto js/globalThis) (.-getRandomValues (.-crypto js/globalThis)))
+        (let [buf (js/Uint8Array. n)]
+          (.getRandomValues (.-crypto js/globalThis) buf)
+          buf)
+
+        node-crypto
+        (let [rb-fn (or (aget node-crypto "randomBytes") (.-randomBytes node-crypto))]
+          (js/Uint8Array. (.call rb-fn node-crypto n)))
+
+        :else
+        (throw (js/Error. "No CSPRNG available (neither globalThis.crypto.getRandomValues nor node:crypto).")))))
+  ([rng n]
+   (if (satisfies? IRandom rng)
+     (let [ba #?(:clj (byte-array n) :cljs (js/Uint8Array. n))]
+       (next-bytes rng ba)
        ba)
-     :cljs
-     (cond
-       (and (exists? js/globalThis) (.-crypto js/globalThis) (.-getRandomValues (.-crypto js/globalThis)))
-       (let [buf (js/Uint8Array. n)]
-         (.getRandomValues (.-crypto js/globalThis) buf)
-         buf)
-
-       node-crypto
-       (js/Uint8Array. (.randomBytes node-crypto n))
-
-       :else
-       (throw (js/Error. "No CSPRNG available (neither globalThis.crypto.getRandomValues nor node:crypto).")))))
+     (random-bytes n))))
 
 ;; =============================================================================
 ;; Pure Synchronous SHA-512 & RFC 8032 Ed25519 (Browser + CLJS Fallback)
@@ -795,9 +803,14 @@
           {:public pub :private priv :public-key pub :private-key priv})
         :cljs
         (if node-crypto
-          (let [kp (.generateKeyPairSync node-crypto "ed25519")
-                pub-der (.export (.-publicKey kp) #js {:type "spki" :format "der"})
-                priv-der (.export (.-privateKey kp) #js {:type "pkcs8" :format "der"})
+          (let [gen-fn (or (aget node-crypto "generateKeyPairSync") (.-generateKeyPairSync node-crypto))
+                kp (.call gen-fn node-crypto "ed25519")
+                pub-obj (or (aget kp "publicKey") (.-publicKey kp))
+                priv-obj (or (aget kp "privateKey") (.-privateKey kp))
+                exp-pub (or (aget pub-obj "export") (.-export pub-obj))
+                exp-priv (or (aget priv-obj "export") (.-export priv-obj))
+                pub-der (.call exp-pub pub-obj #js {:type "spki" :format "der"})
+                priv-der (.call exp-priv priv-obj #js {:type "pkcs8" :format "der"})
                 pub (js/Uint8Array. pub-der)
                 priv (js/Uint8Array. priv-der)]
             {:public pub :private priv :public-key pub :private-key priv})
@@ -827,8 +840,10 @@
          (.sign sig))
        :cljs
        (if node-crypto
-         (let [key-obj (.createPrivateKey node-crypto #js {:key (js/Buffer.from priv-bytes) :format "der" :type "pkcs8"})
-               sig (.sign node-crypto nil (js/Buffer.from msg-bytes) key-obj)]
+         (let [create-key-fn (or (aget node-crypto "createPrivateKey") (.-createPrivateKey node-crypto))
+               sign-fn (or (aget node-crypto "sign") (.-sign node-crypto))
+               key-obj (.call create-key-fn node-crypto #js {:key (js/Buffer.from priv-bytes) :format "der" :type "pkcs8"})
+               sig (.call sign-fn node-crypto nil (js/Buffer.from msg-bytes) key-obj)]
            (js/Uint8Array. sig))
          (pure-ed25519-sign priv-bytes msg-bytes)))))
 
@@ -850,8 +865,10 @@
            (.verify sig ^bytes sig-bytes))
          :cljs
          (if node-crypto
-           (let [key-obj (.createPublicKey node-crypto #js {:key (js/Buffer.from pub-bytes) :format "der" :type "spki"})
-                 ok (.verify node-crypto nil (js/Buffer.from msg-bytes) key-obj (js/Buffer.from sig-bytes))]
+           (let [create-pub-fn (or (aget node-crypto "createPublicKey") (.-createPublicKey node-crypto))
+                 verify-fn (or (aget node-crypto "verify") (.-verify node-crypto))
+                 key-obj (.call create-pub-fn node-crypto #js {:key (js/Buffer.from pub-bytes) :format "der" :type "spki"})
+                 ok (.call verify-fn node-crypto nil (js/Buffer.from msg-bytes) key-obj (js/Buffer.from sig-bytes))]
              (boolean ok))
            (pure-ed25519-verify pub-bytes msg-bytes sig-bytes))))
     (catch #?(:clj Exception :cljs :default) _
@@ -908,6 +925,386 @@
     "Executes an egress signing effect at the shell boundary.")
   (seal-and-emit [this effect]
     "Executes an egress encryption/sealing effect at the shell boundary."))
+
+;; =============================================================================
+;; XSalsa20-Poly1305 Secretbox
+;; =============================================================================
+
+(defn- rotl-32 [^long x ^long n]
+  #?(:clj (Integer/rotateLeft (unchecked-int x) (unchecked-int n))
+     :cljs (bit-or (bit-shift-left (bit-and x 0xffffffff) n)
+                   (unsigned-bit-shift-right (bit-and x 0xffffffff) (- 32 n)))))
+
+(defn- bytes->u32-le [bs ^long offset]
+  (unchecked-int
+   (bit-or (bit-and (int #?(:clj (aget ^bytes bs offset) :cljs (aget bs offset))) 0xff)
+           (bit-shift-left (bit-and (int #?(:clj (aget ^bytes bs (+ offset 1)) :cljs (aget bs (+ offset 1)))) 0xff) 8)
+           (bit-shift-left (bit-and (int #?(:clj (aget ^bytes bs (+ offset 2)) :cljs (aget bs (+ offset 2)))) 0xff) 16)
+           (bit-shift-left (bit-and (int #?(:clj (aget ^bytes bs (+ offset 3)) :cljs (aget bs (+ offset 3)))) 0xff) 24))))
+
+(defn- u32->bytes-le! [^long val bs ^long offset]
+  #?(:clj
+     (do
+       (aset ^bytes bs offset (unchecked-byte (bit-and val 0xff)))
+       (aset ^bytes bs (+ offset 1) (unchecked-byte (bit-and (unsigned-bit-shift-right val 8) 0xff)))
+       (aset ^bytes bs (+ offset 2) (unchecked-byte (bit-and (unsigned-bit-shift-right val 16) 0xff)))
+       (aset ^bytes bs (+ offset 3) (unchecked-byte (bit-and (unsigned-bit-shift-right val 24) 0xff))))
+     :cljs
+     (do
+       (aset bs offset (bit-and val 0xff))
+       (aset bs (+ offset 1) (bit-and (unsigned-bit-shift-right val 8) 0xff))
+       (aset bs (+ offset 2) (bit-and (unsigned-bit-shift-right val 16) 0xff))
+       (aset bs (+ offset 3) (bit-and (unsigned-bit-shift-right val 24) 0xff)))))
+
+(def ^:private c0 (unchecked-int 0x61707865))
+(def ^:private c1 (unchecked-int 0x3320646e))
+(def ^:private c2 (unchecked-int 0x79622d32))
+(def ^:private c3 (unchecked-int 0x6b206574))
+
+(defn- hsalsa20 [k in]
+  (let [x #?(:clj (int-array 16) :cljs (js/Int32Array. 16))]
+    (aset x 0 c0)
+    (aset x 1 (bytes->u32-le k 0))
+    (aset x 2 (bytes->u32-le k 4))
+    (aset x 3 (bytes->u32-le k 8))
+    (aset x 4 (bytes->u32-le k 12))
+    (aset x 5 c1)
+    (aset x 6 (bytes->u32-le in 0))
+    (aset x 7 (bytes->u32-le in 4))
+    (aset x 8 (bytes->u32-le in 8))
+    (aset x 9 (bytes->u32-le in 12))
+    (aset x 10 c2)
+    (aset x 11 (bytes->u32-le k 16))
+    (aset x 12 (bytes->u32-le k 20))
+    (aset x 13 (bytes->u32-le k 24))
+    (aset x 14 (bytes->u32-le k 28))
+    (aset x 15 c3)
+    (dotimes [_ 10]
+      ;; column round
+      (aset x 4 (unchecked-int (bit-xor (aget x 4) (rotl-32 (unchecked-add (aget x 0) (aget x 12)) 7))))
+      (aset x 8 (unchecked-int (bit-xor (aget x 8) (rotl-32 (unchecked-add (aget x 4) (aget x 0)) 9))))
+      (aset x 12 (unchecked-int (bit-xor (aget x 12) (rotl-32 (unchecked-add (aget x 8) (aget x 4)) 13))))
+      (aset x 0 (unchecked-int (bit-xor (aget x 0) (rotl-32 (unchecked-add (aget x 12) (aget x 8)) 18))))
+
+      (aset x 9 (unchecked-int (bit-xor (aget x 9) (rotl-32 (unchecked-add (aget x 5) (aget x 1)) 7))))
+      (aset x 13 (unchecked-int (bit-xor (aget x 13) (rotl-32 (unchecked-add (aget x 9) (aget x 5)) 9))))
+      (aset x 1 (unchecked-int (bit-xor (aget x 1) (rotl-32 (unchecked-add (aget x 13) (aget x 9)) 13))))
+      (aset x 5 (unchecked-int (bit-xor (aget x 5) (rotl-32 (unchecked-add (aget x 1) (aget x 13)) 18))))
+
+      (aset x 14 (unchecked-int (bit-xor (aget x 14) (rotl-32 (unchecked-add (aget x 10) (aget x 6)) 7))))
+      (aset x 2 (unchecked-int (bit-xor (aget x 2) (rotl-32 (unchecked-add (aget x 14) (aget x 10)) 9))))
+      (aset x 6 (unchecked-int (bit-xor (aget x 6) (rotl-32 (unchecked-add (aget x 2) (aget x 14)) 13))))
+      (aset x 10 (unchecked-int (bit-xor (aget x 10) (rotl-32 (unchecked-add (aget x 6) (aget x 2)) 18))))
+
+      (aset x 3 (unchecked-int (bit-xor (aget x 3) (rotl-32 (unchecked-add (aget x 15) (aget x 11)) 7))))
+      (aset x 7 (unchecked-int (bit-xor (aget x 7) (rotl-32 (unchecked-add (aget x 3) (aget x 15)) 9))))
+      (aset x 11 (unchecked-int (bit-xor (aget x 11) (rotl-32 (unchecked-add (aget x 7) (aget x 3)) 13))))
+      (aset x 15 (unchecked-int (bit-xor (aget x 15) (rotl-32 (unchecked-add (aget x 11) (aget x 7)) 18))))
+
+      ;; row round
+      (aset x 1 (unchecked-int (bit-xor (aget x 1) (rotl-32 (unchecked-add (aget x 0) (aget x 3)) 7))))
+      (aset x 2 (unchecked-int (bit-xor (aget x 2) (rotl-32 (unchecked-add (aget x 1) (aget x 0)) 9))))
+      (aset x 3 (unchecked-int (bit-xor (aget x 3) (rotl-32 (unchecked-add (aget x 2) (aget x 1)) 13))))
+      (aset x 0 (unchecked-int (bit-xor (aget x 0) (rotl-32 (unchecked-add (aget x 3) (aget x 2)) 18))))
+
+      (aset x 6 (unchecked-int (bit-xor (aget x 6) (rotl-32 (unchecked-add (aget x 5) (aget x 4)) 7))))
+      (aset x 7 (unchecked-int (bit-xor (aget x 7) (rotl-32 (unchecked-add (aget x 6) (aget x 5)) 9))))
+      (aset x 4 (unchecked-int (bit-xor (aget x 4) (rotl-32 (unchecked-add (aget x 7) (aget x 6)) 13))))
+      (aset x 5 (unchecked-int (bit-xor (aget x 5) (rotl-32 (unchecked-add (aget x 4) (aget x 7)) 18))))
+
+      (aset x 11 (unchecked-int (bit-xor (aget x 11) (rotl-32 (unchecked-add (aget x 10) (aget x 9)) 7))))
+      (aset x 8 (unchecked-int (bit-xor (aget x 8) (rotl-32 (unchecked-add (aget x 11) (aget x 10)) 9))))
+      (aset x 9 (unchecked-int (bit-xor (aget x 9) (rotl-32 (unchecked-add (aget x 8) (aget x 11)) 13))))
+      (aset x 10 (unchecked-int (bit-xor (aget x 10) (rotl-32 (unchecked-add (aget x 9) (aget x 8)) 18))))
+
+      (aset x 12 (unchecked-int (bit-xor (aget x 12) (rotl-32 (unchecked-add (aget x 15) (aget x 14)) 7))))
+      (aset x 13 (unchecked-int (bit-xor (aget x 13) (rotl-32 (unchecked-add (aget x 12) (aget x 15)) 9))))
+      (aset x 14 (unchecked-int (bit-xor (aget x 14) (rotl-32 (unchecked-add (aget x 13) (aget x 12)) 13))))
+      (aset x 15 (unchecked-int (bit-xor (aget x 15) (rotl-32 (unchecked-add (aget x 14) (aget x 13)) 18)))))
+    (let [out #?(:clj (byte-array 32) :cljs (js/Uint8Array. 32))]
+      (u32->bytes-le! (aget x 0) out 0)
+      (u32->bytes-le! (aget x 5) out 4)
+      (u32->bytes-le! (aget x 10) out 8)
+      (u32->bytes-le! (aget x 15) out 12)
+      (u32->bytes-le! (aget x 6) out 16)
+      (u32->bytes-le! (aget x 7) out 20)
+      (u32->bytes-le! (aget x 8) out 24)
+      (u32->bytes-le! (aget x 9) out 28)
+      out)))
+
+(defn- salsa20-block [k n ^long counter]
+  (let [x #?(:clj (int-array 16) :cljs (js/Int32Array. 16))
+        orig #?(:clj (int-array 16) :cljs (js/Int32Array. 16))]
+    (aset x 0 c0)
+    (aset x 1 (bytes->u32-le k 0))
+    (aset x 2 (bytes->u32-le k 4))
+    (aset x 3 (bytes->u32-le k 8))
+    (aset x 4 (bytes->u32-le k 12))
+    (aset x 5 c1)
+    (aset x 6 (bytes->u32-le n 0))
+    (aset x 7 (bytes->u32-le n 4))
+    (aset x 8 (unchecked-int (bit-and counter 0xffffffff)))
+    (aset x 9 (unchecked-int (unsigned-bit-shift-right counter 32)))
+    (aset x 10 c2)
+    (aset x 11 (bytes->u32-le k 16))
+    (aset x 12 (bytes->u32-le k 20))
+    (aset x 13 (bytes->u32-le k 24))
+    (aset x 14 (bytes->u32-le k 28))
+    (aset x 15 c3)
+    #?(:clj (System/arraycopy x 0 orig 0 16)
+       :cljs (.set orig x 0))
+    (dotimes [_ 10]
+      (aset x 4 (unchecked-int (bit-xor (aget x 4) (rotl-32 (unchecked-add (aget x 0) (aget x 12)) 7))))
+      (aset x 8 (unchecked-int (bit-xor (aget x 8) (rotl-32 (unchecked-add (aget x 4) (aget x 0)) 9))))
+      (aset x 12 (unchecked-int (bit-xor (aget x 12) (rotl-32 (unchecked-add (aget x 8) (aget x 4)) 13))))
+      (aset x 0 (unchecked-int (bit-xor (aget x 0) (rotl-32 (unchecked-add (aget x 12) (aget x 8)) 18))))
+
+      (aset x 9 (unchecked-int (bit-xor (aget x 9) (rotl-32 (unchecked-add (aget x 5) (aget x 1)) 7))))
+      (aset x 13 (unchecked-int (bit-xor (aget x 13) (rotl-32 (unchecked-add (aget x 9) (aget x 5)) 9))))
+      (aset x 1 (unchecked-int (bit-xor (aget x 1) (rotl-32 (unchecked-add (aget x 13) (aget x 9)) 13))))
+      (aset x 5 (unchecked-int (bit-xor (aget x 5) (rotl-32 (unchecked-add (aget x 1) (aget x 13)) 18))))
+
+      (aset x 14 (unchecked-int (bit-xor (aget x 14) (rotl-32 (unchecked-add (aget x 10) (aget x 6)) 7))))
+      (aset x 2 (unchecked-int (bit-xor (aget x 2) (rotl-32 (unchecked-add (aget x 14) (aget x 10)) 9))))
+      (aset x 6 (unchecked-int (bit-xor (aget x 6) (rotl-32 (unchecked-add (aget x 2) (aget x 14)) 13))))
+      (aset x 10 (unchecked-int (bit-xor (aget x 10) (rotl-32 (unchecked-add (aget x 6) (aget x 2)) 18))))
+
+      (aset x 3 (unchecked-int (bit-xor (aget x 3) (rotl-32 (unchecked-add (aget x 15) (aget x 11)) 7))))
+      (aset x 7 (unchecked-int (bit-xor (aget x 7) (rotl-32 (unchecked-add (aget x 3) (aget x 15)) 9))))
+      (aset x 11 (unchecked-int (bit-xor (aget x 11) (rotl-32 (unchecked-add (aget x 7) (aget x 3)) 13))))
+      (aset x 15 (unchecked-int (bit-xor (aget x 15) (rotl-32 (unchecked-add (aget x 11) (aget x 7)) 18))))
+
+      (aset x 1 (unchecked-int (bit-xor (aget x 1) (rotl-32 (unchecked-add (aget x 0) (aget x 3)) 7))))
+      (aset x 2 (unchecked-int (bit-xor (aget x 2) (rotl-32 (unchecked-add (aget x 1) (aget x 0)) 9))))
+      (aset x 3 (unchecked-int (bit-xor (aget x 3) (rotl-32 (unchecked-add (aget x 2) (aget x 1)) 13))))
+      (aset x 0 (unchecked-int (bit-xor (aget x 0) (rotl-32 (unchecked-add (aget x 3) (aget x 2)) 18))))
+
+      (aset x 6 (unchecked-int (bit-xor (aget x 6) (rotl-32 (unchecked-add (aget x 5) (aget x 4)) 7))))
+      (aset x 7 (unchecked-int (bit-xor (aget x 7) (rotl-32 (unchecked-add (aget x 6) (aget x 5)) 9))))
+      (aset x 4 (unchecked-int (bit-xor (aget x 4) (rotl-32 (unchecked-add (aget x 7) (aget x 6)) 13))))
+      (aset x 5 (unchecked-int (bit-xor (aget x 5) (rotl-32 (unchecked-add (aget x 4) (aget x 7)) 18))))
+
+      (aset x 11 (unchecked-int (bit-xor (aget x 11) (rotl-32 (unchecked-add (aget x 10) (aget x 9)) 7))))
+      (aset x 8 (unchecked-int (bit-xor (aget x 8) (rotl-32 (unchecked-add (aget x 11) (aget x 10)) 9))))
+      (aset x 9 (unchecked-int (bit-xor (aget x 9) (rotl-32 (unchecked-add (aget x 8) (aget x 11)) 13))))
+      (aset x 10 (unchecked-int (bit-xor (aget x 10) (rotl-32 (unchecked-add (aget x 9) (aget x 8)) 18))))
+
+      (aset x 12 (unchecked-int (bit-xor (aget x 12) (rotl-32 (unchecked-add (aget x 15) (aget x 14)) 7))))
+      (aset x 13 (unchecked-int (bit-xor (aget x 13) (rotl-32 (unchecked-add (aget x 12) (aget x 15)) 9))))
+      (aset x 14 (unchecked-int (bit-xor (aget x 14) (rotl-32 (unchecked-add (aget x 13) (aget x 12)) 13))))
+      (aset x 15 (unchecked-int (bit-xor (aget x 15) (rotl-32 (unchecked-add (aget x 14) (aget x 13)) 18)))))
+    (let [out #?(:clj (byte-array 64) :cljs (js/Uint8Array. 64))]
+      (dotimes [i 16]
+        (u32->bytes-le! (unchecked-add (aget x i) (aget orig i)) out (* i 4)))
+      out)))
+
+#?(:clj
+   (def ^:private ^BigInteger P-poly
+     (-> BigInteger/ONE (.shiftLeft 130) (.subtract (BigInteger/valueOf 5)))))
+#?(:clj
+   (def ^:private ^BigInteger MOD-128
+     (-> BigInteger/ONE (.shiftLeft 128))))
+
+(defn- poly1305-mac [k msg]
+  #?(:clj
+     (let [r-bytes (byte-array 16)
+           _ (System/arraycopy k 0 r-bytes 0 16)
+           _ (aset r-bytes 3 (unchecked-byte (bit-and (int (aget r-bytes 3)) 15)))
+           _ (aset r-bytes 7 (unchecked-byte (bit-and (int (aget r-bytes 7)) 15)))
+           _ (aset r-bytes 11 (unchecked-byte (bit-and (int (aget r-bytes 11)) 15)))
+           _ (aset r-bytes 15 (unchecked-byte (bit-and (int (aget r-bytes 15)) 15)))
+           _ (aset r-bytes 4 (unchecked-byte (bit-and (int (aget r-bytes 4)) 252)))
+           _ (aset r-bytes 8 (unchecked-byte (bit-and (int (aget r-bytes 8)) 252)))
+           _ (aset r-bytes 12 (unchecked-byte (bit-and (int (aget r-bytes 12)) 252)))
+           r (let [rev (byte-array 17)]
+               (dotimes [i 16] (aset rev (- 16 i) (aget r-bytes i)))
+               (BigInteger. 1 rev))
+           s (let [rev (byte-array 17)]
+               (dotimes [i 16] (aset rev (- 16 i) (aget ^bytes k (+ 16 i))))
+               (BigInteger. 1 rev))
+           msg-len (alength ^bytes msg)]
+       (loop [offset 0
+              acc BigInteger/ZERO]
+         (if (< offset msg-len)
+           (let [chunk-len (min 16 (- msg-len offset))
+                 chunk-rev (byte-array (inc chunk-len))]
+             (dotimes [i chunk-len]
+               (aset chunk-rev (- chunk-len i) (aget ^bytes msg (+ offset i))))
+             (aset chunk-rev 0 (unchecked-byte 1))
+             (let [n (BigInteger. 1 chunk-rev)
+                   next-acc (-> acc (.add n) (.multiply r) (.mod P-poly))]
+               (recur (+ offset chunk-len) next-acc)))
+           (let [final-val (-> acc (.add s) (.mod MOD-128))
+                 raw-bytes (.toByteArray final-val)
+                 out (byte-array 16)]
+             (let [raw-len (alength raw-bytes)]
+               (dotimes [i 16]
+                 (let [rev-idx (dec (- raw-len i))]
+                   (when (>= rev-idx 0)
+                     (aset out i (aget raw-bytes rev-idx))))))
+             out))))
+     :cljs
+     (let [r-val (atom (js/BigInt 0))]
+       (dotimes [i 16]
+         (let [bi (js/BigInt (* i 8))]
+           (reset! r-val (js* "(~{} | (BigInt(~{}[~{}]) << ~{}))" @r-val k i bi))))
+       (reset! r-val (js* "(~{} & 0x0ffffffc0ffffffc0ffffffc0fffffffn)" @r-val))
+       (let [s-val (atom (js/BigInt 0))]
+         (dotimes [i 16]
+           (let [bi (js/BigInt (* i 8))]
+             (reset! s-val (js* "(~{} | (BigInt(~{}[16 + ~{}]) << ~{}))" @s-val k i bi))))
+         (let [p (js* "((1n << 130n) - 5n)")
+               a (atom (js/BigInt 0))
+               len (.-length msg)]
+           (loop [i 0]
+             (when (< i len)
+               (let [chunk-len (js/Math.min 16 (- len i))
+                     chunk (.subarray msg i (+ i chunk-len))
+                     num (atom (js/BigInt 0))]
+                 (dotimes [j chunk-len]
+                   (let [bj (js/BigInt (* j 8))]
+                     (reset! num (js* "(~{} | (BigInt(~{}[~{}]) << ~{}))" @num chunk j bj))))
+                 (let [bcl (js/BigInt (* chunk-len 8))]
+                   (reset! num (js* "(~{} | (1n << ~{}))" @num bcl)))
+                 (reset! a (js* "(((~{} + ~{}) * ~{}) % ~{})" @a @num @r-val p))
+                 (recur (+ i 16)))))
+           (reset! a (js* "((~{} + ~{}) % (1n << 128n))" @a @s-val))
+           (let [tag (js/Uint8Array. 16)
+                 n (atom @a)]
+             (dotimes [i 16]
+               (aset tag i (js/Number (js* "(~{} & 0xffn)" @n)))
+               (reset! n (js* "(~{} >> 8n)" @n)))
+             tag))))))
+
+(defn secretbox
+  "Encrypts and authenticates plaintext using 32-byte key and 24-byte nonce (XSalsa20-Poly1305).
+   Returns [16-byte Poly1305 tag || ciphertext] byte array."
+  [key nonce plaintext]
+  (let [k (ensure-bytes key)
+        n (ensure-bytes nonce)
+        pt (if (string? plaintext) (fressian/utf8->bytes plaintext) (ensure-bytes plaintext))
+        pt-len (fressian/count-bytes pt)]
+    #?(:clj
+       (let [n-sub (byte-array 16)
+             n-rem (byte-array 8)]
+         (System/arraycopy n 0 n-sub 0 16)
+         (System/arraycopy n 16 n-rem 0 8)
+         (let [sub-k (hsalsa20 k n-sub)
+               ct (byte-array pt-len)
+               block0 (salsa20-block sub-k n-rem 0)
+               poly-k (byte-array 32)]
+           (System/arraycopy block0 0 poly-k 0 32)
+           (let [first-chunk (min 32 pt-len)]
+             (dotimes [i first-chunk]
+               (aset ct i (unchecked-byte (bit-xor (int (aget ^bytes pt i)) (int (aget ^bytes block0 (+ 32 i))))))))
+           (when (> pt-len 32)
+             (let [rem (- pt-len 32)
+                   num-blocks (long (Math/ceil (/ (double rem) 64.0)))]
+               (dotimes [b-idx num-blocks]
+                 (let [block (salsa20-block sub-k n-rem (inc b-idx))
+                       b-offset (+ 32 (* b-idx 64))
+                       cur-chunk (min 64 (- pt-len b-offset))]
+                   (dotimes [j cur-chunk]
+                     (aset ct (+ b-offset j) (unchecked-byte (bit-xor (int (aget ^bytes pt (+ b-offset j))) (int (aget ^bytes block j))))))))))
+           (let [tag (poly1305-mac poly-k ct)
+                 res (byte-array (+ 16 pt-len))]
+             (System/arraycopy tag 0 res 0 16)
+             (System/arraycopy ct 0 res 16 pt-len)
+             res)))
+       :cljs
+       (let [n-sub (.subarray n 0 16)
+             n-rem (.subarray n 16 24)
+             sub-k (hsalsa20 k n-sub)
+             ct (js/Uint8Array. pt-len)
+             block0 (salsa20-block sub-k n-rem 0)
+             poly-k (.subarray block0 0 32)
+             first-chunk (js/Math.min 32 pt-len)]
+         (dotimes [i first-chunk]
+           (aset ct i (bit-xor (aget pt i) (aget block0 (+ 32 i)))))
+         (when (> pt-len 32)
+           (let [rem (- pt-len 32)
+                 num-blocks (js/Math.ceil (/ rem 64))]
+             (dotimes [b-idx num-blocks]
+               (let [block (salsa20-block sub-k n-rem (inc b-idx))
+                     b-offset (+ 32 (* b-idx 64))
+                     cur-chunk (js/Math.min 64 (- pt-len b-offset))]
+                 (dotimes [j cur-chunk]
+                   (aset ct (+ b-offset j) (bit-xor (aget pt (+ b-offset j)) (aget block j))))))))
+         (let [tag (poly1305-mac poly-k ct)
+               res (js/Uint8Array. (+ 16 pt-len))]
+           (.set res tag 0)
+           (.set res ct 16)
+           res)))))
+
+(defn secretbox-open
+  "Decrypts and authenticates ciphertext using 32-byte key and 24-byte nonce (XSalsa20-Poly1305).
+   ciphertext: [16-byte Poly1305 tag || ciphertext] byte array.
+   Returns decrypted plaintext bytes on success, or nil on authentication failure."
+  [key nonce boxed]
+  (let [k (ensure-bytes key)
+        n (ensure-bytes nonce)
+        b (ensure-bytes boxed)
+        b-len (if b (fressian/count-bytes b) 0)]
+    (when (>= b-len 16)
+      (let [ct-len (- b-len 16)]
+        #?(:clj
+           (let [n-sub (byte-array 16)
+                 n-rem (byte-array 8)]
+             (System/arraycopy n 0 n-sub 0 16)
+             (System/arraycopy n 16 n-rem 0 8)
+             (let [sub-k (hsalsa20 k n-sub)
+                   ct (byte-array ct-len)
+                   recv-tag (byte-array 16)]
+               (System/arraycopy b 0 recv-tag 0 16)
+               (System/arraycopy b 16 ct 0 ct-len)
+               (let [block0 (salsa20-block sub-k n-rem 0)
+                     poly-k (byte-array 32)]
+                 (System/arraycopy block0 0 poly-k 0 32)
+                 (let [expected-tag (poly1305-mac poly-k ct)]
+                   (if (Arrays/equals ^bytes recv-tag ^bytes expected-tag)
+                     (let [pt (byte-array ct-len)
+                           first-chunk (min 32 ct-len)]
+                       (dotimes [i first-chunk]
+                         (aset pt i (unchecked-byte (bit-xor (int (aget ct i)) (int (aget ^bytes block0 (+ 32 i)))))))
+                       (when (> ct-len 32)
+                         (let [rem (- ct-len 32)
+                               num-blocks (long (Math/ceil (/ (double rem) 64.0)))]
+                           (dotimes [b-idx num-blocks]
+                             (let [block (salsa20-block sub-k n-rem (inc b-idx))
+                                   b-offset (+ 32 (* b-idx 64))
+                                   cur-chunk (min 64 (- ct-len b-offset))]
+                               (dotimes [j cur-chunk]
+                                 (aset pt (+ b-offset j) (unchecked-byte (bit-xor (int (aget ^bytes ct (+ b-offset j))) (int (aget ^bytes block j))))))))))
+                       pt)
+                     nil)))))
+           :cljs
+           (let [n-sub (.subarray n 0 16)
+                 n-rem (.subarray n 16 24)
+                 sub-k (hsalsa20 k n-sub)
+                 recv-tag (.subarray b 0 16)
+                 ct (.subarray b 16 b-len)
+                 block0 (salsa20-block sub-k n-rem 0)
+                 poly-k (.subarray block0 0 32)
+                 expected-tag (poly1305-mac poly-k ct)
+                 tag-diff (atom 0)]
+             (dotimes [i 16]
+               (reset! tag-diff (bit-or @tag-diff (bit-xor (aget recv-tag i) (aget expected-tag i)))))
+             (if (zero? @tag-diff)
+               (let [pt (js/Uint8Array. ct-len)
+                     first-chunk (js/Math.min 32 ct-len)]
+                 (dotimes [i first-chunk]
+                   (aset pt i (bit-xor (aget ct i) (aget block0 (+ 32 i)))))
+                 (when (> ct-len 32)
+                   (let [rem (- ct-len 32)
+                         num-blocks (js/Math.ceil (/ rem 64))]
+                     (dotimes [b-idx num-blocks]
+                       (let [block (salsa20-block sub-k n-rem (inc b-idx))
+                             b-offset (+ 32 (* b-idx 64))
+                             cur-chunk (js/Math.min 64 (- ct-len b-offset))]
+                         (dotimes [j cur-chunk]
+                           (aset pt (+ b-offset j) (bit-xor (aget ct (+ b-offset j)) (aget block j))))))))
+                 pt)
+               nil)))))))
 
 (defn canonicalize-agent-event
   "Recursively converts an agent event data structure into a content-deterministic

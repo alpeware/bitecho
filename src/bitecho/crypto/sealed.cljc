@@ -626,11 +626,14 @@
                 priv (.getEncoded (.getPrivate kp))]
             {:public pub :private priv :public-key pub :private-key priv})
      :cljs (if node-crypto
-             (let [kp (.generateKeyPairSync node-crypto "x25519"
-                                            #js {:publicKeyEncoding #js {:type "spki" :format "der"}
-                                                 :privateKeyEncoding #js {:type "pkcs8" :format "der"}})
-                   pub (js/Uint8Array. (.-publicKey kp))
-                   priv (js/Uint8Array. (.-privateKey kp))]
+             (let [gen-fn (or (aget node-crypto "generateKeyPairSync") (.-generateKeyPairSync node-crypto))
+                   kp (.call gen-fn node-crypto "x25519"
+                             #js {:publicKeyEncoding #js {:type "spki" :format "der"}
+                                  :privateKeyEncoding #js {:type "pkcs8" :format "der"}})
+                   pub-obj (or (aget kp "publicKey") (.-publicKey kp))
+                   priv-obj (or (aget kp "privateKey") (.-privateKey kp))
+                   pub (js/Uint8Array. pub-obj)
+                   priv (js/Uint8Array. priv-obj)]
                {:public pub :private priv :public-key pub :private-key priv})
              (pure-x25519-keypair))))
 
@@ -658,9 +661,12 @@
                    u-bytes (if (= (fressian/count-bytes pub-bytes) 32)
                              (fressian/concat-bytes (fressian/hex->bytes "302a300506032b656e032100") pub-bytes)
                              pub-bytes)
-                   priv-key (.createPrivateKey node-crypto #js {:key (js/Buffer.from p-bytes) :format "der" :type "pkcs8"})
-                   pub-key (.createPublicKey node-crypto #js {:key (js/Buffer.from u-bytes) :format "der" :type "spki"})]
-               (js/Uint8Array. (.diffieHellman node-crypto #js {:privateKey priv-key :publicKey pub-key})))
+                   create-priv-fn (or (aget node-crypto "createPrivateKey") (.-createPrivateKey node-crypto))
+                   create-pub-fn (or (aget node-crypto "createPublicKey") (.-createPublicKey node-crypto))
+                   dh-fn (or (aget node-crypto "diffieHellman") (.-diffieHellman node-crypto))
+                   priv-key (.call create-priv-fn node-crypto #js {:key (js/Buffer.from p-bytes) :format "der" :type "pkcs8"})
+                   pub-key (.call create-pub-fn node-crypto #js {:key (js/Buffer.from u-bytes) :format "der" :type "spki"})]
+               (js/Uint8Array. (.call dh-fn node-crypto #js {:privateKey priv-key :publicKey pub-key})))
              (pure-x25519-shared-secret priv-bytes pub-bytes))))
 
 ;; -----------------------------------------------------------------------------

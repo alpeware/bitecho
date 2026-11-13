@@ -53,6 +53,15 @@
       :blob/media-type (str (or media-type "application/octet-stream"))
       :blob/bytes bs})))
 
+(defn verify-blob
+  "Verifies that a Blob map has valid structure and matching SHA-256 content CID."
+  [blob]
+  (and (map? blob)
+       (string? (:blob/cid blob))
+       (some? (:blob/bytes blob))
+       (= (str/lower-case (:blob/cid blob))
+          (compute-cid (:blob/bytes blob)))))
+
 (defn init-blob-store
   "Initializes an empty pure Blob store state map."
   ([] (init-blob-store nil))
@@ -713,42 +722,46 @@
   "Purely verifies a Pointer's structure, subnet match, path-prefix ACL, Ed25519 authority signature,
    expiry window (with per-type skew tolerance), and typed proof.
    Returns `{:ok? true :pointer canon-ptr}` or `{:ok? false :error <kw>}`."
-  [pointer ctx]
-  (if-not (and (map? pointer)
-               (string? (:pointer/authority pointer))
-               (not (str/blank? (:pointer/authority pointer)))
-               (string? (:pointer/subnet pointer))
-               (not (str/blank? (:pointer/subnet pointer)))
-               (string? (:pointer/path pointer))
-               (not (str/blank? (:pointer/path pointer)))
-               (integer? (:pointer/seq pointer))
-               (pos? (long (:pointer/seq pointer)))
-               (string? (:pointer/sig pointer))
-               (not (str/blank? (:pointer/sig pointer))))
-    {:ok? false :error :malformed-pointer}
-    (let [expected-subnet (:subnet ctx)
-          ptr-subnet (:pointer/subnet pointer)]
-      (if (and expected-subnet (not= (str expected-subnet) (str ptr-subnet)))
-        {:ok? false :error :pointer-subnet-mismatch}
-        (let [expires (:pointer/expires pointer)
-              now-ms (:now-ms ctx)
-              skew-ms (pointer-skew-tolerance-ms pointer ctx)]
-          (if (and (some? expires) (some? now-ms)
-                   (>= (long now-ms) (+ (long expires) skew-ms)))
-            {:ok? false :error :pointer-expired}
-            (let [acl-res (authorize-path-acl pointer ctx)]
-              (if-not (:ok? acl-res)
-                acl-res
-                (let [canon (canonical-pointer-map pointer)
-                      payload (canonical-pointer-signing-payload canon)
-                      auth (:pointer/authority canon)
-                      sig (:pointer/sig pointer)]
-                  (if-not (crypto/verify-with-fallback auth payload sig)
-                    {:ok? false :error :invalid-pointer-signature}
-                    (let [proof-res (verify-pointer-proof canon acl-res ctx)]
-                      (if-not (:ok? proof-res)
-                        proof-res
-                        {:ok? true :pointer (assoc canon :pointer/sig (normalize-hex sig))}))))))))))))
+  ([pointer]
+   (verify-pointer pointer nil))
+  ([pointer ctx]
+   (if-not (and (map? pointer)
+                (string? (:pointer/authority pointer))
+                (not (str/blank? (:pointer/authority pointer)))
+                (string? (:pointer/subnet pointer))
+                (not (str/blank? (:pointer/subnet pointer)))
+                (string? (:pointer/path pointer))
+                (not (str/blank? (:pointer/path pointer)))
+                (integer? (:pointer/seq pointer))
+                (pos? (long (:pointer/seq pointer)))
+                (string? (:pointer/sig pointer))
+                (not (str/blank? (:pointer/sig pointer))))
+     {:ok? false :error :malformed-pointer}
+     (let [expected-subnet (:subnet ctx)
+           ptr-subnet (:pointer/subnet pointer)]
+       (if (and expected-subnet (not= (str expected-subnet) (str ptr-subnet)))
+         {:ok? false :error :pointer-subnet-mismatch}
+         (let [expires (:pointer/expires pointer)
+               now-ms (:now-ms ctx)
+               skew-ms (pointer-skew-tolerance-ms pointer ctx)]
+           (if (and (some? expires) (some? now-ms)
+                    (>= (long now-ms) (+ (long expires) skew-ms)))
+             {:ok? false :error :pointer-expired}
+             (let [acl-res (if (or (nil? ctx) (not (contains? ctx :path-acl)))
+                             {:ok? true :principal-type :self-path-owner}
+                             (authorize-path-acl pointer ctx))]
+               (if-not (:ok? acl-res)
+                 acl-res
+                 (let [canon (canonical-pointer-map pointer)
+                       payload (canonical-pointer-signing-payload canon)
+                       auth (:pointer/authority canon)
+                       sig (:pointer/sig pointer)]
+                   (if-not (crypto/verify-with-fallback auth payload sig)
+                     {:ok? false :error :invalid-pointer-signature}
+                     (let [proof-res (verify-pointer-proof canon acl-res ctx)]
+                       (if-not (:ok? proof-res)
+                         proof-res
+                         {:ok? true :pointer (assoc canon :pointer/sig (normalize-hex sig))})))))))))))))
 
 ;; =============================================================================
 ;; 3. Combined Pure Data State (Blobs + Pointers Table)

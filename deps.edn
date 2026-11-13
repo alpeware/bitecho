@@ -5,7 +5,8 @@
         com.taoensso/nippy {:mvn/version "3.6.0"}
         alpeware/clj-fressian {:git/url "https://bitecho.org/git/clj-fressian.git"
                                :git/sha "4c56c12c8f94efed4324c8f0a4ed340337bdbc54"}
-        alpeware/clj-datachannel {:local/root "../clj-datachannel"}}
+        alpeware/clj-datachannel {:local/root "../clj-datachannel"}
+        org.babashka/sci {:mvn/version "0.8.41"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                             "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]

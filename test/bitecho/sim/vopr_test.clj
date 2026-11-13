@@ -325,3 +325,41 @@
           run-2 (vopr/run-datachannel-packet-drop-sim {:seed 55555})]
       (is (= run-1 run-2) "Two runs with identical seed must yield identical diagnostic maps"))))
 
+;; =============================================================================
+;; 8. Milestone Priority 2 & 3: Storage & Smart Contract VOPR Simulations
+;; =============================================================================
+
+(deftest test-nexus-e2ee-storage-simulation
+  (testing "Nexus E2EE Storage Simulation verifies zero plaintext leakage, rollback protection, tamper rejection, and capability resolution"
+    (doseq [seed [20261116 1337 4242]]
+      (let [res (vopr/run-nexus-e2ee-storage-sim {:seed seed})]
+        (is (true? (:valid? res)))
+        (is (true? (:zero-plaintext-leakage? res)))
+        (is (true? (:exact-restore-v2? res)))
+        (is (true? (:rollback-rejected? res)))
+        (is (true? (:tamper-rejected? res)))
+        (is (true? (:capability-resolved? res)))))
+    (testing "Identical seed produces identical result"
+      (let [r1 (vopr/run-nexus-e2ee-storage-sim {:seed 9999})
+            r2 (vopr/run-nexus-e2ee-storage-sim {:seed 9999})]
+        (is (= r1 r2))))))
+
+(deftest test-sci-smart-contract-simulation
+  (testing "ChiaLisp-Style SCI Smart Contract Simulation verifies 90/10 split, tau settlement burn, and adversarial rejection"
+    (doseq [seed [20261116 1337 4242]]
+      (let [res (vopr/run-sci-smart-contract-sim {:seed seed})]
+        (is (true? (:valid? res)))
+        (is (true? (:scenario-1-valid? res)))
+        (is (true? (:scenario-2-valid? res)))
+        (is (= 896 (:author-balance res)))
+        (is (= 99 (:oracle-balance res)))
+        (is (= 5 (:settlement-take res)))
+        (is (true? (:tampered-source-rejected? res)))
+        (is (true? (:forged-sig-rejected? res)))
+        (is (true? (:overspend-rejected? res)))
+        (is (true? (:fuel-exhaustion-rejected? res)))))
+    (testing "Identical seed produces identical result"
+      (let [r1 (vopr/run-sci-smart-contract-sim {:seed 9999})
+            r2 (vopr/run-sci-smart-contract-sim {:seed 9999})]
+        (is (= r1 r2))))))
+

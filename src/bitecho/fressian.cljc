@@ -159,6 +159,11 @@
   [ba]
   (strip-untrusted-crypto-tags (fcore/decode ba)))
 
+(defn decode-canonical
+  "Decodes a canonical Fressian byte array into Clojure persistent data structures."
+  [ba]
+  (decode ba))
+
 (defn write-standard-fressian
   "Writes val using standard Fressian priority/struct caching via pure-CLJC `fressian.core/write`."
   ^bytes [val & opts]

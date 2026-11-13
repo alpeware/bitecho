@@ -8,10 +8,12 @@
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.browser :as browser]
             [bitecho.webauthn :as webauthn]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [goog.object :as gobj]))
 
 (defonce
   ^{:doc "Global atom holding active Human Anchor state for browser UI."}
@@ -1858,60 +1860,133 @@
                              (resolve resp)))))))
             (.catch (fn [err] (resolve {:ok false :error (.-message err)})))))))))
 
-(def api
-  "Global BitechoBrowser API object."
-  #js {:initNode init-node
-       :getStatus get-status
-       :connect connect
-       :connectMesh connect-mesh
-       :openChannel open-channel
-       :acceptChannelOffer accept-channel-offer
-       :p2pOffer p2p-offer
-       :p2pAnswer p2p-answer
-       :setP2pChannelState set-p2p-channel-state
-       :broadcastMessage broadcast-message
-       :sendMessage send-message
-       :closeSession close-session
-       :getChatHistory get-chat-history
-       :getSessions get-sessions
-       :resolvePeer resolve-peer
-       :onStateChange on-state-change
-       :handleVisibilityChange handle-visibility-change!
-       :saveStateToIndexedDB save-state-to-indexed-db
-       :loadStateFromIndexedDB load-state-from-indexed-db
-       :loadStateFromIndexedDb load-state-from-indexed-db
-       :restoreFromIndexedDB restore-from-indexed-db!
-       :restoreFromIndexedDb restore-from-indexed-db!
-       :createOffer create-offer
-       :acceptOffer accept-offer
-       :sendSealedMessage send-sealed-message
-       :runSubnetDemo run-subnet-demo
-       :runZeroBurnSubnetDemo run-zero-burn-subnet-demo
-       :runFederationDemo run-federation-demo
-       :runThreeWayP2pBroadcastDemo run-three-way-p2p-broadcast-demo
-       :initAnchor init-anchor
-       :getAnchorDashboard get-anchor-dashboard
-       :registerYubiKey register-yubikey
-       :recoverFromYubiKey recover-from-yubikey
-       :createDiscoverableCredential create-discoverable-credential
-       :getDiscoverableCredential get-discoverable-credential
-       :queueOffer queue-offer
-       :generateNonExtractableKey generate-non-extractable-key
-       :approveOffer approve-offer-cmd
-       :denyOffer deny-offer-cmd
-       :superviseAgent supervise-agent-cmd
-       :revokeAgentDac revoke-agent-dac-cmd
-       :encodeBech32m encode-bech32m-cmd
-       :decodeBech32m decode-bech32m-cmd
-       :runAnchorEndToEndDemo run-anchor-end-to-end-demo
-       :submitRelayEnvelope submit-relay-envelope!
-       :pollRelayEnvelopes poll-relay-envelopes!
-       :ackRelayEnvelopes ack-relay-envelopes!
-       :fetchRelayChainState fetch-relay-chain-state!
-       :version "1.0.0-m16"})
+(defn get-supported-verbs
+  "Returns JavaScript array of all canonical supported CLI verbs (Priority 4)."
+  []
+  (clj->js cli/supported-cli-verbs))
 
+(defn get-state
+  "Returns current sanitized browser node state as a JavaScript object (Priority 4)."
+  [& [node-atom]]
+  (let [na (or node-atom @active-node-atom)]
+    (if (and na @na)
+      (clj->js (redact-for-js @na))
+      nil)))
+
+(defn stop-node
+  "Stops active browser node, closing all WebRTC data channels and clearing state (Priority 4)."
+  [& [node-atom]]
+  (let [na (or node-atom @active-node-atom)]
+    (when (and na @na)
+      (let [channels (:active-channels @na)]
+        (doseq [[_id dc] channels]
+          (when dc
+            (try (.close dc) (catch :default _ nil)))))
+      (reset! na nil)
+      (when (= na @active-node-atom)
+        (reset! active-node-atom nil))
+      (notify-ui-listeners!)
+      #js {:ok true :stopped true})))
+
+(defn ctl
+  "Executes a CLI command string, token vector, or map against the browser node.
+   Returns a Promise resolving to the JSON response map (Priority 4)."
+  [cmd-or-args & [opts]]
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [opts-clj (if (map? opts) opts (if opts (js->clj opts :keywordize-keys true) {}))
+           node-atom (or (:node-atom opts-clj) @active-node-atom)]
+       (if-not (and node-atom @node-atom)
+         (resolve #js {:ok false :error "node-not-initialized"})
+         (let [priv (or (get-in @node-atom [:keypair :private-key])
+                        (:privkey-bytes @anchor-state-atom))
+               input-clj (cond
+                           (string? cmd-or-args) cmd-or-args
+                           (vector? cmd-or-args) cmd-or-args
+                           (sequential? cmd-or-args) (vec cmd-or-args)
+                           (map? cmd-or-args) cmd-or-args
+                           :else (js->clj cmd-or-args))
+               exec-res (browser/exec-browser-cli @node-atom input-clj priv)
+               resp (:response exec-res)]
+           (when (:state exec-res)
+             (reset! node-atom (:state exec-res))
+             (when (seq (:net-envelopes exec-res))
+               (doseq [env (:net-envelopes exec-res)]
+                 (route-browser-envelope! node-atom env)))
+             (when-let [dial-info (:p2p-dial exec-res)]
+               (dial-browser-p2p-peer! node-atom dial-info))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
+             (notify-ui-listeners!))
+           (resolve (clj->js resp))))))))
+
+(defn exec-command
+  "JS-friendly alias for ctl (Priority 4)."
+  [cmd-or-args & [opts]]
+  (ctl cmd-or-args opts))
+
+(def api
+  "Global BitechoBrowser API object with Closure :advanced-safe string property exports (Priority 4)."
+  #js {"initNode" init-node
+       "ctl" ctl
+       "execCommand" exec-command
+       "getSupportedVerbs" get-supported-verbs
+       "getState" get-state
+       "getStatus" get-status
+       "stopNode" stop-node
+       "connect" connect
+       "connectMesh" connect-mesh
+       "openChannel" open-channel
+       "acceptChannelOffer" accept-channel-offer
+       "p2pOffer" p2p-offer
+       "p2pAnswer" p2p-answer
+       "setP2pChannelState" set-p2p-channel-state
+       "broadcastMessage" broadcast-message
+       "sendMessage" send-message
+       "closeSession" close-session
+       "getChatHistory" get-chat-history
+       "getSessions" get-sessions
+       "resolvePeer" resolve-peer
+       "onStateChange" on-state-change
+       "handleVisibilityChange" handle-visibility-change!
+       "saveStateToIndexedDB" save-state-to-indexed-db
+       "loadStateFromIndexedDB" load-state-from-indexed-db
+       "loadStateFromIndexedDb" load-state-from-indexed-db
+       "restoreFromIndexedDB" restore-from-indexed-db!
+       "restoreFromIndexedDb" restore-from-indexed-db!
+       "createOffer" create-offer
+       "acceptOffer" accept-offer
+       "sendSealedMessage" send-sealed-message
+       "runSubnetDemo" run-subnet-demo
+       "runZeroBurnSubnetDemo" run-zero-burn-subnet-demo
+       "runFederationDemo" run-federation-demo
+       "runThreeWayP2pBroadcastDemo" run-three-way-p2p-broadcast-demo
+       "initAnchor" init-anchor
+       "getAnchorDashboard" get-anchor-dashboard
+       "registerYubiKey" register-yubikey
+       "recoverFromYubiKey" recover-from-yubikey
+       "createDiscoverableCredential" create-discoverable-credential
+       "getDiscoverableCredential" get-discoverable-credential
+       "queueOffer" queue-offer
+       "generateNonExtractableKey" generate-non-extractable-key
+       "approveOffer" approve-offer-cmd
+       "denyOffer" deny-offer-cmd
+       "superviseAgent" supervise-agent-cmd
+       "revokeAgentDac" revoke-agent-dac-cmd
+       "encodeBech32m" encode-bech32m-cmd
+       "decodeBech32m" decode-bech32m-cmd
+       "runAnchorEndToEndDemo" run-anchor-end-to-end-demo
+       "submitRelayEnvelope" submit-relay-envelope!
+       "pollRelayEnvelopes" poll-relay-envelopes!
+       "ackRelayEnvelopes" ack-relay-envelopes!
+       "fetchRelayChainState" fetch-relay-chain-state!
+       "version" "1.0.0-m16"})
+
+(when (exists? js/goog)
+  (.exportSymbol js/goog "BitechoBrowser" api))
 (when (exists? js/globalThis)
-  (set! (.-BitechoBrowser js/globalThis) api))
+  (gobj/set js/globalThis "BitechoBrowser" api))
+(when (exists? js/window)
+  (gobj/set js/window "BitechoBrowser" api))
 
 ;; Wire document visibilitychange listener
 (when (and (exists? js/document) (some? (.-addEventListener js/document)))

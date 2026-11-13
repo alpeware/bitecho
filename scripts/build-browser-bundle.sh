@@ -1125,11 +1125,89 @@ if [ -d "${CLJ_WEB_PUBLIC}" ]; then
   cp dist/bitecho-browser.js "${CLJ_WEB_PUBLIC}/app/"
   cp dist/bitecho-browser.js.sri "${CLJ_WEB_PUBLIC}/app/"
   cp dist/index.html "${CLJ_WEB_PUBLIC}/app/"
+  if [ -f "dist/bitecho-browser.min.js" ]; then
+    cp dist/bitecho-browser.min.js "${CLJ_WEB_PUBLIC}/app/"
+  fi
   if [ -f "dist/relay.html" ]; then
     cp dist/relay.html "${CLJ_WEB_PUBLIC}/relay.html"
     cp dist/relay.html "${CLJ_WEB_PUBLIC}/app/relay.html"
   fi
   echo "Synced bundle and SRI hash to ${CLJ_WEB_PUBLIC}/app/"
 fi
+
+# 7. Compile bitecho.browser-main into dist/bitecho-browser.min.js (:optimizations :advanced) & smoke test
+echo "Compiling bitecho.browser-main via ClojureScript (:optimizations :advanced)..."
+clojure -M:build-browser -e '
+(require (quote [cljs.build.api :as b]))
+(b/build (b/inputs "src")
+         {:main (quote bitecho.browser-main)
+          :output-to "dist/bitecho-browser.min.js"
+          :output-dir "target/cljs-browser-advanced/out"
+          :externs ["resources/closure-externs.js"]
+          :parallel-build false
+          :optimizations :advanced})'
+
+if [ ! -f "dist/bitecho-browser.min.js" ]; then
+  echo "ERROR: dist/bitecho-browser.min.js was not generated!" >&2
+  exit 1
+fi
+
+MIN_BUNDLE_SIZE=$(wc -c < "dist/bitecho-browser.min.js")
+echo "Generated dist/bitecho-browser.min.js (${MIN_BUNDLE_SIZE} bytes)"
+
+echo "Running Node.js smoke assertions on :advanced bundle..."
+node -e "
+globalThis.window = globalThis;
+require('./dist/bitecho-browser.min.js');
+
+async function test() {
+  const B = globalThis.BitechoBrowser;
+  if (!B) throw new Error('BitechoBrowser not found on globalThis');
+  console.log('BitechoBrowser loaded successfully, version:', B.version);
+
+  const verbs = B.getSupportedVerbs();
+  if (!Array.isArray(verbs) || verbs.length !== 51) {
+    throw new Error('Expected 51 verbs, got: ' + (verbs ? verbs.length : 'none'));
+  }
+  console.log('Supported verbs verified: 51 verbs');
+
+  const node = B.initNode();
+  if (!node) throw new Error('initNode returned null');
+  console.log('initNode successful');
+
+  const st = B.getStatus();
+  if (!st || !st.pubkey) throw new Error('getStatus failed: ' + JSON.stringify(st));
+  console.log('getStatus verified, pubkey:', st.pubkey.slice(0, 24) + '...');
+
+  const ctlRes = await B.ctl('status');
+  if (!ctlRes || (!ctlRes.ok && !ctlRes.pubkey)) throw new Error('ctl status failed: ' + JSON.stringify(ctlRes));
+  console.log('ctl status verified, pubkey:', ctlRes.pubkey ? ctlRes.pubkey.slice(0, 24) + '...' : ctlRes);
+
+  const putRes = await B.execCommand('storage-put --subnet nexus --slot note --data minified-payload --seq 1');
+  if (!putRes || !putRes.ok) throw new Error('execCommand storage-put failed: ' + JSON.stringify(putRes));
+  console.log('execCommand storage-put verified');
+
+  const getRes = await B.ctl('storage-get --subnet nexus --slot note --min-seq 1');
+  if (!getRes || !getRes.ok || getRes.data !== 'minified-payload') {
+    throw new Error('ctl storage-get failed: ' + JSON.stringify(getRes));
+  }
+  console.log('ctl storage-get verified: exact data restored');
+
+  const stateObj = B.getState();
+  if (!stateObj) throw new Error('getState failed');
+  console.log('getState verified');
+
+  const stopRes = B.stopNode();
+  if (!stopRes || !stopRes.ok) throw new Error('stopNode failed');
+  console.log('stopNode verified');
+
+  console.log('ALL NODE.JS SMOKE ASSERTIONS PASSED ON :advanced BUNDLE!');
+}
+
+test().catch(err => {
+  console.error('SMOKE TEST ERROR:', err);
+  process.exit(1);
+});
+"
 
 echo "=== Browser bundle build complete ==="

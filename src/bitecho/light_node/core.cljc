@@ -6,6 +6,7 @@
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
+            [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as core-subnet]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
@@ -4326,6 +4327,144 @@
      :net-envelopes []
      :stdout-events []}))
 
+(defn- exec-storage-put
+  [state effective-map privkey-bytes sub-id]
+  (let [data (get effective-map "data" (get effective-map "payload" (get effective-map :data (:payload effective-map))))
+        slot (str (or (get effective-map "slot") (:slot effective-map) "default"))
+        subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "nexus"))
+        path (str "storage/" (:pubkey state) "/" slot)
+        min-seq (long (get-in state [:storage-min-seqs [subnet path]] 0))
+        seq-num (long (or (get effective-map "seq") (:seq effective-map) (inc min-seq)))
+        context (or (get effective-map "context") (:context effective-map))
+        nonce (or (get effective-map "nonce") (:nonce effective-map))
+        pack-res (storage/pack-encrypted-state {:privkey privkey-bytes
+                                                :pubkey (:pubkey state)
+                                                :subnet-id subnet
+                                                :slot slot
+                                                :seq seq-num
+                                                :state-data data
+                                                :context context
+                                                :nonce-bytes nonce})
+        cid (:cid pack-res)
+        blob (:blob pack-res)
+        ptr (:pointer pack-res)]
+    {:state (-> state
+                (assoc-in [:storage-blobs cid] blob)
+                (assoc-in [:storage-pointers [subnet path]] ptr)
+                (assoc-in [:storage-min-seqs [subnet path]] seq-num))
+     :response {"ok" true
+                "cid" cid
+                "path" path
+                "seq" seq-num
+                "subnet_id" subnet
+                "blob" blob
+                "pointer" ptr}
+     :net-envelopes []
+     :stdout-events []}))
+
+(defn- exec-storage-get
+  [state effective-map privkey-bytes sub-id]
+  (let [slot (str (or (get effective-map "slot") (:slot effective-map) "default"))
+        subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "nexus"))
+        path (str (or (get effective-map "path") (:path effective-map) (str "storage/" (:pubkey state) "/" slot)))
+        ptr (or (get effective-map "pointer") (:pointer effective-map) (get-in state [:storage-pointers [subnet path]]))
+        target-cid (when ptr (:pointer/target ptr))
+        blob (or (get effective-map "blob") (:blob effective-map) (when target-cid (get-in state [:storage-blobs target-cid])))
+        min-expected (long (or (get effective-map "min_expected_seq") (get effective-map "min-expected-seq") (:min-expected-seq effective-map) (get-in state [:storage-min-seqs [subnet path]] 0)))
+        context (or (get effective-map "context") (:context effective-map))]
+    (if-not (and blob ptr)
+      {:state state
+       :response {"ok" false "error" "missing-storage-entry"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [res (storage/unpack-encrypted-state {:privkey privkey-bytes
+                                                 :pubkey (:pubkey state)
+                                                 :blob blob
+                                                 :pointer ptr
+                                                 :min-expected-seq min-expected
+                                                 :context context})]
+        (if (:ok? res)
+          {:state (assoc-in state [:storage-min-seqs [subnet path]] (:seq res))
+           :response {"ok" true
+                      "data" (:data res)
+                      "seq" (:seq res)
+                      "cid" (:cid res)
+                      "path" (:path res)}
+           :net-envelopes []
+           :stdout-events []}
+          {:state state
+           :response {"ok" false "error" (name (:error res))}
+           :net-envelopes []
+           :stdout-events []})))))
+
+(defn- exec-capability-publish
+  [state effective-map privkey-bytes sub-id]
+  (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "global"))
+        cap-id (str (or (get effective-map "capability_id") (get effective-map "capability-id") (:capability-id effective-map) "default"))
+        raw-type (or (get effective-map "capability_type") (get effective-map "capability-type") (:capability-type effective-map) :storage/blob-pinning)
+        cap-type (cond
+                   (keyword? raw-type) raw-type
+                   (string? raw-type) (keyword (str/replace raw-type #"^:+" ""))
+                   :else :storage/blob-pinning)
+        price (long (or (get effective-map "price_echo") (get effective-map "price-echo") (:price-echo effective-map) 0))
+        burn (long (or (get effective-map "burn_floor") (get effective-map "burn-floor") (:burn-floor effective-map) 0))
+        meta (or (get effective-map "metadata") (:metadata effective-map) {})
+        target (or (get effective-map "target_cid") (get effective-map "target-cid") (:target-cid effective-map))
+        seq-num (long (or (get effective-map "seq") (:seq effective-map) 1))
+        pack-res (storage/pack-capability-descriptor {:privkey privkey-bytes
+                                                      :pubkey (:pubkey state)
+                                                      :subnet-id subnet
+                                                      :capability-id cap-id
+                                                      :capability-type cap-type
+                                                      :price-echo price
+                                                      :burn-floor burn
+                                                      :metadata meta
+                                                      :seq seq-num
+                                                      :target-cid target})
+        cid (:cid pack-res)
+        path (:path pack-res)
+        blob (:blob pack-res)
+        ptr (:pointer pack-res)]
+    {:state (-> state
+                (assoc-in [:capabilities [subnet path]] ptr)
+                (assoc-in [:capability-blobs cid] blob))
+     :response {"ok" true
+                "cid" cid
+                "path" path
+                "seq" seq-num
+                "subnet_id" subnet
+                "blob" blob
+                "pointer" ptr}
+     :net-envelopes []
+     :stdout-events []}))
+
+(defn- exec-capability-resolve
+  [state effective-map _privkey-bytes sub-id]
+  (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "global"))
+        path (str (or (get effective-map "path") (:path effective-map)))
+        ptr (or (get effective-map "pointer") (:pointer effective-map) (get-in state [:capabilities [subnet path]]))
+        target-cid (when ptr (:pointer/target ptr))
+        blob (or (get effective-map "blob") (:blob effective-map) (when target-cid (get-in state [:capability-blobs target-cid])))
+        min-expected (long (or (get effective-map "min_expected_seq") (get effective-map "min-expected-seq") (:min-expected-seq effective-map) 0))]
+    (if-not (and blob ptr)
+      {:state state
+       :response {"ok" false "error" "missing-capability"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [res (storage/unpack-capability-descriptor {:blob blob :pointer ptr :min-expected-seq min-expected})]
+        (if (:ok? res)
+          {:state state
+           :response {"ok" true
+                      "capability" (:capability res)
+                      "cid" (:cid res)
+                      "seq" (:seq res)}
+           :net-envelopes []
+           :stdout-events []}
+          {:state state
+           :response {"ok" false "error" (name (:error res))}
+           :net-envelopes []
+           :stdout-events []})))))
+
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
    Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps.
@@ -4391,6 +4530,10 @@
               "export-send" (exec-export-send state effective-map privkey-bytes)
               "ack" (exec-ack state effective-map privkey-bytes)
               "export-ack" (exec-export-ack state effective-map privkey-bytes)
+              "storage-put" (exec-storage-put state effective-map privkey-bytes sub-id)
+              "storage-get" (exec-storage-get state effective-map privkey-bytes sub-id)
+              "capability-publish" (exec-capability-publish state effective-map privkey-bytes sub-id)
+              "capability-resolve" (exec-capability-resolve state effective-map privkey-bytes sub-id)
               "status" (exec-status state)
               {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})
         res' (if (seq (:net-envelopes res))

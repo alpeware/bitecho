@@ -16,9 +16,13 @@
             [bitecho.config :as config]
             [bitecho.core.data :as data]
             [bitecho.core.protocol.relay :as relay]
+            [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
+            [bitecho.economy.account :as account]
             [bitecho.economy.burn :as burn]
+            [bitecho.economy.escrow :as escrow]
+            [bitecho.economy.puzzle :as puzzle]
             [bitecho.economy.treasury :as treasury]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.core :as light-node]
@@ -27,6 +31,7 @@
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
             [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.walk :as walk]
             [datachannel.buffer :as b]
             [datachannel.chunks :as dc-chunks]
@@ -2063,22 +2068,26 @@
       (swap! results assoc :DCT-09 (verify-jepsen-bug :DCT-09 "turn/unsolicited-transaction-validation" scenario-09 mutated-09)))
 
     ;; DCT-10: SCTP Duplicate COOKIE-ECHO in :established State Preserves Active Streams & :remote-tsn (RFC 4960 §5.2.4)
-    (let [tcb {:remote-tsn 100 :local-ver-tag 12345 :remote-ver-tag 67890 :negotiated-outbound-streams 16 :negotiated-inbound-streams 16}
-          conn0 {:state :established
+    (let [conn0 {:state :established
+                 :cookie-secret (b/alloc-bytes 32)
                  :local-ver-tag 12345
                  :remote-ver-tag 67890
                  :remote-tsn 5000
                  :ssn 12
                  :streams {0 {:next-ssn 12 :send-queue [] :recv-queue []}}
                  :heartbeat-interval 0}
-          cookie-chunk {:type :cookie-echo :tcb tcb}
+          init-res (dc-chunks/process-chunk conn0 {:type :init :init-tag 67890 :initial-tsn 101 :outbound-streams 16 :inbound-streams 16} nil 1000)
+          cookie (get-in (first (:pending-control-chunks (:next-state init-res))) [:params :cookie])
+          cookie-chunk {:type :cookie-echo :cookie cookie}
           scenario-10
           (fn []
             (let [res (dc-chunks/process-chunk conn0 cookie-chunk nil 1000)
                   st (:next-state res)
                   rem-tsn (:remote-tsn st)
                   ssn (:ssn st)
-                  valid? (and (= 5000 rem-tsn) (= 12 ssn))]
+                  valid? (and (= 5000 rem-tsn)
+                              (= 12 ssn)
+                              (= :cookie-ack (:type (first (:pending-control-chunks st)))))]
               {:valid? (boolean valid?) :remote-tsn rem-tsn :ssn ssn}))
           mutated-10
           (fn [sc-fn]
@@ -2436,3 +2445,329 @@
          :delivered-count (count delivered)
          :delivered-order-matches? order-matches?
          :client-unacked-remaining unacked-remaining}))))
+
+;; =============================================================================
+;; 13. Milestone Priority 2: Nexus E2EE Storage Simulation
+;; =============================================================================
+(defn run-nexus-e2ee-storage-sim
+  "Deterministic VOPR simulation verifying Milestone Priority 2:
+   Fractal E2EE Storage & Capability Service on unified Blob + Pointer + Subnet.
+   Verifies:
+   1. The Nexus subnet stores only opaque ciphertext (zero plaintext leakage).
+   2. A second browser instance holding the same user key fetches Pointer (seq 2) + Blob from Nexus and restores the exact decrypted state.
+   3. An adversarial rollback attempt replaying the old seq 1 pointer is rejected (:stale-pointer-rollback).
+   4. An adversarial ciphertext bit-flip is rejected (:invalid-blob-cid / :decryption-failed).
+   5. Advertising and resolving a paid UOp kernel capability (:compute/uop-kernel, :price-echo 500) on the subnet succeeds cleanly."
+  [& [{:keys [seed] :or {seed 20261116}}]]
+  (let [rng (crypto/make-random seed)
+        user-kp (crypto/generate-keypair rng)
+        user-priv (basalt/bytes->hex (:private user-kp))
+        user-pub (basalt/bytes->hex (:public user-kp))
+        subnet-id "nexus"
+        nexus-policy {:subnet/id subnet-id
+                      :subnet/parent-id "global"
+                      :subnet/gate {:gate/mode :permissioned
+                                    :gate/admission :allowlist
+                                    :gate/trust-anchors #{user-pub}}
+                      :subnet/path-acl [{:pattern "storage/<pubkey>/*" :principal {:type :self-path-owner}}
+                                        {:pattern "capability/<pubkey>/*" :principal {:type :self-path-owner}}]
+                      :subnet/economy {:economy/mode :none :economy/burn-floor 0 :economy/settlement-take-bps 0}
+                      :subnet/replication {:replication/pointers :gossip-crdt :replication/blobs :eager-push}}
+        sub-inst0 (:instance (subnet/init-subnet-instance nexus-policy {:now-ms 1000}))
+        state-v1 {:petnames {"axiom" "302a..."} :sessions ["s1"] :preferences {:theme "light"}}
+        state-v2 {:petnames {"axiom" "302a..."} :sessions ["s1" "s2"] :preferences {:theme "dark"}}
+
+        nonce1 (crypto/random-bytes rng 24)
+        packed1 (storage/pack-encrypted-state {:privkey user-priv
+                                               :pubkey user-pub
+                                               :subnet-id subnet-id
+                                               :slot "browser-state"
+                                               :seq 1
+                                               :leader-term 1
+                                               :nonce-bytes nonce1
+                                               :state-data state-v1})
+        blob1 (:blob packed1)
+        ptr1 (:pointer packed1)
+
+        sub-inst1 (-> sub-inst0
+                      (subnet/reduce-subnet {:type :put-blob :sender user-pub :blob blob1 :now-ms 1100})
+                      (:state)
+                      (subnet/reduce-subnet {:type :publish-pointer :sender user-pub :pointer ptr1 :now-ms 1200})
+                      (:state))
+
+        nonce2 (crypto/random-bytes rng 24)
+        packed2 (storage/pack-encrypted-state {:privkey user-priv
+                                               :pubkey user-pub
+                                               :subnet-id subnet-id
+                                               :slot "browser-state"
+                                               :seq 2
+                                               :leader-term 1
+                                               :nonce-bytes nonce2
+                                               :state-data state-v2})
+        blob2 (:blob packed2)
+        ptr2 (:pointer packed2)
+
+        sub-inst2 (-> sub-inst1
+                      (subnet/reduce-subnet {:type :put-blob :sender user-pub :blob blob2 :now-ms 1300})
+                      (:state)
+                      (subnet/reduce-subnet {:type :publish-pointer :sender user-pub :pointer ptr2 :now-ms 1400})
+                      (:state))
+
+        ;; 1. Zero plaintext leakage on Nexus Subnet
+        blob1-res (data/get-blob (get-in sub-inst2 [:data :blobs]) (:blob/cid blob1))
+        blob1-entry (:blob blob1-res)
+        blob1-bytes (:blob/bytes blob1-entry)
+        blob1-str (try (fressian/bytes->utf8 blob1-bytes) (catch Throwable _ ""))
+        zero-plaintext-leakage? (and (:hit? blob1-res)
+                                     (not (str/includes? blob1-str "preferences"))
+                                     (not (str/includes? blob1-str "dark"))
+                                     (not (str/includes? blob1-str "axiom")))
+
+        ;; 2. Browser Node 2 restores exact decrypted state
+        resolved-ptr2 (get-in sub-inst2 [:data :pointers [subnet-id (:pointer/path ptr2)]])
+        resolved-blob2 (:blob (data/get-blob (get-in sub-inst2 [:data :blobs]) (:pointer/target resolved-ptr2)))
+        unpack2-res (storage/unpack-encrypted-state {:privkey user-priv
+                                                     :pubkey user-pub
+                                                     :blob resolved-blob2
+                                                     :pointer resolved-ptr2
+                                                     :min-expected-seq 1
+                                                     :context "browser-state"})
+        exact-restore-v2? (and (:ok? unpack2-res)
+                               (= state-v2 (:data unpack2-res))
+                               (= 2 (:seq unpack2-res)))
+
+        ;; 3. Adversarial rollback rejected
+        rollback-res (storage/unpack-encrypted-state {:privkey user-priv
+                                                      :pubkey user-pub
+                                                      :blob blob1
+                                                      :pointer ptr1
+                                                      :min-expected-seq 2
+                                                      :context "browser-state"})
+        rollback-rejected? (and (false? (:ok? rollback-res))
+                                (= :stale-pointer-rollback (:error rollback-res)))
+
+        ;; 4. Adversarial ciphertext bit-flip rejected
+        tampered-bytes (byte-array (:blob/bytes blob2))
+        _ (let [idx 25] (aset tampered-bytes idx (unchecked-byte (bit-xor (aget tampered-bytes idx) 1))))
+        tampered-blob (assoc blob2 :blob/bytes tampered-bytes)
+        tamper-res (storage/unpack-encrypted-state {:privkey user-priv
+                                                    :pubkey user-pub
+                                                    :blob tampered-blob
+                                                    :pointer ptr2
+                                                    :min-expected-seq 2
+                                                    :context "browser-state"})
+        tamper-rejected? (and (false? (:ok? tamper-res))
+                              (contains? #{:invalid-blob-cid :decryption-failed} (:error tamper-res)))
+
+        ;; 5. Paid capability advertisement and resolution
+        kernel-cid "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        cap-packed (storage/pack-capability-descriptor {:privkey user-priv
+                                                        :pubkey user-pub
+                                                        :subnet-id subnet-id
+                                                        :capability-id "uop-kernel-v1"
+                                                        :capability-type :compute/uop-kernel
+                                                        :price-echo 500
+                                                        :burn-floor 50
+                                                        :metadata {:arch "arm64" :ops ["gemm"]}
+                                                        :target-cid kernel-cid})
+        sub-inst3 (-> sub-inst2
+                      (subnet/reduce-subnet {:type :put-blob :sender user-pub :blob (:blob cap-packed) :now-ms 1500})
+                      (:state)
+                      (subnet/reduce-subnet {:type :publish-pointer :sender user-pub :pointer (:pointer cap-packed) :now-ms 1600})
+                      (:state))
+        resolved-cap-ptr (get-in sub-inst3 [:data :pointers [subnet-id (:pointer/path (:pointer cap-packed))]])
+        resolved-cap-blob (:blob (data/get-blob (get-in sub-inst3 [:data :blobs]) (:pointer/target resolved-cap-ptr)))
+        unpack-cap-res (storage/unpack-capability-descriptor {:blob resolved-cap-blob
+                                                              :pointer resolved-cap-ptr})
+        cap-resolved? (and (:ok? unpack-cap-res)
+                           (= :compute/uop-kernel (get-in unpack-cap-res [:capability :capability/type]))
+                           (= 500 (get-in unpack-cap-res [:capability :capability/price-echo]))
+                           (= kernel-cid (get-in unpack-cap-res [:capability :capability/target-cid])))]
+    {:valid? (and zero-plaintext-leakage?
+                  exact-restore-v2?
+                  rollback-rejected?
+                  tamper-rejected?
+                  cap-resolved?)
+     :seed seed
+     :zero-plaintext-leakage? zero-plaintext-leakage?
+     :exact-restore-v2? exact-restore-v2?
+     :rollback-rejected? rollback-rejected?
+     :tamper-rejected? tamper-rejected?
+     :capability-resolved? cap-resolved?}))
+
+;; =============================================================================
+;; 14. Milestone Priority 3: ChiaLisp-Style SCI Smart Contract Simulation
+;; =============================================================================
+(defn run-sci-smart-contract-sim
+  "Deterministic VOPR simulation verifying Milestone Priority 3:
+   ChiaLisp-Style Content-Addressed SCI Smart Contracts in Escrow & VOPR.
+   Verifies:
+   - Scenario 1: Honest UOp kernel purchase with oracle attestation,
+     split 900 to author, 100 to oracle, tau = 0.5% burned (total burned = 5),
+     and balances correctly credited.
+   - Scenario 2: Adversarial SCI Attacks in VOPR:
+     (a) Tampered UOp source (hash mismatch)
+     (b) Forged oracle signature
+     (c) Overspending conditions sum > escrow amount
+     (d) Fuel exhaustion / unbounded step budget attack
+     (e) Preimage bypass attempt on puzzle-locked escrow
+     All 5 rejected safely with zero state corruption."
+  [& [{:keys [seed] :or {seed 20261116}}]]
+  (let [rng (crypto/make-random seed)
+        client-kp (crypto/generate-keypair rng)
+        client-pub (basalt/bytes->hex (:public client-kp))
+
+        author-kp (crypto/generate-keypair rng)
+        author-pub (basalt/bytes->hex (:public author-kp))
+
+        oracle-kp (crypto/generate-keypair rng)
+        oracle-pub (basalt/bytes->hex (:public oracle-kp))
+        oracle-priv (basalt/bytes->hex (:private oracle-kp))
+
+        init-st (-> (sm/init-state [] "node-val-1" (assoc config/default-config :settlement-take-bps 50))
+                    (assoc-in [:ledger client-pub]
+                              (account/map->AccountState {:balance 2000 :seq 0 :deps []})))
+
+        kernel-src "float relu(float x) { return x > 0.0f ? x : 0.0f; }"
+        kernel-hash (str/lower-case (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes kernel-src))))
+        oracle-sig (basalt/bytes->hex (crypto/sign (basalt/hex->bytes oracle-priv) (fressian/utf8->bytes kernel-src)))
+
+        puzzle-code (str "(and (= (sha256 (get solution :uop-kernel-source)) (get env :deliverable-hash))\n"
+                         "     (verify-signature \"" oracle-pub "\" (get solution :uop-kernel-source) (get solution :oracle-sig))\n"
+                         "     [ {:type :release :receiver \"" author-pub "\" :amount 900}\n"
+                         "       {:type :release :receiver \"" oracle-pub "\" :amount 100} ])")
+        puzzle-hash (puzzle/puzzle-cid puzzle-code)
+        escrow-id (escrow/compute-escrow-id client-pub author-pub 1000 kernel-hash 1 100 "sim-escrow-1")
+
+        lock-evt {:type :lock-intent
+                  :escrow-id escrow-id
+                  :payer client-pub
+                  :receiver author-pub
+                  :amount 1000
+                  :deliverable-hash kernel-hash
+                  :puzzle-hash puzzle-hash
+                  :created-epoch 1
+                  :expires-epoch 100
+                  :epoch 1
+                  :sender client-pub}
+        lock-res (sm/handle-event init-st lock-evt)
+        st-locked (:state lock-res)
+        lock-ok? (and (= 1000 (get-in st-locked [:ledger client-pub :balance]))
+                      (= :locked (get-in st-locked [:escrows escrow-id :status]))
+                      (= puzzle-hash (get-in st-locked [:escrows escrow-id :puzzle-hash])))
+
+        release-evt {:type :release-intent
+                     :escrow-id escrow-id
+                     :puzzle-source puzzle-code
+                     :solution {:uop-kernel-source kernel-src
+                                :oracle-sig oracle-sig}
+                     :epoch 2}
+        release-res (sm/handle-event st-locked release-evt)
+        st-released (:state release-res)
+
+        author-bal (get-in st-released [:ledger author-pub :balance] 0)
+        oracle-bal (get-in st-released [:ledger oracle-pub :balance] 0)
+        settled-take (get-in st-released [:epoch-settlement-takes 2] 0)
+        escrow-status (get-in st-released [:escrows escrow-id :status])
+
+        scenario-1-valid? (and lock-ok?
+                               (= :released escrow-status)
+                               (= 896 author-bal)
+                               (= 99 oracle-bal)
+                               (= 5 settled-take)
+                               (= 1000 (+ author-bal oracle-bal settled-take)))
+
+        ;; Scenario 2: Adversarial Attacks
+        adv-tampered-res (sm/handle-event st-locked
+                                          {:type :release-intent
+                                           :escrow-id escrow-id
+                                           :puzzle-source puzzle-code
+                                           :solution {:uop-kernel-source "float relu(float x) { return 0.0f; }"
+                                                      :oracle-sig oracle-sig}
+                                           :epoch 2})
+        tampered-source-rejected? (= :locked (get-in (:state adv-tampered-res) [:escrows escrow-id :status]))
+
+        forged-sig (basalt/bytes->hex (byte-array 64))
+        adv-forged-res (sm/handle-event st-locked
+                                        {:type :release-intent
+                                         :escrow-id escrow-id
+                                         :puzzle-source puzzle-code
+                                         :solution {:uop-kernel-source kernel-src
+                                                    :oracle-sig forged-sig}
+                                         :epoch 2})
+        forged-sig-rejected? (= :locked (get-in (:state adv-forged-res) [:escrows escrow-id :status]))
+
+        overspend-code (str "[{:type :release :receiver \"" author-pub "\" :amount 900}\n"
+                            " {:type :release :receiver \"" oracle-pub "\" :amount 200}]")
+        overspend-hash (puzzle/puzzle-cid overspend-code)
+        os-escrow-id (escrow/compute-escrow-id client-pub author-pub 1000 kernel-hash 1 100 "sim-overspend-escrow")
+        st-os-locked (:state (sm/handle-event init-st {:type :lock-intent
+                                                       :escrow-id os-escrow-id
+                                                       :payer client-pub
+                                                       :receiver author-pub
+                                                       :amount 1000
+                                                       :deliverable-hash kernel-hash
+                                                       :puzzle-hash overspend-hash
+                                                       :created-epoch 1
+                                                       :expires-epoch 100
+                                                       :epoch 1
+                                                       :sender client-pub}))
+        adv-overspend-res (sm/handle-event st-os-locked
+                                           {:type :release-intent
+                                            :escrow-id os-escrow-id
+                                            :puzzle-source overspend-code
+                                            :solution {}
+                                            :epoch 2})
+        overspend-rejected? (and (= :locked (get-in (:state adv-overspend-res) [:escrows os-escrow-id :status]))
+                                 (= :puzzle-overspend-violation
+                                    (get-in (:state adv-overspend-res) [:diagnostics :last-puzzle-error])))
+
+        fuel-dos-code "(reduce + 0 (range 1000))"
+        fuel-dos-hash (puzzle/puzzle-cid fuel-dos-code)
+        fuel-escrow-id (escrow/compute-escrow-id client-pub author-pub 1000 kernel-hash 1 100 "sim-fuel-escrow")
+        st-fuel-locked (:state (sm/handle-event init-st {:type :lock-intent
+                                                         :escrow-id fuel-escrow-id
+                                                         :payer client-pub
+                                                         :receiver author-pub
+                                                         :amount 1000
+                                                         :deliverable-hash kernel-hash
+                                                         :puzzle-hash fuel-dos-hash
+                                                         :created-epoch 1
+                                                         :expires-epoch 100
+                                                         :epoch 1
+                                                         :sender client-pub}))
+        adv-fuel-res (sm/handle-event st-fuel-locked
+                                      {:type :release-intent
+                                       :escrow-id fuel-escrow-id
+                                       :puzzle-source fuel-dos-code
+                                       :solution {}
+                                       :epoch 2})
+        fuel-exhaustion-rejected? (and (= :locked (get-in (:state adv-fuel-res) [:escrows fuel-escrow-id :status]))
+                                       (= :puzzle-budget-exceeded
+                                          (get-in (:state adv-fuel-res) [:diagnostics :last-puzzle-error])))
+
+        adv-preimage-bypass-res (sm/handle-event st-locked
+                                                 {:type :release-intent
+                                                  :escrow-id escrow-id
+                                                  :preimage kernel-src
+                                                  :sender author-pub
+                                                  :epoch 2})
+        preimage-bypass-rejected? (= :locked (get-in (:state adv-preimage-bypass-res) [:escrows escrow-id :status]))
+
+        scenario-2-valid? (and tampered-source-rejected?
+                               forged-sig-rejected?
+                               overspend-rejected?
+                               fuel-exhaustion-rejected?
+                               preimage-bypass-rejected?)]
+    {:valid? (and scenario-1-valid? scenario-2-valid?)
+     :seed seed
+     :scenario-1-valid? scenario-1-valid?
+     :scenario-2-valid? scenario-2-valid?
+     :tampered-source-rejected? tampered-source-rejected?
+     :forged-sig-rejected? forged-sig-rejected?
+     :overspend-rejected? overspend-rejected?
+     :fuel-exhaustion-rejected? fuel-exhaustion-rejected?
+     :preimage-bypass-rejected? preimage-bypass-rejected?
+     :author-balance author-bal
+     :oracle-balance oracle-bal
+     :settlement-take settled-take}))

@@ -437,7 +437,7 @@
             "inbox" "inbox-count" "outbox" "chat-history" "messages" "messages-exchanged" "messages-received" "last-message"
             "msg-payload" "gossip-env" "message-id" "payload" "payload-hex" "frame-type" "nonce" "ciphertext" "sealed-frame"
             "burned-ech" "total-burned-ech" "alice-burned" "bob-burned" "vouchers" "vouchers-count" "voucher-id"
-            "escrows" "escrows-count" "escrow-id" "deliverable-hash" "last-transfer-hash"
+            "escrows" "escrows-count" "escrow-id" "deliverable-hash" "puzzle-hash" "last-transfer-hash"
             "settled-epoch" "net-amount" "settlement-mode" "take-amount" "take-burned"
             "refund-amount" "refund-reason" "payer-signature" "preimage" "deliverable"
             "release-submitted" "refund-submitted" "settled-escrow-ids" "settled-escrow-order" "canonical-escrows"
@@ -1046,3 +1046,33 @@
       ;; Candidate lines must preserve both hostnames/IPs
       (is (str/includes? sdp "a=candidate:1 1 UDP 2130706431 btec-123.local 5011 typ host"))
       (is (str/includes? sdp "a=candidate:2 1 UDP 2130706430 192.168.86.36 5011 typ host")))))
+
+(deftest test-exec-browser-cli-dispatch
+  (testing "exec-browser-cli dispatches light node verbs against state"
+    (let [kp (crypto/generate-keypair)
+          pub (fressian/bytes->hex (:public kp))
+          priv (:private kp)
+          identity {:public-key (:public kp) :private-key (:private kp) :pubkey-hex pub}
+          initial-st (light-core/init-light-state identity {})]
+      (testing "exec-browser-cli status"
+        (let [res (browser/exec-browser-cli initial-st "status" priv)]
+          (is (true? (:ok? res)))
+          (is (= "status" (:verb res)))
+          (is (= pub (get-in res [:response "pubkey"])))))
+
+      (testing "exec-browser-cli storage-put and storage-get"
+        (let [put-res (browser/exec-browser-cli initial-st "storage-put --subnet nexus --slot note --data 'secret-data' --seq 1" priv)]
+          (is (true? (:ok? put-res)))
+          (is (= "storage-put" (:verb put-res)))
+          (is (true? (get-in put-res [:response "ok"])))
+          (let [st1 (:state put-res)
+                get-res (browser/exec-browser-cli st1 "storage-get --subnet nexus --slot note --min-seq 1" priv)]
+            (is (true? (:ok? get-res)))
+            (is (= "storage-get" (:verb get-res)))
+            (is (= "secret-data" (get-in get-res [:response "data"]))))))
+
+      (testing "exec-browser-cli invalid verb fails closed with error (Rule 5)"
+        (let [res (browser/exec-browser-cli initial-st "not-a-real-verb" priv)]
+          (is (false? (:ok? res)))
+          (is (= :invalid-verb (:error res))))))))
+
