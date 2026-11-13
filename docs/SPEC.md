@@ -186,4 +186,15 @@ The `wait` command provides zero-latency notification of asynchronous network ev
   "timeout_ms": 10000
 }
 ```
-If actionable events (`message-received`, `offer-received`, `channel-opened`, `p2p-connected`, `p2p-disconnected`, `diagnostic`) are buffered in `:event-queue`, they are drained and returned immediately. If the queue is empty, the daemon holds the HTTP connection open until an event is enqueued or `timeout_ms` expires.
+If actionable events (`message-received`, `offer-received`, `channel-opened`, `p2p-connected`, `p2p-disconnected`, `diagnostic`, `storage-replicated`, `capability-published`) are buffered in `:event-queue`, they are drained and returned immediately. If the queue is empty, the daemon holds the HTTP connection open until an event is enqueued or `timeout_ms` expires.
+
+---
+
+## 4. Content-Addressed `sci` Smart Contracts, Fractal E2EE Storage, & Capability Descriptors
+
+For detailed specifications and cross-runtime CLI/JSONL/Browser usage of Bitecho's programmable settlement, encrypted storage, and capability economy primitives, see:
+
+- **[`docs/SMART_CONTRACTS.md`](SMART_CONTRACTS.md)**: ChiaLisp-style content-addressed `sci` smart contracts (`bitecho.economy.puzzle`), sandbox determinism & fuel metering, condition outputs (`:release`, `:refund`, `:refund-remainder`, `:assert-epoch-gte`, `:assert-epoch-lte`, `:assert-sig`, `:assert-sha256`), and `puzzle-hash` / `puzzle-eval` / `lock-intent` / `release-intent`.
+- **[`docs/STORAGE.md`](STORAGE.md)**: Built-in Fractal E2EE Storage (`bitecho.core.storage`) over `Blob` + `Pointer` + `Subnet`, domain-separated XSalsa20-Poly1305 encryption (`derive-storage-key`), anti-rollback sequence guards, and `storage-put` / `storage-get` / `storage-list`.
+- **[`docs/CAPABILITIES.md`](CAPABILITIES.md)**: Generic Fractal Capability Descriptors (`bitecho.core.storage`) for `:storage/blob-pinning`, `:compute/uop-kernel`, `:compute/gpu-access`, `:model/weights`, `:network/turn-relay`, and `:network/gateway`, plus `capability-publish` / `capability-resolve` / `capability-list`.
+

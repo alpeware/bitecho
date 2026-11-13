@@ -7,8 +7,10 @@
             [bitecho.economy.account :as account]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
+            [bitecho.economy.puzzle :as puzzle]
             [bitecho.light-node.core :as light-core]
             [bitecho.rendezvous.core :as rdv]
+            [bitecho.shell.browser :as browser]
             [bitecho.shell.mesh :as mesh]
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
@@ -3709,6 +3711,315 @@
           (is (= :compute/uop-kernel (get-in res-cap [:response "capability" :capability/type])))
           (is (= 250 (get-in res-cap [:response "capability" :capability/price-echo])))
           (is (= 5 (get-in res-cap [:response "capability" :capability/burn-floor]))))))))
+
+(deftest test-light-node-sci-smart-contracts-and-escrows
+  (testing "puzzle-hash command returns correct CID and size"
+    (let [alice (test-identity)
+          st0 (light-core/init-light-state (:identity alice) {})
+          src "(and true true)"
+          res (light-core/handle-command st0 {"cmd" "puzzle-hash" "puzzle_source" src} (:privkey-bytes alice))
+          resp (:response res)]
+      (is (true? (get resp "ok")))
+      (is (= (puzzle/puzzle-cid src) (get resp "puzzle_hash")))
+      (is (= (count (.getBytes src "UTF-8")) (get resp "size_bytes")))))
+
+  (testing "puzzle-eval command evaluates puzzle and returns valid conditions"
+    (let [alice (test-identity)
+          st0 (light-core/init-light-state (:identity alice) {})
+          src "[{:type :release :receiver (:receiver env) :amount 600}]"
+          res (light-core/handle-command st0 {"cmd" "puzzle-eval"
+                                              "puzzle_source" src
+                                              "amount" 1000}
+                                         (:privkey-bytes alice))
+          resp (:response res)]
+      (is (true? (get resp "ok")))
+      (is (true? (get resp "valid")))
+      (is (= 2 (count (get resp "conditions"))))
+      (is (= "release" (get-in resp ["conditions" 0 "type"])))
+      (is (= 600 (get-in resp ["conditions" 0 "amount"])))
+      (is (= "refund-remainder" (get-in resp ["conditions" 1 "type"])))
+      (is (= 400 (get-in resp ["conditions" 1 "amount"])))))
+
+  (testing "lock-intent with puzzle-source auto-computes puzzle-hash and deliverable-hash"
+    (let [alice (test-identity)
+          bob (test-identity)
+          st0 (-> (light-core/init-light-state (:identity alice) {})
+                  (assoc :account {:balance 5000 :spendable 5000}))
+          src "(= 1 1)"
+          phash (puzzle/puzzle-cid src)
+          lock-res (light-core/handle-command st0 {"cmd" "lock-intent"
+                                                   "receiver" (:pubkey-hex bob)
+                                                   "amount" 1000
+                                                   "puzzle_source" src}
+                                              (:privkey-bytes alice))
+          resp (:response lock-res)
+          eid (get resp "escrow_id")]
+      (is (true? (get resp "ok")))
+      (is (= phash (get resp "puzzle_hash")))
+      (is (= phash (get resp "deliverable_hash")))
+      (is (string? eid))
+
+      ;; Release intent with puzzle-source and solution
+      (let [rel-res (light-core/handle-command (:state lock-res)
+                                               {"cmd" "release-intent"
+                                                "escrow_id" eid
+                                                "puzzle_source" src
+                                                "solution" "{}"}
+                                               (:privkey-bytes alice))
+            rel-resp (:response rel-res)
+            env (first (:net-envelopes rel-res))]
+        (is (true? (get rel-resp "ok")))
+        (is (= "release-submitted" (get rel-resp "status")))
+        (is (= src (get-in env [:event :puzzle-source])))
+        (is (= {} (get-in env [:event :solution])))
+        ;; payer-signature must NOT be auto-generated on puzzle release
+        (is (nil? (get-in env [:event :payer-signature]))))))
+
+  (testing "lock-intent with mismatched puzzle-hash fails closed"
+    (let [alice (test-identity)
+          bob (test-identity)
+          st0 (-> (light-core/init-light-state (:identity alice) {})
+                  (assoc :account {:balance 5000 :spendable 5000}))
+          src "(= 1 1)"
+          wrong-phash "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+          res (light-core/handle-command st0 {"cmd" "lock-intent"
+                                              "receiver" (:pubkey-hex bob)
+                                              "amount" 1000
+                                              "puzzle_source" src
+                                              "puzzle_hash" wrong-phash}
+                                         (:privkey-bytes alice))]
+      (is (false? (get-in res [:response "ok"])))
+      (is (= "puzzle-hash-mismatch" (get-in res [:response "error"]))))))
+
+(deftest test-light-node-storage-replicate-wire-and-listing
+  (let [alice (test-identity)
+        bob (test-identity)
+        st0 (light-core/init-light-state (:identity alice) {})
+        priv-a (:privkey-bytes alice)
+        priv-b (:privkey-bytes bob)
+        put-res (light-core/handle-command st0 {"cmd" "storage-put" "slot" "cfg" "data" "val1"} priv-a)
+        rep-env (first (:net-envelopes put-res))
+        st1 (:state put-res)]
+    (is (true? (get-in put-res [:response "ok"])))
+    (is (= "cfg" (get-in put-res [:response "slot_id"])))
+    (is (= "nexus" (get-in put-res [:response "subnet_id"])))
+    (is (pos? (get-in put-res [:response "size_bytes"])))
+    (is (some? rep-env))
+    (is (= :storage-replicate (:bitecho/type rep-env)))
+
+    ;; storage-list
+    (let [list-res (light-core/handle-command st1 {"cmd" "storage-list" "subnet_id" "nexus"} priv-a)
+          slots (get-in list-res [:response "slots"])]
+      (is (true? (get-in list-res [:response "ok"])))
+      (is (= 1 (get-in list-res [:response "count"])))
+      (is (= "cfg" (get (first slots) "slot_id")))
+      (is (= "nexus" (get (first slots) "subnet_id")))
+      (is (= (:pubkey-hex alice) (get (first slots) "authority"))))
+
+    ;; Wire replication on Bob
+    (let [st-bob (light-core/init-light-state (:identity bob) {})
+          wire-res (light-core/handle-wire-payload st-bob rep-env priv-b)
+          st-bob' (:state wire-res)
+          events (:stdout-events wire-res)]
+      (is (= 1 (count events)))
+      (is (= "storage-replicated" (get (first events) "event")))
+      (is (= "nexus" (get (first events) "subnet_id")))
+      (is (some? (get-in st-bob' [:storage-blobs (get-in put-res [:response "cid"])])))
+
+      ;; Stale sequence rejected
+      (let [stale-res (light-core/handle-wire-payload st-bob' rep-env priv-b)]
+        (is (= 1 (get-in stale-res [:state :diagnostics :replication-rejected])))
+        (is (= "diagnostic" (get (first (:stdout-events stale-res)) "event")))))))
+
+(deftest test-light-node-capability-replicate-wire-and-listing
+  (let [alice (test-identity)
+        bob (test-identity)
+        st0 (light-core/init-light-state (:identity alice) {})
+        priv-a (:privkey-bytes alice)
+        priv-b (:privkey-bytes bob)
+        pub-res (light-core/handle-command st0 {"cmd" "capability-publish"
+                                                "capability_id" "cap-gpu"
+                                                "capability_type" "compute/gpu-access"
+                                                "price_echo" 100
+                                                "burn_floor" 10
+                                                "metadata" "{\"gpu\":\"A100\"}"}
+                                           priv-a)
+        rep-env (first (:net-envelopes pub-res))
+        st1 (:state pub-res)]
+    (is (true? (get-in pub-res [:response "ok"])))
+    (is (= "compute/gpu-access" (get-in pub-res [:response "capability_type"])))
+    (is (some? rep-env))
+    (is (= :capability-replicate (:bitecho/type rep-env)))
+
+    ;; capability-resolve by ID and authority
+    (let [res-cap (light-core/handle-command st1 {"cmd" "capability-resolve"
+                                                  "capability_id" "cap-gpu"
+                                                  "authority" (:pubkey-hex alice)}
+                                             priv-a)]
+      (is (true? (get-in res-cap [:response "ok"])))
+      (is (= "cap-gpu" (get-in res-cap [:response "descriptor" "capability_id"])))
+      (is (= "compute/gpu-access" (get-in res-cap [:response "descriptor" "capability_type"])))
+      (is (= 100 (get-in res-cap [:response "descriptor" "price_echo"])))
+      (is (= {:gpu "A100"} (get-in res-cap [:response "descriptor" "metadata"]))))
+
+    ;; capability-list
+    (let [list-res (light-core/handle-command st1 {"cmd" "capability-list"
+                                                   "capability_type" "compute/gpu-access"}
+                                              priv-a)
+          caps (get-in list-res [:response "capabilities"])]
+      (is (true? (get-in list-res [:response "ok"])))
+      (is (= 1 (get-in list-res [:response "count"])))
+      (is (= "cap-gpu" (get (first caps) "capability_id"))))
+
+    ;; Wire replication on Bob
+    (let [st-bob (light-core/init-light-state (:identity bob) {})
+          wire-res (light-core/handle-wire-payload st-bob rep-env priv-b)
+          st-bob' (:state wire-res)
+          events (:stdout-events wire-res)]
+      (is (= 1 (count events)))
+      (is (= "capability-published" (get (first events) "event")))
+      ;; Bob can now resolve Alice's capability
+      (let [bob-res (light-core/handle-command st-bob' {"cmd" "capability-resolve"
+                                                        "capability_id" "cap-gpu"
+                                                        "authority" (:pubkey-hex alice)}
+                                               priv-b)]
+        (is (true? (get-in bob-res [:response "ok"])))
+        (is (= "cap-gpu" (get-in bob-res [:response "descriptor" "capability_id"])))))))
+
+(deftest test-browser-persistence-allowlist-preservation
+  (let [alice (test-identity)
+        st0 (light-core/init-light-state (:identity alice) {})
+        priv (:privkey-bytes alice)
+        st1 (:state (light-core/handle-command st0 {"cmd" "storage-put" "slot" "s1" "data" {:a 1}} priv))
+        st2 (:state (light-core/handle-command st1 {"cmd" "capability-publish"
+                                                    "capability_id" "c1"
+                                                    "capability_type" "storage/blob-pinning"
+                                                    "metadata" {:custom-meta "arbitrary-val"}}
+                                               priv))
+        sanitized (browser/sanitize-state-for-persistence st2)]
+    (is (some? sanitized))
+    (is (seq (:storage-pointers sanitized)))
+    (is (seq (:storage-blobs sanitized)))
+    (is (seq (:storage-min-seqs sanitized)))
+    (is (seq (:capabilities sanitized)))
+    (is (seq (:capability-blobs sanitized)))))
+
+(deftest test-b-gap-aliases-and-sandbox-bindings
+  (let [alice (test-identity)
+        bob (test-identity)
+        priv-a (:privkey-bytes alice)
+        st0 (-> (light-core/init-light-state (:identity alice) {})
+                (assoc :account {:balance 5000 :spendable 5000})
+                (assoc :epoch 5))]
+
+    (testing "escrow / context / sha256-hex / verify-sig bindings and :assert-epoch-lte in puzzle-eval"
+      (let [msg "bitecho-oracle-auth"
+            sig (basalt/bytes->hex (crypto/sign priv-a (.getBytes msg "UTF-8")))
+            src (str "[{:type :assert-epoch-lte :epoch 10}"
+                     " {:type :assert-sig :pubkey \"" (:pubkey-hex alice) "\" :message \"" msg "\" :signature \"" sig "\"}"
+                     " {:type :release :receiver (:receiver escrow) :amount (:amount context)}]")
+            eval-res (light-core/handle-command st0 {"cmd" "puzzle-eval"
+                                                     "puzzle_source" src
+                                                     "amount" 500
+                                                     "epoch" 5
+                                                     "receiver" (:pubkey-hex bob)
+                                                     "payer" (:pubkey-hex alice)}
+                                                priv-a)
+            resp (:response eval-res)]
+        (is (true? (get resp "ok")))
+        (is (true? (get resp "valid")))
+        (is (= 1 (count (get resp "conditions"))))
+        (is (= "release" (get-in resp ["conditions" 0 "type"])))
+        (is (= 500 (get-in resp ["conditions" 0 "amount"])))))
+
+    (testing ":assert-epoch-lte fails with :epoch-after-max when current epoch exceeds max"
+      (let [src "[{:type :assert-epoch-lte :epoch 4} {:type :release :amount 500}]"
+            eval-res (light-core/handle-command st0 {"cmd" "puzzle-eval"
+                                                     "puzzle_source" src
+                                                     "amount" 500
+                                                     "epoch" 5
+                                                     "receiver" (:pubkey-hex bob)
+                                                     "payer" (:pubkey-hex alice)}
+                                                priv-a)
+            resp (:response eval-res)]
+        (is (true? (get resp "ok")))
+        (is (false? (get resp "valid")))
+        (is (= "epoch-after-max" (get resp "error")))))
+
+    (testing ":assert-sig fails on forged signature"
+      (let [forged-sig (basalt/bytes->hex (crypto/sign (:privkey-bytes bob) (.getBytes "bitecho-oracle-auth" "UTF-8")))
+            src (str "[{:type :assert-sig :pubkey \"" (:pubkey-hex alice) "\" :message \"bitecho-oracle-auth\" :signature \"" forged-sig "\"}]")
+            eval-res (light-core/handle-command st0 {"cmd" "puzzle-eval"
+                                                     "puzzle_source" src
+                                                     "amount" 500
+                                                     "epoch" 5
+                                                     "receiver" (:pubkey-hex bob)
+                                                     "payer" (:pubkey-hex alice)}
+                                                priv-a)
+            resp (:response eval-res)]
+        (is (true? (get resp "ok")))
+        (is (false? (get resp "valid")))
+        (is (= "invalid-signature-condition" (get resp "error")))))
+
+    (testing "CLI aliases --slot-id / --slot, --timeout-epoch, and --intent-id"
+      ;; storage-put with slot-id
+      (let [put-res (light-core/handle-command st0 {"cmd" "storage-put"
+                                                    "slot_id" "config"
+                                                    "data" {:v 42}}
+                                               priv-a)
+            put-resp (:response put-res)
+            st1 (:state put-res)]
+        (is (true? (get put-resp "ok")))
+        (is (= "config" (get put-resp "slot")))
+        (is (= "config" (get put-resp "slot_id")))
+
+        ;; storage-get with slot-id
+        (let [get-res (light-core/handle-command st1 {"cmd" "storage-get"
+                                                      "slot_id" "config"}
+                                                 priv-a)
+              get-resp (:response get-res)]
+          (is (true? (get get-resp "ok")))
+          (is (= "config" (get get-resp "slot")))
+          (is (= "config" (get get-resp "slot_id")))
+          (is (= {:v 42} (get get-resp "data"))))
+
+        ;; lock-intent with --timeout-epoch and --intent-id
+        (let [src "(= 1 1)"
+              lock-res (light-core/handle-command st0 {"cmd" "lock-intent"
+                                                       "receiver" (:pubkey-hex bob)
+                                                       "amount" 100
+                                                       "timeout_epoch" 25
+                                                       "intent_id" "intent-test-1"
+                                                       "puzzle_source" src}
+                                                  priv-a)
+              lock-resp (:response lock-res)]
+          (is (true? (get lock-resp "ok")))
+          (is (= "intent-test-1" (get lock-resp "escrow_id")))
+          (is (= "intent-test-1" (get lock-resp "intent_id")))
+          (is (= 25 (get lock-resp "expires_epoch")))
+          (is (= 25 (get lock-resp "timeout_epoch")))
+
+          ;; release-intent with intent_id
+          (let [rel-res (light-core/handle-command (:state lock-res)
+                                                   {"cmd" "release-intent"
+                                                    "intent_id" "intent-test-1"
+                                                    "puzzle_source" src
+                                                    "solution" "{}"}
+                                                   priv-a)
+                rel-resp (:response rel-res)]
+            (is (true? (get rel-resp "ok")))
+            (is (= "intent-test-1" (get rel-resp "escrow_id")))
+            (is (= "intent-test-1" (get rel-resp "intent_id"))))
+
+          ;; refund-intent with intent_id
+          (let [ref-res (light-core/handle-command (:state lock-res)
+                                                   {"cmd" "refund-intent"
+                                                    "intent_id" "intent-test-1"}
+                                                   priv-a)
+                ref-resp (:response ref-res)]
+            (is (true? (get ref-resp "ok")))
+            (is (= "intent-test-1" (get ref-resp "escrow_id")))
+            (is (= "intent-test-1" (get ref-resp "intent_id")))))))))
 
 
 

@@ -266,7 +266,39 @@
       (is (= 45000 (get cmd "timeout_ms")))
       (is (= 10 (get cmd "min_seq"))))
     (let [cmd-def (shell/build-one-shot-cmd-map "wait" [])]
-      (is (= 30000 (get cmd-def "timeout_ms"))))))
+      (is (= 30000 (get cmd-def "timeout_ms")))))
+
+  (testing "one-shot parsing for storage-list, capability-list, puzzle-hash, and puzzle-eval"
+    (let [c1 (shell/build-one-shot-cmd-map "storage-list" ["--subnet-id" "nexus"])]
+      (is (= "storage-list" (get c1 "cmd")))
+      (is (= "nexus" (get c1 "subnet_id"))))
+    (let [c2 (shell/build-one-shot-cmd-map "capability-list" ["--subnet-id" "nexus" "--capability-type" "compute/uop-kernel" "--authority" "pk1"])]
+      (is (= "capability-list" (get c2 "cmd")))
+      (is (= "nexus" (get c2 "subnet_id")))
+      (is (= "compute/uop-kernel" (get c2 "capability_type")))
+      (is (= "pk1" (get c2 "authority"))))
+    (let [c3 (shell/build-one-shot-cmd-map "puzzle-hash" ["--puzzle-source" "(+ 1 2)"])]
+      (is (= "puzzle-hash" (get c3 "cmd")))
+      (is (= "(+ 1 2)" (get c3 "puzzle_source"))))
+    (let [c4 (shell/build-one-shot-cmd-map "puzzle-eval" ["--puzzle-source" "(+ 1 2)" "--solution" "[3]" "--amount" "100"])]
+      (is (= "puzzle-eval" (get c4 "cmd")))
+      (is (= "(+ 1 2)" (get c4 "puzzle_source")))
+      (is (= "[3]" (get c4 "solution")))
+      (is (= 100 (get c4 "amount"))))
+    (let [c5 (shell/build-one-shot-cmd-map "lock-intent" ["--to" "bob" "--amount" "10" "--puzzle-source" "(= 1 1)"])]
+      (is (= "(= 1 1)" (get c5 "puzzle_source"))))
+    (let [c6 (shell/build-one-shot-cmd-map "storage-get" ["--min-expected-seq" "4"])]
+      (is (= 4 (get c6 "min_seq")))
+      (is (= 4 (get c6 "min_expected_seq"))))
+    (let [c7 (shell/build-one-shot-cmd-map "capability-publish" ["--burn-floor" "15" "--target-cid" "cid1" "--seq" "3" "--metadata" "{\"a\":1}"])]
+      (is (= 15 (get c7 "burn_floor")))
+      (is (= "cid1" (get c7 "target_cid")))
+      (is (= 3 (get c7 "seq")))
+      (is (= "{\"a\":1}" (get c7 "metadata"))))
+    (let [c8 (shell/build-one-shot-cmd-map "capability-resolve" ["--path" "cap/1" "--min-expected-seq" "2"])]
+      (is (= "cap/1" (get c8 "path")))
+      (is (= 2 (get c8 "min_seq")))
+      (is (= 2 (get c8 "min_expected_seq"))))))
 
 ;; =============================================================================
 ;; 5. Generative Property Checks (Rule 1 Strict TDD)

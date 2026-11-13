@@ -187,11 +187,14 @@
 
 (defn pack-capability-descriptor
   "Creates a canonical capability descriptor Blob and signed Pointer."
-  [{:keys [privkey pubkey subnet-id capability-id capability-type price-echo burn-floor metadata seq leader-term target-cid]}]
+  [{:keys [privkey pubkey subnet-id capability-id capability-type price-echo burn-floor metadata seq leader-term target-cid path]}]
   (let [sub-id (str (or subnet-id "global"))
         cap-id (str capability-id)
         pubkey-str (str pubkey)
-        path (str "capability/" pubkey-str "/" cap-id)
+        cap-path (or path
+                     (if (and subnet-id (not= subnet-id "nexus") (not= subnet-id "global"))
+                       (str "subnet/" subnet-id "/capability/" pubkey-str "/" cap-id)
+                       (str "capability/" pubkey-str "/" cap-id)))
         seq-num (long (or seq 1))
         term-num (long (or leader-term 1))
         cap-map {:capability/id cap-id
@@ -204,7 +207,7 @@
                  :capability/metadata (or metadata {})}
         blob (data/make-blob (fressian/encode-canonical cap-map) "application/x-bitecho-capability")
         ptr-template {:pointer/subnet sub-id
-                      :pointer/path path
+                      :pointer/path cap-path
                       :pointer/authority pubkey-str
                       :pointer/seq seq-num
                       :pointer/leader-term term-num
@@ -215,7 +218,7 @@
      :blob blob
      :pointer pointer
      :cid (:blob/cid blob)
-     :path path
+     :path cap-path
      :subnet-id sub-id
      :seq seq-num}))
 

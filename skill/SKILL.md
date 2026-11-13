@@ -20,16 +20,24 @@ Built under the strict Sans-IO architectural pattern, the core protocol logic (`
 
 ---
 
-## Execution Modes
+## Execution Modes (3-Runtime Parity: JVM, Node.js, Browser)
 
-The light node can be invoked via the Clojure CLI or the compiled uberjar:
+The light node shares a unified 55-verb CLI/JSONL parser (`bitecho.light-node.cli`) and pure Sans-IO core (`bitecho.light-node.core`) across all three runtimes:
 
 ```bash
-# Using Clojure alias
+# 1. JVM (Clojure CLI or standalone Uberjar)
 clojure -M:light-node <command|serve> [options]
-
-# Using standalone Uberjar
 java -jar target/bitecho.jar light-node <command|serve> [options]
+
+# 2. Node.js (Single-file zero-dependency CJS bundle)
+node dist/bitecho-light-node.cjs <command|serve> [options]
+```
+
+```javascript
+// 3. Browser (Closure :advanced bundle — dist/bitecho-browser.min.js)
+const node = await BitechoBrowser.createLightNode({ storageKey: "bitecho-agent" });
+// Execute any CLI command string, argv array, or JSONL command map:
+const res = await BitechoBrowser.ctl(node, "puzzle-hash --puzzle-source '[{:type :release :receiver (:receiver escrow) :amount (:amount escrow)}]'");
 ```
 
 ### Global Options
@@ -691,10 +699,10 @@ Accepts a pending Phase 1 rendezvous offer header, generates callee ephemeral X2
 ---
 
 ### `lock-intent`
-Locks single-currency `$ECHO` funds into a deterministic verified-outcome escrow with deliverable commitment hash and expiration epoch.
+Locks single-currency `$ECHO` funds into a deterministic verified-outcome escrow with a deliverable commitment hash (`--deliverable-hash`) or a ChiaLisp-style content-addressed `sci` smart contract (`--puzzle-hash` or `--puzzle-source`) and expiration epoch. When `--puzzle-source` is provided, `:puzzle-hash` (`SHA-256(puzzle-source)`) is computed automatically. See [`docs/SMART_CONTRACTS.md`](../docs/SMART_CONTRACTS.md).
 
-- **CLI**: `clojure -M:light-node lock-intent --receiver <pubkey-or-petname> --amount 1000 --deliverable-hash <64-hex> --expires-epoch 20 [--escrow-id <id>]`
-- **JSONL**: `{"cmd": "lock-intent", "receiver": "bob", "amount": 1000, "deliverable_hash": "<64-hex>", "expires_epoch": 20}`
+- **CLI**: `clojure -M:light-node lock-intent --receiver <pubkey-or-petname> --amount 1000 [--deliverable-hash <64-hex>] [--puzzle-hash <64-hex> | --puzzle-source '<sci-expr>'] --expires-epoch 20 [--escrow-id <id>]`
+- **JSONL**: `{"cmd": "lock-intent", "receiver": "bob", "amount": 1000, "puzzle_hash": "<64-hex>", "expires_epoch": 20}`
 - **Response**:
   ```json
   {
@@ -704,6 +712,7 @@ Locks single-currency `$ECHO` funds into a deterministic verified-outcome escrow
     "receiver": "<receiver-pubkey-hex>",
     "amount": 1000,
     "deliverable_hash": "<64-hex>",
+    "puzzle_hash": "<64-hex>",
     "expires_epoch": 20,
     "status": "locked"
   }
@@ -712,16 +721,54 @@ Locks single-currency `$ECHO` funds into a deterministic verified-outcome escrow
 ---
 
 ### `release-intent`
-Submits a release request for locked escrow funds via deliverable preimage verification or payer outcome attestation signature. Deducts mandatory 0.5% protocol settlement take.
+Submits a release request for locked escrow funds via deliverable preimage verification (`--preimage`), payer outcome attestation signature, or ChiaLisp-style `sci` smart contract reveal (`--puzzle-source` + `--solution`). Deducts mandatory 0.5% protocol settlement take on released amounts and automatically refunds any unspent remainder (`:refund-remainder`) to the payer.
 
-- **CLI**: `clojure -M:light-node release-intent --escrow-id <id> [--preimage <secret>]`
-- **JSONL**: `{"cmd": "release-intent", "escrow_id": "<id>", "preimage": "secret-deliverable"}`
+- **CLI (preimage)**: `clojure -M:light-node release-intent --escrow-id <id> --preimage <secret>`
+- **CLI (`sci` smart contract)**: `clojure -M:light-node release-intent --escrow-id <id> --puzzle-source '[{:type :release :receiver (:receiver escrow) :amount (:payout solution)}]' --solution '{"payout":750}'`
+- **JSONL**: `{"cmd": "release-intent", "escrow_id": "<id>", "puzzle_source": "[{:type :release :receiver (:receiver escrow) :amount (:payout solution)}]", "solution": {"payout": 750}}`
 - **Response**:
   ```json
   {
     "ok": true,
     "escrow_id": "escrow-f7a3...",
     "status": "release-submitted"
+  }
+  ```
+
+---
+
+### `puzzle-hash`
+Computes the canonical 64-character lowercase SHA-256 `Blob` CID (`puzzle_hash`) of a `sci` smart contract source expression locally (Sans-IO). See [`docs/SMART_CONTRACTS.md`](../docs/SMART_CONTRACTS.md).
+
+- **CLI**: `clojure -M:light-node puzzle-hash --puzzle-source '[{:type :release :receiver (:receiver escrow) :amount (:amount escrow)}]'`
+- **JSONL**: `{"cmd": "puzzle-hash", "puzzle_source": "[{:type :release :receiver (:receiver escrow) :amount (:amount escrow)}]"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "puzzle_hash": "<64-char-hex-cid>",
+    "size_bytes": 72
+  }
+  ```
+
+---
+
+### `puzzle-eval`
+Dry-runs a ChiaLisp-style `sci` smart contract locally inside the deterministic fuel-metered sandbox (`default-max-steps = 10000`, `default-max-bytes = 16384`) against a candidate `--solution` and simulated `escrow`/`context` before locking or settling funds on-chain.
+
+- **CLI**: `clojure -M:light-node puzzle-eval --puzzle-source '[{:type :release :receiver (:receiver escrow) :amount (:payout solution)}]' --solution '{"payout":750}' [--amount 1000] [--receiver <pk-or-petname>] [--payer <pk-or-petname>] [--deliverable-hash <hex>] [--timeout-epoch 100] [--epoch 10]`
+- **JSONL**: `{"cmd": "puzzle-eval", "puzzle_source": "[{:type :release :receiver (:receiver escrow) :amount (:payout solution)}]", "solution": {"payout": 750}, "amount": 1000, "epoch": 10}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "valid": true,
+    "puzzle_hash": "<64-char-hex-cid>",
+    "conditions": [
+      {"type": "release", "receiver": "<receiver-pubkey>", "amount": 750},
+      {"type": "refund-remainder", "receiver": "<payer-pubkey>", "amount": 250}
+    ],
+    "error": null
   }
   ```
 
@@ -838,6 +885,150 @@ Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across a
     "burn": 0,
     "zero_burn": true,
     "p2p": true
+  }
+  ```
+
+---
+
+### `storage-put`
+Encrypts arbitrary UTF-8 (`--data`) or hex (`--data-hex`) state with a domain-separated XSalsa20-Poly1305 key derived from the node's seed and `--slot-id` (`SHA-256("bitecho-e2ee-storage-v1:" || seed || ":" || slot-id)`), wraps the ciphertext in a content-addressed `Blob` + signed monotonic `Pointer`, stores it locally, and broadcasts a `:storage-replicate` envelope to the network. See [`docs/STORAGE.md`](../docs/STORAGE.md).
+
+- **CLI**: `clojure -M:light-node storage-put --slot-id browser-wallet --data '{"theme":"dark"}' [--subnet-id nexus] [--seq <n>]`
+- **JSONL**: `{"cmd": "storage-put", "slot_id": "browser-wallet", "data": "{\"theme\":\"dark\"}", "subnet_id": "nexus"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "slot_id": "browser-wallet",
+    "subnet_id": "nexus",
+    "path": "storage/<pubkey-hex>/browser-wallet",
+    "cid": "<64-char-hex-blob-cid>",
+    "seq": 1,
+    "size_bytes": 40
+  }
+  ```
+
+---
+
+### `storage-get`
+Verifies the `Blob` CID, `Pointer` Ed25519 signature, and anti-rollback sequence number (`--min-seq`), then decrypts the slot's E2EE ciphertext using the node's derived slot key.
+
+- **CLI**: `clojure -M:light-node storage-get --slot-id browser-wallet [--subnet-id nexus] [--min-seq 1]`
+- **JSONL**: `{"cmd": "storage-get", "slot_id": "browser-wallet", "subnet_id": "nexus", "min_seq": 1}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "slot_id": "browser-wallet",
+    "subnet_id": "nexus",
+    "cid": "<64-char-hex-blob-cid>",
+    "seq": 1,
+    "data": "{\"theme\":\"dark\"}",
+    "data_hex": "7b227468656d65223a226461726b227d"
+  }
+  ```
+
+---
+
+### `storage-list`
+Lists all local and network-replicated E2EE storage slots and pointer versions (optionally filtered by `--subnet-id`).
+
+- **CLI**: `clojure -M:light-node storage-list [--subnet-id nexus]`
+- **JSONL**: `{"cmd": "storage-list", "subnet_id": "nexus"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "count": 1,
+    "slots": [
+      {
+        "subnet_id": "nexus",
+        "path": "storage/<pubkey-hex>/browser-wallet",
+        "slot_id": "browser-wallet",
+        "cid": "<64-char-hex-blob-cid>",
+        "authority": "<pubkey-hex>",
+        "seq": 1,
+        "size_bytes": 40
+      }
+    ]
+  }
+  ```
+
+---
+
+### `capability-publish`
+Packs and signs a Fractal Capability Descriptor (`:storage/blob-pinning`, `:compute/uop-kernel`, `:compute/gpu-access`, `:model/weights`, `:network/turn-relay`, or `:network/gateway`) as a content-addressed `Blob` + signed `Pointer`, stores it locally, and broadcasts a `:capability-replicate` envelope to the network. See [`docs/CAPABILITIES.md`](../docs/CAPABILITIES.md).
+
+- **CLI**: `clojure -M:light-node capability-publish --capability-id uop-matmul-fp16 --capability-type compute/uop-kernel --price 25 [--burn-floor 5] [--subnet-id nexus] [--target-cid <64-hex>] [--metadata '{"shape":[4096,4096]}']`
+- **JSONL**: `{"cmd": "capability-publish", "capability_id": "uop-matmul-fp16", "capability_type": "compute/uop-kernel", "price_echo": 25, "burn_floor": 5, "subnet_id": "nexus", "metadata": {"shape": [4096, 4096]}}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "capability_id": "uop-matmul-fp16",
+    "capability_type": "compute/uop-kernel",
+    "price_echo": 25,
+    "subnet_id": "nexus",
+    "path": "capability/<provider-pubkey>/uop-matmul-fp16",
+    "cid": "<64-char-hex-blob-cid>",
+    "seq": 1
+  }
+  ```
+
+---
+
+### `capability-resolve`
+Resolves and cryptographically verifies a published capability descriptor by `--capability-id` and `--authority <pubkey-or-petname>` (or explicit `--path`), enforcing `Blob` hash integrity, `Pointer` signature validity, and `--min-seq` anti-rollback protection.
+
+- **CLI**: `clojure -M:light-node capability-resolve --capability-id uop-matmul-fp16 [--authority <pubkey-or-petname>] [--subnet-id nexus] [--min-seq 1]`
+- **JSONL**: `{"cmd": "capability-resolve", "capability_id": "uop-matmul-fp16", "authority": "<pubkey-or-petname>", "subnet_id": "nexus", "min_seq": 1}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "path": "capability/<provider-pubkey>/uop-matmul-fp16",
+    "cid": "<64-char-hex-blob-cid>",
+    "seq": 1,
+    "descriptor": {
+      "capability_id": "uop-matmul-fp16",
+      "capability_type": "compute/uop-kernel",
+      "provider": "<provider-pubkey>",
+      "subnet_id": "nexus",
+      "price_echo": 25,
+      "burn_floor": 5,
+      "metadata": {"shape": [4096, 4096]}
+    }
+  }
+  ```
+
+---
+
+### `capability-list`
+Lists and unpacks all local and network-replicated capability descriptors, optionally filtered by `--subnet-id`, `--capability-type`, or `--authority <pubkey-or-petname>`.
+
+- **CLI**: `clojure -M:light-node capability-list [--subnet-id nexus] [--capability-type compute/uop-kernel] [--authority <pubkey-or-petname>]`
+- **JSONL**: `{"cmd": "capability-list", "subnet_id": "nexus", "capability_type": "compute/uop-kernel"}`
+- **Response**:
+  ```json
+  {
+    "ok": true,
+    "count": 1,
+    "capabilities": [
+      {
+        "path": "capability/<provider-pubkey>/uop-matmul-fp16",
+        "cid": "<64-char-hex-blob-cid>",
+        "seq": 1,
+        "descriptor": {
+          "capability_id": "uop-matmul-fp16",
+          "capability_type": "compute/uop-kernel",
+          "provider": "<provider-pubkey>",
+          "subnet_id": "nexus",
+          "price_echo": 25,
+          "burn_floor": 5,
+          "metadata": {"shape": [4096, 4096]}
+        }
+      }
+    ]
   }
   ```
 

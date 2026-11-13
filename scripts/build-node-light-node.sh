@@ -16,7 +16,7 @@ echo "=== Bitecho Node.js Light-Node Bundle Build (M2b) ==="
 echo "Working directory: ${ROOT_DIR}"
 
 mkdir -p dist
-rm -rf target/cljs-node target/cljs-node-verify
+rm -rf target/cljs-node target/cljs-nod2
 
 echo "Compiling bitecho.node-main via ClojureScript (:target :nodejs, :optimizations :simple)..."
 clojure -M:build-browser -e '
@@ -73,6 +73,8 @@ content = re.sub(
     content
 )
 
+content = content.replace("target/cljs-nod2/out", "target/cljs-node/out")
+
 with open(path, 'w', encoding='utf-8') as f:
     f.write(content)
 PY
@@ -85,16 +87,16 @@ clojure -M:build-browser -e '
 (require (quote [cljs.build.api :as b]))
 (b/build (b/inputs "src")
          {:main (quote bitecho.node-main)
-          :output-to "target/cljs-node-verify/bitecho-light-node.cjs"
-          :output-dir "target/cljs-node-verify/out"
+          :output-to "target/cljs-nod2/bitecho-light-node.cjs"
+          :output-dir "target/cljs-nod2/out"
           :target :nodejs
           :parallel-build false
           :optimizations :simple})'
 
-normalize_bundle "target/cljs-node-verify/bitecho-light-node.cjs"
+normalize_bundle "target/cljs-nod2/bitecho-light-node.cjs"
 
 SHA1=$(sha256sum "dist/bitecho-light-node.cjs" | awk '{print $1}')
-SHA2=$(sha256sum "target/cljs-node-verify/bitecho-light-node.cjs" | awk '{print $1}')
+SHA2=$(sha256sum "target/cljs-nod2/bitecho-light-node.cjs" | awk '{print $1}')
 
 if [ "${SHA1}" != "${SHA2}" ]; then
   echo "ERROR: Non-deterministic build detected! (${SHA1} != ${SHA2})" >&2

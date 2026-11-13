@@ -18,7 +18,7 @@ echo "Working directory: ${ROOT_DIR}"
 
 # 1. Clean and prepare dist directory
 mkdir -p dist
-rm -rf target/cljs-browser target/cljs-browser-verify target/bundle-verify
+rm -rf target/cljs-browser target/cljs-browse2 target/bundle-verify
 mkdir -p target/bundle-verify
 
 # 2. Compile bitecho.browser-main into dist/bitecho-browser.js
@@ -61,6 +61,7 @@ def repl_gen(m):
         gen_map[orig] = f'{prefix}{len(gen_map) + 1}'
     return gen_map[orig]
 content = re.sub(r'(map__|p__|vec__|seq__|first__|G__|t_cljs\\\$core|meta)[0-9]+', repl_gen, content)
+content = content.replace('target/cljs-browse2/out', 'target/cljs-browser/out')
 
 with open(path, 'w', encoding='utf-8') as f:
     f.write(content)
@@ -1101,7 +1102,7 @@ clojure -M:build-browser -e '
 (b/build (b/inputs "src")
          {:main (quote bitecho.browser-main)
           :output-to "target/bundle-verify/bitecho-browser.js"
-          :output-dir "target/cljs-browser-verify/out"
+          :output-dir "target/cljs-browse2/out"
           :parallel-build false
           :optimizations :simple})'
 
@@ -1166,10 +1167,10 @@ async function test() {
   console.log('BitechoBrowser loaded successfully, version:', B.version);
 
   const verbs = B.getSupportedVerbs();
-  if (!Array.isArray(verbs) || verbs.length !== 51) {
-    throw new Error('Expected 51 verbs, got: ' + (verbs ? verbs.length : 'none'));
+  if (!Array.isArray(verbs) || verbs.length !== 55) {
+    throw new Error('Expected 55 verbs, got: ' + (verbs ? verbs.length : 'none'));
   }
-  console.log('Supported verbs verified: 51 verbs');
+  console.log('Supported verbs verified: 55 verbs');
 
   const node = B.initNode();
   if (!node) throw new Error('initNode returned null');

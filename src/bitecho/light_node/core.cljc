@@ -6,6 +6,7 @@
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
+            [bitecho.core.data :as data]
             [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as core-subnet]
             [bitecho.crypto :as crypto]
@@ -13,6 +14,7 @@
             [bitecho.economy.bundle :as bundle]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
+            [bitecho.economy.puzzle :as puzzle]
             [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
             [clojure.edn :as edn]
@@ -37,6 +39,10 @@
 (defn- math-ceil [n]
   #?(:clj (long (Math/ceil (double n)))
      :cljs (long (js/Math.ceil (double n)))))
+
+(defn- now-utc-ms []
+  #?(:clj (System/currentTimeMillis)
+     :cljs (.now js/Date)))
 
 (defn- parse-json-str
   ([s] (parse-json-str s false))
@@ -3196,6 +3202,23 @@
                      :net-envelopes [intent-env]
                      :stdout-events []}))))))))))
 
+(defn- parse-structured-arg
+  [val]
+  (if (string? val)
+    (let [trimmed (str/trim val)]
+      (if (or (str/starts-with? trimmed "{") (str/starts-with? trimmed "["))
+        (try
+          (let [parsed (parse-json-str trimmed true)]
+            (if (or (map? parsed) (vector? parsed))
+              parsed
+              (edn/read-string trimmed)))
+          (catch #?(:clj Exception :cljs :default) _
+            (try
+              (edn/read-string trimmed)
+              (catch #?(:clj Exception :cljs :default) _ val))))
+        val))
+    val))
+
 (defn- exec-lock-intent [state cmd-map privkey-bytes]
   (let [raw-receiver (or (get cmd-map "receiver") (get cmd-map "recipient") (get cmd-map "to")
                          (:receiver cmd-map) (:recipient cmd-map) (:to cmd-map))
@@ -3205,103 +3228,141 @@
                    (:deliverable_hash cmd-map) (:deliverable-hash cmd-map))
         raw-deliv (or (get cmd-map "deliverable") (:deliverable cmd-map)
                       (get cmd-map "preimage") (:preimage cmd-map))
-        deliverable-hash (cond
-                           (and (string? raw-dh) (escrow/valid-deliverable-hash? raw-dh)) (escrow/normalize-hex raw-dh)
-                           (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes raw-deliv)))
-                           :else nil)
+        raw-ph (or (get cmd-map "puzzle_hash") (get cmd-map "puzzle-hash")
+                   (:puzzle_hash cmd-map) (:puzzle-hash cmd-map))
+        raw-psrc (or (get cmd-map "puzzle_source") (get cmd-map "puzzle-source")
+                     (:puzzle_source cmd-map) (:puzzle-source cmd-map))
         curr-ep (effective-chain-epoch state)
-        raw-expires (or (get cmd-map "expires_epoch") (get cmd-map "expires-epoch")
+        raw-expires (or (get cmd-map "timeout_epoch") (get cmd-map "timeout-epoch")
+                        (:timeout_epoch cmd-map) (:timeout-epoch cmd-map)
+                        (get cmd-map "expires_epoch") (get cmd-map "expires-epoch")
                         (:expires_epoch cmd-map) (:expires-epoch cmd-map))
-        expires-epoch (if (some? raw-expires) (parse-long-safe raw-expires :invalid) (+ curr-ep 10))]
+        expires-epoch (if (some? raw-expires) (parse-long-safe raw-expires :invalid) (+ curr-ep 10))
+        has-ph? (and (string? raw-ph) (not (str/blank? raw-ph)))
+        has-psrc? (and (string? raw-psrc) (not (str/blank? raw-psrc)))
+        ph-cid (when has-psrc? (puzzle/puzzle-cid (str raw-psrc)))
+        norm-ph (when has-ph? (escrow/normalize-hex (str raw-ph)))]
     (cond
+      (and has-ph? has-psrc? (not= ph-cid norm-ph))
+      {:state state :response {"ok" false "error" "puzzle-hash-mismatch"} :net-envelopes [] :stdout-events []}
+
       (or (nil? raw-receiver) (and (string? raw-receiver) (str/blank? raw-receiver)))
       {:state state :response {"ok" false "error" "missing-receiver"} :net-envelopes [] :stdout-events []}
 
       (or (nil? amount) (= amount :invalid) (<= amount 0))
       {:state state :response {"ok" false "error" "invalid-amount"} :net-envelopes [] :stdout-events []}
 
-      (nil? deliverable-hash)
-      {:state state :response {"ok" false "error" (if raw-dh "invalid-deliverable-hash" "missing-deliverable-hash")} :net-envelopes [] :stdout-events []}
-
-      (or (= expires-epoch :invalid) (<= expires-epoch curr-ep))
-      {:state state :response {"ok" false "error" "invalid-expires-epoch"} :net-envelopes [] :stdout-events []}
-
       :else
-      (let [resolved (resolve-counterparty state raw-receiver)]
-        (if-not (:ok? resolved)
-          {:state state :response {"ok" false "error" (:error resolved)} :net-envelopes [] :stdout-events []}
-          (let [receiver-pub (:pubkey resolved)
-                pname (:petname resolved)]
-            (if (= (:pubkey state) receiver-pub)
-              {:state state :response {"ok" false "error" "cannot-escrow-self"} :net-envelopes [] :stdout-events []}
-              (let [dac-auth (check-dac-spend-authorization state amount ["lock-intent" "settle" "settle-intent"])]
-                (if-not (:ok? dac-auth)
-                  {:state state :response {"ok" false "error" (:error dac-auth)} :net-envelopes [] :stdout-events []}
-                  (let [acct (:account state)
-                        spendable (when acct (parse-long-safe (or (:spendable acct) (:balance acct)) 0))]
-                    (if (and acct (< spendable amount))
-                      {:state state :response {"ok" false "error" "insufficient-balance"} :net-envelopes [] :stdout-events []}
-                      (let [raw-eid (or (get cmd-map "escrow_id") (get cmd-map "escrow-id")
-                                        (:escrow_id cmd-map) (:escrow-id cmd-map))
-                            nonce (str (inc (long (count (:escrows state {})))))
-                            escrow-id (or (when (and (string? raw-eid) (not (str/blank? raw-eid))) raw-eid)
-                                          (escrow/compute-escrow-id (:pubkey state) receiver-pub amount deliverable-hash curr-ep expires-epoch nonce))
-                            intent-payload {:type :lock-intent
-                                            :escrow-id escrow-id
-                                            :payer (:pubkey state)
-                                            :receiver receiver-pub
-                                            :amount amount
-                                            :deliverable-hash deliverable-hash
-                                            :created-epoch curr-ep
-                                            :expires-epoch expires-epoch
-                                            :epoch curr-ep
-                                            :receipt-id (str "lock:" escrow-id)}
-                            active-dac (when-let [d (:dac state)]
-                                         (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
-                                                                    :current-epoch curr-ep
-                                                                    :revoked-dac-ids (:revoked-dacs state)}))
-                                           d))
-                            envelope (wrap-agent-event intent-payload (:pubkey state) privkey-bytes active-dac)
-                            local-escrow {:escrow-id escrow-id
-                                          :payer (:pubkey state)
-                                          :receiver receiver-pub
-                                          :amount amount
-                                          :deliverable-hash deliverable-hash
-                                          :created-epoch curr-ep
-                                          :expires-epoch expires-epoch
-                                          :status :locked}
-                            new-state (cond-> (-> state
-                                                  (assoc-in [:escrows escrow-id] local-escrow)
-                                                  (assoc :dac-spend (:new-dac-spend dac-auth)))
-                                        acct (update-in [:account :spendable] - amount))]
-                        {:state new-state
-                         :response (cond-> {"ok" true
-                                            "escrow_id" escrow-id
-                                            "payer" (:pubkey state)
-                                            "receiver" receiver-pub
-                                            "amount" amount
-                                            "deliverable_hash" deliverable-hash
-                                            "expires_epoch" expires-epoch
-                                            "status" "locked"}
-                                     pname (assoc "receiver_petname" pname))
-                         :net-envelopes [envelope]
-                         :stdout-events []}))))))))))))
+      (let [puzzle-hash (cond
+                          has-ph? norm-ph
+                          has-psrc? ph-cid
+                          :else nil)]
+        (if (and puzzle-hash (not (escrow/valid-deliverable-hash? puzzle-hash)))
+          {:state state :response {"ok" false "error" "invalid-puzzle-hash"} :net-envelopes [] :stdout-events []}
+          (let [deliverable-hash (cond
+                                   (and (string? raw-dh) (escrow/valid-deliverable-hash? raw-dh)) (escrow/normalize-hex raw-dh)
+                                   (and (string? raw-deliv) (not (str/blank? raw-deliv))) (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes raw-deliv)))
+                                   puzzle-hash puzzle-hash
+                                   :else nil)]
+            (cond
+              (nil? deliverable-hash)
+              {:state state :response {"ok" false "error" (if raw-dh "invalid-deliverable-hash" "missing-deliverable-hash")} :net-envelopes [] :stdout-events []}
+
+              (or (= expires-epoch :invalid) (<= expires-epoch curr-ep))
+              {:state state :response {"ok" false "error" "invalid-expires-epoch"} :net-envelopes [] :stdout-events []}
+
+              :else
+              (let [resolved (resolve-counterparty state raw-receiver)]
+                (if-not (:ok? resolved)
+                  {:state state :response {"ok" false "error" (:error resolved)} :net-envelopes [] :stdout-events []}
+                  (let [receiver-pub (:pubkey resolved)
+                        pname (:petname resolved)]
+                    (if (= (:pubkey state) receiver-pub)
+                      {:state state :response {"ok" false "error" "cannot-escrow-self"} :net-envelopes [] :stdout-events []}
+                      (let [dac-auth (check-dac-spend-authorization state amount ["lock-intent" "settle" "settle-intent"])]
+                        (if-not (:ok? dac-auth)
+                          {:state state :response {"ok" false "error" (:error dac-auth)} :net-envelopes [] :stdout-events []}
+                          (let [acct (:account state)
+                                spendable (when acct (parse-long-safe (or (:spendable acct) (:balance acct)) 0))]
+                            (if (and acct (< spendable amount))
+                              {:state state :response {"ok" false "error" "insufficient-balance"} :net-envelopes [] :stdout-events []}
+                              (let [raw-eid (or (get cmd-map "intent_id") (get cmd-map "intent-id")
+                                                (:intent_id cmd-map) (:intent-id cmd-map)
+                                                (get cmd-map "escrow_id") (get cmd-map "escrow-id")
+                                                (:escrow_id cmd-map) (:escrow-id cmd-map))
+                                    nonce (str (inc (long (count (:escrows state {})))))
+                                    escrow-id (or (when (and (string? raw-eid) (not (str/blank? raw-eid))) raw-eid)
+                                                  (escrow/compute-escrow-id (:pubkey state) receiver-pub amount deliverable-hash curr-ep expires-epoch nonce))
+                                    intent-payload (cond-> {:type :lock-intent
+                                                            :escrow-id escrow-id
+                                                            :payer (:pubkey state)
+                                                            :receiver receiver-pub
+                                                            :amount amount
+                                                            :deliverable-hash deliverable-hash
+                                                            :created-epoch curr-ep
+                                                            :expires-epoch expires-epoch
+                                                            :epoch curr-ep
+                                                            :receipt-id (str "lock:" escrow-id)}
+                                                     puzzle-hash (assoc :puzzle-hash puzzle-hash))
+                                    active-dac (when-let [d (:dac state)]
+                                                 (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
+                                                                            :current-epoch curr-ep
+                                                                            :revoked-dac-ids (:revoked-dacs state)}))
+                                                   d))
+                                    envelope (wrap-agent-event intent-payload (:pubkey state) privkey-bytes active-dac)
+                                    local-escrow (cond-> {:escrow-id escrow-id
+                                                          :payer (:pubkey state)
+                                                          :receiver receiver-pub
+                                                          :amount amount
+                                                          :deliverable-hash deliverable-hash
+                                                          :created-epoch curr-ep
+                                                          :expires-epoch expires-epoch
+                                                          :status :locked}
+                                                   puzzle-hash (assoc :puzzle-hash puzzle-hash))
+                                    new-state (cond-> (-> state
+                                                          (assoc-in [:escrows escrow-id] local-escrow)
+                                                          (assoc :dac-spend (:new-dac-spend dac-auth)))
+                                                acct (update-in [:account :spendable] - amount))]
+                                {:state new-state
+                                 :response (cond-> {"ok" true
+                                                    "escrow_id" escrow-id
+                                                    "intent_id" escrow-id
+                                                    "payer" (:pubkey state)
+                                                    "receiver" receiver-pub
+                                                    "amount" amount
+                                                    "deliverable_hash" deliverable-hash
+                                                    "expires_epoch" expires-epoch
+                                                    "timeout_epoch" expires-epoch
+                                                    "status" "locked"}
+                                             puzzle-hash (assoc "puzzle_hash" puzzle-hash)
+                                             pname (assoc "receiver_petname" pname))
+                                 :net-envelopes [envelope]
+                                 :stdout-events []}))))))))))))))))
 
 (defn- exec-release-intent [state cmd-map privkey-bytes]
-  (let [escrow-id (or (get cmd-map "escrow_id") (get cmd-map "escrow-id")
+  (let [escrow-id (or (get cmd-map "intent_id") (get cmd-map "intent-id")
+                      (:intent_id cmd-map) (:intent-id cmd-map)
+                      (get cmd-map "escrow_id") (get cmd-map "escrow-id")
                       (:escrow_id cmd-map) (:escrow-id cmd-map))]
     (if (or (nil? escrow-id) (and (string? escrow-id) (str/blank? escrow-id)))
       {:state state :response {"ok" false "error" "missing-escrow-id"} :net-envelopes [] :stdout-events []}
       (let [preimage (or (get cmd-map "preimage") (:preimage cmd-map)
                          (get cmd-map "deliverable") (:deliverable cmd-map))
-            payer-sig (or (get cmd-map "payer_signature") (get cmd-map "payer-signature")
-                          (:payer_signature cmd-map) (:payer-signature cmd-map))
+            raw-sig (or (get cmd-map "payer_signature") (get cmd-map "payer-signature")
+                        (:payer_signature cmd-map) (:payer-signature cmd-map))
+            raw-psrc (or (get cmd-map "puzzle_source") (get cmd-map "puzzle-source")
+                         (:puzzle_source cmd-map) (:puzzle-source cmd-map))
+            raw-sol (or (get cmd-map "solution") (:solution cmd-map))
+            solution (when (some? raw-sol) (parse-structured-arg raw-sol))
             local-escrow (get-in state [:escrows escrow-id])
             d-hash (or (when local-escrow (:deliverable-hash local-escrow))
                        (get cmd-map "deliverable_hash") (get cmd-map "deliverable-hash")
                        (:deliverable_hash cmd-map) (:deliverable-hash cmd-map))
-            final-sig (or payer-sig
-                          (when (and (= (:pubkey state) (when local-escrow (:payer local-escrow)))
+            is-puzzle? (or (and (string? raw-psrc) (not (str/blank? raw-psrc)))
+                           (and local-escrow (:puzzle-hash local-escrow)))
+            final-sig (or raw-sig
+                          (when (and (not is-puzzle?)
+                                     (= (:pubkey state) (when local-escrow (:payer local-escrow)))
                                      (string? d-hash))
                             (escrow/sign-escrow-release privkey-bytes escrow-id d-hash)))
             release-payload (cond-> {:type :release-intent
@@ -3309,18 +3370,22 @@
                                      :epoch (effective-chain-epoch state)
                                      :receipt-id (str "release:" escrow-id)}
                               preimage (assoc :preimage preimage)
-                              final-sig (assoc :payer-signature final-sig))
+                              final-sig (assoc :payer-signature final-sig)
+                              raw-psrc (assoc :puzzle-source raw-psrc)
+                              (some? solution) (assoc :solution solution))
             envelope (wrap-agent-event release-payload (:pubkey state) privkey-bytes)
             new-state (if local-escrow
                         (assoc-in state [:escrows escrow-id :status] :release-submitted)
                         state)]
         {:state new-state
-         :response {"ok" true "escrow_id" escrow-id "status" "release-submitted"}
+         :response {"ok" true "escrow_id" escrow-id "intent_id" escrow-id "status" "release-submitted"}
          :net-envelopes [envelope]
          :stdout-events []}))))
 
 (defn- exec-refund-intent [state cmd-map privkey-bytes]
-  (let [escrow-id (or (get cmd-map "escrow_id") (get cmd-map "escrow-id")
+  (let [escrow-id (or (get cmd-map "intent_id") (get cmd-map "intent-id")
+                      (:intent_id cmd-map) (:intent-id cmd-map)
+                      (get cmd-map "escrow_id") (get cmd-map "escrow-id")
                       (:escrow_id cmd-map) (:escrow-id cmd-map))]
     (if (or (nil? escrow-id) (and (string? escrow-id) (str/blank? escrow-id)))
       {:state state :response {"ok" false "error" "missing-escrow-id"} :net-envelopes [] :stdout-events []}
@@ -3334,7 +3399,7 @@
                         (assoc-in state [:escrows escrow-id :status] :refund-submitted)
                         state)]
         {:state new-state
-         :response {"ok" true "escrow_id" escrow-id "status" "refund-submitted"}
+         :response {"ok" true "escrow_id" escrow-id "intent_id" escrow-id "status" "refund-submitted"}
          :net-envelopes [envelope]
          :stdout-events []}))))
 
@@ -3781,7 +3846,9 @@
     "p2p-connected"
     "p2p-disconnected"
     "diagnostic"
-    "outbox-evicted"})
+    "outbox-evicted"
+    "storage-replicated"
+    "capability-published"})
 
 (defn- actionable-event? [ev]
   (when (map? ev)
@@ -4327,11 +4394,92 @@
      :net-envelopes []
      :stdout-events []}))
 
+(defn- exec-puzzle-hash
+  [state cmd-map]
+  (let [src (or (get cmd-map "puzzle_source") (get cmd-map "puzzle-source")
+                (:puzzle_source cmd-map) (:puzzle-source cmd-map))]
+    (if (or (nil? src) (and (string? src) (str/blank? src)))
+      {:state state :response {"ok" false "error" "missing-puzzle-source"} :net-envelopes [] :stdout-events []}
+      (let [src-str (str src)
+            cid (puzzle/puzzle-cid src-str)
+            size-bytes (fressian/count-bytes (fressian/utf8->bytes src-str))]
+        {:state state
+         :response {"ok" true
+                    "puzzle_hash" cid
+                    "size_bytes" size-bytes}
+         :net-envelopes []
+         :stdout-events []}))))
+
+(defn- exec-puzzle-eval
+  [state cmd-map]
+  (let [src (or (get cmd-map "puzzle_source") (get cmd-map "puzzle-source")
+                (:puzzle_source cmd-map) (:puzzle-source cmd-map))]
+    (if (or (nil? src) (and (string? src) (str/blank? src)))
+      {:state state :response {"ok" false "error" "missing-puzzle-source"} :net-envelopes [] :stdout-events []}
+      (let [raw-sol (or (get cmd-map "solution") (:solution cmd-map))
+            solution (if (some? raw-sol) (parse-structured-arg raw-sol) {})
+            amount (long (or (get cmd-map "amount") (:amount cmd-map) 1000))
+            raw-payer (or (get cmd-map "payer") (:payer cmd-map))
+            payer (if raw-payer
+                    (or (:pubkey (resolve-counterparty state raw-payer)) raw-payer)
+                    (or (:pubkey state) "0000000000000000000000000000000000000000000000000000000000000000"))
+            raw-recv (or (get cmd-map "receiver") (get cmd-map "recipient")
+                         (:receiver cmd-map) (:recipient cmd-map))
+            receiver (if raw-recv
+                       (or (:pubkey (resolve-counterparty state raw-recv)) raw-recv)
+                       (or (:pubkey state) "1111111111111111111111111111111111111111111111111111111111111111"))
+            raw-dh (or (get cmd-map "deliverable_hash") (get cmd-map "deliverable-hash")
+                       (:deliverable_hash cmd-map) (:deliverable-hash cmd-map))
+            src-cid (puzzle/puzzle-cid (str src))
+            puzzle-hash (or (get cmd-map "puzzle_hash") (get cmd-map "puzzle-hash")
+                            (:puzzle_hash cmd-map) (:puzzle-hash cmd-map)
+                            src-cid)
+            d-hash (or raw-dh puzzle-hash)
+            to-epoch (long (or (get cmd-map "timeout_epoch") (get cmd-map "timeout-epoch")
+                               (get cmd-map "expires_epoch") (get cmd-map "expires-epoch")
+                               (:timeout_epoch cmd-map) (:timeout-epoch cmd-map)
+                               100))
+            epoch (long (or (get cmd-map "epoch") (:epoch cmd-map) (:epoch state) 1))
+            intent-id (str (or (get cmd-map "intent_id") (get cmd-map "intent-id")
+                               (get cmd-map "escrow_id") (get cmd-map "escrow-id")
+                               (:intent_id cmd-map) (:intent-id cmd-map)
+                               "eval-intent"))
+            env-ctx {:amount amount
+                     :receiver receiver
+                     :payer payer
+                     :deliverable-hash d-hash
+                     :puzzle-hash puzzle-hash
+                     :timeout-epoch to-epoch
+                     :epoch epoch
+                     :escrow-id intent-id}
+            res (puzzle/eval-puzzle (str src) solution env-ctx)]
+        {:state state
+         :response {"ok" true
+                    "valid" (boolean (:valid? res))
+                    "puzzle_hash" puzzle-hash
+                    "conditions" (mapv (fn [c] (cond-> {"type" (name (:type c))}
+                                                 (:receiver c) (assoc "receiver" (:receiver c))
+                                                 (:amount c) (assoc "amount" (:amount c))
+                                                 (:epoch c) (assoc "epoch" (:epoch c))))
+                                       (:conditions res))
+                    "error" (some-> (:error res) name)}
+         :net-envelopes []
+         :stdout-events []}))))
+
 (defn- exec-storage-put
-  [state effective-map privkey-bytes sub-id]
-  (let [data (get effective-map "data" (get effective-map "payload" (get effective-map :data (:payload effective-map))))
-        slot (str (or (get effective-map "slot") (:slot effective-map) "default"))
-        subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "nexus"))
+  [state effective-map privkey-bytes _sub-id]
+  (let [raw-data (get effective-map "data" (get effective-map "payload" (get effective-map :data (:payload effective-map))))
+        raw-hex (or (get effective-map "data_hex") (get effective-map "data-hex")
+                    (:data_hex effective-map) (:data-hex effective-map))
+        data (cond
+               (some? raw-data) raw-data
+               (and (string? raw-hex) (not (str/blank? raw-hex))) (fressian/hex->bytes raw-hex)
+               :else nil)
+        slot (str (or (get effective-map "slot_id") (get effective-map "slot-id")
+                      (:slot_id effective-map) (:slot-id effective-map)
+                      (get effective-map "slot") (:slot effective-map)
+                      "default"))
+        subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) "nexus"))
         path (str "storage/" (:pubkey state) "/" slot)
         min-seq (long (get-in state [:storage-min-seqs [subnet path]] 0))
         seq-num (long (or (get effective-map "seq") (:seq effective-map) (inc min-seq)))
@@ -4347,7 +4495,18 @@
                                                 :nonce-bytes nonce})
         cid (:cid pack-res)
         blob (:blob pack-res)
-        ptr (:pointer pack-res)]
+        ptr (:pointer pack-res)
+        size-bytes (if blob (fressian/count-bytes (:blob/bytes blob)) 0)
+        rep-envelope (when privkey-bytes
+                       {:bitecho/type :storage-replicate
+                        :subnet-id subnet
+                        :path path
+                        :blob blob
+                        :pointer ptr
+                        :sender (:pubkey state)
+                        :epoch (or (:epoch state) 0)
+                        :timestamp (now-utc-ms)
+                        :p2p-broadcast? true})]
     {:state (-> state
                 (assoc-in [:storage-blobs cid] blob)
                 (assoc-in [:storage-pointers [subnet path]] ptr)
@@ -4356,21 +4515,29 @@
                 "cid" cid
                 "path" path
                 "seq" seq-num
+                "slot" slot
+                "slot_id" slot
                 "subnet_id" subnet
+                "size_bytes" size-bytes
                 "blob" blob
                 "pointer" ptr}
-     :net-envelopes []
+     :net-envelopes (if rep-envelope [rep-envelope] [])
      :stdout-events []}))
 
 (defn- exec-storage-get
-  [state effective-map privkey-bytes sub-id]
-  (let [slot (str (or (get effective-map "slot") (:slot effective-map) "default"))
-        subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "nexus"))
+  [state effective-map privkey-bytes _sub-id]
+  (let [slot (str (or (get effective-map "slot_id") (get effective-map "slot-id")
+                      (:slot_id effective-map) (:slot-id effective-map)
+                      (get effective-map "slot") (:slot effective-map)
+                      "default"))
+        subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) "nexus"))
         path (str (or (get effective-map "path") (:path effective-map) (str "storage/" (:pubkey state) "/" slot)))
         ptr (or (get effective-map "pointer") (:pointer effective-map) (get-in state [:storage-pointers [subnet path]]))
         target-cid (when ptr (:pointer/target ptr))
         blob (or (get effective-map "blob") (:blob effective-map) (when target-cid (get-in state [:storage-blobs target-cid])))
-        min-expected (long (or (get effective-map "min_expected_seq") (get effective-map "min-expected-seq") (:min-expected-seq effective-map) (get-in state [:storage-min-seqs [subnet path]] 0)))
+        min-expected (long (or (get effective-map "min_seq") (get effective-map "min-seq") (:min-seq effective-map)
+                               (get effective-map "min_expected_seq") (get effective-map "min-expected-seq") (:min-expected-seq effective-map)
+                               (get-in state [:storage-min-seqs [subnet path]] 0)))
         context (or (get effective-map "context") (:context effective-map))]
     (if-not (and blob ptr)
       {:state state
@@ -4389,13 +4556,49 @@
                       "data" (:data res)
                       "seq" (:seq res)
                       "cid" (:cid res)
-                      "path" (:path res)}
+                      "path" (:path res)
+                      "slot" slot
+                      "slot_id" slot
+                      "subnet_id" subnet}
            :net-envelopes []
            :stdout-events []}
           {:state state
            :response {"ok" false "error" (name (:error res))}
            :net-envelopes []
            :stdout-events []})))))
+
+(defn- exec-storage-list
+  [state effective-map]
+  (let [target-subnet (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map))
+        slots (->> (:storage-pointers state {})
+                   (filter (fn [[[sub _] _]]
+                             (or (nil? target-subnet) (= sub (str target-subnet)))))
+                   (map (fn [[[sub path] ptr]]
+                          (let [cid (:pointer/target ptr)
+                                blob (get-in state [:storage-blobs cid])
+                                sz (if blob (fressian/count-bytes (:blob/bytes blob)) 0)
+                                after-storage (if (str/starts-with? (str path) "storage/")
+                                                (subs (str path) (count "storage/"))
+                                                (str path))
+                                parts (str/split after-storage #"/")
+                                slot-id (if (> (count parts) 1)
+                                          (str/join "/" (rest parts))
+                                          (first parts))]
+                            {"subnet_id" sub
+                             "path" (str path)
+                             "slot_id" slot-id
+                             "cid" cid
+                             "authority" (:pointer/authority ptr)
+                             "seq" (:pointer/seq ptr)
+                             "size_bytes" sz})))
+                   (sort-by #(get % "path"))
+                   vec)]
+    {:state state
+     :response {"ok" true
+                "count" (count slots)
+                "slots" slots}
+     :net-envelopes []
+     :stdout-events []}))
 
 (defn- exec-capability-publish
   [state effective-map privkey-bytes sub-id]
@@ -4408,7 +4611,8 @@
                    :else :storage/blob-pinning)
         price (long (or (get effective-map "price_echo") (get effective-map "price-echo") (:price-echo effective-map) 0))
         burn (long (or (get effective-map "burn_floor") (get effective-map "burn-floor") (:burn-floor effective-map) 0))
-        meta (or (get effective-map "metadata") (:metadata effective-map) {})
+        meta-raw (or (get effective-map "metadata") (:metadata effective-map) {})
+        meta (if (some? meta-raw) (parse-structured-arg meta-raw) {})
         target (or (get effective-map "target_cid") (get effective-map "target-cid") (:target-cid effective-map))
         seq-num (long (or (get effective-map "seq") (:seq effective-map) 1))
         pack-res (storage/pack-capability-descriptor {:privkey privkey-bytes
@@ -4424,28 +4628,62 @@
         cid (:cid pack-res)
         path (:path pack-res)
         blob (:blob pack-res)
-        ptr (:pointer pack-res)]
+        ptr (:pointer pack-res)
+        rep-envelope (when privkey-bytes
+                       {:bitecho/type :capability-replicate
+                        :subnet-id subnet
+                        :path path
+                        :blob blob
+                        :pointer ptr
+                        :sender (:pubkey state)
+                        :epoch (or (:epoch state) 0)
+                        :timestamp (now-utc-ms)
+                        :p2p-broadcast? true})]
     {:state (-> state
                 (assoc-in [:capabilities [subnet path]] ptr)
                 (assoc-in [:capability-blobs cid] blob))
      :response {"ok" true
-                "cid" cid
-                "path" path
-                "seq" seq-num
+                "capability_id" cap-id
+                "capability_type" (if (keyword? cap-type) (subs (str cap-type) 1) (str cap-type))
+                "price_echo" price
+                "burn_floor" burn
                 "subnet_id" subnet
+                "path" path
+                "cid" cid
+                "seq" seq-num
                 "blob" blob
                 "pointer" ptr}
-     :net-envelopes []
+     :net-envelopes (if rep-envelope [rep-envelope] [])
      :stdout-events []}))
 
 (defn- exec-capability-resolve
   [state effective-map _privkey-bytes sub-id]
   (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "global"))
-        path (str (or (get effective-map "path") (:path effective-map)))
-        ptr (or (get effective-map "pointer") (:pointer effective-map) (get-in state [:capabilities [subnet path]]))
+        cap-id (or (get effective-map "capability_id") (get effective-map "capability-id") (:capability-id effective-map))
+        raw-auth (or (get effective-map "authority") (get effective-map "pubkey") (:authority effective-map) (:pubkey effective-map))
+        resolved-auth (when raw-auth
+                        (let [r (resolve-counterparty state raw-auth)]
+                          (if (:ok? r) (:pubkey r) raw-auth)))
+        provider (or resolved-auth (:pubkey state))
+        canonical-path (if cap-id
+                         (if (and subnet (not= subnet "nexus") (not= subnet "global"))
+                           (str "subnet/" subnet "/capability/" provider "/" cap-id)
+                           (str "capability/" provider "/" cap-id))
+                         nil)
+        path (str (or (get effective-map "path") (:path effective-map) canonical-path))
+        ptr (or (get effective-map "pointer") (:pointer effective-map)
+                (get-in state [:capabilities [subnet path]])
+                (when (and cap-id (nil? raw-auth))
+                  ;; fallback search in (:capabilities state)
+                  (some (fn [[[s p] p-ptr]]
+                          (when (and (= s subnet) (str/ends-with? p (str "/" cap-id)))
+                            p-ptr))
+                        (:capabilities state))))
         target-cid (when ptr (:pointer/target ptr))
         blob (or (get effective-map "blob") (:blob effective-map) (when target-cid (get-in state [:capability-blobs target-cid])))
-        min-expected (long (or (get effective-map "min_expected_seq") (get effective-map "min-expected-seq") (:min-expected-seq effective-map) 0))]
+        min-expected (long (or (get effective-map "min_seq") (get effective-map "min-seq") (:min-seq effective-map)
+                               (get effective-map "min_expected_seq") (get effective-map "min-expected-seq") (:min-expected-seq effective-map)
+                               0))]
     (if-not (and blob ptr)
       {:state state
        :response {"ok" false "error" "missing-capability"}
@@ -4453,17 +4691,78 @@
        :stdout-events []}
       (let [res (storage/unpack-capability-descriptor {:blob blob :pointer ptr :min-expected-seq min-expected})]
         (if (:ok? res)
-          {:state state
-           :response {"ok" true
-                      "capability" (:capability res)
-                      "cid" (:cid res)
-                      "seq" (:seq res)}
-           :net-envelopes []
-           :stdout-events []}
+          (let [desc (:capability res)
+                desc-map {"capability_id" (:capability/id desc)
+                          "capability_type" (if (keyword? (:capability/type desc))
+                                              (subs (str (:capability/type desc)) 1)
+                                              (str (:capability/type desc)))
+                          "provider" (:capability/provider desc)
+                          "subnet_id" (:capability/subnet desc)
+                          "price_echo" (:capability/price-echo desc)
+                          "burn_floor" (:capability/burn-floor desc)
+                          "target_cid" (:capability/target-cid desc)
+                          "metadata" (:capability/metadata desc)}]
+            {:state state
+             :response {"ok" true
+                        "descriptor" desc-map
+                        "capability" desc
+                        "cid" (:cid res)
+                        "seq" (:seq res)
+                        "path" (or (:pointer/path ptr) path)}
+             :net-envelopes []
+             :stdout-events []})
           {:state state
            :response {"ok" false "error" (name (:error res))}
            :net-envelopes []
            :stdout-events []})))))
+
+(defn- exec-capability-list
+  [state effective-map]
+  (let [target-subnet (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map))
+        raw-type (or (get effective-map "capability_type") (get effective-map "capability-type") (:capability-type effective-map))
+        type-filter (when raw-type
+                      (if (keyword? raw-type)
+                        (subs (str raw-type) 1)
+                        (str/replace (str raw-type) #"^:+" "")))
+        raw-auth (or (get effective-map "authority") (get effective-map "pubkey") (:authority effective-map) (:pubkey effective-map))
+        auth-filter (when raw-auth
+                      (let [r (resolve-counterparty state raw-auth)]
+                        (if (:ok? r) (:pubkey r) raw-auth)))
+        caps (->> (:capabilities state {})
+                  (filter (fn [[[sub _] _]]
+                            (or (nil? target-subnet) (= sub (str target-subnet)))))
+                  (keep (fn [[[sub path] ptr]]
+                          (let [cid (:pointer/target ptr)
+                                blob (get-in state [:capability-blobs cid])]
+                            (when (and blob ptr)
+                              (let [res (storage/unpack-capability-descriptor {:blob blob :pointer ptr :min-expected-seq 0})]
+                                (when (:ok? res)
+                                  (let [desc (:capability res)
+                                        desc-type (if (keyword? (:capability/type desc))
+                                                    (subs (str (:capability/type desc)) 1)
+                                                    (str (:capability/type desc)))
+                                        provider (:capability/provider desc)]
+                                    (when (and (or (nil? type-filter) (= desc-type type-filter))
+                                               (or (nil? auth-filter) (= provider auth-filter)))
+                                      {"capability_id" (:capability/id desc)
+                                       "capability_type" desc-type
+                                       "provider" provider
+                                       "subnet_id" (:capability/subnet desc sub)
+                                       "price_echo" (:capability/price-echo desc)
+                                       "burn_floor" (:capability/burn-floor desc)
+                                       "target_cid" (:capability/target-cid desc)
+                                       "metadata" (:capability/metadata desc)
+                                       "path" (str path)
+                                       "cid" cid
+                                       "seq" (:pointer/seq ptr)}))))))))
+                  (sort-by #(get % "path"))
+                  vec)]
+    {:state state
+     :response {"ok" true
+                "count" (count caps)
+                "capabilities" caps}
+     :net-envelopes []
+     :stdout-events []}))
 
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
@@ -4473,11 +4772,11 @@
   (let [effective-map (if (map? (get cmd-map "args"))
                         (merge (get cmd-map "args") (dissoc cmd-map "args"))
                         cmd-map)
-        sub-id (str (or (get effective-map "subnet_id")
-                        (get effective-map "subnet-id")
-                        (:subnet-id effective-map)
-                        (:subnet-id state)
-                        "global"))
+        sub-id-raw (or (get effective-map "subnet_id")
+                       (get effective-map "subnet-id")
+                       (:subnet-id effective-map)
+                       (:subnet-id state))
+        sub-id-str (when sub-id-raw (str sub-id-raw))
         res (case (or (get effective-map "cmd") (:cmd effective-map))
               "identity" (exec-identity state)
               "discover" (exec-discover state)
@@ -4518,9 +4817,9 @@
               "directory-verify" (exec-directory-verify state effective-map)
               "directory-register" (exec-directory-register state effective-map privkey-bytes)
               "directory-lookup" (exec-directory-lookup state effective-map)
-              "anchor-subnet" (exec-anchor-subnet state effective-map privkey-bytes sub-id)
-              "epoch-tick" (exec-epoch-tick state effective-map privkey-bytes sub-id)
-              "verify-subnet-anchor" (exec-verify-subnet-anchor state effective-map sub-id)
+              "anchor-subnet" (exec-anchor-subnet state effective-map privkey-bytes (or sub-id-str "global"))
+              "epoch-tick" (exec-epoch-tick state effective-map privkey-bytes (or sub-id-str "global"))
+              "verify-subnet-anchor" (exec-verify-subnet-anchor state effective-map (or sub-id-str "global"))
               "wait" (exec-wait state effective-map)
               "retransmit-outbox" (exec-retransmit-outbox state effective-map)
               "export-poll" (exec-export-poll state effective-map privkey-bytes)
@@ -4530,17 +4829,21 @@
               "export-send" (exec-export-send state effective-map privkey-bytes)
               "ack" (exec-ack state effective-map privkey-bytes)
               "export-ack" (exec-export-ack state effective-map privkey-bytes)
-              "storage-put" (exec-storage-put state effective-map privkey-bytes sub-id)
-              "storage-get" (exec-storage-get state effective-map privkey-bytes sub-id)
-              "capability-publish" (exec-capability-publish state effective-map privkey-bytes sub-id)
-              "capability-resolve" (exec-capability-resolve state effective-map privkey-bytes sub-id)
+              "storage-put" (exec-storage-put state effective-map privkey-bytes sub-id-str)
+              "storage-get" (exec-storage-get state effective-map privkey-bytes sub-id-str)
+              "storage-list" (exec-storage-list state effective-map)
+              "capability-publish" (exec-capability-publish state effective-map privkey-bytes sub-id-str)
+              "capability-resolve" (exec-capability-resolve state effective-map privkey-bytes sub-id-str)
+              "capability-list" (exec-capability-list state effective-map)
+              "puzzle-hash" (exec-puzzle-hash state effective-map)
+              "puzzle-eval" (exec-puzzle-eval state effective-map)
               "status" (exec-status state)
               {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})
         res' (if (seq (:net-envelopes res))
                (update res :net-envelopes (fn [envs]
                                             (mapv (fn [e]
                                                     (if (or (nil? (:subnet-id e)) (= (:subnet-id e) "global"))
-                                                      (assoc e :subnet-id sub-id)
+                                                      (assoc e :subnet-id (or sub-id-str (:subnet-id e) "global"))
                                                       e))
                                                   envs)))
                res)]
@@ -5797,6 +6100,120 @@
            :net-envelopes []
            :stdout-events []})))))
 
+(defn- normalize-wire-blob [b]
+  (when (map? b)
+    (let [cid (str (or (:blob/cid b) (get b "blob/cid") (:cid b) (get b "cid")))
+          media (str (or (:blob/media-type b) (get b "blob/media-type") (:media-type b) (get b "media_type") "application/octet-stream"))
+          raw-bytes (or (:blob/bytes b) (get b "blob/bytes") (:bytes b) (get b "bytes"))
+          bs (cond
+               (fressian/bytes? raw-bytes) raw-bytes
+               (and (string? raw-bytes) (re-matches #"[0-9a-fA-F]+" raw-bytes) (even? (count raw-bytes)))
+               (fressian/hex->bytes raw-bytes)
+               (string? raw-bytes) (fressian/utf8->bytes raw-bytes)
+               :else raw-bytes)]
+      {:blob/cid cid
+       :blob/media-type media
+       :blob/bytes bs})))
+
+(defn- normalize-wire-pointer [p]
+  (when (map? p)
+    (let [sub (str (or (:pointer/subnet p) (get p "pointer/subnet") (:subnet p) (get p "subnet")))
+          path (str (or (:pointer/path p) (get p "pointer/path") (:path p) (get p "path")))
+          auth (str (or (:pointer/authority p) (get p "pointer/authority") (:authority p) (get p "authority")))
+          seq-num (long (or (:pointer/seq p) (get p "pointer/seq") (:seq p) (get p "seq") 0))
+          term (long (or (:pointer/leader-term p) (get p "pointer/leader-term") (:leader-term p) (get p "leader_term") 1))
+          target (str (or (:pointer/target p) (get p "pointer/target") (:target p) (get p "target")))
+          sig (str (or (:pointer/sig p) (get p "pointer/sig") (:sig p) (get p "sig")))
+          proof (or (:pointer/proof p) (get p "pointer/proof") (:proof p) (get p "proof") {:proof/type :self})]
+      {:pointer/subnet sub
+       :pointer/path path
+       :pointer/authority auth
+       :pointer/seq seq-num
+       :pointer/leader-term term
+       :pointer/target target
+       :pointer/sig sig
+       :pointer/proof proof})))
+
+(defn- handle-wire-storage-replicate [state msg]
+  (let [blob (normalize-wire-blob (or (:blob msg) (get msg "blob")))
+        ptr (normalize-wire-pointer (or (:pointer msg) (get msg "pointer")))
+        subnet (str (or (:subnet-id msg) (get msg "subnet_id") (when ptr (:pointer/subnet ptr)) "nexus"))
+        path (str (or (:path msg) (get msg "path") (when ptr (:pointer/path ptr))))
+        current-seq (long (get-in state [:storage-min-seqs [subnet path]] 0))
+        valid-blob? (boolean (and (map? blob) (data/verify-blob blob)))
+        valid-ptr? (boolean (and (map? ptr) (:ok? (data/verify-pointer ptr))))
+        target-match? (boolean (and valid-blob? valid-ptr? (= (:pointer/target ptr) (:blob/cid blob))))
+        seq-valid? (boolean (and valid-ptr? (> (long (:pointer/seq ptr)) current-seq)))
+        valid? (and valid-blob? valid-ptr? target-match? seq-valid?)]
+    (if-not valid?
+      (let [reason (cond
+                     (not valid-blob?) "invalid-blob"
+                     (not valid-ptr?) "invalid-pointer"
+                     (not target-match?) "target-mismatch"
+                     (not seq-valid?) "stale-sequence"
+                     :else "invalid-replicate")
+            diag-event {"event" "diagnostic"
+                        "reason" "storage-replication-rejected"
+                        "cause" reason
+                        "subnet_id" subnet
+                        "path" path}]
+        {:state (-> state
+                    (update-in [:diagnostics :replication-rejected] (fnil inc 0)))
+         :net-envelopes []
+         :stdout-events [diag-event]})
+      (let [evt {"event" "storage-replicated"
+                 "subnet_id" subnet
+                 "path" path
+                 "cid" (:blob/cid blob)
+                 "seq" (:pointer/seq ptr)
+                 "authority" (:pointer/authority ptr)}]
+        {:state (-> state
+                    (assoc-in [:storage-blobs (:blob/cid blob)] blob)
+                    (assoc-in [:storage-pointers [subnet path]] ptr)
+                    (assoc-in [:storage-min-seqs [subnet path]] (:pointer/seq ptr)))
+         :net-envelopes []
+         :stdout-events [evt]}))))
+
+(defn- handle-wire-capability-replicate [state msg]
+  (let [blob (normalize-wire-blob (or (:blob msg) (get msg "blob")))
+        ptr (normalize-wire-pointer (or (:pointer msg) (get msg "pointer")))
+        subnet (str (or (:subnet-id msg) (get msg "subnet_id") (when ptr (:pointer/subnet ptr)) "global"))
+        path (str (or (:path msg) (get msg "path") (when ptr (:pointer/path ptr))))
+        existing-ptr (get-in state [:capabilities [subnet path]])
+        current-seq (long (or (when existing-ptr (:pointer/seq existing-ptr)) 0))
+        valid-blob? (boolean (and (map? blob) (data/verify-blob blob)))
+        valid-ptr? (boolean (and (map? ptr) (:ok? (data/verify-pointer ptr))))
+        target-match? (boolean (and valid-blob? valid-ptr? (= (:pointer/target ptr) (:blob/cid blob))))
+        seq-valid? (boolean (and valid-ptr? (> (long (:pointer/seq ptr)) current-seq)))
+        valid? (and valid-blob? valid-ptr? target-match? seq-valid?)]
+    (if-not valid?
+      (let [reason (cond
+                     (not valid-blob?) "invalid-blob"
+                     (not valid-ptr?) "invalid-pointer"
+                     (not target-match?) "target-mismatch"
+                     (not seq-valid?) "stale-sequence"
+                     :else "invalid-replicate")
+            diag-event {"event" "diagnostic"
+                        "reason" "capability-replication-rejected"
+                        "cause" reason
+                        "subnet_id" subnet
+                        "path" path}]
+        {:state (-> state
+                    (update-in [:diagnostics :replication-rejected] (fnil inc 0)))
+         :net-envelopes []
+         :stdout-events [diag-event]})
+      (let [evt {"event" "capability-published"
+                 "subnet_id" subnet
+                 "path" path
+                 "cid" (:blob/cid blob)
+                 "seq" (:pointer/seq ptr)
+                 "authority" (:pointer/authority ptr)}]
+        {:state (-> state
+                    (assoc-in [:capability-blobs (:blob/cid blob)] blob)
+                    (assoc-in [:capabilities [subnet path]] ptr))
+         :net-envelopes []
+         :stdout-events [evt]}))))
+
 (defn handle-wire-payload
   "Processes an incoming network event or raw payload. Enforces wire protocol version compatibility,
    2-epoch skew tolerance, and anti-replay protections before dispatching to message-specific reducers."
@@ -5848,9 +6265,12 @@
                                                     (get msg "subnet-id")
                                                     (get msg "subnet_id"))]
                                      (str s)))
-                    subnet-mismatch? (or (and outer-subnet (not= outer-subnet "*") (not= expected-subnet "*") (not= outer-subnet expected-subnet))
-                                         (and inner-subnet (not= inner-subnet "*") (not= expected-subnet "*") (not= inner-subnet expected-subnet))
-                                         (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*") (not= outer-subnet inner-subnet)))]
+                    msg-type (keyword (or (:bitecho/type msg) (:type msg) (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
+                    storage-or-cap? (or (= msg-type :storage-replicate) (= msg-type :capability-replicate))
+                    subnet-mismatch? (or (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*") (not= outer-subnet inner-subnet))
+                                         (and (not storage-or-cap?)
+                                              (or (and outer-subnet (not= outer-subnet "*") (not= expected-subnet "*") (not= outer-subnet expected-subnet))
+                                                  (and inner-subnet (not= inner-subnet "*") (not= expected-subnet "*") (not= inner-subnet expected-subnet)))))]
                 (if subnet-mismatch?
                   (let [eff-subnet (or outer-subnet inner-subnet "unknown")
                         new-state (-> state
@@ -5885,7 +6305,9 @@
                         skew-exceeded? (and (not open-session?)
                                             (not (contains? #{:chain-state-snapshot
                                                               :p2p-hub-relay
-                                                              :p2p-broadcast}
+                                                              :p2p-broadcast
+                                                              :storage-replicate
+                                                              :capability-replicate}
                                                             msg-type))
                                             msg-epoch ref-epoch
                                             (> (math-abs (- msg-epoch (long ref-epoch))) max-skew))]
@@ -5925,6 +6347,8 @@
                                   :p2p-answer (handle-wire-p2p-answer state msg)
                                   :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
                                   :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
+                                  :storage-replicate (handle-wire-storage-replicate state msg)
+                                  :capability-replicate (handle-wire-capability-replicate state msg)
                                   {:state state :net-envelopes [] :stdout-events []})
                             res' (if (and (not= msg-type :chain-state-snapshot)
                                           msg-epoch

@@ -359,7 +359,7 @@
     "challenge" "alg"
     "user-verification" "attestation" "extensions"
     "extractable" "extractable?" "usages" "algorithm" "named-curve" "hash" "length"
-    "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta" "metadata"
+    "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta"
     "config" "options" "settings" "profile" "result" "results" "response" "effect" "effects" "event" "events" "cmd" "command"
     "nested" "nested-map" "nested-vec" "nested-set" "nested-list" "child" "children" "parent" "root" "leaf" "branch"
     "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag"
@@ -369,7 +369,13 @@
     "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol"
     "peer-alice" "peer-bob" "peer-carol" "node-alice" "node-bob" "node-carol"
     "browser-alice" "browser-bob" "browser-carol" "rt-node" "browser-test" "browser-guard-test" "test-peer" "test-subnet" "global"
-    "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"})
+    "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"
+    "storage-blobs" "storage-pointers" "storage-min-seqs"
+    "capabilities" "capability-blobs"
+    "puzzle-source" "solution" "conditions"
+    "cid" "mime" "bytes" "target" "authority" "leader-term" "proof"
+    "provider" "price-echo" "target-cid" "capability-id" "capability-type"
+    "replication-rejected"})
 
 (def ^:private allowed-persistence-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))
@@ -388,8 +394,13 @@
     (and (vector? k)
          (= 2 (count k))
          (string? (first k))
-         (integer? (second k))
-         (allowed-persistence-key? (first k))) true
+         (or (and (integer? (second k))
+                  (allowed-persistence-key? (first k)))
+             (and (string? (second k))
+                  (or (str/starts-with? (second k) "storage/")
+                      (str/starts-with? (second k) "capability/")
+                      (str/starts-with? (second k) "subnet/")
+                      (allowed-persistence-key? (second k)))))) true
     (and (string? k)
          (boolean (re-matches #"^(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{88})$" k))) true
     :else

@@ -12,8 +12,8 @@
 ;; =============================================================================
 
 (deftest test-supported-verbs-inventory
-  (testing "Exact 51 canonical verbs in supported-cli-verbs"
-    (is (= 51 (count cli/supported-cli-verbs)))
+  (testing "Exact 55 canonical verbs in supported-cli-verbs"
+    (is (= 55 (count cli/supported-cli-verbs)))
     (is (= (count (distinct cli/supported-cli-verbs)) (count cli/supported-cli-verbs)))
     (is (= cli/supported-cli-verbs (vec (sort cli/supported-cli-verbs))))
     (is (every? #(re-matches #"^[a-z0-9]+(-[a-z0-9]+)*$" %) cli/supported-cli-verbs))
@@ -22,8 +22,12 @@
   (testing "Presence of Milestone 2, 3, 4 verbs"
     (is (contains? cli/supported-cli-verbs-set "storage-put"))
     (is (contains? cli/supported-cli-verbs-set "storage-get"))
+    (is (contains? cli/supported-cli-verbs-set "storage-list"))
     (is (contains? cli/supported-cli-verbs-set "capability-publish"))
     (is (contains? cli/supported-cli-verbs-set "capability-resolve"))
+    (is (contains? cli/supported-cli-verbs-set "capability-list"))
+    (is (contains? cli/supported-cli-verbs-set "puzzle-hash"))
+    (is (contains? cli/supported-cli-verbs-set "puzzle-eval"))
     (is (contains? cli/supported-cli-verbs-set "lock-intent"))
     (is (contains? cli/supported-cli-verbs-set "release-intent"))
     (is (contains? cli/supported-cli-verbs-set "status"))
@@ -87,30 +91,75 @@
       (is (= "storage-get" (:verb res)))
       (is (= "nexus" (get-in res [:cmd-map "subnet_id"])))
       (is (= "profile" (get-in res [:cmd-map "slot"])))
-      (is (= 2 (get-in res [:cmd-map "min_seq"])))))
+      (is (= 2 (get-in res [:cmd-map "min_seq"])))
+      (is (= 2 (get-in res [:cmd-map "min_expected_seq"])))))
+
+  (testing "storage-list command parsing"
+    (let [res (cli/parse-cli-command "storage-list --subnet-id nexus")]
+      (is (true? (:ok? res)))
+      (is (= "storage-list" (:verb res)))
+      (is (= "nexus" (get-in res [:cmd-map "subnet_id"])))))
 
   (testing "capability-publish command parsing"
-    (let [res (cli/parse-cli-command "capability-publish --subnet nexus --capability-id uop-relu --capability-type compute/uop-kernel --price-echo 250")]
+    (let [res (cli/parse-cli-command "capability-publish --subnet nexus --capability-id uop-relu --capability-type compute/uop-kernel --price-echo 250 --burn-floor 10 --target-cid 012345 --seq 2 --metadata '{\"speed\":1}'")]
       (is (true? (:ok? res)))
       (is (= "capability-publish" (:verb res)))
       (is (= "nexus" (get-in res [:cmd-map "subnet_id"])))
       (is (= "uop-relu" (get-in res [:cmd-map "capability_id"])))
       (is (= "compute/uop-kernel" (get-in res [:cmd-map "capability_type"])))
-      (is (= 250 (get-in res [:cmd-map "price_echo"])))))
+      (is (= 250 (get-in res [:cmd-map "price_echo"])))
+      (is (= 10 (get-in res [:cmd-map "burn_floor"])))
+      (is (= "012345" (get-in res [:cmd-map "target_cid"])))
+      (is (= 2 (get-in res [:cmd-map "seq"])))
+      (is (= "{\"speed\":1}" (get-in res [:cmd-map "metadata"])))))
 
   (testing "capability-resolve command parsing"
-    (let [res (cli/parse-cli-command "capability-resolve --subnet nexus --capability-id uop-relu --authority 302a...")]
+    (let [res (cli/parse-cli-command "capability-resolve --subnet nexus --capability-id uop-relu --authority 302a... --path my/path --min-expected-seq 5")]
       (is (true? (:ok? res)))
       (is (= "capability-resolve" (:verb res)))
       (is (= "nexus" (get-in res [:cmd-map "subnet_id"])))
       (is (= "uop-relu" (get-in res [:cmd-map "capability_id"])))
+      (is (= "302a..." (get-in res [:cmd-map "authority"])))
+      (is (= "my/path" (get-in res [:cmd-map "path"])))
+      (is (= 5 (get-in res [:cmd-map "min_seq"])))
+      (is (= 5 (get-in res [:cmd-map "min_expected_seq"])))))
+
+  (testing "capability-list command parsing"
+    (let [res (cli/parse-cli-command "capability-list --subnet-id nexus --capability-type compute/uop-kernel --authority 302a...")]
+      (is (true? (:ok? res)))
+      (is (= "capability-list" (:verb res)))
+      (is (= "nexus" (get-in res [:cmd-map "subnet_id"])))
+      (is (= "compute/uop-kernel" (get-in res [:cmd-map "capability_type"])))
       (is (= "302a..." (get-in res [:cmd-map "authority"])))))
 
-  (testing "lock-intent with --puzzle-hash"
-    (let [res (cli/parse-cli-command "lock-intent --to bob --amount 1000 --deliverable-hash dhash123 --puzzle-hash phash456 --expires-epoch 10")]
+  (testing "puzzle-hash command parsing"
+    (let [res (cli/parse-cli-command "puzzle-hash --puzzle-source '(+ 1 2)'")]
+      (is (true? (:ok? res)))
+      (is (= "puzzle-hash" (:verb res)))
+      (is (= "(+ 1 2)" (get-in res [:cmd-map "puzzle_source"])))))
+
+  (testing "puzzle-eval command parsing"
+    (let [res (cli/parse-cli-command "puzzle-eval --puzzle-source '(= 1 1)' --solution '[]' --amount 500 --receiver bob --payer alice --deliverable-hash dhash --puzzle-hash phash --timeout-epoch 50 --epoch 10 --intent-id eid-10 --subnet-id nexus")]
+      (is (true? (:ok? res)))
+      (is (= "puzzle-eval" (:verb res)))
+      (is (= "(= 1 1)" (get-in res [:cmd-map "puzzle_source"])))
+      (is (= "[]" (get-in res [:cmd-map "solution"])))
+      (is (= 500 (get-in res [:cmd-map "amount"])))
+      (is (= "bob" (get-in res [:cmd-map "receiver"])))
+      (is (= "alice" (get-in res [:cmd-map "payer"])))
+      (is (= "dhash" (get-in res [:cmd-map "deliverable_hash"])))
+      (is (= "phash" (get-in res [:cmd-map "puzzle_hash"])))
+      (is (= 50 (get-in res [:cmd-map "timeout_epoch"])))
+      (is (= 10 (get-in res [:cmd-map "epoch"])))
+      (is (= "eid-10" (get-in res [:cmd-map "intent_id"])))
+      (is (= "nexus" (get-in res [:cmd-map "subnet_id"])))))
+
+  (testing "lock-intent with --puzzle-hash and --puzzle-source"
+    (let [res (cli/parse-cli-command "lock-intent --to bob --amount 1000 --deliverable-hash dhash123 --puzzle-hash phash456 --puzzle-source '(+ 1 1)' --expires-epoch 10")]
       (is (true? (:ok? res)))
       (is (= "lock-intent" (:verb res)))
       (is (= "phash456" (get-in res [:cmd-map "puzzle_hash"])))
+      (is (= "(+ 1 1)" (get-in res [:cmd-map "puzzle_source"])))
       (is (= "dhash123" (get-in res [:cmd-map "deliverable_hash"])))
       (is (= 1000 (get-in res [:cmd-map "amount"])))
       (is (= 10 (get-in res [:cmd-map "expires_epoch"])))))
@@ -145,7 +194,7 @@
 ;; =============================================================================
 
 (defspec ^{:doc "Property: All supported verbs parse cleanly from vector and string format"}
-  prop-all-supported-verbs-parse 51
+  prop-all-supported-verbs-parse 55
   (prop/for-all [idx (gen/choose 0 (dec (count cli/supported-cli-verbs)))]
                 (let [verb (nth cli/supported-cli-verbs idx)
                       res-vec (cli/parse-cli-command [verb])

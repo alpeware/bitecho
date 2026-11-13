@@ -472,7 +472,7 @@
             "challenge" "alg"
             "user-verification" "attestation" "extensions"
             "extractable" "extractable?" "usages" "algorithm" "named-curve" "hash" "length"
-            "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta" "metadata"
+            "val" "value" "id" "ids" "item" "items" "list" "vec" "set" "map" "data" "meta"
             "config" "options" "settings" "profile" "result" "results" "response" "effect" "effects" "event" "events" "cmd" "command"
             "nested" "nested-map" "nested-vec" "nested-set" "nested-list" "child" "children" "parent" "root" "leaf" "branch"
             "level" "depth" "size" "width" "height" "offset" "limit" "page" "cursor" "tag" "tags" "flag"
@@ -482,7 +482,13 @@
             "sess-1" "sess-2" "axiom" "nexus" "alice" "bob" "carol"
             "peer-alice" "peer-bob" "peer-carol" "node-alice" "node-bob" "node-carol"
             "browser-alice" "browser-bob" "browser-carol" "rt-node" "browser-test" "browser-guard-test" "test-peer" "test-subnet" "global"
-            "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"}
+            "sub-agent-alpha" "worker-node-1" "off-demo-1" "core-devs"
+            "storage-blobs" "storage-pointers" "storage-min-seqs"
+            "capabilities" "capability-blobs"
+            "puzzle-source" "solution" "conditions"
+            "cid" "mime" "bytes" "target" "authority" "leader-term" "proof"
+            "provider" "price-echo" "target-cid" "capability-id" "capability-type"
+            "replication-rejected"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)
@@ -625,7 +631,7 @@
                              :else #{}))
             intentional-drops #{:privkey-bytes :caller-x25519-priv :callee-x25519-priv :ephemeral-priv
                                 :tx-key :rx-key :shared-secret :session-keys :tx :rx :ice-pwd :pwd
-                                :session-id :channel :transport :last-error}
+                                :session-id :channel :transport :last-error :metadata}
             real-code-keys (disj (into #{} (concat (collect-keys base-light)
                                                    (collect-keys populated-light)
                                                    (collect-keys base-anchor)
@@ -633,7 +639,7 @@
                                                    (collect-keys (:escrows sm5))))
                                  :privkey-bytes :caller-x25519-priv :callee-x25519-priv :ephemeral-priv
                                  :tx-key :rx-key :shared-secret :session-keys :tx :rx :ice-pwd :pwd
-                                 :session-id :channel :transport :last-error)
+                                 :session-id :channel :transport :last-error :metadata)
             loaded-light (atom nil)]
         (browser/persist-state! populated-light nil)
         (browser/load-persisted-state (fn [_err st] (reset! loaded-light st)))

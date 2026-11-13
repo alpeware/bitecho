@@ -62,9 +62,30 @@
 
 (defn- build-sandbox-bindings
   [step! solution env-ctx max-bytes]
-  (let [wrap-1 (fn [f] (fn [& args] (step! 1) (apply f args)))
+  (let [eid (or (:intent-id env-ctx) (:escrow-id env-ctx))
+        to (or (:timeout-epoch env-ctx) (:expires-epoch env-ctx))
+        norm-env (cond-> env-ctx
+                   eid (assoc :intent-id eid :escrow-id eid)
+                   to (assoc :timeout-epoch to :expires-epoch to))
+        wrap-1 (fn [f] (fn [& args] (step! 1) (apply f args)))
         alloc (fn [f] (wrap-alloc step! max-bytes f))
         coll (fn [f] (wrap-coll step! f))
+        sha-fn (fn [x]
+                 (step! 5)
+                 (let [bs (cond
+                            (fressian/bytes? x) x
+                            (string? x) (fressian/utf8->bytes x)
+                            :else (fressian/encode-canonical x))]
+                   (str/lower-case (basalt/bytes->hex (crypto/sha256 bs)))))
+        sig-fn (fn [pubkey-hex msg-data sig-hex]
+                 (step! 20)
+                 (try
+                   (let [bs (cond
+                              (fressian/bytes? msg-data) msg-data
+                              (string? msg-data) (fressian/utf8->bytes msg-data)
+                              :else (fressian/encode-canonical msg-data))]
+                     (boolean (crypto/verify pubkey-hex bs sig-hex)))
+                   (catch #?(:clj Throwable :cljs :default) _ false)))
         safe-range (fn [& args]
                      (let [n (case (count args)
                                1 (first args)
@@ -77,25 +98,16 @@
                            (step! (inc (long n)))
                            (apply range args)))))]
     {'solution solution
-     'env env-ctx
+     'env norm-env
+     'escrow norm-env
+     'context norm-env
      '-bitecho-step! (fn [n] (step! (long n)))
      'fn metered-fn-macro
-     'sha256 (fn [x]
-               (step! 5)
-               (let [bs (cond
-                          (fressian/bytes? x) x
-                          (string? x) (fressian/utf8->bytes x)
-                          :else (fressian/encode-canonical x))]
-                 (str/lower-case (basalt/bytes->hex (crypto/sha256 bs)))))
-     'verify-signature (fn [pubkey-hex msg-data sig-hex]
-                         (step! 20)
-                         (try
-                           (let [bs (cond
-                                      (fressian/bytes? msg-data) msg-data
-                                      (string? msg-data) (fressian/utf8->bytes msg-data)
-                                      :else (fressian/encode-canonical msg-data))]
-                             (boolean (crypto/verify pubkey-hex bs sig-hex)))
-                           (catch #?(:clj Throwable :cljs :default) _ false)))
+     'sha256 sha-fn
+     'sha256-hex sha-fn
+     'verify-signature sig-fn
+     'verify-sig sig-fn
+     'bytes= (wrap-1 =)
      '= (wrap-1 =)
      'not= (wrap-1 not=)
      '< (wrap-1 <)
@@ -173,29 +185,88 @@
     {:valid? false :error :puzzle-returned-false}
 
     (or (map? res) (vector? res))
-    (let [conditions (if (map? res) (or (:conditions res) [res]) (vec res))]
-      (if-not (and (sequential? conditions)
-                   (seq conditions)
-                   (every? (fn [c]
-                             (and (map? c)
-                                  (= :release (:type c))
-                                  (string? (:receiver c))
-                                  (not (str/blank? (:receiver c)))
-                                  (integer? (:amount c))
-                                  (pos? (long (:amount c)))))
-                           conditions))
+    (let [conditions (if (map? res) (or (:conditions res) [res]) (vec res))
+          env-epoch (long (or (:epoch env-ctx) 0))
+          env-amount (long (or (:amount env-ctx) 0))]
+      (if-not (and (sequential? conditions) (seq conditions) (every? map? conditions))
         {:valid? false :error :invalid-puzzle-conditions}
-        (let [total-released (reduce + 0 (map (comp long :amount) conditions))
-              env-amount (long (or (:amount env-ctx) 0))]
-          (if (> total-released env-amount)
-            {:valid? false :error :puzzle-overspend-violation}
-            (let [remainder (- env-amount total-released)
-                  final-conditions (cond-> conditions
-                                     (and (pos? remainder) (string? (:payer env-ctx)))
-                                     (conj {:type :refund-remainder
-                                            :receiver (:payer env-ctx)
-                                            :amount remainder}))]
-              {:valid? true :conditions final-conditions})))))
+        (loop [rem conditions
+               out-conds []]
+          (if (empty? rem)
+            (let [final-outs (if (empty? out-conds)
+                               [{:type :release :receiver (:receiver env-ctx) :amount env-amount}]
+                               out-conds)
+                  total-released (reduce + 0 (map (comp long :amount) final-outs))]
+              (if (> total-released env-amount)
+                {:valid? false :error :puzzle-overspend-violation}
+                (let [remainder (- env-amount total-released)
+                      final-conditions (cond-> final-outs
+                                         (and (pos? remainder) (string? (:payer env-ctx)))
+                                         (conj {:type :refund-remainder
+                                                :receiver (:payer env-ctx)
+                                                :amount remainder}))]
+                  {:valid? true :conditions final-conditions})))
+            (let [c (first rem)
+                  c-type (:type c)]
+              (case c-type
+                (:assert-epoch-gte :assert-after-epoch)
+                (let [min-ep (long (or (:epoch c) (:min-epoch c) 0))]
+                  (if (< env-epoch min-ep)
+                    {:valid? false :error :epoch-before-min}
+                    (recur (rest rem) out-conds)))
+
+                (:assert-epoch-lte :assert-before-epoch)
+                (let [max-ep (long (or (:epoch c) (:max-epoch c) #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER)))]
+                  (if (> env-epoch max-ep)
+                    {:valid? false :error :epoch-after-max}
+                    (recur (rest rem) out-conds)))
+
+                :assert-sig
+                (let [pk (:pubkey c)
+                      sig (:signature c)
+                      raw-msg (or (:message c) (:msg c))
+                      bs (cond
+                           (fressian/bytes? raw-msg) raw-msg
+                           (string? raw-msg) (fressian/utf8->bytes (str raw-msg))
+                           :else (fressian/encode-canonical raw-msg))
+                      valid-sig? (try
+                                   (boolean (and (string? pk) (string? sig) (crypto/verify pk bs sig)))
+                                   (catch #?(:clj Throwable :cljs :default) _ false))]
+                  (if-not valid-sig?
+                    {:valid? false :error :invalid-signature-condition}
+                    (recur (rest rem) out-conds)))
+
+                :assert-sha256
+                (let [raw-pre (or (:preimage c) (:deliverable c))
+                      bs (cond
+                           (fressian/bytes? raw-pre) raw-pre
+                           (string? raw-pre) (fressian/utf8->bytes (str raw-pre))
+                           :else (fressian/encode-canonical raw-pre))
+                      computed (str/lower-case (basalt/bytes->hex (crypto/sha256 bs)))
+                      expected (str/lower-case (str (or (:hash c) (:deliverable-hash c))))]
+                  (if (not= computed expected)
+                    {:valid? false :error :hash-mismatch-condition}
+                    (recur (rest rem) out-conds)))
+
+                :release
+                (let [recv (:receiver c)
+                      amt (long (or (:amount c) (:value c) 0))]
+                  (if-not (and (string? recv) (not (str/blank? recv)) (pos? amt))
+                    {:valid? false :error :invalid-puzzle-conditions}
+                    (recur (rest rem) (conj out-conds {:type :release :receiver recv :amount amt}))))
+
+                :refund
+                (let [recv (or (:receiver c) (:payer env-ctx))
+                      amt (long (or (:amount c) (:value c) 0))]
+                  (if-not (and (string? recv)
+                               (not (str/blank? recv))
+                               (pos? amt)
+                               (or (nil? (:payer env-ctx)) (= recv (:payer env-ctx))))
+                    {:valid? false :error :invalid-puzzle-conditions}
+                    (recur (rest rem) (conj out-conds {:type :refund :receiver recv :amount amt}))))
+
+                ;; Unrecognized condition type
+                {:valid? false :error :invalid-puzzle-conditions}))))))
 
     :else
     {:valid? false :error :puzzle-returned-invalid-type}))

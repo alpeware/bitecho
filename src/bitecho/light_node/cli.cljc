@@ -9,12 +9,13 @@
 ;; =============================================================================
 
 (def supported-cli-verbs
-  "Canonical sorted vector of all 51 supported CLI verbs across Bitecho shells."
+  "Canonical sorted vector of all 55 supported CLI verbs across Bitecho shells."
   ["accept"
    "account"
    "ack"
    "anchor-subnet"
    "broadcast"
+   "capability-list"
    "capability-publish"
    "capability-resolve"
    "close"
@@ -43,6 +44,8 @@
    "petname-remove"
    "petname-resolve"
    "petname-set"
+   "puzzle-eval"
+   "puzzle-hash"
    "query-chain-state"
    "refund-intent"
    "register-home-set"
@@ -55,6 +58,7 @@
    "settle-intent"
    "status"
    "storage-get"
+   "storage-list"
    "storage-put"
    "submit-vouchers"
    "sync-account"
@@ -256,34 +260,40 @@
             amt (extract-long-flag clean-tokens "--amount" nil)
             dh (extract-flag-value clean-tokens "--deliverable-hash" nil)
             ph (extract-flag-value clean-tokens "--puzzle-hash" nil)
-            ep (extract-long-flag clean-tokens "--expires-epoch" nil)
-            eid (extract-flag-value clean-tokens "--escrow-id" nil)
+            psrc (extract-flag-value clean-tokens "--puzzle-source" nil)
+            ep (or (extract-long-flag clean-tokens "--timeout-epoch" nil)
+                   (extract-long-flag clean-tokens "--expires-epoch" nil))
+            eid (or (extract-flag-value clean-tokens "--intent-id" nil)
+                    (extract-flag-value clean-tokens "--escrow-id" nil))
             m {"cmd" "lock-intent"}]
         (cond-> m
           recv (assoc "receiver" recv "recipient" recv)
           amt (assoc "amount" amt)
           dh (assoc "deliverable_hash" dh)
           ph (assoc "puzzle_hash" ph)
-          ep (assoc "expires_epoch" ep)
-          eid (assoc "escrow_id" eid)))
+          psrc (assoc "puzzle_source" psrc)
+          ep (assoc "expires_epoch" ep "timeout_epoch" ep)
+          eid (assoc "escrow_id" eid "intent_id" eid)))
 
       "release-intent"
-      (let [eid (extract-flag-value clean-tokens "--escrow-id" nil)
+      (let [eid (or (extract-flag-value clean-tokens "--intent-id" nil)
+                    (extract-flag-value clean-tokens "--escrow-id" nil))
             pre (extract-flag-value clean-tokens "--preimage" nil)
             psrc (extract-flag-value clean-tokens "--puzzle-source" nil)
             sol (extract-flag-value clean-tokens "--solution" nil)
             m {"cmd" "release-intent"}]
         (cond-> m
-          eid (assoc "escrow_id" eid)
+          eid (assoc "escrow_id" eid "intent_id" eid)
           pre (assoc "preimage" pre)
           psrc (assoc "puzzle_source" psrc)
           sol (assoc "solution" sol)))
 
       "refund-intent"
-      (let [eid (extract-flag-value clean-tokens "--escrow-id" nil)
+      (let [eid (or (extract-flag-value clean-tokens "--intent-id" nil)
+                    (extract-flag-value clean-tokens "--escrow-id" nil))
             m {"cmd" "refund-intent"}]
         (cond-> m
-          eid (assoc "escrow_id" eid)))
+          eid (assoc "escrow_id" eid "intent_id" eid)))
 
       "escrows"
       (let [sync? (has-flag? clean-tokens "--sync")]
@@ -581,14 +591,18 @@
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
                     "nexus")
-            slot (or (extract-flag-value clean-tokens "--slot" nil) "default")
+            slot (or (extract-flag-value clean-tokens "--slot-id" nil)
+                     (extract-flag-value clean-tokens "--slot" nil)
+                     "default")
             data (extract-flag-value clean-tokens "--data" nil)
+            data-hex (extract-flag-value clean-tokens "--data-hex" nil)
             seq-num (extract-long-flag clean-tokens "--seq" nil)
             min-seq (extract-long-flag clean-tokens "--min-seq" nil)
             out-file (extract-flag-value clean-tokens "--out-file" nil)
-            m {"cmd" "storage-put" "subnet_id" sub "slot" slot}]
+            m {"cmd" "storage-put" "subnet_id" sub "slot" slot "slot_id" slot}]
         (cond-> m
           data (assoc "data" data)
+          data-hex (assoc "data_hex" data-hex)
           seq-num (assoc "seq" seq-num)
           min-seq (assoc "min_seq" min-seq)
           out-file (assoc "out_file" out-file)))
@@ -597,13 +611,23 @@
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
                     "nexus")
-            slot (or (extract-flag-value clean-tokens "--slot" nil) "default")
-            min-seq (extract-long-flag clean-tokens "--min-seq" nil)
+            slot (or (extract-flag-value clean-tokens "--slot-id" nil)
+                     (extract-flag-value clean-tokens "--slot" nil)
+                     "default")
+            min-seq (or (extract-long-flag clean-tokens "--min-seq" nil)
+                        (extract-long-flag clean-tokens "--min-expected-seq" nil))
             out-file (extract-flag-value clean-tokens "--out-file" nil)
-            m {"cmd" "storage-get" "subnet_id" sub "slot" slot}]
+            m {"cmd" "storage-get" "subnet_id" sub "slot" slot "slot_id" slot}]
         (cond-> m
-          min-seq (assoc "min_seq" min-seq)
+          min-seq (assoc "min_seq" min-seq "min_expected_seq" min-seq)
           out-file (assoc "out_file" out-file)))
+
+      "storage-list"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil))
+            m {"cmd" "storage-list"}]
+        (cond-> m
+          sub (assoc "subnet_id" sub)))
 
       "capability-publish"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
@@ -619,13 +643,21 @@
                           (extract-flag-value clean-tokens "--terms" nil))
             price (extract-long-flag clean-tokens "--price-echo"
                                      (extract-long-flag clean-tokens "--price" nil))
+            burn-floor (extract-long-flag clean-tokens "--burn-floor" nil)
+            target-cid (extract-flag-value clean-tokens "--target-cid" nil)
+            seq-num (extract-long-flag clean-tokens "--seq" nil)
+            meta (extract-flag-value clean-tokens "--metadata" nil)
             m {"cmd" "capability-publish" "subnet_id" sub}]
         (cond-> m
           cap-id (assoc "capability_id" cap-id)
           cap-type (assoc "capability_type" cap-type)
           cap-path (assoc "capability_path" cap-path)
           cap-terms (assoc "capability_terms" cap-terms)
-          price (assoc "price_echo" price)))
+          price (assoc "price_echo" price)
+          burn-floor (assoc "burn_floor" burn-floor)
+          target-cid (assoc "target_cid" target-cid)
+          seq-num (assoc "seq" seq-num)
+          meta (assoc "metadata" meta)))
 
       "capability-resolve"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
@@ -635,10 +667,65 @@
                        (extract-flag-value clean-tokens "--cap-id" nil))
             auth (or (extract-flag-value clean-tokens "--authority" nil)
                      (extract-flag-value clean-tokens "--pubkey" nil))
+            path (extract-flag-value clean-tokens "--path" nil)
+            min-seq (or (extract-long-flag clean-tokens "--min-seq" nil)
+                        (extract-long-flag clean-tokens "--min-expected-seq" nil))
             m {"cmd" "capability-resolve" "subnet_id" sub}]
         (cond-> m
           cap-id (assoc "capability_id" cap-id)
+          auth (assoc "authority" auth)
+          path (assoc "path" path)
+          min-seq (assoc "min_seq" min-seq "min_expected_seq" min-seq)))
+
+      "capability-list"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil))
+            cap-type (or (extract-flag-value clean-tokens "--capability-type" nil)
+                         (extract-flag-value clean-tokens "--type" nil))
+            auth (or (extract-flag-value clean-tokens "--authority" nil)
+                     (extract-flag-value clean-tokens "--pubkey" nil))
+            m {"cmd" "capability-list"}]
+        (cond-> m
+          sub (assoc "subnet_id" sub)
+          cap-type (assoc "capability_type" cap-type)
           auth (assoc "authority" auth)))
+
+      "puzzle-hash"
+      (let [psrc (extract-flag-value clean-tokens "--puzzle-source" nil)
+            m {"cmd" "puzzle-hash"}]
+        (cond-> m
+          psrc (assoc "puzzle_source" psrc)))
+
+      "puzzle-eval"
+      (let [psrc (extract-flag-value clean-tokens "--puzzle-source" nil)
+            sol (extract-flag-value clean-tokens "--solution" nil)
+            amt (extract-long-flag clean-tokens "--amount" nil)
+            recv (or (extract-flag-value clean-tokens "--receiver" nil)
+                     (extract-flag-value clean-tokens "--recipient" nil)
+                     (extract-flag-value clean-tokens "--to" nil))
+            payer (extract-flag-value clean-tokens "--payer" nil)
+            dh (extract-flag-value clean-tokens "--deliverable-hash" nil)
+            ph (extract-flag-value clean-tokens "--puzzle-hash" nil)
+            to-ep (or (extract-long-flag clean-tokens "--timeout-epoch" nil)
+                      (extract-long-flag clean-tokens "--expires-epoch" nil))
+            ep (extract-long-flag clean-tokens "--epoch" nil)
+            iid (or (extract-flag-value clean-tokens "--intent-id" nil)
+                    (extract-flag-value clean-tokens "--escrow-id" nil))
+            sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil))
+            m {"cmd" "puzzle-eval"}]
+        (cond-> m
+          psrc (assoc "puzzle_source" psrc)
+          sol (assoc "solution" sol)
+          amt (assoc "amount" amt)
+          recv (assoc "receiver" recv)
+          payer (assoc "payer" payer)
+          dh (assoc "deliverable_hash" dh)
+          ph (assoc "puzzle_hash" ph)
+          to-ep (assoc "timeout_epoch" to-ep)
+          ep (assoc "epoch" ep)
+          iid (assoc "intent_id" iid)
+          sub (assoc "subnet_id" sub)))
 
       {"cmd" verb})))
 
