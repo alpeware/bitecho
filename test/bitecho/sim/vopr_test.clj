@@ -264,3 +264,47 @@
           (is (true? (:remediated-valid? bug)) (str "Bug " jep " failed remediated check: " bug))
           (is (true? (:pre-fix-caught? bug)) (str "Bug " jep " failed pre-fix caught check: " bug))
           (is (true? (:bug-reproduced? bug)) (str "Bug " jep " failed reproduction: " bug)))))))
+
+;; =============================================================================
+;; 8. WebRTC DataChannel Sans-IO Packet-Drop & Retransmission Simulation
+;; =============================================================================
+
+(deftest test-datachannel-packet-drop-simulation
+  (testing "WebRTC DataChannel sans-IO packet-drop and retransmission simulation across seeds and fault schedules"
+    ;; 1. Default fault schedule (DTLS flight loss, DATA drops, bit-flips, reordering)
+    (let [res (vopr/run-datachannel-packet-drop-sim {:seed 20261114})]
+      (is (true? (:valid? res)) (str "Default simulation failed: " res))
+      (is (true? (:dtls-established? res)))
+      (is (true? (:sctp-established? res)))
+      (is (true? (:dtls-flight-rtx-recovered? res)))
+      (is (= 2 (:dropped-packets-count res)))
+      (is (= 1 (:bitflipped-packets-count res)))
+      (is (= 5 (:sent-count res)))
+      (is (= 5 (:delivered-count res)))
+      (is (true? (:delivered-order-matches? res)))
+      (is (pos? (:t3-rtx-retransmissions res)))
+      (is (zero? (:client-unacked-remaining res))))
+
+    ;; 2. Multi-seed and fault matrix verification
+    (doseq [opts [{:seed 1337 :drop-indices #{0} :bitflip-indices #{} :reorder? false :payload-count 3}
+                  {:seed 4242 :drop-indices #{1} :bitflip-indices #{0} :reorder? true :payload-count 4}
+                  {:seed 9999 :drop-indices #{} :bitflip-indices #{} :reorder? false :payload-count 5 :dtls-flight-drop? false}]]
+      (let [res (vopr/run-datachannel-packet-drop-sim opts)]
+        (is (true? (:valid? res)) (str "Matrix scenario failed for opts: " opts " -> " res))
+        (is (true? (:dtls-established? res)))
+        (is (true? (:sctp-established? res)))
+        (is (= (:payload-count opts) (:delivered-count res)))
+        (is (true? (:delivered-order-matches? res)))
+        (is (zero? (:client-unacked-remaining res)))
+        (if (:dtls-flight-drop? opts true)
+          (is (true? (:dtls-flight-rtx-recovered? res)))
+          (is (false? (:dtls-flight-rtx-recovered? res))))
+        (if (empty? (concat (:drop-indices opts) (:bitflip-indices opts)))
+          (is (zero? (:t3-rtx-retransmissions res)))
+          (is (pos? (:t3-rtx-retransmissions res))))))
+
+    ;; 3. Determinism: identical seed produces identical diagnostics
+    (let [run-1 (vopr/run-datachannel-packet-drop-sim {:seed 55555})
+          run-2 (vopr/run-datachannel-packet-drop-sim {:seed 55555})]
+      (is (= run-1 run-2) "Two runs with identical seed must yield identical diagnostic maps"))))
+

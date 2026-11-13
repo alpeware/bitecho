@@ -1808,3 +1808,285 @@
        :seed seed
        :remediated-count (count (filter (fn [[_ r]] (:remediated-valid? r)) res-map))
        :results res-map})))
+
+;; =============================================================================
+;; 11. WebRTC DataChannel Sans-IO Packet-Drop & Retransmission Simulation
+;; =============================================================================
+
+(defn- flip-sim-datachannel-packet
+  "Flips a bit in ciphertext raw buffer `raw` to verify AEAD authentication rejection."
+  [raw]
+  (let [bs (b/to-bytes raw)
+        len (b/blength bs)
+        copy (b/alloc-bytes len)]
+    (b/bcopy! bs 0 copy 0 len)
+    (let [target-idx (dec len)]
+      (b/bset-u8! copy target-idx (bit-xor (b/bget-u8 copy target-idx) 0xFF)))
+    copy))
+
+(defn run-datachannel-packet-drop-sim
+  "Runs a deterministic, pure WebRTC DataChannel packet-drop and retransmission simulation.
+   Establishes client/server endpoints via `dc/create-connection` with simulated DTLS 1.2,
+   recovers from simulated dropped DTLS handshake flight via `:dtls/flight-timeout`,
+   sends `payload-count` Bitecho wire envelopes over SCTP DataChannel stream,
+   injects packet drops (`drop-indices`), bit-flip corruptions (`bitflip-indices`),
+   and out-of-order delivery (`reorder?`), then fires `:sctp/t3-rtx` timeouts until
+   all messages are sequentially delivered and verified."
+  [& [{:keys [seed drop-indices bitflip-indices reorder? payload-count dtls-flight-drop?]
+       :or {seed 20261114
+            drop-indices #{0 2}
+            bitflip-indices #{1}
+            reorder? true
+            payload-count 5
+            dtls-flight-drop? true}}]]
+  (let [rng-a (b/make-rng seed)
+        rng-b (b/make-rng (b/fork-rng rng-a "peer-b"))
+        cert-a (dtls/generate-simulated-cert rng-a)
+        cert-b (dtls/generate-simulated-cert rng-b)
+        base-time 100000
+        client-a (dc/create-connection {:seed seed
+                                        :now-ms base-time
+                                        :simulated-dtls? true
+                                        :cert-data cert-a
+                                        :remote-fingerprint (:fingerprint cert-b)
+                                        :ice-ufrag "AliceUfrag"
+                                        :ice-pwd "AlicePwd"
+                                        :remote-ice-ufrag "BobUfrag"
+                                        :remote-ice-pwd "BobPwd"
+                                        :remote-candidates ["127.0.0.1:5001"]}
+                                       true)
+        client-b (dc/create-connection {:seed (b/random-u64 rng-b)
+                                        :now-ms base-time
+                                        :simulated-dtls? true
+                                        :cert-data cert-b
+                                        :remote-fingerprint (:fingerprint cert-a)
+                                        :ice-ufrag "BobUfrag"
+                                        :ice-pwd "BobPwd"
+                                        :remote-ice-ufrag "AliceUfrag"
+                                        :remote-ice-pwd "AlicePwd"
+                                        :remote-candidates ["127.0.0.1:5000"]}
+                                       false)
+        bh-a (dtls/begin-handshake! (:dtls/engine client-a))
+        bh-b (dtls/begin-handshake! (:dtls/engine client-b))
+        client-a (assoc client-a :dtls/engine (:engine bh-a))
+        client-b (assoc client-b :dtls/engine (:engine bh-b))
+        init-a (-> (dc/handle-timeout client-a :stun/keepalive base-time nil)
+                   (update :network-out into (:packets bh-a))
+                   (assoc-in [:new-state :timers :dtls/flight-timeout] {:expires-at (+ base-time 1000)}))
+        init-b (dc/handle-timeout client-b :stun/keepalive base-time nil)
+        init-a-ser (dc/serialize-network-out init-a)
+        init-b-ser (dc/serialize-network-out init-b)
+        initial-a-out (if dtls-flight-drop? [] (:network-out-bytes init-a-ser []))
+        dtls-dropped-count (if dtls-flight-drop? (count (:network-out-bytes init-a-ser [])) 0)
+
+        ;; Phase 1: Establish DTLS 1.2 Handshake & SCTP Association
+        handshake-res
+        (loop [a (:new-state init-a-ser)
+               b (:new-state init-b-ser)
+               a-out initial-a-out
+               b-out (:network-out-bytes init-b-ser [])
+               dtls-flight-rtx-fired? false
+               tick 0]
+          (let [now (+ base-time (* tick 50))]
+            (if (or (>= tick 80)
+                    (and (= :established (:state a)) (= :established (:state b))))
+              {:state-a a
+               :state-b b
+               :now now
+               :dtls-established? (and (dtls/handshake-finished? (:dtls/engine a))
+                                       (dtls/handshake-finished? (:dtls/engine b)))
+               :sctp-established? (and (= :established (:state a))
+                                       (= :established (:state b)))
+               :dtls-flight-rtx-fired? dtls-flight-rtx-fired?}
+              (let [b-res (reduce (fn [acc item]
+                                    (let [raw (b/to-bytes item)
+                                          rx (dc/serialize-network-out (dc/handle-receive (:state acc) raw now "127.0.0.1:5000"))]
+                                      (-> acc
+                                          (assoc :state (:new-state rx))
+                                          (update :out into (:network-out-bytes rx [])))))
+                                  {:state b :out []}
+                                  a-out)
+                    a-res (reduce (fn [acc item]
+                                    (let [raw (b/to-bytes item)
+                                          rx (dc/serialize-network-out (dc/handle-receive (:state acc) raw now "127.0.0.1:5001"))]
+                                      (-> acc
+                                          (assoc :state (:new-state rx))
+                                          (update :out into (:network-out-bytes rx [])))))
+                                  {:state a :out []}
+                                  b-out)
+                    a-t (reduce (fn [acc [tid timer]]
+                                  (if (>= now (:expires-at timer))
+                                    (let [res (dc/serialize-network-out (dc/handle-timeout (:state acc) tid now (:dtls/engine (:state acc))))]
+                                      (-> acc
+                                          (assoc :state (:new-state res))
+                                          (update :out into (:network-out-bytes res []))
+                                          (cond-> (= tid :dtls/flight-timeout)
+                                            (assoc :dtls-rtx true))))
+                                    acc))
+                                {:state (:state a-res) :out (:out a-res)}
+                                (get-in a-res [:state :timers] {}))
+                    b-t (reduce (fn [acc [tid timer]]
+                                  (if (>= now (:expires-at timer))
+                                    (let [res (dc/serialize-network-out (dc/handle-timeout (:state acc) tid now (:dtls/engine (:state acc))))]
+                                      (-> acc
+                                          (assoc :state (:new-state res))
+                                          (update :out into (:network-out-bytes res []))))
+                                    acc))
+                                {:state (:state b-res) :out (:out b-res)}
+                                (get-in b-res [:state :timers] {}))]
+                (recur (:state a-t)
+                       (:state b-t)
+                       (:out a-t)
+                       (:out b-t)
+                       (or dtls-flight-rtx-fired? (:dtls-rtx a-t false))
+                       (inc tick))))))]
+
+    (if-not (and (:dtls-established? handshake-res) (:sctp-established? handshake-res))
+      {:valid? false
+       :seed seed
+       :dtls-established? (:dtls-established? handshake-res)
+       :sctp-established? (:sctp-established? handshake-res)
+       :error "Failed to establish DTLS/SCTP association"}
+
+      ;; Phase 2: Send `payload-count` Bitecho wire envelopes over DataChannel
+      (let [{:keys [state-a state-b now]} handshake-res
+            sent-envelopes (mapv (fn [i]
+                                   {:type :rendezvous-telemetry
+                                    :seq (long i)
+                                    :sender "alice-dc"
+                                    :payload (str "bitecho-d14-envelope-" i)
+                                    :timestamp (+ now (* i 10))})
+                                 (range payload-count))
+            send-results (reduce (fn [acc env]
+                                   (let [wire (fressian/encode-wire env)
+                                         send-res (-> (dc/send-data (:state acc) wire 0 :webrtc/binary now)
+                                                      (dc/serialize-network-out))]
+                                     (-> acc
+                                         (assoc :state (:new-state send-res))
+                                         (update :packets into (:network-out-bytes send-res [])))))
+                                 {:state state-a :packets []}
+                                 sent-envelopes)
+            initial-client-state (:state send-results)
+            all-outbound-packets (:packets send-results)
+
+            ;; Phase 3: Fault schedule injection (drops, bitflips, reordering)
+            effective-drop-indices (set (filter #(< % (count all-outbound-packets)) drop-indices))
+            effective-bitflip-indices (set (filter (fn [idx]
+                                                     (and (< idx (count all-outbound-packets))
+                                                          (not (contains? effective-drop-indices idx))))
+                                                   bitflip-indices))
+            tagged-packets (map-indexed (fn [idx pkt]
+                                          (cond
+                                            (contains? effective-drop-indices idx)
+                                            {:action :drop :idx idx}
+
+                                            (contains? effective-bitflip-indices idx)
+                                            {:action :bitflip :idx idx :pkt (flip-sim-datachannel-packet pkt)}
+
+                                            :else
+                                            {:action :pass :idx idx :pkt pkt}))
+                                        all-outbound-packets)
+            surviving-packets (remove #(= (:action %) :drop) tagged-packets)
+            scheduled-flight-1 (if reorder? (vec (reverse surviving-packets)) (vec surviving-packets))
+
+            ;; Phase 4: Network Pump with SCTP T3-rtx & SACK Gap Processing
+            sim-delivery
+            (loop [client initial-client-state
+                   server state-b
+                   c->s-pkts (mapv :pkt scheduled-flight-1)
+                   s->c-pkts []
+                   delivered-envelopes []
+                   t3-rtx-count 0
+                   loop-tick 0]
+              (let [t-now (+ now (* loop-tick 100))
+                    client-unacked (long (or (get-in client [:metrics :unacked-data]) 0))]
+                (if (or (>= loop-tick 120)
+                        (and (= (count delivered-envelopes) payload-count)
+                             (zero? client-unacked)))
+                  {:client client
+                   :server server
+                   :delivered delivered-envelopes
+                   :t3-rtx-retransmissions t3-rtx-count
+                   :ticks loop-tick}
+                  (let [srv-rx (reduce (fn [acc pkt-bytes]
+                                         (let [raw (b/to-bytes pkt-bytes)
+                                               rx (-> (dc/handle-receive (:state acc) raw t-now "127.0.0.1:5000")
+                                                      (dc/serialize-network-out))
+                                               evts (:app-events rx)]
+                                           (-> acc
+                                               (assoc :state (:new-state rx))
+                                               (update :out into (:network-out-bytes rx []))
+                                               (update :msgs into (keep (fn [e]
+                                                                          (when (= (:type e) :on-message)
+                                                                            (fressian/decode-wire (:payload e))))
+                                                                        evts)))))
+                                       {:state server :out [] :msgs delivered-envelopes}
+                                       c->s-pkts)
+                        server' (:state srv-rx)
+                        new-delivered (:msgs srv-rx)
+                        srv-replies (:out srv-rx)
+
+                        cli-rx (reduce (fn [acc pkt-bytes]
+                                         (let [raw (b/to-bytes pkt-bytes)
+                                               rx (-> (dc/handle-receive (:state acc) raw t-now "127.0.0.1:5001")
+                                                      (dc/serialize-network-out))]
+                                           (-> acc
+                                               (assoc :state (:new-state rx))
+                                               (update :out into (:network-out-bytes rx [])))))
+                                       {:state client :out []}
+                                       (concat s->c-pkts srv-replies))
+                        client' (:state cli-rx)
+                        cli-replies (:out cli-rx)
+
+                        t3-timer (get-in client' [:timers :sctp/t3-rtx])
+                        t3-due? (and t3-timer (>= t-now (:expires-at t3-timer)))
+                        cli-t3 (if t3-due?
+                                 (let [t-res (-> (dc/handle-timeout client' :sctp/t3-rtx t-now (:dtls/engine client'))
+                                                 (dc/serialize-network-out))]
+                                   {:state (:new-state t-res)
+                                    :out (:network-out-bytes t-res [])
+                                    :fired? true})
+                                 {:state client' :out [] :fired? false})
+                        client'' (:state cli-t3)
+                        t3-out (:out cli-t3)
+                        new-t3-count (if (:fired? cli-t3) (inc t3-rtx-count) t3-rtx-count)
+
+                        srv-sack-timer (get-in server' [:timers :sctp/t-delayed-sack])
+                        srv-sack-due? (and srv-sack-timer (>= t-now (:expires-at srv-sack-timer)))
+                        srv-sack (if srv-sack-due?
+                                   (let [t-res (-> (dc/handle-timeout server' :sctp/t-delayed-sack t-now (:dtls/engine server'))
+                                                   (dc/serialize-network-out))]
+                                     {:state (:new-state t-res) :out (:network-out-bytes t-res [])})
+                                   {:state server' :out []})
+                        server'' (:state srv-sack)
+                        srv-delayed-sacks (:out srv-sack)]
+                    (recur client''
+                           server''
+                           (into cli-replies t3-out)
+                           srv-delayed-sacks
+                           new-delivered
+                           new-t3-count
+                           (inc loop-tick))))))
+
+            delivered (:delivered sim-delivery)
+            final-client (:client sim-delivery)
+            unacked-remaining (long (or (get-in final-client [:metrics :unacked-data]) 0))
+            order-matches? (= (mapv :seq sent-envelopes) (mapv :seq delivered))
+            valid? (and (:dtls-established? handshake-res)
+                        (:sctp-established? handshake-res)
+                        (= payload-count (count delivered))
+                        order-matches?
+                        (zero? unacked-remaining))]
+        {:valid? valid?
+         :seed seed
+         :dtls-established? true
+         :sctp-established? true
+         :dtls-flight-dropped-count dtls-dropped-count
+         :dtls-flight-rtx-recovered? (:dtls-flight-rtx-fired? handshake-res)
+         :dropped-packets-count (count effective-drop-indices)
+         :bitflipped-packets-count (count effective-bitflip-indices)
+         :t3-rtx-retransmissions (:t3-rtx-retransmissions sim-delivery)
+         :sent-count payload-count
+         :delivered-count (count delivered)
+         :delivered-order-matches? order-matches?
+         :client-unacked-remaining unacked-remaining}))))
