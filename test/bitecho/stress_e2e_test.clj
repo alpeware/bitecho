@@ -252,6 +252,24 @@
       (is (:converged-after-remove? res))
       (is (:all-passed? res))))
 
+  (testing "late-joining validator recovering 16 ancestors at epoch 26 (oldest-epoch=10, newest-epoch=25 > 16) executes finalized blocks without stalling"
+    (let [blocks (into {}
+                       (for [ep (range 10 26)
+                             :let [h (str "b-" ep)
+                                   p (str "b-" (dec ep))]]
+                         [h {:epoch ep :parent-hash p :payload []}]))
+          finalized (set (for [ep (range 10 25)] (str "b-" ep)))
+          st {:epoch 26
+              :blocks blocks
+              :finalized-blocks finalized
+              :executed-finalized-blocks #{}
+              :latest-finalized-block-hash "b-24"
+              :last-executed-finalized-epoch 0
+              :config {:max-ancestor-sync-depth 16}}
+          exec-st (sm/execute-finalized-blocks st)]
+      (is (= 24 (:last-executed-finalized-epoch exec-st)))
+      (is (= 1 (get-in exec-st [:diagnostics :finalized-ancestor-gap-recovered] 0)))))
+
   (testing "live-testnet/reconfigure-live-validator! adds and removes validators with treasury signature"
     (let [topo (workload/build-topology)
           tmp-boot (File/createTempFile "bitecho-d15-boot-" ".edn")

@@ -1580,7 +1580,8 @@
                                           (conj visited curr)
                                           (cons (assoc b :hash curr) acc))
                                    (let [oldest-epoch (long (or (:epoch (first acc)) 0))
-                                         gap-depth (- oldest-epoch last-exec)]
+                                         newest-epoch (long (or (:epoch (last acc)) oldest-epoch))
+                                         gap-depth (- newest-epoch last-exec)]
                                      (if (and (seq acc)
                                               (contains? finalized-set latest-hash)
                                               (> gap-depth max-sync-depth))
