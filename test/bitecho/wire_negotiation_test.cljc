@@ -22,7 +22,6 @@
             [bitecho.sieve.core :as sieve]
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
-            #?(:clj [taoensso.nippy :as nippy])
             #?(:clj [clojure.test :refer [deftest is testing]]
                :cljs [cljs.test :refer-macros [deftest is testing]])
             #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
@@ -175,12 +174,11 @@
 
 #?(:clj
    (deftest test-legacy-nippy-wire-decoding-on-jvm
-     (testing "JVM decode-wire transparently decodes legacy Nippy-encoded payloads"
-       (let [legacy-data {:hello "nippy-wire" :number 99}
-             nippy-bytes (nippy/freeze legacy-data)
-             _ (is (fressian/nippy-payload? nippy-bytes))
-             decoded (fressian/decode-wire nippy-bytes)]
-         (is (= legacy-data decoded))))))
+     (testing "JVM decode-wire and decode reject legacy Nippy-encoded payloads fail-closed"
+       (let [nippy-bytes (byte-array [78 80 89 0 1 2 3 4])]
+         (is (fressian/nippy-payload? nippy-bytes))
+         (is (nil? (fressian/decode-wire nippy-bytes)))
+         (is (nil? (fressian/decode nippy-bytes)))))))
 
 ;; =============================================================================
 ;; 2. Step 9B: Wire Format Versioning & Rolling Upgrade Rejection Tests

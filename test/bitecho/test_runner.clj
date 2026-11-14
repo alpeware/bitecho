@@ -51,6 +51,7 @@
             [bitecho.state-machine-ttl-test]
             [bitecho.streamlet.core-test]
             [bitecho.streamlet.fuzz-test]
+            [bitecho.stress-e2e-test]
             [bitecho.tokenomics-v2-e2e-test]
             [bitecho.wire-negotiation-test]
             [clojure.string :as str]

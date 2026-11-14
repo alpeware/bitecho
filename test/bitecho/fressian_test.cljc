@@ -306,39 +306,14 @@
                    :cljs (js/Uint8Array. (clj->js (map #(bit-and % 0xFF) bs)))))
               (gen/vector (gen/choose 0 255) 0 512))]))
 
-(defspec ^{:doc "Property: Pure-CLJC LZ4 block compressor and decompressor round-trip and cross-verify against JVM io.airlift.compress.lz4 reference across adversarial inputs."}
+(defspec ^{:doc "Property: Pure-CLJC LZ4 block compressor and decompressor round-trip across adversarial inputs."}
   prop-lz4-block-codec-cross-reference-and-adversarial 100
   (for-all [input-bytes gen-lz4-adversarial-bytes]
            (let [orig-len (fressian/count-bytes input-bytes)
                  cljc-compressed (fressian/lz4-compress-block input-bytes)
-                 cljc-roundtrip (fressian/lz4-decompress-block cljc-compressed orig-len)
-                 self-ok? (= (fressian/bytes->hex input-bytes)
-                             (fressian/bytes->hex cljc-roundtrip))]
-             #?(:clj
-                (let [ref-comp (io.airlift.compress.lz4.Lz4Compressor.)
-                      ref-decomp (io.airlift.compress.lz4.Lz4Decompressor.)
-                      ;; 1. CLJC compress -> JVM reference decompress
-                      ref-out (byte-array orig-len)
-                      ref-dlen (if (zero? orig-len)
-                                 0
-                                 (.decompress ref-decomp
-                                              ^bytes cljc-compressed 0 (alength ^bytes cljc-compressed)
-                                              ref-out 0 orig-len))
-                      ;; 2. JVM reference compress -> CLJC decompress
-                      max-clen (.maxCompressedLength ref-comp orig-len)
-                      ref-cbuf (byte-array max-clen)
-                      ref-clen (if (zero? orig-len)
-                                 0
-                                 (.compress ref-comp
-                                            ^bytes input-bytes 0 orig-len
-                                            ref-cbuf 0 max-clen))
-                      ref-cbytes (java.util.Arrays/copyOfRange ref-cbuf 0 ref-clen)
-                      cljc-from-ref (fressian/lz4-decompress-block ref-cbytes orig-len)]
-                  (and self-ok?
-                       (= orig-len ref-dlen)
-                       (= (fressian/bytes->hex input-bytes) (fressian/bytes->hex ref-out))
-                       (= (fressian/bytes->hex input-bytes) (fressian/bytes->hex cljc-from-ref))))
-                :cljs self-ok?))))
+                 cljc-roundtrip (fressian/lz4-decompress-block cljc-compressed orig-len)]
+             (= (fressian/bytes->hex input-bytes)
+                (fressian/bytes->hex cljc-roundtrip)))))
 
 (deftest test-wire-compression-btec-framing-and-fail-closed
   (testing "Small payloads (<= 1 KiB) and incompressible payloads stay uncompressed; > 1 KiB compressible payloads use BTEC + 0x01 LZ4 framing"

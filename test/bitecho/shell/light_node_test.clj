@@ -18,8 +18,7 @@
             [clojure.test.check.properties :as prop]
             [datachannel.api :as api]
             [datachannel.core :as dc-core]
-            [datachannel.mdns :as mdns]
-            [taoensso.nippy :as nippy])
+            [datachannel.mdns :as mdns])
   (:import [java.io PrintWriter StringWriter]
            [java.net ServerSocket Socket]
            [java.nio.charset StandardCharsets]
@@ -1510,7 +1509,7 @@
                        :seq seq-num
                        :nonce (basalt/bytes->hex (:nonce sealed-m))
                        :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
-          orig-env (agent-sim/build-gossip-envelope pub-hex priv-bytes (nippy/freeze msg-payload) 500)
+          orig-env (agent-sim/build-gossip-envelope pub-hex priv-bytes (fressian/encode-wire msg-payload) 500)
           orig-msg-id (get-in orig-env [:event :message :message-id])
           session {:session-id sid
                    :peer peer-pub
@@ -1597,7 +1596,7 @@
                        :seq 1
                        :nonce "010203"
                        :ciphertext "aabbcc"}
-          orig-env (agent-sim/build-gossip-envelope pub priv (nippy/freeze msg-payload) 500)
+          orig-env (agent-sim/build-gossip-envelope pub priv (fressian/encode-wire msg-payload) 500)
           orig-msg-id (get-in orig-env [:event :message :message-id])
           st-base {:pubkey pub
                    :epoch 5
@@ -1678,7 +1677,7 @@
                                                    :session-id sid
                                                    :seq i
                                                    :payload (str "msg-" i)}
-                                              env (agent-sim/build-gossip-envelope pub priv (nippy/freeze msg) 500)]
+                                              env (agent-sim/build-gossip-envelope pub priv (fressian/encode-wire msg) 500)]
                                           [i {:seq i :msg-payload msg :burn 500 :gossip-env env}])))
                       outbox-order (vec (range 1 (inc outbox-count)))
                       st-init {:pubkey pub
@@ -2232,7 +2231,7 @@
             (.delete f)))))))
 
 (deftest test-m2a-state-fressian-and-legacy-nippy-migration
-  (testing "M2a: state.fressian is written by default and legacy state.nippy is transparently migrated on load"
+  (testing "D15: state.fressian is written by default and legacy Nippy ('NPY') bytes are rejected fail-closed with :legacy-nippy-snapshot-rejected diagnostic"
     (let [temp-dir (Files/createTempDirectory "bitecho-m2a-state-" (into-array FileAttribute []))
           state-dir (str temp-dir)
           fressian-file (str (io/file state-dir "state.fressian"))
@@ -2242,30 +2241,33 @@
                   (assoc-in [:local-accounting :burned-ech] 1500)
                   (assoc :connected? true :connection-error "should-be-stripped"))]
       (try
-        ;; 1. Write legacy Nippy bytes directly to state.nippy
+        ;; 1. Write legacy Nippy magic header bytes directly to state.fressian and state.nippy
         (Files/write (.toPath (io/file nippy-file))
-                     ^bytes (nippy/freeze (light-shell/strip-sensitive-keys st0))
+                     (byte-array [78 80 89 0 1 2 3 4])
                      (into-array java.nio.file.OpenOption []))
-        ;; 2. Loading state.fressian transparently falls back to legacy state.nippy
-        (let [migrated (light-shell/load-light-state! fressian-file)]
-          (is (some? migrated))
-          (is (= 77 (:epoch migrated)))
-          (is (= 1500 (get-in migrated [:local-accounting :burned-ech])))
-          (is (not (contains? migrated :connected?))))
-        ;; 3. Saving to state.fressian writes canonical Fressian bytes (non-NPY header) and does NOT overwrite legacy state.nippy (M2a-2)
+        (Files/write (.toPath (io/file fressian-file))
+                     (byte-array [78 80 89 0 1 2 3 4])
+                     (into-array java.nio.file.OpenOption []))
+        ;; 2. Loading state.fressian containing NPY bytes fails closed and records counted :diagnose
+        (let [diag-atom (atom [])
+              st-atom (atom {})
+              conn-atom (atom (light-shell/init-conn-state))
+              loaded (light-shell/load-light-state! fressian-file {:diagnostics-atom diag-atom
+                                                                   :state-atom st-atom
+                                                                   :conn-atom conn-atom})]
+          (is (nil? loaded))
+          (is (= :legacy-nippy-snapshot-rejected (:reason (first @diag-atom))))
+          (is (= 1 (get-in @st-atom [:diagnostics :legacy-nippy-snapshot-rejected])))
+          (is (pos? (get (light-shell/get-light-state-load-diagnostics) :legacy-nippy-snapshot-rejected 0))))
+        ;; 3. Saving to state.fressian writes canonical Fressian bytes (non-NPY header) and reloads cleanly
         (light-shell/save-light-state! fressian-file (assoc st0 :epoch 88))
         (is (.exists (io/file fressian-file)))
         (let [raw-bytes (Files/readAllBytes (.toPath (io/file fressian-file)))
-              nippy-bytes (Files/readAllBytes (.toPath (io/file nippy-file)))
               reloaded (light-shell/load-light-state! fressian-file)]
-          (is (not (and (= 78 (aget raw-bytes 0))
-                        (= 80 (aget raw-bytes 1))
-                        (= 89 (aget raw-bytes 2)))))
-          (is (and (= 78 (aget nippy-bytes 0))
-                   (= 80 (aget nippy-bytes 1))
-                   (= 89 (aget nippy-bytes 2)))
-              "M2a-2: legacy state.nippy retains original NPY header rather than being overwritten with Fressian bytes")
+          (is (not (fressian/nippy-payload? raw-bytes)))
           (is (= 88 (:epoch reloaded)))
+          (is (= 1500 (get-in reloaded [:local-accounting :burned-ech])))
+          (is (not (contains? reloaded :connected?)))
           (is (= 88 (:epoch (light-core/decode-light-state raw-bytes)))))
         (finally
           (doseq [f (reverse (file-seq (.toFile temp-dir)))]

@@ -20,8 +20,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [datachannel.api :as api]
-            [datachannel.dtls :as dtls]
-            [taoensso.nippy :as nippy])
+            [datachannel.dtls :as dtls])
   (:import [java.io File]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files]
@@ -165,8 +164,8 @@
                       agent-priv (:private kp)
                       other-kp (crypto/generate-keypair)
                       env (mesh/wrap-agent-event event agent-pub agent-priv)
-                      frozen-bytes (nippy/freeze env)
-                      thawed-env (nippy/thaw frozen-bytes)
+                      frozen-bytes (fressian/encode-wire env)
+                      thawed-env (fressian/decode-wire frozen-bytes)
                       unwrapped (mesh/unwrap-authenticated-agent-event env)
                       unwrapped-frozen (mesh/unwrap-authenticated-agent-event frozen-bytes)
                       unwrapped-thawed (mesh/unwrap-authenticated-agent-event thawed-env)
@@ -177,7 +176,7 @@
                                             (when (bytes? payload)
                                               (let [cloned (byte-array payload)]
                                                 (aset cloned 0 (unchecked-byte (bit-xor (aget cloned 0) 1)))
-                                                (assoc-in (nippy/thaw (nippy/freeze env)) [:event :message :payload] cloned))))]
+                                                (assoc-in (fressian/decode-wire (fressian/encode-wire env)) [:event :message :payload] cloned))))]
                   (and (= (:type unwrapped) (:type event))
                        (= (:sender unwrapped) agent-pub)
                        (= (vec (:sender-pubkey-bytes unwrapped)) (vec (:public kp)))
@@ -530,6 +529,8 @@
                                   {:type t :payload p :message-id "msg-1"})
                     :submit-vouchers (let [ack (rendezvous/create-delivery-ack priv pub :node1 1 "offer-hash" 1 10)]
                                        {:type t :vouchers [ack]})
+                    :signaling-burn {:type t :sender pub :burn 100}
+                    :reconfigure-membership {:type t :receipt {:epoch 1 :validators [pub] :mesh-nodes #{pub} :signature "deadbeef"}}
                     {:type t :sample "data"})
               env (mesh/wrap-agent-event evt pub priv)
               res (mesh/unwrap-authenticated-agent-event env)]
@@ -832,7 +833,7 @@
         sieve-msg (assoc raw-sieve-msg :message-id "msg-sieve-1")
         event {:type :receive-gossip :message sieve-msg}
         envelope (mesh/wrap-agent-event event agent-pub agent-priv)
-        frozen (nippy/freeze envelope)
+        frozen (fressian/encode-wire envelope)
         unwrapped (mesh/unwrap-authenticated-agent-event frozen)]
     (is (some? unwrapped))
     (is (= (:sender unwrapped) agent-pub))
@@ -856,7 +857,7 @@
         (is (contains? (:messages new-state) (basalt/bytes->hex (crypto/sha256 payload))))))
 
     (testing "mutating 1 byte of payload causes unwrap to return nil"
-      (let [thawed (nippy/thaw frozen)
+      (let [thawed (fressian/decode-wire frozen)
             pl (get-in thawed [:event :message :payload])
             mutated-pl (byte-array pl)]
         (aset mutated-pl 0 (unchecked-byte (bit-xor (aget mutated-pl 0) 1)))
@@ -960,7 +961,7 @@
         ;; Test on-message with :keepalive updates last-rx-at and does not put to network-in
         (let [t1 (mesh/conn-last-rx-at (get @peer-conns peer-pk))]
           (Thread/sleep 2)
-          (on-msg {:payload (nippy/freeze {:type :keepalive})})
+          (on-msg {:payload (fressian/encode-wire {:type :keepalive})})
           (let [c (get @peer-conns peer-pk)]
             (is (> (mesh/conn-last-rx-at c) t1))
             (is (nil? (async/poll! network-in)))))
@@ -968,7 +969,7 @@
         ;; Test on-message with regular event puts to network-in
         (let [t2 (mesh/conn-last-rx-at (get @peer-conns peer-pk))]
           (Thread/sleep 2)
-          (on-msg {:payload (nippy/freeze {:type :receive-gossip :data "hello"})})
+          (on-msg {:payload (fressian/encode-wire {:type :receive-gossip :data "hello"})})
           (let [c (get @peer-conns peer-pk)]
             (is (> (mesh/conn-last-rx-at c) t2))
             (let [received (async/poll! network-in)]
@@ -1212,8 +1213,8 @@
           handler (#'mesh/make-agent-connection-handler shell-node agent-conns)
           node-1 {:id :agent-node-1}
           node-2 {:id :agent-node-2}
-          valid-env (nippy/freeze (mesh/wrap-agent-event {:type :receive-summary :epoch 1 :summary "s1"} agent-pub agent-priv))
-          valid-env-2 (nippy/freeze (mesh/wrap-agent-event {:type :receive-summary :epoch 2 :summary "s2"} agent-pub agent-priv))]
+          valid-env (fressian/encode-wire (mesh/wrap-agent-event {:type :receive-summary :epoch 1 :summary "s1"} agent-pub agent-priv))
+          valid-env-2 (fressian/encode-wire (mesh/wrap-agent-event {:type :receive-summary :epoch 2 :summary "s2"} agent-pub agent-priv))]
       (with-redefs [api/set-callbacks! (fn [n cbs] (swap! cbs-map assoc n cbs))
                     api/close! (fn [n] (swap! closed-nodes conj n))]
         ;; 1. First agent connection accepted and authenticates
@@ -1264,8 +1265,8 @@
           handler (mesh/make-agent-connection-handler shell-node agent-conns nil val-ident)
           persistent-node {:id :persistent-agent-node}
           query-node {:id :ephemeral-query-node}
-          persistent-env (nippy/freeze (mesh/wrap-agent-event {:type :receive-summary :epoch 1 :summary "s1"} agent-pub agent-priv))
-          query-env (nippy/freeze (mesh/wrap-agent-event {:type :query-chain-state :pubkey agent-pub :nonce "test-nonce"} agent-pub agent-priv))]
+          persistent-env (fressian/encode-wire (mesh/wrap-agent-event {:type :receive-summary :epoch 1 :summary "s1"} agent-pub agent-priv))
+          query-env (fressian/encode-wire (mesh/wrap-agent-event {:type :query-chain-state :pubkey agent-pub :nonce "test-nonce"} agent-pub agent-priv))]
       (with-redefs [api/set-callbacks! (fn [n cbs] (swap! cbs-map assoc n cbs))
                     api/close! (fn [n] (swap! closed-nodes conj n))
                     api/send! (fn [node payload cid] (swap! sent-messages conj {:node node :payload payload :channel-id cid}))]
@@ -1369,7 +1370,7 @@
         (is (= 2 (count @sends)) "No duplicate messages sent on second replay")
 
         ;; 3. Forward new gossip to agents
-        (let [frozen-m3 (nippy/freeze {:type :receive-gossip :message {:message-id "m3" :content "hello-3"}})]
+        (let [frozen-m3 (fressian/encode-wire {:type :receive-gossip :message {:message-id "m3" :content "hello-3"}})]
           (#'mesh/forward-gossip-to-agents! agent-conns frozen-m3 nil)
           (is (= 3 (count @sends)) "m3 sent on first forward")
           (is (contains? (mesh/conn-sent-msg-ids (get @agent-conns agent-pub)) "m3"))
@@ -1691,13 +1692,10 @@
           b (fressian/encode-wire m)]
       (is (identical? b (mesh/ensure-fressian-wire-bytes b)))))
 
-  (testing "ensure-fressian-wire-bytes transcode-re-encodes legacy Nippy payload to Fressian"
-    (let [m {:type :legacy :val "ok"}
-          nippy-bytes (taoensso.nippy/freeze m)
-          fressian-bytes (mesh/ensure-fressian-wire-bytes nippy-bytes)]
-      (is (bytes? fressian-bytes))
-      (is (not (fressian/nippy-payload? fressian-bytes)))
-      (is (= m (fressian/decode-wire fressian-bytes)))))
+  (testing "ensure-fressian-wire-bytes rejects legacy Nippy payload fail-closed"
+    (let [nippy-bytes (byte-array [78 80 89 0 1 2 3 4])]
+      (is (fressian/nippy-payload? nippy-bytes))
+      (is (nil? (mesh/ensure-fressian-wire-bytes nippy-bytes)))))
 
   (testing "ensure-fressian-wire-bytes returns nil for arbitrary garbage byte arrays"
     (let [garbage1 (byte-array [0x01 0x02 0x03 0x04])

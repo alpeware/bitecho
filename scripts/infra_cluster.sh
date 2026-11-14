@@ -209,8 +209,15 @@ cutover_single_node() {
   local ip="${NODE_IPS[$node]}"
   echo "=== Cutting over ${node} (${ip}) to unified bitecho infra-node ==="
 
-  ssh_ns "$node" bash -s << 'REMOTE_CUT'
+  ssh_ns "$node" bash -s << REMOTE_CUT
 set -euo pipefail
+if [[ "${RESET_VALIDATOR_STATE:-0}" == "1" ]]; then
+  echo "  Archiving and resetting validator state snapshot on ${node}..."
+  sudo rm -rf /var/lib/clj-web/state/*
+elif [[ -f "/var/lib/clj-web/state/snapshot-${node}.edn" ]] && head -c 3 "/var/lib/clj-web/state/snapshot-${node}.edn" 2>/dev/null | grep -q "^NPY"; then
+  echo "  Archiving legacy Nippy validator snapshot on ${node} before Fressian boot..."
+  sudo rm -rf /var/lib/clj-web/state/*
+fi
 echo "  Running idempotent state migration on /var/lib/clj-web..."
 sudo -u cljweb /opt/jdk-25/bin/java \
   -Xms128m -Xmx256m \
@@ -357,7 +364,7 @@ REMOTE_ID
       agent_count=$((agent_count + 1))
     fi
   done
-  local custody_bal=$((4194000000 - agent_count * 1000000))
+  local custody_bal=$((4194000000 - agent_count * 1000000 - 2850000))
 
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
@@ -421,6 +428,14 @@ REMOTE_ID
                               "${PUBKEYS[ns1]}" {:balance 1000000 :seq 0 :deps []}
                               "${PUBKEYS[ns2]}" {:balance 1000000 :seq 0 :deps []}
                               "${PUBKEYS[ns3]}" {:balance 1000000 :seq 0 :deps []}
+                              "302a300506032b6570032100e6fb9542cab052ca0a766ca3e62a9710a4878b0755d6692abcbe301041d10c0e" {:balance 1000000 :seq 0 :deps []}
+                              "302a300506032b65700321006642f780b64b85fac5728e8f2dd4a98e6e53b1722a2c0917c0c7ef0189c19b08" {:balance 500000 :seq 0 :deps []}
+                              "302a300506032b6570032100e0c42229a77cc99152ec454b196cd5f69cd1fae9d0c80895d1e9fafe8fda1a63" {:balance 200000 :seq 0 :deps []}
+                              "302a300506032b6570032100bc6b7f02c896caf209b3574b4f2b8c7f7734f86ccdec50b3b1865092b75daa62" {:balance 200000 :seq 0 :deps []}
+                              "302a300506032b6570032100575926a259d0266da304dd7be98f4518e4a2beb1bee58803ff1cb379113acbb7" {:balance 150000 :seq 0 :deps []}
+                              "302a300506032b65700321004585687db75ca86bcd74c302763cb78952d2603cd7595f4204332dd6346d8127" {:balance 400000 :seq 0 :deps []}
+                              "302a300506032b6570032100d41ac4a9177126260efc632218f4098733973aaed6f8a0850396a294593b47ba" {:balance 300000 :seq 0 :deps []}
+                              "302a300506032b657003210063560420a577848e3e9747bc7cca62f7ccd4c9c0fc515b5323de68bb3a76ecaa" {:balance 100000 :seq 0 :deps []}
 $(printf "%b" "${agent_ledger_lines}")}
              :http {:enabled? true
                     :host "127.0.0.1"
@@ -431,13 +446,14 @@ $(printf "%b" "${agent_ledger_lines}")}
              :protocol {:tick-interval-ms 10000
                         :epoch-length-ms 10000
                         :nodes #{:node1 :node2 :node3 :ns1 :ns2 :ns3}
-                        :validator-count 6
-                        :quorum-threshold 4}
+                        :validator-count 3
+                        :quorum-threshold 2}
              :cluster {:port 5000
                        :agent-port 5010
                        :agent-tcp-port 5010
                        :listen-agents? true
-                       :validators ["${NODE1_PUB}" "${NODE2_PUB}" "${NODE3_PUB}" "${PUBKEYS[ns1]}" "${PUBKEYS[ns2]}" "${PUBKEYS[ns3]}"]
+                       :validators ["${NODE1_PUB}" "${NODE2_PUB}" "${NODE3_PUB}"]
+                       :mesh-nodes {"${NODE1_PUB}" 1.0 "${NODE2_PUB}" 1.0 "${NODE3_PUB}" 1.0 "${PUBKEYS[ns1]}" 1.0 "${PUBKEYS[ns2]}" 1.0 "${PUBKEYS[ns3]}" 1.0}
                        :nodes {:node1 {:ip "35.212.129.138" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${NODE1_PUB}" :fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B" :ice-ufrag "1ec0ae74" :ice-pwd "d928f1aac56a0d6e6fdda551"}
                                :node2 {:ip "35.206.120.143" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${NODE2_PUB}" :fingerprint "F8:73:94:91:1D:7B:CA:66:D9:67:9E:4B:72:B0:D0:8D:5F:5C:37:0F:FE:04:2E:ED:86:E6:8D:79:B8:07:43:78" :ice-ufrag "18388497" :ice-pwd "20540a60217702b8869d7bf5"}
                                :node3 {:ip "35.211.71.139" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${NODE3_PUB}" :fingerprint "38:2B:18:4B:23:E8:F4:32:D7:08:5A:2A:A4:45:4F:EE:12:D4:51:B1:9B:2D:66:7C:2E:E1:2A:3E:7C:B3:60:40" :ice-ufrag "4b1d8fc5" :ice-pwd "47e794a9ed5ef04cc0ebbe7f"}

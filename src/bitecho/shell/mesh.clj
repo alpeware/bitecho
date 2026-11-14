@@ -85,10 +85,12 @@
     :receive-offer-header
     :on-deliver
     :submit-vouchers
+    :signaling-burn
     :settle-intent
     :lock-intent
     :release-intent
     :refund-intent
+    :reconfigure-membership
     :query-chain-state})
 
 (defn canonicalize-for-signing
@@ -260,13 +262,40 @@
                                     :sender-pubkey-bytes agent-pub-bytes
                                     :rng (java.util.Random.)))))
 
+                     :signaling-burn
+                     (let [sender (:sender base-event)
+                           amt (or (:burn base-event) (:burn-amount base-event))]
+                       (when (and (or (nil? sender) (= sender agent-pub-hex))
+                                  (or (nil? amt) (and (integer? amt) (pos? amt))))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
+
+                     :reconfigure-membership
+                     (let [raw-rcpt (or (:receipt base-event) base-event)
+                           vals-coll (:validators raw-rcpt)
+                           mesh-coll (:mesh-nodes raw-rcpt)
+                           sig (:signature raw-rcpt)]
+                       (when (and (coll? vals-coll)
+                                  (seq vals-coll)
+                                  (some? mesh-coll)
+                                  (string? sig)
+                                  (not (str/blank? sig)))
+                         (-> base-event
+                             (dissoc :sender :sender-pubkey-bytes :rng)
+                             (assoc :sender agent-pub-hex
+                                    :sender-pubkey-bytes agent-pub-bytes
+                                    :rng (java.util.Random.)))))
+
                      :lock-intent
                      (let [payer (:payer base-event)
                            receiver (:receiver base-event)
                            amount (:amount base-event)
-                           deliverable-hash (:deliverable-hash base-event)
+                           deliverable-hash (or (:deliverable-hash base-event) (:puzzle-hash base-event))
                            expires-epoch (:expires-epoch base-event)
-                           created-epoch (or (:created-epoch base-event) (:epoch base-event) 0)]
+                           created-epoch (or (:created-epoch base-event) (:epoch base-event))]
                        (when (and (or (nil? payer) (= payer agent-pub-hex))
                                   (string? receiver)
                                   (not (str/blank? receiver))
@@ -276,15 +305,17 @@
                                   (string? deliverable-hash)
                                   (escrow/valid-deliverable-hash? deliverable-hash)
                                   (integer? expires-epoch)
-                                  (integer? created-epoch)
-                                  (> expires-epoch created-epoch))
-                         (-> base-event
-                             (dissoc :sender :sender-pubkey-bytes :rng)
-                             (assoc :sender agent-pub-hex
-                                    :payer agent-pub-hex
-                                    :created-epoch created-epoch
-                                    :sender-pubkey-bytes agent-pub-bytes
-                                    :rng (java.util.Random.)))))
+                                  (if (some? created-epoch)
+                                    (and (integer? created-epoch) (> expires-epoch created-epoch))
+                                    (pos? expires-epoch)))
+                         (cond-> (-> base-event
+                                     (dissoc :sender :sender-pubkey-bytes :rng)
+                                     (assoc :sender agent-pub-hex
+                                            :payer agent-pub-hex
+                                            :sender-pubkey-bytes agent-pub-bytes
+                                            :rng (java.util.Random.)))
+                           (some? created-epoch)
+                           (assoc :created-epoch created-epoch))))
 
                      :release-intent
                      (let [escrow-id (:escrow-id base-event)
@@ -484,8 +515,20 @@
         nodes-cfg (get cluster-cfg :nodes {})
         raw-validators (or (:validators cluster-cfg) (keys nodes-cfg))
         validators (vec (sort (keep (fn [v] (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)) raw-validators)))
-        mesh-nodes (or (:mesh-nodes cluster-cfg)
-                       (into {} (map (fn [pk] [pk 1.0]) validators)))
+        raw-mesh (:mesh-nodes cluster-cfg)
+        mesh-nodes (cond
+                     (map? raw-mesh)
+                     (into {} (keep (fn [[k w]]
+                                      (let [pk (if (keyword? k) (get-in nodes-cfg [k :pubkey]) k)]
+                                        (when pk [pk (double (or w 1.0))])))
+                                    raw-mesh))
+                     (coll? raw-mesh)
+                     (into {} (keep (fn [v]
+                                      (let [pk (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)]
+                                        (when pk [pk 1.0])))
+                                    raw-mesh))
+                     :else
+                     (into {} (map (fn [pk] [pk 1.0]) validators)))
         peer-entries (for [[_ ninfo] nodes-cfg
                            :let [pk (:pubkey ninfo)
                                  pk-bytes (resolve-pubkey-bytes pk)]
@@ -562,7 +605,20 @@
         raw-validators (or (:validators cluster-cfg) (keys nodes-cfg))
         cfg-validators (vec (sort (keep (fn [v] (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)) raw-validators)))
         effective-validators (if (seq cfg-validators) cfg-validators (:validators loaded-state))
-        effective-mesh-nodes (or (:mesh-nodes cluster-cfg)
+        raw-mesh (:mesh-nodes cluster-cfg)
+        cfg-mesh-nodes (cond
+                         (map? raw-mesh)
+                         (into {} (keep (fn [[k w]]
+                                          (let [pk (if (keyword? k) (get-in nodes-cfg [k :pubkey]) k)]
+                                            (when pk [pk (double (or w 1.0))])))
+                                        raw-mesh))
+                         (coll? raw-mesh)
+                         (into {} (keep (fn [v]
+                                          (let [pk (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)]
+                                            (when pk [pk 1.0])))
+                                        raw-mesh))
+                         :else nil)
+        effective-mesh-nodes (or (when (seq cfg-mesh-nodes) cfg-mesh-nodes)
                                  (when (seq effective-validators)
                                    (into {} (map (fn [pk] [pk 1.0]) effective-validators)))
                                  (:mesh-nodes loaded-state))
@@ -1363,11 +1419,23 @@
                                     query (.getQuery (.getRequestURI ^HttpExchange exchange))
                                     pubkey (when query
                                              (second (re-find #"(?:^|&)pubkey=([^&]+)" query)))
-                                    resp (if pubkey
+                                    include-escrows? (and query (str/includes? query "include-escrows=true"))
+                                    resp (cond
+                                           pubkey
                                            {:pubkey pubkey
                                             :account (when-let [a (get (:ledger st) pubkey)] (into {} a))
                                             :spendable (sm/spendable-balance st pubkey)
                                             :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
+
+                                           include-escrows?
+                                           {:accounts (into {} (map (fn [[k v]] [k (into {} v)]) (:ledger st)))
+                                            :escrows (into {} (map (fn [[k v]] [k (into {} v)]) (:escrows st)))
+                                            :failed-receipts-count (long (or (:failed-receipts-count st) 0))
+                                            :pending-receipts-count (long (count (or (:pending-receipts st) [])))
+                                            :epoch (long (or (:epoch st) 0))
+                                            :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
+
+                                           :else
                                            {:accounts (into {} (map (fn [[k v]] [k (into {} v)]) (:ledger st)))
                                             :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))})]
                                 [200 (str (pr-str resp) "\n")])
@@ -1451,17 +1519,27 @@
             (log-mesh-error "Failed to send keepalive" e)))))))
 
 (defn check-and-reconnect-peers!
-  "Checks peer datachannel health and attempts reconnect if closed, stalled during handshake, or quiet past timeout-ms."
+  "Checks peer datachannel health and attempts reconnect if closed, stalled during handshake, or quiet past timeout-ms.
+   Respects dynamic membership changes in [:state-atom :peers-map], shutting down connections to removed peers."
   ([ctx]
    (check-and-reconnect-peers! ctx 20000 (System/currentTimeMillis)))
   ([ctx timeout-ms]
    (check-and-reconnect-peers! ctx timeout-ms (System/currentTimeMillis)))
   ([ctx timeout-ms now-ms]
-   (let [{:keys [nodes-cfg node-id peer-conns]} ctx]
+   (let [{:keys [nodes-cfg node-id peer-conns shell-node]} ctx
+         active-peers-map (when-let [sa (:state-atom shell-node)]
+                            (:peers-map @sa))
+         enforce-active? (boolean (seq active-peers-map))]
+     (when (and enforce-active? peer-conns)
+       (doseq [[peer-hex conn] @peer-conns
+               :when (and (not (contains? active-peers-map peer-hex))
+                          (not= :down (:phase conn)))]
+         (apply-mesh-conn-event! peer-conns peer-hex {:type :shutdown})))
      (doseq [[pid pcfg] nodes-cfg
              :when (not= pid node-id)
-             :let [peer-hex (:pubkey pcfg)
-                   conn (get @peer-conns peer-hex)
+             :let [peer-hex (:pubkey pcfg)]
+             :when (or (not enforce-active?) (contains? active-peers-map peer-hex))
+             :let [conn (get @peer-conns peer-hex)
                    node (:node conn)
                    st (when node (try (api/get-state node) (catch Exception _ :closed)))
                    cid (when conn (conn-channel-id conn))

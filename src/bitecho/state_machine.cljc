@@ -210,7 +210,7 @@
 
 (defn stage-receipt
   "Stages a receipt into :pending-receipts bounded by :max-pending-receipts.
-   Returns {:ok? true/false :state state}."
+   Returns {:ok? true/false :newly-staged? true/false :receipt receipt :state state}."
   [state receipt]
   (let [max-cap (long (or (get-in state [:config :max-pending-receipts]) 4096))
         max-tracked (long (or (get-in state [:config :max-tracked-receipts]) 10000))
@@ -218,10 +218,10 @@
     (cond
       (or (contains? (or (:known-receipt-ids state) #{}) rid)
           (contains? (or (:executed-receipt-ids state) #{}) rid))
-      {:ok? true :state state}
+      {:ok? true :newly-staged? false :receipt receipt :state state}
 
       (>= (count (or (:pending-receipts state) [])) max-cap)
-      {:ok? false :state state}
+      {:ok? false :newly-staged? false :receipt receipt :state state}
 
       :else
       (let [[next-known next-known-ord] (fifo-track (:known-receipt-ids state)
@@ -229,11 +229,27 @@
                                                     rid
                                                     max-tracked)]
         {:ok? true
+         :newly-staged? true
+         :receipt receipt
          :state (-> state
                     (update :pending-receipts (fnil conj []) receipt)
                     (assoc :known-receipt-ids next-known
                            :known-receipt-order next-known-ord)
                     (update :receipt-seq (fnil inc 0)))}))))
+
+(defn- receipt-gossip-commands
+  "Emits a single-hop :send-receipt command to all peers in :peers-map (excluding self)
+   when a receipt was newly staged in consensus mode (B-CARB-1, A-D15-4)."
+  [state staged]
+  (let [targets (vec (sort (disj (set (keys (:peers-map state))) (:node-pubkey state))))]
+    (if (and (:ok? staged)
+             (:newly-staged? staged)
+             (seq targets)
+             (:receipt staged))
+      [{:type :send-receipt
+        :targets targets
+        :receipt (:receipt staged)}]
+      [])))
 
 (defn extract-burn-window
   "Extracts the trailing burn and settlement take window up to the authoritative anchor epoch,
@@ -391,64 +407,70 @@
 
 (defn apply-epoch-treasury-boundary
   "Executes treasury epoch boundary calculations, applying demand-gated mint
-   and custody drawdowns or sunset burns to the state."
+   and custody drawdowns or sunset burns to the state.
+   Rejects epochs already in :minted-epochs or <= :last-pruned-mint-epoch (B-CARB-5)."
   [state new-epoch]
-  (let [cfg (:config state)
-        treasury-ctx (build-tick-treasury-ctx state new-epoch cfg)
-        res (treasury/process-treasury-epoch treasury-ctx)
-        actual-minted (or (:actual-minted res) 0)
-        epoch-mint (or (:epoch-mint res) 0)
-        mint-dust (or (:mint-dust res) 0)
-        unclaimed-mint (or (:unclaimed-mint res) 0)
-        all-mint-shares (or (:all-mint-shares res) {})
-        state-with-custody (-> (if-let [l (:ledger res)]
-                                 (assoc state :ledger l)
-                                 state)
-                               (assoc :skipped-custody-allocations
-                                      (or (:skipped-allocations res) []))
-                               (assoc :sunset-custody-burned
-                                      (long (or (:sunset-custody-burned res)
-                                                (:sunset-custody-burned state)
-                                                0))))
-        t-priv (or (:treasury-privkey state) (get-in state [:config :treasury-privkey]))
-        t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
-    (cond
-      (and (seq all-mint-shares) (pos? actual-minted) t-priv t-pub)
-      (let [sig (treasury/sign-epoch-mint t-priv new-epoch all-mint-shares mint-dust)]
-        (treasury/apply-epoch-mint state-with-custody
-                                   {:epoch new-epoch
-                                    :epoch-gate epoch-mint
-                                    :mint-dust mint-dust
-                                    :unclaimed-mint unclaimed-mint
-                                    :allocations all-mint-shares
-                                    :treasury-pubkey t-pub
-                                    :signature sig}))
+  (let [minted-epochs (or (:minted-epochs state) #{})
+        last-pruned (long (or (:last-pruned-mint-epoch state) -1))]
+    (if (or (contains? minted-epochs new-epoch)
+            (<= (long new-epoch) last-pruned))
+      state
+      (let [cfg (:config state)
+            treasury-ctx (build-tick-treasury-ctx state new-epoch cfg)
+            res (treasury/process-treasury-epoch treasury-ctx)
+            actual-minted (or (:actual-minted res) 0)
+            epoch-mint (or (:epoch-mint res) 0)
+            mint-dust (or (:mint-dust res) 0)
+            unclaimed-mint (or (:unclaimed-mint res) 0)
+            all-mint-shares (or (:all-mint-shares res) {})
+            state-with-custody (-> (if-let [l (:ledger res)]
+                                     (assoc state :ledger l)
+                                     state)
+                                   (assoc :skipped-custody-allocations
+                                          (or (:skipped-allocations res) []))
+                                   (assoc :sunset-custody-burned
+                                          (long (or (:sunset-custody-burned res)
+                                                    (:sunset-custody-burned state)
+                                                    0))))
+            t-priv (or (:treasury-privkey state) (get-in state [:config :treasury-privkey]))
+            t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))]
+        (cond
+          (and (seq all-mint-shares) (pos? actual-minted) t-priv t-pub)
+          (let [sig (treasury/sign-epoch-mint t-priv new-epoch all-mint-shares mint-dust)]
+            (treasury/apply-epoch-mint state-with-custody
+                                       {:epoch new-epoch
+                                        :epoch-gate epoch-mint
+                                        :mint-dust mint-dust
+                                        :unclaimed-mint unclaimed-mint
+                                        :allocations all-mint-shares
+                                        :treasury-pubkey t-pub
+                                        :signature sig}))
 
-      (and (seq all-mint-shares) (pos? actual-minted) t-pub)
-      ;; JEP-04: Deterministic SMR follower or consensus epoch boundary without local treasury private key
-      (let [total-minted (or (:total-minted state-with-custody) 0)
-            max-cap treasury/max-conditional-mint-supply]
-        (if (<= (+ total-minted actual-minted) max-cap)
-          (let [new-ledger (account/apply-mint (or (:ledger state-with-custody) {}) all-mint-shares)]
-            (-> state-with-custody
-                (assoc :ledger new-ledger)
-                (assoc :total-minted (+ total-minted actual-minted))
-                (update :minted-epochs (fnil conj #{}) new-epoch)
-                (assoc :mint-dust mint-dust)
-                (assoc-in [:epoch-mint-dust new-epoch] mint-dust)
-                (update :unclaimed-mint (fnil + 0) unclaimed-mint)
-                (assoc-in [:epoch-unclaimed-mint new-epoch] unclaimed-mint)))
-          state-with-custody))
+          (and (seq all-mint-shares) (pos? actual-minted) t-pub)
+          ;; JEP-04: Deterministic SMR follower or consensus epoch boundary without local treasury private key
+          (let [total-minted (or (:total-minted state-with-custody) 0)
+                max-cap treasury/max-conditional-mint-supply]
+            (if (<= (+ total-minted actual-minted) max-cap)
+              (let [new-ledger (account/apply-mint (or (:ledger state-with-custody) {}) all-mint-shares)]
+                (-> state-with-custody
+                    (assoc :ledger new-ledger)
+                    (assoc :total-minted (+ total-minted actual-minted))
+                    (update :minted-epochs (fnil conj #{}) new-epoch)
+                    (assoc :mint-dust mint-dust)
+                    (assoc-in [:epoch-mint-dust new-epoch] mint-dust)
+                    (update :unclaimed-mint (fnil + 0) unclaimed-mint)
+                    (assoc-in [:epoch-unclaimed-mint new-epoch] unclaimed-mint)))
+              state-with-custody))
 
-      (and (pos? epoch-mint) t-pub)
-      (-> state-with-custody
-          (assoc :mint-dust mint-dust)
-          (assoc-in [:epoch-mint-dust new-epoch] mint-dust)
-          (update :unclaimed-mint (fnil + 0) unclaimed-mint)
-          (assoc-in [:epoch-unclaimed-mint new-epoch] unclaimed-mint))
+          (and (pos? epoch-mint) t-pub)
+          (-> state-with-custody
+              (assoc :mint-dust mint-dust)
+              (assoc-in [:epoch-mint-dust new-epoch] mint-dust)
+              (update :unclaimed-mint (fnil + 0) unclaimed-mint)
+              (assoc-in [:epoch-unclaimed-mint new-epoch] unclaimed-mint))
 
-      :else
-      state-with-custody)))
+          :else
+          state-with-custody)))))
 
 (defn- block->hash-str
   "Extracts or computes the SHA-256 hash string of a block, hash string, or map."
@@ -573,11 +595,12 @@
       state')))
 
 (defn- prune-rendezvous-retention-state
-  "Prunes :home-sets and :voucher-seqs entries strictly older than rdv-cutoff,
+  "Prunes :home-sets, :voucher-seqs, and :settled-voucher-tuples entries strictly older than rdv-cutoff,
    preserving entries within the active voucher retry window."
   [state rdv-cutoff]
   (let [hs (or (:home-sets state) {})
         vs (or (:voucher-seqs state) {})
+        svt (or (:settled-voucher-tuples state) #{})
         pruned-hs (reduce-kv (fn [m k v]
                                (let [ep (second k)]
                                  (if (and (integer? ep) (< ep rdv-cutoff))
@@ -591,10 +614,55 @@
                                    m
                                    (assoc m k v))))
                              {}
-                             vs)]
+                             vs)
+        pruned-svt (into #{}
+                         (filter (fn [tuple]
+                                   (let [ep (nth tuple 2 nil)]
+                                     (not (and (integer? ep) (< ep rdv-cutoff)))))
+                                 svt))]
     (assoc state
            :home-sets pruned-hs
-           :voucher-seqs pruned-vs)))
+           :voucher-seqs pruned-vs
+           :settled-voucher-tuples pruned-svt)))
+
+(defn prune-treasury-epoch-state
+  "Prunes rolling treasury epoch maps (:epoch-mint-dust, :epoch-unclaimed-mint, :epoch-burns,
+   :epoch-settlement-takes, and :minted-epochs) older than treasury-cutoff, and advances
+   monotonic :last-pruned-mint-epoch (INV-D15-2, B-CARB-5)."
+  [state new-epoch cfg]
+  (let [frozen-retention (long (or (:frozen-log-retention-epochs cfg)
+                                   (:frozen-epoch-retention-window cfg)
+                                   168))
+        treasury-retention (long (max frozen-retention
+                                      (or (:treasury-trailing-epochs cfg) 168)
+                                      (or (:streamlet-retention-epochs cfg) 256)))
+        treasury-cutoff (- (long new-epoch) treasury-retention)
+        keep-epoch-kv (fn [m]
+                        (reduce-kv (fn [acc ep v]
+                                     (if (and (integer? ep) (< (long ep) treasury-cutoff))
+                                       acc
+                                       (assoc acc ep v)))
+                                   {}
+                                   (or m {})))
+        pruned-mint-dust (keep-epoch-kv (:epoch-mint-dust state))
+        pruned-unclaimed (keep-epoch-kv (:epoch-unclaimed-mint state))
+        pruned-burns (keep-epoch-kv (:epoch-burns state))
+        pruned-takes (keep-epoch-kv (:epoch-settlement-takes state))
+        pruned-minted (into #{}
+                            (filter #(or (not (integer? %)) (>= (long %) treasury-cutoff))
+                                    (or (:minted-epochs state) #{})))
+        next-last-pruned (if (pos? treasury-cutoff)
+                           (max (long (or (:last-pruned-mint-epoch state) -1))
+                                (dec treasury-cutoff))
+                           (long (or (:last-pruned-mint-epoch state) -1)))]
+    (cond-> (assoc state
+                   :epoch-mint-dust pruned-mint-dust
+                   :epoch-unclaimed-mint pruned-unclaimed
+                   :epoch-burns pruned-burns
+                   :epoch-settlement-takes pruned-takes
+                   :minted-epochs pruned-minted)
+      (or (pos? treasury-cutoff) (contains? state :last-pruned-mint-epoch))
+      (assoc :last-pruned-mint-epoch next-last-pruned))))
 
 (defn- prune-expired-tick-state
   "Prunes state message and role entries for epochs older than the TTL cutoff,
@@ -754,7 +822,15 @@
                :settled-escrow-ids pruned-tracked-settled-escrows
                :settled-escrow-order pruned-settled-escrows-ord
                :murmur-cache pruned-murmur-cache)
-        (prune-rendezvous-retention-state rdv-cutoff))))
+        (prune-rendezvous-retention-state rdv-cutoff)
+        (prune-treasury-epoch-state new-epoch cfg))))
+
+(defn prune-epoch-state
+  "Public entry point for pruning expired tick, rendezvous, and treasury epoch state."
+  ([state new-epoch]
+   (prune-expired-tick-state state new-epoch (:config state)))
+  ([state new-epoch cfg]
+   (prune-expired-tick-state state new-epoch cfg)))
 
 (defn- collect-ancestor-receipt-ids
   "Collects receipt IDs present in notarized ancestor blocks along the chain back to genesis,
@@ -793,6 +869,7 @@
                                                  (contains? ancestor-rids rid)))))
                                  (sort-by (fn [r]
                                             [(case (:type r)
+                                               :reconfigure-membership -1
                                                :register-home-set 0
                                                :burn 1
                                                :transfer 2
@@ -1548,6 +1625,80 @@
                                           :executed-finalized-blocks executed
                                           :latest-finalized-block-hash latest-hash})))
 
+(defn canonical-membership-mesh
+  "Normalizes a mesh-nodes map or collection into a sorted map of {pubkey-str weight-double}."
+  [mesh-nodes]
+  (cond
+    (map? mesh-nodes)
+    (into (sorted-map)
+          (map (fn [[k v]]
+                 [(if (keyword? k) (name k) (str k))
+                  (double (if (number? v) v 1.0))])
+               mesh-nodes))
+
+    (coll? mesh-nodes)
+    (into (sorted-map)
+          (map (fn [k]
+                 [(if (keyword? k) (name k) (str k)) 1.0])
+               mesh-nodes))
+
+    :else
+    (sorted-map)))
+
+(defn reconfigure-membership-signing-bytes
+  "Returns canonical Fressian bytes for signing/verifying a :reconfigure-membership receipt."
+  [receipt-id effective-epoch validators mesh-nodes]
+  (let [canonical-vals (vec (sort (map #(if (keyword? %) (name %) (str %)) validators)))
+        canonical-mesh (canonical-membership-mesh mesh-nodes)]
+    (fressian/encode-canonical
+     [:reconfigure-membership
+      (str receipt-id)
+      (long effective-epoch)
+      canonical-vals
+      canonical-mesh])))
+
+(defn sign-reconfigure-membership
+  "Signs a :reconfigure-membership receipt payload with treasury-privkey."
+  [treasury-privkey receipt-id effective-epoch validators mesh-nodes]
+  (let [priv-bytes (cond
+                     (fressian/bytes? treasury-privkey) treasury-privkey
+                     (string? treasury-privkey) (fressian/hex->bytes treasury-privkey)
+                     :else (to-byte-array treasury-privkey))
+        msg-bytes (reconfigure-membership-signing-bytes receipt-id effective-epoch validators mesh-nodes)]
+    (basalt/bytes->hex (crypto/sign priv-bytes msg-bytes))))
+
+(defn verify-reconfigure-membership?
+  "Verifies a :reconfigure-membership receipt against :treasury-pubkey in state."
+  [state receipt]
+  (let [t-pub (or (:treasury-pubkey state) (get-in state [:config :treasury-pubkey]))
+        rid (:receipt-id receipt)
+        eff-ep (:effective-epoch receipt)
+        vals-coll (:validators receipt)
+        mesh-coll (:mesh-nodes receipt)
+        sig (:signature receipt)]
+    (boolean
+     (and (string? t-pub)
+          (not (string/blank? t-pub))
+          (string? rid)
+          (not (string/blank? rid))
+          (integer? eff-ep)
+          (>= (long eff-ep) 0)
+          (coll? vals-coll)
+          (seq vals-coll)
+          (some? mesh-coll)
+          (seq (canonical-membership-mesh mesh-coll))
+          (some? sig)
+          (try
+            (let [pub-bytes (if (string? t-pub) (fressian/hex->bytes t-pub) (to-byte-array t-pub))
+                  sig-bytes (cond
+                              (fressian/bytes? sig) sig
+                              (string? sig) (fressian/hex->bytes sig)
+                              :else (to-byte-array sig))
+                  msg-bytes (reconfigure-membership-signing-bytes rid eff-ep vals-coll mesh-coll)]
+              (crypto/verify pub-bytes msg-bytes sig-bytes))
+            (catch #?(:clj Exception :cljs :default) _
+              false))))))
+
 (defn execute-finalized-blocks
   "Executes finalized Streamlet blocks along the canonical chain in ascending order.
    Applies receipts, advances epoch vouchers, and executes treasury boundaries."
@@ -1912,6 +2063,42 @@
                                            :else
                                            (update s :failed-receipts-count (fnil inc 0))))
 
+                                       :reconfigure-membership
+                                       (if (and (verify-reconfigure-membership? s r)
+                                                (<= (long (:effective-epoch r)) b-epoch))
+                                         (let [new-vals (vec (sort (map #(if (keyword? %) (name %) (str %)) (:validators r))))
+                                               new-mesh (canonical-membership-mesh (:mesh-nodes r))
+                                               active-peer-set (set/union (set new-vals) (set (keys new-mesh)))
+                                               merged-peers (merge (or (:peers-map s) {})
+                                                                   (into {}
+                                                                         (map (fn [[k v]]
+                                                                                [(if (keyword? k) (name k) (str k))
+                                                                                 (cond
+                                                                                   (fressian/bytes? v) v
+                                                                                   (string? v) (fressian/hex->bytes v)
+                                                                                   :else (to-byte-array v))])
+                                                                              (or (:new-peers-map r) {}))))
+                                               auto-peers (reduce (fn [m pk]
+                                                                    (if (contains? m pk)
+                                                                      m
+                                                                      (if (and (string? pk)
+                                                                               (or (= 64 (count pk)) (= 88 (count pk)))
+                                                                               (re-matches #"^[0-9a-fA-F]+$" pk))
+                                                                        (assoc m pk (fressian/hex->bytes pk))
+                                                                        m)))
+                                                                  merged-peers
+                                                                  active-peer-set)
+                                               next-peers-map (select-keys auto-peers active-peer-set)]
+                                           (-> s
+                                               (assoc :validators new-vals
+                                                      :mesh-nodes new-mesh
+                                                      :peers-map next-peers-map)
+                                               (assoc-in [:config :validators] new-vals)
+                                               (assoc-in [:config :mesh-nodes] new-mesh)
+                                               (assoc-in [:config :peers-map] next-peers-map)
+                                               (update-in [:diagnostics :membership-reconfigured] (fnil inc 0))))
+                                         (update s :failed-receipts-count (fnil inc 0)))
+
                                        s)
                                      [next-exec next-exec-ord] (fifo-track (:executed-receipt-ids s-effect)
                                                                            (:executed-receipt-order s-effect)
@@ -1927,7 +2114,9 @@
                                         :known-receipt-ids next-known
                                         :known-receipt-order next-known-ord)))))
                          st-skipped
-                         receipts)
+                         (let [reconfig-rcpts (filter #(= :reconfigure-membership (:type %)) receipts)
+                               other-rcpts (remove #(= :reconfigure-membership (:type %)) receipts)]
+                           (concat reconfig-rcpts other-rcpts)))
              exec-rids (or (:executed-receipt-ids st-applied) #{})
              st-clean (assoc st-applied
                              :pending-receipts (filterv #(not (contains? exec-rids (:receipt-id %)))
@@ -1938,8 +2127,9 @@
                                                (or (:mempool st-applied) [])))
              st-advanced (if (> b-epoch last-exec)
                            (let [st-settled (apply-epoch-voucher-settlement st-clean closing-ep)
-                                 st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)]
-                             (assoc st-treasury :last-executed-finalized-epoch b-epoch))
+                                 st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)
+                                 st-pruned (prune-treasury-epoch-state st-treasury b-epoch (:config st-treasury))]
+                             (assoc st-pruned :last-executed-finalized-epoch b-epoch))
                            st-clean)
              [next-blocks next-blocks-ord] (fifo-track (:executed-finalized-blocks st-advanced)
                                                        (:executed-finalized-blocks-order st-advanced)
@@ -2042,21 +2232,26 @@
                                  sender-state
                                  (account/validate-transfer sender-state transfer)
                                  (>= (spendable-balance state sender) (long (or (:amount transfer) 0))))
-            state-staged (if valid-transfer?
-                           (let [rid (str "transfer:" (or (account/transfer-hash transfer)
-                                                          message-id
-                                                          (basalt/bytes->hex (crypto/sha256 payload-bytes))))
-                                 staged (stage-receipt state {:receipt-id rid
-                                                              :type :transfer
-                                                              :sender sender
-                                                              :seq (:seq transfer)
-                                                              :amount (:amount transfer)
-                                                              :payload-bytes (mapv long payload-bytes)})]
-                             (if (:ok? staged) (:state staged) state))
-                           state)]
+            staged-transfer (when valid-transfer?
+                              (let [rid (str "transfer:" (or (account/transfer-hash transfer)
+                                                             message-id
+                                                             (basalt/bytes->hex (crypto/sha256 payload-bytes))))]
+                                (stage-receipt state {:receipt-id rid
+                                                      :type :transfer
+                                                      :sender sender
+                                                      :seq (:seq transfer)
+                                                      :amount (:amount transfer)
+                                                      :payload-bytes (mapv long payload-bytes)})))
+            state-staged (if (and staged-transfer (:ok? staged-transfer))
+                           (:state staged-transfer)
+                           state)
+            gossip-cmds (if staged-transfer
+                          (receipt-gossip-commands state staged-transfer)
+                          [])]
         {:state state-staged
-         :commands [{:type :app-event :event-name :on-deliver
-                     :payload (:payload event) :message-id message-id}]})
+         :commands (into [{:type :app-event :event-name :on-deliver
+                           :payload (:payload event) :message-id message-id}]
+                         gossip-cmds)})
       (let [sender-authorized? (or (nil? event-sender)
                                    (let [payload-data (thaw-payload-data payload-bytes)
                                          raw-transfer (when (and (map? payload-data) (:transfer payload-data))
@@ -2095,7 +2290,7 @@
                           (str "burn:" sender-hex ":" (or (:epoch state) 0) ":" (:receipt-seq state 0)))
                   staged (stage-receipt state {:receipt-id rid :type :burn :sender sender-hex :amount burn-amt})]
               (if (:ok? staged)
-                {:state (:state staged) :commands []}
+                {:state (:state staged) :commands (receipt-gossip-commands state staged)}
                 {:state state :commands []}))
             {:state state :commands []}))
         (let [ledger (or (:ledger state) {})
@@ -2383,7 +2578,7 @@
                                            :price-max p-b-max})]
                 (if (:ok? staged)
                   {:state (assoc-in (:state staged) [:home-sets tuple] reg-result)
-                   :commands []}
+                   :commands (receipt-gossip-commands state staged)}
                   {:state state
                    :commands []}))
               {:state (assoc-in state [:home-sets tuple] reg-result)
@@ -2463,7 +2658,7 @@
                                                :ack ack})]
                     (if (:ok? staged)
                       {:state (assoc-in (:state staged) [:voucher-seqs tuple] seq-num)
-                       :commands []}
+                       :commands (receipt-gossip-commands state staged)}
                       {:state state
                        :commands []}))
                   {:state (-> state
@@ -2490,9 +2685,9 @@
                        vals
                        (mapv (fn [group] (apply max-key (comp long :seq) group)))
                        (sort-by (juxt (comp long :epoch) (comp str :callee) (comp str rendezvous/normalize-home-node :home-node) (comp long :seq))))
-        final-state
+        [final-state gossip-cmds]
         (reduce
-         (fn [curr-st ack]
+         (fn [[curr-st cmds] ack]
            (let [callee (:callee ack)
                  home-node (rendezvous/normalize-home-node (:home-node ack))
                  ack-epoch (long (or (:epoch ack) 0))
@@ -2538,15 +2733,16 @@
                                               :cumulative-debit debit
                                               :ack (into {} ack)})]
                    (if (:ok? staged)
-                     (:state staged)
-                     curr-st))
-                 (-> curr-st
-                     (assoc-in [:voucher-seqs tuple] seq-num)
-                     (update :pending-vouchers (fnil conj []) ack)))
-               curr-st)))
-         state
+                     [(:state staged) (into cmds (receipt-gossip-commands curr-st staged))]
+                     [curr-st cmds]))
+                 [(-> curr-st
+                      (assoc-in [:voucher-seqs tuple] seq-num)
+                      (update :pending-vouchers (fnil conj []) ack))
+                  cmds])
+               [curr-st cmds])))
+         [state []]
          compacted)]
-    {:state final-state :commands []}))
+    {:state final-state :commands gossip-cmds}))
 
 (defn- handle-settle-intent
   "Handles an internal or external request to settle a payment intent with protocol take.
@@ -2580,7 +2776,7 @@
                                                :receiver receiver-hex
                                                :amount amount})]
               (if (:ok? staged)
-                {:state (:state staged) :commands []}
+                {:state (:state staged) :commands (receipt-gossip-commands state staged)}
                 {:state state :commands []}))
             {:state state :commands []}))
         (let [payer-acct (when payer-hex (get-in state [:ledger payer-hex]))
@@ -2669,7 +2865,7 @@
                                                    :created-epoch created-epoch
                                                    :expires-epoch expires-epoch})]
                   (if (:ok? staged)
-                    {:state (:state staged) :commands []}
+                    {:state (:state staged) :commands (receipt-gossip-commands state staged)}
                     {:state state :commands []}))
                 {:state state :commands []}))
             (let [payer-acct (get-in state [:ledger payer-hex])
@@ -2765,7 +2961,7 @@
                                                      :solution solution
                                                      :sender sender-hex})]
                     (if (:ok? staged)
-                      {:state (:state staged) :commands []}
+                      {:state (:state staged) :commands (receipt-gossip-commands state staged)}
                       {:state state :commands []}))))
               (let [configured-bps (or (:settlement-take-bps state)
                                        (get-in state [:config :settlement-take-bps])
@@ -2871,7 +3067,7 @@
                                                      :escrow-id escrow-id
                                                      :sender sender-hex})]
                     (if (:ok? staged)
-                      {:state (:state staged) :commands []}
+                      {:state (:state staged) :commands (receipt-gossip-commands state staged)}
                       {:state state :commands []}))))
               (let [payer-acct (get-in state [:ledger payer]
                                        (account/map->AccountState {:balance 0 :seq 0 :deps []}))
@@ -2892,6 +3088,587 @@
                             (assoc :settled-escrow-ids next-settled-ids
                                    :settled-escrow-order next-settled-ord))
                  :commands []}))))))))
+
+(defn handle-reconfigure-membership
+  "Handles a treasury-authorized :reconfigure-membership intent.
+   Verifies the Ed25519 signature over [:reconfigure-membership receipt-id effective-epoch (vec (sort validators)) (into (sorted-map) mesh-nodes)]
+   and stages the receipt (priority -1) in consensus mode or applies immediately in standalone mode."
+  [state event]
+  (let [raw-rcpt (or (:receipt event) event)
+        eff-ep (long (or (:effective-epoch raw-rcpt) (inc (long (or (:epoch state) 0)))))
+        vals-coll (vec (sort (map #(if (keyword? %) (name %) (str %)) (or (:validators raw-rcpt) []))))
+        mesh-map (canonical-membership-mesh (or (:mesh-nodes raw-rcpt) vals-coll))
+        rid (or (:receipt-id raw-rcpt)
+                (str "reconfig:" eff-ep ":" (string/join "," vals-coll)))
+        t-priv (or (:treasury-privkey event)
+                   (:treasury-privkey state)
+                   (get-in state [:config :treasury-privkey]))
+        sig (or (:signature raw-rcpt)
+                (when (and t-priv (seq vals-coll) (seq mesh-map))
+                  (sign-reconfigure-membership t-priv rid eff-ep vals-coll mesh-map)))
+        rcpt (cond-> {:receipt-id rid
+                      :type :reconfigure-membership
+                      :effective-epoch eff-ep
+                      :validators vals-coll
+                      :mesh-nodes mesh-map
+                      :signature sig}
+               (seq (:new-peers-map raw-rcpt))
+               (assoc :new-peers-map (:new-peers-map raw-rcpt)))]
+    (if-not (verify-reconfigure-membership? state rcpt)
+      {:state (update-in state [:diagnostics :invalid-reconfigure-membership-rejected] (fnil inc 0))
+       :commands [{:type :diagnose
+                   :effect :diagnose
+                   :reason :invalid-reconfigure-membership-rejected
+                   :receipt-id rid}]}
+      (if (consensus-mode? state)
+        (let [staged (stage-receipt state rcpt)]
+          (if (:ok? staged)
+            {:state (:state staged)
+             :commands (receipt-gossip-commands state staged)}
+            {:state state :commands []}))
+        (let [active-peer-set (set/union (set vals-coll) (set (keys mesh-map)))
+              merged-peers (merge (or (:peers-map state) {}) (or (:new-peers-map rcpt) {}))
+              next-peers-map (select-keys merged-peers active-peer-set)]
+          {:state (-> state
+                      (assoc :validators vals-coll
+                             :mesh-nodes mesh-map
+                             :peers-map next-peers-map)
+                      (assoc-in [:config :validators] vals-coll)
+                      (assoc-in [:config :mesh-nodes] mesh-map)
+                      (assoc-in [:config :peers-map] next-peers-map)
+                      (update-in [:diagnostics :membership-reconfigured] (fnil inc 0)))
+           :commands []})))))
+
+(defn validate-gossiped-receipt?
+  "Validates cryptographic signatures and state preconditions for a gossiped receipt
+   before staging into :pending-receipts (B-CARB-1, A-D15-4)."
+  [state receipt]
+  (and (map? receipt)
+       (string? (:receipt-id receipt))
+       (not (string/blank? (:receipt-id receipt)))
+       (case (:type receipt)
+         :register-home-set
+         (let [callee (:callee receipt)
+               ep (:epoch receipt)
+               p-b (:price receipt)
+               p-b-max (or (:price-max receipt) p-b)
+               cands (:candidates receipt)
+               existing (get-in state [:home-sets [callee ep]])]
+           (and (string? callee)
+                (not (string/blank? callee))
+                (integer? ep)
+                (>= (long ep) 0)
+                (integer? p-b)
+                (not (neg? (long p-b)))
+                (integer? p-b-max)
+                (>= (long p-b-max) (long p-b))
+                (coll? cands)
+                (seq cands)
+                (or (nil? existing) (nil? (:price existing)) (= (:price existing) p-b))))
+
+         :burn
+         (let [sender (:sender receipt)
+               amt (:amount receipt)
+               floor (burn/effective-signaling-burn-floor state)]
+           (and (string? sender)
+                (integer? amt)
+                (>= (long amt) floor)
+                (some? (get-in state [:ledger sender]))
+                (>= (spendable-balance state sender) (long amt))))
+
+         :transfer
+         (if-let [pb (:payload-bytes receipt)]
+           (some? (apply-transfer-payload-to-ledger (projected-ledger state) (to-byte-array pb)))
+           false)
+
+         :settle-intent
+         (let [payer (:payer receipt)
+               receiver (:receiver receipt)
+               amt (:amount receipt)]
+           (and (string? payer)
+                (string? receiver)
+                (integer? amt)
+                (pos? (long amt))
+                (some? (get-in state [:ledger payer]))
+                (>= (spendable-balance state payer) (long amt))))
+
+         :lock-intent
+         (let [escrow-id (:escrow-id receipt)
+               payer (:payer receipt)
+               receiver (:receiver receipt)
+               amt (:amount receipt)
+               d-hash (or (:deliverable-hash receipt) (:puzzle-hash receipt))
+               created-ep (:created-epoch receipt)
+               expires-ep (:expires-epoch receipt)
+               already? (or (contains? (or (:escrows state) #{}) escrow-id)
+                            (contains? (or (:settled-escrow-ids state) #{}) escrow-id))]
+           (and (string? escrow-id)
+                (not (string/blank? escrow-id))
+                (not already?)
+                (string? payer)
+                (string? receiver)
+                (not= payer receiver)
+                (integer? amt)
+                (pos? (long amt))
+                (escrow/valid-deliverable-hash? d-hash)
+                (integer? created-ep)
+                (integer? expires-ep)
+                (> (long expires-ep) (long created-ep))
+                (<= (- (long expires-ep) (long created-ep)) 168)
+                (some? (get-in state [:ledger payer]))
+                (>= (spendable-balance state payer) (long amt))))
+
+         :release-intent
+         (let [escrow-id (:escrow-id receipt)
+               pending-lock (some (fn [r]
+                                    (when (and (= (:type r) :lock-intent)
+                                               (= (:escrow-id r) escrow-id))
+                                      {:escrow-id escrow-id
+                                       :payer (:payer r)
+                                       :receiver (:receiver r)
+                                       :amount (:amount r)
+                                       :deliverable-hash (or (:deliverable-hash r) (:puzzle-hash r))
+                                       :puzzle-hash (:puzzle-hash r)
+                                       :created-epoch (:created-epoch r)
+                                       :expires-epoch (:expires-epoch r)
+                                       :status :locked}))
+                                  (or (:pending-receipts state) []))
+               escrow (or (get-in state [:escrows escrow-id]) pending-lock)
+               current-ep (long (or (:epoch state) 0))]
+           (if-not (and escrow (= :locked (:status escrow)))
+             false
+             (let [payer (:payer escrow)
+                   receiver (:receiver escrow)
+                   d-hash (:deliverable-hash escrow)
+                   p-hash (:puzzle-hash escrow)
+                   expires-ep (long (or (:expires-epoch escrow) 0))
+                   amount (long (:amount escrow))
+                   preimage (:preimage receipt)
+                   payer-sig (:payer-signature receipt)
+                   puzzle-src (:puzzle-source receipt)
+                   solution (:solution receipt)
+                   sender (:sender receipt)
+                   htlc-cid (puzzle/standard-htlc-cid)
+                   custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
+                   env-ctx {:amount amount
+                            :receiver receiver
+                            :payer payer
+                            :deliverable-hash d-hash
+                            :puzzle-hash p-hash
+                            :epoch current-ep
+                            :escrow-id escrow-id}
+                   puzzle-res (when (and p-hash puzzle-src (<= current-ep expires-ep))
+                                (puzzle/eval-puzzle puzzle-src solution env-ctx))
+                   puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
+                   payer-sig-valid? (and (not custom-puzzle?)
+                                         (or (= sender payer)
+                                             (and (string? payer-sig)
+                                                  (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig))))
+                   preimage-sig-valid? (and (not custom-puzzle?)
+                                            (string? preimage)
+                                            (<= current-ep expires-ep))
+                   payer-auth? (and payer-sig-valid?
+                                    (not puzzle-auth?)
+                                    (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :payer-authorized} env-ctx)))
+                   preimage-auth? (and preimage-sig-valid?
+                                       (not puzzle-auth?)
+                                       (not payer-auth?)
+                                       (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :preimage :preimage preimage} env-ctx)))]
+               (boolean (or payer-auth? preimage-auth? puzzle-auth?)))))
+
+         :refund-intent
+         (let [escrow-id (:escrow-id receipt)
+               pending-lock (some (fn [r]
+                                    (when (and (= (:type r) :lock-intent)
+                                               (= (:escrow-id r) escrow-id))
+                                      {:escrow-id escrow-id
+                                       :payer (:payer r)
+                                       :receiver (:receiver r)
+                                       :amount (:amount r)
+                                       :expires-epoch (:expires-epoch r)
+                                       :status :locked}))
+                                  (or (:pending-receipts state) []))
+               escrow (or (get-in state [:escrows escrow-id]) pending-lock)
+               current-ep (long (or (:epoch state) 0))
+               sender (:sender receipt)]
+           (if-not (and escrow (= :locked (:status escrow)))
+             false
+             (let [payer (:payer escrow)
+                   receiver (:receiver escrow)
+                   expires-ep (long (or (:expires-epoch escrow) 0))]
+               (boolean (or (and (> current-ep expires-ep)
+                                 (or (nil? sender) (contains? #{payer receiver} sender)))
+                            (= sender receiver))))))
+
+         :voucher
+         (let [raw (:ack receipt)
+               ack (when raw
+                     (if (record? raw)
+                       raw
+                       (try (rendezvous/map->DeliveryAck raw)
+                            (catch #?(:clj Exception :cljs :default) _ nil))))]
+           (boolean (and ack (rendezvous/verify-delivery-ack ack))))
+
+         :reconfigure-membership
+         (verify-reconfigure-membership? state receipt)
+
+         false)))
+
+(defn handle-receive-receipt
+  "Handles an inbound single-hop :receive-receipt gossip event from a peer validator.
+   Verifies sender membership in :peers-map, deduplicates against :known-receipt-ids and :executed-receipt-ids,
+   and validates cryptographic signatures and state preconditions before staging.
+   Never re-emits :send-receipt (B-CARB-1, A-D15-4)."
+  [state event]
+  (let [sender (:sender event)
+        sender-hex (when sender (if (string? sender) sender (basalt/bytes->hex sender)))
+        receipt (:receipt event)
+        rid (when (map? receipt) (:receipt-id receipt))
+        known-peers (set/union (set (keys (:peers-map state)))
+                               (set (streamlet/extract-validator-hexes state)))
+        sender-ok? (or (nil? sender-hex)
+                       (empty? known-peers)
+                       (contains? known-peers sender-hex))
+        already-known? (and (string? rid)
+                            (or (contains? (or (:known-receipt-ids state) #{}) rid)
+                                (contains? (or (:executed-receipt-ids state) #{}) rid)))
+        max-cap (long (or (get-in state [:config :max-pending-receipts]) 4096))]
+    (cond
+      already-known?
+      {:state state :commands []}
+
+      (or (not sender-ok?)
+          (not (map? receipt))
+          (not (string? rid))
+          (string/blank? rid)
+          (>= (count (or (:pending-receipts state) [])) max-cap)
+          (not (validate-gossiped-receipt? state receipt)))
+      {:state (update-in state [:diagnostics :unverified-gossip-receipt-rejected] (fnil inc 0))
+       :commands [{:type :diagnose
+                   :effect :diagnose
+                   :reason :unverified-gossip-receipt-rejected
+                   :sender sender-hex
+                   :receipt-id rid}]}
+
+      :else
+      (let [staged (stage-receipt state receipt)
+            next-state (if (and (:ok? staged) (= :register-home-set (:type receipt)))
+                         (let [cands (mapv (fn [c]
+                                             (if (contains? c :node-id)
+                                               (assoc c :node-id (rendezvous/normalize-home-node (:node-id c)))
+                                               c))
+                                           (:candidates receipt))
+                               reg-res (rendezvous/register-home-set cands
+                                                                     (:price receipt)
+                                                                     (or (:price-max receipt) (:price receipt)))]
+                           (assoc-in (:state staged) [:home-sets [(:callee receipt) (:epoch receipt)]] reg-res))
+                         (:state staged))]
+        {:state next-state :commands []}))))
+
+(defn compute-checkpoint-state-digest
+  "Computes the canonical SHA-256 hex digest over the authoritative checkpoint state fields
+   (:ledger, :escrows, :total-minted, :mint-dust, :unclaimed-mint, :sunset-custody-burned, :validators, :mesh-nodes)."
+  [snapshot]
+  (let [canon-ledger (into (sorted-map)
+                           (map (fn [[k v]]
+                                  [(str k)
+                                   {:balance (long (or (:balance v) 0))
+                                    :seq (long (or (:seq v) 0))
+                                    :deps (vec (or (:deps v) []))}])
+                                (or (:ledger snapshot) {})))
+        canon-escrows (into (sorted-map)
+                            (map (fn [[k v]]
+                                   [(str k) (into (sorted-map) v)])
+                                 (or (:escrows snapshot) {})))
+        canon-vals (vec (sort (map #(if (keyword? %) (name %) (str %))
+                                   (or (:validators snapshot)
+                                       (get-in snapshot [:config :validators])
+                                       []))))
+        canon-mesh (canonical-membership-mesh
+                    (or (:mesh-nodes snapshot)
+                        (get-in snapshot [:config :mesh-nodes])
+                        canon-vals))
+        payload {:ledger canon-ledger
+                 :escrows canon-escrows
+                 :total-minted (long (or (:total-minted snapshot) 0))
+                 :mint-dust (long (or (:mint-dust snapshot) 0))
+                 :unclaimed-mint (long (or (:unclaimed-mint snapshot) 0))
+                 :sunset-custody-burned (long (or (:sunset-custody-burned snapshot) 0))
+                 :validators canon-vals
+                 :mesh-nodes canon-mesh}]
+    (basalt/bytes->hex (crypto/sha256 (fressian/encode-canonical payload)))))
+
+(defn checkpoint-signing-bytes
+  "Returns canonical Fressian bytes for a validator checkpoint attestation."
+  [finalized-epoch latest-finalized-block-hash state-digest]
+  (fressian/encode-canonical
+   ["bitecho-state-checkpoint-v1"
+    (long finalized-epoch)
+    (str latest-finalized-block-hash)
+    (str state-digest)]))
+
+(defn sign-checkpoint-attestation
+  "Signs a checkpoint attestation over [\"bitecho-state-checkpoint-v1\" finalized-epoch latest-finalized-block-hash state-digest].
+   4-arity returns the hex signature string; 5-arity returns the attestation map."
+  ([privkey finalized-epoch latest-finalized-block-hash state-digest]
+   (let [priv-bytes (cond
+                      (fressian/bytes? privkey) privkey
+                      (string? privkey) (fressian/hex->bytes privkey)
+                      :else (to-byte-array privkey))
+         msg-bytes (checkpoint-signing-bytes finalized-epoch latest-finalized-block-hash state-digest)]
+     (basalt/bytes->hex (crypto/sign priv-bytes msg-bytes))))
+  ([privkey validator-pubkey finalized-epoch latest-finalized-block-hash state-digest]
+   {:validator (str validator-pubkey)
+    :finalized-epoch (long finalized-epoch)
+    :block-hash (str latest-finalized-block-hash)
+    :state-digest (str state-digest)
+    :signature (sign-checkpoint-attestation privkey finalized-epoch latest-finalized-block-hash state-digest)}))
+
+(defn build-checkpoint-snapshot
+  "Constructs a checkpoint payload from the current node state, attaching a local validator attestation if keypair is present."
+  [state]
+  (let [fin-epoch (long (or (:last-executed-finalized-epoch state) 0))
+        b-hash (:latest-finalized-block-hash state)
+        raw-block (when b-hash (get-in state [:blocks b-hash]))
+        block (when raw-block (if (record? raw-block) raw-block (streamlet/map->Block raw-block)))
+        vals-vec (streamlet/extract-validator-hexes state)
+        mesh-map (canonical-membership-mesh (or (:mesh-nodes state) (get-in state [:config :mesh-nodes]) vals-vec))
+        snap {:finalized-epoch fin-epoch
+              :latest-finalized-block-hash b-hash
+              :latest-finalized-block (when block (into {} block))
+              :depth (long (or (get-in state [:block-depths b-hash]) fin-epoch 1))
+              :ledger (into {} (map (fn [[k v]] [k (into {} v)]) (or (:ledger state) {})))
+              :escrows (or (:escrows state) {})
+              :home-sets (or (:home-sets state) {})
+              :voucher-seqs (or (:voucher-seqs state) {})
+              :settled-voucher-tuples (or (:settled-voucher-tuples state) #{})
+              :total-minted (long (or (:total-minted state) 0))
+              :mint-dust (long (or (:mint-dust state) 0))
+              :unclaimed-mint (long (or (:unclaimed-mint state) 0))
+              :sunset-custody-burned (long (or (:sunset-custody-burned state) 0))
+              :epoch-burns (or (:epoch-burns state) {})
+              :epoch-settlement-takes (or (:epoch-settlement-takes state) {})
+              :epoch-mint-dust (or (:epoch-mint-dust state) {})
+              :epoch-unclaimed-mint (or (:epoch-unclaimed-mint state) {})
+              :minted-epochs (or (:minted-epochs state) #{})
+              :last-pruned-mint-epoch (long (or (:last-pruned-mint-epoch state) -1))
+              :validators vals-vec
+              :mesh-nodes mesh-map}
+        digest (compute-checkpoint-state-digest snap)
+        my-pub (:node-pubkey state)
+        my-priv (or (:node-private-key state) (get-in state [:keypair :private]))
+        notarization-proofs (when b-hash
+                              (vec (for [[voter vote] (get-in state [:block-vote-proofs b-hash] {})]
+                                     (into {:voter voter} vote))))
+        my-att (when (and my-priv my-pub b-hash (contains? (set vals-vec) my-pub))
+                 (sign-checkpoint-attestation my-priv my-pub fin-epoch b-hash digest))
+        existing-qc (or (get-in state [:checkpoint-qcs [fin-epoch b-hash]]) [])
+        qc (vec (vals (into {}
+                            (map (fn [a] [(:validator a) a])
+                                 (cond-> existing-qc my-att (conj my-att))))))]
+    (assoc snap
+           :state-digest digest
+           :notarization-proofs (or notarization-proofs [])
+           :checkpoint-qc qc)))
+
+(defn verify-checkpoint-qc?
+  "Verifies a checkpoint payload fail-closed (INV-D15-4, B-CARB-2):
+   1. :latest-finalized-block hashes to :latest-finalized-block-hash and matches :finalized-epoch.
+   2. :state-digest matches (compute-checkpoint-state-digest snapshot).
+   3. :checkpoint-qc contains >= quorum-threshold(|:validators|) valid Ed25519 signatures from distinct authoritative :validators
+      over [\"bitecho-state-checkpoint-v1\" finalized-epoch latest-finalized-block-hash state-digest].
+   4. If :notarization-proofs is non-empty, verifies >= quorum-threshold valid Streamlet vote signatures over :latest-finalized-block-hash."
+  [state checkpoint]
+  (let [snapshot (or (:snapshot checkpoint) checkpoint)
+        fin-epoch (long (or (:finalized-epoch checkpoint) (:finalized-epoch snapshot) -1))
+        raw-block (or (:latest-finalized-block checkpoint) (:latest-finalized-block snapshot))
+        block (when (map? raw-block) (streamlet/map->Block raw-block))
+        b-hash (or (:latest-finalized-block-hash checkpoint) (:latest-finalized-block-hash snapshot))
+        digest (or (:state-digest checkpoint) (:state-digest snapshot))
+        auth-vals (set (streamlet/extract-validator-hexes state))
+        q-thresh (streamlet/quorum-threshold (count auth-vals))
+        raw-qc (or (when (seq (:qc-signatures checkpoint)) (:qc-signatures checkpoint))
+                   (when (seq (:checkpoint-qc checkpoint)) (:checkpoint-qc checkpoint))
+                   (when (seq (:qc-signatures snapshot)) (:qc-signatures snapshot))
+                   (when (seq (:checkpoint-qc snapshot)) (:checkpoint-qc snapshot))
+                   [])
+        qc (if (map? raw-qc)
+             (mapv (fn [[k v]] {:validator (if (keyword? k) (name k) (str k)) :signature v}) raw-qc)
+             raw-qc)
+        proofs (or (:notarization-proofs checkpoint) (:notarization-proofs snapshot) [])]
+    (boolean
+     (and (pos? fin-epoch)
+          (some? block)
+          (string? b-hash)
+          (not (string/blank? b-hash))
+          (= fin-epoch (long (or (:epoch block) -2)))
+          (= b-hash (streamlet/hash-block block))
+          (string? digest)
+          (= digest (compute-checkpoint-state-digest snapshot))
+          (pos? (count auth-vals))
+          (let [msg-bytes (checkpoint-signing-bytes fin-epoch b-hash digest)
+                valid-signers
+                (reduce
+                 (fn [acc att]
+                   (let [v-hex (:validator att)
+                         sig (:signature att)
+                         pub-raw (or (get-in state [:peers-map v-hex])
+                                     (when (and (string? v-hex)
+                                                (or (= 64 (count v-hex)) (= 88 (count v-hex)))
+                                                (re-matches #"^[0-9a-fA-F]+$" v-hex))
+                                       (fressian/hex->bytes v-hex)))]
+                     (if (and (string? v-hex)
+                              (contains? auth-vals v-hex)
+                              (not (contains? acc v-hex))
+                              pub-raw
+                              sig
+                              (try
+                                (let [pub-bytes (if (fressian/bytes? pub-raw) pub-raw (fressian/hex->bytes (str pub-raw)))
+                                      sig-bytes (cond
+                                                  (fressian/bytes? sig) sig
+                                                  (string? sig) (fressian/hex->bytes sig)
+                                                  :else (to-byte-array sig))]
+                                  (crypto/verify pub-bytes msg-bytes sig-bytes))
+                                (catch #?(:clj Exception :cljs :default) _
+                                  false)))
+                       (conj acc v-hex)
+                       acc)))
+                 #{}
+                 qc)]
+            (>= (count valid-signers) q-thresh))
+          (or (empty? proofs)
+              (let [vote-msg-bytes (fressian/utf8->bytes b-hash)
+                    valid-voters
+                    (reduce
+                     (fn [acc p]
+                       (let [v-hex (or (:voter p) (when (string? (:voter p)) (:voter p)))
+                             sig (or (:voter-signature p) (:signature p))
+                             pub-raw (or (get-in state [:peers-map v-hex])
+                                         (when (and (string? v-hex)
+                                                    (or (= 64 (count v-hex)) (= 88 (count v-hex)))
+                                                    (re-matches #"^[0-9a-fA-F]+$" v-hex))
+                                           (fressian/hex->bytes v-hex)))]
+                         (if (and (string? v-hex)
+                                  (contains? auth-vals v-hex)
+                                  (not (contains? acc v-hex))
+                                  pub-raw
+                                  sig
+                                  (try
+                                    (let [pub-bytes (if (fressian/bytes? pub-raw) pub-raw (fressian/hex->bytes (str pub-raw)))
+                                          sig-bytes (cond
+                                                      (fressian/bytes? sig) sig
+                                                      (string? sig) (fressian/hex->bytes sig)
+                                                      :else (to-byte-array sig))]
+                                      (or (crypto/verify pub-bytes vote-msg-bytes sig-bytes)
+                                          (streamlet/verify-vote-signature p pub-bytes)))
+                                    (catch #?(:clj Exception :cljs :default) _
+                                      false)))
+                           (conj acc v-hex)
+                           acc)))
+                     #{}
+                     proofs)]
+                (>= (count valid-voters) q-thresh)))))))
+
+(defn handle-request-checkpoint
+  "Handles a :request-checkpoint or :receive-request-checkpoint event.
+   If :sender is present (incoming request from a peer), builds a checkpoint snapshot and emits :send-checkpoint to :sender.
+   If local command (no :sender), emits :send-request-checkpoint to :target or all validators."
+  [state event]
+  (if-let [requester (:sender event)]
+    (let [snap (build-checkpoint-snapshot state)]
+      (if (and (pos? (long (:finalized-epoch snap 0)))
+               (some? (:latest-finalized-block-hash snap)))
+        {:state state
+         :commands [{:type :send-checkpoint
+                     :target requester
+                     :checkpoint snap}]}
+        {:state state :commands []}))
+    (let [targets (if-let [t (:target event)]
+                    [t]
+                    (vec (sort (disj (set (streamlet/extract-validator-hexes state)) (:node-pubkey state)))))]
+      {:state state
+       :commands (if (seq targets)
+                   [{:type :send-request-checkpoint
+                     :targets targets}]
+                   [])})))
+
+(defn handle-receive-checkpoint
+  "Handles an incoming :receive-checkpoint event (INV-D15-4, B-CARB-2).
+   Verifies the checkpoint quorum certificate and state digest fail-closed,
+   and when finalized-epoch > :last-executed-finalized-epoch, installs the snapshot
+   and roots the Streamlet block tree at :latest-finalized-block-hash."
+  [state event]
+  (let [checkpoint (or (:checkpoint event) event)
+        snapshot (or (:snapshot checkpoint) checkpoint)
+        fin-epoch (long (or (:finalized-epoch checkpoint) (:finalized-epoch snapshot) -1))
+        last-exec (long (or (:last-executed-finalized-epoch state) 0))]
+    (if-not (and (> fin-epoch last-exec)
+                 (verify-checkpoint-qc? state checkpoint))
+      {:state (update-in state [:diagnostics :invalid-checkpoint-rejected] (fnil inc 0))
+       :commands [{:type :diagnose
+                   :effect :diagnose
+                   :reason :invalid-checkpoint-rejected
+                   :finalized-epoch fin-epoch
+                   :last-executed-finalized-epoch last-exec}]}
+      (let [b-hash (or (:latest-finalized-block-hash checkpoint) (:latest-finalized-block-hash snapshot))
+            raw-block (or (:latest-finalized-block checkpoint) (:latest-finalized-block snapshot))
+            block-rec (streamlet/map->Block raw-block)
+            depth (long (or (:depth checkpoint) (:depth snapshot) fin-epoch 1))
+            restored-ledger (into {}
+                                  (map (fn [[k v]]
+                                         [(str k) (if (record? v) v (account/map->AccountState v))])
+                                       (or (:ledger snapshot) {})))
+            new-vals (vec (sort (map #(if (keyword? %) (name %) (str %))
+                                     (or (:validators snapshot) (streamlet/extract-validator-hexes state)))))
+            new-mesh (canonical-membership-mesh (or (:mesh-nodes snapshot) new-vals))
+            active-peer-set (set/union (set new-vals) (set (keys new-mesh)))
+            auto-peers (reduce (fn [m pk]
+                                 (if (contains? m pk)
+                                   m
+                                   (if (and (string? pk) (= 64 (count pk)) (re-matches #"^[0-9a-fA-F]+$" pk))
+                                     (assoc m pk (fressian/hex->bytes pk))
+                                     m)))
+                               (or (:peers-map state) {})
+                               active-peer-set)
+            next-peers-map (select-keys auto-peers active-peer-set)
+            next-last-pruned (max (long (or (:last-pruned-mint-epoch state) -1))
+                                  (long (or (:last-pruned-mint-epoch snapshot) -1)))]
+        {:state (-> state
+                    (assoc :ledger restored-ledger
+                           :escrows (or (:escrows snapshot) {})
+                           :home-sets (or (:home-sets snapshot) {})
+                           :voucher-seqs (or (:voucher-seqs snapshot) {})
+                           :settled-voucher-tuples (set (or (:settled-voucher-tuples snapshot) #{}))
+                           :total-minted (long (or (:total-minted snapshot) 0))
+                           :mint-dust (long (or (:mint-dust snapshot) 0))
+                           :unclaimed-mint (long (or (:unclaimed-mint snapshot) 0))
+                           :sunset-custody-burned (long (or (:sunset-custody-burned snapshot) 0))
+                           :epoch-burns (or (:epoch-burns snapshot) {})
+                           :epoch-settlement-takes (or (:epoch-settlement-takes snapshot) {})
+                           :epoch-mint-dust (or (:epoch-mint-dust snapshot) {})
+                           :epoch-unclaimed-mint (or (:epoch-unclaimed-mint snapshot) {})
+                           :minted-epochs (set (or (:minted-epochs snapshot) #{}))
+                           :last-pruned-mint-epoch next-last-pruned
+                           :validators new-vals
+                           :mesh-nodes new-mesh
+                           :peers-map next-peers-map
+                           :blocks {b-hash block-rec}
+                           :block-depths {b-hash depth}
+                           :notarized-blocks #{b-hash}
+                           :finalized-blocks #{b-hash}
+                           :executed-finalized-blocks #{b-hash}
+                           :executed-finalized-blocks-order [b-hash]
+                           :head-hash b-hash
+                           :latest-finalized-block-hash b-hash
+                           :last-executed-finalized-epoch fin-epoch
+                           :epoch (max (long (or (:epoch state) 0)) fin-epoch)
+                           :pending-receipts []
+                           :mempool [])
+                    (assoc-in [:config :validators] new-vals)
+                    (assoc-in [:config :mesh-nodes] new-mesh)
+                    (assoc-in [:config :peers-map] next-peers-map)
+                    (update-in [:diagnostics :checkpoints-applied] (fnil inc 0)))
+         :commands []}))))
 
 (defn handle-event
   "Pure root reducer. Takes the current state and an event,
@@ -2918,6 +3695,11 @@
         :lock-intent (handle-lock-intent state event)
         :release-intent (handle-release-intent state event)
         :refund-intent (handle-refund-intent state event)
+        :reconfigure-membership (handle-reconfigure-membership state event)
+        :receive-receipt (handle-receive-receipt state event)
+        :request-checkpoint (handle-request-checkpoint state event)
+        :receive-request-checkpoint (handle-request-checkpoint state event)
+        :receive-checkpoint (handle-receive-checkpoint state event)
         :epoch-mint (handle-epoch-mint state event)
         :apply-epoch-mint (handle-epoch-mint state event)
         :submit-transcript (handle-submit-transcript state event)

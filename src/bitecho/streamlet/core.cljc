@@ -424,13 +424,20 @@
                                            h)))
                                  blocks)
             voted-epochs (into #{} (filter #(>= (long %) cutoff)) (get state-with-depths :voted-epochs #{}))
-            epoch-voters (into {} (filter (fn [[ep _]] (>= (long ep) cutoff))) (get state-with-depths :epoch-voters {}))]
+            epoch-voters (into {} (filter (fn [[ep _]] (>= (long ep) cutoff))) (get state-with-depths :epoch-voters {}))
+            retained-blocks (reduce dissoc blocks expired-hashes)
+            parent-boundary-hashes (set (keep :parent-hash (vals retained-blocks)))
+            allowed-depth-hashes (set/union (set (keys retained-blocks))
+                                            parent-boundary-hashes
+                                            protected-hashes
+                                            (disj (hash-set head-hash latest-finalized "genesis") nil))
+            bounded-depths (select-keys (:block-depths state-with-depths {}) allowed-depth-hashes)]
         (if (empty? expired-hashes)
-          (assoc state-with-depths :voted-epochs voted-epochs :epoch-voters epoch-voters)
-          (let [retained-blocks (reduce dissoc blocks expired-hashes)
-                parent-boundary-hashes (set (keep :parent-hash (vals retained-blocks)))
-                expired-depth-hashes (set/difference expired-hashes parent-boundary-hashes)
-                notarized (get state-with-depths :notarized-blocks #{})
+          (assoc state-with-depths
+                 :block-depths bounded-depths
+                 :voted-epochs voted-epochs
+                 :epoch-voters epoch-voters)
+          (let [notarized (get state-with-depths :notarized-blocks #{})
                 finalized (get state-with-depths :finalized-blocks #{})
                 pruned-notarized (count (set/intersection notarized expired-hashes))
                 pruned-finalized (count (set/intersection finalized expired-hashes))
@@ -442,13 +449,13 @@
                 (update :finalized-blocks #(set/difference (or % #{}) expired-hashes))
                 (update :block-votes #(reduce dissoc (or % {}) expired-hashes))
                 (update :block-vote-proofs #(reduce dissoc (or % {}) expired-hashes))
-                (update :block-depths #(reduce dissoc (or % {}) expired-depth-hashes))
-                (assoc :voted-epochs voted-epochs
+                (assoc :block-depths bounded-depths
+                       :voted-epochs voted-epochs
                        :epoch-voters epoch-voters
                        :pruned-notarized-count cum-pruned-notarized
                        :pruned-finalized-count cum-pruned-finalized))))))))
 
-(defn- extract-peer-hexes
+(defn extract-peer-hexes
   "Extracts a sorted vector of peer public key hex strings from state."
   [state]
   (cond
@@ -464,12 +471,25 @@
     :else
     []))
 
+(defn extract-validator-hexes
+  "Extracts a sorted vector of Streamlet BFT committee validator public key hex strings from state.
+   When :validators (or [:config :validators]) is non-empty, returns sorted vector of :validators;
+   otherwise falls back to extract-peer-hexes."
+  [state]
+  (let [vals-coll (or (when (seq (:validators state)) (:validators state))
+                      (when (seq (get-in state [:config :validators])) (get-in state [:config :validators])))]
+    (if (seq vals-coll)
+      (vec (sort (if (map? vals-coll) (keys vals-coll) vals-coll)))
+      (extract-peer-hexes state))))
+
 (defn- total-node-count
-  "Determines the total network size from state or peer set."
-  [state peer-hexes]
-  (or (:total-nodes state)
-      (when (seq peer-hexes) (count peer-hexes))
-      1))
+  "Determines the Streamlet BFT committee size from state or validator set."
+  [state validator-hexes]
+  (if (or (seq (:validators state)) (seq (get-in state [:config :validators])))
+    (max 1 (count validator-hexes))
+    (or (:total-nodes state)
+        (when (seq validator-hexes) (count validator-hexes))
+        1)))
 
 (defn resolve-peer-pubkey-bytes
   "Resolves the peer's public key byte array strictly from :peers-map in state.
@@ -487,7 +507,7 @@
    - event and block must be maps
    - :peers-map must be non-empty
    - epoch must be a positive integer
-   - proposer must be a string and in :peers-map
+   - proposer must be a string, in :peers-map, and in the active Streamlet BFT :validators committee
    - proposer must match expected round-robin leader for epoch
    - if :sender is present on event, must equal (:proposer block)
    - proposer signature must be valid Ed25519 signature verified by proposer's pubkey bytes"
@@ -495,8 +515,9 @@
   (boolean
    (when (and (map? state) (map? event) (map? (:block event)))
      (let [block (:block event)
-           peer-hexes (extract-peer-hexes state)
-           total-nodes (total-node-count state peer-hexes)
+           validator-hexes (extract-validator-hexes state)
+           validator-set (set validator-hexes)
+           total-nodes (total-node-count state validator-hexes)
            epoch (:epoch block)
            proposer (:proposer block)
            sender (:sender event)
@@ -505,12 +526,14 @@
                         (bytes? sender) (bytes->hex sender)
                         :else nil)]
        (when (and (seq (:peers-map state))
+                  (seq validator-hexes)
                   (integer? epoch)
                   (pos? epoch)
                   (string? proposer)
+                  (contains? validator-set proposer)
                   (pos? total-nodes)
                   (or (nil? sender) (= sender-hex proposer)))
-         (let [expected-leader (when (seq peer-hexes) (nth peer-hexes (mod epoch total-nodes)))
+         (let [expected-leader (nth validator-hexes (mod epoch total-nodes))
                proposer-pk (resolve-peer-pubkey-bytes state proposer)]
            (and expected-leader
                 (= proposer expected-leader)
@@ -597,8 +620,8 @@
   [state parent-hash max-depth]
   (let [blocks (get state :blocks {})
         notarized (get state :notarized-blocks #{})
-        peer-hexes (extract-peer-hexes state)
-        total-nodes (total-node-count state peer-hexes)
+        validator-hexes (extract-validator-hexes state)
+        total-nodes (total-node-count state validator-hexes)
         threshold (quorum-threshold total-nodes)]
     (loop [curr-hash parent-hash
            depth 0
@@ -621,7 +644,7 @@
 
 (defn verify-ancestor-quorum
   "Verifies that an ancestor entry contains a valid block proposal within max-epoch-catchup-delta
-   and a quorum of validly signed votes from peers in :peers-map."
+   and a quorum of validly signed votes from Streamlet BFT committee members."
   [state ancestor-entry]
   (if-not (and (map? ancestor-entry)
                (map? (:block ancestor-entry))
@@ -637,13 +660,15 @@
       (if-not proposal-ok?
         {:valid? false}
         (let [b-hash (hash-block block)
-              peer-hexes (extract-peer-hexes state)
-              total-nodes (total-node-count state peer-hexes)
+              validator-hexes (extract-validator-hexes state)
+              validator-set (set validator-hexes)
+              total-nodes (total-node-count state validator-hexes)
               threshold (quorum-threshold total-nodes)
               verified-votes
               (into {}
                     (filter (fn [[voter-hex vote]]
                               (when (and (string? voter-hex)
+                                         (contains? validator-set voter-hex)
                                          (map? vote)
                                          (= (:block-hash vote) b-hash))
                                 (when-let [voter-pk (resolve-peer-pubkey-bytes state voter-hex)]
@@ -698,18 +723,18 @@
             kept))))))
 
 (defn- handle-tick-event
-  "Handles a :tick event: advances epoch, elects proposer, and proposes if local node."
+  "Handles a :tick event: advances epoch, elects proposer from Streamlet BFT :validators committee, and proposes if local node."
   [state]
   (let [new-epoch (inc (get state :epoch 0))
         state (-> state
                   (assoc :epoch new-epoch)
                   update-head-hash)
-        peer-hexes (extract-peer-hexes state)]
-    (if (empty? peer-hexes)
+        validator-hexes (extract-validator-hexes state)]
+    (if (empty? validator-hexes)
       {:state (prune-streamlet-state state) :commands []}
-      (let [total-nodes (total-node-count state peer-hexes)
+      (let [total-nodes (total-node-count state validator-hexes)
             proposer-idx (mod new-epoch total-nodes)
-            proposer-hex (nth peer-hexes proposer-idx)
+            proposer-hex (nth validator-hexes proposer-idx)
             is-proposer? (= proposer-hex (:node-pubkey state))]
         (if is-proposer?
           (let [block (propose-block state new-epoch)
@@ -748,7 +773,7 @@
 
 (defn- handle-propose-event
   "Handles a :receive-propose event: validates proposal fail-closed,
-   enforces epoch bounds, ingests verified quorum ancestors, records block and votes."
+   enforces epoch bounds, ingests verified quorum ancestors, records block and votes (if in :validators committee)."
   [state event]
   (if-not (valid-block-proposal? state event)
     {:state state :commands []}
@@ -768,9 +793,11 @@
               parent-hash (:parent-hash block)
               known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
           (if known-parent?
-            (let [peer-hexes (extract-peer-hexes state)
-                  total-nodes (total-node-count state peer-hexes)
-                  vote (cast-vote state block)
+            (let [validator-hexes (extract-validator-hexes state)
+                  validator-set (set validator-hexes)
+                  total-nodes (total-node-count state validator-hexes)
+                  eligible-voter? (contains? validator-set (:node-pubkey state))
+                  vote (when eligible-voter? (cast-vote state block))
                   local-pk (extract-local-pubkey-bytes state)
                   state (if vote
                           (-> state
@@ -817,17 +844,21 @@
               (recur (rest remaining) curr-state acc-cmds (conj unresolved event)))))))))
 
 (defn- handle-vote-event
-  "Handles a :receive-vote event: rejects Sybil senders, malformed votes, or far-future epochs fail-closed,
+  "Handles a :receive-vote event: rejects non-committee/Sybil senders, malformed votes, or far-future epochs fail-closed,
    accumulates vote if block is known, or buffers into :future-votes."
   [state event]
   (let [vote (:vote event)
         sender-pk (extract-sender-pubkey-bytes state event)
+        sender-hex (when sender-pk (bytes->hex sender-pk))
+        validator-hexes (extract-validator-hexes state)
+        validator-set (set validator-hexes)
         b-hash (when (map? vote) (:block-hash vote))
         sig (when (map? vote) (:voter-signature vote))
         epoch (when (map? vote) (:epoch vote))
         curr-epoch (or (:epoch state) 0)
         max-delta (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta)]
     (if (or (nil? sender-pk)
+            (not (contains? validator-set sender-hex))
             (not (string? b-hash))
             (not (valid-hex-string? sig))
             (not (integer? epoch))
@@ -837,8 +868,7 @@
       {:state state :commands []}
       (let [state (update state :epoch (fn [e] (max (or e 0) (long epoch))))]
         (if (contains? (:blocks state) b-hash)
-          (let [peer-hexes (extract-peer-hexes state)
-                total-nodes (total-node-count state peer-hexes)
+          (let [total-nodes (total-node-count state validator-hexes)
                 state (accumulate-vote state vote sender-pk total-nodes)
                 {state :state cmds :commands} (drain-future-blocks state)
                 state (-> state

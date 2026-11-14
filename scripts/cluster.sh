@@ -439,6 +439,7 @@ run_pre_deploy_e2e_gate() {
 cmd_deploy() {
   local reset_state=false
   local skip_e2e_gate=false
+  local streamlet_validators="node1,node2,node3"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reset-state)
@@ -447,6 +448,13 @@ cmd_deploy() {
         ;;
       --skip-e2e-gate)
         skip_e2e_gate=true
+        shift
+        ;;
+      --streamlet-validators)
+        streamlet_validators="$2"
+        shift 2
+        ;;
+      --include-infra)
         shift
         ;;
       *)
@@ -640,12 +648,24 @@ REMOTE_ID
       agent_count=$((agent_count + 1))
     fi
   done
-  local custody_bal=$((4194000000 - agent_count * 1000000))
+  local custody_bal=$((4194000000 - agent_count * 1000000 - 2850000))
   local ip_ns1 ip_ns2 ip_ns3
   ip_ns1="$(get_ip ns1)"
   ip_ns2="$(get_ip ns2)"
   ip_ns3="$(get_ip ns3)"
-  echo "Devnet Agent Pubkeys: ${agent_count} agent(s) configured across 6-validator mesh (Custody allocation: ${custody_bal} ECH)."
+  local validators_edn=""
+  local validator_count=0
+  IFS=',' read -ra STREAMLET_VAL_ARR <<< "${streamlet_validators}"
+  for vnode in "${STREAMLET_VAL_ARR[@]}"; do
+    vnode="$(echo "$vnode" | tr -d '[:space:]')"
+    if [[ -n "$vnode" && -n "${PUBKEY[$vnode]:-}" ]]; then
+      validators_edn="${validators_edn} \"${PUBKEY[$vnode]}\""
+      validator_count=$((validator_count + 1))
+    fi
+  done
+  validators_edn="${validators_edn# }"
+  local quorum_threshold=$(( (2 * validator_count + 2) / 3 ))
+  echo "Devnet Agent Pubkeys: ${agent_count} agent(s) configured across 6-validator mesh (Streamlet BFT validators: ${validator_count}, quorum=${quorum_threshold}; Custody allocation: ${custody_bal} ECH)."
 
   for node in "${NODES[@]}"; do
     local ip
@@ -680,12 +700,20 @@ REMOTE_ID
                   "${PUBKEY[ns1]}" {:balance 1000000 :seq 0 :deps []}
                   "${PUBKEY[ns2]}" {:balance 1000000 :seq 0 :deps []}
                   "${PUBKEY[ns3]}" {:balance 1000000 :seq 0 :deps []}
+                  "302a300506032b6570032100e6fb9542cab052ca0a766ca3e62a9710a4878b0755d6692abcbe301041d10c0e" {:balance 1000000 :seq 0 :deps []}
+                  "302a300506032b65700321006642f780b64b85fac5728e8f2dd4a98e6e53b1722a2c0917c0c7ef0189c19b08" {:balance 500000 :seq 0 :deps []}
+                  "302a300506032b6570032100e0c42229a77cc99152ec454b196cd5f69cd1fae9d0c80895d1e9fafe8fda1a63" {:balance 200000 :seq 0 :deps []}
+                  "302a300506032b6570032100bc6b7f02c896caf209b3574b4f2b8c7f7734f86ccdec50b3b1865092b75daa62" {:balance 200000 :seq 0 :deps []}
+                  "302a300506032b6570032100575926a259d0266da304dd7be98f4518e4a2beb1bee58803ff1cb379113acbb7" {:balance 150000 :seq 0 :deps []}
+                  "302a300506032b65700321004585687db75ca86bcd74c302763cb78952d2603cd7595f4204332dd6346d8127" {:balance 400000 :seq 0 :deps []}
+                  "302a300506032b6570032100d41ac4a9177126260efc632218f4098733973aaed6f8a0850396a294593b47ba" {:balance 300000 :seq 0 :deps []}
+                  "302a300506032b657003210063560420a577848e3e9747bc7cca62f7ccd4c9c0fc515b5323de68bb3a76ecaa" {:balance 100000 :seq 0 :deps []}
 $(printf "%b" "${agent_ledger_lines}")}
  :protocol {:tick-interval-ms ${TICK_INTERVAL_MS}
             :epoch-length-ms ${TICK_INTERVAL_MS}
             :nodes #{:node1 :node2 :node3 :ns1 :ns2 :ns3}
-            :validator-count 6
-            :quorum-threshold 4}
+            :validator-count ${validator_count}
+            :quorum-threshold ${quorum_threshold}}
  :http {:enabled? true
         :host "127.0.0.1"
         :port 8080}
@@ -693,7 +721,8 @@ $(printf "%b" "${agent_ledger_lines}")}
            :agent-port 5010
            :agent-tcp-port 5010
            :listen-agents? ${LISTEN_AGENTS:-false}
-           :validators ["${PUBKEY[node1]}" "${PUBKEY[node2]}" "${PUBKEY[node3]}" "${PUBKEY[ns1]}" "${PUBKEY[ns2]}" "${PUBKEY[ns3]}"]
+           :validators [${validators_edn}]
+           :mesh-nodes {"${PUBKEY[node1]}" 1.0 "${PUBKEY[node2]}" 1.0 "${PUBKEY[node3]}" 1.0 "${PUBKEY[ns1]}" 1.0 "${PUBKEY[ns2]}" 1.0 "${PUBKEY[ns3]}" 1.0}
            :nodes {:node1 {:ip "${ip1}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node1]}" :fingerprint "${FINGERPRINT[node1]}" :ice-ufrag "${ICE_UFRAG[node1]}" :ice-pwd "${ICE_PWD[node1]}"}
                    :node2 {:ip "${ip2}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node2]}" :fingerprint "${FINGERPRINT[node2]}" :ice-ufrag "${ICE_UFRAG[node2]}" :ice-pwd "${ICE_PWD[node2]}"}
                    :node3 {:ip "${ip3}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEY[node3]}" :fingerprint "${FINGERPRINT[node3]}" :ice-ufrag "${ICE_UFRAG[node3]}" :ice-pwd "${ICE_PWD[node3]}"}
@@ -1699,6 +1728,70 @@ cmd_reprovision_infra_standard() {
   fi
 }
 
+cmd_add_validator() {
+  local target_node="${1:-}"
+  if [[ -z "$target_node" ]]; then
+    echo "Usage: ./scripts/cluster.sh add-validator <node-id> [--streamlet-bft]" >&2
+    return 1
+  fi
+  shift
+  local promote_bft=false
+  if [[ "${1:-}" == "--streamlet-bft" ]]; then
+    promote_bft=true
+  fi
+  if [[ ! -f "${ROOT_DIR}/devnet/bootstrap.edn" || ! -f "${TREASURY_KEY_FILE}" ]]; then
+    echo "Error: devnet/bootstrap.edn and ${TREASURY_KEY_FILE} must exist before running add-validator." >&2
+    return 1
+  fi
+  local submit_live=false
+  if [[ "${LIVE_SUBMIT:-0}" == "1" ]]; then
+    submit_live=true
+  fi
+  echo "=== Dynamically Adding Validator ${target_node} via :reconfigure-membership (promote_bft=${promote_bft}, submit_live=${submit_live}) ==="
+  (cd "${ROOT_DIR}" && clojure -M:simulate -e "
+    (require '[bitecho.stress.live-testnet :as lt])
+    (let [res (lt/reconfigure-live-validator! {:action :add
+                                               :node-id (keyword \"${target_node#:}\")
+                                               :promote-bft? ${promote_bft}
+                                               :submit-live? ${submit_live}
+                                               :bootstrap-file \"${ROOT_DIR}/devnet/bootstrap.edn\"
+                                               :treasury-key-file \"${TREASURY_KEY_FILE}\"})]
+      (println (pr-str res))
+      (when-not (:ok? res)
+        (binding [*out* *err*]
+          (println \"Error: reconfigure-live-validator! failed:\" (pr-str res)))
+        (System/exit 1)))")
+}
+
+cmd_remove_validator() {
+  local target_node="${1:-}"
+  if [[ -z "$target_node" ]]; then
+    echo "Usage: ./scripts/cluster.sh remove-validator <node-id>" >&2
+    return 1
+  fi
+  if [[ ! -f "${ROOT_DIR}/devnet/bootstrap.edn" || ! -f "${TREASURY_KEY_FILE}" ]]; then
+    echo "Error: devnet/bootstrap.edn and ${TREASURY_KEY_FILE} must exist before running remove-validator." >&2
+    return 1
+  fi
+  local submit_live=false
+  if [[ "${LIVE_SUBMIT:-0}" == "1" ]]; then
+    submit_live=true
+  fi
+  echo "=== Dynamically Removing Validator ${target_node} via :reconfigure-membership (submit_live=${submit_live}) ==="
+  (cd "${ROOT_DIR}" && clojure -M:simulate -e "
+    (require '[bitecho.stress.live-testnet :as lt])
+    (let [res (lt/reconfigure-live-validator! {:action :remove
+                                               :node-id (keyword \"${target_node#:}\")
+                                               :submit-live? ${submit_live}
+                                               :bootstrap-file \"${ROOT_DIR}/devnet/bootstrap.edn\"
+                                               :treasury-key-file \"${TREASURY_KEY_FILE}\"})]
+      (println (pr-str res))
+      (when-not (:ok? res)
+        (binding [*out* *err*]
+          (println \"Error: reconfigure-live-validator! failed:\" (pr-str res)))
+        (System/exit 1)))")
+}
+
 # ------------------------------------------------------------------------------
 # CLI Dispatcher & Usage
 # ------------------------------------------------------------------------------
@@ -1712,8 +1805,11 @@ Usage:
 
 Commands:
   init                                Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
-  deploy [--reset-state] [--skip-e2e-gate]
+  deploy [--reset-state] [--skip-e2e-gate] [--streamlet-validators node1,node2,node3]
                                       Build local uberjar, run pre/post-deploy E2E transfer gates, sync configs, and restart
+  add-validator <node-id> [--streamlet-bft]
+                                      Dynamically add a validator node to :mesh-nodes (and optionally :validators) with zero reset
+  remove-validator <node-id>          Dynamically remove a validator node from :mesh-nodes / :validators with zero reset
   verify-e2e                          Run pre-deploy E2E transfer & 3-epoch Streamlet finalization gate (60s bound)
   status                              Display live status table across all 3 (or 6 with --include-infra) cluster nodes
   audit                               Audit /statusz, /burnsz, /accountz, /connz, and memory convergence across all nodes (supports --include-infra)
@@ -1754,6 +1850,12 @@ main() {
       ;;
     deploy)
       cmd_deploy "$@"
+      ;;
+    add-validator|add_validator)
+      cmd_add_validator "$@"
+      ;;
+    remove-validator|remove_validator)
+      cmd_remove_validator "$@"
       ;;
     verify-e2e|verify_e2e)
       run_pre_deploy_e2e_gate "$@"

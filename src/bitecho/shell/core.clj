@@ -26,10 +26,16 @@
     :receive-offer-header
     :on-deliver
     :submit-vouchers
+    :signaling-burn
     :settle-intent
     :lock-intent
     :release-intent
     :refund-intent
+    :reconfigure-membership
+    :receive-receipt
+    :request-checkpoint
+    :receive-request-checkpoint
+    :receive-checkpoint
     :query-chain-state
     :submit-transcript
     :receive-transcript-sig})
@@ -46,6 +52,8 @@
     (cond
       (= (:type cmd) :app-event)
       (async/put! app-out (assoc cmd :node-pubkey node-pubkey))
+      (or (= (:type cmd) :diagnose) (= (:effect cmd) :diagnose))
+      nil
       (is-network-command? cmd) (async/put! net-out cmd)
       :else (async/put! events-in cmd))))
 

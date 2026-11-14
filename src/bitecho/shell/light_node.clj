@@ -15,8 +15,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datachannel.api :as api]
-            [datachannel.mdns :as mdns]
-            [taoensso.nippy :as nippy])
+            [datachannel.mdns :as mdns])
   (:import [com.sun.net.httpserver HttpHandler HttpServer]
            [java.io BufferedReader InputStreamReader PrintWriter RandomAccessFile]
            [java.lang ProcessHandle ProcessBuilder ProcessBuilder$Redirect]
@@ -751,36 +750,43 @@
         (write-state-bytes-atomic! f encoded)
         true))))
 
-(defn- nippy-bytes?
-  [^bytes b]
-  (and b
-       (>= (alength b) 4)
-       (= 78 (aget b 0))
-       (= 80 (aget b 1))
-       (= 89 (aget b 2))))
+(declare execute-conn-effects! apply-conn-event!)
+
+(defonce ^:private light-state-load-diagnostics-atom (atom {}))
+
+(defn get-light-state-load-diagnostics
+  "Returns counted diagnostic counters recorded during light-node state loading."
+  []
+  @light-state-load-diagnostics-atom)
 
 (defn load-light-state!
-  "Loads persisted light-node state from `state.fressian` (or transparently migrates legacy
-   `state.nippy` bytes on JVM), returning nil if no state file exists."
-  [state-file]
-  (when (and (some? state-file) (not (str/blank? (str state-file))))
-    (let [f (io/file state-file)
-          dir (or (.getParentFile f) (io/file "."))
-          eff-file (cond
-                     (.exists f) f
-                     (and (= (.getName f) "state.fressian")
-                          (.exists (io/file dir "state.nippy")))
-                     (io/file dir "state.nippy")
-                     (and (= (.getName f) "state.nippy")
-                          (.exists (io/file dir "state.fressian")))
-                     (io/file dir "state.fressian")
-                     :else nil)]
-      (when (and eff-file (.exists eff-file))
-        (let [b (Files/readAllBytes (.toPath eff-file))]
-          (when (pos? (alength b))
-            (if (nippy-bytes? b)
-              (nippy/thaw b)
-              (light-core/decode-light-state b))))))))
+  "Loads persisted light-node state strictly from `state.fressian`.
+   Rejects legacy Nippy ('NPY') bytes fail-closed with a counted :diagnose
+   :legacy-nippy-snapshot-rejected effect, returning nil."
+  ([state-file]
+   (load-light-state! state-file nil))
+  ([state-file opts]
+   (when (and (some? state-file) (not (str/blank? (str state-file))))
+     (let [f (io/file state-file)]
+       (when (.exists f)
+         (let [b (Files/readAllBytes (.toPath f))]
+           (when (pos? (alength b))
+             (if (fressian/nippy-payload? b)
+               (let [eff {:effect :diagnose
+                          :reason :legacy-nippy-snapshot-rejected
+                          :error "legacy-nippy-snapshot-rejected"
+                          :state-file (str f)}]
+                 (swap! light-state-load-diagnostics-atom update :legacy-nippy-snapshot-rejected (fnil inc 0))
+                 (when-let [st-atom (:state-atom opts)]
+                   (when (instance? clojure.lang.IAtom st-atom)
+                     (swap! st-atom update-in [:diagnostics :legacy-nippy-snapshot-rejected] (fnil inc 0))))
+                 (if-let [c-atom (:conn-atom opts)]
+                   (apply-conn-event! c-atom {:type :legacy-nippy-snapshot-rejected
+                                              :error "legacy-nippy-snapshot-rejected"}
+                                      opts)
+                   (execute-conn-effects! [eff] opts))
+                 nil)
+               (light-core/decode-light-state b)))))))))
 
 (defn load-or-create-light-identity!
   "Loads or creates persistent light-node identity in state-dir.
@@ -1399,6 +1405,15 @@
         :persist-failed
         (let [err (or (:error event) "persist-failed")
               diag-eff {:effect :diagnose :reason :persist-failed :error err}
+              new-conn (-> conn
+                           (assoc :last-error err
+                                  :dropped (inc (long (:dropped conn 0))))
+                           (push-diagnostic diag-eff))]
+          [new-conn [diag-eff]])
+
+        :legacy-nippy-snapshot-rejected
+        (let [err (or (:error event) "legacy-nippy-snapshot-rejected")
+              diag-eff {:effect :diagnose :reason :legacy-nippy-snapshot-rejected :error err}
               new-conn (-> conn
                            (assoc :last-error err
                                   :dropped (inc (long (:dropped conn 0))))

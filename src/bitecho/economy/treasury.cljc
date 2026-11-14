@@ -424,6 +424,7 @@
   [state mint-ctx]
   (let [epoch (:epoch mint-ctx)
         minted-epochs (or (:minted-epochs state) #{})
+        last-pruned (long (or (:last-pruned-mint-epoch state) -1))
         allocs-raw (or (:allocations mint-ctx) {})
         allocations (if (map? allocs-raw)
                       allocs-raw
@@ -434,8 +435,10 @@
         has-dust? (some? (:mint-dust mint-ctx))
         raw-dust (:mint-dust mint-ctx)]
     (cond
-      ;; 1. Epoch must be present and not already minted
-      (or (nil? epoch) (contains? minted-epochs epoch))
+      ;; 1. Epoch must be present, not already minted, and not below the pruned horizon (B-CARB-5)
+      (or (nil? epoch)
+          (<= (long epoch) last-pruned)
+          (contains? minted-epochs epoch))
       state
 
       ;; 2. Signature and state pubkey must be non-nil and non-empty

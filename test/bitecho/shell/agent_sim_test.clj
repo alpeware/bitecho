@@ -4,6 +4,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.economy.account :as account]
+            [bitecho.fressian :as fressian]
             [bitecho.shell.agent-sim :as sim]
             [bitecho.shell.mesh :as mesh]
             [bitecho.state-machine :as sm]
@@ -13,8 +14,7 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [datachannel.api :as api]
-            [taoensso.nippy :as nippy]))
+            [datachannel.api :as api]))
 
 (defn- setup-test-state
   "Constructs a clean state-machine test state with funded sender."
@@ -55,8 +55,8 @@
                       initial-bal 50000
 
                       envelope (sim/build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn)
-                      frozen (nippy/freeze envelope)
-                      thawed (nippy/thaw frozen)
+                      frozen (fressian/encode-wire envelope)
+                      thawed (fressian/decode-wire frozen)
                       unwrapped (mesh/unwrap-authenticated-agent-event thawed)
 
                       state (setup-test-state node-pub-hex sender-pub-hex initial-bal)
@@ -85,7 +85,7 @@
                             (let [p (.getBytes (str "test-payload-" i) "UTF-8")]
                               (sim/build-gossip-envelope sender-pub-hex sender-priv-bytes p burn)))
                           (range 5))
-          unwrapped-events (mapv #(mesh/unwrap-authenticated-agent-event (nippy/freeze %)) envelopes)
+          unwrapped-events (mapv #(mesh/unwrap-authenticated-agent-event (fressian/encode-wire %)) envelopes)
           msg-ids (mapv #(get-in % [:message :message-id]) unwrapped-events)]
       ;; 5 distinct non-blank message-ids
       (is (= 5 (count (distinct msg-ids))))
@@ -125,7 +125,7 @@
       (is (= thash (account/transfer-hash signed-transfer)))
 
       ;; 1. Unpack envelope via mesh
-      (let [unwrapped (mesh/unwrap-authenticated-agent-event (nippy/freeze envelope))]
+      (let [unwrapped (mesh/unwrap-authenticated-agent-event (fressian/encode-wire envelope))]
         (is (some? unwrapped))
         (is (= :receive-gossip (:type unwrapped)))
 
@@ -160,7 +160,7 @@
           price 250
           epoch 5
           envelope (sim/build-home-set-envelope agent-pub-hex agent-priv-bytes candidates price epoch)
-          unwrapped (mesh/unwrap-authenticated-agent-event (nippy/freeze envelope))
+          unwrapped (mesh/unwrap-authenticated-agent-event (fressian/encode-wire envelope))
           st0 (setup-test-state node-pub-hex agent-pub-hex 10000)
           res (sm/handle-event st0 unwrapped)
           st1 (:state res)]
@@ -182,7 +182,7 @@
           ufrag "agent-ice-ufrag"
           pwd "agent-ice-pwd"
           envelope (sim/build-home-set-envelope agent-pub-hex agent-priv-bytes candidates price epoch ufrag pwd)
-          frozen (nippy/freeze envelope)
+          frozen (fressian/encode-wire envelope)
           unwrapped (mesh/unwrap-authenticated-agent-event frozen)]
       (is (some? unwrapped))
       (is (= :register-home-set (:type unwrapped)))
@@ -218,7 +218,7 @@
                   settle-payload {:type :settle-intent :payer agent-pub-hex :receiver "rec-pubkey" :amount 10
                                   :ice-ufrag spoofed-ufrag :ice-pwd spoofed-pwd}
                   settle-env (mesh/wrap-agent-event settle-payload agent-pub-hex agent-priv-bytes)]
-              (on-msg {:payload (nippy/freeze settle-env) :channel-id 0})
+              (on-msg {:payload (fressian/encode-wire settle-env) :channel-id 0})
               (is (nil? (get @peer-ice-pwds spoofed-ufrag)) "Non-:register-home-set event must NOT ingest credentials into peer-ice-pwds"))
 
             ;; 2. A second agent cannot overwrite/poison an existing ufrag owned by the first agent
@@ -226,7 +226,7 @@
                   agent2-pub (basalt/bytes->hex (:public agent2-kp))
                   agent2-priv (:private agent2-kp)
                   malicious-env (sim/build-home-set-envelope agent2-pub agent2-priv candidates price epoch ufrag "poisoned-pwd")]
-              (on-msg {:payload (nippy/freeze malicious-env) :channel-id 0})
+              (on-msg {:payload (fressian/encode-wire malicious-env) :channel-id 0})
               (is (= pwd (get @peer-ice-pwds ufrag)) "Second agent must NOT overwrite existing ufrag credentials")
               (is (= agent-pub-hex (get @peer-ice-pwds [:owner ufrag])) "Ownership must remain with first agent"))))))))
 

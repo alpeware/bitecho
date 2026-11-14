@@ -1,8 +1,14 @@
 (ns bitecho.shell.persistence-test
-  (:require [bitecho.shell.light-node :as light-node]
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.economy.account :as account]
+            [bitecho.fressian :as fressian]
+            [bitecho.rendezvous.core :as rendezvous]
+            [bitecho.shell.light-node :as light-node]
             [bitecho.shell.persistence :as persistence]
+            [bitecho.streamlet.core :as streamlet]
             [clojure.core.async :as async]
-            [clojure.test :refer [deftest is testing]]))
+            [clojure.test :refer [deftest is testing]])
+  (:import [java.nio.file Files]))
 
 (deftest ^{:doc "Tests that strip-unserializable-state converts PersistentQueue to vector"}
   strip-unserializable-state-test
@@ -98,3 +104,54 @@
           (.shutdown pool)
           (try (.delete temp-snap) (catch Exception _ nil))
           (try (.delete temp-light) (catch Exception _ nil)))))))
+
+(deftest fressian-record-reconstitution-and-nippy-rejection-test
+  (testing "persistence/save-state-to-disk and load-state-from-disk reconstitute records and sets and reject NPY magic bytes fail-closed"
+    (let [temp-file (java.io.File/createTempFile "bitecho-fressian-snap" ".bin")
+          filepath (.getAbsolutePath temp-file)
+          acct (account/map->AccountState {:balance 5000 :seq 2 :deps ["d1"]})
+          blk (streamlet/map->Block {:epoch 1 :parent-hash "genesis" :txs ["tx1"] :proposer "p1" :signature "sig1"})
+          vote (streamlet/map->Vote {:epoch 1 :block-hash "bh1" :voter "v1" :signature "vsig1"})
+          ack (rendezvous/map->DeliveryAck {:offer-hash "oh1" :seq 1 :callee "c1" :home-node :node1 :epoch 1 :debit 10 :signature "asig1"})
+          peer (basalt/make-peer "127.0.0.1" 5000 (byte-array 32 (byte 7)))
+          state {:ledger {"alice" acct}
+                 :blocks {"bh1" blk}
+                 :block-votes {"bh1" #{"v1"}}
+                 :block-vote-proofs {"bh1" {"v1" vote}}
+                 :pending-vouchers [ack]
+                 :basalt-view [{:hash (byte-array 32) :peer peer}]
+                 :notarized-blocks #{"bh1"}
+                 :finalized-blocks #{"genesis"}
+                 :executed-finalized-blocks #{"genesis"}
+                 :minted-epochs #{1}
+                 :contagion-known-ids #{"m1"}
+                 :known-receipt-ids #{"r1"}
+                 :executed-receipt-ids #{"r0"}
+                 :settled-escrow-ids #{"e1"}
+                 :voted-epochs #{1}
+                 :equivocated-voters #{"bad1"}
+                 :murmur-cache {:queue (into clojure.lang.PersistentQueue/EMPTY ["m1"])
+                                :seen #{"m1"}}}]
+      (try
+        (persistence/save-state-to-disk filepath state)
+        (let [raw-bytes (Files/readAllBytes (.toPath temp-file))
+              loaded (persistence/load-state-from-disk filepath)]
+          (is (not (fressian/nippy-payload? raw-bytes)))
+          (is (instance? bitecho.economy.account.AccountState (get-in loaded [:ledger "alice"])))
+          (is (instance? bitecho.streamlet.core.Block (get-in loaded [:blocks "bh1"])))
+          (is (instance? bitecho.streamlet.core.Vote (get-in loaded [:block-vote-proofs "bh1" "v1"])))
+          (is (instance? bitecho.rendezvous.core.DeliveryAck (first (:pending-vouchers loaded))))
+          (is (instance? bitecho.basalt.core.Peer (get-in loaded [:basalt-view 0 :peer])))
+          (is (set? (get-in loaded [:block-votes "bh1"])))
+          (is (set? (:notarized-blocks loaded)))
+          (is (set? (:finalized-blocks loaded)))
+          (is (set? (:executed-finalized-blocks loaded)))
+          (is (set? (:minted-epochs loaded)))
+          (is (instance? clojure.lang.PersistentQueue (get-in loaded [:murmur-cache :queue]))))
+        ;; Write legacy NPY magic header bytes and verify fail-closed rejection
+        (Files/write (.toPath temp-file)
+                     (byte-array [78 80 89 0 1 2 3 4])
+                     (into-array java.nio.file.OpenOption []))
+        (is (nil? (persistence/load-state-from-disk filepath)))
+        (finally
+          (.delete temp-file))))))

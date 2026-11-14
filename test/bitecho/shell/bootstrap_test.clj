@@ -28,7 +28,10 @@
       (is (re-find #"Max Execution Lag:" script))
       (is (re-find #"PROBE_PUB=" script))
       (is (re-find #"cmd_fund \"\$\{PROBE_PUB\}\" 1" script))
-      (is (re-find #"state-backup" script)))))
+      (is (re-find #"state-backup" script))
+      (is (re-find #"--streamlet-validators" script))
+      (is (re-find #"add-validator" script))
+      (is (re-find #"remove-validator" script)))))
 
 (deftest test-browser-bundle-and-index-html-refresh-restore-wiring
   (testing "M1 & L7: dist/index.html calls exact BitechoBrowser.loadStateFromIndexedDB exported by dist/bitecho-browser.js and preserves identity across reload"

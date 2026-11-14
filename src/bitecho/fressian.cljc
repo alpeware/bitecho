@@ -8,8 +8,7 @@
    - Legacy Nippy payload detection and transparent JVM rolling-upgrade decoding."
   (:refer-clojure :exclude [bytes?])
   (:require [fressian.core :as fcore]
-            [fressian.lz4 :as flz4]
-            #?(:clj [taoensso.nippy :as nippy])))
+            [fressian.lz4 :as flz4]))
 
 ;; =============================================================================
 ;; Re-exported Portable Byte & String Utilities
@@ -153,11 +152,18 @@
   [val]
   (fcore/encode-canonical val))
 
+(defn encode
+  "Encodes a Clojure data structure into Canonical Fressian bytes after normalizing records/queues for wire/persistence."
+  [val]
+  (fcore/encode-canonical (fcore/normalize-for-wire val)))
+
 (defn decode
   "Decodes a Fressian byte array into Clojure persistent data structures
-   and recursively strips untrusted shell-boundary crypto tags."
+   and recursively strips untrusted shell-boundary crypto tags.
+   Rejects legacy Nippy ('NPY') payloads fail-closed (returns nil)."
   [ba]
-  (strip-untrusted-crypto-tags (fcore/decode ba)))
+  (when-not (nippy-payload? ba)
+    (strip-untrusted-crypto-tags (fcore/normalize-decoded-wire (fcore/decode ba)))))
 
 (defn decode-canonical
   "Decodes a canonical Fressian byte array into Clojure persistent data structures."
@@ -272,27 +278,21 @@
 
 (defn- decode-fressian-or-nippy-bytes
   [ba]
-  (let [sentinel decode-error-sentinel
-        raw #?(:clj
-               (if (nippy-payload? ba)
-                 (try (nippy/thaw ba)
-                      (catch Exception _
-                        (try (fcore/read ba)
-                             (catch Exception _
-                               (try (fcore/decode ba) (catch Exception _ sentinel))))))
-                 (try (fcore/read ba)
-                      (catch Exception _
-                        (try (fcore/decode ba)
-                             (catch Exception _
-                               (if (nippy-payload? ba)
-                                 (try (nippy/thaw ba) (catch Exception _ sentinel))
-                                 sentinel))))))
-               :cljs
-               (try (fcore/decode ba)
-                    (catch :default _ sentinel)))]
-    (if (identical? raw sentinel)
+  (let [sentinel decode-error-sentinel]
+    (if (nippy-payload? ba)
       sentinel
-      (strip-untrusted-crypto-tags (normalize-decoded-wire raw)))))
+      (let [raw #?(:clj
+                   (try (fcore/read ba)
+                        (catch Exception _
+                          (try (fcore/decode ba)
+                               (catch Exception _
+                                 sentinel))))
+                   :cljs
+                   (try (fcore/decode ba)
+                        (catch :default _ sentinel)))]
+        (if (identical? raw sentinel)
+          sentinel
+          (strip-untrusted-crypto-tags (normalize-decoded-wire raw)))))))
 
 (defn decode-wire-strict
   "Strictly decodes wire bytes, throwing ExceptionInfo with :reason on BTEC compression

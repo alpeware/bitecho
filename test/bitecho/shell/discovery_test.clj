@@ -101,7 +101,7 @@
           (is (= :devnet (:network parsed)))
           (is (string? (:treasury-pubkey parsed)))
           (is (string? (:custody-pubkey parsed)))
-          (is (= 3 (count (:nodes parsed))))
+          (is (= 6 (count (:nodes parsed))))
           (let [n1 (get-in parsed [:nodes :node1])]
             (is (= :node1 (:node-id n1)))
             (is (= "35.212.129.138" (:ip n1)))
@@ -119,7 +119,7 @@
           (is (= :devnet (:network parsed)))
           (is (string? (:treasury-pubkey parsed)))
           (is (string? (:custody-pubkey parsed)))
-          (is (= 3 (count (:nodes parsed))))
+          (is (= 6 (count (:nodes parsed))))
           (let [n2 (get-in parsed [:nodes :node2])]
             (is (= :node2 (:node-id n2)))
             (is (= "35.206.120.143" (:ip n2)))
