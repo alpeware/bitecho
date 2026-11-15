@@ -488,7 +488,15 @@
             "puzzle-source" "solution" "conditions"
             "cid" "mime" "bytes" "target" "authority" "leader-term" "proof"
             "provider" "price-echo" "target-cid" "capability-id" "capability-type"
-            "replication-rejected"}
+            "replication-rejected"
+            "governance" "governance-replication-rejected" "lab-subnets" "subnet-anchors"
+            "blob-store" "blobs" "pointers" "bips" "bounties" "circles" "circle-responses"
+            "regression-vectors" "subnet-regression-vectors" "scheduled-upgrades" "activated-upgrades" "subnet-policies"
+            "entries" "hot-bytes" "unpinned-bytes" "access-seq" "max-hot-bytes" "max-unpinned-bytes"
+            "evicted-hot" "evicted-unpinned" "cache-misses" "cid-mismatch" "dangling-pointers"
+            "builders-stewards" "mesh-validators" "anchor-agent-users"
+            "invalid-lab-subnet-rejected" "bip-admission-rejected" "sybil-bounty-claim-rejected"
+            "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)
@@ -652,8 +660,8 @@
                                     (collect-keys populated-light)
                                     (collect-keys base-anchor)
                                     (collect-keys base-conn)))))
-        ;; All 43 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
-        (is (= 43 (count (keys base-light))))
+        ;; All 44 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
+        (is (= 44 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)
