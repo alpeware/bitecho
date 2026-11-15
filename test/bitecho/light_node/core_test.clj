@@ -4021,6 +4021,114 @@
             (is (= "intent-test-1" (get ref-resp "escrow_id")))
             (is (= "intent-test-1" (get ref-resp "intent_id")))))))))
 
+;; =============================================================================
+;; Milestone D18: Burn-Bearing Broadcast, Storage-Put, Capability-Publish & Inbox
+;; =============================================================================
+
+(deftest test-d18-burn-broadcast-storage-capability-and-subnet-inbox
+  (let [alice (test-identity)
+        bob (test-identity)
+        priv-a (:privkey-bytes alice)
+        priv-b (:privkey-bytes bob)
+        st-a0 (-> (light-core/init-light-state (:identity alice) {:epoch 10})
+                  (assoc :account {:balance 1000 :spendable 1000 :seq 0}))
+        st-b0 (light-core/init-light-state (:identity bob) {:epoch 10})]
+
+    (testing "1. broadcast --burn 100 --subnet-id homebrew-cafe deducts burn, wraps outer :subnet-id *, and rejects insufficient funds"
+      (let [b-res (light-core/handle-command st-a0 {"cmd" "broadcast"
+                                                    "subnet_id" "homebrew-cafe"
+                                                    "text" "welcome to homebrew-cafe"
+                                                    "burn" 100}
+                                             priv-a)
+            st-a1 (:state b-res)
+            env (first (:net-envelopes b-res))]
+        (is (true? (get-in b-res [:response "ok"])))
+        (is (= "homebrew-cafe" (get-in b-res [:response "subnet_id"])))
+        (is (= 100 (get-in b-res [:response "burn"])))
+        (is (false? (get-in b-res [:response "zero_burn"])))
+        (is (= 900 (get-in st-a1 [:account :spendable])))
+        (is (= 900 (get-in st-a1 [:account :balance])))
+        (is (= 100 (get-in st-a1 [:local-accounting :burned-ech])))
+        (is (= :receive-gossip (get-in env [:event :type])))
+        (is (= "*" (:subnet-id env)))
+        (is (= 100 (get-in env [:event :message :burn-amount])))
+        (let [inner (light-core/thaw-payload (get-in env [:event :message :payload]))]
+          (is (= "homebrew-cafe" (:subnet-id inner)))
+          (is (= "welcome to homebrew-cafe" (:text inner))))
+
+        ;; Insufficient funds rejected cleanly
+        (let [fail-res (light-core/handle-command st-a1 {"cmd" "broadcast"
+                                                         "subnet_id" "homebrew-cafe"
+                                                         "text" "too expensive"
+                                                         "burn" 5000}
+                                                  priv-a)]
+          (is (false? (get-in fail-res [:response "ok"])))
+          (is (= "insufficient-funds" (get-in fail-res [:response "error"]))))
+
+        ;; Bob (default "global" node) receives Alice's homebrew-cafe broadcast and drains via inbox with --subnet-id filtering
+        (let [rx-res (light-core/handle-wire-payload st-b0 env priv-b)
+              st-b1 (:state rx-res)]
+          (is (= 1 (count (:broadcast-inbox st-b1))))
+          (is (= "homebrew-cafe" (:subnet-id (first (:broadcast-inbox st-b1)))))
+          (is (= "homebrew-cafe" (:subnet-id (first (:inbox st-b1)))))
+
+          ;; Filtering by non-matching subnet leaves homebrew-cafe broadcast in inbox
+          (let [in-other (light-core/handle-command st-b1 {"cmd" "inbox" "subnet_id" "other-subnet"} priv-b)]
+            (is (empty? (get-in in-other [:response "messages"])))
+            (is (empty? (get-in in-other [:response "broadcasts"])))
+            (is (= 1 (count (:broadcast-inbox (:state in-other)))))
+            (is (= 1 (count (:inbox (:state in-other))))))
+
+          ;; Filtering by "homebrew-cafe" drains and returns the broadcast
+          (let [in-cafe (light-core/handle-command st-b1 {"cmd" "inbox" "subnet_id" "homebrew-cafe"} priv-b)]
+            (is (= 1 (count (get-in in-cafe [:response "messages"]))))
+            (is (= 1 (count (get-in in-cafe [:response "broadcasts"]))))
+            (is (= "welcome to homebrew-cafe" (:text (first (get-in in-cafe [:response "broadcasts"])))))
+            (is (empty? (:broadcast-inbox (:state in-cafe))))
+            (is (empty? (:inbox (:state in-cafe))))))))
+
+    (testing "2. storage-put --burn 100 and capability-publish --burn 100 deduct burn and wrap in gossip envelope"
+      (let [put-res (light-core/handle-command st-a0 {"cmd" "storage-put"
+                                                      "slot_id" "notes"
+                                                      "subnet_id" "homebrew-cafe"
+                                                      "data" "my secret notes"
+                                                      "burn" 100}
+                                               priv-a)
+            st-a1 (:state put-res)
+            put-env (first (:net-envelopes put-res))]
+        (is (true? (get-in put-res [:response "ok"])))
+        (is (= 100 (get-in put-res [:response "burn"])))
+        (is (= 900 (get-in st-a1 [:account :spendable])))
+        (is (= :receive-gossip (get-in put-env [:event :type])))
+        (is (= :storage-replicate (:bitecho/type put-env)))
+        (is (= "*" (:subnet-id put-env)))
+        (is (= 100 (get-in put-env [:event :message :burn-amount])))
+        ;; Bob receives the gossip-wrapped storage-replicate envelope cleanly
+        (let [bob-rx (light-core/handle-wire-payload st-b0 (select-keys put-env [:event :signature :agent-pubkey :subnet-id]) priv-b)]
+          (is (= "storage-replicated" (get (first (:stdout-events bob-rx)) "event"))))
+
+        ;; capability-publish with --burn 100
+        (let [cap-res (light-core/handle-command st-a1 {"cmd" "capability-publish"
+                                                        "capability_id" "code-audit"
+                                                        "capability_type" "compute/uop-kernel"
+                                                        "subnet_id" "homebrew-cafe"
+                                                        "price_echo" 250
+                                                        "burn" 100}
+                                                 priv-a)
+              st-a2 (:state cap-res)
+              cap-env (first (:net-envelopes cap-res))]
+          (is (true? (get-in cap-res [:response "ok"])))
+          (is (= 100 (get-in cap-res [:response "burn"])))
+          (is (= 800 (get-in st-a2 [:account :spendable])))
+          (is (= :receive-gossip (get-in cap-env [:event :type])))
+          (is (= :capability-replicate (:bitecho/type cap-env)))
+          (is (= "*" (:subnet-id cap-env)))
+          (is (= 100 (get-in cap-env [:event :message :burn-amount])))
+          ;; Bob receives the gossip-wrapped capability-replicate envelope cleanly
+          (let [bob-cap-rx (light-core/handle-wire-payload st-b0 (select-keys cap-env [:event :signature :agent-pubkey :subnet-id]) priv-b)]
+            (is (= "capability-published" (get (first (:stdout-events bob-cap-rx)) "event")))))))))
+
+
 
 
 

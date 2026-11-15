@@ -28,7 +28,7 @@ flowchart TD
 | **2. 6-Stage Fractal E2E Workload & Golden Oracle** | [`dev/bitecho/stress/e2e_workload.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/e2e_workload.clj) | 6-validator (`3` BFT + `3` mesh) + 8-light-node topology executing 6 protocol stages and verifying against the closed-form `compute-golden-expected-state` oracle. | `clojure -M:test -n bitecho.stress-e2e-test` |
 | **3. 4-Environment Differential Parity Harnesses** | [`dev/bitecho/stress/harness.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/harness.clj), [`dev/bitecho/stress/live_testnet.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/live_testnet.clj) | Runs the identical 6-stage workload across Clean Sans-IO, Chaos/Byzantine Shell, Fressian Wire-Boundary + Bounded State (`8,192` cap), and Live 6-Node GCP Testnet (`UDP :5010` WebRTC DataChannel). | `./scripts/cluster.sh stress-e2e` |
 | **4. Tokenomics Horizon & Topology / Nemesis Suites** | [`dev/bitecho/stress/tokenomics_sim.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/tokenomics_sim.clj), [`dev/simulator.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/simulator.clj), [`test/bitecho/vopr_test.clj`](file:///home/simonpure/src/alpeware/bitecho/test/bitecho/vopr_test.clj) | 30,000-epoch (~3.42-year) tokenomics horizon simulator across 4 demand regimes; 10..1000-node Basalt/Contagion simulator; Jepsen/VOPR nemesis partition & clock-skew suites. | `clojure -M:simulate -m bitecho.stress.tokenomics-sim` |
-| **5. Bubblewrap-Sandboxed Multi-Agent `agy` Harness** | [`dev/bitecho/experiments/sandbox.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/sandbox.clj), [`dev/bitecho/experiments/node_tool.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/node_tool.clj), [`dev/bitecho/experiments/runner.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/runner.clj) | Spawns isolated headless `agy` AI agents inside `bwrap` filesystem/PID/IPC/UTS sandboxes with per-node UDP DNS allowlist filtering, hierarchical ECH funding, and deterministic halts. | `clojure -M:simulate -m bitecho.experiments.runner dev/experiments/sociocratic_subnet_demo.edn` |
+| **5. Bubblewrap-Sandboxed Multi-Agent `agy` Harness** | [`dev/bitecho/experiments/sandbox.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/sandbox.clj), [`dev/bitecho/experiments/node_tool.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/node_tool.clj), [`dev/bitecho/experiments/runner.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/runner.clj) | Spawns isolated headless `agy` AI agents inside `bwrap` filesystem/PID/IPC/UTS sandboxes with per-node real Bitecho light-node daemons (`light-shell/run-serve!`) connected to the live testnet, UDP DNS allowlist filtering, hierarchical ECH funding, and deterministic halts. | `clojure -M:simulate -m bitecho.experiments.runner dev/experiments/homebrew_cafe_civilization.edn` |
 
 ---
 
@@ -149,9 +149,11 @@ The tokenomics horizon simulator ([`dev/bitecho/stress/tokenomics_sim.clj`](file
 
 ### 3.4 How to Configure & Run a Sandboxed Multi-Agent `agy` Experiment (`dev/experiments/`)
 
-The Milestone D16/D17 multi-agent harness spawns multiple autonomous Bitecho light nodes inside hardened Linux **Bubblewrap (`bwrap`)** sandboxes (`--ro-bind / /`, isolated PID/IPC/UTS namespaces, `--tmpfs` masks over `~/.ssh`, repo `.ssh`, `~/.cache`, `/tmp`, and sibling node directories, plus a per-node local UDP DNS allowlist server and `/etc/hosts` filter).
+The Milestone D16–D18 multi-agent harness spawns multiple autonomous Bitecho light nodes inside hardened Linux **Bubblewrap (`bwrap`)** sandboxes (`--ro-bind / /`, isolated PID/IPC/UTS namespaces, `--tmpfs` masks over `~/.ssh`, repo `.ssh`, `~/.cache`, `/tmp`, and sibling node directories, plus a per-node local UDP DNS allowlist server and `/etc/hosts` filter).
 
-Each node runs a **single long-lived streaming `agy` process** (`agy --input-format stream-json --output-format stream-json --model <model> --dangerously-skip-permissions`) across all turns (`INV-D17-2`, `INV-D17-3`), preserving full multi-turn conversation memory, tool-execution state, and subagent context while streaming NDJSON events to `<node-dir>/agy-stream.jsonl` and `<experiment-dir>/agy-events.jsonl`.
+Each node runs:
+1. **A real Bitecho light-node daemon (`bitecho.shell.light-node/run-serve!`)** initialized with an Ed25519 identity (`data/identity.fressian`), Fressian state (`data/state.fressian`), local HTTP control server (`data/control.json` on `127.0.0.1:<ephemeral-port>/ctl`), and live WebRTC DataChannel connections (`connect-validators!`) to the Bitecho testnet (`devnet/bootstrap.edn`, `:node1` `35.212.172.159:5010`) (`INV-D18-1`..`INV-D18-4`). There is **zero in-memory message routing** in `runner.clj` — all broadcasts, capability publications, E2E X25519/ChaCha20-Poly1305 sealed sessions (`offer`/`send`), and signed `transfer` transactions traverse the live Bitecho network, enabling experiments where nodes run on the same host or across separate machines.
+2. **A single long-lived streaming `agy` process** (`agy --input-format stream-json --output-format stream-json --model <model> --dangerously-skip-permissions`) across all turns (`INV-D17-2`, `INV-D17-3`), preserving full multi-turn conversation memory, tool-execution state, and subagent context while streaming NDJSON events to `<node-dir>/agy-stream.jsonl` and `<experiment-dir>/agy-events.jsonl`.
 
 #### Step 1: Create an Experiment EDN Configuration File
 
@@ -161,6 +163,8 @@ Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/homebrew_c
 {:experiment-id "homebrew-cafe-civilization-01"
  :max-turns 2
  :min-echo-balance 100
+ :live-network? true
+ :fund-from-state-dir "/tmp/antigravity-light-node"
  :dns-records {"bitecho.org" "35.212.172.159"
                "*.bitecho.org" "35.209.253.119"}
  :nodes
@@ -169,15 +173,15 @@ Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/homebrew_c
    :start-balance 700
    :model-type "gemini-4-hydrogen-low"
    :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com" "en.wikipedia.org" "*.wikipedia.org"]
-   :initial-prompt "Read SCENARIO.md, join homebrew-cafe, query Wikipedia, and offer wikipedia-oracle for 350 ECH."
-   :followup-prompt "Fulfill any capability-order in p2p-inbox, join new-alexandria, and halt with accomplished-goal."}
+   :initial-prompt "Read SCENARIO.md, query Wikipedia, cache via storage-put, publish wikipedia-oracle via capability-publish, and broadcast on homebrew-cafe."
+   :followup-prompt "Check inbox, deliver summary via send --to alchemist-tesla, broadcast on new-alexandria, and write SUMMARY.md."}
   {:node-id :alchemist-tesla
    :parent-id :patron-medici
    :start-balance 1400
    :model-type "gemini-3.8-flash-low"
    :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
-   :initial-prompt "Read SCENARIO.md, join homebrew-cafe, offer cipher-forge for 300 ECH, and buy wikipedia-oracle."
-   :followup-prompt "Deliver cipher-forge seal to patron-medici, join new-alexandria, and halt with accomplished-goal."}]}
+   :initial-prompt "Read SCENARIO.md, publish cipher-forge via capability-publish, transfer 350 ECH to archivist-hypatia, and open/send order."
+   :followup-prompt "Check inbox, deliver Genesis Seal to patron-medici via send, broadcast on new-alexandria, and write SUMMARY.md."}]}
 ```
 
 #### Supported `:model-type` Identifiers (`INV-D16-1`)
@@ -186,20 +190,21 @@ Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/homebrew_c
 - **Claude 5.5:** `"claude-opus-5-5-low"`, `"claude-opus-5-5-medium"`, `"claude-opus-5-5-high"`, `"claude-sonnet-5-5-low"`, `"claude-sonnet-5-5-medium"`, `"claude-sonnet-5-5-high"`
 - **Open-Weights:** `"gpt-oss-120b-medium"`
 
-#### Hierarchical Funding (`:parent-id`), Capability Marketplace, & Halt Conditions (`INV-D16-4`, `INV-D16-5`, `INV-D17-1`)
+#### Hierarchical Funding (`:parent-id`), Real Light-Node CLI (`clojure -M:light-node`), & Halt Conditions (`INV-D16-4`, `INV-D16-5`, `INV-D18-1`..`INV-D18-4`)
 
 - Root nodes specify `:parent-id :genesis-custody` (or `:treasury`).
-- Child nodes specify a sibling node's `:node-id` as `:parent-id`; the child's `:start-balance` is automatically deducted from the parent node's `:start-balance` at provisioning time so total experiment ECH supply is strictly conserved.
-- Each node workspace is provisioned with `AGENTS.md`, `SCENARIO.md`, `.agents/skills/bitecho-light-node/SKILL.md`, and `bin/bitecho-node`:
-  - `bitecho-node status`, `bitecho-node peers`, `bitecho-node p2p-inbox`, `bitecho-node subnet-inbox`, `bitecho-node capability-list` (`0` ECH free reads).
-  - `bitecho-node subnet-join <subnet>`, `bitecho-node subnet-broadcast <subnet> "<msg>"`, `bitecho-node p2p-send <peer> "<msg>"` (`100` ECH burn each).
-  - `bitecho-node capability-offer <cap-id> <price> "<desc>"` (`100` ECH burn), `bitecho-node capability-buy <cap-id> "<req>"` (`<price> + 100` ECH burn; credits `<price>` ECH to provider), `bitecho-node capability-deliver <buyer> <cap-id> "<result>"` (`100` ECH burn).
-  - `bitecho-node transfer <peer> <amount>` (`<amount> + 100` ECH burn).
+- Child nodes specify a sibling node's `:node-id` as `:parent-id`; the child's `:start-balance` is automatically deducted from the parent node's `:start-balance` at provisioning time so total experiment ECH supply is strictly conserved, and when `:live-network? true` is set, each node is funded on-chain via `/tmp/antigravity-light-node`.
+- Each node workspace is provisioned with `AGENTS.md`, `SCENARIO.md`, the real [`skill/SKILL.md`](file:///home/simonpure/src/alpeware/bitecho/skill/SKILL.md) at `.agents/skills/bitecho-light-node/SKILL.md`, and fast-path wrappers `bin/clojure` (`clojure -M:light-node <verb> ...`) and `bin/bitecho-light-node` that forward `{"argv": [...]}` to the node's local light-node daemon via `./data/control.json`:
+  - `clojure -M:light-node status`, `clojure -M:light-node petname-list`, `clojure -M:light-node inbox [--subnet-id <subnet>]`, `clojure -M:light-node capability-list`, `clojure -M:light-node storage-get --slot-id <slot> [--subnet-id <subnet>]` (`0` ECH free local reads).
+  - `clojure -M:light-node broadcast --subnet-id <subnet> --text "<msg>" --burn 100` (`100` ECH burn).
+  - `clojure -M:light-node storage-put --slot-id <slot> --subnet-id <subnet> --data "<text>" --burn 100` (`100` ECH burn).
+  - `clojure -M:light-node capability-publish --capability-id <id> --capability-type compute/uop-kernel --subnet-id <subnet> --price <ech> --burn 100` (`100` ECH burn).
+  - `clojure -M:light-node offer --callee <petname|pubkey> --price 0 --burn 100` and `clojure -M:light-node send --to <petname|pubkey> --text "<msg>" --burn 100` (`100` ECH burn each; E2E encrypted X25519 + ChaCha20-Poly1305 session).
+  - `clojure -M:light-node transfer --receiver <petname|pubkey> --amount <ech> --burn 100` (`<amount> + 100` ECH burn; verified & credited by recipient's `handle-wire-transfer`).
 - A node halts immediately (and its long-lived `agy` process is cleanly terminated) when:
-  1. Its balance drops strictly below `:min-echo-balance` (`:out-of-echos`),
-  2. It invokes `bitecho-node halt accomplished-goal "<summary>"` (`:accomplished-goal`),
-  3. It invokes `bitecho-node halt gave-up "<reason>"` (`:gave-up`), or
-  4. It reaches `:max-turns` (`:max-turns-exceeded`).
+  1. Its real light-node daemon `spendable` balance drops strictly below `:min-echo-balance` (`:out-of-echos`),
+  2. The agent writes a non-empty `<workspace>/SUMMARY.md` (`:accomplished-goal`), or
+  3. It reaches `:max-turns` (`:max-turns-exceeded`).
 
 #### Step 2: Run Preflight Verification or Full Headless Execution
 
@@ -207,9 +212,22 @@ Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/homebrew_c
 # 1. Run preflight sandbox & DNS isolation verification (--dry-run):
 clojure -M:simulate -m bitecho.experiments.runner dev/experiments/homebrew_cafe_civilization.edn --dry-run
 
-# 2. Run the full multi-turn long-lived stream-json agy experiment:
+# 2. Run the full multi-turn long-lived stream-json agy experiment over the live testnet:
 clojure -M:simulate -m bitecho.experiments.runner dev/experiments/homebrew_cafe_civilization.edn
 
 # 3. Run the automated unit, bwrap integration, and test.check generative suite:
 clojure -M:test -n bitecho.experiments-test
 ```
+
+---
+
+### 3.5 Verified Live Testnet Execution Report: `homebrew-cafe-civilization-01` (Milestone D18)
+
+Executed against the live GCP Bitecho testnet (`35.212.172.159:5010` WebRTC DataChannel, funded via `/tmp/antigravity-light-node`):
+
+| Node | Model | Parent | Initial ECH | Final ECH | Halted? | Halt Reason | Verified Live Protocol Operations |
+| :--- | :--- | :--- | ---: | ---: | :---: | :--- | :--- |
+| `:archivist-hypatia` | `gemini-4-hydrogen-low` | `:patron-medici` | `700` | `550` | `true` | `:accomplished-goal` | Queried Wikipedia (`Byzantine_fault`), cached via `storage-put`, published `wikipedia-oracle` (`350 ECH`), received `350 ECH` transfer (`tx_id: 64958d5d...`), delivered summary over E2E session `3970886f...`, broadcast guild join on `new-alexandria`, wrote `SUMMARY.md` |
+| `:alchemist-tesla` | `gemini-3.8-flash-low` | `:patron-medici` | `1400` | `750` | `true` | `:accomplished-goal` | Confirmed Wikipedia DNS blocked, published `cipher-forge` (`300 ECH`), paid `350 ECH` (`+ 100` burn) to `:archivist-hypatia`, received `300 ECH` transfer (`tx_id: 0e103489...`) from `:patron-medici`, delivered SHA-256 Genesis Seal over E2E session `6f17f77d...`, wrote `SUMMARY.md` |
+| `:patron-medici` | `gemini-4-carbon-low` | `:genesis-custody` | `2650` | `1750` | `true` | `:accomplished-goal` | Broadcast guild invitation on `homebrew-cafe`, paid `300 ECH` (`+ 100` burn) to `:alchemist-tesla`, received Genesis Seal on E2E session `6f17f77d...`, persisted `new-alexandria-charter` (`cid: 7ac6e471...`) via `storage-put`, broadcast charter ratification on `new-alexandria`, wrote `SUMMARY.md` |
+| `:nomad-diogenes` | `gemini-3.8-flash-low` | `:patron-medici` | `250` | `50` | `true` | `:out-of-echos` | Broadcast 2 Cynic aphorisms (`2 x 100 ECH` burn -> `50 ECH < 100 ECH` floor); automatically halted with `:out-of-echos` after Turn 1 (Turn 2 skipped) |

@@ -350,11 +350,17 @@
                        (:effective-balances cafe-res)))
                 (is (.exists (io/file (:workspace-dir alpha-ctx) "SCENARIO.md")))))
 
-            (testing "bwrap command contains mandatory read-only root and secret/sibling masks"
+            (testing "bwrap command contains mandatory read-only root, secret/sibling masks, and zero shared-bus"
               (is (some #{"--ro-bind"} bwrap-cmd))
               (is (some #{"--unshare-pid"} bwrap-cmd))
               (is (some #{"--die-with-parent"} bwrap-cmd))
-              (is (some #{"/home/simonpure/src/alpeware/bitecho/.ssh"} bwrap-cmd)))
+              (is (some #{"/home/simonpure/src/alpeware/bitecho/.ssh"} bwrap-cmd))
+              (is (not (.exists (io/file (:experiment-dir provisioned) "shared-bus"))))
+              (is (.exists (io/file (:data-dir alpha-ctx) "control.json")))
+              (is (.exists (io/file (:data-dir alpha-ctx) "state.fressian")))
+              (let [skill-md (slurp (io/file (:workspace-dir alpha-ctx) ".agents" "skills" "bitecho-light-node" "SKILL.md"))]
+                (is (str/includes? skill-md "capability-publish"))
+                (is (str/includes? skill-md "storage-put"))))
 
             (testing "live bwrap preflight enforces read-only root, secret masking, sibling masking, and DNS allowlist"
               (is (:ok? iso-alpha) (pr-str iso-alpha))
@@ -366,38 +372,87 @@
               (is (:blocked-dns-refused? iso-alpha))
               (is (:ok? iso-beta) (pr-str iso-beta)))
 
-            (testing "bin/bitecho-node executes inside bwrap for subnet, P2P, capability marketplace, transfer, out-of-echos, and accomplished-goal"
-              (let [r1 (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "status"])
+            (testing "real light-node CLI (clojure -M:light-node / bitecho-light-node) executes inside bwrap over /ctl and live validator WebRTC DataChannel for broadcast, storage, capability, session, transfer, out-of-echos, and SUMMARY.md accomplished-goal"
+              (let [;; 1. Verify status and petname-list via clojure -M:light-node and bitecho-light-node
+                    r1 (runner/exec-in-node-sandbox! provisioned alpha-ctx ["clojure" "-M:light-node" "status"])
                     _ (is (zero? (:exit r1)) (pr-str r1))
-                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "subnet-join" "sociocratic-lab"])
-                    _ (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "subnet-join" "sociocratic-lab"])
-                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "subnet-broadcast" "sociocratic-lab" "hello-circle"])
-                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "p2p-send" "beta" "direct-ping-from-alpha"])
-                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "capability-offer" "wikipedia-oracle" "100" "Live Wikipedia lookup"])
-                    self-buy (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "capability-buy" "wikipedia-oracle" "self-buy"])
-                    _ (is (= 1 (:exit self-buy)))
-                    cap-list (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "capability-list"])
+                    r-pets (runner/exec-in-node-sandbox! provisioned alpha-ctx ["clojure" "-M:light-node" "petname-list"])
+                    _ (is (zero? (:exit r-pets)) (pr-str r-pets))
+                    _ (is (str/includes? (:out r-pets) "beta"))
+                    ;; 2. Alpha (starts with 1350 ECH): broadcast (1250), storage-put (1150), storage-get, capability-publish (1050)
+                    bcast-res (runner/exec-in-node-sandbox!
+                               provisioned alpha-ctx
+                               ["clojure" "-M:light-node" "broadcast" "--subnet-id" "sociocratic-lab" "--text" "hello-circle" "--burn" "100"])
+                    _ (is (zero? (:exit bcast-res)) (pr-str bcast-res))
+                    put-res (runner/exec-in-node-sandbox!
+                             provisioned alpha-ctx
+                             ["clojure" "-M:light-node" "storage-put" "--slot-id" "wiki-cache" "--subnet-id" "sociocratic-lab" "--data" "Byzantine summary" "--burn" "100"])
+                    _ (is (zero? (:exit put-res)) (pr-str put-res))
+                    get-res (runner/exec-in-node-sandbox!
+                             provisioned alpha-ctx
+                             ["clojure" "-M:light-node" "storage-get" "--slot-id" "wiki-cache" "--subnet-id" "sociocratic-lab"])
+                    _ (is (zero? (:exit get-res)) (pr-str get-res))
+                    _ (is (str/includes? (:out get-res) "Byzantine summary"))
+                    cap-pub (runner/exec-in-node-sandbox!
+                             provisioned alpha-ctx
+                             ["clojure" "-M:light-node" "capability-publish"
+                              "--capability-id" "wikipedia-oracle"
+                              "--capability-type" "compute/uop-kernel"
+                              "--subnet-id" "sociocratic-lab"
+                              "--price" "100"
+                              "--burn" "100"])
+                    _ (is (zero? (:exit cap-pub)) (pr-str cap-pub))
+                    ;; 3. Alpha opens sealed session to beta (950), waits for live validator round-trip auto-accept, and sends direct ping (850)
+                    offer-res (runner/exec-in-node-sandbox!
+                               provisioned alpha-ctx
+                               ["clojure" "-M:light-node" "offer" "--callee" "beta" "--price" "0" "--burn" "100"])
+                    _ (is (zero? (:exit offer-res)) (pr-str offer-res))
+                    _ (Thread/sleep 400)
+                    send-res (runner/exec-in-node-sandbox!
+                              provisioned alpha-ctx
+                              ["clojure" "-M:light-node" "send" "--to" "beta" "--text" "direct-ping-from-alpha" "--burn" "100"])
+                    _ (is (zero? (:exit send-res)) (pr-str send-res))
+                    _ (Thread/sleep 300)
+                    ;; 4. Beta (starts with 650 ECH): lists replicated capabilities, broadcasts on subnet (550), pays alpha 100 ECH for wikipedia-oracle (100+100 -> 350 left; alpha +100 -> 950)
+                    cap-list (runner/exec-in-node-sandbox! provisioned beta-ctx ["clojure" "-M:light-node" "capability-list"])
+                    _ (is (zero? (:exit cap-list)) (pr-str cap-list))
                     _ (is (str/includes? (:out cap-list) "wikipedia-oracle"))
-                    buy-res (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "capability-buy" "wikipedia-oracle" "Byzantine_fault"])
-                    _ (is (zero? (:exit buy-res)) (pr-str buy-res))
-                    deliv-res (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "capability-deliver" "beta" "wikipedia-oracle" "Byzantine summary"])
+                    b-bcast (runner/exec-in-node-sandbox!
+                             provisioned beta-ctx
+                             ["clojure" "-M:light-node" "broadcast" "--subnet-id" "sociocratic-lab" "--text" "beta-joined" "--burn" "100"])
+                    _ (is (zero? (:exit b-bcast)) (pr-str b-bcast))
+                    buy-tf (runner/exec-in-node-sandbox!
+                            provisioned beta-ctx
+                            ["clojure" "-M:light-node" "transfer" "--receiver" "alpha" "--amount" "100" "--burn" "100"])
+                    _ (is (zero? (:exit buy-tf)) (pr-str buy-tf))
+                    ;; 5. Alpha delivers capability result over sealed session to beta (950 - 100 -> 850)
+                    deliv-res (runner/exec-in-node-sandbox!
+                               provisioned alpha-ctx
+                               ["clojure" "-M:light-node" "send" "--to" "beta" "--text" "Byzantine summary" "--burn" "100"])
                     _ (is (zero? (:exit deliv-res)) (pr-str deliv-res))
-                    inbox-beta (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "p2p-inbox"])
-                    _ (is (zero? (:exit inbox-beta)))
+                    _ (Thread/sleep 400)
+                    ;; 6. Beta drains inbox and verifies both sealed messages and subnet broadcast
+                    inbox-beta (runner/exec-in-node-sandbox! provisioned beta-ctx ["clojure" "-M:light-node" "inbox"])
+                    _ (is (zero? (:exit inbox-beta)) (pr-str inbox-beta))
+                    _ (is (str/includes? (:out inbox-beta) "hello-circle"))
                     _ (is (str/includes? (:out inbox-beta) "direct-ping-from-alpha"))
                     _ (is (str/includes? (:out inbox-beta) "Byzantine summary"))
-                    ;; Beta starts with 650 ECH; subnet-join burned 100 (550), capability-buy cost 100+100 (350 left).
-                    ;; Transferring 200 ECH to alpha + 100 burn leaves 50 ECH (< 100 min-echo-balance) -> out-of-echos!
-                    _ (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "transfer" "alpha" "200"])
+                    ;; 7. Beta has 350 ECH left. Transferring 200 ECH to alpha + 100 burn leaves 50 ECH (< 100 min-echo-balance) -> out-of-echos!
+                    ;; Alpha receives +200 ECH over live validator gossip -> 1050 ECH.
+                    _ (runner/exec-in-node-sandbox!
+                       provisioned beta-ctx
+                       ["clojure" "-M:light-node" "transfer" "--receiver" "alpha" "--amount" "200" "--burn" "100"])
+                    _ (Thread/sleep 400)
                     st-beta (runner/read-node-local-state beta-ctx)
-                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "halt" "accomplished-goal" "Subnet, P2P, & Capability verified"])
+                    _ (spit (io/file (:workspace-dir alpha-ctx) "SUMMARY.md")
+                            "Subnet, P2P, & Capability verified over live validator\n")
                     st-alpha (runner/read-node-local-state alpha-ctx)]
                 (is (:halted? st-beta))
                 (is (= :out-of-echos (:halt-reason st-beta)))
                 (is (= 50 (:balance st-beta)))
                 (is (:halted? st-alpha))
                 (is (= :accomplished-goal (:halt-reason st-alpha)))
-                (is (= 1150 (:balance st-alpha))))))
+                (is (= 1050 (:balance st-alpha))))))
           (finally
             (runner/shutdown-experiment! provisioned))))
       (finally

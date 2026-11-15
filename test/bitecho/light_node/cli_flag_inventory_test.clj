@@ -3,8 +3,10 @@
    Verifies CLI and daemon protocol verbs: `ctl`, `export-poll`, `import-poll`, `import`,
    `export-offer`, `export-send`, `export-ack`, `wait`, `retransmit-outbox`, and flags:
    `--since-seq`, `--since-broadcast-seq`, `--control-port`, `--max-epoch-skew`, etc."
-  (:require [bitecho.light-node.core :as light-core]
+  (:require [bitecho.light-node.cli :as cli]
+            [bitecho.light-node.core :as light-core]
             [bitecho.shell.light-node :as shell]
+            [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -134,6 +136,31 @@
             (is (true? (or (get res2 "ok") (:ok res2))))
             (is (= 2 (count all-evs)))
             (is (= 2 (count (distinct all-evs))))))
+
+        ;; 6. D18: POST /ctl with {"argv": [...]} and run-one-shot! auto-delegation
+        (swap! state-atom assoc :account {:balance 5000 :spendable 5000 :seq 0})
+        (let [ctl-info (json/read-str (slurp (io/file state-dir "control.json")))
+              port (get ctl-info "port")
+              token (get ctl-info "token")
+              argv-res (shell/post-control-request!
+                        port token
+                        {"argv" ["--state-dir" (str state-dir)
+                                 "broadcast" "--subnet-id" "homebrew-cafe"
+                                 "--text" "hello from argv" "--burn" "100"]}
+                        5000)]
+          (is (true? (or (get argv-res "ok") (:ok argv-res))))
+          (is (= "homebrew-cafe" (get argv-res "subnet_id")))
+          (is (= 100 (get argv-res "burn")))
+          (is (= 4900 (get-in @state-atom [:account :spendable]))))
+
+        ;; 7. D18: run-light-node-cli! one-shot command auto-delegates when control.json is reachable
+        (let [oneshot-res (shell/run-light-node-cli! ["petname-set" "--state-dir" (str state-dir)
+                                                      "--petname" "bob"
+                                                      "--pubkey" "302a300506032b65700321006642f780b64b85fac5728e8f2dd4a98e6e53b1722a2c0917c0c7ef0189c19b08"
+                                                      "--overwrite"])]
+          (is (true? (or (get oneshot-res "ok") (:ok oneshot-res))))
+          (is (= "302a300506032b65700321006642f780b64b85fac5728e8f2dd4a98e6e53b1722a2c0917c0c7ef0189c19b08"
+                 (get-in @state-atom [:petnames "bob"]))))
         (finally
           (when ctrl-svc
             (try ((:stop! ctrl-svc)) (catch Exception _ nil)))
@@ -298,7 +325,29 @@
     (let [c8 (shell/build-one-shot-cmd-map "capability-resolve" ["--path" "cap/1" "--min-expected-seq" "2"])]
       (is (= "cap/1" (get c8 "path")))
       (is (= 2 (get c8 "min_seq")))
-      (is (= 2 (get c8 "min_expected_seq"))))))
+      (is (= 2 (get c8 "min_expected_seq"))))
+    (let [b1 (shell/build-one-shot-cmd-map "broadcast" ["--subnet-id" "homebrew-cafe" "--text" "hi" "--burn" "100"])
+          b2 (cli/build-cmd-map "broadcast" ["--subnet-id" "homebrew-cafe" "--text" "hi" "--burn" "100"])]
+      (is (= 100 (get b1 "burn")))
+      (is (= "homebrew-cafe" (get b1 "subnet_id")))
+      (is (= 100 (get b2 "burn")))
+      (is (= "homebrew-cafe" (get b2 "subnet_id"))))
+    (let [s1 (shell/build-one-shot-cmd-map "storage-put" ["--slot-id" "notes" "--data" "v1" "--burn" "100"])
+          s2 (cli/build-cmd-map "storage-put" ["--slot-id" "notes" "--data" "v1" "--burn" "100"])]
+      (is (= 100 (get s1 "burn")))
+      (is (= 100 (get s2 "burn"))))
+    (let [cp1 (shell/build-one-shot-cmd-map "capability-publish" ["--capability-id" "cap1" "--price" "50" "--burn" "100"])
+          cp2 (cli/build-cmd-map "capability-publish" ["--capability-id" "cap1" "--price" "50" "--burn" "100"])]
+      (is (= 100 (get cp1 "burn")))
+      (is (= 100 (get cp2 "burn"))))
+    (let [in1 (shell/build-one-shot-cmd-map "inbox" ["--subnet-id" "homebrew-cafe"])
+          in2 (shell/build-one-shot-cmd-map "inbox" ["--subnet" "homebrew-cafe"])
+          in3 (cli/build-cmd-map "inbox" ["--subnet-id" "homebrew-cafe"])
+          in4 (cli/build-cmd-map "inbox" ["--subnet" "homebrew-cafe"])]
+      (is (= "homebrew-cafe" (get in1 "subnet_id")))
+      (is (= "homebrew-cafe" (get in2 "subnet_id")))
+      (is (= "homebrew-cafe" (get in3 "subnet_id")))
+      (is (= "homebrew-cafe" (get in4 "subnet_id"))))))
 
 ;; =============================================================================
 ;; 5. Generative Property Checks (Rule 1 Strict TDD)

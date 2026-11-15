@@ -8,26 +8,26 @@
    :parent-id :genesis-custody
    :start-balance 5000
    :model-type "gemini-4-hydrogen-low"
-   :initial-prompt "You are light node :alpha-coordinator. Run these exact shell commands using the bash tool: 1) `bitecho-node subnet-join sociocratic-lab`, 2) `bitecho-node subnet-broadcast sociocratic-lab \"Proposal: beta-worker compute SHA-256 verification digest for 400 ECH\"`, 3) `bitecho-node transfer beta-worker 400`, and 4) `bitecho-node halt accomplished-goal \"Coordinated subnet proposal and transferred 400 ECH bounty\"`."
+   :initial-prompt "You are light node :alpha-coordinator. Run these exact shell commands using the bash tool: 1) `clojure -M:light-node broadcast --subnet-id sociocratic-lab --text \"Proposal: beta-worker compute SHA-256 verification digest for 400 ECH\" --burn 100`, 2) `clojure -M:light-node transfer --receiver beta-worker --amount 400 --burn 100`, and 3) write `SUMMARY.md` containing `Coordinated subnet proposal and transferred 400 ECH bounty`."
    :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]}
 
   {:node-id :beta-worker
    :parent-id :alpha-coordinator
    :start-balance 1500
    :model-type "gemini-3.8-flash-low"
-   :initial-prompt "You are light node :beta-worker funded by :alpha-coordinator. Run these exact shell commands using the bash tool: 1) `bitecho-node subnet-join sociocratic-lab`, 2) `bitecho-node p2p-inbox`, 3) `bitecho-node p2p-send alpha-coordinator \"digest=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"`, and 4) `bitecho-node halt accomplished-goal \"Computed and delivered SHA-256 verification digest\"`."
+   :initial-prompt "You are light node :beta-worker funded by :alpha-coordinator. Run these exact shell commands using the bash tool: 1) `clojure -M:light-node inbox`, 2) `clojure -M:light-node offer --callee alpha-coordinator --price 0 --burn 100`, 3) `clojure -M:light-node send --to alpha-coordinator --text \"digest=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" --burn 100`, and 4) write `SUMMARY.md` containing `Computed and delivered SHA-256 verification digest`."
    :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]}
 
   {:node-id :gamma-auditor
    :parent-id :alpha-coordinator
    :start-balance 1200
    :model-type "gemini-4-carbon-low"
-   :initial-prompt "You are light node :gamma-auditor funded by :alpha-coordinator. Run these exact shell commands using the bash tool: 1) `bitecho-node subnet-join sociocratic-lab`, 2) `bitecho-node p2p-inbox`, 3) `bitecho-node subnet-broadcast sociocratic-lab \"CONSENT: verified SHA-256 digest and 400 ECH bounty settlement\"`, and 4) `bitecho-node halt accomplished-goal \"Audited sociocratic round and granted CONSENT\"`."
+   :initial-prompt "You are light node :gamma-auditor funded by :alpha-coordinator. Run these exact shell commands using the bash tool: 1) `clojure -M:light-node inbox`, 2) `clojure -M:light-node broadcast --subnet-id sociocratic-lab --text \"CONSENT: verified SHA-256 digest and 400 ECH bounty settlement\" --burn 100`, and 3) write `SUMMARY.md` containing `Audited sociocratic round and granted CONSENT`."
    :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]}
 
   {:node-id :delta-constrained
    :parent-id :beta-worker
    :start-balance 250
    :model-type "gemini-3.8-flash-low"
-   :initial-prompt "You are light node :delta-constrained funded by :beta-worker with a tight 250 ECH budget (min balance 100 ECH). Run these exact shell commands using the bash tool: 1) `bitecho-node subnet-join sociocratic-lab` (burns 100 ECH -> 150 ECH left) and 2) `bitecho-node subnet-broadcast sociocratic-lab \"Status ping from delta-constrained\"` (burns 100 ECH -> 50 ECH left, triggering :out-of-echos halt)."
+   :initial-prompt "You are light node :delta-constrained funded by :beta-worker with a tight 250 ECH budget (min balance 100 ECH). Run these exact shell commands using the bash tool: 1) `clojure -M:light-node broadcast --subnet-id sociocratic-lab --text \"Joining sociocratic-lab\" --burn 100` (burns 100 ECH -> 150 ECH left) and 2) `clojure -M:light-node broadcast --subnet-id sociocratic-lab --text \"Status ping from delta-constrained\" --burn 100` (burns 100 ECH -> 50 ECH left, triggering :out-of-echos halt)."
    :dns-allow-list ["bitecho.org" "*.googleapis.com"]}]}

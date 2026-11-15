@@ -723,7 +723,10 @@
                    "identity" {"cmd" "identity"}
                    "status"   {"cmd" "status"}
                    "discover" {"cmd" "discover"}
-                   "inbox"    {"cmd" "inbox"}
+                   "inbox"    (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                            (extract-flag-value args "--subnet" nil))]
+                                (cond-> {"cmd" "inbox"}
+                                  sub (assoc "subnet_id" sub)))
                    "offer"    (let [m {"cmd" "offer"
                                        "callee" (extract-flag-value args "--callee" nil)
                                        "price" (extract-long-flag args "--price" 0)
@@ -874,13 +877,15 @@
                                        seq-num (extract-long-flag args "--seq" nil)
                                        min-seq (extract-long-flag args "--min-seq" nil)
                                        out-file (extract-flag-value args "--out-file" nil)
+                                       b (extract-long-flag args "--burn" nil)
                                        m {"cmd" "storage-put" "subnet_id" sub "slot" slot "slot_id" slot}]
                                    (cond-> m
                                      data (assoc "data" data)
                                      data-hex (assoc "data_hex" data-hex)
                                      seq-num (assoc "seq" seq-num)
                                      min-seq (assoc "min_seq" min-seq)
-                                     out-file (assoc "out_file" out-file)))
+                                     out-file (assoc "out_file" out-file)
+                                     (some? b) (assoc "burn" b)))
                    "storage-get" (let [sub (or (extract-flag-value args "--subnet-id" nil)
                                                (extract-flag-value args "--subnet" nil)
                                                "global")
@@ -913,6 +918,7 @@
                                               price (extract-long-flag args "--price-echo"
                                                                        (extract-long-flag args "--price" nil))
                                               burn-floor (extract-long-flag args "--burn-floor" nil)
+                                              b (extract-long-flag args "--burn" nil)
                                               target-cid (extract-flag-value args "--target-cid" nil)
                                               seq-num (extract-long-flag args "--seq" nil)
                                               meta (extract-flag-value args "--metadata" nil)
@@ -924,6 +930,7 @@
                                             cap-terms (assoc "capability_terms" cap-terms)
                                             price (assoc "price_echo" price)
                                             burn-floor (assoc "burn_floor" burn-floor)
+                                            (some? b) (assoc "burn" b)
                                             target-cid (assoc "target_cid" target-cid)
                                             seq-num (assoc "seq" seq-num)
                                             meta (assoc "metadata" meta)))
@@ -1063,12 +1070,16 @@
                                          (cond-> m
                                            tr (assoc "transport" tr)
                                            err (assoc "error" err)))
-                   "broadcast" (let [t (extract-flag-value args "--text" nil)
-                                     sub (extract-flag-value args "--subnet-id" nil)
+                   "broadcast" (let [t (or (extract-flag-value args "--text" nil)
+                                           (extract-flag-value args "--message" nil))
+                                     sub (or (extract-flag-value args "--subnet-id" nil)
+                                             (extract-flag-value args "--subnet" nil))
+                                     b (extract-long-flag args "--burn" nil)
                                      m {"cmd" "broadcast"}]
                                  (cond-> m
                                    t (assoc "text" t)
-                                   sub (assoc "subnet_id" sub)))
+                                   sub (assoc "subnet_id" sub)
+                                   (some? b) (assoc "burn" b)))
                    "anchor-subnet" (let [sub (or (extract-flag-value args "--subnet-id" nil)
                                                  (extract-flag-value args "--subnet" nil)
                                                  (extract-flag-value args "--child-subnet" nil))

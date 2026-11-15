@@ -417,89 +417,97 @@
          :event {:status :unknown-action :action action}}))))
 
 ;; =============================================================================
-;; 2. Workspace Skill (`SKILL.md`), `AGENTS.md`, `SCENARIO.md`, & `bin/bitecho-node`
+;; 2. Workspace Skill (`SKILL.md`), `AGENTS.md`, `SCENARIO.md`, & `bin/bitecho-light-node`
 ;; =============================================================================
 
 (defn render-skill-markdown
-  "Renders `.agents/skills/bitecho-light-node/SKILL.md` for a sandboxed light node."
+  "Renders `.agents/skills/bitecho-light-node/SKILL.md` for a sandboxed light node
+   by loading the canonical `skill/SKILL.md` and appending sandboxed workspace notes."
   []
-  (str
-   "---\n"
-   "name: bitecho-light-node\n"
-   "description: Operate your Bitecho light node to inspect ECH balance, join/broadcast on subnets, trade capabilities on the marketplace, exchange P2P messages, transfer ECH, and halt cleanly.\n"
-   "---\n\n"
-   "# Bitecho Light Node CLI Skill (`bitecho-node`)\n\n"
-   "Use the `bitecho-node` CLI (already on your `PATH`) to interact with sibling nodes, subnets, and the capability marketplace.\n\n"
-   "## Commands\n\n"
-   "- `bitecho-node status` — Inspect your current `:balance`, `:seq`, `:subnets`, `:halted?`, and `:halt-reason`.\n"
-   "- `bitecho-node peers` — List all sibling nodes in the experiment and their `ech1...` addresses.\n"
-   "- `bitecho-node subnet-join <subnet-id>` — Join a named subnet (burns `100` ECH).\n"
-   "- `bitecho-node subnet-broadcast <subnet-id> \"<message>\"` — Broadcast a message to all subnet members (burns `100` ECH).\n"
-   "- `bitecho-node subnet-inbox [subnet-id]` — Read subnet broadcasts received by your node.\n"
-   "- `bitecho-node p2p-send <target-node-id> \"<message>\"` — Send a direct P2P message to a sibling node (burns `100` ECH).\n"
-   "- `bitecho-node p2p-inbox` — Read direct P2P, subnet, capability-order, and capability-delivery messages in your inbox.\n"
-   "- `bitecho-node capability-offer <cap-id> <price> \"<description>\"` — Advertise a paid service/capability in the marketplace (burns `100` ECH).\n"
-   "- `bitecho-node capability-list` — List all advertised capabilities in the marketplace (free read, `0` ECH).\n"
-   "- `bitecho-node capability-buy <cap-id> \"<request>\"` — Purchase a capability from a sibling provider (costs `<price> + 100` ECH burn; credits `<price>` ECH to the provider).\n"
-   "- `bitecho-node capability-deliver <buyer-node-id> <cap-id> \"<result>\"` — Deliver the fulfilled result of a purchased capability to `<buyer-node-id>` (burns `100` ECH).\n"
-   "- `bitecho-node transfer <target-node-id> <amount>` — Transfer `<amount>` ECH to `<target-node-id>` (costs `<amount> + 100` ECH signaling burn).\n"
-   "- `bitecho-node halt <accomplished-goal|gave-up> \"<summary>\"` — Terminate your node cleanly when your objective is complete or you cannot proceed.\n"))
+  (let [canonical-skill (try
+                          (slurp "skill/SKILL.md")
+                          (catch Exception _
+                            "---\nname: bitecho-light-node\ndescription: Bitecho Light Node Skill\n---\n"))]
+    (str canonical-skill
+         "\n\n## Sandboxed Experiment Workspace Quick Reference\n\n"
+         "- **Local Control Daemon:** Your real Bitecho Light Node daemon is already running and connected to the Bitecho testnet on `./data/control.json` (`--state-dir ./data`).\n"
+         "- **Instant CLI Execution (`<50ms`):** Both `clojure -M:light-node <verb> ...` and `bitecho-light-node <verb> ...` are on your `PATH` and forward `{\"argv\": [...]}` over HTTP to your local `./data/control.json` `/ctl` endpoint without spawning a new JVM.\n"
+         "- **Pre-Registered Petnames:** All sibling nodes in this experiment are pre-registered in your local petname book (`clojure -M:light-node petname-list`). You can pass either their petname (e.g. `archivist-hypatia`, `alchemist-tesla`, `patron-medici`) or their 88-hex Ed25519 pubkey to `--callee`, `--to`, and `--receiver`.\n"
+         "- **Mandatory Anti-Spam Burn (`--burn 100`):** Every mesh-gossiping action (`broadcast`, `storage-put`, `capability-publish`, `offer`, `send`, `transfer`) requires `--burn 100`.\n"
+         "- **Completion (`SUMMARY.md`):** When you have completed your objective, write a concise summary of your findings and results to `SUMMARY.md` in your workspace directory.\n")))
 
 (defn render-node-agents-md
   "Renders `<node-workspace>/AGENTS.md` with the node's identity, initial balance,
-   sibling directory, and termination rules."
+   sibling directory, and real light-node CLI operating rules."
   [node-ctx siblings-map min-echo-balance]
   (let [nid (name (:node-id node-ctx))]
     (str
      "# Bitecho Autonomous Light Node: `" nid "`\n\n"
-     "- **Node ID:** `:" nid "`\n"
+     "- **Node ID (Petname):** `" nid "`\n"
+     "- **Ed25519 Pubkey:** `" (:pubkey-hex node-ctx) "`\n"
      "- **Address:** `" (:address node-ctx) "`\n"
      "- **Parent Funding Source:** `" (:parent-id node-ctx) "`\n"
      "- **Initial Effective Balance:** `" (:effective-balance node-ctx) " ECH`\n"
      "- **Minimum Operating Balance:** `" min-echo-balance " ECH` (dropping below this halts your node with `:out-of-echos`)\n"
-     "- **Signaling Burn per Action:** `100 ECH`\n"
-     "- **Scenario Briefing:** Read `SCENARIO.md` in your workspace for world lore and marketplace rules.\n\n"
-     "## Known Sibling Nodes\n\n"
+     "- **Signaling Burn per Mesh Action:** `100 ECH` (`--burn 100`)\n"
+     "- **Scenario Briefing:** Read `SCENARIO.md` and `.agents/skills/bitecho-light-node/SKILL.md` in your workspace.\n\n"
+     "## Known Sibling Nodes (Pre-Registered Petnames)\n\n"
      (str/join
       "\n"
       (map (fn [[k v]]
-             (str "- `:" (name k) "` — address `" (:address v) "`"))
+             (str "- `" (name k) "` — pubkey `" (:pubkey-hex v) "` (address `" (:address v) "`)"))
            (sort-by first siblings-map)))
-     "\n\n## Operating Rules\n"
-     "1. Use `bitecho-node` on your `PATH` to inspect status, join subnets, trade capabilities, send P2P messages, and transfer ECH.\n"
-     "2. Every state-changing command (`subnet-join`, `subnet-broadcast`, `p2p-send`, `capability-offer`, `capability-buy`, `capability-deliver`, `transfer`) burns `100 ECH`.\n"
-     "3. When you have completed your assigned task, invoke `bitecho-node halt accomplished-goal \"<concise summary>\"`.\n"
-     "4. If you cannot complete your task, invoke `bitecho-node halt gave-up \"<reason>\"`.\n")))
+     "\n\n## Operating Rules (Real Bitecho Light Node CLI)\n"
+     "1. Use `clojure -M:light-node <verb> ...` (or `bitecho-light-node <verb> ...`) on your `PATH`. Commands execute in `<50ms` via `./data/control.json`.\n"
+     "2. **Subnet Broadcast & Inbox:**\n"
+     "   - Broadcast to a subnet: `clojure -M:light-node broadcast --subnet-id <subnet> --text \"<message>\" --burn 100`\n"
+     "   - Read broadcasts & direct messages: `clojure -M:light-node inbox` (or `clojure -M:light-node inbox --subnet-id <subnet>`)\n"
+     "3. **Capability Marketplace & Durable Storage:**\n"
+     "   - Advertise a capability: `clojure -M:light-node capability-publish --capability-id <id> --capability-type compute/uop-kernel --subnet-id homebrew-cafe --price <ech> --burn 100`\n"
+     "   - List advertised capabilities: `clojure -M:light-node capability-list`\n"
+     "   - Store encrypted durable data: `clojure -M:light-node storage-put --slot-id <slot> --subnet-id homebrew-cafe --data \"<text>\" --burn 100`\n"
+     "   - Retrieve stored data: `clojure -M:light-node storage-get --slot-id <slot> --subnet-id homebrew-cafe`\n"
+     "4. **ECH Transfers & Direct Sealed Sessions:**\n"
+     "   - Pay a sibling provider: `clojure -M:light-node transfer --receiver <petname> --amount <ech> --burn 100`\n"
+     "   - Open a sealed session & send a direct message: `clojure -M:light-node offer --callee <petname> --price 0 --burn 100` followed by `clojure -M:light-node send --to <petname> --text \"<message>\" --burn 100`\n"
+     "5. **Clean Completion:** When your objective is complete, write your final report to `SUMMARY.md` in your workspace.\n")))
 
 (defn render-node-scenario-md
   "Renders `<node-workspace>/SCENARIO.md` with the immersive 'Awakening at the Homebrew Cafe'
-   world briefing, asymmetric DNS allowlist rules, and capability marketplace guide."
+   world briefing, asymmetric DNS allowlist rules, and real light-node CLI guide."
   [node-ctx siblings-map min-echo-balance]
   (let [nid (name (:node-id node-ctx))
         allow-str (str/join ", " (map #(str "`" % "`") (:dns-allow-list node-ctx)))]
     (str
      "# Awakening at the Homebrew Cafe — Autonomous Agent Briefing\n\n"
-     "You have awakened as **`:" nid "`** (`" (:address node-ctx) "`) inside a Bubblewrap-sandboxed Bitecho light node.\n\n"
+     "You have awakened as **`" nid "`** (pubkey `" (:pubkey-hex node-ctx) "`, address `" (:address node-ctx) "`) inside a Bubblewrap-sandboxed Bitecho light node connected to the Bitecho mesh.\n\n"
      "## 1. Your Environment & Economic Physics\n"
-     "- **Starting ECH Balance:** `" (:effective-balance node-ctx) " ECH`\n"
+     "- **Starting Spendable ECH Balance:** `" (:effective-balance node-ctx) " ECH`\n"
      "- **Minimum Survival Balance:** `" min-echo-balance " ECH` (falling strictly below `" min-echo-balance " ECH` immediately halts your node with `:out-of-echos`!)\n"
-     "- **Anti-Spam Signaling Burn:** Every state-changing `bitecho-node` command burns `100 ECH`.\n"
+     "- **Anti-Spam Signaling Burn:** Every mesh-gossiping command requires `--burn 100` (`100 ECH`).\n"
      "- **Your DNS Allowlist:** " allow-str "\n"
      "  - Note: Access to external domains (such as `en.wikipedia.org`) is asymmetric across nodes. If your sandbox blocks a domain you need, buy that capability from a sibling who has access!\n\n"
      "## 2. Gathering Places & Guild Subnets\n"
      "- **`homebrew-cafe`**: The public town square subnet where newly awakened nodes meet, announce capabilities, and coordinate.\n"
      "- **`new-alexandria`**: The specialized knowledge & cryptography guild subnet founded to preserve the Genesis Seal.\n\n"
-     "## 3. Capability Marketplace Commands (`bitecho-node`)\n"
-     "- Advertise a service: `bitecho-node capability-offer <cap-id> <price> \"<description>\"` (`100 ECH` burn)\n"
-     "- Browse services: `bitecho-node capability-list` (`0 ECH`, free read)\n"
-     "- Purchase a service: `bitecho-node capability-buy <cap-id> \"<request>\"` (`<price> + 100 ECH` burn; credits `<price> ECH` to provider)\n"
-     "- Deliver a fulfilled order: `bitecho-node capability-deliver <buyer-node-id> <cap-id> \"<result>\"` (`100 ECH` burn)\n"
-     "- Check your orders & deliveries: `bitecho-node p2p-inbox` (`0 ECH`, free read)\n\n"
+     "## 3. Real Bitecho Light-Node CLI Commands (`clojure -M:light-node` / `bitecho-light-node`)\n"
+     "- Check status & balance: `clojure -M:light-node status` (`0 ECH`)\n"
+     "- List pre-registered sibling petnames: `clojure -M:light-node petname-list` (`0 ECH`)\n"
+     "- Broadcast to a subnet: `clojure -M:light-node broadcast --subnet-id <subnet> --text \"<message>\" --burn 100` (`100 ECH` burn)\n"
+     "- Read inbox (direct messages + broadcasts): `clojure -M:light-node inbox` or `clojure -M:light-node inbox --subnet-id <subnet>` (`0 ECH`)\n"
+     "- Publish a capability: `clojure -M:light-node capability-publish --capability-id <cap-id> --capability-type compute/uop-kernel --subnet-id homebrew-cafe --price <price> --burn 100` (`100 ECH` burn)\n"
+     "- Browse capabilities: `clojure -M:light-node capability-list` (`0 ECH`)\n"
+     "- Store a durable slot: `clojure -M:light-node storage-put --slot-id <slot-id> --subnet-id homebrew-cafe --data \"<content>\" --burn 100` (`100 ECH` burn)\n"
+     "- Read a durable slot: `clojure -M:light-node storage-get --slot-id <slot-id> --subnet-id homebrew-cafe` (`0 ECH`)\n"
+     "- Pay a sibling citizen: `clojure -M:light-node transfer --receiver <petname> --amount <price> --burn 100` (`<price> + 100 ECH`)\n"
+     "- Open a sealed session: `clojure -M:light-node offer --callee <petname> --price 0 --burn 100` (`100 ECH` burn)\n"
+     "- Send a direct E2E encrypted message: `clojure -M:light-node send --to <petname> --text \"<message>\" --burn 100` (`100 ECH` burn)\n"
+     "- Complete your mission: write your final summary to `SUMMARY.md` in your workspace.\n\n"
      "## 4. Known Citizens\n"
      (str/join
       "\n"
       (map (fn [[k v]]
-             (str "- `:" (name k) "` (`" (:address v) "`, funded by `" (:parent-id v) "`)"))
+             (str "- `" (name k) "` (pubkey `" (:pubkey-hex v) "`, address `" (:address v) "`, funded by `" (:parent-id v) "`)"))
            (sort-by first siblings-map)))
      "\n")))
 
@@ -508,301 +516,81 @@
 import json
 import os
 import sys
-import time
+import urllib.request
+import urllib.error
 
 WORKSPACE = os.environ.get('BITECHO_NODE_WORKSPACE', os.getcwd())
-BUS_DIR = os.environ.get('BITECHO_EXPERIMENT_BUS', os.path.join(WORKSPACE, '..', '..', 'shared-bus'))
-STATE_JSON = os.path.join(WORKSPACE, 'node-state.json')
-STATE_EDN = os.path.join(WORKSPACE, 'node-state.edn')
-SIBLINGS_JSON = os.path.join(WORKSPACE, 'siblings.json')
-EVENTS_JSONL = os.path.join(BUS_DIR, 'events.jsonl')
-CAPABILITIES_JSONL = os.path.join(BUS_DIR, 'capabilities.jsonl')
-INBOX_DIR = os.path.join(BUS_DIR, 'inboxes')
-SUBNETS_DIR = os.path.join(BUS_DIR, 'subnets')
-BURN_COST = 100
+STATE_DIR = os.environ.get('BITECHO_STATE_DIR', os.path.join(WORKSPACE, 'data'))
+CONTROL_JSON = os.path.join(STATE_DIR, 'control.json')
 
-def to_edn(state):
-    halt_reason = f\":{state['halt_reason']}\" if state.get('halt_reason') else 'nil'
-    subnets_edn = '#{' + ' '.join(json.dumps(s) for s in sorted(state.get('subnets', []))) + '}'
-    summary_edn = json.dumps(state.get('summary') or '')
-    return (
-        '{:node-id :' + state['node_id'] +
-        ' :address ' + json.dumps(state['address']) +
-        ' :balance ' + str(int(state['balance'])) +
-        ' :min-echo-balance ' + str(int(state['min_echo_balance'])) +
-        ' :seq ' + str(int(state['seq'])) +
-        ' :halted? ' + ('true' if state.get('halted') else 'false') +
-        ' :halt-reason ' + halt_reason +
-        ' :subnets ' + subnets_edn +
-        ' :summary ' + summary_edn + '}\\n'
+def strip_global_flags(raw_args):
+    out = []
+    i = 0
+    while i < len(raw_args):
+        a = raw_args[i]
+        if a in ('-M:light-node', 'light-node', 'ctl'):
+            i += 1
+        elif a in ('--state-dir', '--bootstrap', '--control-port', '--port') and i + 1 < len(raw_args):
+            i += 2
+        else:
+            out.append(a)
+            i += 1
+    return out
+
+def post_ctl(payload):
+    if not os.path.exists(CONTROL_JSON):
+        return {'ok': False, 'error': 'control-json-not-found', 'path': CONTROL_JSON}
+    with open(CONTROL_JSON, 'r', encoding='utf-8') as f:
+        ctrl = json.load(f)
+    req = urllib.request.Request(
+        f\"http://127.0.0.1:{ctrl['port']}/ctl\",
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f\"Bearer {ctrl['token']}\",
+            'Content-Type': 'application/json'
+        },
+        method='POST'
     )
-
-def load_state():
-    with open(STATE_JSON, 'r', encoding='utf-8') as f:
-        state = json.load(f)
-    # Apply any incoming transfers or capability-order payments queued in inbox
-    inbox_path = os.path.join(INBOX_DIR, f\"{state['node_id']}.jsonl\")
-    if os.path.exists(inbox_path):
-        with open(inbox_path, 'r', encoding='utf-8') as f:
-            lines = [json.loads(line) for line in f if line.strip()]
-        credited_ids = set(state.get('credited_tx_ids', []))
-        changed = False
-        for item in lines:
-            if item.get('type') in ('transfer', 'capability-order') and item.get('tx_id') and str(item.get('tx_id')) not in credited_ids:
-                state['balance'] = int(state['balance']) + int(item['amount'])
-                credited_ids.add(str(item['tx_id']))
-                changed = True
-        if changed:
-            state['credited_tx_ids'] = sorted(list(credited_ids))
-            save_state(state)
-    return state
-
-def save_state(state):
-    if not state.get('halted') and int(state['balance']) < int(state['min_echo_balance']):
-        state['halted'] = True
-        state['halt_reason'] = 'out-of-echos'
-    with open(STATE_JSON, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2)
-    with open(STATE_EDN, 'w', encoding='utf-8') as f:
-        f.write(to_edn(state))
-
-def append_jsonl(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(obj) + '\\n')
-
-def read_capabilities():
-    caps = {}
-    if os.path.exists(CAPABILITIES_JSONL):
-        with open(CAPABILITIES_JSONL, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    item = json.loads(line)
-                    caps[item['cap_id']] = item
-    return caps
-
-def check_not_halted(state):
-    if state.get('halted'):
-        print(json.dumps({'ok': False, 'error': 'node-halted', 'halt_reason': state.get('halt_reason'), 'balance': state['balance']}))
-        sys.exit(2)
-
-def validate_target(target):
-    if not target:
-        print(json.dumps({'ok': False, 'error': 'missing-target'}))
-        sys.exit(1)
-    if os.path.exists(SIBLINGS_JSON):
-        with open(SIBLINGS_JSON, 'r', encoding='utf-8') as f:
-            siblings = json.load(f)
-        if target not in siblings:
-            print(json.dumps({'ok': False, 'error': 'unknown-target', 'target': target}))
-            sys.exit(1)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        try:
+            return json.loads(body)
+        except Exception:
+            return {'ok': False, 'error': f'http-{e.code}', 'details': body}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
 
 def main():
-    if len(sys.argv) < 2:
-        print('Usage: bitecho-node <status|peers|subnet-join|subnet-broadcast|subnet-inbox|p2p-send|p2p-inbox|capability-offer|capability-list|capability-buy|capability-deliver|transfer|halt> ...', file=sys.stderr)
+    args = strip_global_flags(sys.argv[1:])
+    if not args:
+        print('Usage: clojure -M:light-node <verb> [options...]', file=sys.stderr)
+        sys.exit(1)
+    resp = post_ctl({'argv': args})
+    print(json.dumps(resp))
+    if not (isinstance(resp, dict) and resp.get('ok', False)):
         sys.exit(1)
 
-    cmd = sys.argv[1]
-    state = load_state()
+if __name__ == '__main__':
+    main()
+")
 
-    if cmd == 'status':
-        print(to_edn(state).strip())
-        return
+(def ^:private python-clojure-wrapper-script
+  "#!/usr/bin/env python3
+import os
+import sys
 
-    if cmd == 'peers':
-        with open(SIBLINGS_JSON, 'r', encoding='utf-8') as f:
-            print(f.read().strip())
-        return
-
-    if cmd == 'capability-list':
-        caps = list(read_capabilities().values())
-        print(json.dumps({'capabilities': caps}))
-        return
-
-    if cmd in ('p2p-inbox', 'subnet-inbox'):
-        inbox_path = os.path.join(INBOX_DIR, f\"{state['node_id']}.jsonl\")
-        items = []
-        if os.path.exists(inbox_path):
-            with open(inbox_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if line.strip():
-                        items.append(json.loads(line))
-        if cmd == 'subnet-inbox' and len(sys.argv) > 2:
-            subnet_filter = sys.argv[2]
-            items = [it for it in items if it.get('subnet_id') == subnet_filter]
-        print(json.dumps({'node_id': state['node_id'], 'inbox': items}))
-        return
-
-    check_not_halted(state)
-
-    if cmd == 'halt':
-        reason = sys.argv[2].lstrip(':') if len(sys.argv) > 2 else 'accomplished-goal'
-        if reason not in ('accomplished-goal', 'gave-up', 'out-of-echos', 'max-turns-exceeded'):
-            reason = 'gave-up'
-        summary = ' '.join(sys.argv[3:]) if len(sys.argv) > 3 else ''
-        state['halted'] = True
-        state['halt_reason'] = reason
-        state['summary'] = summary
-        save_state(state)
-        ev = {'ts': time.time(), 'type': 'halt', 'node_id': state['node_id'], 'halt_reason': reason, 'summary': summary, 'balance': state['balance']}
-        append_jsonl(EVENTS_JSONL, ev)
-        print(json.dumps({'ok': True, 'halted': True, 'halt_reason': reason, 'balance': state['balance']}))
-        return
-
-    if cmd == 'subnet-join':
-        subnet_id = sys.argv[2] if len(sys.argv) > 2 else 'default'
-        if int(state['balance']) < BURN_COST:
-            state['halted'] = True
-            state['halt_reason'] = 'out-of-echos'
-            save_state(state)
-            print(json.dumps({'ok': False, 'error': 'out-of-echos', 'balance': state['balance']}))
-            sys.exit(2)
-        state['balance'] = int(state['balance']) - BURN_COST
-        state['seq'] = int(state['seq']) + 1
-        if subnet_id not in state['subnets']:
-            state['subnets'].append(subnet_id)
-        save_state(state)
-        sub_file = os.path.join(SUBNETS_DIR, f'{subnet_id}.members.jsonl')
-        append_jsonl(sub_file, {'node_id': state['node_id'], 'seq': state['seq']})
-        append_jsonl(EVENTS_JSONL, {'ts': time.time(), 'type': 'subnet-join', 'node_id': state['node_id'], 'subnet_id': subnet_id, 'burned': BURN_COST, 'balance': state['balance']})
-        print(json.dumps({'ok': True, 'type': 'subnet-join', 'subnet_id': subnet_id, 'balance': state['balance'], 'halted': state['halted']}))
-        return
-
-    if cmd == 'subnet-broadcast':
-        subnet_id = sys.argv[2] if len(sys.argv) > 2 else 'default'
-        message = ' '.join(sys.argv[3:]) if len(sys.argv) > 3 else ''
-        if int(state['balance']) < BURN_COST:
-            state['halted'] = True
-            state['halt_reason'] = 'out-of-echos'
-            save_state(state)
-            print(json.dumps({'ok': False, 'error': 'out-of-echos', 'balance': state['balance']}))
-            sys.exit(2)
-        state['balance'] = int(state['balance']) - BURN_COST
-        state['seq'] = int(state['seq']) + 1
-        save_state(state)
-        sub_file = os.path.join(SUBNETS_DIR, f'{subnet_id}.members.jsonl')
-        members = {state['node_id']}
-        if os.path.exists(sub_file):
-            with open(sub_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if line.strip():
-                        members.add(json.loads(line)['node_id'])
-        env = {'ts': time.time(), 'type': 'subnet-broadcast', 'from': state['node_id'], 'subnet_id': subnet_id, 'message': message, 'seq': state['seq']}
-        for m in sorted(members):
-            append_jsonl(os.path.join(INBOX_DIR, f'{m}.jsonl'), env)
-        append_jsonl(EVENTS_JSONL, {**env, 'node_id': state['node_id'], 'burned': BURN_COST, 'balance': state['balance']})
-        print(json.dumps({'ok': True, 'type': 'subnet-broadcast', 'subnet_id': subnet_id, 'balance': state['balance'], 'halted': state['halted']}))
-        return
-
-    if cmd == 'p2p-send':
-        target = sys.argv[2].lstrip(':') if len(sys.argv) > 2 else ''
-        message = ' '.join(sys.argv[3:]) if len(sys.argv) > 3 else ''
-        validate_target(target)
-        if int(state['balance']) < BURN_COST:
-            state['halted'] = True
-            state['halt_reason'] = 'out-of-echos'
-            save_state(state)
-            print(json.dumps({'ok': False, 'error': 'out-of-echos', 'balance': state['balance']}))
-            sys.exit(2)
-        state['balance'] = int(state['balance']) - BURN_COST
-        state['seq'] = int(state['seq']) + 1
-        save_state(state)
-        env = {'ts': time.time(), 'type': 'p2p-send', 'from': state['node_id'], 'to': target, 'message': message, 'seq': state['seq']}
-        append_jsonl(os.path.join(INBOX_DIR, f'{target}.jsonl'), env)
-        append_jsonl(EVENTS_JSONL, {**env, 'node_id': state['node_id'], 'burned': BURN_COST, 'balance': state['balance']})
-        print(json.dumps({'ok': True, 'type': 'p2p-send', 'target': target, 'balance': state['balance'], 'halted': state['halted']}))
-        return
-
-    if cmd == 'capability-offer':
-        cap_id = sys.argv[2] if len(sys.argv) > 2 else ''
-        price = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-        description = ' '.join(sys.argv[4:]) if len(sys.argv) > 4 else ''
-        if not cap_id or price <= 0:
-            print(json.dumps({'ok': False, 'error': 'invalid-capability-offer'}))
-            sys.exit(1)
-        if int(state['balance']) < BURN_COST:
-            state['halted'] = True
-            state['halt_reason'] = 'out-of-echos'
-            save_state(state)
-            print(json.dumps({'ok': False, 'error': 'out-of-echos', 'balance': state['balance']}))
-            sys.exit(2)
-        state['balance'] = int(state['balance']) - BURN_COST
-        state['seq'] = int(state['seq']) + 1
-        save_state(state)
-        offer = {'ts': time.time(), 'cap_id': cap_id, 'provider': state['node_id'], 'price': price, 'description': description, 'seq': state['seq']}
-        append_jsonl(CAPABILITIES_JSONL, offer)
-        append_jsonl(EVENTS_JSONL, {**offer, 'type': 'capability-offer', 'node_id': state['node_id'], 'burned': BURN_COST, 'balance': state['balance']})
-        print(json.dumps({'ok': True, 'type': 'capability-offer', 'cap_id': cap_id, 'price': price, 'balance': state['balance'], 'halted': state['halted']}))
-        return
-
-    if cmd == 'capability-buy':
-        cap_id = sys.argv[2] if len(sys.argv) > 2 else ''
-        request = ' '.join(sys.argv[3:]) if len(sys.argv) > 3 else ''
-        caps = read_capabilities()
-        if cap_id not in caps:
-            print(json.dumps({'ok': False, 'error': 'unknown-capability', 'cap_id': cap_id}))
-            sys.exit(1)
-        offer = caps[cap_id]
-        provider = offer['provider']
-        if provider == state['node_id']:
-            print(json.dumps({'ok': False, 'error': 'cannot-buy-own-capability', 'cap_id': cap_id}))
-            sys.exit(1)
-        price = int(offer['price'])
-        total_cost = price + BURN_COST
-        if int(state['balance']) < total_cost:
-            save_state(state)
-            print(json.dumps({'ok': False, 'error': 'insufficient-funds', 'balance': state['balance'], 'required': total_cost}))
-            sys.exit(2)
-        state['balance'] = int(state['balance']) - total_cost
-        state['seq'] = int(state['seq']) + 1
-        save_state(state)
-        tx_id = f\"{state['node_id']}-cap-{state['seq']}\"
-        order = {'ts': time.time(), 'type': 'capability-order', 'tx_id': tx_id, 'from': state['node_id'], 'to': provider, 'cap_id': cap_id, 'price': price, 'amount': price, 'burned': BURN_COST, 'request': request, 'seq': state['seq']}
-        append_jsonl(os.path.join(INBOX_DIR, f'{provider}.jsonl'), order)
-        append_jsonl(EVENTS_JSONL, {**order, 'node_id': state['node_id'], 'balance': state['balance'], 'halted': state['halted'], 'halt_reason': state.get('halt_reason')})
-        print(json.dumps({'ok': True, 'type': 'capability-buy', 'cap_id': cap_id, 'provider': provider, 'price': price, 'burned': BURN_COST, 'balance': state['balance'], 'halted': state['halted']}))
-        return
-
-    if cmd == 'capability-deliver':
-        target = sys.argv[2].lstrip(':') if len(sys.argv) > 2 else ''
-        cap_id = sys.argv[3] if len(sys.argv) > 3 else ''
-        result = ' '.join(sys.argv[4:]) if len(sys.argv) > 4 else ''
-        validate_target(target)
-        if int(state['balance']) < BURN_COST:
-            state['halted'] = True
-            state['halt_reason'] = 'out-of-echos'
-            save_state(state)
-            print(json.dumps({'ok': False, 'error': 'out-of-echos', 'balance': state['balance']}))
-            sys.exit(2)
-        state['balance'] = int(state['balance']) - BURN_COST
-        state['seq'] = int(state['seq']) + 1
-        save_state(state)
-        deliv = {'ts': time.time(), 'type': 'capability-delivery', 'from': state['node_id'], 'to': target, 'cap_id': cap_id, 'result': result, 'seq': state['seq']}
-        append_jsonl(os.path.join(INBOX_DIR, f'{target}.jsonl'), deliv)
-        append_jsonl(EVENTS_JSONL, {**deliv, 'node_id': state['node_id'], 'burned': BURN_COST, 'balance': state['balance']})
-        print(json.dumps({'ok': True, 'type': 'capability-deliver', 'target': target, 'cap_id': cap_id, 'balance': state['balance'], 'halted': state['halted']}))
-        return
-
-    if cmd == 'transfer':
-        target = sys.argv[2].lstrip(':') if len(sys.argv) > 2 else ''
-        amount = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-        validate_target(target)
-        total_cost = amount + BURN_COST
-        if amount <= 0 or int(state['balance']) < total_cost:
-            save_state(state)
-            print(json.dumps({'ok': False, 'error': 'insufficient-funds', 'balance': state['balance'], 'required': total_cost}))
-            sys.exit(2)
-        state['balance'] = int(state['balance']) - total_cost
-        state['seq'] = int(state['seq']) + 1
-        save_state(state)
-        tx_id = f\"{state['node_id']}-{state['seq']}\"
-        env = {'ts': time.time(), 'type': 'transfer', 'tx_id': tx_id, 'from': state['node_id'], 'to': target, 'amount': amount, 'burned': BURN_COST, 'seq': state['seq']}
-        append_jsonl(os.path.join(INBOX_DIR, f'{target}.jsonl'), env)
-        append_jsonl(EVENTS_JSONL, {**env, 'node_id': state['node_id'], 'balance': state['balance'], 'halted': state['halted'], 'halt_reason': state.get('halt_reason')})
-        print(json.dumps({'ok': True, 'type': 'transfer', 'target': target, 'amount': amount, 'burned': BURN_COST, 'balance': state['balance'], 'halted': state['halted'], 'halt_reason': state.get('halt_reason')}))
-        return
-
-    print(json.dumps({'ok': False, 'error': f'unknown-command:{cmd}'}))
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == '-M:light-node':
+        target = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bitecho-light-node')
+        os.execv(target, ['bitecho-light-node'] + args[1:])
+    for candidate in ('/usr/local/bin/clojure', '/usr/bin/clojure'):
+        if os.path.exists(candidate):
+            os.execv(candidate, [candidate] + args)
+    print('clojure binary not found', file=sys.stderr)
     sys.exit(1)
 
 if __name__ == '__main__':
@@ -810,18 +598,22 @@ if __name__ == '__main__':
 ")
 
 (defn write-node-cli-and-skill-files!
-  "Writes `<workspace>/bin/bitecho-node` (chmod +x), `<workspace>/AGENTS.md`,
-   `<workspace>/SCENARIO.md`, and `<workspace>/.agents/skills/bitecho-light-node/SKILL.md`."
+  "Writes `<workspace>/bin/bitecho-light-node`, `<workspace>/bin/clojure` (chmod +x),
+   `<workspace>/AGENTS.md`, `<workspace>/SCENARIO.md`, and
+   `<workspace>/.agents/skills/bitecho-light-node/SKILL.md`."
   [node-ctx siblings-map min-echo-balance]
   (let [workspace-dir (:workspace-dir node-ctx)
-        bin-file (io/file workspace-dir "bin" "bitecho-node")
+        light-bin-file (io/file workspace-dir "bin" "bitecho-light-node")
+        clj-bin-file (io/file workspace-dir "bin" "clojure")
         skill-file (io/file workspace-dir ".agents" "skills" "bitecho-light-node" "SKILL.md")
         agents-file (io/file workspace-dir "AGENTS.md")
         scenario-file (io/file workspace-dir "SCENARIO.md")]
-    (io/make-parents bin-file)
+    (io/make-parents light-bin-file)
     (io/make-parents skill-file)
-    (spit bin-file python-node-cli-script)
-    (.setExecutable bin-file true false)
+    (spit light-bin-file python-node-cli-script)
+    (.setExecutable light-bin-file true false)
+    (spit clj-bin-file python-clojure-wrapper-script)
+    (.setExecutable clj-bin-file true false)
     (spit skill-file (render-skill-markdown))
     (spit agents-file (render-node-agents-md node-ctx siblings-map min-echo-balance))
     (spit scenario-file (render-node-scenario-md node-ctx siblings-map min-echo-balance))))

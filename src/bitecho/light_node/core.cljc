@@ -11,6 +11,7 @@
             [bitecho.core.subnet :as core-subnet]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
+            [bitecho.economy.account :as account]
             [bitecho.economy.bundle :as bundle]
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
@@ -20,7 +21,6 @@
             [clojure.edn :as edn]
             [clojure.string :as str]
             [datachannel.mdns :as mdns]
-            #?(:cljs [bitecho.economy.account :as account])
             #?(:cljs [bitecho.sieve.core :as sieve])
             #?(:clj [bitecho.shell.agent-sim :as agent-sim])
             #?(:clj [bitecho.shell.mesh :as mesh])
@@ -1939,9 +1939,11 @@
                                    :price price
                                    :home-node home-node
                                    :offer-hash offer-hash}
-                    new-state (-> state
-                                  (assoc-in [:sessions session-id] session-entry)
-                                  (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))]
+                    new-state (cond-> (-> state
+                                          (assoc-in [:sessions session-id] session-entry)
+                                          (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
+                                (and (pos? burn-amt) (some? (get-in state [:account :spendable])))
+                                (update-in [:account :spendable] - burn-amt))]
                 {:state new-state
                  :response (cond-> {"ok" true
                                     "session_id" session-id
@@ -2701,64 +2703,86 @@
                    error (assoc "error" (str error)))]
      (:state (exec-p2p-channel-state state cmd-map)))))
 
+(defn- check-and-deduct-burn
+  [state burn-amt]
+  (let [burn (max 0 (long (or burn-amt 0)))
+        acct (:account state)
+        has-bal? (and (map? acct) (or (some? (:spendable acct)) (some? (:balance acct))))
+        spendable (when has-bal? (long (parse-long-safe (or (:spendable acct) (:balance acct)) 0)))]
+    (if (and (pos? burn) has-bal? (< spendable burn))
+      {:ok? false :error "insufficient-funds" :state state}
+      {:ok? true
+       :burn burn
+       :state (cond-> (update-in state [:local-accounting :burned-ech] (fnil + 0) burn)
+                (and (pos? burn) (some? (:spendable acct)))
+                (update-in [:account :spendable] - burn)
+                (and (pos? burn) (some? (:balance acct)))
+                (update-in [:account :balance] - burn))})))
+
 (defn- exec-broadcast [state cmd-map privkey-bytes]
   (let [raw-text (or (get cmd-map "text") (get cmd-map "message") (:text cmd-map) (:message cmd-map))
         text (when (some? raw-text) (str raw-text))]
     (if (or (nil? text) (str/blank? text))
       {:state state :response {"ok" false "error" "empty-payload"} :net-envelopes [] :stdout-events []}
-      (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
-            sender (normalize-pubkey-hex (:pubkey state))
-            next-seq (inc (long (or (:broadcast-seq state) 0)))
-            msg-id (compute-broadcast-msg-id sub-id sender next-seq text)
-            epoch (long (or (:epoch state) 0))
-            explicit-dac (or (get cmd-map "dac") (:dac cmd-map))
-            dac (or explicit-dac
-                    (when-let [d (:dac state)]
-                      (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
-                                                 :current-epoch epoch
-                                                 :revoked-dac-ids (:revoked-dacs state)
-                                                 :required-scope "broadcast"}))
-                        d)))
-            dac-id (when (map? dac) (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id")))
-            sig-str (canonical-broadcast-str sub-id sender next-seq msg-id text epoch dac-id)
-            sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
-            sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
-            payload (cond-> {:protocol-version current-wire-version
-                             :wire-format current-wire-format
-                             :subnet-id sub-id
-                             :bitecho/type :p2p-broadcast
-                             :type :p2p-broadcast
-                             :sender sender
-                             :seq next-seq
-                             :msg-id msg-id
-                             :text text
-                             :epoch epoch
-                             :signature sig-hex}
-                      dac (assoc :dac dac))
-            raw-env (build-gossip-envelope sender privkey-bytes (freeze-payload payload) 0 sub-id)
-            env (assoc raw-env :p2p-direct? true :p2p-broadcast? true)
-            dedup-key [sender next-seq msg-id]
-            b-entry {:from sender
-                     :seq next-seq
-                     :msg-id msg-id
-                     :text text
-                     :subnet-id sub-id
-                     :epoch epoch
-                     :broadcast? true}
-            new-state (-> state
-                          (assoc :broadcast-seq next-seq)
-                          (update :broadcast-seen (fnil conj #{}) dedup-key)
-                          (update :broadcast-inbox (fnil conj []) b-entry))]
-        {:state new-state
-         :response {"ok" true
-                    "subnet_id" sub-id
-                    "seq" next-seq
-                    "msg_id" msg-id
-                    "burn" 0
-                    "zero_burn" true
-                    "p2p" true}
-         :net-envelopes [env]
-         :stdout-events []}))))
+      (let [burn-amt (max 0 (long (or (parse-long-safe (or (get cmd-map "burn") (:burn cmd-map)) 0) 0)))
+            burn-chk (check-and-deduct-burn state burn-amt)]
+        (if-not (:ok? burn-chk)
+          {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+          (let [st-after-burn (:state burn-chk)
+                sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
+                sender (normalize-pubkey-hex (:pubkey state))
+                next-seq (inc (long (or (:broadcast-seq state) 0)))
+                msg-id (compute-broadcast-msg-id sub-id sender next-seq text)
+                epoch (long (or (:epoch state) 0))
+                explicit-dac (or (get cmd-map "dac") (:dac cmd-map))
+                dac (or explicit-dac
+                        (when-let [d (:dac state)]
+                          (when (:ok? (verify-dac d {:expected-agent-pubkey (:pubkey state)
+                                                     :current-epoch epoch
+                                                     :revoked-dac-ids (:revoked-dacs state)
+                                                     :required-scope "broadcast"}))
+                            d)))
+                dac-id (when (map? dac) (or (:dac-id dac) (get dac "dac_id") (get dac "dac-id")))
+                sig-str (canonical-broadcast-str sub-id sender next-seq msg-id text epoch dac-id)
+                sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes sig-str))
+                sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
+                payload (cond-> {:protocol-version current-wire-version
+                                 :wire-format current-wire-format
+                                 :subnet-id sub-id
+                                 :bitecho/type :p2p-broadcast
+                                 :type :p2p-broadcast
+                                 :sender sender
+                                 :seq next-seq
+                                 :msg-id msg-id
+                                 :text text
+                                 :epoch epoch
+                                 :signature sig-hex}
+                          dac (assoc :dac dac))
+                outer-sub (if (pos? burn-amt) "*" sub-id)
+                raw-env (build-gossip-envelope sender privkey-bytes (freeze-payload payload) burn-amt outer-sub)
+                env (assoc raw-env :p2p-direct? true :p2p-broadcast? true)
+                dedup-key [sender next-seq msg-id]
+                b-entry {:from sender
+                         :seq next-seq
+                         :msg-id msg-id
+                         :text text
+                         :subnet-id sub-id
+                         :epoch epoch
+                         :broadcast? true}
+                new-state (-> st-after-burn
+                              (assoc :broadcast-seq next-seq)
+                              (update :broadcast-seen (fnil conj #{}) dedup-key)
+                              (update :broadcast-inbox (fnil conj []) b-entry))]
+            {:state new-state
+             :response {"ok" true
+                        "subnet_id" sub-id
+                        "seq" next-seq
+                        "msg_id" msg-id
+                        "burn" burn-amt
+                        "zero_burn" (zero? burn-amt)
+                        "p2p" true}
+             :net-envelopes [env]
+             :stdout-events []}))))))
 
 (defn- exec-send [state cmd-map privkey-bytes]
   (let [resolved-sid (resolve-session-id state cmd-map :open)]
@@ -2841,6 +2865,8 @@
                                           (assoc-in [:sessions session-id :outbox] final-outbox)
                                           (assoc-in [:sessions session-id :outbox-order] final-order)
                                           (update-in [:local-accounting :burned-ech] (fnil + 0) burn-amt))
+                                (and (pos? burn-amt) (some? (get-in state [:account :spendable])))
+                                (update-in [:account :spendable] - burn-amt)
                                 (pos? overflow)
                                 (-> (update-in [:sessions session-id :outbox-evicted] (fnil + 0) overflow)
                                     (update-in [:sessions session-id :outbox-evicted-seqs] (fnil (fn [v sqs] (vec (take-last 64 (into (vec v) sqs)))) []) evicted-seqs)))]
@@ -2856,36 +2882,54 @@
                  :net-envelopes [gossip-env]
                  :stdout-events diag-events}))))))))
 
-(defn- exec-inbox [state]
-  (let [enriched-msgs (mapv (fn [m]
-                              (let [clean-m (dissoc m :from_petname :from-petname "from_petname" "from-petname")
-                                    sender (or (:from clean-m) (get clean-m "from"))
-                                    pname (when sender (pubkey->petname state sender))]
-                                (cond-> clean-m
-                                  pname (assoc :from_petname pname "from_petname" pname))))
-                            (:inbox state))
-        enriched-offers (mapv (fn [o]
-                                (let [clean-o (dissoc o :petname :nickname :caller_petname :caller-petname
-                                                      "petname" "nickname" "caller_petname" "caller-petname")
-                                      caller (or (:caller clean-o) (get clean-o "caller"))
-                                      pname (when caller (pubkey->petname state caller))]
-                                  (cond-> clean-o
-                                    pname (assoc :caller_petname pname "caller_petname" pname))))
-                              (vec (vals (:pending-offers state))))
-        enriched-rendezvous (mapv (fn [r]
-                                    (let [clean-r (dissoc r :caller_petname :caller-petname "caller_petname" "caller-petname")
-                                          caller (or (:caller clean-r) (get clean-r "caller"))
-                                          pname (when caller (pubkey->petname state caller))]
-                                      (cond-> clean-r
-                                        pname (assoc :caller_petname pname "caller_petname" pname))))
-                                  (vec (vals (:pending-rendezvous state))))]
-    {:state (assoc state :inbox [])
-     :response {"ok" true
-                "messages" enriched-msgs
-                "pending_offers" enriched-offers
-                "pending_rendezvous" enriched-rendezvous}
-     :net-envelopes []
-     :stdout-events []}))
+(defn- exec-inbox
+  ([state] (exec-inbox state {}))
+  ([state cmd-map]
+   (let [raw-sub (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map)
+                     (get cmd-map "subnet") (:subnet cmd-map))
+         subnet-filter (when (and raw-sub (not (str/blank? (str raw-sub))))
+                         (str raw-sub))
+         matches-subnet? (fn [entry]
+                           (if (nil? subnet-filter)
+                             true
+                             (= subnet-filter (str (or (:subnet-id entry) (get entry "subnet_id") (get entry "subnet-id"))))))
+         inbox-entries (vec (:inbox state))
+         bcast-entries (vec (:broadcast-inbox state))
+         matched-inbox (filterv matches-subnet? inbox-entries)
+         rem-inbox (if subnet-filter (filterv (complement matches-subnet?) inbox-entries) [])
+         matched-bcasts (filterv matches-subnet? bcast-entries)
+         rem-bcasts (if subnet-filter (filterv (complement matches-subnet?) bcast-entries) [])
+         enrich-entry (fn [m]
+                        (let [clean-m (dissoc m :from_petname :from-petname "from_petname" "from-petname")
+                              sender (or (:from clean-m) (get clean-m "from"))
+                              pname (when sender (pubkey->petname state sender))]
+                          (cond-> clean-m
+                            pname (assoc :from_petname pname "from_petname" pname))))
+         enriched-msgs (mapv enrich-entry matched-inbox)
+         enriched-bcasts (mapv enrich-entry matched-bcasts)
+         enriched-offers (mapv (fn [o]
+                                 (let [clean-o (dissoc o :petname :nickname :caller_petname :caller-petname
+                                                       "petname" "nickname" "caller_petname" "caller-petname")
+                                       caller (or (:caller clean-o) (get clean-o "caller"))
+                                       pname (when caller (pubkey->petname state caller))]
+                                   (cond-> clean-o
+                                     pname (assoc :caller_petname pname "caller_petname" pname))))
+                               (vec (vals (:pending-offers state))))
+         enriched-rendezvous (mapv (fn [r]
+                                     (let [clean-r (dissoc r :caller_petname :caller-petname "caller_petname" "caller-petname")
+                                           caller (or (:caller clean-r) (get clean-r "caller"))
+                                           pname (when caller (pubkey->petname state caller))]
+                                       (cond-> clean-r
+                                         pname (assoc :caller_petname pname "caller_petname" pname))))
+                                   (vec (vals (:pending-rendezvous state))))]
+     {:state (assoc state :inbox rem-inbox :broadcast-inbox rem-bcasts)
+      :response {"ok" true
+                 "messages" enriched-msgs
+                 "broadcasts" enriched-bcasts
+                 "pending_offers" enriched-offers
+                 "pending_rendezvous" enriched-rendezvous}
+      :net-envelopes []
+      :stdout-events []})))
 
 (defn- exec-close [state cmd-map privkey-bytes]
   (let [resolved-sid (resolve-session-id state cmd-map :active)]
@@ -4468,61 +4512,76 @@
 
 (defn- exec-storage-put
   [state effective-map privkey-bytes _sub-id]
-  (let [raw-data (get effective-map "data" (get effective-map "payload" (get effective-map :data (:payload effective-map))))
-        raw-hex (or (get effective-map "data_hex") (get effective-map "data-hex")
-                    (:data_hex effective-map) (:data-hex effective-map))
-        data (cond
-               (some? raw-data) raw-data
-               (and (string? raw-hex) (not (str/blank? raw-hex))) (fressian/hex->bytes raw-hex)
-               :else nil)
-        slot (str (or (get effective-map "slot_id") (get effective-map "slot-id")
-                      (:slot_id effective-map) (:slot-id effective-map)
-                      (get effective-map "slot") (:slot effective-map)
-                      "default"))
-        subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) _sub-id "global"))
-        path (str "storage/" (:pubkey state) "/" slot)
-        min-seq (long (get-in state [:storage-min-seqs [subnet path]] 0))
-        seq-num (long (or (get effective-map "seq") (:seq effective-map) (inc min-seq)))
-        context (or (get effective-map "context") (:context effective-map))
-        nonce (or (get effective-map "nonce") (:nonce effective-map))
-        pack-res (storage/pack-encrypted-state {:privkey privkey-bytes
-                                                :pubkey (:pubkey state)
-                                                :subnet-id subnet
-                                                :slot slot
-                                                :seq seq-num
-                                                :state-data data
-                                                :context context
-                                                :nonce-bytes nonce})
-        cid (:cid pack-res)
-        blob (:blob pack-res)
-        ptr (:pointer pack-res)
-        size-bytes (if blob (fressian/count-bytes (:blob/bytes blob)) 0)
-        rep-envelope (when privkey-bytes
-                       {:bitecho/type :storage-replicate
-                        :subnet-id subnet
-                        :path path
-                        :blob blob
-                        :pointer ptr
-                        :sender (:pubkey state)
-                        :epoch (or (:epoch state) 0)
-                        :timestamp (now-utc-ms)
-                        :p2p-broadcast? true})]
-    {:state (-> state
-                (assoc-in [:storage-blobs cid] blob)
-                (assoc-in [:storage-pointers [subnet path]] ptr)
-                (assoc-in [:storage-min-seqs [subnet path]] seq-num))
-     :response {"ok" true
-                "cid" cid
-                "path" path
-                "seq" seq-num
-                "slot" slot
-                "slot_id" slot
-                "subnet_id" subnet
-                "size_bytes" size-bytes
-                "blob" blob
-                "pointer" ptr}
-     :net-envelopes (if rep-envelope [rep-envelope] [])
-     :stdout-events []}))
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            raw-data (get effective-map "data" (get effective-map "payload" (get effective-map :data (:payload effective-map))))
+            raw-hex (or (get effective-map "data_hex") (get effective-map "data-hex")
+                        (:data_hex effective-map) (:data-hex effective-map))
+            data (cond
+                   (some? raw-data) raw-data
+                   (and (string? raw-hex) (not (str/blank? raw-hex))) (fressian/hex->bytes raw-hex)
+                   :else nil)
+            slot (str (or (get effective-map "slot_id") (get effective-map "slot-id")
+                          (:slot_id effective-map) (:slot-id effective-map)
+                          (get effective-map "slot") (:slot effective-map)
+                          "default"))
+            subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) _sub-id "global"))
+            path (str "storage/" (:pubkey state) "/" slot)
+            min-seq (long (get-in state [:storage-min-seqs [subnet path]] 0))
+            seq-num (long (or (get effective-map "seq") (:seq effective-map) (inc min-seq)))
+            context (or (get effective-map "context") (:context effective-map))
+            nonce (or (get effective-map "nonce") (:nonce effective-map))
+            pack-res (storage/pack-encrypted-state {:privkey privkey-bytes
+                                                    :pubkey (:pubkey state)
+                                                    :subnet-id subnet
+                                                    :slot slot
+                                                    :seq seq-num
+                                                    :state-data data
+                                                    :context context
+                                                    :nonce-bytes nonce})
+            cid (:cid pack-res)
+            blob (:blob pack-res)
+            ptr (:pointer pack-res)
+            size-bytes (if blob (fressian/count-bytes (:blob/bytes blob)) 0)
+            rep-payload {:protocol-version current-wire-version
+                         :wire-format current-wire-format
+                         :bitecho/type :storage-replicate
+                         :subnet-id subnet
+                         :path path
+                         :blob blob
+                         :pointer ptr
+                         :sender (:pubkey state)
+                         :epoch (or (:epoch state) 0)
+                         :timestamp (now-utc-ms)}
+            outer-sub (if (pos? burn-amt) "*" subnet)
+            rep-envelope (when privkey-bytes
+                           (let [gossip-env (build-gossip-envelope
+                                             (normalize-pubkey-hex (:pubkey state))
+                                             privkey-bytes
+                                             (freeze-payload rep-payload)
+                                             burn-amt
+                                             outer-sub)]
+                             (merge rep-payload gossip-env {:p2p-broadcast? true})))]
+        {:state (-> st-after-burn
+                    (assoc-in [:storage-blobs cid] blob)
+                    (assoc-in [:storage-pointers [subnet path]] ptr)
+                    (assoc-in [:storage-min-seqs [subnet path]] seq-num))
+         :response {"ok" true
+                    "cid" cid
+                    "path" path
+                    "seq" seq-num
+                    "slot" slot
+                    "slot_id" slot
+                    "subnet_id" subnet
+                    "size_bytes" size-bytes
+                    "burn" burn-amt
+                    "blob" blob
+                    "pointer" ptr}
+         :net-envelopes (if rep-envelope [rep-envelope] [])
+         :stdout-events []}))))
 
 (defn- exec-storage-get
   [state effective-map privkey-bytes _sub-id]
@@ -4602,59 +4661,74 @@
 
 (defn- exec-capability-publish
   [state effective-map privkey-bytes sub-id]
-  (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "global"))
-        cap-id (str (or (get effective-map "capability_id") (get effective-map "capability-id") (:capability-id effective-map) "default"))
-        raw-type (or (get effective-map "capability_type") (get effective-map "capability-type") (:capability-type effective-map) :storage/blob-pinning)
-        cap-type (cond
-                   (keyword? raw-type) raw-type
-                   (string? raw-type) (keyword (str/replace raw-type #"^:+" ""))
-                   :else :storage/blob-pinning)
-        price (long (or (get effective-map "price_echo") (get effective-map "price-echo") (:price-echo effective-map) 0))
-        burn (long (or (get effective-map "burn_floor") (get effective-map "burn-floor") (:burn-floor effective-map) 0))
-        meta-raw (or (get effective-map "metadata") (:metadata effective-map) {})
-        meta (if (some? meta-raw) (parse-structured-arg meta-raw) {})
-        target (or (get effective-map "target_cid") (get effective-map "target-cid") (:target-cid effective-map))
-        seq-num (long (or (get effective-map "seq") (:seq effective-map) 1))
-        pack-res (storage/pack-capability-descriptor {:privkey privkey-bytes
-                                                      :pubkey (:pubkey state)
-                                                      :subnet-id subnet
-                                                      :capability-id cap-id
-                                                      :capability-type cap-type
-                                                      :price-echo price
-                                                      :burn-floor burn
-                                                      :metadata meta
-                                                      :seq seq-num
-                                                      :target-cid target})
-        cid (:cid pack-res)
-        path (:path pack-res)
-        blob (:blob pack-res)
-        ptr (:pointer pack-res)
-        rep-envelope (when privkey-bytes
-                       {:bitecho/type :capability-replicate
-                        :subnet-id subnet
-                        :path path
-                        :blob blob
-                        :pointer ptr
-                        :sender (:pubkey state)
-                        :epoch (or (:epoch state) 0)
-                        :timestamp (now-utc-ms)
-                        :p2p-broadcast? true})]
-    {:state (-> state
-                (assoc-in [:capabilities [subnet path]] ptr)
-                (assoc-in [:capability-blobs cid] blob))
-     :response {"ok" true
-                "capability_id" cap-id
-                "capability_type" (if (keyword? cap-type) (subs (str cap-type) 1) (str cap-type))
-                "price_echo" price
-                "burn_floor" burn
-                "subnet_id" subnet
-                "path" path
-                "cid" cid
-                "seq" seq-num
-                "blob" blob
-                "pointer" ptr}
-     :net-envelopes (if rep-envelope [rep-envelope] [])
-     :stdout-events []}))
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id "global"))
+            cap-id (str (or (get effective-map "capability_id") (get effective-map "capability-id") (:capability-id effective-map) "default"))
+            raw-type (or (get effective-map "capability_type") (get effective-map "capability-type") (:capability-type effective-map) :storage/blob-pinning)
+            cap-type (cond
+                       (keyword? raw-type) raw-type
+                       (string? raw-type) (keyword (str/replace raw-type #"^:+" ""))
+                       :else :storage/blob-pinning)
+            price (long (or (get effective-map "price_echo") (get effective-map "price-echo") (:price-echo effective-map) 0))
+            burn (long (or (get effective-map "burn_floor") (get effective-map "burn-floor") (:burn-floor effective-map) 0))
+            meta-raw (or (get effective-map "metadata") (:metadata effective-map) {})
+            meta (if (some? meta-raw) (parse-structured-arg meta-raw) {})
+            target (or (get effective-map "target_cid") (get effective-map "target-cid") (:target-cid effective-map))
+            seq-num (long (or (get effective-map "seq") (:seq effective-map) 1))
+            pack-res (storage/pack-capability-descriptor {:privkey privkey-bytes
+                                                          :pubkey (:pubkey state)
+                                                          :subnet-id subnet
+                                                          :capability-id cap-id
+                                                          :capability-type cap-type
+                                                          :price-echo price
+                                                          :burn-floor burn
+                                                          :metadata meta
+                                                          :seq seq-num
+                                                          :target-cid target})
+            cid (:cid pack-res)
+            path (:path pack-res)
+            blob (:blob pack-res)
+            ptr (:pointer pack-res)
+            rep-payload {:protocol-version current-wire-version
+                         :wire-format current-wire-format
+                         :bitecho/type :capability-replicate
+                         :subnet-id subnet
+                         :path path
+                         :blob blob
+                         :pointer ptr
+                         :sender (:pubkey state)
+                         :epoch (or (:epoch state) 0)
+                         :timestamp (now-utc-ms)}
+            outer-sub (if (pos? burn-amt) "*" subnet)
+            rep-envelope (when privkey-bytes
+                           (let [gossip-env (build-gossip-envelope
+                                             (normalize-pubkey-hex (:pubkey state))
+                                             privkey-bytes
+                                             (freeze-payload rep-payload)
+                                             burn-amt
+                                             outer-sub)]
+                             (merge rep-payload gossip-env {:p2p-broadcast? true})))]
+        {:state (-> st-after-burn
+                    (assoc-in [:capabilities [subnet path]] ptr)
+                    (assoc-in [:capability-blobs cid] blob))
+         :response {"ok" true
+                    "capability_id" cap-id
+                    "capability_type" (if (keyword? cap-type) (subs (str cap-type) 1) (str cap-type))
+                    "price_echo" price
+                    "burn_floor" burn
+                    "burn" burn-amt
+                    "subnet_id" subnet
+                    "path" path
+                    "cid" cid
+                    "seq" seq-num
+                    "blob" blob
+                    "pointer" ptr}
+         :net-envelopes (if rep-envelope [rep-envelope] [])
+         :stdout-events []}))))
 
 (defn- exec-capability-resolve
   [state effective-map _privkey-bytes sub-id]
@@ -4792,7 +4866,7 @@
               "rendezvous-offer" (exec-rendezvous-offer state effective-map privkey-bytes)
               "rendezvous-accept" (exec-rendezvous-accept state effective-map privkey-bytes)
               "send" (exec-send state effective-map privkey-bytes)
-              "inbox" (exec-inbox state)
+              "inbox" (exec-inbox state effective-map)
               "close" (exec-close state effective-map privkey-bytes)
               "transfer" (exec-transfer state effective-map privkey-bytes)
               "account" (exec-sync-account state effective-map)
@@ -4905,6 +4979,8 @@
              (contains? raw-payload-or-event :type)
              (contains? raw-payload-or-event "type")
              (contains? raw-payload-or-event "cmd")
+             (contains? raw-payload-or-event :transfer)
+             (contains? raw-payload-or-event "transfer")
              (contains? raw-payload-or-event :validator-pubkey)
              (contains? raw-payload-or-event "validator-pubkey")
              (contains? raw-payload-or-event "validator_pubkey")))
@@ -6214,6 +6290,67 @@
          :net-envelopes []
          :stdout-events [evt]}))))
 
+(defn- handle-wire-transfer [state msg]
+  (let [raw-tf (or (:transfer msg) (get msg "transfer"))
+        tf (when (map? raw-tf)
+             {:sender (normalize-pubkey-hex (str (or (:sender raw-tf) (get raw-tf "sender") "")))
+              :receiver (normalize-pubkey-hex (str (or (:receiver raw-tf) (get raw-tf "receiver") "")))
+              :amount (long (or (:amount raw-tf) (get raw-tf "amount") 0))
+              :seq (long (or (:seq raw-tf) (get raw-tf "seq") 0))
+              :deps (vec (or (:deps raw-tf) (get raw-tf "deps") []))
+              :signature (or (:signature raw-tf) (get raw-tf "signature"))})
+        my-pub (normalize-pubkey-hex (str (or (:pubkey state) "")))
+        for-me? (and (map? tf) (not (str/blank? my-pub)) (= (:receiver tf) my-pub))
+        valid-sig? (boolean
+                    (when (and for-me? (pos? (:amount tf)))
+                      (try
+                        (let [sender-bytes (basalt/hex->bytes (:sender tf))
+                              unsigned-tf (into (sorted-map) (fressian/strip-untrusted-crypto-tags (dissoc tf :signature)))
+                              sig-raw (:signature tf)
+                              sig-bytes (cond
+                                          (fressian/bytes? sig-raw) sig-raw
+                                          (string? sig-raw) (basalt/hex->bytes sig-raw)
+                                          (coll? sig-raw) #?(:clj (byte-array (map byte sig-raw))
+                                                             :cljs (js/Uint8Array. (clj->js sig-raw)))
+                                          :else nil)]
+                          (and sender-bytes sig-bytes
+                               (crypto/verify-with-fallback sender-bytes unsigned-tf sig-bytes)))
+                        (catch #?(:clj Exception :cljs :default) _ false))))]
+    (cond
+      (not for-me?)
+      {:state state :net-envelopes [] :stdout-events []}
+
+      (not valid-sig?)
+      {:state (update-in state [:diagnostics :invalid-transfer-dropped] (fnil inc 0))
+       :net-envelopes []
+       :stdout-events [{"event" "diagnostic" "reason" "invalid-transfer-signature"}]}
+
+      :else
+      (let [tx-id (account/transfer-hash tf)
+            credited? (contains? (set (or (:credited-tx-ids state) #{})) tx-id)]
+        (if credited?
+          {:state state :net-envelopes [] :stdout-events []}
+          (let [amt (:amount tf)
+                evt {"event" "transfer-received"
+                     "tx_id" tx-id
+                     "from" (:sender tf)
+                     "to" (:receiver tf)
+                     "amount" amt
+                     "seq" (:seq tf)}
+                inbox-entry {:type "transfer-received"
+                             :tx-id tx-id
+                             :from (:sender tf)
+                             :amount amt
+                             :seq (:seq tf)
+                             :message (str "Received " amt " ECH transfer from " (:sender tf))}]
+            {:state (-> state
+                        (update :credited-tx-ids (fn [s] (conj (set (or s #{})) tx-id)))
+                        (update-in [:account :balance] (fn [b] (+ (long (or b 0)) amt)))
+                        (update-in [:account :spendable] (fn [s] (+ (long (or s 0)) amt)))
+                        (update :inbox (fn [ib] (conj (vec (or ib [])) inbox-entry))))
+             :net-envelopes []
+             :stdout-events [evt]}))))))
+
 (defn handle-wire-payload
   "Processes an incoming network event or raw payload. Enforces wire protocol version compatibility,
    2-epoch skew tolerance, and anti-replay protections before dispatching to message-specific reducers."
@@ -6265,10 +6402,15 @@
                                                     (get msg "subnet-id")
                                                     (get msg "subnet_id"))]
                                      (str s)))
-                    msg-type (keyword (or (:bitecho/type msg) (:type msg) (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
-                    storage-or-cap? (or (= msg-type :storage-replicate) (= msg-type :capability-replicate))
+                    msg-type (keyword (or (:bitecho/type msg)
+                                          (:type msg)
+                                          (when (or (:transfer msg) (get msg "transfer")) :transfer)
+                                          (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
+                    storage-or-cap? (or (= msg-type :storage-replicate) (= msg-type :capability-replicate) (= msg-type :transfer))
+                    broadcast-on-default-global? (and (= msg-type :p2p-broadcast) (= expected-subnet "global"))
                     subnet-mismatch? (or (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*") (not= outer-subnet inner-subnet))
                                          (and (not storage-or-cap?)
+                                              (not broadcast-on-default-global?)
                                               (or (and outer-subnet (not= outer-subnet "*") (not= expected-subnet "*") (not= outer-subnet expected-subnet))
                                                   (and inner-subnet (not= inner-subnet "*") (not= expected-subnet "*") (not= inner-subnet expected-subnet)))))]
                 (if subnet-mismatch?
@@ -6287,7 +6429,10 @@
                      :response {"ok" false "error" "subnet-mismatch" "subnet" eff-subnet}
                      :net-envelopes []
                      :stdout-events [diag-event]})
-                  (let [msg-type (keyword (or (:bitecho/type msg) (:type msg) (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
+                  (let [msg-type (keyword (or (:bitecho/type msg)
+                                              (:type msg)
+                                              (when (or (:transfer msg) (get msg "transfer")) :transfer)
+                                              (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
                         msg-epoch (when (integer? (:epoch msg)) (long (:epoch msg)))
                         target-sid (or (:session-id msg) (get msg "session_id"))
                         sess-epoch (when target-sid
@@ -6349,6 +6494,7 @@
                                   :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
                                   :storage-replicate (handle-wire-storage-replicate state msg)
                                   :capability-replicate (handle-wire-capability-replicate state msg)
+                                  :transfer (handle-wire-transfer state msg)
                                   {:state state :net-envelopes [] :stdout-events []})
                             res' (if (and (not= msg-type :chain-state-snapshot)
                                           msg-epoch

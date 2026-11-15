@@ -1,11 +1,14 @@
 (ns bitecho.experiments.runner
-  "Multi-agent headless `agy` experiment provisioner, long-lived `stream-json`
-   session manager, turn scheduler, ledger/halt reconciler, and Markdown/EDN
-   report generator (`INV-D16-1`..`INV-D16-5`, `INV-D17-1`..`INV-D17-3`)."
-  (:require [bitecho.basalt.core :as basalt]
-            [bitecho.crypto :as crypto]
-            [bitecho.experiments.node-tool :as node-tool]
+  "Multi-agent headless `agy` experiment provisioner, real light-node daemon
+   lifecycle manager, long-lived `stream-json` session manager, turn scheduler,
+   ledger/halt reconciler, and Markdown/EDN report generator
+   (`INV-D16-1`..`INV-D16-5`, `INV-D17-1`..`INV-D17-3`, `INV-D18-1`..`INV-D18-4`)."
+  (:require [bitecho.experiments.node-tool :as node-tool]
             [bitecho.experiments.sandbox :as sandbox]
+            [bitecho.light-node.core :as light-core]
+            [bitecho.shell.discovery :as discovery]
+            [bitecho.shell.light-node :as light-shell]
+            [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
@@ -15,7 +18,7 @@
            [java.util.concurrent LinkedBlockingQueue TimeUnit]))
 
 ;; =============================================================================
-;; 1. Experiment Directory & Per-Node Sandbox Provisioning
+;; 1. Experiment Directory & Per-Node Real Light-Node Daemon Provisioning
 ;; =============================================================================
 
 (defn- write-json-map!
@@ -35,36 +38,6 @@
                          (str "  \"" k-str "\": " v-str)))
                      m)]
     (spit file-path (str "{\n" (str/join ",\n" entries) "\n}\n"))))
-
-(defn- write-node-initial-state!
-  [workspace-dir node-id-kw address balance min-echo-balance]
-  (let [nid-str (name node-id-kw)
-        halted? (< (long balance) (long min-echo-balance))
-        halt-reason (when halted? "out-of-echos")
-        state-json-file (io/file workspace-dir "node-state.json")
-        state-edn-file (io/file workspace-dir "node-state.edn")]
-    (write-json-map!
-     state-json-file
-     {"node_id" nid-str
-      "address" address
-      "balance" (long balance)
-      "min_echo_balance" (long min-echo-balance)
-      "seq" 0
-      "halted" halted?
-      "halt_reason" halt-reason
-      "subnets" []
-      "credited_tx_ids" []
-      "summary" ""})
-    (spit state-edn-file
-          (pr-str {:node-id node-id-kw
-                   :address address
-                   :balance (long balance)
-                   :min-echo-balance (long min-echo-balance)
-                   :seq 0
-                   :halted? halted?
-                   :halt-reason (when halted? :out-of-echos)
-                   :subnets #{}
-                   :summary ""}))))
 
 (defn- expand-allowlist-hosts
   "Expands `allow-list` into concrete hostnames for `/etc/hosts` inside `bwrap`
@@ -103,10 +76,35 @@
                      allow-list)]
     (distinct base)))
 
+(defn- maybe-fund-node-from-live-daemon!
+  "When `fund-from-state-dir` has an active `control.json`, submits a real on-chain
+   `transfer` to fund `pubkey-hex` with `amount` ECH and returns the `tx_id` string."
+  [fund-from-state-dir pubkey-hex amount]
+  (when (and fund-from-state-dir (pos? (long amount)))
+    (let [ctrl-file (io/file fund-from-state-dir "control.json")]
+      (when (.exists ctrl-file)
+        (try
+          (let [info (json/read-str (slurp ctrl-file))
+                port (get info "port")
+                token (get info "token")]
+            (when (and port token)
+              (let [resp (light-shell/post-control-request!
+                          port token
+                          {"cmd" "transfer"
+                           "receiver" pubkey-hex
+                           "amount" (long amount)
+                           "burn" 100}
+                          10000)]
+                (when (map? resp)
+                  (or (get resp "tx_id") (get resp "transfer_hash"))))))
+          (catch Exception _ nil))))))
+
 (defn provision-experiment!
-  "Validates `exp-cfg`, provisions isolated node directories, starts per-node
-   local UDP DNS allowlist servers, writes per-node `/etc/{resolv.conf,nsswitch.conf,hosts}`,
-   and installs `bin/bitecho-node`, `AGENTS.md`, `SCENARIO.md`, and `SKILL.md`."
+  "Validates `exp-cfg`, provisions isolated node directories (with zero `shared-bus`),
+   initializes real Ed25519 light-node identities and `state.fressian` in `<workspace>/data`,
+   starts per-node real Bitecho light-node daemons (`light-shell/run-serve!`) connected to
+   the live network, starts UDP DNS allowlist servers, and installs `bin/bitecho-light-node`,
+   `bin/clojure`, `AGENTS.md`, `SCENARIO.md`, and `SKILL.md` (`INV-D18-1`..`INV-D18-4`)."
   [exp-cfg]
   (let [validation (sandbox/validate-experiment-config exp-cfg)]
     (when-not (:ok? validation)
@@ -115,103 +113,159 @@
           base-dir (or (:base-dir exp-cfg) "/var/tmp/bitecho-experiments")
           exp-dir (.getAbsolutePath (io/file base-dir exp-id))
           nodes-root (.getAbsolutePath (io/file exp-dir "nodes"))
-          shared-bus (.getAbsolutePath (io/file exp-dir "shared-bus"))
           min-echo-balance (long (or (:min-echo-balance exp-cfg) 100))
           max-turns (long (or (:max-turns exp-cfg) 6))
           effective-balances (:effective-balances validation)
           node-order (mapv :node-id (:nodes exp-cfg))
+          bootstrap-path (.getAbsolutePath (io/file (or (:bootstrap-path exp-cfg) "devnet/bootstrap.edn")))
+          bootstrap (try (discovery/parse-bootstrap-descriptor (slurp bootstrap-path)) (catch Exception _ {:nodes {}}))
+          live-network? (and (boolean (:live-network? exp-cfg))
+                             (not (boolean (:dry-run? exp-cfg))))
+          fund-from-dir (or (:fund-from-state-dir exp-cfg) "/tmp/antigravity-light-node")
           default-dns-records (merge {"bitecho.org" "35.212.172.159"
                                       "*.bitecho.org" "35.209.253.119"}
                                      (:dns-records exp-cfg))]
       (.mkdirs (io/file nodes-root))
-      (.mkdirs (io/file shared-bus "inboxes"))
-      (.mkdirs (io/file shared-bus "subnets"))
-      ;; Reset shared-bus and telemetry files on fresh provision so re-runs are clean
-      (doseq [^java.io.File f (concat (file-seq (io/file shared-bus "inboxes"))
-                                      (file-seq (io/file shared-bus "subnets"))
-                                      [(io/file shared-bus "events.jsonl")
-                                       (io/file shared-bus "capabilities.jsonl")
-                                       (io/file exp-dir "agy-events.jsonl")])]
-        (when (and (.exists f) (.isFile f))
-          (.delete f)))
+      (doseq [^java.io.File f [(io/file exp-dir "agy-events.jsonl")
+                               (io/file exp-dir "experiment.jsonl")]]
+        (when (.exists f) (.delete f)))
       (let [raw-nodes
             (mapv (fn [ncfg]
                     (let [nid (:node-id ncfg)
                           nid-str (name nid)
-                          kp (crypto/generate-keypair (str exp-id "-" nid-str))
-                          pub-hex (basalt/bytes->hex (:public kp))
-                          address (str "ech1" (subs pub-hex (max 0 (- (count pub-hex) 32))))
                           node-dir (.getAbsolutePath (io/file nodes-root nid-str))
                           workspace-dir (.getAbsolutePath (io/file node-dir "workspace"))
+                          data-dir (.getAbsolutePath (io/file workspace-dir "data"))
                           gemini-dir (.getAbsolutePath (io/file node-dir "gemini"))
                           etc-dir (.getAbsolutePath (io/file node-dir "etc"))
                           resolv-conf (.getAbsolutePath (io/file etc-dir "resolv.conf"))
                           nsswitch-conf (.getAbsolutePath (io/file etc-dir "nsswitch.conf"))
-                          hosts-path (.getAbsolutePath (io/file etc-dir "hosts"))
-                          dns-srv (sandbox/start-dns-allowlist-server!
-                                   (:dns-allow-list ncfg)
-                                   default-dns-records)
-                          eff-bal (long (get effective-balances nid 0))
-                          expanded-hosts (expand-allowlist-hosts (:dns-allow-list ncfg))
-                          host-lines (map (fn [h]
-                                            (str (sandbox/resolve-domain-ip h default-dns-records)
-                                                 " " h))
-                                          expanded-hosts)]
+                          hosts-path (.getAbsolutePath (io/file etc-dir "hosts"))]
                       (.mkdirs (io/file workspace-dir "bin"))
+                      (.mkdirs (io/file data-dir))
                       (.mkdirs (io/file gemini-dir))
                       (.mkdirs (io/file etc-dir))
                       (doseq [^java.io.File lf [(io/file node-dir "agy-stream.jsonl")
-                                                (io/file node-dir "agy-stderr.log")]]
+                                                (io/file node-dir "agy-stderr.log")
+                                                (io/file node-dir "light-node-events.jsonl")
+                                                (io/file workspace-dir "SUMMARY.md")
+                                                (io/file data-dir "control.json")
+                                                (io/file data-dir "identity.fressian")
+                                                (io/file data-dir "state.fressian")]]
                         (when (.exists lf) (.delete lf)))
-                      (spit resolv-conf
-                            (str "# Generated by Bitecho D16/D17 Sandbox for :" nid-str "\n"
-                                 "nameserver 0.0.0.0\n"
-                                 "options ndots:1 timeout:1 attempts:1\n"))
-                      (spit nsswitch-conf
-                            "hosts: files\nnetworks: files\n")
-                      (spit hosts-path
-                            (str "127.0.0.1 localhost\n"
-                                 "::1 localhost\n"
-                                 (str/join "\n" host-lines)
-                                 "\n"))
-                      (write-node-initial-state! workspace-dir nid address eff-bal min-echo-balance)
-                      (assoc ncfg
-                             :address address
-                             :pubkey-hex pub-hex
-                             :effective-balance eff-bal
-                             :node-dir node-dir
-                             :workspace-dir workspace-dir
-                             :gemini-dir gemini-dir
-                             :etc-dir etc-dir
-                             :resolv-conf-path resolv-conf
-                             :nsswitch-conf-path nsswitch-conf
-                             :hosts-path hosts-path
-                             :dns-server dns-srv
-                             :agy-session-atom (atom nil))))
+                      (let [light-id (light-shell/load-or-create-light-identity! data-dir)
+                            pub-hex (:pubkey-hex light-id)
+                            address (str "ech1" (subs pub-hex (max 0 (- (count pub-hex) 32))))
+                            dns-srv (sandbox/start-dns-allowlist-server!
+                                     (:dns-allow-list ncfg)
+                                     default-dns-records)
+                            eff-bal (long (get effective-balances nid 0))
+                            expanded-hosts (expand-allowlist-hosts (:dns-allow-list ncfg))
+                            host-lines (map (fn [h]
+                                              (str (sandbox/resolve-domain-ip h default-dns-records)
+                                                   " " h))
+                                            expanded-hosts)]
+                        (spit resolv-conf
+                              (str "# Generated by Bitecho D18 Sandbox for :" nid-str "\n"
+                                   "nameserver 0.0.0.0\n"
+                                   "options ndots:1 timeout:1 attempts:1\n"))
+                        (spit nsswitch-conf
+                              "hosts: files\nnetworks: files\n")
+                        (spit hosts-path
+                              (str "127.0.0.1 localhost\n"
+                                   "::1 localhost\n"
+                                   (str/join "\n" host-lines)
+                                   "\n"))
+                        (assoc ncfg
+                               :address address
+                               :pubkey-hex pub-hex
+                               :light-identity light-id
+                               :effective-balance eff-bal
+                               :min-echo-balance min-echo-balance
+                               :node-dir node-dir
+                               :workspace-dir workspace-dir
+                               :data-dir data-dir
+                               :bootstrap-path bootstrap-path
+                               :gemini-dir gemini-dir
+                               :etc-dir etc-dir
+                               :resolv-conf-path resolv-conf
+                               :nsswitch-conf-path nsswitch-conf
+                               :hosts-path hosts-path
+                               :dns-server dns-srv
+                               :halted-atom (atom (< eff-bal min-echo-balance))
+                               :halt-reason-atom (atom (when (< eff-bal min-echo-balance) :out-of-echos))
+                               :summary-atom (atom "")
+                               :agy-session-atom (atom nil)))))
                   (:nodes exp-cfg))
             siblings-map (into {}
                                (map (fn [n]
                                       [(:node-id n)
                                        {:node-id (:node-id n)
                                         :address (:address n)
+                                        :pubkey-hex (:pubkey-hex n)
                                         :parent-id (:parent-id n)}])
-                                    raw-nodes))]
-        (doseq [n raw-nodes]
-          (spit (io/file (:workspace-dir n) "siblings.edn") (pr-str siblings-map))
-          (write-json-map!
-           (io/file (:workspace-dir n) "siblings.json")
-           (into {} (map (fn [[k v]] [(name k) (:address v)]) siblings-map)))
-          (node-tool/write-node-cli-and-skill-files! n siblings-map min-echo-balance))
+                                    raw-nodes))
+            petnames-map (into {}
+                               (map (fn [[k v]]
+                                      [(name k) (:pubkey-hex v)])
+                                    siblings-map))
+            initialized-nodes
+            (mapv (fn [n]
+                    (let [eff-bal (:effective-balance n)
+                          funding-tx-id (when live-network?
+                                          (maybe-fund-node-from-live-daemon! fund-from-dir (:pubkey-hex n) eff-bal))
+                          init-st (-> (light-core/init-light-state
+                                       (:light-identity n)
+                                       {:bootstrap bootstrap
+                                        :autonomous? true
+                                        :economy-enabled? true
+                                        :burn-floor 100})
+                                      (assoc :petnames petnames-map
+                                             :home-set [:node1]
+                                             :credited-tx-ids (set (keep identity [funding-tx-id]))
+                                             :account {:balance eff-bal
+                                                       :spendable eff-bal
+                                                       :seq 0
+                                                       :deps []}))
+                          state-file (io/file (:data-dir n) "state.fressian")
+                          _ (light-shell/save-light-state! state-file init-st)
+                          daemon (light-shell/run-serve!
+                                  {:state-dir (:data-dir n)
+                                   :bootstrap bootstrap-path
+                                   :control-port 0
+                                   :autonomous? true
+                                   :auto-sync? false
+                                   :events-out (str (io/file (:node-dir n) "light-node-events.jsonl"))
+                                   :embedded? true})]
+                      (spit (io/file (:workspace-dir n) "siblings.edn") (pr-str siblings-map))
+                      (write-json-map!
+                       (io/file (:workspace-dir n) "siblings.json")
+                       petnames-map)
+                      (node-tool/write-node-cli-and-skill-files! n siblings-map min-echo-balance)
+                      (assoc n
+                             :daemon daemon
+                             :state-atom (:state-atom daemon)
+                             :conn-atom (:conn-atom daemon)
+                             :control-server (:control-server daemon))))
+                  raw-nodes)
+            _ (when live-network?
+                (let [deadline (+ (System/currentTimeMillis) 6000)]
+                  (loop []
+                    (when (and (< (System/currentTimeMillis) deadline)
+                               (not-every? #(= :connected (:phase @(:conn-atom %))) initialized-nodes))
+                      (Thread/sleep 100)
+                      (recur)))))
+            nodes-map (into {} (map (juxt :node-id identity) initialized-nodes))]
         {:experiment-id exp-id
          :experiment-dir exp-dir
          :nodes-root-dir nodes-root
-         :shared-bus-dir shared-bus
+         :bootstrap-path bootstrap-path
          :min-echo-balance min-echo-balance
          :max-turns max-turns
          :initial-supply (:initial-supply validation)
          :effective-balances effective-balances
          :node-order node-order
-         :nodes (into {} (map (juxt :node-id identity) raw-nodes))}))))
+         :nodes nodes-map}))))
 
 (defn exec-in-node-sandbox!
   "Executes `inner-cmd-vec` inside the node's `bwrap` sandbox and returns
@@ -223,11 +277,57 @@
      (sandbox/run-command-vec! bwrap-cmd opts))))
 
 (defn read-node-local-state
-  "Reads `<node-workspace>/node-state.edn` and returns the parsed Clojure map."
+  "Queries the node's real Bitecho light-node daemon via `/ctl` (`status`) and checks
+   `<workspace>/SUMMARY.md` to determine the node's live spendable balance and halt status."
   [node-ctx]
-  (let [f (io/file (:workspace-dir node-ctx) "node-state.edn")]
-    (when (.exists f)
-      (edn/read-string (slurp f)))))
+  (let [daemon (:daemon node-ctx)
+        port (:port daemon)
+        token (:token daemon)
+        status-resp (when (and port token)
+                      (try
+                        (light-shell/post-control-request! port token {"argv" ["status"]} 5000)
+                        (catch Exception _ nil)))
+        live-st (when-let [sa (:state-atom node-ctx)] @sa)
+        spendable (long (or (when (and (map? status-resp) (get status-resp "ok"))
+                              (or (get status-resp "spendable") (get status-resp "balance")))
+                            (get-in live-st [:account :spendable])
+                            (get-in live-st [:account :balance])
+                            (:effective-balance node-ctx)
+                            0))
+        seq-val (long (or (when (and (map? status-resp) (get status-resp "ok"))
+                            (get-in status-resp ["account" "seq"]))
+                          (get-in live-st [:account :seq])
+                          0))
+        min-bal (long (or (:min-echo-balance node-ctx) 100))
+        summary-file (io/file (:workspace-dir node-ctx) "SUMMARY.md")
+        file-summary (when (.exists summary-file)
+                       (str/trim (slurp summary-file)))
+        out-of-echos? (< spendable min-bal)
+        accomplished? (and (not out-of-echos?) (some? file-summary) (not (str/blank? file-summary)))
+        halted? (or out-of-echos? accomplished? (boolean @(:halted-atom node-ctx)))
+        halt-reason (cond
+                      out-of-echos? :out-of-echos
+                      accomplished? :accomplished-goal
+                      :else @(:halt-reason-atom node-ctx))
+        summary (or (when (and file-summary (not (str/blank? file-summary))) file-summary)
+                    @(:summary-atom node-ctx)
+                    "")]
+    (when out-of-echos?
+      (reset! (:halted-atom node-ctx) true)
+      (reset! (:halt-reason-atom node-ctx) :out-of-echos))
+    (when accomplished?
+      (reset! (:halted-atom node-ctx) true)
+      (reset! (:halt-reason-atom node-ctx) :accomplished-goal)
+      (reset! (:summary-atom node-ctx) summary))
+    {:node-id (:node-id node-ctx)
+     :address (:address node-ctx)
+     :pubkey-hex (:pubkey-hex node-ctx)
+     :balance spendable
+     :min-echo-balance min-bal
+     :seq seq-val
+     :halted? halted?
+     :halt-reason halt-reason
+     :summary summary}))
 
 ;; =============================================================================
 ;; 2. Long-Lived `stream-json` `agy` Session Lifecycle (`INV-D17-2`, `INV-D17-3`)
@@ -259,10 +359,14 @@
         (catch Exception _ nil)))))
 
 (defn shutdown-experiment!
-  "Stops all per-node long-lived `agy` sessions and UDP DNS allowlist servers in `exp-ctx`."
+  "Stops all per-node long-lived `agy` sessions, real light-node daemons,
+   and UDP DNS allowlist servers in `exp-ctx`."
   [exp-ctx]
   (doseq [[_ node-ctx] (:nodes exp-ctx)]
     (stop-node-agy-session! node-ctx)
+    (when-let [daemon (:daemon node-ctx)]
+      (when-let [stop-fn (:stop! daemon)]
+        (try (stop-fn) (catch Exception _ nil))))
     (when-let [srv (:dns-server node-ctx)]
       (sandbox/stop-dns-allowlist-server! srv))))
 
@@ -322,20 +426,21 @@
           sess)))))
 
 (defn- build-turn-prompt
-  [exp-ctx node-ctx turn-idx st-before]
+  [_exp-ctx node-ctx turn-idx st-before]
   (if (zero? (long turn-idx))
     (:initial-prompt node-ctx)
     (let [nid-str (name (:node-id node-ctx))
-          inbox-file (io/file (:shared-bus-dir exp-ctx) "inboxes" (str nid-str ".jsonl"))
-          caps-file (io/file (:shared-bus-dir exp-ctx) "capabilities.jsonl")
-          inbox-str (if (.exists inbox-file) (str/trim (slurp inbox-file)) "none")
-          caps-str (if (.exists caps-file) (str/trim (slurp caps-file)) "none")
+          live-st (when-let [sa (:state-atom node-ctx)] @sa)
+          inbox-items (vec (concat (:inbox live-st) (:broadcast-inbox live-st)))
+          caps-res (when live-st
+                     (:response (light-core/handle-command live-st {"cmd" "capability-list"} nil)))
+          caps-items (get caps-res "capabilities" [])
           followup (or (:followup-prompt node-ctx)
-                       "Complete any remaining orders/deliveries or run `bitecho-node halt accomplished-goal \"...\"` if finished.")]
+                       "Check your inbox (`clojure -M:light-node inbox`), complete any remaining orders/deliveries, or write `SUMMARY.md` in your workspace if finished.")]
       (str "Turn " (inc turn-idx) " Situational Update for :" nid-str "\n"
            "- Current Node State: " (pr-str st-before) "\n"
-           "- Recent Inbox Messages (`p2p-inbox`): " (if (str/blank? inbox-str) "none" inbox-str) "\n"
-           "- Advertised Marketplace Capabilities (`capability-list`): " (if (str/blank? caps-str) "none" caps-str) "\n\n"
+           "- Unread Inbox & Broadcast Items (`clojure -M:light-node inbox`): " (pr-str inbox-items) "\n"
+           "- Advertised Marketplace Capabilities (`clojure -M:light-node capability-list`): " (pr-str caps-items) "\n\n"
            "Instructions for this turn:\n"
            followup))))
 
@@ -343,8 +448,6 @@
   "Sends one NDJSON user turn to the node's long-lived `stream-json` `agy` process
    and waits until its `{\"event\":\"result\",...}` frame is emitted (`INV-D17-2`, `INV-D17-3`)."
   [exp-ctx node-ctx turn-idx]
-  ;; Sync incoming transfers or capability-order payments before reading state (`A-D17-2`)
-  (exec-in-node-sandbox! exp-ctx node-ctx ["bitecho-node" "status"] {:timeout-ms 5000})
   (let [st-before (read-node-local-state node-ctx)]
     (if (:halted? st-before)
       (do
@@ -400,8 +503,6 @@
                              :subagents next-subs
                              :result-line line}
                             (recur next-tools next-subs line))))))))
-              ;; Sync state after turn completes
-              _ (exec-in-node-sandbox! exp-ctx node-ctx ["bitecho-node" "status"] {:timeout-ms 5000})
               st-after (read-node-local-state node-ctx)]
           (when (or (:halted? st-after) (:timed-out? turn-res) (:eof? turn-res))
             (stop-node-agy-session! node-ctx))
@@ -444,9 +545,10 @@
    preflight mode or live long-lived `stream-json` `agy` mode), writing `experiment.jsonl`,
    `agy-events.jsonl`, `summary.edn`, and `report.md`."
   [config-or-path & [{:keys [dry-run?] :or {dry-run? false}}]]
-  (let [exp-cfg (if (string? config-or-path)
+  (let [raw-cfg (if (string? config-or-path)
                   (edn/read-string (slurp config-or-path))
                   config-or-path)
+        exp-cfg (assoc raw-cfg :dry-run? dry-run?)
         exp-ctx (provision-experiment! exp-cfg)]
     (try
       ;; 1. Verify sandbox & DNS isolation preflight for every node (`INV-D16-2`, `INV-D16-3`)
@@ -478,20 +580,23 @@
             (let [nctx (get-in exp-ctx [:nodes nid])
                   st (read-node-local-state nctx)]
               (when-not (:halted? st)
-                (exec-in-node-sandbox!
-                 exp-ctx nctx
-                 ["bitecho-node" "halt" "max-turns-exceeded" "Reached max-turns limit"])))))
+                (reset! (:halted-atom nctx) true)
+                (reset! (:halt-reason-atom nctx) :max-turns-exceeded)
+                (reset! (:summary-atom nctx) "Reached max-turns limit")))))
         (let [final-states (into {}
                                  (map (fn [nid]
                                         (let [nctx (get-in exp-ctx [:nodes nid])]
-                                          (exec-in-node-sandbox! exp-ctx nctx ["bitecho-node" "status"])
                                           [nid (read-node-local-state nctx)]))
                                       (:node-order exp-ctx)))
-              bus-events-file (io/file (:shared-bus-dir exp-ctx) "events.jsonl")
               exp-jsonl-file (io/file (:experiment-dir exp-ctx) "experiment.jsonl")
-              events-content (if (.exists bus-events-file)
-                               (slurp bus-events-file)
-                               "")
+              events-content (str/join
+                              ""
+                              (keep (fn [nid]
+                                      (let [nctx (get-in exp-ctx [:nodes nid])
+                                            ev-f (io/file (:node-dir nctx) "light-node-events.jsonl")]
+                                        (when (.exists ev-f)
+                                          (slurp ev-f))))
+                                    (:node-order exp-ctx)))
               summary {:experiment-id (:experiment-id exp-ctx)
                        :experiment-dir (:experiment-dir exp-ctx)
                        :initial-supply (:initial-supply exp-ctx)
@@ -516,4 +621,5 @@
     (println (str "Experiment completed: " (:experiment-id res)
                   " -> " (:experiment-dir res) "/report.md"))
     (flush)
-    (shutdown-agents)))
+    (shutdown-agents)
+    (System/exit 0)))

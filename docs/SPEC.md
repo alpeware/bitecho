@@ -169,7 +169,7 @@ When running in daemon mode (`serve`), light nodes expose a local loopback-only 
 - **Lifecycle:** On graceful shutdown or signal termination (SIGINT, SIGTERM), the socket is closed and `<state-dir>/control.json` is atomically unlinked.
 
 ### 3.2 Command Dispatch (`POST /ctl`)
-Any valid light-node command map may be sent to `/ctl`:
+Any valid light-node command map or raw CLI `argv` array may be sent to `/ctl`:
 ```json
 {
   "cmd": "send",
@@ -177,6 +177,13 @@ Any valid light-node command map may be sent to `/ctl`:
   "text": "Hello, world!"
 }
 ```
+or:
+```json
+{
+  "argv": ["broadcast", "--subnet-id", "homebrew-cafe", "--text", "Hello subnet!", "--burn", "100"]
+}
+```
+When `<state-dir>/control.json` exists and is reachable, one-shot `clojure -M:light-node <verb> ...` invocations automatically delegate execution to the running `serve` daemon over `POST /ctl` to preserve Single-Authority Shell Lifecycle State (`Rule 4`). Gossip-emitting commands (`broadcast`, `storage-put`, `capability-publish`) accept `--burn <ech>` to attach anti-spam burn fees and route across all validators via outer `:subnet-id "*"`, while `inbox` accepts `--subnet-id <id>` to filter and drain both direct messages and subnet broadcasts.
 
 ### 3.3 Event Notification Long-Polling (`cmd: "wait"`)
 The `wait` command provides zero-latency notification of asynchronous network events:

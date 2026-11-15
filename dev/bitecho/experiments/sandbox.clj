@@ -287,7 +287,7 @@
    - Mounts host `/` read-only (`--ro-bind / /`)
    - Unshares PID, IPC, and UTS namespaces and binds `--die-with-parent`
    - Masks `/tmp`, `/run/systemd/resolve`, `~/.cache`, `~/.ssh`, and repo `.ssh` with fresh `--tmpfs`
-   - Masks `<nodes-root-dir>` with `--tmpfs` and binds only this node's directory and `<shared-bus-dir>`
+   - Masks `<nodes-root-dir>` with `--tmpfs` and binds only this node's directory
    - Binds per-node `.gemini/antigravity-cli` state directory while read-only binding host OAuth token
    - Read-only binds per-node `/etc/resolv.conf`, `/etc/nsswitch.conf`, and `/etc/hosts`"
   [exp-ctx node-ctx inner-cmd-vec]
@@ -295,9 +295,10 @@
         repo-ssh "/home/simonpure/src/alpeware/bitecho/.ssh"
         host-oauth (io/file user-home ".gemini/antigravity-cli/antigravity-oauth-token")
         nodes-root (:nodes-root-dir exp-ctx)
-        shared-bus (:shared-bus-dir exp-ctx)
         node-dir (:node-dir node-ctx)
         workspace-dir (:workspace-dir node-ctx)
+        state-dir (or (:state-dir node-ctx) (str workspace-dir "/data"))
+        bootstrap (or (:bootstrap exp-ctx) "https://bitecho.org/devnet/bootstrap.txt")
         gemini-dir (:gemini-dir node-ctx)
         resolv-conf (:resolv-conf-path node-ctx)
         nsswitch-conf (:nsswitch-conf-path node-ctx)
@@ -318,7 +319,6 @@
                    "--tmpfs" repo-ssh
                    "--tmpfs" nodes-root
                    "--bind" node-dir node-dir
-                   "--bind" shared-bus shared-bus
                    "--bind" gemini-dir (str user-home "/.gemini/antigravity-cli")]
         oauth-args (if (.exists host-oauth)
                      ["--ro-bind" (.getAbsolutePath host-oauth) (.getAbsolutePath host-oauth)]
@@ -329,7 +329,8 @@
                   "--setenv" "PATH" (str workspace-dir "/bin:" user-home "/.local/bin:/usr/local/bin:/usr/bin:/bin")
                   "--setenv" "BITECHO_NODE_ID" (name (:node-id node-ctx))
                   "--setenv" "BITECHO_NODE_WORKSPACE" workspace-dir
-                  "--setenv" "BITECHO_EXPERIMENT_BUS" shared-bus
+                  "--setenv" "BITECHO_STATE_DIR" state-dir
+                  "--setenv" "BITECHO_BOOTSTRAP" (str bootstrap)
                   "--setenv" "BITECHO_DNS_PORT" (str (get-in node-ctx [:dns-server :port] 0))
                   "--chdir" workspace-dir
                   "--"]]

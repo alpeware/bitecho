@@ -297,10 +297,10 @@ Encrypts and dispatches a sealed message (from UTF-8 text or raw hex bytes) over
 ---
 
 ### `inbox`
-Retrieves and drains all decrypted inbound messages from local memory, along with any pending offers.
+Retrieves and drains all decrypted inbound messages and subnet broadcasts from local memory (optionally filtered by `--subnet-id`), along with any pending offers.
 
-- **CLI**: `clojure -M:light-node inbox`
-- **JSONL**: `{"cmd": "inbox"}`
+- **CLI**: `clojure -M:light-node inbox [--subnet-id <id>]`
+- **JSONL**: `{"cmd": "inbox", "subnet_id": "homebrew-cafe"}`
 - **Response**:
   ```json
   {
@@ -312,6 +312,17 @@ Retrieves and drains all decrypted inbound messages from local memory, along wit
         "seq": 1,
         "text": "Hello peer",
         "payload_hex": "<hex>"
+      }
+    ],
+    "broadcasts": [
+      {
+        "from": "<sender-pubkey-hex>",
+        "seq": 1,
+        "msg_id": "<sha256-hex>",
+        "text": "Hello subnet",
+        "subnet_id": "homebrew-cafe",
+        "epoch": 10,
+        "broadcast": true
       }
     ],
     "pending_offers": []
@@ -871,10 +882,10 @@ Sets or notifies the transport connectivity status of a direct P2P session per R
 ---
 
 ### `broadcast`
-Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across an authenticated mesh subnet (default `"chat/simon-nexus-axiom"`), attaching the sender's Delegated Agent Certificate (DAC) and deduplicating via `msg_id = SHA-256("bitecho-broadcast-id-v1|" || subnet_id || "|" || sender_pubkey_hex || "|" || seq || "|" || text)`. Peers with multiple open P2P channels automatically hub-relay (`:p2p-hub-relay`) to bridged peers.
+Signs and dispatches a multi-peer broadcast message across an authenticated mesh subnet (default `"global"`), optionally attaching a `--burn <ech>` fee (e.g., `--burn 100` to satisfy the validator gossip anti-spam burn floor across the public mesh, or `0 ECH` when attaching a Delegated Agent Certificate (DAC) or routing over direct P2P channels) and deduplicating via `msg_id = SHA-256("bitecho-broadcast-id-v1|" || subnet_id || "|" || sender_pubkey_hex || "|" || seq || "|" || text)`. Peers with multiple open P2P channels automatically hub-relay (`:p2p-hub-relay`) to bridged peers.
 
-- **CLI**: `clojure -M:light-node broadcast --text "Hello Simon, Nexus, and Axiom" [--subnet-id chat/simon-nexus-axiom]`
-- **JSONL**: `{"cmd": "broadcast", "text": "Hello Simon, Nexus, and Axiom", "subnet_id": "chat/simon-nexus-axiom"}`
+- **CLI**: `clojure -M:light-node broadcast --text "Hello Simon, Nexus, and Axiom" [--subnet-id chat/simon-nexus-axiom] [--burn 100]`
+- **JSONL**: `{"cmd": "broadcast", "text": "Hello Simon, Nexus, and Axiom", "subnet_id": "chat/simon-nexus-axiom", "burn": 100}`
 - **Response**:
   ```json
   {
@@ -882,8 +893,8 @@ Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across a
     "subnet_id": "chat/simon-nexus-axiom",
     "seq": 1,
     "msg_id": "<sha256-hex>",
-    "burn": 0,
-    "zero_burn": true,
+    "burn": 100,
+    "zero_burn": false,
     "p2p": true
   }
   ```
@@ -891,10 +902,10 @@ Signs and dispatches a zero-burn (`0 ECH`) multi-peer broadcast message across a
 ---
 
 ### `storage-put`
-Encrypts arbitrary UTF-8 (`--data`) or hex (`--data-hex`) state with a domain-separated XSalsa20-Poly1305 key derived from the node's seed and `--slot-id` (`SHA-256("bitecho-e2ee-storage-v1:" || seed || ":" || slot-id)`), wraps the ciphertext in a content-addressed `Blob` + signed monotonic `Pointer`, stores it locally, and broadcasts a `:storage-replicate` envelope to the network. See [`docs/STORAGE.md`](../docs/STORAGE.md).
+Encrypts arbitrary UTF-8 (`--data`) or hex (`--data-hex`) state with a domain-separated XSalsa20-Poly1305 key derived from the node's seed and `--slot-id` (`SHA-256("bitecho-e2ee-storage-v1:" || seed || ":" || slot-id)`), wraps the ciphertext in a content-addressed `Blob` + signed monotonic `Pointer`, stores it locally, and broadcasts a `:storage-replicate` gossip envelope to the network (optionally burning `--burn <ech>` for validator mesh propagation). See [`docs/STORAGE.md`](../docs/STORAGE.md).
 
-- **CLI**: `clojure -M:light-node storage-put --slot-id browser-wallet --data '{"theme":"dark"}' [--subnet-id global] [--seq <n>]`
-- **JSONL**: `{"cmd": "storage-put", "slot_id": "browser-wallet", "data": "{\"theme\":\"dark\"}", "subnet_id": "global"}`
+- **CLI**: `clojure -M:light-node storage-put --slot-id browser-wallet --data '{"theme":"dark"}' [--subnet-id global] [--seq <n>] [--burn 100]`
+- **JSONL**: `{"cmd": "storage-put", "slot_id": "browser-wallet", "data": "{\"theme\":\"dark\"}", "subnet_id": "global", "burn": 100}`
 - **Response**:
   ```json
   {
@@ -957,10 +968,10 @@ Lists all local and network-replicated E2EE storage slots and pointer versions (
 ---
 
 ### `capability-publish`
-Packs and signs a Fractal Capability Descriptor (`:storage/blob-pinning`, `:compute/uop-kernel`, `:compute/gpu-access`, `:model/weights`, `:network/turn-relay`, or `:network/gateway`) as a content-addressed `Blob` + signed `Pointer`, stores it locally, and broadcasts a `:capability-replicate` envelope to the network. See [`docs/CAPABILITIES.md`](../docs/CAPABILITIES.md).
+Packs and signs a Fractal Capability Descriptor (`:storage/blob-pinning`, `:compute/uop-kernel`, `:compute/gpu-access`, `:model/weights`, `:network/turn-relay`, or `:network/gateway`) as a content-addressed `Blob` + signed `Pointer`, stores it locally, and broadcasts a `:capability-replicate` gossip envelope to the network (optionally burning `--burn <ech>` for validator mesh propagation). See [`docs/CAPABILITIES.md`](../docs/CAPABILITIES.md).
 
-- **CLI**: `clojure -M:light-node capability-publish --capability-id uop-matmul-fp16 --capability-type compute/uop-kernel --price 25 [--burn-floor 5] [--subnet-id global] [--target-cid <64-hex>] [--metadata '{"shape":[4096,4096]}']`
-- **JSONL**: `{"cmd": "capability-publish", "capability_id": "uop-matmul-fp16", "capability_type": "compute/uop-kernel", "price_echo": 25, "burn_floor": 5, "subnet_id": "global", "metadata": {"shape": [4096, 4096]}}`
+- **CLI**: `clojure -M:light-node capability-publish --capability-id uop-matmul-fp16 --capability-type compute/uop-kernel --price 25 [--burn-floor 5] [--burn 100] [--subnet-id global] [--target-cid <64-hex>] [--metadata '{"shape":[4096,4096]}']`
+- **JSONL**: `{"cmd": "capability-publish", "capability_id": "uop-matmul-fp16", "capability_type": "compute/uop-kernel", "price_echo": 25, "burn_floor": 5, "burn": 100, "subnet_id": "global", "metadata": {"shape": [4096, 4096]}}`
 - **Response**:
   ```json
   {
