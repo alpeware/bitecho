@@ -183,24 +183,26 @@
             blob (data/make-blob canonical-bytes "application/vnd.bitecho.bip+fressian")
             put-res (data/put-blob (:blob-store state) blob)
             cid (:cid put-res)
+            sub-id (str (or (:subnet-id bip) dev-subnet-id))
             path (str "bip/" bip-id)
-            prev-ptr (get-in state [:pointers [dev-subnet-id path]])
+            prev-ptr (get-in state [:pointers [sub-id path]])
             next-seq (inc (long (:pointer/seq prev-ptr 0)))
             ptr (data/sign-pointer
                  author-privkey
                  {:pointer/authority (:author-pubkey bip)
-                  :pointer/subnet dev-subnet-id
+                  :pointer/subnet sub-id
                   :pointer/path path
                   :pointer/seq next-seq
                   :pointer/target cid
                   :pointer/proof {:proof/type :self}})
             bip-record (assoc bip
+                              :subnet-id sub-id
                               :cid cid
                               :pointer ptr
                               :status :under-review)
             st' (-> state
                     (assoc :blob-store (:store put-res))
-                    (assoc-in [:pointers [dev-subnet-id path]] ptr)
+                    (assoc-in [:pointers [sub-id path]] ptr)
                     (assoc-in [:bips bip-id] bip-record))]
         {:ok? true
          :bip-id bip-id

@@ -175,11 +175,15 @@
 (defn run-tokenomics-horizon-sim
   "Runs the 30,000-epoch tokenomics horizon simulation for `regime` (`:low`, `:medium`, or `:high`).
    Options:
-   - `:epochs` (default `30000`, crossing `26,280` 3-year Bootstrap custody sunset)."
+   - `:epochs` (default `30000`, crossing `26,280` 3-year Bootstrap custody sunset)
+   - `:theta` (optional policy parameter map overrides `A-D21-2`, `A-CARB-D21-3`)
+   - `:verify-signatures?` (default `true`)."
   ([regime]
    (run-tokenomics-horizon-sim regime {:epochs 30000}))
-  ([regime {:keys [epochs] :or {epochs 30000}}]
-   (let [{:keys [keys state]} (build-initial-tokenomics-state)
+  ([regime {:keys [epochs theta verify-signatures?]
+            :or {epochs 30000
+                 verify-signatures? true}}]
+   (let [{:keys [keys state]} (build-initial-tokenomics-state theta)
          bootstrap-hex (get-in keys [:bootstrap :hex])
          partners-kp (:partners keys)
          team-kp (:team keys)
@@ -190,7 +194,10 @@
                           :medium 50000
                           :high 2000000
                           10000)
-         sunset-ep treasury/default-bootstrap-sunset-epoch]
+         sunset-ep (long (or (:bootstrap-sunset-epoch theta)
+                             treasury/default-bootstrap-sunset-epoch))
+         expected-bound (+ (max 256 (long (or (:treasury-trailing-epochs theta) 168))) 4)
+         step-opts (assoc (or theta {}) :verify-signatures? verify-signatures?)]
      (loop [ep 1
             curr-st state
             cumulative-burns 0
@@ -225,6 +232,7 @@
                pruned-replay-rejected? (= (:total-minted curr-st) (:total-minted st-after-replay))
                ledger-sum (reduce + 0 (map :balance (vals (:ledger curr-st))))]
            {:regime regime
+            :theta (or theta (:policy curr-st))
             :epochs-simulated epochs
             :burn-per-epoch burn-per-epoch
             :cumulative-burns cumulative-burns
@@ -245,14 +253,14 @@
             :conservation-ok? conservation-ok?
             :pruned-replay-rejected? pruned-replay-rejected?
             :max-retained-epoch-entries max-map-size
-            :bounded-state-ok? (<= max-map-size 260)})
+            :bounded-state-ok? (<= max-map-size expected-bound)})
          (let [;; Draw down 500,000 ECHO every 500 epochs prior to sunset, and attempt drawdown at sunset+1
                allocs (when (or (and (< ep sunset-ep) (zero? (mod ep 500)))
                                 (= ep (inc sunset-ep)))
                         [{:receiver recipient-hex :amount 500000}])
                pre-bal (when (= ep sunset-ep)
                          (get-in curr-st [:ledger bootstrap-hex :balance]))
-               {:keys [state treasury-res]} (step-tokenomics-epoch curr-st ep burn-per-epoch allocs)
+               {:keys [state treasury-res]} (step-tokenomics-epoch curr-st ep burn-per-epoch allocs step-opts)
                post-bal (when (= ep sunset-ep)
                           (get-in state [:ledger bootstrap-hex :balance]))
                post-cmds (when (= ep (inc sunset-ep))

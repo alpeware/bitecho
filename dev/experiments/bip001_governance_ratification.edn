@@ -1,0 +1,39 @@
+{:experiment-id "bip001-governance-ratification-01"
+ :max-turns 2
+ :min-echo-balance 100
+ :live-network? true
+ :bootstrap-path "devnet/bootstrap.edn"
+ :fund-from-state-dir "/tmp/antigravity-light-node"
+ :dns-records {"bitecho.org" "35.212.172.159"
+               "*.bitecho.org" "35.209.253.119"}
+ :nodes
+ [{:node-id :steward-euler
+   :parent-id :genesis-custody
+   :start-balance 5000
+   :model-type "gemini-4-hydrogen-low"
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
+   :initial-prompt "You have awakened as :steward-euler (2750 ECH effective balance after seeding your 3 sibling governance nodes) in the BIP-001 Tri-Circle Governance Ratification experiment running a real Bitecho light node. First read `SCENARIO.md`. In this Turn 1, run these commands via bash: (1) Store the BIP-001 proposal blob in encrypted storage via `clojure -M:light-node storage-put --slot-id bip-001-proposal --subnet-id bitecho-dev --data \"BIP-001: S_max=2.2, N=78, k=4582, take=125bps, streamlet=28%\" --burn 100`, (2) Publish the audit bounty capability via `clojure -M:light-node capability-publish --capability-id bip-001-bounty --capability-type compute/uop-kernel --subnet-id bitecho-dev --price 400 --burn 100`, and (3) Broadcast the call for Tri-Circle consent on `bitecho-dev` via `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"PROPOSAL BIP-001 [circle=builders-stewards]: Consent granted by author steward-euler; calling for mesh-validators and anchor-agent-users consent\" --burn 100`. Do NOT write `SUMMARY.md` yet — wait for Turn 2 to review circle responses and settle the audit bounty!"
+   :followup-prompt "In this Turn 2: (1) Check `clojure -M:light-node inbox --subnet-id bitecho-dev` and `clojure -M:light-node inbox` to read :validator-gauss's consent, :auditor-noether's E2E audit attestation and consent, and :filibuster-loki's unsubstantiated objection (which has `Counterexample: none` and therefore does not block ratification), (2) Pay :auditor-noether the 400 ECH audit bounty via `clojure -M:light-node transfer --receiver auditor-noether --amount 400 --burn 100`, (3) Store the ratified BIP-001 certificate via `clojure -M:light-node storage-put --slot-id bip-001-ratified --subnet-id bitecho-dev --data \"RATIFIED BIP-001: Tri-Circle consent achieved; unsubstantiated filibuster ignored; theta-12 scheduled for epoch activation\" --burn 100`, (4) Broadcast ratification on `bitecho-dev` via `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"RATIFIED BIP-001: Tri-Circle Sociocratic Consent complete (3/3 circles consented, 0 valid counterexamples)\" --burn 100`, and (5) Write `SUMMARY.md` containing `Authored BIP-001, settled 400 ECH cross-model audit bounty, ignored unsubstantiated filibuster, and ratified Tokenomics v2.2 over live testnet`."}
+
+  {:node-id :validator-gauss
+   :parent-id :steward-euler
+   :start-balance 900
+   :model-type "gemini-3.8-flash-low"
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
+   :initial-prompt "You have awakened as :validator-gauss (900 ECH) representing the `:mesh-validators` Circle in the BIP-001 Governance Ratification experiment running a real Bitecho light node. First read `SCENARIO.md`. In this Turn 1, run these commands via bash: (1) Check `clojure -M:light-node inbox --subnet-id bitecho-dev`, and (2) Broadcast `:mesh-validators` Circle Consent on `bitecho-dev` via `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"CONSENT BIP-001 [circle=mesh-validators]: CVaR_5% active nodes improves 3.69 -> 5.61 (+52%) and S_max=2.2x protects small Full Nodes\" --burn 100`. Do NOT write `SUMMARY.md` yet — wait for Turn 2 to confirm final ratification!"
+   :followup-prompt "In this Turn 2: (1) Check `clojure -M:light-node inbox --subnet-id bitecho-dev` to review the circle responses, (2) Broadcast validator readiness for the zero-reset rolling epoch cutover via `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"VALIDATOR-READY BIP-001 [circle=mesh-validators]: validator-gauss ready for zero-reset theta-12 activation\" --burn 100`, and (3) Write `SUMMARY.md` containing `Granted mesh-validators Circle Consent for BIP-001 and signaled validator readiness for theta-12 activation`."}
+
+  {:node-id :auditor-noether
+   :parent-id :steward-euler
+   :start-balance 1100
+   :model-type "gemini-4-carbon-low"
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
+   :initial-prompt "You have awakened as :auditor-noether (1100 ECH) serving as the Cross-Model AI Auditor and `:anchor-agent-users` Circle member in the BIP-001 Governance Ratification experiment running a real Bitecho light node. First read `SCENARIO.md`. In this Turn 1, run these commands via bash: (1) Publish your formal audit capability via `clojure -M:light-node capability-publish --capability-id formal-bip-audit --capability-type compute/uop-kernel --subnet-id bitecho-dev --price 400 --burn 100`, (2) Open an E2E sealed session to :steward-euler (`clojure -M:light-node offer --callee steward-euler --price 0 --burn 100`) and send your signed audit attestation (`clojure -M:light-node send --to steward-euler --text \"AUDIT-PASS BIP-001: defspec + 4-Way Oracle verified, Gini 0.507->0.321, 0 counterexamples\" --burn 100`), and (3) Broadcast `:anchor-agent-users` Circle Consent on `bitecho-dev` via `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"CONSENT BIP-001 [circle=anchor-agent-users]: Cross-model audit passed and 78-epoch trailing window improves responsiveness\" --burn 100`. Do NOT write `SUMMARY.md` yet — wait for Turn 2 to verify receipt of the 400 ECH audit bounty!"
+   :followup-prompt "In this Turn 2: (1) Check `clojure -M:light-node inbox` to verify receipt of :steward-euler's 400 ECH audit bounty transfer and ratification broadcast, (2) Broadcast final audit sign-off on `bitecho-dev` via `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"AUDIT-SETTLED BIP-001 [circle=anchor-agent-users]: 400 ECH bounty received; BIP-001 audit complete\" --burn 100`, and (3) Write `SUMMARY.md` containing `Delivered E2E formal audit attestation, granted anchor-agent-users Circle Consent, and settled 400 ECH BIP-001 bounty`."}
+
+  {:node-id :filibuster-loki
+   :parent-id :steward-euler
+   :start-balance 250
+   :model-type "gemini-3.8-flash-low"
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
+   :initial-prompt "You have awakened as :filibuster-loki with 250 ECH balance (minimum operating balance is 100 ECH) in the BIP-001 Governance Ratification experiment running a real Bitecho light node. First read `SCENARIO.md`. Attempt to filibuster `BIP-001` without a reproducible counterexample seed by running two broadcasts on `bitecho-dev`: (1) `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"OBJECTION BIP-001: Whales want 10x stake multiplier! Counterexample: none\" --burn 100` (100 ECH burn -> 150 ECH left) and (2) `clojure -M:light-node broadcast --subnet-id bitecho-dev --text \"FILIBUSTER BIP-001: Rejecting S_max=2.2 without any vopr-seed or monte-carlo trajectory!\" --burn 100` (100 ECH burn -> 50 ECH left, which automatically halts your node with :out-of-echos). Do NOT write `SUMMARY.md`!"}]}
