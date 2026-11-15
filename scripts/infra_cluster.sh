@@ -811,30 +811,37 @@ EOF_GIT_INDEX
       echo "--> Running migrate-infra & rolling restart on ${node} (${ip})..."
       ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "bash -s" << 'REMOTE_PUBLISH_MIGRATE'
 set -euo pipefail
+sudo systemctl stop bitecho-infra.service || true
 sudo -u cljweb /opt/jdk-25/bin/java -Xms128m -Xmx512m \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
   --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
   -jar /opt/bitecho-infra/bitecho.jar migrate-infra /etc/bitecho-infra/config.edn
 sudo chown -R cljweb:cljweb /var/lib/clj-web
-sudo systemctl restart bitecho-infra.service
+sudo systemctl start bitecho-infra.service
 REMOTE_PUBLISH_MIGRATE
 
-      for _ in {1..20}; do
+      for _ in $(seq 1 60); do
         if curl -fsS --max-time 2 "http://${ip}:80/healthz" >/dev/null 2>&1; then
           break
         fi
-        sleep 1
+        sleep 2
       done
       verify_node_health "$node"
-      echo "--> Verifying SKILL.md and --trusted-dac-anchors on ${node} (${ip})..."
+      echo "--> Verifying SKILL.md and /devnet/bootstrap.txt on ${node} (${ip})..."
       local skill_content
-      skill_content="$(curl -fsS --max-time 5 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/SKILL.md")"
+      skill_content="$(curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/SKILL.md")"
       if ! echo "${skill_content}" | grep -q -- "--trusted-dac-anchors"; then
         echo "FATAL: ${node} SKILL.md missing --trusted-dac-anchors" >&2
         exit 1
       fi
-      echo "  [OK] ${node} verified --trusted-dac-anchors in SKILL.md"
+      local bootstrap_content
+      bootstrap_content="$(curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/devnet/bootstrap.txt")"
+      if ! echo "${bootstrap_content}" | grep -q "ns3"; then
+        echo "FATAL: ${node} /devnet/bootstrap.txt missing 6-validator ns1..ns3 entries" >&2
+        exit 1
+      fi
+      echo "  [OK] ${node} verified --trusted-dac-anchors in SKILL.md and 6-validator /devnet/bootstrap.txt"
     done
   else
     echo "  [INFO] Skipping live migrate-infra + service restart (pass --deploy or DEPLOY_LIVE=1 after deploy go-ahead)"
