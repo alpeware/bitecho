@@ -89,16 +89,19 @@
      (quot (* safe-r effective-k) 10000))))
 
 (defn split-mint
-  "Splits M_t into Streamlet (20%) and Mesh (80%) shares:
-     M_streamlet = (quot (* M_t 20) 100)
+  "Splits M_t into Streamlet (default 20%) and Mesh (default 80%) shares:
+     M_streamlet = (quot (* M_t streamlet-pct) 100)
      M_mesh = (- M_t M_streamlet)
    Conserves the exact total mint (M_streamlet + M_mesh == M_t) with zero loss."
-  [mint-amount]
-  (let [safe-m (max 0 (or mint-amount 0))
-        m-streamlet (quot (* safe-m streamlet-share-pct) 100)
-        m-mesh (- safe-m m-streamlet)]
-    {:streamlet m-streamlet
-     :mesh m-mesh}))
+  ([mint-amount]
+   (split-mint mint-amount streamlet-share-pct))
+  ([mint-amount streamlet-pct]
+   (let [safe-m (max 0 (or mint-amount 0))
+         eff-pct (min 100 (max 0 (long (or streamlet-pct streamlet-share-pct))))
+         m-streamlet (quot (* safe-m eff-pct) 100)
+         m-mesh (- safe-m m-streamlet)]
+     {:streamlet m-streamlet
+      :mesh m-mesh})))
 
 (defn distribute-shares
   "Distributes an integer total-amount across recipients.
@@ -265,7 +268,8 @@
         total-minted (or (:total-minted treasury-ctx) 0)
         cap-room (max 0 (- max-conditional-mint-supply total-minted))
         m-t (min (+ demand-gate carry-dust) cap-room)
-        split (split-mint m-t)
+        streamlet-pct (:streamlet-share-pct treasury-ctx streamlet-share-pct)
+        split (split-mint m-t streamlet-pct)
         m-streamlet (:streamlet split)
         m-mesh (:mesh split)
         active-validators (:validators treasury-ctx)
@@ -458,9 +462,10 @@
       state
 
       ;; 5. Cryptographic signature verification against allocations, binding mint-dust if present
-      (not (if has-dust?
-             (verify-mint-signature state-pub sig epoch allocations raw-dust)
-             (verify-mint-signature state-pub sig epoch allocations)))
+      (and (not (:skip-signature-verification? mint-ctx))
+           (not (if has-dust?
+                  (verify-mint-signature state-pub sig epoch allocations raw-dust)
+                  (verify-mint-signature state-pub sig epoch allocations))))
       state
 
       :else

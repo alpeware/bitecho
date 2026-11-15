@@ -4,9 +4,9 @@ This document is the authoritative architectural reference, verification report,
 
 ---
 
-## 1. Architecture of Bitecho's 5 Verification & Simulation Layers
+## 1. Architecture of Bitecho's 6 Verification & Simulation Layers
 
-Bitecho enforces **Strict Sans-IO Purity** (`Rule 2`), **Single-Authority Shell Lifecycle State** (`Rule 4`), and **Zero Silent Failures** (`Rule 5`) across five complementary verification layers:
+Bitecho enforces **Strict Sans-IO Purity** (`Rule 2`), **Single-Authority Shell Lifecycle State** (`Rule 4`), and **Zero Silent Failures** (`Rule 5`) across six complementary verification layers:
 
 ```mermaid
 flowchart TD
@@ -15,20 +15,25 @@ flowchart TD
     L3["Layer 3: 4-Environment Differential Parity Harnesses (Clean, Chaos/Byzantine, Wire-Boundary, Live GCP UDP :5010)"]
     L4["Layer 4: 30,000-Epoch Tokenomics Horizon & 10..1000-Node Topology / Jepsen / VOPR Simulators"]
     L5["Layer 5: Bubblewrap-Sandboxed Multi-Agent Headless agy Experiments (dev/bitecho/experiments/)"]
+    L6["Layer 6: Sans-IO Monte Carlo Optimizer & Tri-Circle Sociocratic Governance (monte_carlo.clj, governance/core.cljc)"]
 
     L1 --> L2
     L2 --> L3
     L2 --> L4
     L3 --> L5
+    L4 --> L6
+    L6 --> L3
+    L6 --> L5
 ```
 
 | Layer | Primary Namespaces / Scripts | Core Scope & Guarantees | CLI Command |
 | :--- | :--- | :--- | :--- |
-| **1. Sans-IO Unit & Generative Properties** | `test/bitecho/**/*_test.clj` | Deterministic unit tests and `clojure.test.check` `defspec` properties over Streamlet BFT, Basalt RPS, Contagion gossip, Sieve/Murmur, SCI Puzzle VM, Fressian codecs, and Shell state machines. | `clojure -M:test` |
+| **1. Sans-IO Unit & Generative Properties** | `test/bitecho/**/*_test.clj` | Deterministic unit tests and `clojure.test.check` `defspec` properties over Streamlet BFT, Basalt RPS, Contagion gossip, Sieve/Murmur, SCI Puzzle VM, Fressian codecs, Governance, and Shell state machines. | `clojure -M:test` |
 | **2. 6-Stage Fractal E2E Workload & Golden Oracle** | [`dev/bitecho/stress/e2e_workload.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/e2e_workload.clj) | 6-validator (`3` BFT + `3` mesh) + 8-light-node topology executing 6 protocol stages and verifying against the closed-form `compute-golden-expected-state` oracle. | `clojure -M:test -n bitecho.stress-e2e-test` |
 | **3. 4-Environment Differential Parity Harnesses** | [`dev/bitecho/stress/harness.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/harness.clj), [`dev/bitecho/stress/live_testnet.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/live_testnet.clj) | Runs the identical 6-stage workload across Clean Sans-IO, Chaos/Byzantine Shell, Fressian Wire-Boundary + Bounded State (`8,192` cap), and Live 6-Node GCP Testnet (`UDP :5010` WebRTC DataChannel). | `./scripts/cluster.sh stress-e2e` |
-| **4. Tokenomics Horizon & Topology / Nemesis Suites** | [`dev/bitecho/stress/tokenomics_sim.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/tokenomics_sim.clj), [`dev/simulator.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/simulator.clj), [`test/bitecho/vopr_test.clj`](file:///home/simonpure/src/alpeware/bitecho/test/bitecho/vopr_test.clj) | 30,000-epoch (~3.42-year) tokenomics horizon simulator across 4 demand regimes; 10..1000-node Basalt/Contagion simulator; Jepsen/VOPR nemesis partition & clock-skew suites. | `clojure -M:simulate -m bitecho.stress.tokenomics-sim` |
+| **4. Tokenomics Horizon & Topology / Nemesis Suites** | [`dev/bitecho/stress/tokenomics_sim.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/tokenomics_sim.clj), [`dev/simulator.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/simulator.clj), [`test/bitecho/vopr_test.clj`](file:///home/simonpure/src/alpeware/bitecho/test/bitecho/vopr_test.clj) | 30,000-epoch (~3.42-year) tokenomics horizon simulator across demand regimes; 10..1000-node Basalt/Contagion simulator; Jepsen/VOPR nemesis partition & clock-skew suites. | `clojure -M:simulate -m bitecho.stress.tokenomics-sim` |
 | **5. Bubblewrap-Sandboxed Multi-Agent `agy` Harness** | [`dev/bitecho/experiments/sandbox.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/sandbox.clj), [`dev/bitecho/experiments/node_tool.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/node_tool.clj), [`dev/bitecho/experiments/runner.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/experiments/runner.clj) | Spawns isolated headless `agy` AI agents inside `bwrap` filesystem/PID/IPC/UTS sandboxes with per-node real Bitecho light-node daemons (`light-shell/run-serve!`) connected to the live testnet, UDP DNS allowlist filtering, hierarchical ECH funding, and deterministic halts. | `clojure -M:simulate -m bitecho.experiments.runner dev/experiments/homebrew_cafe_civilization.edn` |
+| **6. Monte Carlo Optimizer & Autonomous Governance** | [`dev/bitecho/stress/monte_carlo.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/monte_carlo.clj), [`src/bitecho/governance/core.cljc`](file:///home/simonpure/src/alpeware/bitecho/src/bitecho/governance/core.cljc) | LHS parameter sweeps over $\theta \in \Theta$ with Common Random Number Ornstein-Uhlenbeck + Hawkes jump demand, endogenous operator cohort dynamics, 4-objective Pareto ranking, and Tri-Circle Sociocratic Governance. | `clojure -M:test -n bitecho.stress.monte-carlo-test -n bitecho.governance.core-test` |
 
 ---
 
@@ -100,14 +105,35 @@ Every stage is verified against `(e2e/compute-golden-expected-state workload)` a
 
 ### 2.4 30,000-Epoch Tokenomics Horizon Simulation Report (`tokenomics_sim.clj`)
 
-The tokenomics horizon simulator ([`dev/bitecho/stress/tokenomics_sim.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/tokenomics_sim.clj)) evaluates `30,000` epochs (~3.42 years at 1-hour epochs) across four network demand regimes, including the **3-year Bootstrap Custody Sunset** at epoch `26,280` (`18,900,000,000` ECH initial custody allocation) and the **`23,100,000,000` ECH (`23.1B`) hard supply cap** (`INV-D15-8`):
+The tokenomics horizon simulator ([`dev/bitecho/stress/tokenomics_sim.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/tokenomics_sim.clj)) evaluates `30,000` epochs (~3.42 years at 1-hour epochs) under the ratified **Tokenomics v2.1 Demand-Gated Minting Engine** ($M_t = \min(\lfloor R_{\text{trailing}, N} \cdot k / 10000 \rfloor + \text{dust}_{t-1}, C_{\text{rem}})$ with $k = 5000\text{ bps} = 0.50$, trailing window $N = 168$ epochs, and `20/80` Streamlet/Mesh reward split), crossing the **3-year Bootstrap Custody Sunset** at epoch `26,280` (`4,200,000,000` ECH initial Bootstrap allocation within `18,900,000,000` ECH total Genesis Custody) and enforcing the **`23,100,000,000` ECH (`23.1B`) conditional mint supply cap** (`INV-D15-8`):
 
-| Regime | Load Factor | Epochs Simulated | Supply Cap (`23.1B`) Reached? | Epoch `26,280` Custody Burn Verified? | Key Verified Economic Behavior |
+| Regime | Synthetic Burn / Epoch (ECH) | Epochs Simulated | Conditional Cap (`23.1B`) Reached? | Epoch `26,280` Bootstrap Sunset Burn Verified? | Key Verified Economic Behavior |
 | :--- | ---: | ---: | :--- | :--- | :--- |
-| **`:low`** | `0.15` | `30,000` | No (burns + gradual emission stay below cap) | Yes (`18.9B` unallocated custody burned at `26,280`) | Low logistic burn multiplier; steady validator + voucher rewards |
-| **`:medium`** | `0.50` | `30,000` | Reached prior to `26,280`, resumes post-burn | Yes (`18.9B` unallocated custody burned at `26,280`) | Logistic midpoint (`multiplier = 0.5`); balanced burn vs emission |
-| **`:high`** | `0.90` | `30,000` | **Yes — at Epoch `11,551`** | Yes (`18.9B` unallocated custody burned at `26,280`) | Clamps `minted = 0` at `23.1B` cap (`11,551..26,279`), then automatically resumes minting at `26,280` after custody burn |
-| **`:zero-participation`** | `0.00` | `30,000` | No (`0` minted across all `30,000` epochs) | Yes (`18.9B` burned -> `0` circulating supply) | Zero division-by-zero, zero negative balances, exact accounting |
+| **`:low`** | `2,000` | `30,000` | No (`~29.98M` ECH minted < `60M` cumulative burns) | Yes (`4,174,000,000` ECH unspent Bootstrap custody burned at `26,280`; post-sunset drawdowns rejected) | Net deflationary ($k = 0.50$); steady `20/80` Streamlet/Mesh rewards; bounded epoch state maps (`<= 260`) |
+| **`:medium`** | `50,000` | `30,000` | No (`~749.58M` ECH minted < `1.5B` cumulative burns) | Yes (`4,174,000,000` ECH unspent Bootstrap custody burned at `26,280`; Partner/Team/Ecosystem intact) | Net deflationary (`minted < cumulative burns`); exact dust carry-forward (`:actual-minted + :mint-dust == :epoch-mint`) |
+| **`:high`** | `2,000,000` | `30,000` | **Yes — at Epoch `23,185`** (`23.1B` conditional cap reached) | Yes (`4,174,000,000` ECH unspent Bootstrap custody burned at `26,280`) | Clamps conditional `minted = 0` once `total-minted + mint-dust == 23,100,000,000` at epoch `23,185`; total supply strictly `<= 42.0B` hard cap |
+
+---
+
+### 2.5 Sans-IO Monte Carlo Tokenomics Optimizer & Endogenous Cohort Simulation (`monte_carlo.clj`)
+
+Milestone D19 ([`dev/bitecho/stress/monte_carlo.clj`](file:///home/simonpure/src/alpeware/bitecho/dev/bitecho/stress/monte_carlo.clj)) extends Layer 4 with a parameterized policy space $\theta \in \Theta$ (`:k-bps`, `:treasury-trailing-epochs`, `:settlement-take-bps`, `:streamlet-share-pct`, `:min-node-stake`, `:max-stake-multiplier`, `:min-signaling-burn`, `:bootstrap-sunset-epoch`, `:bootstrap-drawdown-lambda`):
+
+1. **Latin Hypercube Sampling (`sample-lhs-parameters`)**: Stratifies all 9 policy dimensions uniformly using deterministic `crypto/fork-random` sub-streams.
+2. **Decoupled Common Random Numbers & Integer Jump-Diffusion Demand (`generate-epoch-demand`, `A-CARB-D19-1..2`)**: Forks `(crypto/fork-random master-rng (str "demand-" path-id "-" epoch))` per path and epoch to generate mean-reverting Ornstein-Uhlenbeck + Hawkes self-exciting jump demand in exact integer arithmetic, separating `:signaling-burn` (`:epoch-burns`) and `:settlement-take` (`:epoch-settlement-takes`) with price/disintermediation elasticity.
+3. **Endogenous Operator Cohort Reducer (`step-operator-cohort`)**: Forks `(crypto/fork-random master-rng (str "cohort-" path-id "-" epoch))` to simulate rational operator entry/exit against hourly OpEx and 3-strike Poisson fault freezes across small ($1\times S_{\min}$), medium ($2\times S_{\min}$), and whale ($S_{\max}\times S_{\min}$) stake tiers, dynamically updating `:mesh-nodes` weights via `attestation/calculate-node-weight`.
+4. **4-Objective Pareto Frontier (`pareto-frontier`, `A-CARB-D19-3`) & Cross-Layer Validation (`validate-pareto-candidates-e2e!`)**: Filters non-dominated candidates across `:cvar-5pct-active-nodes`, `:cap-longevity-score`, `:net-deflation-efficiency`, and `:decentralization-score` ($1 - \text{Gini}$), ranks by `[0, 1]` normalized composite score, and validates top $\theta^*$ candidates inside `harness/run-chaos-byzantine-e2e`.
+
+---
+
+### 2.6 Autonomous Development & Tri-Circle Sociocratic Governance (`src/bitecho/governance/core.cljc`)
+
+Milestone D20 ([`src/bitecho/governance/core.cljc`](file:///home/simonpure/src/alpeware/bitecho/src/bitecho/governance/core.cljc)) implements Bitecho's 4-layer autonomous protocol evolution and Sociocratic governance engine:
+
+1. **Layer 1 — Permissionless Fractal Lab Subnets (`register-lab-subnet`, `anchor-subnet-merkle-root`)**: Registers child lab subnets with custom signaling burn floors and admission gates, anchoring state into `"global"` via RFC 6962 domain-separated binary Merkle roots (`0x00` leaf prefix, `0x01` internal node prefix, `A-D20-1`).
+2. **Layer 2 — Executable BIPs on `bitecho.org/dev` (`verify-bip-admission-gates`, `submit-bip`)**: Enforces `"No Proposal Without a Property & Seed"` (`INV-D20-1`), requiring 4 invariant-diff fields and 4 signed oracle receipts before publishing a content-addressed `Blob` and authority-signed `Pointer` (`bip/<bip-id>`).
+3. **Layer 3 — Bilateral Builder/Auditor Bounties (`calculate-bounty-split`, `settle-bounty-escrow`)**: Enforces zero-dust integer conservation (`builder-net + auditor-net + protocol-take == gross-amount`, `A-CARB-D20-2`) and pairwise distinctness across the 3 heterogeneous signers (`builder`, cross-model AI `auditor`, and Human Anchor `maintainer`, `A-CARB-D20-1`).
+4. **Layer 4 — Tri-Circle Sociocratic Consent (`submit-circle-response`, `evaluate-tri-circle-consent`)**: Weights `:builders-stewards`, `:mesh-validators`, and `:anchor-agent-users` by Sybil-anchored metrics (`A-CARB-D20-3`), ignores unsubstantiated objections with counted `:unsubstantiated-objection-ignored` diagnostics, and converts valid reproducible counterexamples (`:vopr-seed`, `:monte-carlo-insolvency`, `:security-regression`) into deterministic regression test vectors (`INV-D20-4`).
 
 ---
 

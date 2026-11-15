@@ -11,110 +11,166 @@
             [bitecho.economy.treasury :as treasury]
             [bitecho.state-machine :as sm]))
 
-(defn- deterministic-kp
-  [seed]
-  (let [kp (crypto/generate-keypair seed)]
-    {:public (:public kp)
-     :private (:private kp)
-     :hex (basalt/bytes->hex (:public kp))}))
+(def ^:private deterministic-kp
+  (memoize
+   (fn [seed]
+     (let [kp (crypto/generate-keypair seed)]
+       {:public (:public kp)
+        :private (:private kp)
+        :hex (basalt/bytes->hex (:public kp))}))))
 
 (defn build-initial-tokenomics-state
   "Constructs the initial 45% Genesis Custody ledger (18.9B ECHO across Bootstrap, Team,
-   Partners, and Ecosystem) plus 3 Streamlet validators and 6 Mesh validators."
-  []
-  (let [treasury-kp (deterministic-kp "d15-tok-treasury")
-        bootstrap-kp (deterministic-kp "d15-tok-bootstrap")
-        team-kp (deterministic-kp "d15-tok-team")
-        partners-kp (deterministic-kp "d15-tok-partners")
-        ecosystem-kp (deterministic-kp "d15-tok-ecosystem")
-        recipient-kp (deterministic-kp "d15-tok-grant-recipient")
-        validators (mapv #(-> (str "d15-tok-val-" %) deterministic-kp :hex) (range 3))
-        mesh-nodes (into (sorted-map)
-                         (map (fn [i]
-                                [(-> (str "d15-tok-mesh-" i) deterministic-kp :hex) 1.0])
-                              (range 6)))
-        genesis-ledger (treasury/default-genesis-ledger
-                        {:bootstrap (:hex bootstrap-kp)
-                         :team (:hex team-kp)
-                         :partners (:hex partners-kp)
-                         :ecosystem (:hex ecosystem-kp)})]
-    {:keys {:treasury treasury-kp
-            :bootstrap bootstrap-kp
-            :team team-kp
-            :partners partners-kp
-            :ecosystem ecosystem-kp
-            :recipient recipient-kp}
-     :state {:epoch 0
-             :ledger genesis-ledger
-             :escrows {}
-             :total-minted 0
-             :mint-dust 0
-             :unclaimed-mint 0
-             :sunset-custody-burned 0
-             :last-pruned-mint-epoch -1
-             :minted-epochs #{}
-             :epoch-burns {}
-             :epoch-settlement-takes {}
-             :epoch-mint-dust {}
-             :epoch-unclaimed-mint {}
-             :validators validators
-             :mesh-nodes mesh-nodes
-             :treasury-pubkey (:hex treasury-kp)
-             :treasury-privkey (:private treasury-kp)
-             :custody-pubkey (:hex bootstrap-kp)
-             :custody-privkey (:private bootstrap-kp)
-             :bootstrap-sunset-epoch treasury/default-bootstrap-sunset-epoch
-             :config {:treasury-trailing-epochs 168
-                      :streamlet-retention-epochs 256
-                      :frozen-epoch-retention-window 16
-                      :rendezvous-retention-epochs 16
-                      :bootstrap-sunset-epoch treasury/default-bootstrap-sunset-epoch}}}))
+   Partners, and Ecosystem) plus 3 Streamlet validators and 6 Mesh validators.
+   Accepts an optional policy parameter map `theta` (`A-D19-2`)."
+  ([]
+   (build-initial-tokenomics-state nil))
+  ([theta]
+   (let [treasury-kp (deterministic-kp "d15-tok-treasury")
+         bootstrap-kp (deterministic-kp "d15-tok-bootstrap")
+         team-kp (deterministic-kp "d15-tok-team")
+         partners-kp (deterministic-kp "d15-tok-partners")
+         ecosystem-kp (deterministic-kp "d15-tok-ecosystem")
+         recipient-kp (deterministic-kp "d15-tok-grant-recipient")
+         validators (mapv #(-> (str "d15-tok-val-" %) deterministic-kp :hex) (range 3))
+         mesh-nodes (into (sorted-map)
+                          (map (fn [i]
+                                 [(-> (str "d15-tok-mesh-" i) deterministic-kp :hex) 1.0])
+                               (range 6)))
+         genesis-ledger (treasury/default-genesis-ledger
+                         {:bootstrap (:hex bootstrap-kp)
+                          :team (:hex team-kp)
+                          :partners (:hex partners-kp)
+                          :ecosystem (:hex ecosystem-kp)})
+         trailing-ep (long (or (:treasury-trailing-epochs theta) 168))
+         sunset-ep (long (or (:bootstrap-sunset-epoch theta) treasury/default-bootstrap-sunset-epoch))
+         k-bps (long (or (:k-bps theta) treasury/default-k-bps))
+         streamlet-pct (long (or (:streamlet-share-pct theta) treasury/streamlet-share-pct))
+         take-bps (long (or (:settlement-take-bps theta) 50))
+         min-stake (long (or (:min-node-stake theta) 250000))
+         max-mult (double (or (:max-stake-multiplier theta) 4.0))
+         min-burn (long (or (:min-signaling-burn theta) 100))
+         drawdown-lambda (double (or (:bootstrap-drawdown-lambda theta) 0.0001))]
+     {:keys {:treasury treasury-kp
+             :bootstrap bootstrap-kp
+             :team team-kp
+             :partners partners-kp
+             :ecosystem ecosystem-kp
+             :recipient recipient-kp}
+      :state {:epoch 0
+              :ledger genesis-ledger
+              :escrows {}
+              :total-minted 0
+              :mint-dust 0
+              :unclaimed-mint 0
+              :sunset-custody-burned 0
+              :last-pruned-mint-epoch -1
+              :minted-epochs #{}
+              :epoch-burns {}
+              :epoch-settlement-takes {}
+              :epoch-mint-dust {}
+              :epoch-unclaimed-mint {}
+              :validators validators
+              :mesh-nodes mesh-nodes
+              :treasury-pubkey (:hex treasury-kp)
+              :treasury-privkey (:private treasury-kp)
+              :custody-pubkey (:hex bootstrap-kp)
+              :custody-privkey (:private bootstrap-kp)
+              :bootstrap-sunset-epoch sunset-ep
+              :policy {:k-bps k-bps
+                       :treasury-trailing-epochs trailing-ep
+                       :settlement-take-bps take-bps
+                       :streamlet-share-pct streamlet-pct
+                       :min-node-stake min-stake
+                       :max-stake-multiplier max-mult
+                       :min-signaling-burn min-burn
+                       :bootstrap-sunset-epoch sunset-ep
+                       :bootstrap-drawdown-lambda drawdown-lambda}
+              :config {:treasury-trailing-epochs trailing-ep
+                       :streamlet-retention-epochs 256
+                       :frozen-epoch-retention-window 16
+                       :rendezvous-retention-epochs 16
+                       :bootstrap-sunset-epoch sunset-ep}}})))
 
-(defn- step-tokenomics-epoch
-  "Steps a single epoch `ep` in the fast-forward tokenomics simulation:
-   1. Records synthetic epoch burn (`burn-per-epoch`) into `:epoch-burns` and deducts from ecosystem/circulation.
-   2. Computes trailing 168-epoch revenue and runs `treasury/process-treasury-epoch`.
-   3. Signs and applies epoch mint via `treasury/apply-epoch-mint`.
+(defn step-tokenomics-epoch
+  "Steps a single epoch in the fast-forward tokenomics simulation:
+   1. Records synthetic epoch burn (`burn-per-epoch`) into `:epoch-burns` and optional
+      `:settlement-take-per-epoch` into `:epoch-settlement-takes`.
+   2. Computes trailing `N`-epoch revenue and runs `treasury/process-treasury-epoch`.
+   3. Signs (when `:verify-signatures?` is true, default) and applies epoch mint via `treasury/apply-epoch-mint`.
    4. Prunes expired treasury epoch maps via `sm/prune-epoch-state`."
-  [st ep burn-per-epoch custody-allocs]
-  (let [t-Window 168
-        st-with-burn (-> st
-                         (assoc :epoch ep)
-                         (assoc-in [:epoch-burns (dec ep)] burn-per-epoch))
-        trailing-revs (treasury/extract-trailing-revenues st-with-burn ep t-Window)
-        t-res (treasury/process-treasury-epoch
-               {:epoch ep
-                :trailing-burns trailing-revs
-                :n-epochs t-Window
-                :k-bps treasury/default-k-bps
-                :carry-dust (:mint-dust st-with-burn 0)
-                :total-minted (:total-minted st-with-burn 0)
-                :sunset-custody-burned (:sunset-custody-burned st-with-burn 0)
-                :validators (:validators st-with-burn)
-                :mesh-nodes (:mesh-nodes st-with-burn)
-                :ledger (:ledger st-with-burn)
-                :custody-pubkey (:custody-pubkey st-with-burn)
-                :custody-privkey (:custody-privkey st-with-burn)
-                :custody-allocations custody-allocs
-                :bootstrap-sunset-epoch (:bootstrap-sunset-epoch st-with-burn)})
-        allocs (:all-mint-shares t-res)
-        dust (:mint-dust t-res)
-        sig (treasury/sign-epoch-mint (:treasury-privkey st-with-burn) ep allocs dust)
-        st-custody (assoc st-with-burn
-                          :ledger (:ledger t-res)
-                          :sunset-custody-burned (:sunset-custody-burned t-res))
-        st-minted (treasury/apply-epoch-mint
-                   st-custody
-                   {:epoch ep
-                    :allocations allocs
-                    :mint-dust dust
-                    :unclaimed-mint (:unclaimed-mint t-res)
-                    :epoch-gate (:epoch-mint t-res)
-                    :treasury-pubkey (:treasury-pubkey st-with-burn)
-                    :signature sig})
-        st-pruned (sm/prune-epoch-state st-minted ep (:config st-minted))]
-    {:state st-pruned
-     :treasury-res t-res}))
+  ([st burn-per-epoch]
+   (step-tokenomics-epoch st (inc (long (:epoch st 0))) burn-per-epoch nil nil))
+  ([st burn-per-epoch opts]
+   (step-tokenomics-epoch st (long (or (:epoch opts) (inc (long (:epoch st 0))))) burn-per-epoch (:custody-allocations opts) opts))
+  ([st ep burn-per-epoch custody-allocs]
+   (step-tokenomics-epoch st ep burn-per-epoch custody-allocs nil))
+  ([st ep burn-per-epoch custody-allocs opts]
+   (let [policy (:policy st)
+         t-window (long (or (:treasury-trailing-epochs opts)
+                            (:treasury-trailing-epochs policy)
+                            (get-in st [:config :treasury-trailing-epochs])
+                            168))
+         k-bps (long (or (:k-bps opts)
+                         (:k-bps policy)
+                         treasury/default-k-bps))
+         streamlet-pct (long (or (:streamlet-share-pct opts)
+                                 (:streamlet-share-pct policy)
+                                 treasury/streamlet-share-pct))
+         sunset-ep (long (or (:bootstrap-sunset-epoch opts)
+                             (:bootstrap-sunset-epoch policy)
+                             (:bootstrap-sunset-epoch st)
+                             treasury/default-bootstrap-sunset-epoch))
+         take-per-epoch (long (or (:settlement-take-per-epoch opts) 0))
+         verify-sigs? (if (contains? opts :verify-signatures?)
+                        (boolean (:verify-signatures? opts))
+                        true)
+         st-with-burn (-> st
+                          (assoc :epoch ep
+                                 :bootstrap-sunset-epoch sunset-ep)
+                          (assoc-in [:config :treasury-trailing-epochs] t-window)
+                          (assoc-in [:config :bootstrap-sunset-epoch] sunset-ep)
+                          (assoc-in [:epoch-burns (dec ep)] (long burn-per-epoch))
+                          (cond-> (pos? take-per-epoch)
+                            (assoc-in [:epoch-settlement-takes (dec ep)] take-per-epoch)))
+         trailing-revs (treasury/extract-trailing-revenues st-with-burn ep t-window)
+         t-res (treasury/process-treasury-epoch
+                {:epoch ep
+                 :trailing-burns trailing-revs
+                 :n-epochs t-window
+                 :k-bps k-bps
+                 :streamlet-share-pct streamlet-pct
+                 :carry-dust (:mint-dust st-with-burn 0)
+                 :total-minted (:total-minted st-with-burn 0)
+                 :sunset-custody-burned (:sunset-custody-burned st-with-burn 0)
+                 :validators (:validators st-with-burn)
+                 :mesh-nodes (:mesh-nodes st-with-burn)
+                 :ledger (:ledger st-with-burn)
+                 :custody-pubkey (:custody-pubkey st-with-burn)
+                 :custody-privkey (:custody-privkey st-with-burn)
+                 :custody-allocations custody-allocs
+                 :bootstrap-sunset-epoch sunset-ep})
+         allocs (:all-mint-shares t-res)
+         dust (:mint-dust t-res)
+         sig (if verify-sigs?
+               (treasury/sign-epoch-mint (:treasury-privkey st-with-burn) ep allocs dust)
+               "fast-forward-pure")
+         st-custody (assoc st-with-burn
+                           :ledger (:ledger t-res)
+                           :sunset-custody-burned (:sunset-custody-burned t-res))
+         st-minted (treasury/apply-epoch-mint
+                    st-custody
+                    {:epoch ep
+                     :allocations allocs
+                     :mint-dust dust
+                     :unclaimed-mint (:unclaimed-mint t-res)
+                     :epoch-gate (:epoch-mint t-res)
+                     :treasury-pubkey (:treasury-pubkey st-with-burn)
+                     :signature sig
+                     :skip-signature-verification? (not verify-sigs?)})
+         st-pruned (sm/prune-epoch-state st-minted ep (:config st-minted))]
+     {:state st-pruned
+      :treasury-res t-res})))
 
 (defn run-tokenomics-horizon-sim
   "Runs the 30,000-epoch tokenomics horizon simulation for `regime` (`:low`, `:medium`, or `:high`).

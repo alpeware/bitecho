@@ -205,3 +205,24 @@ For detailed specifications and cross-runtime CLI/JSONL/Browser usage of Bitecho
 - **[`docs/STORAGE.md`](STORAGE.md)**: Built-in Fractal E2EE Storage (`bitecho.core.storage`) over `Blob` + `Pointer` + `Subnet`, domain-separated XSalsa20-Poly1305 encryption (`derive-storage-key`), anti-rollback sequence guards, and `storage-put` / `storage-get` / `storage-list`.
 - **[`docs/CAPABILITIES.md`](CAPABILITIES.md)**: Generic Fractal Capability Descriptors (`bitecho.core.storage`) for `:storage/blob-pinning`, `:compute/uop-kernel`, `:compute/gpu-access`, `:model/weights`, `:network/turn-relay`, and `:network/gateway`, plus `capability-publish` / `capability-resolve` / `capability-list`.
 
+---
+
+## 5. Autonomous Development & Tri-Circle Sociocratic Governance Protocol (`bitecho.governance.core`)
+
+Bitecho implements a pure Sans-IO 4-layer autonomous protocol evolution and governance state machine in [`src/bitecho/governance/core.cljc`](file:///home/simonpure/src/alpeware/bitecho/src/bitecho/governance/core.cljc):
+
+1. **Layer 1 — Permissionless Fractal Lab Subnets & RFC 6962 Binary Merkle Anchoring (`register-lab-subnet`, `compute-rfc6962-merkle-root`, `anchor-subnet-merkle-root`):**
+   - Registers child lab subnets with custom `:min-signaling-burn`, `:admission-gate` (`:permissionless`, `:dac-attested`, `:stake-gated`), `:capability-schemas`, and `:settlement-take-bps`.
+   - Computes domain-separated RFC 6962 binary Merkle roots (`SHA-256(0x00 || leaf)` for leaves and `SHA-256(0x01 || left || right)` for internal nodes) to anchor child subnet state into `"global"`.
+2. **Layer 2 — Executable BIPs on `bitecho.org/dev` (`verify-bip-admission-gates`, `submit-bip`):**
+   - Enforces `"No Proposal Without a Property & Seed"` (`INV-D20-1`): a BIP is rejected with counted `:bip-admission-rejected` diagnostics unless it provides all 4 `:invariant-diff` fields (`:defspec-vars`, `:sans-io-pure?`, `:diagnose-coverage?`, `:co-committed-spec-and-flags?`) and all 4 `:oracle-receipts` (`:four-way-golden-oracle`, `:vopr-jepsen-non-vacuity`, `:deterministic-bundle-sha256`, `:bwrap-civilization-regression`).
+   - Admitted BIPs are stored as content-addressed Fressian `Blob`s and referenced by authority-signed `Pointer`s (`bip/<bip-id>`) in subnet `"bitecho.org/dev"`.
+3. **Layer 3 — Bilateral Builder/Auditor Bounties (`calculate-bounty-split`, `create-bounty-escrow`, `settle-bounty-escrow`):**
+   - Enforces exact zero-dust integer conservation (`builder-net + auditor-net + protocol-take == gross-amount`) for all $A \ge 1$.
+   - Requires pairwise-distinct Ed25519 signatures from a **Builder**, a **Cross-Model AI Auditor** (attesting `:tests-passed? true`, `:lint-clean? true`, and matching `:reproducible-sha256`), and a **Human Anchor Maintainer**; any signer collision fails closed with `:sybil-bounty-claim-rejected`.
+4. **Layer 4 — Tri-Circle Sociocratic Consent & Reproducible Counterexample Gate (`register-circle-member`, `submit-circle-response`, `evaluate-tri-circle-consent`):**
+   - Evaluates consent across `:builders-stewards` (`:verified-commits`), `:mesh-validators` (`attestation/calculate-node-weight`), and `:anchor-agent-users` (`:trailing-burned-ech`).
+   - Unsubstantiated objections (missing or invalid `:counterexample`) emit counted `:unsubstantiated-objection-ignored` diagnostics and never block ratification.
+   - Valid reproducible counterexamples (`:vopr-seed`, `:monte-carlo-insolvency`, `:security-regression`) transition the BIP to `:blocked-by-paramount-objection` and append a deterministic regression test vector to `:regression-vectors`.
+
+

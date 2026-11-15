@@ -165,17 +165,20 @@
 
 (defn calculate-node-weight
   "Calculates node weight using continuous linear scaling:
-     w_i = participation_i * min(4.0, stake_i / S_min)
-   Handles boundary conditions (s-min <= 0, zero or negative participation/stake) safely."
+     w_i = participation_i * min(s_max, stake_i / S_min)
+   Handles boundary conditions (s-min <= 0, s-max <= 0, zero or negative participation/stake) safely."
   ([participation stake]
-   (calculate-node-weight participation stake default-min-stake))
+   (calculate-node-weight participation stake default-min-stake max-stake-multiplier))
   ([participation stake s-min]
+   (calculate-node-weight participation stake s-min max-stake-multiplier))
+  ([participation stake s-min s-max]
    (if (or (nil? s-min) (not (number? s-min)) (<= s-min 0)
+           (nil? s-max) (not (number? s-max)) (<= s-max 0)
            (nil? participation) (not (number? participation)) (<= participation 0)
            (nil? stake) (not (number? stake)) (<= stake 0))
      0.0
      (let [stake-ratio (/ (double stake) (double s-min))
-           multiplier (min max-stake-multiplier (max 0.0 stake-ratio))]
+           multiplier (min (double s-max) (max 0.0 stake-ratio))]
        (* (double participation) multiplier)))))
 
 (defn reconcile-message-roles
