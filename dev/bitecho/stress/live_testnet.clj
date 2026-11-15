@@ -238,7 +238,11 @@
       (let [nested-cluster? (map? (:cluster boot-cfg))
             cluster (if nested-cluster? (:cluster boot-cfg) boot-cfg)
             nodes-map (or (:nodes cluster) {})
-            curr-vals (vec (or (:validators cluster) (keys nodes-map)))
+            curr-vals (vec (or (:validators cluster)
+                               (let [core-ks (filter #{:node1 :node2 :node3} (keys nodes-map))]
+                                 (if (= 3 (count core-ks))
+                                   [:node1 :node2 :node3]
+                                   (keys nodes-map)))))
             raw-mesh (or (:mesh-nodes cluster)
                          (into {} (map (fn [k] [k 1.0]) (keys nodes-map))))
             curr-mesh (if (map? raw-mesh)

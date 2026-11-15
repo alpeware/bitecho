@@ -1743,9 +1743,9 @@ cmd_add_validator() {
     echo "Error: devnet/bootstrap.edn and ${TREASURY_KEY_FILE} must exist before running add-validator." >&2
     return 1
   fi
-  local submit_live=false
-  if [[ "${LIVE_SUBMIT:-0}" == "1" ]]; then
-    submit_live=true
+  local submit_live=true
+  if [[ "${LIVE_SUBMIT:-1}" == "0" ]]; then
+    submit_live=false
   fi
   echo "=== Dynamically Adding Validator ${target_node} via :reconfigure-membership (promote_bft=${promote_bft}, submit_live=${submit_live}) ==="
   (cd "${ROOT_DIR}" && clojure -M:simulate -e "
@@ -1757,6 +1757,7 @@ cmd_add_validator() {
                                                :bootstrap-file \"${ROOT_DIR}/devnet/bootstrap.edn\"
                                                :treasury-key-file \"${TREASURY_KEY_FILE}\"})]
       (println (pr-str res))
+      (shutdown-agents)
       (when-not (:ok? res)
         (binding [*out* *err*]
           (println \"Error: reconfigure-live-validator! failed:\" (pr-str res)))
@@ -1773,9 +1774,9 @@ cmd_remove_validator() {
     echo "Error: devnet/bootstrap.edn and ${TREASURY_KEY_FILE} must exist before running remove-validator." >&2
     return 1
   fi
-  local submit_live=false
-  if [[ "${LIVE_SUBMIT:-0}" == "1" ]]; then
-    submit_live=true
+  local submit_live=true
+  if [[ "${LIVE_SUBMIT:-1}" == "0" ]]; then
+    submit_live=false
   fi
   echo "=== Dynamically Removing Validator ${target_node} via :reconfigure-membership (submit_live=${submit_live}) ==="
   (cd "${ROOT_DIR}" && clojure -M:simulate -e "
@@ -1786,6 +1787,7 @@ cmd_remove_validator() {
                                                :bootstrap-file \"${ROOT_DIR}/devnet/bootstrap.edn\"
                                                :treasury-key-file \"${TREASURY_KEY_FILE}\"})]
       (println (pr-str res))
+      (shutdown-agents)
       (when-not (:ok? res)
         (binding [*out* *err*]
           (println \"Error: reconfigure-live-validator! failed:\" (pr-str res)))
