@@ -20,6 +20,7 @@
             [bitecho.economy.escrow-test]
             [bitecho.economy.puzzle-test]
             [bitecho.economy.treasury-test]
+            [bitecho.experiments-test]
             [bitecho.fractal-federation-test]
             [bitecho.fressian-test]
             [bitecho.light-node.cli-flag-inventory-test]
