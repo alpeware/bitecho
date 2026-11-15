@@ -149,31 +149,35 @@ The tokenomics horizon simulator ([`dev/bitecho/stress/tokenomics_sim.clj`](file
 
 ### 3.4 How to Configure & Run a Sandboxed Multi-Agent `agy` Experiment (`dev/experiments/`)
 
-The Milestone D16 multi-agent harness spawns multiple autonomous Bitecho light nodes inside hardened Linux **Bubblewrap (`bwrap`)** sandboxes (`--ro-bind / /`, isolated PID/IPC/UTS namespaces, `--tmpfs` masks over `~/.ssh`, repo `.ssh`, `~/.cache`, `/tmp`, and sibling node directories, plus a per-node local UDP DNS allowlist server).
+The Milestone D16/D17 multi-agent harness spawns multiple autonomous Bitecho light nodes inside hardened Linux **Bubblewrap (`bwrap`)** sandboxes (`--ro-bind / /`, isolated PID/IPC/UTS namespaces, `--tmpfs` masks over `~/.ssh`, repo `.ssh`, `~/.cache`, `/tmp`, and sibling node directories, plus a per-node local UDP DNS allowlist server and `/etc/hosts` filter).
+
+Each node runs a **single long-lived streaming `agy` process** (`agy --input-format stream-json --output-format stream-json --model <model> --dangerously-skip-permissions`) across all turns (`INV-D17-2`, `INV-D17-3`), preserving full multi-turn conversation memory, tool-execution state, and subagent context while streaming NDJSON events to `<node-dir>/agy-stream.jsonl` and `<experiment-dir>/agy-events.jsonl`.
 
 #### Step 1: Create an Experiment EDN Configuration File
 
-Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/sociocratic_subnet_demo.edn`](file:///home/simonpure/src/alpeware/bitecho/dev/experiments/sociocratic_subnet_demo.edn)):
+Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/homebrew_cafe_civilization.edn`](file:///home/simonpure/src/alpeware/bitecho/dev/experiments/homebrew_cafe_civilization.edn) and [`dev/experiments/sociocratic_subnet_demo.edn`](file:///home/simonpure/src/alpeware/bitecho/dev/experiments/sociocratic_subnet_demo.edn)):
 
 ```clojure
-{:experiment-id "my-multi-agent-experiment"
- :max-turns 4
+{:experiment-id "homebrew-cafe-civilization-01"
+ :max-turns 2
  :min-echo-balance 100
  :dns-records {"bitecho.org" "35.212.172.159"
                "*.bitecho.org" "35.209.253.119"}
  :nodes
- [{:node-id :alpha-coordinator
-   :parent-id :genesis-custody
-   :start-balance 5000
+ [{:node-id :archivist-hypatia
+   :parent-id :patron-medici
+   :start-balance 700
    :model-type "gemini-4-hydrogen-low"
-   :initial-prompt "Join subnet 'lab-1', broadcast a task, and halt with accomplished-goal."
-   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]}
-  {:node-id :beta-worker
-   :parent-id :alpha-coordinator
-   :start-balance 1500
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com" "en.wikipedia.org" "*.wikipedia.org"]
+   :initial-prompt "Read SCENARIO.md, join homebrew-cafe, query Wikipedia, and offer wikipedia-oracle for 350 ECH."
+   :followup-prompt "Fulfill any capability-order in p2p-inbox, join new-alexandria, and halt with accomplished-goal."}
+  {:node-id :alchemist-tesla
+   :parent-id :patron-medici
+   :start-balance 1400
    :model-type "gemini-3.8-flash-low"
-   :initial-prompt "Join subnet 'lab-1', reply to :alpha-coordinator via p2p-send, and halt."
-   :dns-allow-list ["bitecho.org" "*.googleapis.com"]}]}
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
+   :initial-prompt "Read SCENARIO.md, join homebrew-cafe, offer cipher-forge for 300 ECH, and buy wikipedia-oracle."
+   :followup-prompt "Deliver cipher-forge seal to patron-medici, join new-alexandria, and halt with accomplished-goal."}]}
 ```
 
 #### Supported `:model-type` Identifiers (`INV-D16-1`)
@@ -182,12 +186,16 @@ Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/sociocrati
 - **Claude 5.5:** `"claude-opus-5-5-low"`, `"claude-opus-5-5-medium"`, `"claude-opus-5-5-high"`, `"claude-sonnet-5-5-low"`, `"claude-sonnet-5-5-medium"`, `"claude-sonnet-5-5-high"`
 - **Open-Weights:** `"gpt-oss-120b-medium"`
 
-#### Hierarchical Funding (`:parent-id`) & Halt Conditions (`INV-D16-4`, `INV-D16-5`)
+#### Hierarchical Funding (`:parent-id`), Capability Marketplace, & Halt Conditions (`INV-D16-4`, `INV-D16-5`, `INV-D17-1`)
 
 - Root nodes specify `:parent-id :genesis-custody` (or `:treasury`).
 - Child nodes specify a sibling node's `:node-id` as `:parent-id`; the child's `:start-balance` is automatically deducted from the parent node's `:start-balance` at provisioning time so total experiment ECH supply is strictly conserved.
-- Every state-changing `bitecho-node` CLI command (`subnet-join`, `subnet-broadcast`, `p2p-send`, `transfer`) burns `100` ECH.
-- A node halts immediately when:
+- Each node workspace is provisioned with `AGENTS.md`, `SCENARIO.md`, `.agents/skills/bitecho-light-node/SKILL.md`, and `bin/bitecho-node`:
+  - `bitecho-node status`, `bitecho-node peers`, `bitecho-node p2p-inbox`, `bitecho-node subnet-inbox`, `bitecho-node capability-list` (`0` ECH free reads).
+  - `bitecho-node subnet-join <subnet>`, `bitecho-node subnet-broadcast <subnet> "<msg>"`, `bitecho-node p2p-send <peer> "<msg>"` (`100` ECH burn each).
+  - `bitecho-node capability-offer <cap-id> <price> "<desc>"` (`100` ECH burn), `bitecho-node capability-buy <cap-id> "<req>"` (`<price> + 100` ECH burn; credits `<price>` ECH to provider), `bitecho-node capability-deliver <buyer> <cap-id> "<result>"` (`100` ECH burn).
+  - `bitecho-node transfer <peer> <amount>` (`<amount> + 100` ECH burn).
+- A node halts immediately (and its long-lived `agy` process is cleanly terminated) when:
   1. Its balance drops strictly below `:min-echo-balance` (`:out-of-echos`),
   2. It invokes `bitecho-node halt accomplished-goal "<summary>"` (`:accomplished-goal`),
   3. It invokes `bitecho-node halt gave-up "<reason>"` (`:gave-up`), or
@@ -197,10 +205,10 @@ Create an `.edn` file under `dev/experiments/` (see [`dev/experiments/sociocrati
 
 ```bash
 # 1. Run preflight sandbox & DNS isolation verification (--dry-run):
-clojure -M:simulate -m bitecho.experiments.runner dev/experiments/sociocratic_subnet_demo.edn --dry-run
+clojure -M:simulate -m bitecho.experiments.runner dev/experiments/homebrew_cafe_civilization.edn --dry-run
 
-# 2. Run the full multi-turn headless agy experiment:
-clojure -M:simulate -m bitecho.experiments.runner dev/experiments/sociocratic_subnet_demo.edn
+# 2. Run the full multi-turn long-lived stream-json agy experiment:
+clojure -M:simulate -m bitecho.experiments.runner dev/experiments/homebrew_cafe_civilization.edn
 
 # 3. Run the automated unit, bwrap integration, and test.check generative suite:
 clojure -M:test -n bitecho.experiments-test

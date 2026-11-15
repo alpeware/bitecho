@@ -189,7 +189,7 @@
 ;; =============================================================================
 
 (def gen-node-action
-  "Generator for random light-node actions (:transfer, :subnet-join, :subnet-broadcast, :p2p-send, :halt)."
+  "Generator for random light-node actions (:transfer, :subnet-join, :subnet-broadcast, :p2p-send, :capability-offer, :capability-buy, :capability-deliver, :halt)."
   (gen/one-of
    [(gen/fmap (fn [[from to amt]]
                 {:type :transfer :node-id from :target to :amount amt})
@@ -199,29 +199,43 @@
     (gen/fmap (fn [[nid sub]]
                 {:type :subnet-join :node-id nid :subnet-id sub})
               (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements ["sociocratic-lab" "kernel-ring"])))
+                         (gen/elements ["sociocratic-lab" "homebrew-cafe" "new-alexandria"])))
     (gen/fmap (fn [[nid sub msg]]
                 {:type :subnet-broadcast :node-id nid :subnet-id sub :message msg})
               (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements ["sociocratic-lab" "kernel-ring"])
+                         (gen/elements ["sociocratic-lab" "homebrew-cafe" "new-alexandria"])
                          (gen/elements ["proposal-1" "consent-vote-ok"])))
     (gen/fmap (fn [[from to msg]]
                 {:type :p2p-send :node-id from :target to :message msg})
               (gen/tuple (gen/elements [:alpha :beta :gamma])
                          (gen/elements [:alpha :beta :gamma])
                          (gen/elements ["hello-sibling" "ack-digest"])))
+    (gen/fmap (fn [[nid cap-id price]]
+                {:type :capability-offer :node-id nid :cap-id cap-id :price price :description "service"})
+              (gen/tuple (gen/elements [:alpha :beta :gamma])
+                         (gen/elements ["wikipedia-oracle" "cipher-forge"])
+                         (gen/choose -20 350)))
+    (gen/fmap (fn [[nid cap-id]]
+                {:type :capability-buy :node-id nid :cap-id cap-id :request "lookup"})
+              (gen/tuple (gen/elements [:alpha :beta :gamma])
+                         (gen/elements ["wikipedia-oracle" "cipher-forge" "unknown-cap"])))
+    (gen/fmap (fn [[from to cap-id]]
+                {:type :capability-deliver :node-id from :target to :cap-id cap-id :result "payload"})
+              (gen/tuple (gen/elements [:alpha :beta :gamma])
+                         (gen/elements [:alpha :beta :gamma :non-existent])
+                         (gen/elements ["wikipedia-oracle" "cipher-forge"])))
     (gen/fmap (fn [[nid mode]]
                 {:type :halt :node-id nid :halt-reason mode :summary "done"})
               (gen/tuple (gen/elements [:alpha :beta :gamma])
                          (gen/elements [:accomplished-goal :gave-up])))]))
 
-(defspec ^{:doc "Property: Arbitrary sequences of light-node actions strictly conserve total ECH supply and deterministically halt nodes below min-echo-balance (INV-D16-4, INV-D16-5)."}
+(defspec ^{:doc "Property: Arbitrary sequences of light-node actions (including capability marketplace) strictly conserve total ECH supply and deterministically halt nodes below min-echo-balance (INV-D16-4, INV-D16-5, INV-D17-1)."}
   node-tool-supply-conservation-and-halt-prop 40
-  (prop/for-all [actions (gen/vector gen-node-action 1 25)]
+  (prop/for-all [actions (gen/vector gen-node-action 1 30)]
                 (let [init-world (node-tool/init-world-state
                                   {:min-echo-balance 100
                                    :max-turns 8
-                                   :balances {:alpha 600 :beta 350 :gamma 250}})
+                                   :balances {:alpha 900 :beta 650 :gamma 450}})
                       final-world (reduce
                                    (fn [w act]
                                      (:world (node-tool/apply-node-action w act)))
@@ -235,6 +249,52 @@
                                                    (:halt-reason nd)))
                                    true))
                                (:nodes final-world))))))
+
+(deftest inv-d17-1-pure-capability-marketplace-test
+  (testing "Pure capability-offer, capability-buy, self-purchase guard, and capability-deliver conserve supply"
+    (let [w0 (node-tool/init-world-state
+              {:min-echo-balance 100
+               :max-turns 4
+               :balances {:hypatia 700 :tesla 1400 :medici 2650}})
+          ;; 1. Hypatia offers wikipedia-oracle at 350 ECH (-100 burn -> 600 ECH)
+          {w1 :world ev1 :event} (node-tool/apply-node-action
+                                  w0
+                                  {:type :capability-offer
+                                   :node-id :hypatia
+                                   :cap-id "wikipedia-oracle"
+                                   :price 350
+                                   :description "Live Wikipedia summary lookup"})
+          ;; 2. Hypatia attempts to buy her own capability -> rejected with 0 burn
+          {w2 :world ev2 :event} (node-tool/apply-node-action
+                                  w1
+                                  {:type :capability-buy
+                                   :node-id :hypatia
+                                   :cap-id "wikipedia-oracle"
+                                   :request "self-buy"})
+          ;; 3. Tesla buys wikipedia-oracle from Hypatia (-450 -> 950 ECH; Hypatia +350 -> 950 ECH)
+          {w3 :world ev3 :event} (node-tool/apply-node-action
+                                  w2
+                                  {:type :capability-buy
+                                   :node-id :tesla
+                                   :cap-id "wikipedia-oracle"
+                                   :request "Byzantine_fault summary"})
+          ;; 4. Hypatia delivers result to Tesla (-100 burn -> 850 ECH)
+          {w4 :world ev4 :event} (node-tool/apply-node-action
+                                  w3
+                                  {:type :capability-deliver
+                                   :node-id :hypatia
+                                   :target :tesla
+                                   :cap-id "wikipedia-oracle"
+                                   :result "Byzantine fault tolerance summary"})]
+      (is (= :ok (:status ev1)))
+      (is (= :cannot-buy-own-capability (:status ev2)))
+      (is (= 600 (get-in w2 [:nodes :hypatia :balance])))
+      (is (= :ok (:status ev3)))
+      (is (= 950 (get-in w3 [:nodes :tesla :balance])))
+      (is (= 950 (get-in w3 [:nodes :hypatia :balance])))
+      (is (= :ok (:status ev4)))
+      (is (= 850 (get-in w4 [:nodes :hypatia :balance])))
+      (is (node-tool/conserve-supply? w4)))))
 
 ;; =============================================================================
 ;; 4. INV-D16-2, INV-D16-3, & INV-D16-4: Live Bubblewrap Isolation & CLI Test
@@ -257,7 +317,7 @@
                           :dns-allow-list ["bitecho.org" "*.bitecho.org"]}
                          {:node-id :beta
                           :parent-id :alpha
-                          :start-balance 450
+                          :start-balance 650
                           :model-type "gemini-3.8-flash-low"
                           :initial-prompt "Test beta"
                           :dns-allow-list ["bitecho.org"]}]}]
@@ -269,16 +329,26 @@
                 bwrap-cmd (sandbox/build-bwrap-command provisioned alpha-ctx ["true"])
                 iso-alpha (sandbox/verify-sandbox-isolation! provisioned alpha-ctx)
                 iso-beta (sandbox/verify-sandbox-isolation! provisioned beta-ctx)]
-            (testing "sociocratic_subnet_demo.edn validates cleanly with conserved 5000 ECH supply"
+            (testing "sociocratic_subnet_demo.edn and homebrew_cafe_civilization.edn validate cleanly with conserved 5000 ECH supply"
               (let [demo-cfg (edn/read-string (slurp "dev/experiments/sociocratic_subnet_demo.edn"))
-                    demo-res (sandbox/validate-experiment-config demo-cfg)]
+                    demo-res (sandbox/validate-experiment-config demo-cfg)
+                    cafe-cfg (edn/read-string (slurp "dev/experiments/homebrew_cafe_civilization.edn"))
+                    cafe-res (sandbox/validate-experiment-config cafe-cfg)]
                 (is (:ok? demo-res))
                 (is (= 5000 (:initial-supply demo-res)))
                 (is (= {:alpha-coordinator 2300
                         :beta-worker 1250
                         :gamma-auditor 1200
                         :delta-constrained 250}
-                       (:effective-balances demo-res)))))
+                       (:effective-balances demo-res)))
+                (is (:ok? cafe-res))
+                (is (= 5000 (:initial-supply cafe-res)))
+                (is (= {:archivist-hypatia 700
+                        :alchemist-tesla 1400
+                        :patron-medici 2650
+                        :nomad-diogenes 250}
+                       (:effective-balances cafe-res)))
+                (is (.exists (io/file (:workspace-dir alpha-ctx) "SCENARIO.md")))))
 
             (testing "bwrap command contains mandatory read-only root and secret/sibling masks"
               (is (some #{"--ro-bind"} bwrap-cmd))
@@ -296,27 +366,38 @@
               (is (:blocked-dns-refused? iso-alpha))
               (is (:ok? iso-beta) (pr-str iso-beta)))
 
-            (testing "bin/bitecho-node executes inside bwrap for subnet, P2P, transfer, out-of-echos, and accomplished-goal"
+            (testing "bin/bitecho-node executes inside bwrap for subnet, P2P, capability marketplace, transfer, out-of-echos, and accomplished-goal"
               (let [r1 (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "status"])
                     _ (is (zero? (:exit r1)) (pr-str r1))
                     _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "subnet-join" "sociocratic-lab"])
                     _ (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "subnet-join" "sociocratic-lab"])
                     _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "subnet-broadcast" "sociocratic-lab" "hello-circle"])
                     _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "p2p-send" "beta" "direct-ping-from-alpha"])
+                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "capability-offer" "wikipedia-oracle" "100" "Live Wikipedia lookup"])
+                    self-buy (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "capability-buy" "wikipedia-oracle" "self-buy"])
+                    _ (is (= 1 (:exit self-buy)))
+                    cap-list (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "capability-list"])
+                    _ (is (str/includes? (:out cap-list) "wikipedia-oracle"))
+                    buy-res (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "capability-buy" "wikipedia-oracle" "Byzantine_fault"])
+                    _ (is (zero? (:exit buy-res)) (pr-str buy-res))
+                    deliv-res (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "capability-deliver" "beta" "wikipedia-oracle" "Byzantine summary"])
+                    _ (is (zero? (:exit deliv-res)) (pr-str deliv-res))
                     inbox-beta (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "p2p-inbox"])
                     _ (is (zero? (:exit inbox-beta)))
                     _ (is (str/includes? (:out inbox-beta) "direct-ping-from-alpha"))
-                    ;; Beta starts with 450 ECH; subnet-join burned 100 (350 left).
+                    _ (is (str/includes? (:out inbox-beta) "Byzantine summary"))
+                    ;; Beta starts with 650 ECH; subnet-join burned 100 (550), capability-buy cost 100+100 (350 left).
                     ;; Transferring 200 ECH to alpha + 100 burn leaves 50 ECH (< 100 min-echo-balance) -> out-of-echos!
                     _ (runner/exec-in-node-sandbox! provisioned beta-ctx ["bitecho-node" "transfer" "alpha" "200"])
                     st-beta (runner/read-node-local-state beta-ctx)
-                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "halt" "accomplished-goal" "Subnet & P2P verified"])
+                    _ (runner/exec-in-node-sandbox! provisioned alpha-ctx ["bitecho-node" "halt" "accomplished-goal" "Subnet, P2P, & Capability verified"])
                     st-alpha (runner/read-node-local-state alpha-ctx)]
                 (is (:halted? st-beta))
                 (is (= :out-of-echos (:halt-reason st-beta)))
                 (is (= 50 (:balance st-beta)))
                 (is (:halted? st-alpha))
-                (is (= :accomplished-goal (:halt-reason st-alpha))))))
+                (is (= :accomplished-goal (:halt-reason st-alpha)))
+                (is (= 1150 (:balance st-alpha))))))
           (finally
             (runner/shutdown-experiment! provisioned))))
       (finally

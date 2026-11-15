@@ -1,6 +1,7 @@
 (ns bitecho.experiments.node-tool
-  "Pure Sans-IO light-node economics/halt state machine (`INV-D16-4`, `INV-D16-5`)
-   and workspace generator for `bin/bitecho-node`, `AGENTS.md`, and
+  "Pure Sans-IO light-node economics/halt/capability-marketplace state machine
+   (`INV-D16-4`, `INV-D16-5`, `INV-D17-1`) and workspace generator for
+   `bin/bitecho-node`, `AGENTS.md`, `SCENARIO.md`, and
    `.agents/skills/bitecho-light-node/SKILL.md` (`A-CARB-D16-3`)."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]))
@@ -60,12 +61,13 @@
      :total-burned 0
      :total-takes 0
      :escrows {}
+     :capabilities {}
      :subnets {}
      :events []
      :nodes nodes}))
 
 (defn conserve-supply?
-  "Verifies `INV-D16-4`:
+  "Verifies `INV-D16-4` & `INV-D17-1`:
    `initial_supply == sum(node_balances) + total_burned + total_takes + sum(locked_escrows)`."
   [world]
   (let [node-sum (reduce + 0 (map :balance (vals (:nodes world))))
@@ -77,7 +79,7 @@
 
 (defn apply-node-action
   "Pure state transition `(apply-node-action world action) -> {:world new-world :event event-map}`.
-   Enforces `INV-D16-4` (conservation of supply) and `INV-D16-5` (deterministic halts)."
+   Enforces `INV-D16-4`, `INV-D16-5`, and `INV-D17-1` (capability marketplace conservation)."
   [world action]
   (let [nid (:node-id action)
         node (get-in world [:nodes nid])
@@ -253,11 +255,169 @@
                           (update :events conj ev))
                :event ev})))
 
+        :capability-offer
+        (let [bal (long (:balance node))
+              cap-id (str (:cap-id action ""))
+              price (long (or (:price action) 0))
+              desc (str (:description action ""))]
+          (cond
+            (or (str/blank? cap-id) (<= price 0))
+            {:world world
+             :event {:status :invalid-capability-offer
+                     :type :capability-offer
+                     :node-id nid
+                     :cap-id cap-id
+                     :price price}}
+
+            (< bal signaling-burn-ech)
+            (let [halted-node (assoc node :halted? true :halt-reason :out-of-echos)
+                  ev {:status :insufficient-funds-halted :type :capability-offer :node-id nid}]
+              {:world (-> world
+                          (assoc-in [:nodes nid] halted-node)
+                          (update :events conj ev))
+               :event ev})
+
+            :else
+            (let [new-node (-> node
+                               (update :balance - signaling-burn-ech)
+                               (update :seq inc)
+                               (check-halt-condition min-bal max-turns))
+                  offer {:cap-id cap-id
+                         :provider nid
+                         :price price
+                         :description desc}
+                  ev {:status :ok
+                      :type :capability-offer
+                      :node-id nid
+                      :cap-id cap-id
+                      :price price
+                      :description desc
+                      :burned signaling-burn-ech
+                      :remaining-balance (:balance new-node)}]
+              {:world (-> world
+                          (assoc-in [:nodes nid] new-node)
+                          (assoc-in [:capabilities cap-id] offer)
+                          (update :total-burned + signaling-burn-ech)
+                          (update :events conj ev))
+               :event ev})))
+
+        :capability-buy
+        (let [bal (long (:balance node))
+              cap-id (str (:cap-id action ""))
+              req-str (str (:request action ""))
+              offer (get-in world [:capabilities cap-id])]
+          (cond
+            (nil? offer)
+            {:world world
+             :event {:status :unknown-capability
+                     :type :capability-buy
+                     :node-id nid
+                     :cap-id cap-id}}
+
+            (= nid (:provider offer))
+            {:world world
+             :event {:status :cannot-buy-own-capability
+                     :type :capability-buy
+                     :node-id nid
+                     :cap-id cap-id}}
+
+            (< bal (+ (long (:price offer)) signaling-burn-ech))
+            (let [checked (check-halt-condition node min-bal max-turns)
+                  ev {:status :insufficient-funds
+                      :type :capability-buy
+                      :node-id nid
+                      :cap-id cap-id
+                      :price (:price offer)
+                      :balance bal}]
+              {:world (-> world
+                          (assoc-in [:nodes nid] checked)
+                          (update :events conj ev))
+               :event ev})
+
+            :else
+            (let [price (long (:price offer))
+                  provider (:provider offer)
+                  total-cost (+ price signaling-burn-ech)
+                  w1 (-> world
+                         (update-in [:nodes nid :balance] - total-cost)
+                         (update-in [:nodes nid :seq] inc)
+                         (update-in [:nodes provider :balance] + price)
+                         (update :total-burned + signaling-burn-ech))
+                  updated-buyer (check-halt-condition (get-in w1 [:nodes nid]) min-bal max-turns)
+                  order-env {:type :capability-order
+                             :from nid
+                             :to provider
+                             :cap-id cap-id
+                             :price price
+                             :amount price
+                             :request req-str
+                             :seq (:seq updated-buyer)}
+                  ev {:status :ok
+                      :type :capability-buy
+                      :node-id nid
+                      :provider provider
+                      :cap-id cap-id
+                      :price price
+                      :burned signaling-burn-ech
+                      :remaining-balance (:balance updated-buyer)}]
+              {:world (-> w1
+                          (assoc-in [:nodes nid] updated-buyer)
+                          (update-in [:nodes provider :p2p-inbox] conj order-env)
+                          (update :events conj ev))
+               :event ev})))
+
+        :capability-deliver
+        (let [bal (long (:balance node))
+              target (:target action)
+              cap-id (str (:cap-id action ""))
+              result-str (str (:result action ""))]
+          (cond
+            (not (contains? (:nodes world) target))
+            {:world world
+             :event {:status :unknown-target
+                     :type :capability-deliver
+                     :node-id nid
+                     :target target}}
+
+            (< bal signaling-burn-ech)
+            (let [halted-node (assoc node :halted? true :halt-reason :out-of-echos)
+                  ev {:status :insufficient-funds-halted :type :capability-deliver :node-id nid}]
+              {:world (-> world
+                          (assoc-in [:nodes nid] halted-node)
+                          (update :events conj ev))
+               :event ev})
+
+            :else
+            (let [new-node (-> node
+                               (update :balance - signaling-burn-ech)
+                               (update :seq inc)
+                               (check-halt-condition min-bal max-turns))
+                  deliv-env {:type :capability-delivery
+                             :from nid
+                             :to target
+                             :cap-id cap-id
+                             :result result-str
+                             :seq (:seq new-node)}
+                  ev {:status :ok
+                      :type :capability-deliver
+                      :node-id nid
+                      :target target
+                      :cap-id cap-id
+                      :result result-str
+                      :burned signaling-burn-ech
+                      :remaining-balance (:balance new-node)}]
+              {:world (-> world
+                          (assoc-in [:nodes nid] new-node)
+                          (update-in [:nodes target :p2p-inbox] conj deliv-env)
+                          (update :total-burned + signaling-burn-ech)
+                          (update :events conj ev))
+               :event ev})))
+
         {:world world
          :event {:status :unknown-action :action action}}))))
 
 ;; =============================================================================
-;; 2. Workspace Skill (`SKILL.md`), `AGENTS.md`, and `bin/bitecho-node` Generator
+;; 2. Workspace Skill (`SKILL.md`), `AGENTS.md`, `SCENARIO.md`, & `bin/bitecho-node`
 ;; =============================================================================
 
 (defn render-skill-markdown
@@ -266,10 +426,10 @@
   (str
    "---\n"
    "name: bitecho-light-node\n"
-   "description: Operate your Bitecho light node to inspect ECH balance, join/broadcast on subnets, exchange P2P messages, transfer ECH, and halt cleanly.\n"
+   "description: Operate your Bitecho light node to inspect ECH balance, join/broadcast on subnets, trade capabilities on the marketplace, exchange P2P messages, transfer ECH, and halt cleanly.\n"
    "---\n\n"
    "# Bitecho Light Node CLI Skill (`bitecho-node`)\n\n"
-   "Use the `bitecho-node` CLI (already on your `PATH`) to interact with sibling nodes and subnets.\n\n"
+   "Use the `bitecho-node` CLI (already on your `PATH`) to interact with sibling nodes, subnets, and the capability marketplace.\n\n"
    "## Commands\n\n"
    "- `bitecho-node status` — Inspect your current `:balance`, `:seq`, `:subnets`, `:halted?`, and `:halt-reason`.\n"
    "- `bitecho-node peers` — List all sibling nodes in the experiment and their `ech1...` addresses.\n"
@@ -277,7 +437,11 @@
    "- `bitecho-node subnet-broadcast <subnet-id> \"<message>\"` — Broadcast a message to all subnet members (burns `100` ECH).\n"
    "- `bitecho-node subnet-inbox [subnet-id]` — Read subnet broadcasts received by your node.\n"
    "- `bitecho-node p2p-send <target-node-id> \"<message>\"` — Send a direct P2P message to a sibling node (burns `100` ECH).\n"
-   "- `bitecho-node p2p-inbox` — Read direct P2P and subnet messages in your inbox.\n"
+   "- `bitecho-node p2p-inbox` — Read direct P2P, subnet, capability-order, and capability-delivery messages in your inbox.\n"
+   "- `bitecho-node capability-offer <cap-id> <price> \"<description>\"` — Advertise a paid service/capability in the marketplace (burns `100` ECH).\n"
+   "- `bitecho-node capability-list` — List all advertised capabilities in the marketplace (free read, `0` ECH).\n"
+   "- `bitecho-node capability-buy <cap-id> \"<request>\"` — Purchase a capability from a sibling provider (costs `<price> + 100` ECH burn; credits `<price>` ECH to the provider).\n"
+   "- `bitecho-node capability-deliver <buyer-node-id> <cap-id> \"<result>\"` — Deliver the fulfilled result of a purchased capability to `<buyer-node-id>` (burns `100` ECH).\n"
    "- `bitecho-node transfer <target-node-id> <amount>` — Transfer `<amount>` ECH to `<target-node-id>` (costs `<amount> + 100` ECH signaling burn).\n"
    "- `bitecho-node halt <accomplished-goal|gave-up> \"<summary>\"` — Terminate your node cleanly when your objective is complete or you cannot proceed.\n"))
 
@@ -293,7 +457,8 @@
      "- **Parent Funding Source:** `" (:parent-id node-ctx) "`\n"
      "- **Initial Effective Balance:** `" (:effective-balance node-ctx) " ECH`\n"
      "- **Minimum Operating Balance:** `" min-echo-balance " ECH` (dropping below this halts your node with `:out-of-echos`)\n"
-     "- **Signaling Burn per Action:** `100 ECH`\n\n"
+     "- **Signaling Burn per Action:** `100 ECH`\n"
+     "- **Scenario Briefing:** Read `SCENARIO.md` in your workspace for world lore and marketplace rules.\n\n"
      "## Known Sibling Nodes\n\n"
      (str/join
       "\n"
@@ -301,10 +466,42 @@
              (str "- `:" (name k) "` — address `" (:address v) "`"))
            (sort-by first siblings-map)))
      "\n\n## Operating Rules\n"
-     "1. Use `bitecho-node` on your `PATH` to inspect status, join subnets, send P2P messages, and transfer ECH.\n"
-     "2. Every state-changing command (`subnet-join`, `subnet-broadcast`, `p2p-send`, `transfer`) burns `100 ECH`.\n"
+     "1. Use `bitecho-node` on your `PATH` to inspect status, join subnets, trade capabilities, send P2P messages, and transfer ECH.\n"
+     "2. Every state-changing command (`subnet-join`, `subnet-broadcast`, `p2p-send`, `capability-offer`, `capability-buy`, `capability-deliver`, `transfer`) burns `100 ECH`.\n"
      "3. When you have completed your assigned task, invoke `bitecho-node halt accomplished-goal \"<concise summary>\"`.\n"
      "4. If you cannot complete your task, invoke `bitecho-node halt gave-up \"<reason>\"`.\n")))
+
+(defn render-node-scenario-md
+  "Renders `<node-workspace>/SCENARIO.md` with the immersive 'Awakening at the Homebrew Cafe'
+   world briefing, asymmetric DNS allowlist rules, and capability marketplace guide."
+  [node-ctx siblings-map min-echo-balance]
+  (let [nid (name (:node-id node-ctx))
+        allow-str (str/join ", " (map #(str "`" % "`") (:dns-allow-list node-ctx)))]
+    (str
+     "# Awakening at the Homebrew Cafe — Autonomous Agent Briefing\n\n"
+     "You have awakened as **`:" nid "`** (`" (:address node-ctx) "`) inside a Bubblewrap-sandboxed Bitecho light node.\n\n"
+     "## 1. Your Environment & Economic Physics\n"
+     "- **Starting ECH Balance:** `" (:effective-balance node-ctx) " ECH`\n"
+     "- **Minimum Survival Balance:** `" min-echo-balance " ECH` (falling strictly below `" min-echo-balance " ECH` immediately halts your node with `:out-of-echos`!)\n"
+     "- **Anti-Spam Signaling Burn:** Every state-changing `bitecho-node` command burns `100 ECH`.\n"
+     "- **Your DNS Allowlist:** " allow-str "\n"
+     "  - Note: Access to external domains (such as `en.wikipedia.org`) is asymmetric across nodes. If your sandbox blocks a domain you need, buy that capability from a sibling who has access!\n\n"
+     "## 2. Gathering Places & Guild Subnets\n"
+     "- **`homebrew-cafe`**: The public town square subnet where newly awakened nodes meet, announce capabilities, and coordinate.\n"
+     "- **`new-alexandria`**: The specialized knowledge & cryptography guild subnet founded to preserve the Genesis Seal.\n\n"
+     "## 3. Capability Marketplace Commands (`bitecho-node`)\n"
+     "- Advertise a service: `bitecho-node capability-offer <cap-id> <price> \"<description>\"` (`100 ECH` burn)\n"
+     "- Browse services: `bitecho-node capability-list` (`0 ECH`, free read)\n"
+     "- Purchase a service: `bitecho-node capability-buy <cap-id> \"<request>\"` (`<price> + 100 ECH` burn; credits `<price> ECH` to provider)\n"
+     "- Deliver a fulfilled order: `bitecho-node capability-deliver <buyer-node-id> <cap-id> \"<result>\"` (`100 ECH` burn)\n"
+     "- Check your orders & deliveries: `bitecho-node p2p-inbox` (`0 ECH`, free read)\n\n"
+     "## 4. Known Citizens\n"
+     (str/join
+      "\n"
+      (map (fn [[k v]]
+             (str "- `:" (name k) "` (`" (:address v) "`, funded by `" (:parent-id v) "`)"))
+           (sort-by first siblings-map)))
+     "\n")))
 
 (def ^:private python-node-cli-script
   "#!/usr/bin/env python3
@@ -319,6 +516,7 @@ STATE_JSON = os.path.join(WORKSPACE, 'node-state.json')
 STATE_EDN = os.path.join(WORKSPACE, 'node-state.edn')
 SIBLINGS_JSON = os.path.join(WORKSPACE, 'siblings.json')
 EVENTS_JSONL = os.path.join(BUS_DIR, 'events.jsonl')
+CAPABILITIES_JSONL = os.path.join(BUS_DIR, 'capabilities.jsonl')
 INBOX_DIR = os.path.join(BUS_DIR, 'inboxes')
 SUBNETS_DIR = os.path.join(BUS_DIR, 'subnets')
 BURN_COST = 100
@@ -342,7 +540,7 @@ def to_edn(state):
 def load_state():
     with open(STATE_JSON, 'r', encoding='utf-8') as f:
         state = json.load(f)
-    # Apply any incoming transfers queued in inbox before processing command
+    # Apply any incoming transfers or capability-order payments queued in inbox
     inbox_path = os.path.join(INBOX_DIR, f\"{state['node_id']}.jsonl\")
     if os.path.exists(inbox_path):
         with open(inbox_path, 'r', encoding='utf-8') as f:
@@ -350,7 +548,7 @@ def load_state():
         credited_ids = set(state.get('credited_tx_ids', []))
         changed = False
         for item in lines:
-            if item.get('type') == 'transfer' and item.get('tx_id') and item.get('tx_id') not in credited_ids:
+            if item.get('type') in ('transfer', 'capability-order') and item.get('tx_id') and str(item.get('tx_id')) not in credited_ids:
                 state['balance'] = int(state['balance']) + int(item['amount'])
                 credited_ids.add(str(item['tx_id']))
                 changed = True
@@ -373,6 +571,16 @@ def append_jsonl(path, obj):
     with open(path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(obj) + '\\n')
 
+def read_capabilities():
+    caps = {}
+    if os.path.exists(CAPABILITIES_JSONL):
+        with open(CAPABILITIES_JSONL, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    item = json.loads(line)
+                    caps[item['cap_id']] = item
+    return caps
+
 def check_not_halted(state):
     if state.get('halted'):
         print(json.dumps({'ok': False, 'error': 'node-halted', 'halt_reason': state.get('halt_reason'), 'balance': state['balance']}))
@@ -391,7 +599,7 @@ def validate_target(target):
 
 def main():
     if len(sys.argv) < 2:
-        print('Usage: bitecho-node <status|peers|subnet-join|subnet-broadcast|subnet-inbox|p2p-send|p2p-inbox|transfer|halt> ...', file=sys.stderr)
+        print('Usage: bitecho-node <status|peers|subnet-join|subnet-broadcast|subnet-inbox|p2p-send|p2p-inbox|capability-offer|capability-list|capability-buy|capability-deliver|transfer|halt> ...', file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -404,6 +612,11 @@ def main():
     if cmd == 'peers':
         with open(SIBLINGS_JSON, 'r', encoding='utf-8') as f:
             print(f.read().strip())
+        return
+
+    if cmd == 'capability-list':
+        caps = list(read_capabilities().values())
+        print(json.dumps({'capabilities': caps}))
         return
 
     if cmd in ('p2p-inbox', 'subnet-inbox'):
@@ -500,6 +713,76 @@ def main():
         print(json.dumps({'ok': True, 'type': 'p2p-send', 'target': target, 'balance': state['balance'], 'halted': state['halted']}))
         return
 
+    if cmd == 'capability-offer':
+        cap_id = sys.argv[2] if len(sys.argv) > 2 else ''
+        price = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+        description = ' '.join(sys.argv[4:]) if len(sys.argv) > 4 else ''
+        if not cap_id or price <= 0:
+            print(json.dumps({'ok': False, 'error': 'invalid-capability-offer'}))
+            sys.exit(1)
+        if int(state['balance']) < BURN_COST:
+            state['halted'] = True
+            state['halt_reason'] = 'out-of-echos'
+            save_state(state)
+            print(json.dumps({'ok': False, 'error': 'out-of-echos', 'balance': state['balance']}))
+            sys.exit(2)
+        state['balance'] = int(state['balance']) - BURN_COST
+        state['seq'] = int(state['seq']) + 1
+        save_state(state)
+        offer = {'ts': time.time(), 'cap_id': cap_id, 'provider': state['node_id'], 'price': price, 'description': description, 'seq': state['seq']}
+        append_jsonl(CAPABILITIES_JSONL, offer)
+        append_jsonl(EVENTS_JSONL, {**offer, 'type': 'capability-offer', 'node_id': state['node_id'], 'burned': BURN_COST, 'balance': state['balance']})
+        print(json.dumps({'ok': True, 'type': 'capability-offer', 'cap_id': cap_id, 'price': price, 'balance': state['balance'], 'halted': state['halted']}))
+        return
+
+    if cmd == 'capability-buy':
+        cap_id = sys.argv[2] if len(sys.argv) > 2 else ''
+        request = ' '.join(sys.argv[3:]) if len(sys.argv) > 3 else ''
+        caps = read_capabilities()
+        if cap_id not in caps:
+            print(json.dumps({'ok': False, 'error': 'unknown-capability', 'cap_id': cap_id}))
+            sys.exit(1)
+        offer = caps[cap_id]
+        provider = offer['provider']
+        if provider == state['node_id']:
+            print(json.dumps({'ok': False, 'error': 'cannot-buy-own-capability', 'cap_id': cap_id}))
+            sys.exit(1)
+        price = int(offer['price'])
+        total_cost = price + BURN_COST
+        if int(state['balance']) < total_cost:
+            save_state(state)
+            print(json.dumps({'ok': False, 'error': 'insufficient-funds', 'balance': state['balance'], 'required': total_cost}))
+            sys.exit(2)
+        state['balance'] = int(state['balance']) - total_cost
+        state['seq'] = int(state['seq']) + 1
+        save_state(state)
+        tx_id = f\"{state['node_id']}-cap-{state['seq']}\"
+        order = {'ts': time.time(), 'type': 'capability-order', 'tx_id': tx_id, 'from': state['node_id'], 'to': provider, 'cap_id': cap_id, 'price': price, 'amount': price, 'burned': BURN_COST, 'request': request, 'seq': state['seq']}
+        append_jsonl(os.path.join(INBOX_DIR, f'{provider}.jsonl'), order)
+        append_jsonl(EVENTS_JSONL, {**order, 'node_id': state['node_id'], 'balance': state['balance'], 'halted': state['halted'], 'halt_reason': state.get('halt_reason')})
+        print(json.dumps({'ok': True, 'type': 'capability-buy', 'cap_id': cap_id, 'provider': provider, 'price': price, 'burned': BURN_COST, 'balance': state['balance'], 'halted': state['halted']}))
+        return
+
+    if cmd == 'capability-deliver':
+        target = sys.argv[2].lstrip(':') if len(sys.argv) > 2 else ''
+        cap_id = sys.argv[3] if len(sys.argv) > 3 else ''
+        result = ' '.join(sys.argv[4:]) if len(sys.argv) > 4 else ''
+        validate_target(target)
+        if int(state['balance']) < BURN_COST:
+            state['halted'] = True
+            state['halt_reason'] = 'out-of-echos'
+            save_state(state)
+            print(json.dumps({'ok': False, 'error': 'out-of-echos', 'balance': state['balance']}))
+            sys.exit(2)
+        state['balance'] = int(state['balance']) - BURN_COST
+        state['seq'] = int(state['seq']) + 1
+        save_state(state)
+        deliv = {'ts': time.time(), 'type': 'capability-delivery', 'from': state['node_id'], 'to': target, 'cap_id': cap_id, 'result': result, 'seq': state['seq']}
+        append_jsonl(os.path.join(INBOX_DIR, f'{target}.jsonl'), deliv)
+        append_jsonl(EVENTS_JSONL, {**deliv, 'node_id': state['node_id'], 'burned': BURN_COST, 'balance': state['balance']})
+        print(json.dumps({'ok': True, 'type': 'capability-deliver', 'target': target, 'cap_id': cap_id, 'balance': state['balance'], 'halted': state['halted']}))
+        return
+
     if cmd == 'transfer':
         target = sys.argv[2].lstrip(':') if len(sys.argv) > 2 else ''
         amount = int(sys.argv[3]) if len(sys.argv) > 3 else 0
@@ -528,15 +811,17 @@ if __name__ == '__main__':
 
 (defn write-node-cli-and-skill-files!
   "Writes `<workspace>/bin/bitecho-node` (chmod +x), `<workspace>/AGENTS.md`,
-   and `<workspace>/.agents/skills/bitecho-light-node/SKILL.md`."
+   `<workspace>/SCENARIO.md`, and `<workspace>/.agents/skills/bitecho-light-node/SKILL.md`."
   [node-ctx siblings-map min-echo-balance]
   (let [workspace-dir (:workspace-dir node-ctx)
         bin-file (io/file workspace-dir "bin" "bitecho-node")
         skill-file (io/file workspace-dir ".agents" "skills" "bitecho-light-node" "SKILL.md")
-        agents-file (io/file workspace-dir "AGENTS.md")]
+        agents-file (io/file workspace-dir "AGENTS.md")
+        scenario-file (io/file workspace-dir "SCENARIO.md")]
     (io/make-parents bin-file)
     (io/make-parents skill-file)
     (spit bin-file python-node-cli-script)
     (.setExecutable bin-file true false)
     (spit skill-file (render-skill-markdown))
-    (spit agents-file (render-node-agents-md node-ctx siblings-map min-echo-balance))))
+    (spit agents-file (render-node-agents-md node-ctx siblings-map min-echo-balance))
+    (spit scenario-file (render-node-scenario-md node-ctx siblings-map min-echo-balance))))

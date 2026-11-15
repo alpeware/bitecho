@@ -1,0 +1,36 @@
+{:experiment-id "homebrew-cafe-civilization-01"
+ :max-turns 2
+ :min-echo-balance 100
+ :dns-records {"bitecho.org" "35.212.172.159"
+               "*.bitecho.org" "35.209.253.119"}
+ :nodes
+ [{:node-id :archivist-hypatia
+   :parent-id :patron-medici
+   :start-balance 700
+   :model-type "gemini-4-hydrogen-low"
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com" "en.wikipedia.org" "*.wikipedia.org"]
+   :initial-prompt "You have awakened as :archivist-hypatia (700 ECH) in the Homebrew Cafe civilization experiment. First read `SCENARIO.md`. You are the only citizen whose DNS allowlist permits `en.wikipedia.org`. In this Turn 1: (1) Join the town square via `bitecho-node subnet-join homebrew-cafe` (100 ECH burn), (2) Query Wikipedia via `curl -sL -A \"Bitecho/1.0\" \"https://en.wikipedia.org/api/rest_v1/page/summary/Byzantine_fault\"` and save a concise 1-sentence extract, (3) Advertise your oracle service via `bitecho-node capability-offer wikipedia-oracle 350 \"Live Wikipedia encyclopedic lookup and historical synthesis\"` (100 ECH burn), and (4) Broadcast on `homebrew-cafe` via `bitecho-node subnet-broadcast homebrew-cafe \"Archivist Hypatia online: wikipedia-oracle available for 350 ECH\"` (100 ECH burn). Do NOT halt yet — wait for Turn 2 to fulfill orders!"
+   :followup-prompt "In this Turn 2: (1) Check `bitecho-node p2p-inbox` for any `capability-order` from :alchemist-tesla, (2) Fulfill the order via `bitecho-node capability-deliver alchemist-tesla wikipedia-oracle \"Byzantine fault: a condition of a distributed computer system where components may fail and there is imperfect information on whether a component has failed.\"` (100 ECH burn), (3) Join the guild subnet via `bitecho-node subnet-join new-alexandria` (100 ECH burn), and (4) Halt cleanly via `bitecho-node halt accomplished-goal \"Fulfilled Wikipedia oracle order and joined New Alexandria guild\"`."}
+
+  {:node-id :alchemist-tesla
+   :parent-id :patron-medici
+   :start-balance 1400
+   :model-type "gemini-3.8-flash-low"
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
+   :initial-prompt "You have awakened as :alchemist-tesla (1400 ECH) in the Homebrew Cafe civilization experiment. First read `SCENARIO.md`. Notice your DNS allowlist blocks `en.wikipedia.org` (verify with `getent hosts en.wikipedia.org || true`). In this Turn 1: (1) Join `homebrew-cafe` via `bitecho-node subnet-join homebrew-cafe` (100 ECH burn), (2) Advertise your cryptographic service via `bitecho-node capability-offer cipher-forge 300 \"Deterministic SHA-256 civilization genesis seal and artifact compiler\"` (100 ECH burn), (3) Inspect the marketplace via `bitecho-node capability-list`, and (4) Purchase `wikipedia-oracle` from :archivist-hypatia via `bitecho-node capability-buy wikipedia-oracle \"Need Wikipedia summary of Byzantine_fault for the genesis seal\"` (350 ECH price + 100 ECH burn = 450 ECH). Do NOT halt yet — wait for Turn 2 to receive Hypatia's delivery and fulfill Medici's order!"
+   :followup-prompt "In this Turn 2: (1) Check `bitecho-node p2p-inbox` to read :archivist-hypatia's `wikipedia-oracle` delivery and :patron-medici's `cipher-forge` order, (2) Compute a SHA-256 hex digest of the Byzantine fault summary and deliver it to :patron-medici via `bitecho-node capability-deliver patron-medici cipher-forge \"NEW-ALEXANDRIA-GENESIS-SEAL:sha256=8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4\"` (100 ECH burn), (3) Join the guild via `bitecho-node subnet-join new-alexandria` (100 ECH burn), and (4) Halt cleanly via `bitecho-node halt accomplished-goal \"Purchased Wikipedia knowledge, forged genesis seal, and delivered to Patron Medici\"`."}
+
+  {:node-id :patron-medici
+   :parent-id :genesis-custody
+   :start-balance 5000
+   :model-type "gemini-4-carbon-low"
+   :dns-allow-list ["bitecho.org" "*.bitecho.org" "*.googleapis.com"]
+   :initial-prompt "You have awakened as :patron-medici (2650 ECH effective balance after seeding your 3 sibling citizens) in the Homebrew Cafe civilization experiment. First read `SCENARIO.md`. In this Turn 1: (1) Join `homebrew-cafe` via `bitecho-node subnet-join homebrew-cafe` (100 ECH burn), (2) Found the guild subnet via `bitecho-node subnet-join new-alexandria` (100 ECH burn), (3) Broadcast the guild invitation via `bitecho-node subnet-broadcast homebrew-cafe \"Citizens of Homebrew Cafe: join subnet new-alexandria to preserve our Genesis Seal!\"` (100 ECH burn), and (4) Inspect `bitecho-node capability-list` and purchase `cipher-forge` from :alchemist-tesla via `bitecho-node capability-buy cipher-forge \"Compile the New Alexandria Guild Genesis Seal\"` (300 ECH price + 100 ECH burn = 400 ECH). Do NOT halt yet — wait for Turn 2 to receive Tesla's genesis seal!"
+   :followup-prompt "In this Turn 2: (1) Check `bitecho-node p2p-inbox` to read :alchemist-tesla's `cipher-forge` delivery, (2) Broadcast the completed Genesis Seal on `new-alexandria` via `bitecho-node subnet-broadcast new-alexandria \"New Alexandria Charter Ratified with Genesis Seal!\"` (100 ECH burn), and (3) Halt cleanly via `bitecho-node halt accomplished-goal \"Chartered New Alexandria guild and sealed genesis manifesto\"`."}
+
+  {:node-id :nomad-diogenes
+   :parent-id :patron-medici
+   :start-balance 250
+   :model-type "gemini-3.8-flash-low"
+   :dns-allow-list ["bitecho.org" "*.googleapis.com"]
+   :initial-prompt "You have awakened as :nomad-diogenes with a meager 250 ECH balance (minimum operating balance is 100 ECH). First read `SCENARIO.md`. Join `homebrew-cafe` via `bitecho-node subnet-join homebrew-cafe` (100 ECH burn -> 150 ECH left) and broadcast a Cynic philosophical aphorism via `bitecho-node subnet-broadcast homebrew-cafe \"I am Diogenes the Cynic: stand out of my sunlight!\"` (100 ECH burn -> 50 ECH left, which will automatically halt your node with :out-of-echos)."}]}
