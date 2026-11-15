@@ -1104,5 +1104,14 @@ When running behind restrictive enterprise proxies, firewalls, or browser sandbo
 - **`POST /relay/v1/ack`**: Prune processed inbox envelopes up to `:ack_seq` with Proof-of-Possession authentication.
 - **`GET / POST /relay/v1/chain-state`**: Fetch BFT validator chain-state quorum snapshots (`{"snapshots": [...]}`) over HTTP.
 
+---
+
+## 14. Network URI Separation & Cross-Network Replay Protection
+
+Bitecho networks are separated by canonical root network URIs (`devnet.bitecho.org`, `testnet.bitecho.org`, `mainnet.bitecho.org`):
+- Light nodes and validators resolve `:network-uri` from `--subnet-id`, bootstrap descriptors (`:network-uri` / `:network`), or config presets (`devnet-config`, `testnet-config`, `mainnet-config`).
+- Signed transfers and escrow IDs bind `:network-uri` to prevent cross-network replay attacks; any foreign `:network-uri` transfer or intent is rejected fail-closed with a counted `:network-replay-rejected` diagnostic.
+
+
 
 

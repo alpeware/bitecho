@@ -4,7 +4,8 @@
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.crypto :as crypto]
-            [bitecho.fressian :as fressian]))
+            [bitecho.fressian :as fressian]
+            [clojure.string :as str]))
 
 (defrecord ^{:doc "Account ledger state record holding balance, seq, and transaction dependency hashes."} AccountState [balance seq deps])
 
@@ -31,50 +32,68 @@
 
 (defn validate-transfer
   "Validates a transfer against a current account state.
-   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)."
-  [current-state transfer]
-  (try
-    (let [sender (:sender transfer)
-          sender-bytes (if (string? sender)
-                         (basalt/hex->bytes sender)
-                         sender)
-          valid-seq? (= (:seq transfer) (inc (:seq current-state)))
-          valid-deps? (= (:deps transfer) (:deps current-state))
-          valid-balance? (>= (:balance current-state) (:amount transfer))
+   Supports N/N-1 rolling verification (v2 canonical Fressian with v1 pr-str fallback)
+   and optional cross-network replay protection via (:network-uri opts) and (:strict-network-uri? opts)."
+  ([current-state transfer]
+   (validate-transfer current-state transfer nil))
+  ([current-state transfer opts]
+   (try
+     (let [expected-uri (when (map? opts) (:network-uri opts))
+           strict-uri? (or (boolean (when (map? opts) (:strict-network-uri? opts)))
+                           (= "mainnet.bitecho.org" expected-uri))
+           tx-uri (or (:network-uri transfer) (get transfer "network-uri") (get transfer "network_uri"))
+           valid-network-uri? (cond
+                                (and strict-uri? (or (nil? tx-uri) (str/blank? (str tx-uri))))
+                                false
 
-          unsigned-transfer (into (sorted-map) (fressian/strip-untrusted-crypto-tags (dissoc transfer :signature)))
-          sig-bytes (if (coll? (:signature transfer))
-                      #?(:clj (byte-array (map byte (:signature transfer)))
-                         :cljs (js/Uint8Array. (clj->js (:signature transfer))))
-                      (:signature transfer))
-          valid-signature? (crypto/verify-with-fallback sender-bytes unsigned-transfer sig-bytes)]
+                                (and (string? expected-uri) (not (str/blank? expected-uri))
+                                     (string? tx-uri) (not (str/blank? tx-uri)))
+                                (= (str/trim expected-uri) (str/trim tx-uri))
 
-      (and valid-seq? valid-deps? valid-balance? (boolean valid-signature?)))
-    (catch #?(:clj Exception :cljs :default) _
-      false)))
+                                :else true)
+           sender (:sender transfer)
+           sender-bytes (if (string? sender)
+                          (basalt/hex->bytes sender)
+                          sender)
+           valid-seq? (= (:seq transfer) (inc (:seq current-state)))
+           valid-deps? (= (:deps transfer) (:deps current-state))
+           valid-balance? (>= (:balance current-state) (:amount transfer))
+
+           unsigned-transfer (into (sorted-map) (fressian/strip-untrusted-crypto-tags (dissoc transfer :signature)))
+           sig-bytes (if (coll? (:signature transfer))
+                       #?(:clj (byte-array (map byte (:signature transfer)))
+                          :cljs (js/Uint8Array. (clj->js (:signature transfer))))
+                       (:signature transfer))
+           valid-signature? (crypto/verify-with-fallback sender-bytes unsigned-transfer sig-bytes)]
+
+       (and valid-network-uri? valid-seq? valid-deps? valid-balance? (boolean valid-signature?)))
+     (catch #?(:clj Exception :cljs :default) _
+       false))))
 
 (defn apply-transfer
   "Applies a transfer to the given ledger (a map of pubkeys to AccountState).
-   Validates the transfer against the sender's current state.
+   Validates the transfer against the sender's current state (and optional opts).
    If valid, decrements the sender's balance, increments the sender's seq,
    updates the sender's deps to the transfer hash, and increments the receiver's balance.
    If invalid, returns the ledger unmodified."
-  [ledger transfer]
-  (let [sender (:sender transfer)
-        receiver (:receiver transfer)
-        sender-state (get ledger sender)
-        amount (:amount transfer)]
-    (if (and sender-state (validate-transfer sender-state transfer))
-      (let [t-hash (transfer-hash transfer)
-            new-sender-state (map->AccountState
-                              {:balance (- (:balance sender-state) amount)
-                               :seq (:seq transfer)
-                               :deps [t-hash]})
-            ledger-after-send (assoc ledger sender new-sender-state)
-            receiver-state (get ledger-after-send receiver (map->AccountState {:balance 0 :seq 0 :deps []}))
-            new-receiver-state (assoc receiver-state :balance (+ (:balance receiver-state) amount))]
-        (assoc ledger-after-send receiver new-receiver-state))
-      ledger)))
+  ([ledger transfer]
+   (apply-transfer ledger transfer nil))
+  ([ledger transfer opts]
+   (let [sender (:sender transfer)
+         receiver (:receiver transfer)
+         sender-state (get ledger sender)
+         amount (:amount transfer)]
+     (if (and sender-state (validate-transfer sender-state transfer opts))
+       (let [t-hash (transfer-hash transfer)
+             new-sender-state (map->AccountState
+                               {:balance (- (:balance sender-state) amount)
+                                :seq (:seq transfer)
+                                :deps [t-hash]})
+             ledger-after-send (assoc ledger sender new-sender-state)
+             receiver-state (get ledger-after-send receiver (map->AccountState {:balance 0 :seq 0 :deps []}))
+             new-receiver-state (assoc receiver-state :balance (+ (:balance receiver-state) amount))]
+         (assoc ledger-after-send receiver new-receiver-state))
+       ledger))))
 
 (defn apply-mint
   "Applies mint allocations to the given ledger.

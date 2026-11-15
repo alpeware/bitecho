@@ -6,6 +6,7 @@
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
+            [bitecho.config :as config]
             [bitecho.core.data :as data]
             [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as core-subnet]
@@ -340,10 +341,17 @@
                               :subnet-mismatch-dropped 0
                               :last-error nil}
    :subnet-id (str (or (:subnet-id opts) (:subnet-id identity-pub-map) "global"))
+   :network-uri (or (config/resolve-network-uri (:network-uri opts))
+                    (config/resolve-network-uri (:network opts))
+                    (config/resolve-network-uri (:bootstrap opts))
+                    (when (contains? (set (vals config/network-uris)) (str (:subnet-id opts)))
+                      (str (:subnet-id opts)))
+                    "devnet.bitecho.org")
    :economy-enabled? (boolean (get opts :economy-enabled? (get-in opts [:bootstrap :economy-enabled?] true)))
    :burn-floor (long (or (:burn-floor opts) (get-in opts [:bootstrap :burn-floor]) 0))
    :max-epoch-skew (max 1 (long (or (:max-epoch-skew opts) 15)))
    :diagnostics (merge {:subnet-mismatch-dropped 0
+                        :network-replay-rejected 0
                         :p2p-relayed 0
                         :broadcast-duplicates-dropped 0
                         :broadcast-rejected 0
@@ -6794,17 +6802,38 @@
 
 (defn- handle-wire-transfer [state msg]
   (let [raw-tf (or (:transfer msg) (get msg "transfer"))
+        tf-net-uri (when (map? raw-tf)
+                     (or (:network-uri raw-tf)
+                         (get raw-tf "network-uri")
+                         (get raw-tf "network_uri")))
         tf (when (map? raw-tf)
-             {:sender (normalize-pubkey-hex (str (or (:sender raw-tf) (get raw-tf "sender") "")))
-              :receiver (normalize-pubkey-hex (str (or (:receiver raw-tf) (get raw-tf "receiver") "")))
-              :amount (long (or (:amount raw-tf) (get raw-tf "amount") 0))
-              :seq (long (or (:seq raw-tf) (get raw-tf "seq") 0))
-              :deps (vec (or (:deps raw-tf) (get raw-tf "deps") []))
-              :signature (or (:signature raw-tf) (get raw-tf "signature"))})
+             (cond-> {:sender (normalize-pubkey-hex (str (or (:sender raw-tf) (get raw-tf "sender") "")))
+                      :receiver (normalize-pubkey-hex (str (or (:receiver raw-tf) (get raw-tf "receiver") "")))
+                      :amount (long (or (:amount raw-tf) (get raw-tf "amount") 0))
+                      :seq (long (or (:seq raw-tf) (get raw-tf "seq") 0))
+                      :deps (vec (or (:deps raw-tf) (get raw-tf "deps") []))
+                      :signature (or (:signature raw-tf) (get raw-tf "signature"))}
+               (and (string? tf-net-uri) (not (str/blank? tf-net-uri)))
+               (assoc :network-uri (str/trim tf-net-uri))))
+        expected-net-uri (or (:network-uri state)
+                             (config/resolve-network-uri (:bootstrap state))
+                             (when (contains? (set (vals config/network-uris)) (str (:subnet-id state)))
+                               (str (:subnet-id state)))
+                             "devnet.bitecho.org")
+        strict-net? (or (= expected-net-uri "mainnet.bitecho.org")
+                        (= (:network state) :mainnet)
+                        (= (get-in state [:bootstrap :network]) :mainnet))
+        replay? (and (map? tf)
+                     (or (and (string? (:network-uri tf))
+                              (not (str/blank? (:network-uri tf)))
+                              (not= (:network-uri tf) expected-net-uri))
+                         (and strict-net?
+                              (or (not (string? (:network-uri tf)))
+                                  (str/blank? (:network-uri tf))))))
         my-pub (normalize-pubkey-hex (str (or (:pubkey state) "")))
         for-me? (and (map? tf) (not (str/blank? my-pub)) (= (:receiver tf) my-pub))
         valid-sig? (boolean
-                    (when (and for-me? (pos? (:amount tf)))
+                    (when (and for-me? (not replay?) (pos? (:amount tf)))
                       (try
                         (let [sender-bytes (basalt/hex->bytes (:sender tf))
                               unsigned-tf (into (sorted-map) (fressian/strip-untrusted-crypto-tags (dissoc tf :signature)))
@@ -6819,6 +6848,14 @@
                                (crypto/verify-with-fallback sender-bytes unsigned-tf sig-bytes)))
                         (catch #?(:clj Exception :cljs :default) _ false))))]
     (cond
+      replay?
+      {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+       :net-envelopes []
+       :stdout-events [{"event" "diagnostic"
+                        "reason" "network-replay-rejected"
+                        "expected_network_uri" expected-net-uri
+                        "actual_network_uri" (:network-uri tf)}]}
+
       (not for-me?)
       {:state state :net-envelopes [] :stdout-events []}
 
@@ -6894,6 +6931,11 @@
                  :net-envelopes []
                  :stdout-events [diag-event]})
               (let [expected-subnet (str (or (:subnet-id state) "global"))
+                    active-net-uri (or (:network-uri state)
+                                       (config/resolve-network-uri (:bootstrap state))
+                                       (when (contains? (set (vals config/network-uris)) expected-subnet)
+                                         expected-subnet)
+                                       "devnet.bitecho.org")
                     outer-subnet (when-let [s (when (map? raw-payload-or-event)
                                                 (or (:subnet-id raw-payload-or-event)
                                                     (get raw-payload-or-event "subnet-id")
@@ -6912,12 +6954,15 @@
                                         (= msg-type :capability-replicate)
                                         (= msg-type :governance-replicate)
                                         (= msg-type :transfer))
-                    broadcast-on-default-global? (and (= msg-type :p2p-broadcast) (= expected-subnet "global"))
-                    subnet-mismatch? (or (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*") (not= outer-subnet inner-subnet))
+                    broadcast-on-default-global? (and (= msg-type :p2p-broadcast) (config/root-subnet-id? expected-subnet))
+                    subnet-mismatch? (or (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*")
+                                              (not (config/equivalent-subnet-id? outer-subnet inner-subnet active-net-uri)))
                                          (and (not storage-or-cap?)
                                               (not broadcast-on-default-global?)
-                                              (or (and outer-subnet (not= outer-subnet "*") (not= expected-subnet "*") (not= outer-subnet expected-subnet))
-                                                  (and inner-subnet (not= inner-subnet "*") (not= expected-subnet "*") (not= inner-subnet expected-subnet)))))]
+                                              (or (and outer-subnet (not= outer-subnet "*") (not= expected-subnet "*")
+                                                       (not (config/equivalent-subnet-id? outer-subnet expected-subnet active-net-uri)))
+                                                  (and inner-subnet (not= inner-subnet "*") (not= expected-subnet "*")
+                                                       (not (config/equivalent-subnet-id? inner-subnet expected-subnet active-net-uri))))))]
                 (if subnet-mismatch?
                   (let [eff-subnet (or outer-subnet inner-subnet "unknown")
                         new-state (-> state

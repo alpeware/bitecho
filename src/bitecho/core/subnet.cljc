@@ -12,6 +12,7 @@
    100% pure `.cljc` portable across Clojure (JVM) and ClojureScript (Node/Browser)."
   (:refer-clojure :exclude [bytes?])
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
             [bitecho.core.data :as data]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
@@ -108,7 +109,7 @@
 
         (and (= econ-mode :full-settlement)
              (nil? parent-id)
-             (not (contains? #{"global" "validator-core"} sid)))
+             (not (config/root-subnet-id? sid)))
         {:ok? false
          :error :full-settlement-requires-anchor
          :effects [{:effect :diagnose :reason :full-settlement-requires-anchor :subnet sid}]}

@@ -383,7 +383,8 @@
     "evicted-hot" "evicted-unpinned" "cache-misses" "cid-mismatch" "dangling-pointers"
     "builders-stewards" "mesh-validators" "anchor-agent-users"
     "invalid-lab-subnet-rejected" "bip-admission-rejected" "sybil-bounty-claim-rejected"
-    "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"})
+    "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"
+    "network-uri" "network-replay-rejected"})
 
 (def ^:private allowed-persistence-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))

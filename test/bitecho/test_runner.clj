@@ -56,6 +56,7 @@
             [bitecho.stress-e2e-test]
             [bitecho.stress.bip001-sim-test]
             [bitecho.stress.monte-carlo-test]
+            [bitecho.stress.release-proof-test]
             [bitecho.tokenomics-v2-e2e-test]
             [bitecho.wire-negotiation-test]
             [clojure.string :as str]

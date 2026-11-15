@@ -136,11 +136,59 @@
       :escrows {}
       :settled-escrow-ids #{}
       :settled-escrow-order []
-      ;; Subnet & Economy configuration (Milestone 12)
+      ;; Subnet & Economy configuration (Milestone 12 / D23)
       :subnet-id (str (or (:subnet-id cfg) "global"))
+      :network-uri (or (config/resolve-network-uri cfg)
+                       (when (contains? (set (vals config/network-uris)) (str (:subnet-id cfg)))
+                         (str (:subnet-id cfg)))
+                       "devnet.bitecho.org")
       :economy-enabled? (boolean (get cfg :economy-enabled? true))
       :burn-floor (long (or (:burn-floor cfg) (if (get cfg :economy-enabled? true) 100 0)))
-      :diagnostics (merge {:subnet-mismatch-dropped 0} (:diagnostics cfg))})))
+      :diagnostics (merge {:subnet-mismatch-dropped 0
+                           :network-replay-rejected 0}
+                          (:diagnostics cfg))})))
+
+(defn- state-network-uri
+  [state]
+  (or (:network-uri state)
+      (config/resolve-network-uri (:config state))
+      (when (contains? (set (vals config/network-uris)) (str (:subnet-id state)))
+        (str (:subnet-id state)))
+      "devnet.bitecho.org"))
+
+(defn- transfer-validation-opts
+  [state]
+  (let [net-uri (state-network-uri state)]
+    {:network-uri net-uri
+     :strict-network-uri? (boolean (or (:strict-network-uri? state)
+                                       (get-in state [:config :strict-network-uri?])
+                                       (= net-uri "mainnet.bitecho.org")
+                                       (= (:network state) :mainnet)
+                                       (= (get-in state [:config :network]) :mainnet)))}))
+
+(defn foreign-network-replay?
+  "Returns true if `item` (an event, message, payload map, or Transfer) carries an explicit
+   non-blank `:network-uri` that disagrees with `(state-network-uri state)`, OR if `state` enforces
+   `:strict-network-uri?` (Mainnet) and `item` is a transfer missing `:network-uri`."
+  [state item]
+  (when (or (map? item) (record? item))
+    (let [expected-uri (state-network-uri state)
+          item-uri (or (:network-uri item) (get item "network-uri") (get item "network_uri"))
+          strict? (:strict-network-uri? (transfer-validation-opts state))
+          is-transfer? (and (contains? item :sender)
+                            (contains? item :receiver)
+                            (contains? item :amount)
+                            (contains? item :seq))]
+      (boolean
+       (or (and (string? expected-uri)
+                (not (string/blank? expected-uri))
+                (string? item-uri)
+                (not (string/blank? item-uri))
+                (not= expected-uri item-uri))
+           (and strict?
+                is-transfer?
+                (or (not (string? item-uri))
+                    (string/blank? item-uri))))))))
 
 (defn fifo-track
   "Maintains a bounded set and order vector with deterministic FIFO eviction.
@@ -1285,6 +1333,27 @@
                    :epoch-to-message-roles new-epoch-to-roles)
      :commands commands}))
 
+(defn- thaw-payload-data
+  "Deserializes a payload map, trying canonical Fressian first.
+   If decoding fails or does not yield a map/record, falls back to legacy EDN string parsing.
+   Always recursively strips untrusted shell-boundary crypto tags."
+  [payload-bytes]
+  (let [pb (to-byte-array payload-bytes)]
+    (or (try
+          (let [v (fressian/decode pb)]
+            (when (or (map? v) (record? v))
+              (fressian/strip-untrusted-crypto-tags v)))
+          (catch #?(:clj Exception :cljs :default) _ nil))
+        (try
+          (let [payload-str (fressian/bytes->utf8 pb)
+                edn-val (edn/read-string {:default tagged-literal
+                                          :readers {'bitecho.economy.account.Transfer account/map->Transfer
+                                                    'bitecho.economy.account.AccountState account/map->AccountState}}
+                                         payload-str)]
+            (when (or (map? edn-val) (record? edn-val))
+              (fressian/strip-untrusted-crypto-tags edn-val)))
+          (catch #?(:clj Exception :cljs :default) _ nil)))))
+
 (defn- handle-receive-gossip
   "Handles an incoming Murmur gossip message.
    Validates Sieve signature and burn-amount before accepting into the cache.
@@ -1295,6 +1364,11 @@
         murmur-max-cache-size (:murmur-max-cache-size cfg)
         raw-message (:message event)
         payload (when (map? raw-message) (:payload raw-message))
+        payload-data (when (bytes? payload) (thaw-payload-data payload))
+        inner-transfer (when (map? payload-data) (:transfer payload-data))
+        replay? (or (foreign-network-replay? state raw-message)
+                    (foreign-network-replay? state payload-data)
+                    (foreign-network-replay? state inner-transfer))
         msg-id (when (bytes? payload)
                  (basalt/bytes->hex (crypto/sha256 payload)))
         message (when msg-id (assoc raw-message :message-id msg-id))
@@ -1303,68 +1377,74 @@
         econ-enabled? (get-in state [:config :economy-enabled?] (get state :economy-enabled? true))
         floor (burn/effective-signaling-burn-floor state)
         valid-burn? (and (number? burn-amt) (>= burn-amt floor))
-        valid-signature? (when (and valid-burn? message) (sieve/validate-message message))]
-    (if (and (some? msg-id) valid-burn? valid-signature?)
-      (let [non-self-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
-            hop-sender-hex (peer-pubkey-hex (:sender event))
-            non-sender-peers (if hop-sender-hex
-                               (filterv #(not= (peer-pubkey-hex %) hop-sender-hex) non-self-peers)
-                               non-self-peers)
-            extracted-peers non-sender-peers
-            gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
-            new-message? (some? (:message gossip-result))
-            sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
-            node-pk (when-let [np (:node-pubkey state)] (if (string? np) np (basalt/bytes->hex np)))
-            current-epoch (or (:epoch state) 0)]
-        (if (or (not econ-enabled?) (zero? (long (or burn-amt 0))))
-          (record-accepted-gossip state message gossip-result new-message? current-epoch)
-          (if (consensus-mode? state)
-            (if new-message?
-              (let [burn-rid (str "gossip-burn:" msg-id)
-                    already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
-                                        (contains? (or (:executed-receipt-ids state) #{}) burn-rid))]
-                (if already-burned?
-                  (record-accepted-gossip state message gossip-result new-message? current-epoch)
-                  (if (and (not= sender node-pk) sender)
-                    (if (and (get-in state [:ledger sender])
-                             (>= (spendable-balance state sender) burn-amt))
+        valid-signature? (when (and (not replay?) valid-burn? message) (sieve/validate-message message))]
+    (if replay?
+      {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+       :commands [{:type :diagnose
+                   :effect :diagnose
+                   :reason :network-replay-rejected
+                   :expected-network-uri (state-network-uri state)}]}
+      (if (and (some? msg-id) valid-burn? valid-signature?)
+        (let [non-self-peers (exclude-self-peers state (basalt/extract-peers (:basalt-view state)))
+              hop-sender-hex (peer-pubkey-hex (:sender event))
+              non-sender-peers (if hop-sender-hex
+                                 (filterv #(not= (peer-pubkey-hex %) hop-sender-hex) non-self-peers)
+                                 non-self-peers)
+              extracted-peers non-sender-peers
+              gossip-result (murmur/receive-gossip (:murmur-cache state) message rng extracted-peers murmur-k murmur-max-cache-size)
+              new-message? (some? (:message gossip-result))
+              sender (when-let [s (:sender message)] (if (string? s) s (basalt/bytes->hex s)))
+              node-pk (when-let [np (:node-pubkey state)] (if (string? np) np (basalt/bytes->hex np)))
+              current-epoch (or (:epoch state) 0)]
+          (if (or (not econ-enabled?) (zero? (long (or burn-amt 0))))
+            (record-accepted-gossip state message gossip-result new-message? current-epoch)
+            (if (consensus-mode? state)
+              (if new-message?
+                (let [burn-rid (str "gossip-burn:" msg-id)
+                      already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
+                                          (contains? (or (:executed-receipt-ids state) #{}) burn-rid))]
+                  (if already-burned?
+                    (record-accepted-gossip state message gossip-result new-message? current-epoch)
+                    (if (and (not= sender node-pk) sender)
+                      (if (and (get-in state [:ledger sender])
+                               (>= (spendable-balance state sender) burn-amt))
+                        (let [staged (stage-receipt state {:receipt-id burn-rid
+                                                           :type :burn
+                                                           :sender sender
+                                                           :amount burn-amt})]
+                          (if (:ok? staged)
+                            (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
+                            {:state state :commands []}))
+                        {:state state :commands []})
                       (let [staged (stage-receipt state {:receipt-id burn-rid
                                                          :type :burn
                                                          :sender sender
                                                          :amount burn-amt})]
                         (if (:ok? staged)
                           (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
-                          {:state state :commands []}))
-                      {:state state :commands []})
-                    (let [staged (stage-receipt state {:receipt-id burn-rid
-                                                       :type :burn
-                                                       :sender sender
-                                                       :amount burn-amt})]
-                      (if (:ok? staged)
-                        (record-accepted-gossip (:state staged) message gossip-result new-message? current-epoch)
-                        {:state state :commands []})))))
-              (record-accepted-gossip state message gossip-result new-message? current-epoch))
-            ;; Standalone non-consensus mode
-            (let [burn-rid (str "gossip-burn:" msg-id)
-                  already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
-                                      (contains? (or (:executed-receipt-ids state) #{}) burn-rid))
-                  burn-deduction (when (and new-message? (not already-burned?) (not= sender node-pk) sender)
-                                   (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
-              (if (and new-message? (not already-burned?) (not= sender node-pk) (nil? burn-deduction))
-                {:state state :commands []}
-                (let [state-with-burn (if (and burn-deduction (not already-burned?))
-                                        (let [[next-known next-known-ord] (fifo-track (:known-receipt-ids state)
-                                                                                      (:known-receipt-order state)
-                                                                                      burn-rid
-                                                                                      (long (or (get-in state [:config :max-tracked-receipts]) 10000)))]
-                                          (-> state
-                                              (assoc :ledger (:ledger burn-deduction))
-                                              (assoc :known-receipt-ids next-known
-                                                     :known-receipt-order next-known-ord)
-                                              (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt)))
-                                        state)]
-                  (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch)))))))
-      {:state state :commands []})))
+                          {:state state :commands []})))))
+                (record-accepted-gossip state message gossip-result new-message? current-epoch))
+              ;; Standalone non-consensus mode
+              (let [burn-rid (str "gossip-burn:" msg-id)
+                    already-burned? (or (contains? (or (:known-receipt-ids state) #{}) burn-rid)
+                                        (contains? (or (:executed-receipt-ids state) #{}) burn-rid))
+                    burn-deduction (when (and new-message? (not already-burned?) (not= sender node-pk) sender)
+                                     (burn/deduct-signaling-burn (:ledger state) sender burn-amt))]
+                (if (and new-message? (not already-burned?) (not= sender node-pk) (nil? burn-deduction))
+                  {:state state :commands []}
+                  (let [state-with-burn (if (and burn-deduction (not already-burned?))
+                                          (let [[next-known next-known-ord] (fifo-track (:known-receipt-ids state)
+                                                                                        (:known-receipt-order state)
+                                                                                        burn-rid
+                                                                                        (long (or (get-in state [:config :max-tracked-receipts]) 10000)))]
+                                            (-> state
+                                                (assoc :ledger (:ledger burn-deduction))
+                                                (assoc :known-receipt-ids next-known
+                                                       :known-receipt-order next-known-ord)
+                                                (update-in [:epoch-burns current-epoch] (fnil + 0) burn-amt)))
+                                          state)]
+                    (record-accepted-gossip state-with-burn message gossip-result new-message? current-epoch)))))))
+        {:state state :commands []}))))
 
 (defn- transition-to-ready
   "Transitions node to Ready for message-id and emits signed :send-contagion-ready."
@@ -1417,70 +1497,52 @@
               {:state state-with-echo :commands []}))
           {:state state :commands []})))))
 
-(defn- thaw-payload-data
-  "Deserializes a payload map, trying canonical Fressian first.
-   If decoding fails or does not yield a map/record, falls back to legacy EDN string parsing.
-   Always recursively strips untrusted shell-boundary crypto tags."
-  [payload-bytes]
-  (let [pb (to-byte-array payload-bytes)]
-    (or (try
-          (let [v (fressian/decode pb)]
-            (when (or (map? v) (record? v))
-              (fressian/strip-untrusted-crypto-tags v)))
-          (catch #?(:clj Exception :cljs :default) _ nil))
-        (try
-          (let [payload-str (fressian/bytes->utf8 pb)
-                edn-val (edn/read-string {:default tagged-literal
-                                          :readers {'bitecho.economy.account.Transfer account/map->Transfer
-                                                    'bitecho.economy.account.AccountState account/map->AccountState}}
-                                         payload-str)]
-            (when (or (map? edn-val) (record? edn-val))
-              (fressian/strip-untrusted-crypto-tags edn-val)))
-          (catch #?(:clj Exception :cljs :default) _ nil)))))
-
 (defn- apply-transfer-payload-to-ledger
   "Deserializes a transfer from payload-bytes and applies it to ledger if valid.
    Supports canonical Fressian payload bytes as well as legacy EDN UTF-8 strings.
+   Optional `opts` map (`:network-uri`, `:strict-network-uri?`) enforces cross-network replay protection.
    Returns the updated ledger map, or nil if invalid/failed."
-  [ledger payload-bytes]
-  (try
-    (let [pb (to-byte-array payload-bytes)
-          payload-data (thaw-payload-data pb)
-          transfer-map (cond
-                         (and (map? payload-data) (:transfer payload-data)) (:transfer payload-data)
-                         (record? payload-data) payload-data
-                         :else nil)]
-      (if transfer-map
-        (let [transfer-map (if (tagged-literal? transfer-map)
-                             (:form transfer-map)
-                             (into {} transfer-map))
-              sig (cond
-                    (fressian/bytes? (:signature transfer-map)) (:signature transfer-map)
-                    (vector? (:signature transfer-map)) (to-byte-array (:signature transfer-map))
-                    (string? (:signature transfer-map)) (if (re-matches #"^[0-9a-fA-F]+$" (:signature transfer-map))
-                                                          (fressian/hex->bytes (:signature transfer-map))
-                                                          (fressian/utf8->bytes (:signature transfer-map)))
-                    (and (seqable? (:signature transfer-map)) (every? number? (:signature transfer-map))) (to-byte-array (:signature transfer-map))
-                    :else empty-bytes)
-              transfer-map (assoc transfer-map :signature sig)
-              transfer (account/map->Transfer transfer-map)
-              sender (:sender transfer)
-              sender-state (get ledger sender)]
-          (if (and sender-state (account/validate-transfer sender-state transfer))
-            (let [ledger-with-receiver (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
-                                         (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
-                                         ledger)]
-              (account/apply-transfer ledger-with-receiver transfer))
-            nil))
-        nil))
-    (catch #?(:clj Exception :cljs :default) _
-      nil)))
+  ([ledger payload-bytes]
+   (apply-transfer-payload-to-ledger ledger payload-bytes nil))
+  ([ledger payload-bytes opts]
+   (try
+     (let [pb (to-byte-array payload-bytes)
+           payload-data (thaw-payload-data pb)
+           transfer-map (cond
+                          (and (map? payload-data) (:transfer payload-data)) (:transfer payload-data)
+                          (record? payload-data) payload-data
+                          :else nil)]
+       (if transfer-map
+         (let [transfer-map (if (tagged-literal? transfer-map)
+                              (:form transfer-map)
+                              (into {} transfer-map))
+               sig (cond
+                     (fressian/bytes? (:signature transfer-map)) (:signature transfer-map)
+                     (vector? (:signature transfer-map)) (to-byte-array (:signature transfer-map))
+                     (string? (:signature transfer-map)) (if (re-matches #"^[0-9a-fA-F]+$" (:signature transfer-map))
+                                                           (fressian/hex->bytes (:signature transfer-map))
+                                                           (fressian/utf8->bytes (:signature transfer-map)))
+                     (and (seqable? (:signature transfer-map)) (every? number? (:signature transfer-map))) (to-byte-array (:signature transfer-map))
+                     :else empty-bytes)
+               transfer-map (assoc transfer-map :signature sig)
+               transfer (account/map->Transfer transfer-map)
+               sender (:sender transfer)
+               sender-state (get ledger sender)]
+           (if (and sender-state (account/validate-transfer sender-state transfer opts))
+             (let [ledger-with-receiver (if (and (:receiver transfer) (not (contains? ledger (:receiver transfer))))
+                                          (assoc ledger (:receiver transfer) (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                          ledger)]
+               (account/apply-transfer ledger-with-receiver transfer opts))
+             nil))
+         nil))
+     (catch #?(:clj Exception :cljs :default) _
+       nil))))
 
 (defn- apply-payload-to-ledger
   "Attempts to parse a payload and apply any transfer to the ledger.
    Returns the updated state if successful, or the original state on failure."
   [state payload-bytes]
-  (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger state) payload-bytes)]
+  (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger state) payload-bytes (transfer-validation-opts state))]
     (assoc state :ledger new-ledger)
     state))
 
@@ -1524,7 +1586,7 @@
 
          :transfer
          (if-let [pb (:payload-bytes r)]
-           (if-let [new-ledger (apply-transfer-payload-to-ledger ledger (to-byte-array pb))]
+           (if-let [new-ledger (apply-transfer-payload-to-ledger ledger (to-byte-array pb) (transfer-validation-opts state))]
              new-ledger
              ledger)
            ledger)
@@ -1743,7 +1805,7 @@
 
                                        :transfer
                                        (if-let [pb (:payload-bytes r)]
-                                         (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger s) (to-byte-array pb))]
+                                         (if-let [new-ledger (apply-transfer-payload-to-ledger (:ledger s) (to-byte-array pb) (transfer-validation-opts s))]
                                            (assoc s :ledger new-ledger)
                                            (update s :failed-receipts-count (fnil inc 0)))
                                          (update s :failed-receipts-count (fnil inc 0)))
@@ -2205,25 +2267,33 @@
   (let [p (or (:payload event) (when (:transfer event) (fressian/encode-canonical {:transfer (into {} (:transfer event))})))
         payload-bytes (to-byte-array p)
         message-id (:message-id event)
-        event-sender (:sender event)]
+        event-sender (:sender event)
+        payload-data (thaw-payload-data payload-bytes)
+        raw-transfer (or (:transfer event)
+                         (when (and (map? payload-data) (:transfer payload-data))
+                           (:transfer payload-data)))
+        transfer-map (when raw-transfer
+                       (let [m (if (tagged-literal? raw-transfer)
+                                 (:form raw-transfer)
+                                 (into {} raw-transfer))
+                             sig (cond
+                                   (fressian/bytes? (:signature m)) (:signature m)
+                                   (vector? (:signature m)) (to-byte-array (:signature m))
+                                   (string? (:signature m)) (if (re-matches #"^[0-9a-fA-F]+$" (:signature m))
+                                                              (fressian/hex->bytes (:signature m))
+                                                              (fressian/utf8->bytes (:signature m)))
+                                   (and (seqable? (:signature m)) (every? number? (:signature m))) (to-byte-array (:signature m))
+                                   :else empty-bytes)]
+                         (assoc m :signature sig)))
+        replay? (or (foreign-network-replay? state payload-data)
+                    (foreign-network-replay? state transfer-map))
+        replay-cmd {:type :diagnose
+                    :effect :diagnose
+                    :reason :network-replay-rejected
+                    :expected-network-uri (state-network-uri state)
+                    :actual-network-uri (or (:network-uri transfer-map) (:network-uri payload-data))}]
     (if (consensus-mode? state)
-      (let [payload-data (thaw-payload-data payload-bytes)
-            raw-transfer (when (and (map? payload-data) (:transfer payload-data))
-                           (:transfer payload-data))
-            transfer-map (when raw-transfer
-                           (let [m (if (tagged-literal? raw-transfer)
-                                     (:form raw-transfer)
-                                     (into {} raw-transfer))
-                                 sig (cond
-                                       (fressian/bytes? (:signature m)) (:signature m)
-                                       (vector? (:signature m)) (to-byte-array (:signature m))
-                                       (string? (:signature m)) (if (re-matches #"^[0-9a-fA-F]+$" (:signature m))
-                                                                  (fressian/hex->bytes (:signature m))
-                                                                  (fressian/utf8->bytes (:signature m)))
-                                       (and (seqable? (:signature m)) (every? number? (:signature m))) (to-byte-array (:signature m))
-                                       :else empty-bytes)]
-                             (assoc m :signature sig)))
-            transfer (when transfer-map (account/map->Transfer transfer-map))
+      (let [transfer (when (and (not replay?) transfer-map) (account/map->Transfer transfer-map))
             sender (when transfer (:sender transfer))
             sender-authorized? (or (nil? event-sender) (= sender event-sender))
             proj-ledger (projected-ledger state)
@@ -2231,7 +2301,7 @@
             valid-transfer? (and transfer
                                  sender-authorized?
                                  sender-state
-                                 (account/validate-transfer sender-state transfer)
+                                 (account/validate-transfer sender-state transfer (transfer-validation-opts state))
                                  (>= (spendable-balance state sender) (long (or (:amount transfer) 0))))
             staged-transfer (when valid-transfer?
                               (let [rid (str "transfer:" (or (account/transfer-hash transfer)
@@ -2243,31 +2313,28 @@
                                                       :seq (:seq transfer)
                                                       :amount (:amount transfer)
                                                       :payload-bytes (mapv long payload-bytes)})))
-            state-staged (if (and staged-transfer (:ok? staged-transfer))
-                           (:state staged-transfer)
-                           state)
+            state-staged (cond
+                           replay? (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+                           (and staged-transfer (:ok? staged-transfer)) (:state staged-transfer)
+                           :else state)
             gossip-cmds (if staged-transfer
                           (receipt-gossip-commands state staged-transfer)
                           [])]
         {:state state-staged
-         :commands (into [{:type :app-event :event-name :on-deliver
-                           :payload (:payload event) :message-id message-id}]
-                         gossip-cmds)})
+         :commands (cond-> [{:type :app-event :event-name :on-deliver
+                             :payload (:payload event) :message-id message-id}]
+                     replay? (conj replay-cmd)
+                     (seq gossip-cmds) (into gossip-cmds))})
       (let [sender-authorized? (or (nil? event-sender)
-                                   (let [payload-data (thaw-payload-data payload-bytes)
-                                         raw-transfer (when (and (map? payload-data) (:transfer payload-data))
-                                                        (:transfer payload-data))
-                                         transfer-map (when raw-transfer
-                                                        (if (tagged-literal? raw-transfer)
-                                                          (:form raw-transfer)
-                                                          (into {} raw-transfer)))]
-                                     (= (:sender transfer-map) event-sender)))
-            state-with-applied-ledger (if sender-authorized?
-                                        (apply-payload-to-ledger state payload-bytes)
-                                        state)]
+                                   (= (:sender transfer-map) event-sender))
+            state-with-applied-ledger (cond
+                                        replay? (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+                                        sender-authorized? (apply-payload-to-ledger state payload-bytes)
+                                        :else state)]
         {:state state-with-applied-ledger
-         :commands [{:type :app-event :event-name :on-deliver
-                     :payload (:payload event) :message-id message-id}]}))))
+         :commands (cond-> [{:type :app-event :event-name :on-deliver
+                             :payload (:payload event) :message-id message-id}]
+                     replay? (conj replay-cmd))}))))
 
 (defn- handle-signaling-burn
   "Handles a direct signaling burn event, deducting burn from the sender's account
@@ -3179,7 +3246,7 @@
 
          :transfer
          (if-let [pb (:payload-bytes receipt)]
-           (some? (apply-transfer-payload-to-ledger (projected-ledger state) (to-byte-array pb)))
+           (some? (apply-transfer-payload-to-ledger (projected-ledger state) (to-byte-array pb) (transfer-validation-opts state)))
            false)
 
          :settle-intent
@@ -3676,17 +3743,29 @@
    returns a map with :state (new state) and :commands (side-effects to perform)."
   [state event]
   (let [event-subnet (or (:subnet-id event) (get event "subnet-id"))
-        state-subnet (or (:subnet-id state) "global")]
-    (if (and (some? event-subnet)
-             (not= (str event-subnet) "*")
-             (not= (str state-subnet) "*")
-             (not= (str event-subnet) (str state-subnet)))
+        state-subnet (or (:subnet-id state) "global")
+        net-uri (state-network-uri state)]
+    (cond
+      (and (some? event-subnet)
+           (not= (str event-subnet) "*")
+           (not= (str state-subnet) "*")
+           (not (config/equivalent-subnet-id? event-subnet state-subnet net-uri)))
       {:state (update-in state [:diagnostics :subnet-mismatch-dropped] (fnil inc 0))
        :commands [{:type :diagnose
                    :effect :diagnose
                    :reason :subnet-mismatch-dropped
                    :event-subnet event-subnet
                    :state-subnet state-subnet}]}
+
+      (foreign-network-replay? state event)
+      {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+       :commands [{:type :diagnose
+                   :effect :diagnose
+                   :reason :network-replay-rejected
+                   :expected-network-uri net-uri
+                   :actual-network-uri (or (:network-uri event) (get event "network-uri"))}]}
+
+      :else
       (case (:type event)
         :contagion-broadcast (handle-contagion-broadcast state event)
         :tick (handle-tick state event)

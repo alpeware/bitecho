@@ -545,15 +545,21 @@
                                                (or (:port ninfo) 8000)
                                                pk-bytes)))
         overrides (extract-top-level-overrides cfg cluster-cfg)
-        network (or (:network cfg) (get-in cfg [:cluster :network]) :mainnet)
-        base-proto-cfg (if (= network :devnet)
-                         config/devnet-config
+        explicit-network (or (:network cfg) (get-in cfg [:cluster :network]))
+        base-proto-cfg (case explicit-network
+                         :devnet config/devnet-config
+                         :testnet config/testnet-config
+                         :mainnet config/mainnet-config
                          config/default-config)
+        net-uri (or (config/resolve-network-uri cfg)
+                    (:network-uri base-proto-cfg)
+                    "devnet.bitecho.org")
         proto-cfg (merge base-proto-cfg
                          (get cfg :protocol {})
                          (get cluster-cfg :protocol {})
                          overrides
-                         {:validators validators
+                         {:network-uri net-uri
+                          :validators validators
                           :mesh-nodes mesh-nodes})
         base-state (sm/init-state initial-peers pubkey-hex proto-cfg)]
     (merge base-state
@@ -708,6 +714,14 @@
          (contains? (:cluster cfg) :nodes)
          (not (map? (get-in cfg [:cluster :nodes]))))
     {:valid? false :error "[:cluster :nodes] must be a map"}
+
+    (and (or (= (:network cfg) :mainnet)
+             (= (get-in cfg [:cluster :network]) :mainnet)
+             (= (config/resolve-network-uri cfg) "mainnet.bitecho.org"))
+         (some? (or (:custody-privkey cfg)
+                    (get-in cfg [:protocol :custody-privkey])
+                    (get-in cfg [:cluster :custody-privkey]))))
+    {:valid? false :error "Mainnet configuration must not contain hot :custody-privkey (A-D23-4)"}
 
     :else
     (let [node-id (or (:node/id cfg) (:node-id cfg))

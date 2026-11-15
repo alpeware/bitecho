@@ -35,16 +35,20 @@
     :else nil))
 
 (defn canonical-escrow-id-str
-  "Formats canonical string for escrow identification."
-  [payer receiver amount deliverable-hash created-epoch expires-epoch nonce]
-  (str "bitecho-escrow-v1|"
-       (normalize-party payer) "|"
-       (normalize-party receiver) "|"
-       (long (if (integer? amount) amount (or amount 0))) "|"
-       (normalize-hex deliverable-hash) "|"
-       (long (if (integer? created-epoch) created-epoch (or created-epoch 0))) "|"
-       (long (if (integer? expires-epoch) expires-epoch (or expires-epoch 0))) "|"
-       (or nonce "0")))
+  "Formats canonical string for escrow identification, optionally scoped to network-uri."
+  ([payer receiver amount deliverable-hash created-epoch expires-epoch nonce]
+   (canonical-escrow-id-str payer receiver amount deliverable-hash created-epoch expires-epoch nonce nil))
+  ([payer receiver amount deliverable-hash created-epoch expires-epoch nonce network-uri]
+   (str "bitecho-escrow-v1|"
+        (when (and (string? network-uri) (not (str/blank? network-uri)))
+          (str (str/trim network-uri) "|"))
+        (normalize-party payer) "|"
+        (normalize-party receiver) "|"
+        (long (if (integer? amount) amount (or amount 0))) "|"
+        (normalize-hex deliverable-hash) "|"
+        (long (if (integer? created-epoch) created-epoch (or created-epoch 0))) "|"
+        (long (if (integer? expires-epoch) expires-epoch (or expires-epoch 0))) "|"
+        (or nonce "0"))))
 
 (defn compute-escrow-id
   "Computes deterministic 64-character SHA-256 hex escrow-id from escrow parameters."
@@ -57,9 +61,12 @@
                           (get m "deliverable-hash") (get m "puzzle-hash"))
                       (or (:created-epoch m) (get m "created_epoch") (get m "created-epoch") 0)
                       (or (:expires-epoch m) (get m "expires_epoch") (get m "expires-epoch"))
-                      (or (:nonce m) (get m "nonce") "0")))
+                      (or (:nonce m) (get m "nonce") "0")
+                      (or (:network-uri m) (get m "network_uri") (get m "network-uri"))))
   ([payer receiver amount deliverable-hash created-epoch expires-epoch nonce]
-   (let [s (canonical-escrow-id-str payer receiver amount deliverable-hash created-epoch expires-epoch nonce)
+   (compute-escrow-id payer receiver amount deliverable-hash created-epoch expires-epoch nonce nil))
+  ([payer receiver amount deliverable-hash created-epoch expires-epoch nonce network-uri]
+   (let [s (canonical-escrow-id-str payer receiver amount deliverable-hash created-epoch expires-epoch nonce network-uri)
          b (fressian/utf8->bytes s)]
      (basalt/bytes->hex (crypto/sha256 b)))))
 

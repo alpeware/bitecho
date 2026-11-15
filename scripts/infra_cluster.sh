@@ -582,7 +582,7 @@ Autonomous agents and operators connecting to the live Bitecho devnet mesh shoul
 
 - **[Light Node Onboarding & Operator Guide (\`/ONBOARDING.md\`)](/ONBOARDING.md)** (also at [\`/onboarding\`](/onboarding)): Step-by-step instructions to clone, launch a light node (\`--auto-sync\` enabled by default in \`serve\` mode), resolve directory peers, and participate in the network.
 - **[Light Node Skill & JSONL Stdio Protocol Reference (\`/skill/SKILL.md\`)](/skill/SKILL.md)** (also at [\`/SKILL.md\`](/SKILL.md)): Complete CLI command reference, flags (\`--auto-sync\`, \`--sync-interval-ms\`, \`--autonomous\`, \`--transport\`, \`--ingress-tcp-port\`, \`--candidates\`), and JSONL \`stdin\`/\`stdout\` daemon protocol specification.
-- **[Live Devnet Bootstrap Descriptor (\`/devnet/bootstrap.txt\`)](/devnet/bootstrap.txt)**: Signed 3-validator BFT cluster bootstrap descriptor (\`node1\`, \`node2\`, \`node3\`).
+- **[Live Devnet Bootstrap Descriptor (\`/devnet/bootstrap.txt\`)](/devnet/bootstrap.txt)**: Signed 6-validator BFT cluster bootstrap descriptor (\`node1..node3\`, \`ns1..ns3\`).
 - **[Online Directory Peers](/nexus)**: Verified directory descriptors for active agents ([\`/nexus\`](/nexus), [\`/axiom\`](/axiom)).
 - **[Human Anchor Web App (\`/app/\`)](/app/)**: Browser-based WebRTC DataChannel node & hardware-key dashboard.
 
@@ -780,6 +780,13 @@ EOF_GIT_INDEX
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding.md"
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding/index.md"
+    if [[ -f "${ROOT_DIR}/devnet/bootstrap.txt" && -f "${ROOT_DIR}/devnet/bootstrap.edn" ]]; then
+      ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "mkdir -p /var/www/clj-web/public/devnet"
+      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        "${ROOT_DIR}/devnet/bootstrap.txt" "${SSH_USER}@${ip}:/var/www/clj-web/public/devnet/bootstrap.txt"
+      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        "${ROOT_DIR}/devnet/bootstrap.edn" "${SSH_USER}@${ip}:/var/www/clj-web/public/devnet/bootstrap.edn"
+    fi
     if [[ ( "${DEPLOY_LIVE:-0}" == "1" || "${1:-}" == "--deploy" ) && -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
       rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/dist/bitecho-browser.js" \

@@ -496,7 +496,8 @@
             "evicted-hot" "evicted-unpinned" "cache-misses" "cid-mismatch" "dangling-pointers"
             "builders-stewards" "mesh-validators" "anchor-agent-users"
             "invalid-lab-subnet-rejected" "bip-admission-rejected" "sybil-bounty-claim-rejected"
-            "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"}
+            "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"
+            "network-uri" "network-replay-rejected"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)
@@ -660,8 +661,8 @@
                                     (collect-keys populated-light)
                                     (collect-keys base-anchor)
                                     (collect-keys base-conn)))))
-        ;; All 44 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
-        (is (= 44 (count (keys base-light))))
+        ;; All 45 top-level init-light-state keys and all non-secret init-anchor-state / initial-conn-state keys survive intact
+        (is (= 45 (count (keys base-light))))
         (is (= (set (keys base-light)) (set (keys sanitized-light))))
         (is (= (set (keys base-light)) (set (keys @loaded-light))))
         (is (= (disj (set (keys base-anchor)) :privkey-bytes)

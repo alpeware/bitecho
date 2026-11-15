@@ -229,4 +229,20 @@ Bitecho implements a pure Sans-IO 4-layer autonomous protocol evolution and gove
 5. **First-Class Light-Node CLI & Wire Verbs (`INV-D22-3`):**
    - All 61 light-node CLI verbs (including `bip-submit`, `bip-consent`, `bip-object`, `bip-status`, `bounty-create`, `bounty-settle`, and `offer --wait-open-ms`) execute across JVM, Node.js, and Browser runtimes and replicate governance state over signed `:governance-replicate` Fressian gossip envelopes.
 
+---
+
+## 6. Network URI Separation, Cross-Network Replay Protection, & Canary Release Process (`RELEASE.md`)
+
+1. **Canonical Network URIs & Root Subnet Equivalence (`bitecho.config`):**
+   - Bitecho defines three canonical root network URIs: `:devnet` -> `"devnet.bitecho.org"`, `:testnet` -> `"testnet.bitecho.org"`, and `:mainnet` -> `"mainnet.bitecho.org"`.
+   - Each network URI is a valid root `:subnet/id` (`root-subnet-id?`) that validates in `bitecho.core.subnet/validate-subnet-policy` without requiring `:subnet/parent-id`.
+   - During rolling `N` / `N+1` upgrades, `equivalent-subnet-id?` treats legacy `"global"` as equivalent to the active network's root URI while strictly isolating `"devnet.bitecho.org"`, `"testnet.bitecho.org"`, and `"mainnet.bitecho.org"` from one another.
+2. **Cryptographic Cross-Network Replay Protection (`bitecho.economy.account`, `bitecho.economy.escrow`, `bitecho.state-machine`, `bitecho.light-node.core`):**
+   - `Transfer` signatures bind `:network-uri`, and `escrow/compute-escrow-id` (8-arity) binds `network-uri` into `bitecho-escrow-id-v1`.
+   - Validators and light nodes reject foreign-network transfers and escrow intents fail-closed, incrementing `[:diagnostics :network-replay-rejected]` and emitting a `:diagnose` effect (`Rule 5`).
+   - Mainnet (`config/mainnet-config`) enforces `:strict-network-uri? true` (rejecting unscoped transfers) and `mesh/validate-node-config` rejects hot `:custody-privkey` on Mainnet (`A-D23-4`).
+3. **Formal Release Runbook & Canary Rolling Deploy ([`RELEASE.md`](../RELEASE.md)):**
+   - Defines the 6-gate pre-release verification pipeline, deterministic artifact SHA-256 attestation, canary rolling order (`ns3` -> `node3` -> E2E gate -> `ns2` -> `ns1` -> `node2` -> `node1`), and `./scripts/cluster.sh rollback`.
+
+
 

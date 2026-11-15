@@ -10,7 +10,66 @@
      - Ê ≈ 0.7 · E   (echo threshold)
      - R̂ ≈ 0.3 · R   (ready threshold — low to ensure contagion spread)
      - D̂ ≈ 0.8 · D   (delivery threshold — high for safety)
-     - G (murmur-k) ≈ O(log N)")
+     - G (murmur-k) ≈ O(log N)"
+  (:require [clojure.string :as str]))
+
+;; ---------------------------------------------------------------------------
+;; Network URI Registry & Root Subnet Equivalence (Milestone D23)
+;; ---------------------------------------------------------------------------
+
+(def network-uris
+  "Canonical root network URIs for Devnet, Testnet, and Mainnet."
+  {:devnet  "devnet.bitecho.org"
+   :testnet "testnet.bitecho.org"
+   :mainnet "mainnet.bitecho.org"})
+
+(defn resolve-network-uri
+  "Resolves a network keyword (:devnet, :testnet, :mainnet), URI string, or config map
+   to its canonical network URI string (or nil if unspecified)."
+  [x]
+  (cond
+    (string? x) (when-not (str/blank? x) (str/trim x))
+    (keyword? x) (get network-uris x)
+    (map? x) (or (resolve-network-uri (:network-uri x))
+                 (resolve-network-uri (:network x))
+                 (resolve-network-uri (get-in x [:cluster :network-uri]))
+                 (resolve-network-uri (get-in x [:cluster :network]))
+                 (resolve-network-uri (get-in x [:protocol :network-uri]))
+                 (resolve-network-uri (get-in x [:protocol :network])))
+    :else nil))
+
+(def root-subnet-ids
+  "Set of recognized root subnet identifiers (legacy 'global' / 'validator-core' plus network URIs)."
+  #{"devnet.bitecho.org"
+    "testnet.bitecho.org"
+    "mainnet.bitecho.org"
+    "bitecho.org"
+    "global"
+    "validator-core"})
+
+(defn root-subnet-id?
+  "Returns true if sid is a recognized root subnet identifier."
+  [sid]
+  (contains? root-subnet-ids (str sid)))
+
+(defn equivalent-subnet-id?
+  "Returns true if subnet identifiers s1 and s2 refer to the same subnet.
+   During N/N+1 rolling upgrades, legacy 'global' is equivalent to the active
+   network's root URI (e.g. 'devnet.bitecho.org'), while distinct explicit
+   network URIs ('devnet.bitecho.org' vs 'testnet.bitecho.org' vs 'mainnet.bitecho.org')
+   are NEVER equivalent."
+  ([s1 s2]
+   (equivalent-subnet-id? s1 s2 "devnet.bitecho.org"))
+  ([s1 s2 active-network-uri]
+   (let [a (str (or s1 "global"))
+         b (str (or s2 "global"))
+         net-uri (str (or (resolve-network-uri active-network-uri) "devnet.bitecho.org"))
+         active-roots #{"global" net-uri}]
+     (or (= a "*")
+         (= b "*")
+         (= a b)
+         (and (contains? active-roots a)
+              (contains? active-roots b))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Defaults (suitable for small networks, N ≈ 10–50)
@@ -87,7 +146,9 @@
 (def devnet-config
   "Protocol parameters tuned for the 3-node Genesis Devnet cluster (N = 3)."
   (merge default-config
-         {:epoch-length-ms      10000
+         {:network              :devnet
+          :network-uri          "devnet.bitecho.org"
+          :epoch-length-ms      10000
           :tick-interval-ms     10000
           :murmur-k             2
           :basalt-max-view-size 10
@@ -113,7 +174,9 @@
    (devnet-6-config {}))
   ([overrides]
    (merge default-config
-          {:nodes                devnet-6-nodes
+          {:network              :devnet
+           :network-uri          "devnet.bitecho.org"
+           :nodes                devnet-6-nodes
            :validator-count      6
            :quorum-threshold     4
            :epoch-length-ms      10000
@@ -127,6 +190,32 @@
            :delivery-sample-size 5
            :delivery-threshold   4}
           overrides)))
+
+;; ---------------------------------------------------------------------------
+;; Testnet & Mainnet presets (Milestone D23 — BIP-001 Tokenomics v2.2 defaults)
+;; ---------------------------------------------------------------------------
+
+(def testnet-config
+  "Protocol parameters tuned for Testnet (testnet.bitecho.org) with BIP-001 Tokenomics v2.2 parameters."
+  (merge (devnet-6-config)
+         {:network                  :testnet
+          :network-uri              "testnet.bitecho.org"
+          :subnet-id                "testnet.bitecho.org"
+          :settlement-take-bps      150
+          :treasury-trailing-epochs 336
+          :burn-floor               50}))
+
+(def mainnet-config
+  "Protocol parameters tuned for Mainnet (mainnet.bitecho.org) with BIP-001 Tokenomics v2.2 parameters
+   and strict-network-uri? replay protection enabled."
+  (merge default-config
+         {:network                  :mainnet
+          :network-uri              "mainnet.bitecho.org"
+          :subnet-id                "mainnet.bitecho.org"
+          :strict-network-uri?      true
+          :settlement-take-bps      150
+          :treasury-trailing-epochs 336
+          :burn-floor               50}))
 
 ;; ---------------------------------------------------------------------------
 ;; Constructor
