@@ -228,3 +228,144 @@
       (is (false? (:ok? res)))
       (is (= :unauthorized-circle-member (:error res)))
       (is (= 1 (get-in (:state res) [:diagnostics :unauthorized-circle-member]))))))
+
+;; =============================================================================
+;; 5. Milestone D22: Fractal Subnet Governance Isolation & Epoch Activation
+;; =============================================================================
+
+(defspec ^{:doc "Property: Concurrent fractal subnets isolate BIPs, circle rosters, capability-backed bounties, regression vectors, and epoch-boundary policy activations (`A-D22-1`, `A-CARB-D22-1`, `A-CARB-D22-2`)."}
+  prop-fractal-subnet-governance-isolation-and-epoch-activation 25
+  (prop/for-all [act-epoch-dev (gen/choose 5 25)
+                 act-epoch-child (gen/choose 26 50)
+                 bounty-dev (gen/choose 1000 50000)
+                 bounty-child (gen/choose 500 25000)
+                 block-child-bip2? gen/boolean]
+                (let [sub-dev "bitecho-dev"
+                      sub-child "new-alexandria"
+                      dev-steward (make-kp "d22-dev-steward")
+                      dev-val (make-kp "d22-dev-val")
+                      dev-user (make-kp "d22-dev-user")
+                      child-steward (make-kp "d22-child-steward")
+                      child-val (make-kp "d22-child-val")
+                      child-user (make-kp "d22-child-user")
+                      builder (make-kp "d22-builder")
+                      auditor (make-kp "d22-auditor")
+                      ;; Register distinct circle rosters on sub-dev and sub-child
+                      st0 (-> (gov/init-governance-state)
+                              (gov/register-circle-member sub-dev :builders-stewards (:hex dev-steward) {:verified-commits 15})
+                              (gov/register-circle-member sub-dev :mesh-validators (:hex dev-val) {:participation 1.0 :stake 500000})
+                              (gov/register-circle-member sub-dev :anchor-agent-users (:hex dev-user) {:trailing-burned-ech 10000})
+                              (gov/register-circle-member sub-child :builders-stewards (:hex child-steward) {:verified-commits 8})
+                              (gov/register-circle-member sub-child :mesh-validators (:hex child-val) {:participation 0.95 :stake 300000})
+                              (gov/register-circle-member sub-child :anchor-agent-users (:hex child-user) {:trailing-burned-ech 4000}))
+                      ;; Cross-subnet circle member cannot vote on the other subnet
+                      cross-vote (gov/submit-circle-response
+                                  st0 sub-dev "BIP-001" :builders-stewards (:hex child-steward) {:stance :consent})
+                      ;; Submit BIP-001 on sub-dev and NAF-BIP-01 on sub-child with distinct policy-theta and activate-at-epoch
+                      theta-dev {:k-bps 4582 :max-stake-multiplier 2.2 :treasury-trailing-epochs 78}
+                      theta-child {:min-signaling-burn 25 :settlement-take-bps 100}
+                      bip-dev {:bip-id "BIP-001"
+                               :subnet-id sub-dev
+                               :title "Tokenomics v2.2"
+                               :author-pubkey (:hex dev-steward)
+                               :policy-theta theta-dev
+                               :activate-at-epoch act-epoch-dev
+                               :invariant-diff valid-invariant-diff
+                               :oracle-receipts valid-oracle-receipts}
+                      bip-child {:bip-id "NAF-BIP-01"
+                                 :subnet-id sub-child
+                                 :title "New Alexandria Local Burn Policy"
+                                 :author-pubkey (:hex child-steward)
+                                 :policy-theta theta-child
+                                 :activate-at-epoch act-epoch-child
+                                 :invariant-diff valid-invariant-diff
+                                 :oracle-receipts valid-oracle-receipts}
+                      res-bip-dev (gov/submit-bip st0 bip-dev (:private dev-steward))
+                      res-bip-child (gov/submit-bip (:state res-bip-dev) bip-child (:private child-steward))
+                      st1 (:state res-bip-child)
+                      ;; Create capability-backed bounties on both subnets with the SAME local bounty-id "bounty-1" to verify zero collision
+                      esc-dev (gov/create-bounty-escrow
+                               st1
+                               {:bounty-id "bounty-1"
+                                :subnet-id sub-dev
+                                :target-bip-cid (:cid res-bip-dev)
+                                :gross-amount bounty-dev
+                                :maintainer-pubkey (:hex dev-steward)}
+                               (:private dev-steward))
+                      esc-child (gov/create-bounty-escrow
+                                 (:state esc-dev)
+                                 {:bounty-id "bounty-1"
+                                  :subnet-id sub-child
+                                  :target-bip-cid (:cid res-bip-child)
+                                  :gross-amount bounty-child
+                                  :maintainer-pubkey (:hex child-steward)}
+                                 (:private child-steward))
+                      st2 (:state esc-child)
+                      ;; Settle sub-dev bounty-1; sub-child bounty-1 must remain :locked
+                      bundle-sha "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                      claim-dev (gov/build-signed-bounty-claim
+                                 {:bounty-id "bounty-1"
+                                  :patch-bundle-cid "cid-dev-patch"
+                                  :reproducible-sha256 bundle-sha
+                                  :builder-kp builder
+                                  :auditor-kp auditor
+                                  :maintainer-kp dev-steward})
+                      settle-dev (gov/settle-bounty-escrow st2 sub-dev "bounty-1" claim-dev)
+                      st3 (:state settle-dev)
+                      ;; Ratify both BIP-001 on sub-dev and NAF-BIP-01 on sub-child
+                      st4 (-> st3
+                              (gov/submit-circle-response sub-dev "BIP-001" :builders-stewards (:hex dev-steward) {:stance :consent})
+                              :state
+                              (gov/submit-circle-response sub-dev "BIP-001" :mesh-validators (:hex dev-val) {:stance :consent})
+                              :state
+                              (gov/submit-circle-response sub-dev "BIP-001" :anchor-agent-users (:hex dev-user) {:stance :consent})
+                              :state
+                              (gov/submit-circle-response sub-child "NAF-BIP-01" :builders-stewards (:hex child-steward) {:stance :consent})
+                              :state
+                              (gov/submit-circle-response sub-child "NAF-BIP-01" :mesh-validators (:hex child-val) {:stance :consent})
+                              :state
+                              (gov/submit-circle-response sub-child "NAF-BIP-01" :anchor-agent-users (:hex child-user) {:stance :consent})
+                              :state)
+                      eval-dev (gov/evaluate-tri-circle-consent st4 sub-dev "BIP-001")
+                      eval-child (gov/evaluate-tri-circle-consent (:state eval-dev) sub-child "NAF-BIP-01")
+                      st5 (:state eval-child)
+                      ;; Optional second BIP on sub-child that gets blocked by paramount objection
+                      st6 (if block-child-bip2?
+                            (let [b2 (assoc bip-child :bip-id "NAF-BIP-02")
+                                  s-b2 (:state (gov/submit-bip st5 b2 (:private child-steward)))
+                                  s-obj (:state (gov/submit-circle-response
+                                                 s-b2 sub-child "NAF-BIP-02" :mesh-validators (:hex child-val)
+                                                 {:stance :paramount-objection
+                                                  :counterexample {:type :vopr-seed
+                                                                   :seed 424242
+                                                                   :failing-invariant :INV-NAF-1}}))]
+                              (:state (gov/evaluate-tri-circle-consent s-obj sub-child "NAF-BIP-02")))
+                            st5)
+                      ;; Activate epoch upgrades at act-epoch-dev (only sub-dev activates) and then at act-epoch-child (sub-child activates)
+                      act1 (gov/activate-epoch-upgrades st6 act-epoch-dev)
+                      st7 (:state act1)
+                      act2 (gov/activate-epoch-upgrades st7 act-epoch-child)
+                      st8 (:state act2)]
+                  (and (false? (:ok? cross-vote))
+                       (= :unauthorized-circle-member (:error cross-vote))
+                       (:ok? settle-dev)
+                       (= :settled (:status (gov/get-bounty st8 sub-dev "bounty-1")))
+                       (= :locked (:status (gov/get-bounty st8 sub-child "bounty-1")))
+                       (some? (get-in st8 [:capabilities [sub-dev "bounty/bounty-1"]]))
+                       (some? (get-in st8 [:capabilities [sub-child "bounty/bounty-1"]]))
+                       (:ratified? eval-dev)
+                       (:ratified? eval-child)
+                       (= :ratified (:status (gov/get-bip st8 sub-dev "BIP-001")))
+                       (= :ratified (:status (gov/get-bip st8 sub-child "NAF-BIP-01")))
+                       ;; At act-epoch-dev: sub-dev policy is active, sub-child policy is not yet active
+                       (= theta-dev (get-in st7 [:subnet-policies sub-dev]))
+                       (nil? (get-in st7 [:subnet-policies sub-child]))
+                       ;; At act-epoch-child: both subnet policies are active and isolated
+                       (= theta-dev (get-in st8 [:subnet-policies sub-dev]))
+                       (= theta-child (get-in st8 [:subnet-policies sub-child]))
+                       ;; Regression vectors are strictly isolated per subnet
+                       (empty? (gov/get-subnet-regression-vectors st8 sub-dev))
+                       (if block-child-bip2?
+                         (= 1 (count (gov/get-subnet-regression-vectors st8 sub-child)))
+                         (empty? (gov/get-subnet-regression-vectors st8 sub-child)))))))
+

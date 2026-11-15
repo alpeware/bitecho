@@ -4128,6 +4128,216 @@
           (let [bob-cap-rx (light-core/handle-wire-payload st-b0 (select-keys cap-env [:event :signature :agent-pubkey :subnet-id]) priv-b)]
             (is (= "capability-published" (get (first (:stdout-events bob-cap-rx)) "event")))))))))
 
+;; =============================================================================
+;; Milestone D22: First-Class Governance & Bounty CLI Verbs + Wire Replication
+;; =============================================================================
+
+(deftest test-d22-fractal-governance-bounty-cli-and-wire-replication
+  (let [euler (test-identity)
+        gauss (test-identity)
+        noether (test-identity)
+        priv-e (:privkey-bytes euler)
+        pub-g (:pubkey-hex gauss)
+        priv-g (:privkey-bytes gauss)
+        pub-n (:pubkey-hex noether)
+        priv-n (:privkey-bytes noether)
+        st-e0 (-> (light-core/init-light-state (:identity euler) {:epoch 10})
+                  (assoc :account {:balance 20000 :spendable 20000 :seq 0}))
+        st-g0 (-> (light-core/init-light-state (:identity gauss) {:epoch 10})
+                  (assoc :account {:balance 5000 :spendable 5000 :seq 0}))
+        st-n0 (-> (light-core/init-light-state (:identity noether) {:epoch 10})
+                  (assoc :account {:balance 5000 :spendable 5000 :seq 0}))]
+    (testing "1. bip-submit, bip-consent, bip-object, bip-status, and epoch-tick upgrade activation across peers"
+      ;; Euler submits BIP-001 on bitecho-dev with policy_edn and activate_at_epoch 20
+      (let [sub-res (light-core/handle-command
+                     st-e0
+                     {"cmd" "bip-submit"
+                      "bip_id" "BIP-001"
+                      "title" "Pareto-Optimal Tokenomics v2.2"
+                      "subnet_id" "bitecho-dev"
+                      "policy_edn" "{:k-bps 4582 :max-stake-multiplier 2.2}"
+                      "activate_at_epoch" 20
+                      "defspec_vars" "prop-1,prop-2"
+                      "burn" 100}
+                     priv-e)
+            st-e1 (:state sub-res)
+            sub-env (first (:net-envelopes sub-res))]
+        (is (true? (get-in sub-res [:response "ok"])))
+        (is (= "BIP-001" (get-in sub-res [:response "bip_id"])))
+        (is (= "bitecho-dev" (get-in sub-res [:response "subnet_id"])))
+        (is (= 19900 (get-in st-e1 [:account :spendable])))
+        (is (some? sub-env))
+        ;; Replicate BIP-001 to Gauss and Noether
+        (let [st-g1 (:state (light-core/handle-wire-payload st-g0 sub-env priv-g))
+              st-n1 (:state (light-core/handle-wire-payload st-n0 sub-env priv-n))
+              ;; Euler consents in builders-stewards
+              c1-res (light-core/handle-command
+                      st-e1
+                      {"cmd" "bip-consent"
+                       "bip_id" "BIP-001"
+                       "subnet_id" "bitecho-dev"
+                       "circle" "builders-stewards"
+                       "weight" 12
+                       "comment" "Builder consent"
+                       "burn" 100}
+                      priv-e)
+              c1-env (first (:net-envelopes c1-res))
+              st-g2 (:state (light-core/handle-wire-payload st-g1 c1-env priv-g))
+              ;; Gauss consents in mesh-validators
+              c2-res (light-core/handle-command
+                      st-g2
+                      {"cmd" "bip-consent"
+                       "bip_id" "BIP-001"
+                       "subnet_id" "bitecho-dev"
+                       "circle" "mesh-validators"
+                       "weight" 10
+                       "burn" 100}
+                      priv-g)
+              c2-env (first (:net-envelopes c2-res))
+              st-e2 (:state (light-core/handle-wire-payload (:state c1-res) c2-env priv-e))
+              st-n2 (-> st-n1
+                        (light-core/handle-wire-payload c1-env priv-n)
+                        :state
+                        (light-core/handle-wire-payload c2-env priv-n)
+                        :state)
+              ;; Noether consents in anchor-agent-users -> completes Tri-Circle quorum and schedules epoch 20 upgrade
+              c3-res (light-core/handle-command
+                      st-n2
+                      {"cmd" "bip-consent"
+                       "bip_id" "BIP-001"
+                       "subnet_id" "bitecho-dev"
+                       "circle" "anchor-agent-users"
+                       "weight" 8
+                       "burn" 100}
+                      priv-n)
+              c3-env (first (:net-envelopes c3-res))
+              st-e3 (:state (light-core/handle-wire-payload st-e2 c3-env priv-e))
+              status-res (light-core/handle-command
+                          st-e3
+                          {"cmd" "bip-status"
+                           "bip_id" "BIP-001"
+                           "subnet_id" "bitecho-dev"}
+                          priv-e)]
+          (is (true? (get-in c3-res [:response "ok"])))
+          (is (true? (get-in c3-res [:response "ratified"])))
+          (is (true? (get-in status-res [:response "ok"])))
+          (is (= "ratified" (get-in status-res [:response "status"])))
+          (is (true? (get-in status-res [:response "ratified"])))
+          ;; Advance Euler to epoch 20 via epoch-tick -> activates scheduled upgrade
+          (let [tick-res (light-core/handle-command
+                          st-e3
+                          {"cmd" "epoch-tick" "subnet_id" "bitecho-dev" "epoch" 20}
+                          priv-e)
+                status-after (light-core/handle-command
+                              (:state tick-res)
+                              {"cmd" "bip-status" "bip_id" "BIP-001" "subnet_id" "bitecho-dev"}
+                              priv-e)]
+            (is (= {:k-bps 4582 :max-stake-multiplier 2.2}
+                   (get-in status-after [:response "active_policy"])))))
+
+        ;; Test bip-object on a flawed BIP on child subnet "new-alexandria"
+        (let [flawed-sub (light-core/handle-command
+                          st-e1
+                          {"cmd" "bip-submit"
+                           "bip_id" "NAF-BIP-99"
+                           "title" "Flawed Child Policy"
+                           "subnet_id" "new-alexandria"
+                           "burn" 50}
+                          priv-e)
+              obj-res (light-core/handle-command
+                       (:state flawed-sub)
+                       {"cmd" "bip-object"
+                        "bip_id" "NAF-BIP-99"
+                        "subnet_id" "new-alexandria"
+                        "circle" "mesh-validators"
+                        "counterexample_edn" "{:type :vopr-seed :seed 999 :failing-invariant :INV-NAF-1}"
+                        "burn" 50}
+                       priv-e)
+              naf-status (light-core/handle-command
+                          (:state obj-res)
+                          {"cmd" "bip-status"
+                           "bip_id" "NAF-BIP-99"
+                           "subnet_id" "new-alexandria"}
+                          priv-e)]
+          (is (true? (get-in obj-res [:response "ok"])))
+          (is (= "paramount-objection" (get-in obj-res [:response "recorded_stance"])))
+          (is (= "blocked-by-paramount-objection" (get-in naf-status [:response "status"])))
+          (is (= 1 (count (get-in naf-status [:response "regression_vectors"])))))))
+
+    (testing "2. bounty-create publishes marketplace capability bounty/<id> and bounty-settle enforces 3-party split & wire replication"
+      (let [bcr-res (light-core/handle-command
+                     st-e0
+                     {"cmd" "bounty-create"
+                      "bounty_id" "bounty-bip001"
+                      "bip_id" "BIP-001"
+                      "subnet_id" "bitecho-dev"
+                      "amount" 10000
+                      "builder_bps" 8500
+                      "auditor_bps" 1500
+                      "burn" 100}
+                     priv-e)
+            st-e1 (:state bcr-res)
+            bcr-envs (:net-envelopes bcr-res)]
+        (is (true? (get-in bcr-res [:response "ok"])))
+        (is (= "bounty-bip001" (get-in bcr-res [:response "bounty_id"])))
+        (is (= "bounty/bounty-bip001" (get-in bcr-res [:response "capability_path"])))
+        (is (= 9900 (get-in st-e1 [:account :spendable])))
+        ;; Verify capability-list and capability-resolve see bounty/bounty-bip001
+        (let [clist (light-core/handle-command
+                     st-e1
+                     {"cmd" "capability-list" "subnet_id" "bitecho-dev"}
+                     priv-e)
+              cres (light-core/handle-command
+                    st-e1
+                    {"cmd" "capability-resolve"
+                     "subnet_id" "bitecho-dev"
+                     "path" "bounty/bounty-bip001"}
+                    priv-e)]
+          (is (= 1 (get-in clist [:response "count"])))
+          (is (= "governance/bounty" (get-in clist [:response "capabilities" 0 "capability_type"])))
+          (is (true? (get-in cres [:response "ok"])))
+          (is (= 10000 (get-in cres [:response "descriptor" "price_echo"]))))
+
+        ;; Replicate bounty-create envelopes to Gauss (builder) and Noether (auditor)
+        (let [st-g1 (reduce (fn [s env] (:state (light-core/handle-wire-payload s env priv-g))) st-g0 bcr-envs)
+              st-n1 (reduce (fn [s env] (:state (light-core/handle-wire-payload s env priv-n))) st-n0 bcr-envs)
+              ;; Sybil self-audit attempt (builder == auditor) must fail closed
+              sybil-settle (light-core/handle-command
+                            st-e1
+                            {"cmd" "bounty-settle"
+                             "bounty_id" "bounty-bip001"
+                             "subnet_id" "bitecho-dev"
+                             "builder" pub-g
+                             "auditor" pub-g
+                             "patch_cid" "cid-patch-001"
+                             "sha256" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+                            priv-e)
+              ;; Valid 3-party settlement (maintainer Euler != builder Gauss != auditor Noether)
+              settle-res (light-core/handle-command
+                          st-e1
+                          {"cmd" "bounty-settle"
+                           "bounty_id" "bounty-bip001"
+                           "subnet_id" "bitecho-dev"
+                           "builder" pub-g
+                           "auditor" pub-n
+                           "patch_cid" "cid-patch-001"
+                           "sha256" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                           "burn" 100}
+                          priv-e)
+              settle-envs (:net-envelopes settle-res)
+              st-g2 (reduce (fn [s env] (:state (light-core/handle-wire-payload s env priv-g))) st-g1 settle-envs)
+              st-n2 (reduce (fn [s env] (:state (light-core/handle-wire-payload s env priv-n))) st-n1 settle-envs)]
+          (is (false? (get-in sybil-settle [:response "ok"])))
+          (is (= "sybil-bounty-claim-rejected" (get-in sybil-settle [:response "error"])))
+          (is (true? (get-in settle-res [:response "ok"])))
+          (is (= 8457 (get-in settle-res [:response "builder_net"])))
+          (is (= 1493 (get-in settle-res [:response "auditor_net"])))
+          (is (= 50 (get-in settle-res [:response "protocol_take"])))
+          ;; Builder Gauss and Auditor Noether receive their on-chain transfers and bounty settlement replication
+          (is (= (+ 5000 8457) (get-in st-g2 [:account :balance])))
+          (is (= (+ 5000 1493) (get-in st-n2 [:account :balance]))))))))
+
+
 
 
 

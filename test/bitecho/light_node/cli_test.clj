@@ -12,14 +12,14 @@
 ;; =============================================================================
 
 (deftest test-supported-verbs-inventory
-  (testing "Exact 55 canonical verbs in supported-cli-verbs"
-    (is (= 55 (count cli/supported-cli-verbs)))
+  (testing "Exact 61 canonical verbs in supported-cli-verbs"
+    (is (= 61 (count cli/supported-cli-verbs)))
     (is (= (count (distinct cli/supported-cli-verbs)) (count cli/supported-cli-verbs)))
     (is (= cli/supported-cli-verbs (vec (sort cli/supported-cli-verbs))))
     (is (every? #(re-matches #"^[a-z0-9]+(-[a-z0-9]+)*$" %) cli/supported-cli-verbs))
     (is (= (set cli/supported-cli-verbs) cli/supported-cli-verbs-set)))
 
-  (testing "Presence of Milestone 2, 3, 4 verbs"
+  (testing "Presence of Milestone 2, 3, 4, and D22 governance/bounty verbs"
     (is (contains? cli/supported-cli-verbs-set "storage-put"))
     (is (contains? cli/supported-cli-verbs-set "storage-get"))
     (is (contains? cli/supported-cli-verbs-set "storage-list"))
@@ -30,6 +30,12 @@
     (is (contains? cli/supported-cli-verbs-set "puzzle-eval"))
     (is (contains? cli/supported-cli-verbs-set "lock-intent"))
     (is (contains? cli/supported-cli-verbs-set "release-intent"))
+    (is (contains? cli/supported-cli-verbs-set "bip-consent"))
+    (is (contains? cli/supported-cli-verbs-set "bip-object"))
+    (is (contains? cli/supported-cli-verbs-set "bip-status"))
+    (is (contains? cli/supported-cli-verbs-set "bip-submit"))
+    (is (contains? cli/supported-cli-verbs-set "bounty-create"))
+    (is (contains? cli/supported-cli-verbs-set "bounty-settle"))
     (is (contains? cli/supported-cli-verbs-set "status"))
     (is (contains? cli/supported-cli-verbs-set "identity"))
     (is (contains? cli/supported-cli-verbs-set "wait"))))

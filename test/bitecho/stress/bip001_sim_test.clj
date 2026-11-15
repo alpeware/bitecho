@@ -1,7 +1,8 @@
 (ns bitecho.stress.bip001-sim-test
-  "Generative and unit tests for Milestone D21: Track A In-Memory End-to-End & Governance
-   Simulation for BIP-001 (`A-D21-1`..`4`, `A-CARB-D21-1`..`5`)."
+  "Generative and unit tests for Milestone D21/D22: Track A In-Memory End-to-End & Governance
+   Simulation for BIP-001 (`A-D21-1`..`4`, `A-CARB-D21-1`..`5`, `A-D22-1`..`5`)."
   (:require [bitecho.stress.bip001-sim :as bip001]
+            [bitecho.stress.tokenomics-sim :as tok-sim]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -54,3 +55,19 @@
              (get-in res [:comparison :crn-metrics :theta-flawed :gini-index])))
       (is (str/includes? md "BIP-001"))
       (is (str/includes? md "8457")))))
+
+(deftest d22-mid-horizon-epoch-cutover-and-child-subnet-test
+  (testing "Mid-horizon :scheduled-upgrades cutover from theta-0 to theta-12 at epoch E_act conserves 100% of supply (A-D22-1)"
+    (let [res-0 (tok-sim/run-tokenomics-horizon-sim :medium {:epochs 100 :theta bip001/theta-0 :verify-signatures? false})
+          res-12 (tok-sim/run-tokenomics-horizon-sim :medium {:epochs 100 :theta bip001/theta-12 :verify-signatures? false})
+          res-cutover (tok-sim/run-tokenomics-horizon-sim
+                       :medium
+                       {:epochs 100
+                        :theta bip001/theta-0
+                        :scheduled-upgrades {50 bip001/theta-12}
+                        :verify-signatures? false})]
+      (is (true? (:conservation-ok? res-cutover)))
+      (is (true? (:supply-cap-respected? res-cutover)))
+      (is (= bip001/theta-12 (:active-theta res-cutover)))
+      ;; Minted total in cutover at epoch 50 lies strictly between pure theta-0 and pure theta-12
+      (is (< (:total-minted res-0) (:total-minted res-cutover) (:total-minted res-12))))))

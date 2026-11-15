@@ -1236,7 +1236,7 @@
 (deftest test-cli-and-skill-flag-inventory
   (testing "Bidirectional CLI verbs and flags inventory between skill/SKILL.md and parse-light-node-args"
     (let [skill-md (slurp "skill/SKILL.md")
-          documented-flags (set (re-seq #"--[a-z][a-z-]*" skill-md))
+          documented-flags (set (re-seq #"--[a-z][a-z0-9-]*" skill-md))
           verbs ["serve" "wait-event" "identity" "status" "discover" "register-home-set"
                  "offer" "accept" "send" "inbox" "close" "transfer"
                  "account" "sync-account" "settle-intent" "submit-vouchers"
@@ -1245,10 +1245,13 @@
                  "directory-register" "directory-lookup"
                  "rendezvous-policy" "rendezvous-offer" "rendezvous-accept"
                  "p2p-offer" "p2p-answer" "p2p-channel-state" "broadcast"
-                 "lock-intent" "release-intent" "refund-intent" "escrows"]
+                 "lock-intent" "release-intent" "refund-intent" "escrows"
+                 "bip-submit" "bip-consent" "bip-object" "bip-status"
+                 "bounty-create" "bounty-settle"]
           flags #{"--state-dir" "--bootstrap" "--autonomous" "--transport" "--proxy"
                   "--ingress-tcp-port"
                   "--timeout-ms" "--callee" "--price" "--price-max" "--burn" "--home-node"
+                  "--wait-open-ms"
                   "--session" "--session-id" "--text" "--payload-hex" "--receiver"
                   "--recipient" "--amount" "--seq" "--nodes" "--balance" "--sync"
                   "--petname" "--pubkey" "--overwrite" "--directory-pubkey"
@@ -1266,7 +1269,11 @@
                   "--block" "--until-event"
                   "--timeout-epoch" "--epoch" "--path" "--data-hex" "--capability-type"
                   "--puzzle-hash" "--puzzle-source" "--target-cid" "--authority" "--data"
-                  "--slot-id" "--metadata" "--capability-id" "--payer" "--burn-floor" "--solution"}]
+                  "--slot-id" "--metadata" "--capability-id" "--payer" "--burn-floor" "--solution"
+                  "--bip-id" "--title" "--policy-edn" "--activate-at-epoch" "--defspec-vars"
+                  "--circle" "--weight" "--comment" "--counterexample-edn"
+                  "--bounty-id" "--builder-bps" "--auditor-bps" "--take-bps"
+                  "--builder" "--auditor" "--patch-cid" "--sha256"}]
       ;; All verbs documented in SKILL.md
       (doseq [v verbs]
         (is (str/includes? skill-md v) (str "Verb documented in SKILL.md: " v)))

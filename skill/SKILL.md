@@ -239,10 +239,10 @@ Registers the light node's rendezvous home node set ($m \ge 3$) with the validat
 ---
 
 ### `offer`
-Initiates a sealed channel session offer to a target callee public key, burning anti-spam ECHO tokens.
+Initiates a sealed channel session offer to a target callee public key, burning anti-spam ECHO tokens. Pass `--wait-open-ms <ms>` when calling via `ctl` / daemon to block until the callee accepts and the session transitions to `"open"`.
 
-- **CLI**: `clojure -M:light-node offer --callee <pubkey-hex> --price <price> [--burn <burn-amt>] [--home-node <node-id>]`
-- **JSONL**: `{"cmd": "offer", "callee": "<pubkey-hex>", "price": 10, "burn": 500}`
+- **CLI**: `clojure -M:light-node offer --callee <pubkey-hex> --price <price> [--burn <burn-amt>] [--home-node <node-id>] [--wait-open-ms <ms>]`
+- **JSONL**: `{"cmd": "offer", "callee": "<pubkey-hex>", "price": 10, "burn": 500, "wait_open_ms": 5000}`
 - **Response**:
   ```json
   {
@@ -1042,6 +1042,54 @@ Lists and unpacks all local and network-replicated capability descriptors, optio
     ]
   }
   ```
+
+---
+
+### `bip-submit`
+Submits an executable Improvement Proposal (BIP) on a fractal subnet (`--subnet-id`, default `bitecho.org/dev`), packs it into a content-addressed Fressian `Blob` + signed `Pointer` (`bip/<bip-id>`), and broadcasts a `:governance-replicate` gossip envelope.
+
+- **CLI**: `clojure -M:light-node bip-submit --bip-id BIP-001 --title "Pareto-Optimal Tokenomics v2.2" [--subnet-id bitecho-dev] [--policy-edn '{:k-bps 4582 :max-stake-multiplier 2.2}'] [--activate-at-epoch 20] [--defspec-vars prop-1,prop-2] [--burn 100]`
+- **JSONL**: `{"cmd": "bip-submit", "bip_id": "BIP-001", "title": "Pareto-Optimal Tokenomics v2.2", "subnet_id": "bitecho-dev", "policy_edn": "{:k-bps 4582}", "activate_at_epoch": 20, "burn": 100}`
+
+---
+
+### `bip-consent`
+Records a Tri-Circle Sociocratic `CONSENT` vote (`builders-stewards`, `mesh-validators`, or `anchor-agent-users`) for a BIP on a fractal subnet and broadcasts a `:governance-replicate` envelope. When all 3 circles reach positive consenting weight with zero valid paramount objections, ratifies the BIP and schedules any `:activate-at-epoch` upgrade.
+
+- **CLI**: `clojure -M:light-node bip-consent --bip-id BIP-001 --circle builders-stewards [--subnet-id bitecho-dev] [--weight 12] [--comment "Verified CRN dominance"] [--burn 100]`
+- **JSONL**: `{"cmd": "bip-consent", "bip_id": "BIP-001", "subnet_id": "bitecho-dev", "circle": "builders-stewards", "weight": 12, "burn": 100}`
+
+---
+
+### `bip-object`
+Submits a Tri-Circle Sociocratic `PARAMOUNT OBJECTION` with a reproducible `--counterexample-edn` (`:vopr-seed`, `:monte-carlo-insolvency`, or `:security-regression`). Valid counterexamples halt ratification (`blocked-by-paramount-objection`) and append a permanent regression vector to the subnet's regression suite; unsubstantiated objections are ignored with a counted diagnostic.
+
+- **CLI**: `clojure -M:light-node bip-object --bip-id BIP-001-draft-alpha --circle mesh-validators --counterexample-edn '{:type :monte-carlo-insolvency :seed 20261115 :path-id 2 :theta {:k-bps 4500}}' [--subnet-id bitecho-dev] [--burn 100]`
+- **JSONL**: `{"cmd": "bip-object", "bip_id": "BIP-001-draft-alpha", "subnet_id": "bitecho-dev", "circle": "mesh-validators", "counterexample_edn": "{:type :vopr-seed :seed 999 :failing-invariant :INV-1}", "burn": 100}`
+
+---
+
+### `bip-status`
+Queries the Tri-Circle ratification status, per-circle quorums, subnet regression vectors, and active subnet policy for a BIP on a fractal subnet.
+
+- **CLI**: `clojure -M:light-node bip-status --bip-id BIP-001 [--subnet-id bitecho-dev]`
+- **JSONL**: `{"cmd": "bip-status", "bip_id": "BIP-001", "subnet_id": "bitecho-dev"}`
+
+---
+
+### `bounty-create`
+Locks an ECH bilateral Builder/Auditor bounty escrow for a BIP on a fractal subnet, automatically publishes a discoverable `:governance/bounty` marketplace capability descriptor at `bounty/<bounty-id>` (discoverable via `capability-list` / `capability-resolve`), and broadcasts a `:governance-replicate` envelope.
+
+- **CLI**: `clojure -M:light-node bounty-create --bounty-id bounty-bip001 --bip-id BIP-001 --amount 10000 [--subnet-id bitecho-dev] [--builder-bps 8500] [--auditor-bps 1500] [--take-bps 50] [--burn 100]`
+- **JSONL**: `{"cmd": "bounty-create", "bounty_id": "bounty-bip001", "bip_id": "BIP-001", "subnet_id": "bitecho-dev", "amount": 10000, "burn": 100}`
+
+---
+
+### `bounty-settle`
+Settles a locked bilateral bounty escrow on a fractal subnet, enforcing pairwise-distinct 3-party identities (`maintainer != builder != auditor`) and zero-dust integer conservation (`builder_net + auditor_net + protocol_take == gross_amount`), and replicates the settlement and payouts across peers.
+
+- **CLI**: `clojure -M:light-node bounty-settle --bounty-id bounty-bip001 --builder <pubkey-or-petname> --auditor <pubkey-or-petname> --patch-cid <cid> --sha256 <64-hex> [--subnet-id bitecho-dev] [--burn 100]`
+- **JSONL**: `{"cmd": "bounty-settle", "bounty_id": "bounty-bip001", "subnet_id": "bitecho-dev", "builder": "<pubkey>", "auditor": "<pubkey>", "patch_cid": "<cid>", "sha256": "<64-hex>", "burn": 100}`
 
 ---
 

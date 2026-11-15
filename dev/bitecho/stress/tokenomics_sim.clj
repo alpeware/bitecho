@@ -177,10 +177,11 @@
    Options:
    - `:epochs` (default `30000`, crossing `26,280` 3-year Bootstrap custody sunset)
    - `:theta` (optional policy parameter map overrides `A-D21-2`, `A-CARB-D21-3`)
+   - `:scheduled-upgrades` (optional `{epoch-num theta-map}` for mid-horizon cutover `INV-D22-4`)
    - `:verify-signatures?` (default `true`)."
   ([regime]
    (run-tokenomics-horizon-sim regime {:epochs 30000}))
-  ([regime {:keys [epochs theta verify-signatures?]
+  ([regime {:keys [epochs theta scheduled-upgrades verify-signatures?]
             :or {epochs 30000
                  verify-signatures? true}}]
    (let [{:keys [keys state]} (build-initial-tokenomics-state theta)
@@ -194,12 +195,12 @@
                           :medium 50000
                           :high 2000000
                           10000)
-         sunset-ep (long (or (:bootstrap-sunset-epoch theta)
-                             treasury/default-bootstrap-sunset-epoch))
-         expected-bound (+ (max 256 (long (or (:treasury-trailing-epochs theta) 168))) 4)
-         step-opts (assoc (or theta {}) :verify-signatures? verify-signatures?)]
+         all-thetas (cons (or theta (:policy state)) (vals (or scheduled-upgrades {})))
+         max-trailing (apply max 168 (keep :treasury-trailing-epochs all-thetas))
+         expected-bound (+ (max 256 (long max-trailing)) 4)]
      (loop [ep 1
             curr-st state
+            curr-theta (or theta (:policy state))
             cumulative-burns 0
             cap-reached-epoch nil
             pre-sunset-custody-bal nil
@@ -233,6 +234,7 @@
                ledger-sum (reduce + 0 (map :balance (vals (:ledger curr-st))))]
            {:regime regime
             :theta (or theta (:policy curr-st))
+            :active-theta curr-theta
             :epochs-simulated epochs
             :burn-per-epoch burn-per-epoch
             :cumulative-burns cumulative-burns
@@ -254,13 +256,22 @@
             :pruned-replay-rejected? pruned-replay-rejected?
             :max-retained-epoch-entries max-map-size
             :bounded-state-ok? (<= max-map-size expected-bound)})
-         (let [;; Draw down 500,000 ECHO every 500 epochs prior to sunset, and attempt drawdown at sunset+1
+         (let [upgraded-theta (if-let [upg (get scheduled-upgrades ep)]
+                                (merge curr-theta upg)
+                                curr-theta)
+               st-for-ep (if (identical? upgraded-theta curr-theta)
+                           curr-st
+                           (update curr-st :policy merge upgraded-theta))
+               sunset-ep (long (or (:bootstrap-sunset-epoch upgraded-theta)
+                                   treasury/default-bootstrap-sunset-epoch))
+               step-opts (assoc upgraded-theta :verify-signatures? verify-signatures?)
+               ;; Draw down 500,000 ECHO every 500 epochs prior to sunset, and attempt drawdown at sunset+1
                allocs (when (or (and (< ep sunset-ep) (zero? (mod ep 500)))
                                 (= ep (inc sunset-ep)))
                         [{:receiver recipient-hex :amount 500000}])
                pre-bal (when (= ep sunset-ep)
-                         (get-in curr-st [:ledger bootstrap-hex :balance]))
-               {:keys [state treasury-res]} (step-tokenomics-epoch curr-st ep burn-per-epoch allocs step-opts)
+                         (get-in st-for-ep [:ledger bootstrap-hex :balance]))
+               {:keys [state treasury-res]} (step-tokenomics-epoch st-for-ep ep burn-per-epoch allocs step-opts)
                post-bal (when (= ep sunset-ep)
                           (get-in state [:ledger bootstrap-hex :balance]))
                post-cmds (when (= ep (inc sunset-ep))
@@ -282,6 +293,7 @@
                               cap-reached-epoch)]
            (recur (inc ep)
                   state
+                  upgraded-theta
                   new-cum-burns
                   newly-capped
                   (or pre-sunset-custody-bal pre-bal)

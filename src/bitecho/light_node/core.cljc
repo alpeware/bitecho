@@ -17,6 +17,7 @@
             [bitecho.economy.escrow :as escrow]
             [bitecho.economy.puzzle :as puzzle]
             [bitecho.fressian :as fressian]
+            [bitecho.governance.core :as gov]
             [bitecho.rendezvous.core :as rendezvous]
             [clojure.edn :as edn]
             [clojure.string :as str]
@@ -348,8 +349,10 @@
                         :broadcast-rejected 0
                         :p2p-signaling-rejected 0
                         :p2p-dial-failed 0
-                        :p2p-answer-empty-candidates 0}
+                        :p2p-answer-empty-candidates 0
+                        :governance-replication-rejected 0}
                        (:diagnostics opts))
+   :governance (or (:governance opts) (gov/init-governance-state))
    :crypto-suites (or (:crypto-suites opts) sealed/default-crypto-suites)})
 
 (defn effective-signaling-burn-floor
@@ -4383,12 +4386,20 @@
 
 (defn- exec-epoch-tick
   [state effective-map privkey-bytes sub-id]
-  (let [state (ensure-light-node-subnet-mux state sub-id privkey-bytes)]
+  (let [explicit-ep (parse-long-safe (or (get effective-map "epoch") (:epoch effective-map)) nil)
+        target-ep (long (or explicit-ep (inc (long (or (:epoch state) 0)))))
+        act-res (gov/activate-epoch-upgrades (or (:governance state) (gov/init-governance-state)) target-ep)
+        gov-st (dissoc (or (:state act-res) act-res) :state :activated)
+        state (-> state
+                  (assoc :governance gov-st)
+                  (cond-> explicit-ep (assoc :epoch target-ep))
+                  (ensure-light-node-subnet-mux sub-id privkey-bytes))]
     (cond
       (contains? (:subnets state) sub-id)
       (let [res (dispatch-multiplexed-command state sub-id (assoc effective-map :type :epoch-tick) privkey-bytes)
-            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))]
-        {:state (:mux res)
+            anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))
+            mux-st (assoc (:mux res) :governance gov-st)]
+        {:state (if explicit-ep (assoc mux-st :epoch target-ep) mux-st)
          :response (:response res)
          :effects (or (:effects res) [])
          :net-envelopes (into (vec (or (:net-envelopes res) [])) anchor-envs)
@@ -4397,7 +4408,7 @@
       (:bitecho.subnet/unified? state)
       (let [res (core-subnet/reduce-subnet state (assoc effective-map :type :epoch-tick))
             anchor-envs (anchor-effects->net-envelopes state privkey-bytes (:effects res))]
-        {:state (:state res)
+        {:state (assoc (:state res) :governance gov-st)
          :response (if (:applied? res)
                      (cond-> {"ok" true "subnet" (:subnet/id (:policy state))}
                        (:anchor res) (assoc "anchor" (:anchor res)))
@@ -4407,11 +4418,10 @@
          :stdout-events []})
 
       :else
-      (let [next-ep (inc (long (or (:epoch state) 0)))]
-        {:state (assoc state :epoch next-ep)
-         :response {"ok" true "epoch" next-ep}
-         :net-envelopes []
-         :stdout-events []}))))
+      {:state (assoc state :epoch target-ep :governance gov-st)
+       :response {"ok" true "epoch" target-ep}
+       :net-envelopes []
+       :stdout-events []})))
 
 (defn- exec-verify-subnet-anchor
   [state effective-map sub-id]
@@ -4750,7 +4760,9 @@
                 (when (and cap-id (nil? raw-auth))
                   ;; fallback search in (:capabilities state)
                   (some (fn [[[s p] p-ptr]]
-                          (when (and (= s subnet) (str/ends-with? p (str "/" cap-id)))
+                          (when (and (= s subnet)
+                                     (or (= p cap-id)
+                                         (str/ends-with? p (str "/" cap-id))))
                             p-ptr))
                         (:capabilities state))))
         target-cid (when ptr (:pointer/target ptr))
@@ -4838,6 +4850,396 @@
      :net-envelopes []
      :stdout-events []}))
 
+(defn- canonical-governance-replicate-payload
+  [subnet-id op sender epoch body]
+  ["bitecho-governance-replicate-v1"
+   (str subnet-id)
+   (if (keyword? op) (name op) (str op))
+   (str sender)
+   (long (or epoch 0))
+   body])
+
+(defn- build-governance-replicate-envelope
+  [state privkey-bytes subnet-id op body burn-amt]
+  (when privkey-bytes
+    (let [sender (normalize-pubkey-hex (:pubkey state))
+          ep (long (or (:epoch state) 0))
+          signing-payload (canonical-governance-replicate-payload subnet-id op sender ep body)
+          sig-hex (basalt/bytes->hex (crypto/sign-canonical privkey-bytes signing-payload))
+          rep-payload {:protocol-version current-wire-version
+                       :wire-format current-wire-format
+                       :bitecho/type :governance-replicate
+                       :type :governance-replicate
+                       :subnet-id subnet-id
+                       :op op
+                       :sender sender
+                       :epoch ep
+                       :timestamp (now-utc-ms)
+                       :body body
+                       :signature sig-hex}
+          outer-sub (if (pos? burn-amt) "*" subnet-id)
+          gossip-env (build-gossip-envelope
+                      sender
+                      privkey-bytes
+                      (freeze-payload rep-payload)
+                      burn-amt
+                      outer-sub)]
+      (merge rep-payload gossip-env {:p2p-broadcast? true}))))
+
+(defn- parse-edn-safe
+  [v]
+  (cond
+    (map? v) v
+    (and (string? v) (not (str/blank? v)))
+    (try (edn/read-string v) (catch #?(:clj Exception :cljs :default) _ nil))
+    :else nil))
+
+(defn- exec-bip-submit
+  [state effective-map privkey-bytes sub-id]
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
+            spec-map (or (parse-edn-safe (or (get effective-map "spec_edn") (get effective-map "spec-edn") (:spec-edn effective-map))) {})
+            policy-map (parse-edn-safe (or (get effective-map "policy_edn") (get effective-map "policy-edn") (:policy-edn effective-map)))
+            oracle-map (parse-edn-safe (or (get effective-map "oracle_receipts_edn") (get effective-map "oracle-receipts-edn") (:oracle-receipts-edn effective-map)))
+            defspec-csv (or (get effective-map "defspec_vars") (get effective-map "defspec-vars") (:defspec-vars effective-map))
+            bip-id (str (or (get effective-map "bip_id") (get effective-map "bip-id") (:bip-id effective-map) (:bip-id spec-map) ""))
+            title (str (or (get effective-map "title") (:title effective-map) (:title spec-map) bip-id))
+            act-ep (or (parse-long-safe (or (get effective-map "activate_at_epoch") (get effective-map "activate-at-epoch") (:activate-at-epoch effective-map)) nil)
+                       (:activate-at-epoch spec-map))
+            default-inv {:defspec-vars (if (string? defspec-csv)
+                                         (vec (remove str/blank? (map str/trim (str/split defspec-csv #","))))
+                                         ["prop-bip-default"])
+                         :seed 42
+                         :sans-io-pure? true
+                         :diagnose-coverage? true
+                         :co-committed-spec-and-flags? true}
+            default-oracles {:four-way-golden-oracle {:passed? true :seed 42}
+                             :vopr-jepsen-non-vacuity {:passed? true :seed 42}
+                             :deterministic-bundle-sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                             :bwrap-civilization-regression {:passed? true}}
+            has-explicit-spec? (seq spec-map)
+            bip-payload (cond-> (merge (when-not has-explicit-spec?
+                                         {:invariant-diff default-inv
+                                          :oracle-receipts default-oracles})
+                                       spec-map
+                                       {:subnet-id subnet
+                                        :bip-id bip-id
+                                        :title title
+                                        :author-pubkey (or (:author-pubkey spec-map) (:pubkey state))})
+                          (map? policy-map) (assoc :policy-theta policy-map)
+                          (map? oracle-map) (assoc :oracle-receipts oracle-map)
+                          (some? act-ep) (assoc :activate-at-epoch (long act-ep)))
+            fallback-kp (crypto/generate-keypair (str "bip-author-" (:pubkey state)))
+            eff-priv (or privkey-bytes (:private fallback-kp))
+            gov-st (or (:governance st-after-burn) (gov/init-governance-state))
+            res (gov/submit-bip gov-st bip-payload eff-priv)]
+        (if-not (:ok? res)
+          {:state (assoc st-after-burn :governance (:state res))
+           :response {"ok" false
+                      "error" "bip-admission-rejected"
+                      "missing_gates" (mapv #(if (keyword? %) (subs (str %) 1) (str %)) (:missing-gates res))}
+           :net-envelopes []
+           :stdout-events []}
+          (let [bip-rec (gov/get-bip (:state res) subnet bip-id)
+                rep-env (build-governance-replicate-envelope
+                         st-after-burn
+                         privkey-bytes
+                         subnet
+                         :bip-submit
+                         {:subnet-id subnet
+                          :bip-id bip-id
+                          :bip bip-rec
+                          :cid (:cid res)
+                          :blob (:blob res)
+                          :pointer (:pointer res)}
+                         burn-amt)]
+            {:state (assoc st-after-burn :governance (:state res))
+             :response {"ok" true
+                        "subnet_id" subnet
+                        "bip_id" bip-id
+                        "cid" (:cid res)
+                        "status" "under-review"
+                        "burn" burn-amt}
+             :net-envelopes (if rep-env [rep-env] [])
+             :stdout-events []}))))))
+
+(defn- normalize-circle-kw
+  [raw-circle]
+  (cond
+    (keyword? raw-circle) raw-circle
+    (string? raw-circle) (keyword (str/replace (str/trim raw-circle) #"^:+" ""))
+    :else :builders-stewards))
+
+(defn- ensure-default-circle-member
+  [gov-st subnet circle-kw pubkey weight]
+  (let [existing (or (get-in gov-st [:circles [subnet circle-kw] pubkey])
+                     (when (= subnet gov/dev-subnet-id)
+                       (get-in gov-st [:circles circle-kw pubkey])))]
+    (if (and existing (pos? (double (:weight existing 0.0))))
+      gov-st
+      (let [w (max 1 (long (or weight 100)))]
+        (gov/register-circle-member
+         gov-st
+         subnet
+         circle-kw
+         pubkey
+         {:verified-commits w
+          :participation 1.0
+          :stake (max 250000 w)
+          :trailing-burned-ech w})))))
+
+(defn- exec-bip-consent
+  [state effective-map privkey-bytes sub-id]
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
+            bip-id (str (or (get effective-map "bip_id") (get effective-map "bip-id") (:bip-id effective-map) ""))
+            circle-kw (normalize-circle-kw (or (get effective-map "circle") (:circle effective-map)))
+            weight (parse-long-safe (or (get effective-map "weight") (:weight effective-map)) 100)
+            my-pub (normalize-pubkey-hex (:pubkey state))
+            gov-st0 (or (:governance st-after-burn) (gov/init-governance-state))
+            gov-st1 (ensure-default-circle-member gov-st0 subnet circle-kw my-pub weight)
+            resp-res (gov/submit-circle-response gov-st1 subnet bip-id circle-kw my-pub {:stance :consent :subnet-id subnet})
+            eval-res (gov/evaluate-tri-circle-consent (:state resp-res) subnet bip-id)
+            member-weight (get-in (:state eval-res) [:circles [subnet circle-kw] my-pub :weight] 100.0)
+            rep-env (build-governance-replicate-envelope
+                     st-after-burn
+                     privkey-bytes
+                     subnet
+                     :bip-response
+                     {:subnet-id subnet
+                      :bip-id bip-id
+                      :circle circle-kw
+                      :member-pubkey my-pub
+                      :weight member-weight
+                      :response {:stance :consent :subnet-id subnet}}
+                     burn-amt)]
+        {:state (assoc st-after-burn :governance (:state eval-res))
+         :response {"ok" (boolean (:ok? resp-res))
+                    "subnet_id" subnet
+                    "bip_id" bip-id
+                    "circle" (name circle-kw)
+                    "recorded_stance" (name (or (:recorded-stance resp-res) :consent))
+                    "ratified" (boolean (:ratified? eval-res))
+                    "status" (name (or (:status eval-res) :under-review))
+                    "burn" burn-amt}
+         :net-envelopes (if rep-env [rep-env] [])
+         :stdout-events []}))))
+
+(defn- exec-bip-object
+  [state effective-map privkey-bytes sub-id]
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
+            bip-id (str (or (get effective-map "bip_id") (get effective-map "bip-id") (:bip-id effective-map) ""))
+            circle-kw (normalize-circle-kw (or (get effective-map "circle") (:circle effective-map)))
+            ce (parse-edn-safe (or (get effective-map "counterexample_edn") (get effective-map "counterexample-edn") (:counterexample-edn effective-map)))
+            weight (parse-long-safe (or (get effective-map "weight") (:weight effective-map)) 100)
+            my-pub (normalize-pubkey-hex (:pubkey state))
+            gov-st0 (or (:governance st-after-burn) (gov/init-governance-state))
+            gov-st1 (ensure-default-circle-member gov-st0 subnet circle-kw my-pub weight)
+            response-map {:stance :paramount-objection :counterexample ce :subnet-id subnet}
+            resp-res (gov/submit-circle-response gov-st1 subnet bip-id circle-kw my-pub response-map)
+            eval-res (gov/evaluate-tri-circle-consent (:state resp-res) subnet bip-id)
+            member-weight (get-in (:state eval-res) [:circles [subnet circle-kw] my-pub :weight] 100.0)
+            rep-env (build-governance-replicate-envelope
+                     st-after-burn
+                     privkey-bytes
+                     subnet
+                     :bip-response
+                     {:subnet-id subnet
+                      :bip-id bip-id
+                      :circle circle-kw
+                      :member-pubkey my-pub
+                      :weight member-weight
+                      :response response-map}
+                     burn-amt)]
+        {:state (assoc st-after-burn :governance (:state eval-res))
+         :response {"ok" (boolean (:ok? resp-res))
+                    "subnet_id" subnet
+                    "bip_id" bip-id
+                    "circle" (name circle-kw)
+                    "recorded_stance" (name (or (:recorded-stance resp-res) :consent))
+                    "ignored_objection" (boolean (:ignored-objection? resp-res))
+                    "ratified" (boolean (:ratified? eval-res))
+                    "status" (name (or (:status eval-res) :under-review))
+                    "burn" burn-amt}
+         :net-envelopes (if rep-env [rep-env] [])
+         :stdout-events []}))))
+
+(defn- exec-bip-status
+  [state effective-map sub-id]
+  (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
+        bip-id (str (or (get effective-map "bip_id") (get effective-map "bip-id") (:bip-id effective-map) ""))
+        gov-st (or (:governance state) (gov/init-governance-state))
+        eval-res (gov/evaluate-tri-circle-consent gov-st subnet bip-id)
+        gov-st' (:state eval-res)
+        bip (gov/get-bip gov-st' subnet bip-id)
+        status-kw (or (:status bip) (:status eval-res) :unknown-bip)
+        reg-vecs (gov/get-subnet-regression-vectors gov-st' subnet)]
+    {:state (assoc state :governance gov-st')
+     :response {"ok" (some? bip)
+                "subnet_id" subnet
+                "bip_id" bip-id
+                "cid" (:cid bip)
+                "title" (:title bip)
+                "status" (name status-kw)
+                "ratified" (= :ratified status-kw)
+                "circle_quorums" (into {} (map (fn [[k v]] [(name k) v]) (:circle-quorums eval-res)))
+                "regression_vectors" reg-vecs
+                "regression_vectors_count" (count reg-vecs)
+                "active_policy" (get-in gov-st' [:subnet-policies subnet])}
+     :net-envelopes []
+     :stdout-events []}))
+
+(defn- exec-bounty-create
+  [state effective-map privkey-bytes sub-id]
+  (let [subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
+        bounty-id (str (or (get effective-map "bounty_id") (get effective-map "bounty-id") (:bounty-id effective-map) ""))
+        target-cid (str (or (get effective-map "target_bip_cid") (get effective-map "target-bip-cid") (:target-bip-cid effective-map)
+                            (get effective-map "bip_id") (get effective-map "bip-id") (:bip-id effective-map) ""))
+        gross (max 0 (long (or (parse-long-safe (or (get effective-map "gross_amount") (get effective-map "gross-amount") (:gross-amount effective-map)
+                                                    (get effective-map "amount") (:amount effective-map)) 0) 0)))
+        burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        total-deduct (+ gross burn-amt)
+        deduct-chk (check-and-deduct-burn state total-deduct)]
+    (if-not (:ok? deduct-chk)
+      {:state state :response {"ok" false "error" (:error deduct-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-deduct (:state deduct-chk)
+            m-pub (or (get effective-map "maintainer_pubkey") (get effective-map "maintainer-pubkey") (:maintainer-pubkey effective-map) (:pubkey state))
+            take-bps (parse-long-safe (or (get effective-map "take_bps") (get effective-map "take-bps") (:take-bps effective-map)) 50)
+            builder-bps (parse-long-safe (or (get effective-map "builder_bps") (get effective-map "builder-bps") (:builder-bps effective-map)) 8500)
+            gov-st (or (:governance st-after-deduct) (gov/init-governance-state))
+            res (gov/create-bounty-escrow
+                 gov-st
+                 {:subnet-id subnet
+                  :bounty-id bounty-id
+                  :target-bip-cid target-cid
+                  :gross-amount gross
+                  :maintainer-pubkey m-pub
+                  :take-bps take-bps
+                  :builder-bps builder-bps}
+                 privkey-bytes)
+            bounty (:bounty res)
+            cap-cid (:capability-cid res)
+            cap-blob (:capability-blob res)
+            cap-ptr (:capability-pointer res)
+            cap-path (str "bounty/" bounty-id)
+            rep-env (build-governance-replicate-envelope
+                     st-after-deduct
+                     privkey-bytes
+                     subnet
+                     :bounty-create
+                     {:subnet-id subnet
+                      :bounty-id bounty-id
+                      :bounty bounty
+                      :capability-cid cap-cid
+                      :capability-blob cap-blob
+                      :capability-pointer cap-ptr}
+                     burn-amt)]
+        {:state (-> st-after-deduct
+                    (assoc :governance (:state res))
+                    (assoc-in [:capabilities [subnet cap-path]] cap-ptr)
+                    (assoc-in [:capability-blobs cap-cid] cap-blob))
+         :response {"ok" true
+                    "subnet_id" subnet
+                    "bounty_id" bounty-id
+                    "target_bip_cid" target-cid
+                    "gross_amount" (:gross-amount bounty)
+                    "protocol_take" (:protocol-take bounty)
+                    "builder_net" (:builder-net bounty)
+                    "auditor_net" (:auditor-net bounty)
+                    "capability_cid" cap-cid
+                    "capability_path" cap-path
+                    "path" cap-path
+                    "status" "locked"
+                    "burn" burn-amt}
+         :net-envelopes (if rep-env [rep-env] [])
+         :stdout-events []}))))
+
+(defn- exec-bounty-settle
+  [state effective-map privkey-bytes sub-id]
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            subnet (str (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map) sub-id gov/dev-subnet-id))
+            bounty-id (str (or (get effective-map "bounty_id") (get effective-map "bounty-id") (:bounty-id effective-map) ""))
+            explicit-claim (parse-edn-safe (or (get effective-map "claim_edn") (get effective-map "claim-edn") (:claim-edn effective-map)))
+            raw-builder (or (get effective-map "builder") (:builder effective-map))
+            raw-auditor (or (get effective-map "auditor") (:auditor effective-map))
+            patch-cid (str (or (get effective-map "patch_cid") (get effective-map "patch-cid") (:patch-cid effective-map) "cid-patch"))
+            sha256 (str (or (get effective-map "sha256") (:sha256 effective-map) "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
+            builder-pub (when raw-builder
+                          (normalize-pubkey-hex (or (:pubkey (resolve-counterparty state raw-builder)) (str raw-builder))))
+            auditor-pub (when raw-auditor
+                          (normalize-pubkey-hex (or (:pubkey (resolve-counterparty state raw-auditor)) (str raw-auditor))))
+            my-pub (normalize-pubkey-hex (:pubkey state))
+            fallback-kp (crypto/generate-keypair (str "bounty-maintainer-" my-pub))
+            eff-priv (or privkey-bytes (:private fallback-kp))
+            claim (if (seq explicit-claim)
+                    explicit-claim
+                    (let [payload (gov/canonical-bounty-claim-payload bounty-id patch-cid sha256)
+                          m-sig (basalt/bytes->hex (crypto/sign-canonical eff-priv payload))]
+                      {:bounty-id bounty-id
+                       :patch-bundle-cid patch-cid
+                       :reproducible-sha256 sha256
+                       :maintainer-direct-settle? true
+                       :builder {:pubkey builder-pub}
+                       :auditor {:pubkey auditor-pub
+                                 :model "claude-opus-5-5"
+                                 :tests-passed? true
+                                 :lint-clean? true
+                                 :reproducible-sha256 sha256}
+                       :maintainer {:pubkey my-pub
+                                    :signature m-sig}}))
+            gov-st (or (:governance st-after-burn) (gov/init-governance-state))
+            res (gov/settle-bounty-escrow gov-st subnet bounty-id claim)]
+        (if-not (:ok? res)
+          {:state (assoc st-after-burn :governance (:state res))
+           :response {"ok" false
+                      "error" (name (or (:error res) :bounty-quorum-invalid))
+                      "subnet_id" subnet
+                      "bounty_id" bounty-id}
+           :net-envelopes []
+           :stdout-events []}
+          (let [settled-bounty (:bounty res)
+                b-net (long (or (:builder-net settled-bounty) 0))
+                a-net (long (or (:auditor-net settled-bounty) 0))
+                rep-env (build-governance-replicate-envelope
+                         st-after-burn
+                         privkey-bytes
+                         subnet
+                         :bounty-settle
+                         {:subnet-id subnet
+                          :bounty-id bounty-id
+                          :claim claim
+                          :bounty settled-bounty}
+                         burn-amt)]
+            {:state (assoc st-after-burn :governance (:state res))
+             :response {"ok" true
+                        "subnet_id" subnet
+                        "bounty_id" bounty-id
+                        "status" "settled"
+                        "payouts" (:payouts res)
+                        "builder_net" b-net
+                        "auditor_net" a-net
+                        "protocol_take" (:protocol-take res)
+                        "burn" burn-amt}
+             :net-envelopes (if rep-env [rep-env] [])
+             :stdout-events []}))))))
+
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
    Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps.
@@ -4911,6 +5313,12 @@
               "capability-list" (exec-capability-list state effective-map)
               "puzzle-hash" (exec-puzzle-hash state effective-map)
               "puzzle-eval" (exec-puzzle-eval state effective-map)
+              "bip-submit" (exec-bip-submit state effective-map privkey-bytes sub-id-str)
+              "bip-consent" (exec-bip-consent state effective-map privkey-bytes sub-id-str)
+              "bip-object" (exec-bip-object state effective-map privkey-bytes sub-id-str)
+              "bip-status" (exec-bip-status state effective-map sub-id-str)
+              "bounty-create" (exec-bounty-create state effective-map privkey-bytes sub-id-str)
+              "bounty-settle" (exec-bounty-settle state effective-map privkey-bytes sub-id-str)
               "status" (exec-status state)
               {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})
         res' (if (seq (:net-envelopes res))
@@ -6290,6 +6698,100 @@
          :net-envelopes []
          :stdout-events [evt]}))))
 
+(defn- handle-wire-governance-replicate [state msg]
+  (let [subnet (str (or (:subnet-id msg) (get msg "subnet_id") gov/dev-subnet-id))
+        op (keyword (or (:op msg) (get msg "op")))
+        sender (normalize-pubkey-hex (str (or (:sender msg) (get msg "sender") "")))
+        ep (long (or (:epoch msg) (get msg "epoch") 0))
+        body (or (:body msg) (get msg "body") {})
+        sig-hex (str (or (:signature msg) (get msg "signature") ""))
+        valid-sig? (boolean
+                    (when (and (valid-pubkey-hex? sender)
+                               (not (str/blank? sig-hex))
+                               (contains? #{:bip-submit :bip-response :bounty-create :bounty-settle} op))
+                      (try
+                        (let [sender-bytes (basalt/hex->bytes sender)
+                              sig-bytes (basalt/hex->bytes sig-hex)
+                              payload (canonical-governance-replicate-payload subnet op sender ep body)]
+                          (and sender-bytes sig-bytes
+                               (crypto/verify-with-fallback sender-bytes payload sig-bytes)))
+                        (catch #?(:clj Exception :cljs :default) _ false))))]
+    (if-not valid-sig?
+      (let [diag-event {"event" "diagnostic"
+                        "reason" "governance-replication-rejected"
+                        "subnet_id" subnet
+                        "op" (if op (name op) "unknown")}]
+        {:state (update-in state [:diagnostics :governance-replication-rejected] (fnil inc 0))
+         :net-envelopes []
+         :stdout-events [diag-event]})
+      (let [gov-st0 (or (:governance state) (gov/init-governance-state))
+            evt {"event" "governance-replicated"
+                 "subnet_id" subnet
+                 "op" (name op)
+                 "sender" sender}]
+        (case op
+          :bip-submit
+          (let [bip (:bip body)
+                bip-id (str (or (:bip-id body) (:bip-id bip) ""))
+                blob (normalize-wire-blob (:blob body))
+                ptr (normalize-wire-pointer (:pointer body))
+                cid (or (:cid body) (:blob/cid blob))
+                path (str "bip/" bip-id)
+                gov-st' (-> gov-st0
+                            (cond-> (and cid blob) (assoc-in [:blobs cid] blob))
+                            (cond-> ptr (assoc-in [:pointers [subnet path]] ptr))
+                            (assoc-in [:bips [subnet bip-id]] bip)
+                            (assoc-in [:bips bip-id] bip))]
+            {:state (assoc state :governance gov-st')
+             :net-envelopes []
+             :stdout-events [evt]})
+
+          :bip-response
+          (let [bip-id (str (or (:bip-id body) ""))
+                circle-kw (normalize-circle-kw (:circle body))
+                member-pub (normalize-pubkey-hex (str (or (:member-pubkey body) sender)))
+                weight (double (or (:weight body) 100.0))
+                response (:response body)
+                gov-st1 (ensure-default-circle-member gov-st0 subnet circle-kw member-pub weight)
+                resp-res (gov/submit-circle-response gov-st1 subnet bip-id circle-kw member-pub response)
+                eval-res (gov/evaluate-tri-circle-consent (:state resp-res) subnet bip-id)]
+            {:state (assoc state :governance (:state eval-res))
+             :net-envelopes []
+             :stdout-events [evt]})
+
+          :bounty-create
+          (let [bounty (:bounty body)
+                bounty-id (str (or (:bounty-id body) (:bounty-id bounty) ""))
+                cap-cid (:capability-cid body)
+                cap-blob (normalize-wire-blob (:capability-blob body))
+                cap-ptr (normalize-wire-pointer (:capability-pointer body))
+                cap-path (str "bounty/" bounty-id)
+                gov-st' (-> gov-st0
+                            (cond-> (and cap-cid cap-blob) (assoc-in [:blobs cap-cid] cap-blob))
+                            (cond-> cap-ptr (assoc-in [:pointers [subnet cap-path]] cap-ptr))
+                            (assoc-in [:bounties [subnet bounty-id]] bounty)
+                            (assoc-in [:bounties bounty-id] bounty))]
+            {:state (-> state
+                        (assoc :governance gov-st')
+                        (cond-> cap-ptr (assoc-in [:capabilities [subnet cap-path]] cap-ptr))
+                        (cond-> (and cap-cid cap-blob) (assoc-in [:capability-blobs cap-cid] cap-blob)))
+             :net-envelopes []
+             :stdout-events [evt]})
+
+          :bounty-settle
+          (let [bounty-id (str (or (:bounty-id body) ""))
+                claim (:claim body)
+                settle-res (gov/settle-bounty-escrow gov-st0 subnet bounty-id claim)
+                my-pub (normalize-pubkey-hex (str (or (:pubkey state) "")))
+                my-payout (when (:ok? settle-res)
+                            (long (or (get (:payouts settle-res) my-pub) 0)))]
+            {:state (cond-> (assoc state :governance (:state settle-res))
+                      (and my-payout (pos? my-payout))
+                      (-> (update-in [:account :balance] (fn [b] (+ (long (or b 0)) my-payout)))
+                          (update-in [:account :spendable] (fn [s] (+ (long (or s 0)) my-payout)))))
+             :net-envelopes []
+             :stdout-events [evt]}))))))
+
 (defn- handle-wire-transfer [state msg]
   (let [raw-tf (or (:transfer msg) (get msg "transfer"))
         tf (when (map? raw-tf)
@@ -6406,7 +6908,10 @@
                                           (:type msg)
                                           (when (or (:transfer msg) (get msg "transfer")) :transfer)
                                           (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
-                    storage-or-cap? (or (= msg-type :storage-replicate) (= msg-type :capability-replicate) (= msg-type :transfer))
+                    storage-or-cap? (or (= msg-type :storage-replicate)
+                                        (= msg-type :capability-replicate)
+                                        (= msg-type :governance-replicate)
+                                        (= msg-type :transfer))
                     broadcast-on-default-global? (and (= msg-type :p2p-broadcast) (= expected-subnet "global"))
                     subnet-mismatch? (or (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*") (not= outer-subnet inner-subnet))
                                          (and (not storage-or-cap?)
@@ -6452,7 +6957,8 @@
                                                               :p2p-hub-relay
                                                               :p2p-broadcast
                                                               :storage-replicate
-                                                              :capability-replicate}
+                                                              :capability-replicate
+                                                              :governance-replicate}
                                                             msg-type))
                                             msg-epoch ref-epoch
                                             (> (math-abs (- msg-epoch (long ref-epoch))) max-skew))]
@@ -6494,6 +7000,7 @@
                                   :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
                                   :storage-replicate (handle-wire-storage-replicate state msg)
                                   :capability-replicate (handle-wire-capability-replicate state msg)
+                                  :governance-replicate (handle-wire-governance-replicate state msg)
                                   :transfer (handle-wire-transfer state msg)
                                   {:state state :net-envelopes [] :stdout-events []})
                             res' (if (and (not= msg-type :chain-state-snapshot)

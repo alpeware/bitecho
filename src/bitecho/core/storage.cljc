@@ -183,7 +183,8 @@
     :compute/gpu-access
     :model/weights
     :network/turn-relay
-    :network/gateway})
+    :network/gateway
+    :governance/bounty})
 
 (defn pack-capability-descriptor
   "Creates a canonical capability descriptor Blob and signed Pointer."

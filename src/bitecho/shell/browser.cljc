@@ -375,7 +375,15 @@
     "puzzle-source" "solution" "conditions"
     "cid" "mime" "bytes" "target" "authority" "leader-term" "proof"
     "provider" "price-echo" "target-cid" "capability-id" "capability-type"
-    "replication-rejected"})
+    "replication-rejected"
+    "governance" "governance-replication-rejected" "lab-subnets" "subnet-anchors"
+    "blob-store" "blobs" "pointers" "bips" "bounties" "circles" "circle-responses"
+    "regression-vectors" "subnet-regression-vectors" "scheduled-upgrades" "activated-upgrades" "subnet-policies"
+    "entries" "hot-bytes" "unpinned-bytes" "access-seq" "max-hot-bytes" "max-unpinned-bytes"
+    "evicted-hot" "evicted-unpinned" "cache-misses" "cid-mismatch" "dangling-pointers"
+    "builders-stewards" "mesh-validators" "anchor-agent-users"
+    "invalid-lab-subnet-rejected" "bip-admission-rejected" "sybil-bounty-claim-rejected"
+    "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"})
 
 (def ^:private allowed-persistence-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))

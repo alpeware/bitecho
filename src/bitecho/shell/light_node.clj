@@ -75,8 +75,11 @@
                                        "callee" (extract-flag-value args "--callee" nil)
                                        "price" (extract-long-flag args "--price" 0)
                                        "burn" (extract-long-flag args "--burn" 500)}
-                                    hn (extract-flag-value args "--home-node" nil)]
-                                (if hn (assoc m "home_node" hn) m))
+                                    hn (extract-flag-value args "--home-node" nil)
+                                    wait-open-ms (extract-long-flag args "--wait-open-ms" nil)]
+                                (cond-> m
+                                  hn (assoc "home_node" hn)
+                                  (some? wait-open-ms) (assoc "wait_open_ms" wait-open-ms)))
                    "accept"   {"cmd" "accept"
                                "session_id" (or (extract-flag-value args "--session-id" nil)
                                                 (extract-flag-value args "--session" nil))}
@@ -535,6 +538,112 @@
                                                      (extract-flag-value args "--session" nil))]
                                          (cond-> {"cmd" "retransmit-outbox"}
                                            sid (assoc "session_id" sid)))
+                   "bip-submit" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                              (extract-flag-value args "--subnet" nil))
+                                      bip-id (extract-flag-value args "--bip-id" nil)
+                                      title (extract-flag-value args "--title" nil)
+                                      spec-file (extract-flag-value args "--spec-file" nil)
+                                      spec-edn (or (extract-flag-value args "--spec-edn" nil)
+                                                   (when spec-file (try (slurp spec-file) (catch Exception _ nil))))
+                                      policy-edn (extract-flag-value args "--policy-edn" nil)
+                                      defspec-vars (extract-flag-value args "--defspec-vars" nil)
+                                      oracle-edn (extract-flag-value args "--oracle-receipts-edn" nil)
+                                      act-ep (extract-long-flag args "--activate-at-epoch" nil)
+                                      b (extract-long-flag args "--burn" nil)
+                                      m {"cmd" "bip-submit"}]
+                                  (cond-> m
+                                    sub (assoc "subnet_id" sub)
+                                    bip-id (assoc "bip_id" bip-id)
+                                    title (assoc "title" title)
+                                    spec-edn (assoc "spec_edn" spec-edn)
+                                    spec-file (assoc "spec_file" spec-file)
+                                    policy-edn (assoc "policy_edn" policy-edn)
+                                    defspec-vars (assoc "defspec_vars" defspec-vars)
+                                    oracle-edn (assoc "oracle_receipts_edn" oracle-edn)
+                                    (some? act-ep) (assoc "activate_at_epoch" act-ep)
+                                    (some? b) (assoc "burn" b)))
+                   "bip-consent" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                               (extract-flag-value args "--subnet" nil))
+                                       bip-id (extract-flag-value args "--bip-id" nil)
+                                       circle (extract-flag-value args "--circle" nil)
+                                       w (extract-long-flag args "--weight" nil)
+                                       comment-str (extract-flag-value args "--comment" nil)
+                                       b (extract-long-flag args "--burn" nil)
+                                       m {"cmd" "bip-consent"}]
+                                   (cond-> m
+                                     sub (assoc "subnet_id" sub)
+                                     bip-id (assoc "bip_id" bip-id)
+                                     circle (assoc "circle" circle)
+                                     (some? w) (assoc "weight" w)
+                                     comment-str (assoc "comment" comment-str)
+                                     (some? b) (assoc "burn" b)))
+                   "bip-object" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                              (extract-flag-value args "--subnet" nil))
+                                      bip-id (extract-flag-value args "--bip-id" nil)
+                                      circle (extract-flag-value args "--circle" nil)
+                                      ce-edn (extract-flag-value args "--counterexample-edn" nil)
+                                      w (extract-long-flag args "--weight" nil)
+                                      b (extract-long-flag args "--burn" nil)
+                                      m {"cmd" "bip-object"}]
+                                  (cond-> m
+                                    sub (assoc "subnet_id" sub)
+                                    bip-id (assoc "bip_id" bip-id)
+                                    circle (assoc "circle" circle)
+                                    ce-edn (assoc "counterexample_edn" ce-edn)
+                                    (some? w) (assoc "weight" w)
+                                    (some? b) (assoc "burn" b)))
+                   "bip-status" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                              (extract-flag-value args "--subnet" nil))
+                                      bip-id (extract-flag-value args "--bip-id" nil)
+                                      m {"cmd" "bip-status"}]
+                                  (cond-> m
+                                    sub (assoc "subnet_id" sub)
+                                    bip-id (assoc "bip_id" bip-id)))
+                   "bounty-create" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                 (extract-flag-value args "--subnet" nil))
+                                         bounty-id (extract-flag-value args "--bounty-id" nil)
+                                         target-cid (or (extract-flag-value args "--target-bip-cid" nil)
+                                                        (extract-flag-value args "--bip-id" nil))
+                                         gross (or (extract-long-flag args "--gross-amount" nil)
+                                                   (extract-long-flag args "--amount" nil))
+                                         m-pub (extract-flag-value args "--maintainer-pubkey" nil)
+                                         take-bps (extract-long-flag args "--take-bps" nil)
+                                         builder-bps (extract-long-flag args "--builder-bps" nil)
+                                         auditor-bps (extract-long-flag args "--auditor-bps" nil)
+                                         b (extract-long-flag args "--burn" nil)
+                                         m {"cmd" "bounty-create"}]
+                                     (cond-> m
+                                       sub (assoc "subnet_id" sub)
+                                       bounty-id (assoc "bounty_id" bounty-id)
+                                       target-cid (assoc "target_bip_cid" target-cid "bip_id" target-cid)
+                                       (some? gross) (assoc "gross_amount" gross "amount" gross)
+                                       m-pub (assoc "maintainer_pubkey" m-pub)
+                                       (some? take-bps) (assoc "take_bps" take-bps)
+                                       (some? builder-bps) (assoc "builder_bps" builder-bps)
+                                       (some? auditor-bps) (assoc "auditor_bps" auditor-bps)
+                                       (some? b) (assoc "burn" b)))
+                   "bounty-settle" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                 (extract-flag-value args "--subnet" nil))
+                                         bounty-id (extract-flag-value args "--bounty-id" nil)
+                                         claim-file (extract-flag-value args "--claim-file" nil)
+                                         claim-edn (or (extract-flag-value args "--claim-edn" nil)
+                                                       (when claim-file (try (slurp claim-file) (catch Exception _ nil))))
+                                         builder (extract-flag-value args "--builder" nil)
+                                         auditor (extract-flag-value args "--auditor" nil)
+                                         patch-cid (extract-flag-value args "--patch-cid" nil)
+                                         sha256 (extract-flag-value args "--sha256" nil)
+                                         b (extract-long-flag args "--burn" nil)
+                                         m {"cmd" "bounty-settle"}]
+                                     (cond-> m
+                                       sub (assoc "subnet_id" sub)
+                                       bounty-id (assoc "bounty_id" bounty-id)
+                                       claim-edn (assoc "claim_edn" claim-edn)
+                                       claim-file (assoc "claim_file" claim-file)
+                                       builder (assoc "builder" builder)
+                                       auditor (assoc "auditor" auditor)
+                                       patch-cid (assoc "patch_cid" patch-cid)
+                                       sha256 (assoc "sha256" sha256)
+                                       (some? b) (assoc "burn" b)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -2749,8 +2858,31 @@
                                                         (do
                                                           (Thread/sleep (min 50 (if block? 50 (max 10 rem))))
                                                           (recur)))))))))
-                                          (locking cmd-lock
-                                            (handle-serve-line! cmd-map ctx)))
+                                          (let [raw-res (locking cmd-lock
+                                                          (handle-serve-line! cmd-map ctx))
+                                                sid (when (map? raw-res) (or (get raw-res "session_id") (:session-id raw-res)))
+                                                explicit-wait (or (get cmd-map "wait_open_ms")
+                                                                  (get cmd-map "wait-open-ms")
+                                                                  (:wait-open-ms cmd-map))
+                                                live-net? (and (:conn-atom ctx)
+                                                               (connection-live? @(:conn-atom ctx) @state-atom))
+                                                wait-ms (long (or explicit-wait (if live-net? 3000 0)))]
+                                            (if (and (= (get cmd-map "cmd") "offer")
+                                                     (true? (get raw-res "ok"))
+                                                     (string? sid))
+                                              (do
+                                                (when (and (pos? wait-ms) live-net?)
+                                                  (let [deadline (+ (System/currentTimeMillis) wait-ms)]
+                                                    (loop []
+                                                      (let [st-phase (get-in @state-atom [:sessions sid :state])]
+                                                        (when (and (not= st-phase "open")
+                                                                   (< (System/currentTimeMillis) deadline))
+                                                          (try (Thread/sleep 25) (catch InterruptedException _ nil))
+                                                          (recur))))))
+                                                (assoc raw-res
+                                                       "session_phase"
+                                                       (or (get-in @state-atom [:sessions sid :state]) "initiating")))
+                                              raw-res)))
                                     resp-bytes (.getBytes (json/write-str res) "UTF-8")]
                                 (.sendResponseHeaders exchange 200 (alength resp-bytes))
                                 (with-open [os (.getResponseBody exchange)]
