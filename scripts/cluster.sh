@@ -444,9 +444,10 @@ verify_release_proof_gate() {
     return 1
   fi
 
-  local proof_commit proof_tree head_commit parent_commit head_tree parent_tree
-  proof_commit=$(sed -n -E 's/.*:commit-sha\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
-  proof_tree=$(sed -n -E 's/.*:tree-sha\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
+  local proof_commit proof_tree head_commit parent_commit head_tree parent_tree flat_proof
+  flat_proof=$(tr '\n' ' ' < "${proof_file}")
+  proof_commit=$(echo "${flat_proof}" | sed -n -E 's/.*:commit-sha[[:space:]]+"([^"]+)".*/\1/p')
+  proof_tree=$(echo "${flat_proof}" | sed -n -E 's/.*:tree-sha[[:space:]]+"([^"]+)".*/\1/p')
   head_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)
   parent_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD~1 2>/dev/null || true)
   head_tree=$(git -C "${ROOT_DIR}" rev-parse HEAD^{tree} 2>/dev/null || true)
@@ -470,13 +471,13 @@ verify_release_proof_gate() {
   fi
 
   local proof_node_sha actual_node_sha proof_browser_sha actual_browser_sha
-  proof_node_sha=$(sed -n -E 's/.*:node-bundle-sha256\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
+  proof_node_sha=$(echo "${flat_proof}" | sed -n -E 's/.*:node-bundle-sha256[[:space:]]+"([^"]+)".*/\1/p')
   actual_node_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-light-node.cjs" | awk '{print $1}')
   if [[ "${proof_node_sha}" != "${actual_node_sha}" ]]; then
     echo "Error: Release proof :node-bundle-sha256 (${proof_node_sha}) does not match dist/bitecho-light-node.cjs (${actual_node_sha})." >&2
     return 1
   fi
-  proof_browser_sha=$(sed -n -E 's/.*:browser-bundle-sha256\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
+  proof_browser_sha=$(echo "${flat_proof}" | sed -n -E 's/.*:browser-bundle-sha256[[:space:]]+"([^"]+)".*/\1/p')
   actual_browser_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-browser.js" | awk '{print $1}')
   if [[ "${proof_browser_sha}" != "${actual_browser_sha}" ]]; then
     echo "Error: Release proof :browser-bundle-sha256 (${proof_browser_sha}) does not match dist/bitecho-browser.js (${actual_browser_sha})." >&2
