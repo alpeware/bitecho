@@ -104,7 +104,7 @@
                   (let [st (or (:state s) (when (:status s) (name (:status s))))
                         survives? (cond
                                     (= st "open") (or (some? (:tx-key s)) (some? (:session-keys s)))
-                                    (= st "offered") (some? (:ephemeral-priv s))
+                                    (= st "offered") (or (some? (:ephemeral-priv s)) (some? (:offer-nonce s)))
                                     :else false)]
                     (when survives?
                       [sid (dissoc s :p2p)]))))

@@ -669,6 +669,22 @@
                (js/Uint8Array. (.call dh-fn node-crypto #js {:privateKey priv-key :publicKey pub-key})))
              (pure-x25519-shared-secret priv-bytes pub-bytes))))
 
+(defn x25519-keypair-from-seed
+  "Deterministically derives an X25519 keypair from a 32-byte seed.
+   Returns {:public spki-der-44-bytes :private pkcs8-der-48-bytes
+            :public-key spki-der-44-bytes :private-key pkcs8-der-48-bytes}."
+  [seed-32-bytes]
+  (let [seed (if (string? seed-32-bytes) (fressian/hex->bytes seed-32-bytes) seed-32-bytes)
+        priv-der (fressian/concat-bytes (fressian/hex->bytes "302e020100300506032b656e04220420") seed)
+        u9 #?(:clj (let [b (byte-array 32)] (aset-byte b 0 9) b)
+              :cljs (let [b (js/Uint8Array. 32)] (aset b 0 9) b))
+        pub-raw (x25519-shared-secret priv-der u9)
+        pub-der (fressian/concat-bytes (fressian/hex->bytes "302a300506032b656e032100") pub-raw)]
+    {:public pub-der
+     :private priv-der
+     :public-key pub-der
+     :private-key priv-der}))
+
 ;; -----------------------------------------------------------------------------
 ;; HKDF-SHA256 (RFC 5869)
 ;; -----------------------------------------------------------------------------
@@ -719,6 +735,18 @@
   [ikm salt info length]
   (let [prk (hkdf-extract salt ikm)]
     (hkdf-expand prk info length)))
+
+(defn derive-offer-x25519-keypair
+  "Derives an X25519 keypair deterministically for an offer using domain-separated HKDF (F-D25-4)."
+  [privkey-bytes offer-nonce-hex caller-hex callee-hex]
+  (let [priv-bytes (if (string? privkey-bytes) (fressian/hex->bytes privkey-bytes) privkey-bytes)
+        subkey (hkdf-sha256 priv-bytes nil (fressian/utf8->bytes "bitecho-ed25519-offer-subkey-v1") 32)
+        salt (if (string? offer-nonce-hex) (fressian/hex->bytes offer-nonce-hex) offer-nonce-hex)
+        info (fressian/utf8->bytes (str "bitecho-offer-x25519-v1|"
+                                        (str/lower-case (str caller-hex)) "|"
+                                        (str/lower-case (str callee-hex))))
+        seed (hkdf-sha256 subkey salt info 32)]
+    (x25519-keypair-from-seed seed)))
 
 ;; -----------------------------------------------------------------------------
 ;; Directional Channel Keys & Nonce Derivation

@@ -593,6 +593,14 @@
                                               (filterv (fn [e] (>= (long (:received-at e 0)) cutoff-ms))
                                                        (or (:broadcasts capped-st) []))
                                               (or (:broadcasts capped-st) []))
+                            sub-id (str (or (:subnet-id decoded)
+                                            (get decoded "subnet_id")
+                                            (get decoded "subnet-id")
+                                            (get-in decoded [:event :subnet-id])
+                                            (get-in decoded [:event "subnet_id"])
+                                            (get-in decoded [:event :message :subnet-id])
+                                            (get-in decoded [:event "message" "subnet_id"])
+                                            "global"))
                             b-entry {:broadcast-seq next-bseq
                                      :broadcast_seq next-bseq
                                      :envelope-id envelope-id
@@ -601,6 +609,9 @@
                                      :envelope-hex wire-hex
                                      :envelope_hex wire-hex
                                      :sender sender
+                                     :subnet-id sub-id
+                                     :subnet_id sub-id
+                                     "subnet_id" sub-id
                                      :received-at now-ms
                                      :received_at now-ms
                                      :byte-size payload-size}
@@ -720,16 +731,33 @@
                 inbox (filterv (fn [e] (and (> (long (:relay-seq e)) since-seq)
                                             (or (<= now-ms 0) (>= (long (:received-at e 0)) cutoff-ms))))
                                (get-in state [:inboxes norm-pk] []))
-                bcasts (filterv (fn [e] (and (> (long (:broadcast-seq e)) since-bseq)
-                                             (or (<= now-ms 0) (>= (long (:received-at e 0)) cutoff-ms))))
-                                (get state :broadcasts []))
+                raw-subs (or (:subnets event) (:subnet-ids event) (get event "subnets"))
+                sub-filter-set (when (and raw-subs (seq (cond (coll? raw-subs) raw-subs
+                                                              (string? raw-subs) (str/split raw-subs #",")
+                                                              :else [])))
+                                 (set (map (comp str/trim str)
+                                           (if (coll? raw-subs) raw-subs (str/split raw-subs #",")))))
+                all-bcasts (filterv (fn [e] (and (> (long (:broadcast-seq e)) since-bseq)
+                                                 (or (<= now-ms 0) (>= (long (:received-at e 0)) cutoff-ms))))
+                                    (get state :broadcasts []))
+                max-bseq (if (seq all-bcasts)
+                           (apply max (map :broadcast-seq all-bcasts))
+                           since-bseq)
+                filtered-bcasts (if sub-filter-set
+                                  (filterv (fn [e]
+                                             (let [esub (str (or (:subnet-id e) (:subnet_id e) (get e "subnet_id") "global"))]
+                                               (or (contains? sub-filter-set esub)
+                                                   (contains? sub-filter-set "*"))))
+                                           all-bcasts)
+                                  all-bcasts)
                 new-st (update-in state-with-nonce [:diagnostics :polled] (fnil inc 0))]
             {:state new-st
              :ok? true
              :response {"ok" true
                         "pubkey" norm-pk
                         "messages" inbox
-                        "broadcasts" bcasts}
+                        "broadcasts" filtered-bcasts
+                        "last_broadcast_seq" max-bseq}
              :effects []})))
 
       :relay-ack

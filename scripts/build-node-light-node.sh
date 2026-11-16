@@ -75,9 +75,13 @@ content = re.sub(
 
 content = content.replace("target/cljs-nod2/out", "target/cljs-node/out")
 
+if not content.startswith("#!/usr/bin/env node\n"):
+    content = "#!/usr/bin/env node\n" + content
+
 with open(path, 'w', encoding='utf-8') as f:
     f.write(content)
 PY
+chmod +x "$bundle_file"
 }
 
 normalize_bundle "dist/bitecho-light-node.cjs"
@@ -111,6 +115,13 @@ echo "Generated deterministic dist/bitecho-light-node.cjs (${BUNDLE_SIZE} bytes,
 NODE_BIN="${NODE_BIN:-node}"
 if [ -x "${HOME}/.local/bin/node" ]; then
   NODE_BIN="${HOME}/.local/bin/node"
+fi
+
+HELP_OUT=$("${NODE_BIN}" "dist/bitecho-light-node.cjs" --help)
+echo "Help smoke check output: ${HELP_OUT}"
+if [[ "${HELP_OUT}" != *'"help":true'* || "${HELP_OUT}" != *'"verbs":'* ]]; then
+  echo "ERROR: Help smoke check failed for dist/bitecho-light-node.cjs!" >&2
+  exit 1
 fi
 
 TMP_STATE_DIR="$(mktemp -d)"

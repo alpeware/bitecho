@@ -1,0 +1,118 @@
+{:d25-remediation-scenarios
+ {:all-passed? true,
+  :count 7,
+  :scenarios
+  [{:scenario "S9",
+    :name "handle-serve-line-state-commit-and-sequential-p2p-dial",
+    :passed? true}
+   {:scenario "S10",
+    :name "relay-poll-ingest-ordering-and-no-poll-escape-hatch",
+    :passed? true}
+   {:scenario "S11",
+    :name "stateless-offer-handshake-continuity-and-nonce-recovery",
+    :passed? true}
+   {:scenario "S12",
+    :name "inbox-peek-and-dual-key-broadcast-normalization",
+    :passed? true}
+   {:scenario "S13",
+    :name "subnet-filtering-relay-poll-and-wire-payload",
+    :passed? true}
+   {:scenario "S14",
+    :name "flag-before-verb-parsing-and-help-isolation",
+    :passed? true}
+   {:scenario "S15",
+    :name "upnp-renewal-loop-lifecycle",
+    :passed? true}]},
+ :all-passed? true,
+ :milestone "D25",
+ :cross-network-replay
+ {:pairs
+  [{:source "devnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}
+   {:source "devnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}],
+  :mainnet-unscoped-rejected? true,
+  :devnet-unscoped-accepted? true,
+  :all-rejected? true},
+ :rolling-upgrade
+ {:node-n-subnet "global",
+  :node-n-plus-1-subnet "devnet.bitecho.org",
+  :n-accepted-n1-event? true,
+  :n1-accepted-n-event? true,
+  :foreign-subnet-dropped? true,
+  :passed? true},
+ :node-bundle-sha256
+ "5deb8ecec1464b181213f26c3b5f145133983ee14bdab962e60fe3c0551d8126",
+ :networks
+ {"devnet.bitecho.org"
+  {:network :devnet,
+   :network-uri "devnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 50,
+   :governance-passed? true,
+   :passed? true},
+  "testnet.bitecho.org"
+  {:network :testnet,
+   :network-uri "testnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true},
+  "mainnet.bitecho.org"
+  {:network :mainnet,
+   :network-uri "mainnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true}},
+ :d24-remediation-scenarios
+ {:all-passed? true,
+  :count 8,
+  :scenarios
+  [{:scenario "S1",
+    :name "p2p-answer-candidate-fallback-and-persistence",
+    :passed? true}
+   {:scenario "S2",
+    :name "port-443-passthrough-and-signatures",
+    :passed? true}
+   {:scenario "S3",
+    :name "cross-subnet-relay-and-early-sealed-buffering",
+    :passed? true}
+   {:scenario "S4",
+    :name "now-ms-injection-and-offline-shuttle",
+    :passed? true}
+   {:scenario "S5",
+    :name "replication-auth-and-ctl-concurrency",
+    :passed? true}
+   {:scenario "S6",
+    :name "single-responder-and-newline-discipline",
+    :passed? true}
+   {:scenario "S7",
+    :name "jepsen-and-datachannel-campaigns",
+    :passed? true}
+   {:scenario "S8",
+    :name "node-bundle-relay-send-and-failover",
+    :passed? true}]},
+ :version "v0.23.3",
+ :browser-bundle-sha256
+ "31386eff3a8a9dc17aa054800d3de15a434b9baa4580674c0a8d7b7db87ee942"}

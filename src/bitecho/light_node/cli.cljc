@@ -37,6 +37,7 @@
    "export-offer"
    "export-poll"
    "export-send"
+   "help"
    "identity"
    "import"
    "import-poll"
@@ -67,6 +68,7 @@
    "storage-list"
    "storage-put"
    "submit-vouchers"
+   "subscribe-subnets"
    "sync-account"
    "transfer"
    "verify-subnet-anchor"
@@ -75,6 +77,18 @@
 (def supported-cli-verbs-set
   "Set of all canonical CLI verbs for O(1) membership check."
   (set supported-cli-verbs))
+
+(def known-command-flags
+  "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
+  ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--subnet-id" "--subnet"
+   "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
+   "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--after-ts"
+   "--ingress-tcp-port" "--trusted-dac-anchors" "--turn-server" "--turn-username"
+   "--turn-password" "--turn-realm" "--turn-force-relay" "--sync-interval-ms" "--price"
+   "--price-max" "--burn" "--to" "--from" "--callee" "--peer" "--receiver" "--recipient"
+   "--amount" "--text" "--message" "--payload-hex" "--peek" "--poll" "--sync" "--no-poll"
+   "--autonomous" "--auto-sync" "--auto-register-home-set" "--no-auto-register-home-set"
+   "--wait-open-ms" "--block" "--until-event" "--help"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -236,11 +250,25 @@
       "status"   {"cmd" "status"}
       "identity" {"cmd" "identity"}
       "discover" {"cmd" "discover"}
+      "help"     {"cmd" "help"}
       "inbox"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
-                    (extract-flag-value clean-tokens "--subnet" nil))]
+                    (extract-flag-value clean-tokens "--subnet" nil))
+            peek? (has-flag? clean-tokens "--peek")]
         (cond-> {"cmd" "inbox"}
-          sub (assoc "subnet_id" sub)))
+          sub (assoc "subnet_id" sub)
+          peek? (assoc "peek" true)))
+
+      "subscribe-subnets"
+      (let [subnets-raw (or (extract-flag-value clean-tokens "--subnets" nil)
+                            (extract-flag-value clean-tokens "--subscribe-subnets" nil)
+                            (extract-flag-value clean-tokens "--subnet-id" nil)
+                            (extract-flag-value clean-tokens "--subnet" nil))
+            subnets (if subnets-raw
+                      (mapv str/trim (str/split subnets-raw #","))
+                      [])]
+        {"cmd" "subscribe-subnets"
+         "subnets" subnets})
 
       "offer"
       (let [callee (or (extract-flag-value clean-tokens "--callee" nil)

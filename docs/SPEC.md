@@ -227,7 +227,7 @@ Bitecho implements a pure Sans-IO 4-layer autonomous protocol evolution and gove
    - Valid reproducible counterexamples (`:vopr-seed`, `:monte-carlo-insolvency`, `:security-regression`) transition the BIP to `:blocked-by-paramount-objection` and append a deterministic regression test vector to `[:subnet-regression-vectors subnet-id]` and `:regression-vectors`.
    - Ratified BIPs specifying `:policy-theta` and `:activate-at-epoch` are queued in `[:scheduled-upgrades [subnet-id activate-at-epoch]]` and deterministically activated at epoch boundary $E_{\text{act}}$ via `activate-epoch-upgrades` (`INV-D22-4`).
 5. **First-Class Light-Node CLI & Wire Verbs (`INV-D22-3`):**
-   - All 61 light-node CLI verbs (including `bip-submit`, `bip-consent`, `bip-object`, `bip-status`, `bounty-create`, `bounty-settle`, and `offer --wait-open-ms`) execute across JVM, Node.js, and Browser runtimes and replicate governance state over signed `:governance-replicate` Fressian gossip envelopes.
+   - All 63 light-node CLI verbs (including `bip-submit`, `bip-consent`, `bip-object`, `bip-status`, `bounty-create`, `bounty-settle`, `subscribe-subnets`, `help`, and `offer --wait-open-ms`) and 51 canonical flags execute across JVM, Node.js, and Browser runtimes and replicate governance state over signed `:governance-replicate` Fressian gossip envelopes.
 
 ---
 
@@ -257,6 +257,25 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 ### 7.2 Hook Newline Discipline & Control Concurrency
 1. **Streaming JSONL Discipline:** Streaming CLI commands, subagent inputs, or stdin pipelines (`--cmd-file` or stdin pipe) must strictly maintain single-line JSON (`\n`) formatting. If adjacent, un-delimited JSON commands arrive (e.g. `}{`), `cli/split-jsonl-commands` parses and splits valid JSON objects without dropping envelopes or throwing syntax errors.
 2. **Control Socket Concurrency:** All `/ctl` command executions are serialized through a single reentrant mutex (`serve-cmd-lock` / sequential dispatch) to prevent concurrent command races and state corruption across multiple subagents.
+
+---
+
+## 8. Milestone D25: Stateless One-Shot Continuity, Peek Semantics, Subnet Filtering, & UPnP
+
+### 8.1 Stateless One-Shot Offer Handshake Continuity (`A-D25-1`, `A-D25-2`, `A-CARB-D25-1`, `F-D25-4`)
+1. **Deterministic X25519 Seed Keypair Derivation:** `sealed/x25519-keypair-from-seed` derives SPKI/PKCS#8 keypairs cross-runtime (JVM, Node.js, Browser) identically from RFC 7748 scalar multiplication.
+2. **Domain-Separated HKDF Nonce Recovery:** `exec-offer` generates 32-byte `:offer-nonce` and derives the ephemeral keypair using HKDF with info string `"bitecho-offer-x25519-v1|<caller>|<callee>"`.
+3. **Restricted Nonce Lifetime (`A-CARB-D25-1`):** `:offer-nonce` is preserved across persistence while session state is `"offered"`, allowing one-shot nodes to resume and complete handshakes across process boundaries. Once the handshake transitions to `"open"` or `"closed"`, `:offer-nonce` is strictly stripped alongside `:ephemeral-priv`.
+
+### 8.2 Non-Destructive Peek Reads & Subnet Filtering (`F-D25-5`, `F-D25-6`, `F-D25-7`, `F-D25-9`)
+1. **`inbox --peek` Semantics:** When `--peek` is passed, `inbox` returns messages non-destructively without draining `:inbox` or `:broadcast-inbox`, without writing state to disk, and without acknowledging relay envelopes.
+2. **Subnet-Filtered Relay Polling:** Gateway relay `/relay/v1/poll` filters broadcasts by `:subnets` while advancing `:last_broadcast_seq` monotonically.
+3. **Subnet Subscriptions:** Default subscribed subnets include `"chat/simon-nexus-axiom"`. `subscribe-subnets` CLI verb dynamically registers additional subnet filters.
+4. **Dual Key Broadcast Normalization:** Incoming broadcasts normalize dual snake/kebab keys (`:msg-id`, `:msg_id`, `"msg_id"`, `:subnet-id`, `:subnet_id`, `"subnet_id"`).
+
+### 8.3 UPnP IGD Port-Mapping Renewal Loop (`F-D25-10`)
+1. **Background Lease Renewal:** `upnp/start-upnp-renewal-loop!` starts a daemon thread periodically renewing router port mappings for `:ingress-tcp-port` and `:agent-port`.
+2. **SSDP Gateway Re-Discovery & Fail-Closed Diagnostics:** If gateway mapping fails or times out, the renewal loop attempts re-discovery and emits counted `:diagnose` effects per Rule 5. Clean termination via `upnp/stop-upnp-renewal-loop!` is wired into node shutdown.
 
 
 

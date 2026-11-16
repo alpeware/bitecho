@@ -12,6 +12,7 @@
             [bitecho.crypto-test]
             [bitecho.crypto.sealed-test]
             [bitecho.d24-remediation-scenarios-test]
+            [bitecho.d25-remediation-scenarios-test]
             [bitecho.demo.angels-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

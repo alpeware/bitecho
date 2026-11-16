@@ -498,3 +498,52 @@
                   :reason :external-reachability-gate-failed
                   :external-ip external-ip
                   :failed-ports (mapv #(select-keys % [:protocol :port :error]) failed)}]})))
+
+;; =============================================================================
+;; 4. Periodic UPnP IGD Port-Mapping Lease Renewal Loop (Item 7 / F-D25-10)
+;; =============================================================================
+
+(defn start-upnp-renewal-loop!
+  "Starts a daemon background thread that periodically refreshes UPnP IGD port mappings.
+   Opts:
+     :renew-interval-ms (default 300000 / 5 minutes)
+     :diagnose-fn (callback invoked with each :diagnose effect map, e.g. for shell state routing)
+     :renew-fn (custom renewal function for testing, defaults to calling ensure-ingress-port-mappings!)
+   Returns a handle map `{:running? (fn [] ...) :stop! (fn [] ...) :renew-fn ...}`."
+  ([config]
+   (start-upnp-renewal-loop! config {}))
+  ([config opts]
+   (let [interval-ms (long (or (:renew-interval-ms opts) (:renew-interval-ms config) 300000))
+         diagnose-fn (or (:diagnose-fn opts) (fn [_] nil))
+         renew-fn (or (:renew-fn opts) (fn [] (ensure-ingress-port-mappings! (merge config opts))))
+         stopped? (atom false)
+         last-result (atom nil)
+         thread (Thread.
+                 (fn []
+                   (while (not @stopped?)
+                     (try
+                       (Thread/sleep interval-ms)
+                       (when (not @stopped?)
+                         (let [res (try (renew-fn) (catch Exception e {:ok? false :error (.getMessage e) :effects [{:effect :diagnose :reason :upnp-renew-exception :message (.getMessage e)}]}))]
+                           (reset! last-result res)
+                           (doseq [eff (:effects res)]
+                             (try (diagnose-fn eff) (catch Exception _ nil)))))
+                       (catch InterruptedException _
+                         (reset! stopped? true))
+                       (catch Exception e
+                         (try (diagnose-fn {:effect :diagnose :reason :upnp-renewal-loop-error :message (.getMessage e)}) (catch Exception _ nil))))))
+                 "bitecho-upnp-renewal-loop")]
+     (.setDaemon thread true)
+     (.start thread)
+     {:running? (fn [] (and (not @stopped?) (.isAlive thread)))
+      :last-result (fn [] @last-result)
+      :renew-fn renew-fn
+      :stop! (fn []
+               (when (compare-and-set! stopped? false true)
+                 (.interrupt thread)))})))
+
+(defn stop-upnp-renewal-loop!
+  "Stops an active UPnP renewal loop."
+  [loop-handle]
+  (when (and (map? loop-handle) (fn? (:stop! loop-handle)))
+    ((:stop! loop-handle))))

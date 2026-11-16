@@ -12,8 +12,8 @@
 ;; =============================================================================
 
 (deftest test-supported-verbs-inventory
-  (testing "Exact 61 canonical verbs in supported-cli-verbs"
-    (is (= 61 (count cli/supported-cli-verbs)))
+  (testing "Exact 63 canonical verbs in supported-cli-verbs"
+    (is (= 63 (count cli/supported-cli-verbs)))
     (is (= (count (distinct cli/supported-cli-verbs)) (count cli/supported-cli-verbs)))
     (is (= cli/supported-cli-verbs (vec (sort cli/supported-cli-verbs))))
     (is (every? #(re-matches #"^[a-z0-9]+(-[a-z0-9]+)*$" %) cli/supported-cli-verbs))
@@ -38,6 +38,8 @@
     (is (contains? cli/supported-cli-verbs-set "bounty-settle"))
     (is (contains? cli/supported-cli-verbs-set "status"))
     (is (contains? cli/supported-cli-verbs-set "identity"))
+    (is (contains? cli/supported-cli-verbs-set "help"))
+    (is (contains? cli/supported-cli-verbs-set "subscribe-subnets"))
     (is (contains? cli/supported-cli-verbs-set "wait"))))
 
 ;; =============================================================================

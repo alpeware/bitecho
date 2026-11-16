@@ -10,6 +10,7 @@
             [bitecho.config :as config]
             [bitecho.crypto :as crypto]
             [bitecho.d24-remediation-scenarios-test :as d24-test]
+            [bitecho.d25-remediation-scenarios-test :as d25-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
             [bitecho.fressian :as fressian]
@@ -345,31 +346,63 @@
      :count (count results)
      :scenarios results}))
 
+(defn run-d25-scenarios
+  "Executes Milestone D25 remediation and scenario verification suite (S9-S15)."
+  []
+  (let [scenarios [{:id "S9" :name "handle-serve-line-state-commit-and-sequential-p2p-dial" :test-fn d25-test/test-scenario-s9-handle-serve-line-state-commit-and-sequential-p2p-dial}
+                   {:id "S10" :name "relay-poll-ingest-ordering-and-no-poll-escape-hatch" :test-fn d25-test/test-scenario-s10-relay-poll-ingest-ordering-and-no-poll-escape-hatch}
+                   {:id "S11" :name "stateless-offer-handshake-continuity-and-nonce-recovery" :test-fn d25-test/test-scenario-s11-stateless-offer-handshake-continuity-and-nonce-recovery}
+                   {:id "S12" :name "inbox-peek-and-dual-key-broadcast-normalization" :test-fn d25-test/test-scenario-s12-inbox-peek-and-dual-key-broadcast-normalization}
+                   {:id "S13" :name "subnet-filtering-relay-poll-and-wire-payload" :test-fn d25-test/test-scenario-s13-subnet-filtering-relay-poll-and-wire-payload}
+                   {:id "S14" :name "flag-before-verb-parsing-and-help-isolation" :test-fn d25-test/test-scenario-s14-flag-before-verb-parsing-and-help-isolation}
+                   {:id "S15" :name "upnp-renewal-loop-lifecycle" :test-fn d25-test/test-scenario-s15-upnp-renewal-loop-lifecycle}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D24 (v0.23.2) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D25 (v0.23.3) release verification proof and returns a deterministic EDN map."
   [opts]
-  (let [ver (or (:version opts) "v0.23.2")
-        ms (or (:milestone opts) "D24")
+  (let [ver (or (:version opts) "v0.23.3")
+        ms (or (:milestone opts) "D25")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
         replay-res (run-cross-network-replay-matrix)
         rolling-res (run-rolling-upgrade-interop)
         d24-scenarios (run-d24-scenarios)
+        d25-scenarios (run-d25-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
         bundle-sha (when (.exists bundle-file)
                      (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath bundle-file)))))
+        browser-file (io/file "dist/bitecho-browser.js")
+        browser-sha (when (.exists browser-file)
+                      (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath browser-file)))))
         all-passed? (boolean (and (:passed? devnet-res)
                                   (:passed? testnet-res)
                                   (:passed? mainnet-res)
                                   (:all-rejected? replay-res)
                                   (:passed? rolling-res)
-                                  (:all-passed? d24-scenarios)))]
+                                  (:all-passed? d24-scenarios)
+                                  (:all-passed? d25-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
      :node-bundle-sha256 bundle-sha
+     :browser-bundle-sha256 browser-sha
      :d24-remediation-scenarios d24-scenarios
+     :d25-remediation-scenarios d25-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}
@@ -377,9 +410,9 @@
      :rolling-upgrade rolling-res}))
 
 (defn -main
-  "CLI entrypoint generating the Milestone D24 release proof EDN artifact."
+  "CLI entrypoint generating the Milestone D25 release proof EDN artifact."
   [& args]
-  (let [out-path (or (first args) "docs/releases/v0.23.2-proof.edn")
+  (let [out-path (or (first args) "docs/releases/v0.23.3-proof.edn")
         proof (run-release-proof {})
         out-file (io/file out-path)]
     (when-let [parent (.getParentFile out-file)]

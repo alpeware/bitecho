@@ -550,11 +550,14 @@
                                                        :since-seq since-seq
                                                        :timestamp-ms now-ms
                                                        :nonce nonce})
+                 sub-param (when-let [s (:subnets opts)]
+                             (if (coll? s) (str/join "," s) (str s)))
                  params (cond-> {"pubkey" pk-hex
                                  "since_seq" (str since-seq)}
                           (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
                           (:limit opts) (assoc "limit" (str (:limit opts)))
-                          (:timeout-ms opts) (assoc "timeout_ms" (str (:timeout-ms opts))))
+                          (:timeout-ms opts) (assoc "timeout_ms" (str (:timeout-ms opts)))
+                          sub-param (assoc "subnets" sub-param))
                  q-str (str/join "&" (map (fn [[k v]] (str (js/encodeURIComponent (name k)) "=" (js/encodeURIComponent (str v)))) params))
                  base-url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/poll")
                  url (str base-url "?" q-str)
@@ -564,7 +567,8 @@
                                   "X-Bitecho-Timestamp-Ms" (str now-ms)
                                   "X-Bitecho-Nonce" nonce
                                   "X-Bitecho-Signature" sig}
-                           (:timeout-ms opts) (assoc "X-Bitecho-Wait-Ms" (str (:timeout-ms opts))))
+                           (:timeout-ms opts) (assoc "X-Bitecho-Wait-Ms" (str (:timeout-ms opts)))
+                           sub-param (assoc "X-Bitecho-Subnets" sub-param))
                  done (fn [res]
                         (if cb (cb res) (resolve res)))]
              (http-get-json! url headers (+ (or (:timeout-ms opts) 0) 5000) done)))]
@@ -724,10 +728,23 @@
                    "identity" {"cmd" "identity"}
                    "status"   {"cmd" "status"}
                    "discover" {"cmd" "discover"}
+                   "help"     {"cmd" "help"}
                    "inbox"    (let [sub (or (extract-flag-value args "--subnet-id" nil)
-                                            (extract-flag-value args "--subnet" nil))]
+                                            (extract-flag-value args "--subnet" nil))
+                                    peek? (some #{"--peek"} args)]
                                 (cond-> {"cmd" "inbox"}
-                                  sub (assoc "subnet_id" sub)))
+                                  sub (assoc "subnet_id" sub)
+                                  peek? (assoc "peek" true)))
+                   "subscribe-subnets"
+                   (let [subnets-raw (or (extract-flag-value args "--subnets" nil)
+                                         (extract-flag-value args "--subscribe-subnets" nil)
+                                         (extract-flag-value args "--subnet-id" nil)
+                                         (extract-flag-value args "--subnet" nil))
+                         subnets (if subnets-raw
+                                   (mapv str/trim (str/split subnets-raw #","))
+                                   [])]
+                     {"cmd" "subscribe-subnets"
+                      "subnets" subnets})
                    "offer"    (let [m {"cmd" "offer"
                                        "callee" (or (extract-flag-value args "--callee" nil)
                                                     (extract-flag-value args "--peer" nil)
@@ -1382,12 +1399,23 @@
   "Extracts the subverb and remaining arguments, allowing global flags like
    --state-dir <path> or --control-port <port> to appear before or after the subverb."
   [tokens]
-  (let [global-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
+  (let [pre-verb-valued-flags #{"--state-dir" "--control-port" "--bootstrap" "--relay-url"
+                                "--subnet-id" "--subnet" "--subscribe-subnets" "--subnets"
+                                "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
+                                "--cmd-file" "--events-out" "--session-id" "--session"
+                                "--min-seq" "--after-ts" "--ingress-tcp-port"
+                                "--trusted-dac-anchors" "--turn-server" "--turn-username"
+                                "--turn-password" "--turn-realm" "--sync-interval-ms"
+                                "--price" "--price-max" "--burn" "--to" "--from"
+                                "--callee" "--peer" "--receiver" "--recipient"
+                                "--amount" "--text" "--message" "--payload-hex"
+                                "--wait-open-ms" "--until-event"}
+        runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
         {:subverb nil :subargs []}
         (let [tok (first rem)]
-          (if (contains? global-valued-flags tok)
+          (if (contains? pre-verb-valued-flags tok)
             (recur (vec (drop 2 rem)))
             (if (str/starts-with? tok "--")
               (recur (vec (rest rem)))
@@ -1399,7 +1427,7 @@
                                       (if (empty? in)
                                         out
                                         (let [t (first in)]
-                                          (if (contains? global-valued-flags t)
+                                          (if (contains? runner-valued-flags t)
                                             (recur (vec (drop 2 in)) out)
                                             (recur (vec (rest in)) (conj out t))))))]
                 {:subverb subverb
@@ -1415,7 +1443,9 @@
          first-non-flag (if (and (string? first-tok) (str/starts-with? first-tok "--"))
                           (:subverb (extract-subverb-and-args clean-args))
                           first-tok)
-         verb (or first-non-flag "status")
+         help? (boolean (or (some #{"--help" "-h"} clean-args) (= first-non-flag "help")))
+         verb (if help? "help" (or first-non-flag "status"))
+         no-poll? (boolean (some #{"--no-poll"} clean-args))
          ctl? (= verb "ctl")
          serve? (= verb "serve")
          daemon? (= verb "daemon")
@@ -1485,6 +1515,7 @@
                           :realm turn-realm
                           :force-relay? turn-force-relay?}))]
      (cond-> {:mode (cond
+                      help? :help
                       (or daemon? ctl-ensure? serve-daemon?) :daemon
                       ctl? :ctl
                       serve? :serve
@@ -1497,12 +1528,13 @@
               :auto-sync? (boolean auto-sync?)
               :auto-register-home-set? (boolean auto-register-home-set?)
               :transport transport
-              :cmd-map (let [m (when-not (or ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
+              :cmd-map (let [m (when-not (or help? ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
                                  (build-one-shot-cmd-map verb (if (and (string? first-tok) (str/starts-with? first-tok "--"))
                                                                 (:subargs (extract-subverb-and-args clean-args))
                                                                 (rest clean-args))))]
                          (cond-> m
-                           subnet-id (assoc "subnet_id" subnet-id)))}
+                           (and subnet-id (nil? (get m "subnet_id"))) (assoc "subnet_id" subnet-id)))}
+       no-poll? (assoc :no-poll? true)
        control-port (assoc :control-port control-port)
        max-epoch-skew (assoc :max-epoch-skew max-epoch-skew)
        (or daemon? ctl-ensure? serve-daemon?)
@@ -2804,141 +2836,130 @@
             attempt-dial!
             (fn []
               (let [mdns-state' (read-mdns-state)
-                    parsed-candidates (keep #(light-core/parse-p2p-candidate % mdns-state') candidates)
-                    success? (atom false)]
-                (if (empty? parsed-candidates)
-                  (let [cmd-res (light-core/handle-command @state-atom
-                                                           {"cmd" "p2p-channel-state"
-                                                            "session_id" sid
-                                                            "connected" false
-                                                            "error" "p2p-dial-failed"}
-                                                           privkey-bytes)]
-                    (reset! state-atom (:state cmd-res))
-                    (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
-                    (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))
-                  (doseq [cand parsed-candidates
-                          :while (not @success?)]
-                    (try
-                      (let [host (:host cand)
-                            port (int (:port cand))
-                            transport (or (:transport cand) :tcp)
-                            channel-id (atom nil)
-                            assigned-gen (atom nil)
-                            on-close-fired? (atom false)
-                            client-node (api/create-node {:port 0 :setup "active"})
-                            peer-send! (fn [env]
-                                         (if-let [cid @channel-id]
-                                           (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch :default _ nil))]
-                                             (if payload
-                                               (try (api/send! client-node payload cid) true (catch :default _ false))
+                    parsed-candidates (vec (keep #(light-core/parse-p2p-candidate % mdns-state') candidates))
+                    success? (atom false)
+                    dial-step!
+                    (fn dial-step! [idx]
+                      (if (or @success? (get-in @state-atom [:sessions sid :p2p :connected?]))
+                        nil
+                        (if (>= idx (count parsed-candidates))
+                          (let [cmd-res (light-core/handle-command @state-atom
+                                                                   {"cmd" "p2p-channel-state"
+                                                                    "session_id" sid
+                                                                    "connected" false
+                                                                    "error" "p2p-dial-failed"}
+                                                                   privkey-bytes)]
+                            (reset! state-atom (:state cmd-res))
+                            (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
+                            (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))
+                          (let [cand (nth parsed-candidates idx)
+                                host (:host cand)
+                                port (int (:port cand))
+                                transport (or (:transport cand) :tcp)
+                                channel-id (atom nil)
+                                assigned-gen (atom nil)
+                                on-close-fired? (atom false)
+                                timeout-id (atom nil)
+                                client-node (api/create-node {:port 0 :setup "active"})
+                                advance! (fn []
+                                           (when-let [tid @timeout-id]
+                                             (js/clearTimeout tid)
+                                             (reset! timeout-id nil))
+                                           (try (api/close! client-node) (catch :default _ nil))
+                                           (dial-step! (inc idx)))
+                                peer-send! (fn [env]
+                                             (if-let [cid @channel-id]
+                                               (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch :default _ nil))]
+                                                 (if payload
+                                                   (try (api/send! client-node payload cid) true (catch :default _ false))
+                                                   false))
                                                false))
-                                           false))
-                            on-close-fn (fn [_]
-                                          (when (compare-and-set! on-close-fired? false true)
-                                            (let [my-gen @assigned-gen
-                                                  cur-gen (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0))]
-                                              (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
-                                                (when state-atom
-                                                  (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
-                                                (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
-                                                  (when p2p-peers-atom
-                                                    (swap! p2p-peers-atom dissoc peer-pk))
-                                                  (when state-atom
-                                                    (let [cmd-res (light-core/handle-command @state-atom
-                                                                                             {"cmd" "p2p-channel-state"
-                                                                                              "session_id" sid
-                                                                                              "connected" false
-                                                                                              "error" "channel-closed"}
-                                                                                             privkey-bytes)]
-                                                      (reset! state-atom (:state cmd-res))
-                                                      (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
-                                                      (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))))
-                            peer-close! (fn []
-                                          (try
-                                            (api/close! client-node)
-                                            (on-close-fn {:type :on-close})
-                                            (catch :default _ nil)))
-                            remote-sdp (cond-> {:ip host
-                                                :port port
-                                                :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
-                                                :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
-                                         (:remote-fingerprint dial-info)
-                                         (assoc :fingerprint (normalize-fingerprint (:remote-fingerprint dial-info)))
-                                         (:proxy-connect? cand)
-                                         (assoc :proxy (resolve-proxy-url nil)))
-                            callbacks {:on-open (fn [evt]
-                                                  (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                                    (reset! channel-id cid)
-                                                    (when (compare-and-set! success? false true)
-                                                      (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
-                                                        (reset! assigned-gen my-gen)
-                                                        (when p2p-peers-atom
-                                                          (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
-                                                                                               :close-fn peer-close!
-                                                                                               :session-id sid
-                                                                                               :generation my-gen}))
-                                                        (let [local-pub (or (:pubkey @state-atom) "")
-                                                              bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
-                                                          (peer-send! bind-env))
+                                on-close-fn (fn [_]
+                                              (when (compare-and-set! on-close-fired? false true)
+                                                (let [my-gen @assigned-gen
+                                                      cur-gen (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0))]
+                                                  (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
+                                                    (when state-atom
+                                                      (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
+                                                    (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
+                                                      (when p2p-peers-atom
+                                                        (swap! p2p-peers-atom dissoc peer-pk))
+                                                      (when state-atom
                                                         (let [cmd-res (light-core/handle-command @state-atom
                                                                                                  {"cmd" "p2p-channel-state"
                                                                                                   "session_id" sid
-                                                                                                  "connected" true}
+                                                                                                  "connected" false
+                                                                                                  "error" "channel-closed"}
                                                                                                  privkey-bytes)]
                                                           (reset! state-atom (:state cmd-res))
                                                           (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
-                                                          (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))
-                                       :on-data-channel (fn [evt]
-                                                          (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                                            (reset! channel-id cid)
-                                                            (when (compare-and-set! success? false true)
-                                                              (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
-                                                                (reset! assigned-gen my-gen)
-                                                                (when p2p-peers-atom
-                                                                  (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
-                                                                                                       :close-fn peer-close!
-                                                                                                       :session-id sid
-                                                                                                       :generation my-gen}))
-                                                                (let [local-pub (or (:pubkey @state-atom) "")
-                                                                      bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
-                                                                  (peer-send! bind-env))
-                                                                (let [cmd-res (light-core/handle-command @state-atom
-                                                                                                         {"cmd" "p2p-channel-state"
-                                                                                                          "session_id" sid
-                                                                                                          "connected" true}
-                                                                                                         privkey-bytes)]
-                                                                  (reset! state-atom (:state cmd-res))
-                                                                  (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
-                                                                  (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))
-                                       :on-message (fn [evt]
-                                                     (when-let [payload (:payload evt)]
-                                                       (when state-atom
-                                                         (let [st @state-atom
-                                                               res (light-core/handle-wire-payload st payload privkey-bytes)]
-                                                           (reset! state-atom (:state res))
-                                                           (when state-file (try (save-light-state! state-file (:state res)) (catch :default _ nil)))
-                                                           (when (seq (:stdout-events res))
-                                                             (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
-                                                           (when (seq (:net-envelopes res))
-                                                             (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
-                                       :on-close on-close-fn}]
-                        (if (or (= transport :tcp) (= transport :connect))
-                          (api/start-tcp! client-node remote-sdp callbacks)
-                          (api/start! client-node remote-sdp callbacks))
-                        (js/setTimeout
-                         (fn []
-                           (when (and (not @success?) (not (get-in @state-atom [:sessions sid :p2p :connected?])))
-                             (let [cmd-res (light-core/handle-command @state-atom
-                                                                      {"cmd" "p2p-channel-state"
-                                                                       "session_id" sid
-                                                                       "connected" false
-                                                                       "error" "p2p-dial-failed"}
-                                                                      privkey-bytes)]
-                               (reset! state-atom (:state cmd-res))
-                               (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
-                               (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))
-                         3000))
-                      (catch :default _ nil))))))]
+                                                          (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))))
+                                peer-close! (fn []
+                                              (try
+                                                (api/close! client-node)
+                                                (on-close-fn {:type :on-close})
+                                                (catch :default _ nil)))
+                                remote-sdp (cond-> {:ip host
+                                                    :port port
+                                                    :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
+                                                    :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
+                                             (:remote-fingerprint dial-info)
+                                             (assoc :fingerprint (normalize-fingerprint (:remote-fingerprint dial-info)))
+                                             (:proxy-connect? cand)
+                                             (assoc :proxy (resolve-proxy-url nil)))
+                                on-opened! (fn [cid]
+                                             (when-let [tid @timeout-id]
+                                               (js/clearTimeout tid)
+                                               (reset! timeout-id nil))
+                                             (reset! channel-id cid)
+                                             (when (compare-and-set! success? false true)
+                                               (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
+                                                 (reset! assigned-gen my-gen)
+                                                 (when p2p-peers-atom
+                                                   (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
+                                                                                        :close-fn peer-close!
+                                                                                        :session-id sid
+                                                                                        :generation my-gen}))
+                                                 (let [local-pub (or (:pubkey @state-atom) "")
+                                                       bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
+                                                   (peer-send! bind-env))
+                                                 (let [cmd-res (light-core/handle-command @state-atom
+                                                                                          {"cmd" "p2p-channel-state"
+                                                                                           "session_id" sid
+                                                                                           "connected" true}
+                                                                                          privkey-bytes)]
+                                                   (reset! state-atom (:state cmd-res))
+                                                   (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
+                                                   (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev)))))))
+                                callbacks {:on-open (fn [evt]
+                                                      (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                                        (on-opened! cid)))
+                                           :on-data-channel (fn [evt]
+                                                              (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                                                (on-opened! cid)))
+                                           :on-message (fn [evt]
+                                                         (when-let [payload (:payload evt)]
+                                                           (when state-atom
+                                                             (let [st @state-atom
+                                                                   res (light-core/handle-wire-payload st payload privkey-bytes)]
+                                                               (reset! state-atom (:state res))
+                                                               (when state-file (try (save-light-state! state-file (:state res)) (catch :default _ nil)))
+                                                               (when (seq (:stdout-events res))
+                                                                 (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
+                                                               (when (seq (:net-envelopes res))
+                                                                 (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
+                                           :on-close (fn [evt]
+                                                       (if-not @success?
+                                                         (advance!)
+                                                         (on-close-fn evt)))}]
+                            (try
+                              (reset! timeout-id (js/setTimeout advance! 3000))
+                              (if (or (= transport :tcp) (= transport :connect))
+                                (api/start-tcp! client-node remote-sdp callbacks)
+                                (api/start! client-node remote-sdp callbacks))
+                              (catch :default _
+                                (advance!)))))))]
+                (dial-step! 0)))]
         (if (and @queried? (identical? mdns-state (read-mdns-state)))
           (js/setTimeout attempt-dial! 50)
           (attempt-dial!))))))
@@ -3148,6 +3169,10 @@
         execute-cmd!
         (fn [effective-line]
           (let [res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
+                _ (when (:state res)
+                    (reset! state-atom (:state res))
+                    (when state-file
+                      (try (save-light-state! state-file @state-atom) (catch :default _ nil))))
                 _ (when-let [dial-info (:p2p-dial res)]
                     (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file))
                 shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
@@ -3182,13 +3207,14 @@
                         sent? (or sent-val? sent-ingress?)]
                     (if sent?
                       (do
-                        (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                        (swap! state-atom assoc :connected? true :connection-error nil)
                         (sync-conn-diagnostics! state-atom conn-atom)
                         (save-light-state! state-file @state-atom)
                         (when-let [resp (:response res)]
                           (emit! resp))
                         (done-cb (:response res)))
                       (do
+                        (swap! state-atom assoc :connected? false :connection-error "send-failed")
                         (when conn-atom
                           (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
                         (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
@@ -3209,7 +3235,7 @@
                                        all-envs (into (vec r-envs) (:net-envelopes res))]
                                    (if (send-all-envelopes! (:send-fn reconn) all-envs)
                                      (do
-                                       (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
+                                       (swap! state-atom assoc :connected? true :connection-error nil)
                                        (sync-conn-diagnostics! state-atom conn-atom)
                                        (save-light-state! state-file @state-atom)
                                        (when-let [resp (:response res)]
@@ -3218,17 +3244,15 @@
                                      (let [err "send-failed"]
                                        (when conn-atom
                                          (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
+                                       (swap! state-atom assoc :connected? false :connection-error err)
                                        (if (= verb "send")
                                          (do
-                                           (reset! state-atom (assoc (:state res) :connected? false :connection-error err))
                                            (sync-conn-diagnostics! state-atom conn-atom)
                                            (save-light-state! state-file @state-atom)
                                            (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
                                              (emit! err-map)
                                              (done-cb err-map)))
                                          (do
-                                           (when state-atom
-                                             (swap! state-atom assoc :connected? false :connection-error err))
                                            (sync-conn-diagnostics! state-atom conn-atom)
                                            (let [resp {"ok" false "error" err}]
                                              (emit! resp)
@@ -3236,17 +3260,15 @@
                                (let [err (or (:error reconn) "listener-disabled")]
                                  (when conn-atom
                                    (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
+                                 (swap! state-atom assoc :connected? false :connection-error err)
                                  (if (= verb "send")
                                    (do
-                                     (reset! state-atom (assoc (:state res) :connected? false :connection-error err))
                                      (sync-conn-diagnostics! state-atom conn-atom)
                                      (save-light-state! state-file @state-atom)
                                      (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
                                        (emit! err-map)
                                        (done-cb err-map)))
                                    (do
-                                     (when state-atom
-                                       (swap! state-atom assoc :connected? false :connection-error err))
                                      (sync-conn-diagnostics! state-atom conn-atom)
                                      (let [resp {"ok" false "error" err}]
                                        (emit! resp)
@@ -3742,60 +3764,71 @@
                       poll-tick!
                       (fn poll-tick! []
                         (when (compare-and-set! polling? false true)
-                          (poll-relay-envelopes!
-                           (:relay-url opts)
-                           (or (:pubkey-hex identity) (:pubkey identity))
-                           (:privkey-bytes identity)
-                           {:since-seq @since-mseq
-                            :since-broadcast-seq @since-bseq
-                            :timeout-ms 2000}
-                           (fn [poll-res]
-                             (try
-                               (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
-                                     bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
-                                     all-items (concat msgs bcasts)]
-                                 (when (seq msgs)
-                                   (let [last-m (last msgs)
-                                         mseq (or (get last-m "relay_seq") (get last-m "relay-seq")
-                                                  (get last-m :relay_seq) (get last-m :relay-seq))]
-                                     (when mseq (reset! since-mseq (long mseq)))))
-                                 (when (seq bcasts)
-                                   (let [last-b (last bcasts)
-                                         bseq (or (get last-b "broadcast_seq") (get last-b "broadcast-seq")
-                                                  (get last-b :broadcast_seq) (get last-b :broadcast-seq))]
-                                     (when bseq (reset! since-bseq (long bseq)))))
-                                 (swap! state-atom assoc :relay-since-seq @since-mseq :relay-since-broadcast-seq @since-bseq)
-                                 (doseq [item all-items]
-                                   (let [env-raw (or (get item "envelope_hex") (get item "envelope")
-                                                     (get item :envelope_hex) (get item :envelope))
-                                         wire-bytes (when env-raw
-                                                      (try (basalt/hex->bytes (str env-raw)) (catch :default _ nil)))]
-                                     (when wire-bytes
-                                       (let [st @state-atom
-                                             r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
-                                         (reset! state-atom (:state r))
-                                         (when state-file
-                                           (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
-                                         (doseq [ev (:stdout-events r)]
-                                           (event-out ev))
-                                         (when-let [dial-info (:p2p-dial r)]
-                                           (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
-                                         (when (seq (:net-envelopes r))
-                                           (send-routed-envelopes! (:net-envelopes r)
-                                                                   (:send-fn conn-res)
-                                                                   p2p-peers-atom
-                                                                   ingress-peers-atom
-                                                                   state-atom
-                                                                   (:privkey-bytes identity)))))))
-                                 (when (seq msgs)
-                                   (ack-relay-envelopes!
-                                    (:relay-url opts)
-                                    (or (:pubkey-hex identity) (:pubkey identity))
-                                    (:privkey-bytes identity)
-                                    @since-mseq
-                                    {:ack-broadcast-seq @since-bseq})))
-                               (finally
-                                 (reset! polling? false)))))))]
+                          (let [eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
+                                                           (empty? (disj (or (:subscribed-subnets @state-atom) #{})
+                                                                         light-core/simon-nexus-axiom-subnet-id)))
+                                              (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+                                subnets (or (:subnets opts) eff-subnets)]
+                            (poll-relay-envelopes!
+                             (:relay-url opts)
+                             (or (:pubkey-hex identity) (:pubkey identity))
+                             (:privkey-bytes identity)
+                             (cond-> {:since-seq @since-mseq
+                                      :since-broadcast-seq @since-bseq
+                                      :timeout-ms 2000}
+                               subnets (assoc :subnets subnets))
+                             (fn [poll-res]
+                               (try
+                                 (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
+                                       bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                                       last-bseq (or (get poll-res "last_broadcast_seq")
+                                                     (get poll-res "last-broadcast-seq")
+                                                     (get poll-res :last_broadcast_seq))
+                                       all-items (concat msgs bcasts)
+                                       old-bseq @since-bseq]
+                                   (when (seq msgs)
+                                     (let [last-m (last msgs)
+                                           mseq (or (get last-m "relay_seq") (get last-m "relay-seq")
+                                                    (get last-m :relay_seq) (get last-m :relay-seq))]
+                                       (when mseq (reset! since-mseq (long mseq)))))
+                                   (let [bseq (or last-bseq
+                                                  (when (seq bcasts)
+                                                    (let [last-b (last bcasts)]
+                                                      (or (get last-b "broadcast_seq") (get last-b "broadcast-seq")
+                                                          (get last-b :broadcast_seq) (get last-b :broadcast-seq)))))]
+                                     (when bseq (reset! since-bseq (long bseq))))
+                                   (swap! state-atom assoc :relay-since-seq @since-mseq :relay-since-broadcast-seq @since-bseq)
+                                   (doseq [item all-items]
+                                     (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                                                       (get item :envelope_hex) (get item :envelope))
+                                           wire-bytes (when env-raw
+                                                        (try (basalt/hex->bytes (str env-raw)) (catch :default _ nil)))]
+                                       (when wire-bytes
+                                         (let [st @state-atom
+                                               r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
+                                           (reset! state-atom (:state r))
+                                           (when state-file
+                                             (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
+                                           (doseq [ev (:stdout-events r)]
+                                             (event-out ev))
+                                           (when-let [dial-info (:p2p-dial r)]
+                                             (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
+                                           (when (seq (:net-envelopes r))
+                                             (send-routed-envelopes! (:net-envelopes r)
+                                                                     (:send-fn conn-res)
+                                                                     p2p-peers-atom
+                                                                     ingress-peers-atom
+                                                                     state-atom
+                                                                     (:privkey-bytes identity)))))))
+                                   (when (or (seq msgs) (seq bcasts) (> @since-bseq old-bseq))
+                                     (ack-relay-envelopes!
+                                      (:relay-url opts)
+                                      (or (:pubkey-hex identity) (:pubkey identity))
+                                      (:privkey-bytes identity)
+                                      @since-mseq
+                                      {:ack-broadcast-seq @since-bseq})))
+                                 (finally
+                                   (reset! polling? false))))))))]
                   (poll-tick!)
                   (js/setInterval poll-tick! 1000)))
               (when (boolean (:auto-sync? opts true))
@@ -3827,148 +3860,313 @@
                                   (when-not (and cmd-file (not (str/blank? (str cmd-file))))
                                     (js/setTimeout #(.exit js/process 0) 100)))))))))))))
 
+(defn- pid-alive? [pid]
+  (try
+    (boolean (.kill js/process (long pid) 0))
+    (catch :default e
+      (= (.-code e) "EPERM"))))
+
+(defn- try-delegate-one-shot-to-daemon!
+  "If <state-dir>/control.json exists and the daemon's /ctl socket is reachable,
+   delegates the one-shot command map to the running serve daemon (Rule 4).
+   If unreachable and the daemon process is alive, fails closed with daemon-control-unreachable (F-D25-1).
+   Invokes (cb result) if handled/rejected, or (cb nil) to proceed with one-shot."
+  [state-dir cmd-map opts cb]
+  (let [ctrl-file (when state-dir (.join node-path state-dir "control.json"))]
+    (if-not (and ctrl-file (.existsSync node-fs ctrl-file) (map? cmd-map) (contains? cmd-map "cmd"))
+      (cb nil)
+      (let [control-data (try
+                           (parse-json-safe (.readFileSync node-fs ctrl-file "utf8"))
+                           (catch :default _ nil))
+            pid (or (get control-data "pid") (get control-data :pid))
+            port (or (:control-port opts) (get control-data "port") (get control-data :port))
+            token (or (get control-data "token") (get control-data :token))
+            eff-cmd (if (and (:auto-sync? opts) (contains? #{"account" "escrows"} (get cmd-map "cmd")))
+                      (assoc cmd-map "sync" true)
+                      cmd-map)
+            timeout-ms (or (:timeout-ms opts) 15000)]
+        (if-not (and port token)
+          (if (and pid (pid-alive? pid))
+            (cb {"ok" false
+                 "error" "daemon-control-unreachable"
+                 "pid" pid
+                 "port" port
+                 "status" "rejected"})
+            (cb nil))
+          (let [body-json (write-json-str eff-cmd)
+                body-buf (.from (.-Buffer js/globalThis) body-json "utf8")
+                called? (atom false)
+                finish! (fn [val]
+                          (when (compare-and-set! called? false true)
+                            (cb val)))
+                req-opts #js {:hostname "127.0.0.1"
+                              :port (int port)
+                              :path "/ctl"
+                              :method "POST"
+                              :headers #js {"Authorization" (str "Bearer " token)
+                                            "Content-Type" "application/json"
+                                            "Content-Length" (.-length body-buf)}
+                              :timeout timeout-ms}
+                req (.request node-http req-opts
+                              (fn [res]
+                                (let [chunks #js []]
+                                  (.on res "data" (fn [c] (.push chunks c)))
+                                  (.on res "end"
+                                       (fn []
+                                         (let [resp-str (.toString (.concat (.-Buffer js/globalThis) chunks) "utf8")
+                                               parsed (try (parse-json-safe resp-str) (catch :default _ nil))]
+                                           (if (map? parsed)
+                                             (finish! parsed)
+                                             (if (and pid (pid-alive? pid))
+                                               (finish! {"ok" false
+                                                         "error" "daemon-control-unreachable"
+                                                         "pid" pid
+                                                         "port" port
+                                                         "status" "rejected"})
+                                               (finish! nil)))))))))]
+            (.on req "error"
+                 (fn [_]
+                   (if (and pid (pid-alive? pid))
+                     (finish! {"ok" false
+                               "error" "daemon-control-unreachable"
+                               "pid" pid
+                               "port" port
+                               "status" "rejected"})
+                     (finish! nil))))
+            (.on req "timeout"
+                 (fn []
+                   (.destroy req)
+                   (if (and pid (pid-alive? pid))
+                     (finish! {"ok" false
+                               "error" "daemon-control-unreachable"
+                               "pid" pid
+                               "port" port
+                               "status" "rejected"})
+                     (finish! nil))))
+            (.write req body-buf)
+            (.end req)))))))
+
+(defn poll-and-ingest-relay-once!
+  "Polls the relay once on Node.js, ingests incoming messages/broadcasts, saves state to disk,
+   and acks to the relay. Calls (cb auto-net-envelopes) upon completion."
+  [relay-url identity state-atom state-file opts cb]
+  (let [pk-hex (or (:pubkey-hex identity) (:pubkey identity))
+        priv-bytes (:privkey-bytes identity)
+        since-mseq (long (or (:relay-since-seq @state-atom) 0))
+        since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))
+        eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
+                                   (empty? (disj (or (:subscribed-subnets @state-atom) #{})
+                                                 light-core/simon-nexus-axiom-subnet-id)))
+                      (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+        subnets (or (:subnets opts) eff-subnets)]
+    (poll-relay-envelopes!
+     relay-url pk-hex priv-bytes
+     (cond-> {:since-seq since-mseq
+              :since-broadcast-seq since-bseq
+              :timeout-ms 0}
+       subnets (assoc :subnets subnets))
+     (fn [poll-res]
+       (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
+             bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+             last-bseq (or (get poll-res "last_broadcast_seq")
+                           (get poll-res "last-broadcast-seq")
+                           (get poll-res :last_broadcast_seq))
+             new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") since-mseq))
+             new-bseq (long (or last-bseq (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))
+             all-items (concat msgs bcasts)
+             auto-net-envs (atom [])]
+         (when (and (not (:peek? opts))
+                    (or (not= new-mseq since-mseq) (not= new-bseq since-bseq)))
+           (swap! state-atom assoc :relay-since-seq new-mseq :relay-since-broadcast-seq new-bseq))
+         (doseq [item all-items]
+           (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                             (get item :envelope_hex) (get item :envelope))
+                 wire-bytes (when env-raw (try (basalt/hex->bytes (str env-raw)) (catch :default _ nil)))]
+             (when wire-bytes
+               (let [r (light-core/handle-wire-payload @state-atom wire-bytes priv-bytes)]
+                 (reset! state-atom (:state r))
+                 (when (seq (:net-envelopes r))
+                   (swap! auto-net-envs into (:net-envelopes r)))))))
+         (when (and (not (:peek? opts))
+                    (or (not= new-mseq since-mseq) (not= new-bseq since-bseq) (seq all-items)))
+           (when state-file
+             (try (save-light-state! state-file @state-atom) (catch :default _ nil))))
+         (if (and (not (:peek? opts))
+                  (or (seq msgs) (seq bcasts) (> new-bseq since-bseq)))
+           (ack-relay-envelopes!
+            relay-url pk-hex priv-bytes new-mseq
+            {:ack-broadcast-seq new-bseq}
+            (fn [_] (cb @auto-net-envs)))
+           (cb @auto-net-envs)))))))
+
 (defn run-one-shot!
   "Executes a single one-shot light-node command on Node.js and outputs JSON response."
   [opts]
   (let [state-dir (:state-dir opts)
-        state-file (.join node-path state-dir "state.fressian")
-        identity (load-or-create-light-identity! state-dir)]
-    (load-bootstrap-descriptor!
-     (:bootstrap opts) nil
-     (fn [b-res]
-       (if-not (:ok? b-res)
+        raw-cmd-map (:cmd-map opts)]
+    (try-delegate-one-shot-to-daemon!
+     state-dir raw-cmd-map opts
+     (fn [delegated]
+       (if delegated
          (do
-           (emit-json-line! {"ok" false "error" (:error b-res)})
-           (.exit js/process 0))
-         (let [bootstrap (:descriptor b-res)
-               loaded-state (load-light-state! state-file)
-               base-state (or (when loaded-state
-                                (cond-> loaded-state
-                                  (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
-                                  (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
-                                  (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
-                                  (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
-                                  (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
-                                  (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
-                                  (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                                  (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                                  (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
-                              (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
-                                                                             :autonomous? (boolean (:autonomous? opts false))}
-                                                                      (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
-                                                                      (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
-                                                                      (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                                                                      (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                                                                      (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
-               initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15))
-                               (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                               (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                               (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
-               state-atom (atom initial-state)
-               raw-cmd-map (:cmd-map opts)
-               verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
-               run-cmd-with-map!
-               (fn [cmd-map]
-                 (let [shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal"
-                                                  "export-p2p-offer" "export-p2p-answer" "export-send"
-                                                  "import-envelope" "import-poll" "import"}
-                                                verb)
-                       sync-explicit? (boolean (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map)))
-                       sync-wanted? (if shuttle-verb?
-                                      sync-explicit?
-                                      (or (boolean (:auto-sync? opts))
-                                          (and (= verb "sync-account")
-                                               (nil? (get cmd-map "balance"))
-                                               (nil? (get cmd-map "snapshots"))
-                                               (nil? (get cmd-map "snapshot")))
-                                          (and (= verb "account") sync-explicit?)
-                                          (and (= verb "escrows") sync-explicit?)))
-                       sync-opts (assoc opts :identity identity)
-                       after-sync!
-                       (fn []
-                         (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
-                               new-state (:state res)
-                               connect-explicit? (contains? opts :connect?)
-                               connect-wanted? (if connect-explicit?
-                                                 (boolean (:connect? opts))
-                                                 (not shuttle-verb?))
-                               needs-network? (and (seq (:net-envelopes res)) connect-wanted?)]
-                           (if needs-network?
-                             (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
-                                                  (when (and (string? u) (not (str/blank? u))) u))]
-                               (let [relay-opts (assoc opts :timeout-ms (or (:timeout-ms opts) 5000))
-                                     envs (vec (:net-envelopes res))
-                                     step (fn step [idx]
-                                            (if (>= idx (count envs))
-                                              (do
-                                                (save-light-state! state-file new-state)
-                                                (emit-json-line! (:response res))
-                                                (.exit js/process 0))
-                                              (-> (submit-relay-envelope! relay-url (nth envs idx) relay-opts)
-                                                  (.then (fn [item-res]
-                                                           (let [res-map (if (map? item-res) item-res (js->clj item-res :keywordize-keys true))]
-                                                             (if (false? (or (:ok res-map) (get res-map "ok")))
-                                                               (do
-                                                                 (emit-json-line! {"ok" false "error" (or (:error res-map) "relay-submit-failed")})
-                                                                 (.exit js/process 0))
-                                                               (step (inc idx))))))
-                                                  (.catch (fn [err]
-                                                            (emit-json-line! {"ok" false "error" (str err)})
-                                                            (.exit js/process 0))))))]
-                                 (step 0))
-                               (connect-validators!
-                                identity bootstrap opts
-                                (fn [conn-res]
-                                  (if-not (:ok? conn-res)
-                                    (do
-                                      (emit-json-line! {"ok" false "error" (or (:error conn-res) "listener-disabled")})
-                                      (.exit js/process 0))
-                                    (let [send-fn (:send-fn conn-res)
-                                          envs (:net-envelopes res)
-                                          finish! (fn [sent?]
-                                                    (when-let [n (:node conn-res)]
-                                                      (try (api/close! n) (catch :default _ nil)))
-                                                    (if sent?
-                                                      (do
-                                                        (save-light-state! state-file new-state)
-                                                        (emit-json-line! (:response res))
-                                                        (.exit js/process 0))
-                                                      (do
-                                                        (emit-json-line! {"ok" false "error" "connection-closed"})
-                                                        (.exit js/process 0))))]
-                                      (if (= :http-relay (:transport conn-res))
-                                        (send-all-envelopes! send-fn envs (fn [sent?] (finish! sent?)))
-                                        (let [sent? (send-all-envelopes! send-fn envs)]
-                                          (js/setTimeout
-                                           (fn []
-                                             (finish! sent?))
-                                           50))))))))
-                             (do
-                               (save-light-state! state-file new-state)
-                               (emit-json-line! (:response res))
-                               (.exit js/process 0)))))]
-                   (if sync-wanted?
-                     (maybe-sync-account-state!
-                      state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts
-                      (fn [sync-res]
-                        (if (false? (:ok? sync-res))
-                          (do
-                            (emit-json-line! {"ok" false "error" (:error sync-res)})
-                            (.exit js/process 0))
-                          (after-sync!))))
-                     (after-sync!))))]
-           (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
-                    (not (contains? raw-cmd-map "descriptor"))
-                    (not (contains? raw-cmd-map :descriptor)))
-             (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map))
-                   dom (or (get raw-cmd-map "domain") (:domain raw-cmd-map) "bitecho.org")]
-               (if (and (string? nick) (not (str/blank? nick)))
-                 (fetch-directory-descriptor!
-                  dom nick opts
-                  (fn [desc]
-                    (run-cmd-with-map! (cond-> raw-cmd-map desc (assoc "descriptor" desc)))))
-                 (run-cmd-with-map! raw-cmd-map)))
-             (run-cmd-with-map! raw-cmd-map))))))))
+           (emit-json-line! delegated)
+           (.exit js/process (if (and (map? delegated) (false? (get delegated "ok"))) 1 0)))
+         (let [state-file (.join node-path state-dir "state.fressian")
+               identity (load-or-create-light-identity! state-dir)]
+           (load-bootstrap-descriptor!
+            (:bootstrap opts) nil
+            (fn [b-res]
+              (if-not (:ok? b-res)
+                (do
+                  (emit-json-line! {"ok" false "error" (:error b-res)})
+                  (.exit js/process 0))
+                (let [bootstrap (:descriptor b-res)
+                      loaded-state (load-light-state! state-file)
+                      base-state (or (when loaded-state
+                                       (cond-> loaded-state
+                                         (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
+                                         (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
+                                         (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
+                                         (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                         (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
+                                         (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
+                                         (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                         (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                         (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
+                                     (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
+                                                                                    :autonomous? (boolean (:autonomous? opts false))}
+                                                                             (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
+                                                                             (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                                                             (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                                                             (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                                                             (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
+                      initial-state (cond-> (assoc base-state :max-epoch-skew (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15))
+                                      (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                      (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                      (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
+                      state-atom (atom initial-state)
+                      verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
+                      run-cmd-with-map!
+                      (fn [cmd-map]
+                        (let [shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal"
+                                                         "export-p2p-offer" "export-p2p-answer" "export-send"
+                                                         "import-envelope" "import-poll" "import"}
+                                                       verb)
+                              sync-explicit? (boolean (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map)))
+                              sync-wanted? (if shuttle-verb?
+                                             sync-explicit?
+                                             (or (boolean (:auto-sync? opts))
+                                                 (and (= verb "sync-account")
+                                                      (nil? (get cmd-map "balance"))
+                                                      (nil? (get cmd-map "snapshots"))
+                                                      (nil? (get cmd-map "snapshot")))
+                                                 (and (= verb "account") sync-explicit?)
+                                                 (and (= verb "escrows") sync-explicit?)))
+                              sync-opts (assoc opts :identity identity)
+                              after-sync!
+                              (fn []
+                                (let [effective-relay-url (or (:relay-url opts)
+                                                              (:relay_url opts)
+                                                              (when-let [u (resolve-relay-url nil #(aget (.-env js/process) %))] u)
+                                                              (when-let [u (:relay-url bootstrap)] (resolve-relay-url u #(aget (.-env js/process) %))))
+                                      poll-verb? (and (not (:no-poll? opts))
+                                                      effective-relay-url
+                                                      (not= (:connect? opts) false)
+                                                      (or (contains? #{"inbox" "wait" "accept" "rendezvous-accept" "send"
+                                                                       "p2p-offer" "p2p-answer" "close" "sync-account"
+                                                                       "account" "escrows"} verb)
+                                                          (and (= verb "status") (or (:sync? opts) (get cmd-map "sync") (:poll? opts) (get cmd-map "poll")))))
+                                      after-poll!
+                                      (fn [poll-auto-envs]
+                                        (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
+                                              new-state (:state res)
+                                              connect-explicit? (contains? opts :connect?)
+                                              connect-wanted? (if connect-explicit?
+                                                                (boolean (:connect? opts))
+                                                                (not shuttle-verb?))
+                                              all-envs (into (vec poll-auto-envs) (:net-envelopes res))
+                                              needs-network? (and (seq all-envs) connect-wanted?)]
+                                          (if needs-network?
+                                            (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
+                                                                 (when (and (string? u) (not (str/blank? u))) u))]
+                                              (let [relay-opts (assoc opts :timeout-ms (or (:timeout-ms opts) 5000))
+                                                    envs (vec all-envs)
+                                                    step (fn step [idx]
+                                                           (if (>= idx (count envs))
+                                                             (do
+                                                               (when-not (get cmd-map "peek")
+                                                                 (save-light-state! state-file new-state))
+                                                               (emit-json-line! (:response res))
+                                                               (.exit js/process 0))
+                                                             (-> (submit-relay-envelope! relay-url (nth envs idx) relay-opts)
+                                                                 (.then (fn [item-res]
+                                                                          (let [res-map (if (map? item-res) item-res (js->clj item-res :keywordize-keys true))]
+                                                                            (if (false? (or (:ok res-map) (get res-map "ok")))
+                                                                              (do
+                                                                                (emit-json-line! {"ok" false "error" (or (:error res-map) "relay-submit-failed")})
+                                                                                (.exit js/process 0))
+                                                                              (step (inc idx))))))
+                                                                 (.catch (fn [err]
+                                                                           (emit-json-line! {"ok" false "error" (str err)})
+                                                                           (.exit js/process 0))))))]
+                                                (step 0))
+                                              (connect-validators!
+                                               identity bootstrap opts
+                                               (fn [conn-res]
+                                                 (if-not (:ok? conn-res)
+                                                   (do
+                                                     (emit-json-line! {"ok" false "error" (or (:error conn-res) "listener-disabled")})
+                                                     (.exit js/process 0))
+                                                   (let [send-fn (:send-fn conn-res)
+                                                         finish! (fn [sent?]
+                                                                   (when-let [n (:node conn-res)]
+                                                                     (try (api/close! n) (catch :default _ nil)))
+                                                                   (if sent?
+                                                                     (do
+                                                                       (when-not (get cmd-map "peek")
+                                                                         (save-light-state! state-file new-state))
+                                                                       (emit-json-line! (:response res))
+                                                                       (.exit js/process 0))
+                                                                     (do
+                                                                       (emit-json-line! {"ok" false "error" "connection-closed"})
+                                                                       (.exit js/process 0))))]
+                                                     (if (= :http-relay (:transport conn-res))
+                                                       (send-all-envelopes! send-fn all-envs (fn [sent?] (finish! sent?)))
+                                                       (let [sent? (send-all-envelopes! send-fn all-envs)]
+                                                         (js/setTimeout
+                                                          (fn []
+                                                            (finish! sent?))
+                                                          50))))))))
+                                            (do
+                                              (when-not (get cmd-map "peek")
+                                                (save-light-state! state-file new-state))
+                                              (emit-json-line! (:response res))
+                                              (.exit js/process 0)))))]
+                                  (if poll-verb?
+                                    (poll-and-ingest-relay-once! effective-relay-url identity state-atom state-file opts after-poll!)
+                                    (after-poll! []))))]
+                          (if sync-wanted?
+                            (maybe-sync-account-state!
+                             state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts
+                             (fn [sync-res]
+                               (if (false? (:ok? sync-res))
+                                 (do
+                                   (emit-json-line! {"ok" false "error" (:error sync-res)})
+                                   (.exit js/process 0))
+                                 (after-sync!))))
+                            (after-sync!))))]
+                  (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
+                           (not (contains? raw-cmd-map "descriptor"))
+                           (not (contains? raw-cmd-map :descriptor)))
+                    (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map))
+                          dom (or (get raw-cmd-map "domain") (:domain raw-cmd-map) "bitecho.org")]
+                      (if (and (string? nick) (not (str/blank? nick)))
+                        (fetch-directory-descriptor!
+                         dom nick opts
+                         (fn [desc]
+                           (run-cmd-with-map! (cond-> raw-cmd-map desc (assoc "descriptor" desc)))))
+                        (run-cmd-with-map! raw-cmd-map)))
+                    (run-cmd-with-map! raw-cmd-map))))))))))))
 
 (defn- check-daemon-status
   "Checks if a daemon is running and responsive via control.json. Calls cb with status map or nil."
@@ -4015,12 +4213,6 @@
             (.on req "timeout" (fn [] (.destroy req) (finish! nil)))
             (.write req body-buf)
             (.end req)))))))
-
-(defn- pid-alive? [pid]
-  (try
-    (boolean (.kill js/process (long pid) 0))
-    (catch :default e
-      (= (.-code e) "EPERM"))))
 
 (defn run-daemon!
   "Zero-glue process supervisor managing the light-node serve daemon (start, stop, status, restart, ensure)."
@@ -4149,6 +4341,14 @@
   [args]
   (let [parsed (parse-light-node-args args)]
     (case (:mode parsed)
+      :help
+      (let [res {"ok" true
+                 "help" true
+                 "verbs" cli/supported-cli-verbs
+                 "modes" ["one-shot" "serve" "ctl" "wait-event"]
+                 "flags" cli/known-command-flags}]
+        (emit-json-line! res)
+        (.exit js/process 0))
       :daemon (run-daemon! parsed)
       :ctl (run-ctl! parsed)
       :serve (run-serve! parsed)

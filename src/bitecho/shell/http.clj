@@ -1037,6 +1037,13 @@
                 signature (or (get body-json "signature")
                               (get body-json "sig")
                               (first (get headers :header/x-bitecho-signature)))
+                raw-subs (or (get body-json "subnets")
+                             (get query-params "subnets")
+                             (first (get headers :header/x-bitecho-subnets)))
+                subnets (cond
+                          (coll? raw-subs) (mapv (comp str/trim str) raw-subs)
+                          (string? raw-subs) (mapv str/trim (str/split raw-subs #","))
+                          :else nil)
                 raw-wait-val (or (get body-json "wait_ms")
                                  (get body-json "wait-ms")
                                  (get body-json "timeout_ms")
@@ -1068,14 +1075,15 @@
               :else
               (let [wait-ms (long (or parsed-wait 0))
                     now-ms (System/currentTimeMillis)
-                    poll-event {:type :relay-poll
-                                :pubkey pubkey
-                                :since-seq since-seq
-                                :since-broadcast-seq since-bseq
-                                :timestamp-ms ts-ms
-                                :nonce nonce
-                                :signature signature
-                                :now-ms now-ms}
+                    poll-event (cond-> {:type :relay-poll
+                                        :pubkey pubkey
+                                        :since-seq since-seq
+                                        :since-broadcast-seq since-bseq
+                                        :timestamp-ms ts-ms
+                                        :nonce nonce
+                                        :signature signature
+                                        :now-ms now-ms}
+                                 subnets (assoc :subnets subnets))
                     res-box (atom nil)
                     _ (swap! relay-atom
                              (fn [st]

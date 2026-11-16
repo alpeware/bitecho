@@ -433,3 +433,68 @@
                   (and (= :serve (:mode parsed))
                        (= (long port) (:control-port parsed))
                        (= (long skew) (:max-epoch-skew parsed))))))
+
+;; =============================================================================
+;; 6. Milestone D25 Command & Flag Inventory Verifications (Rule 6)
+;; =============================================================================
+
+(deftest test-d25-flag-inventory-and-help
+  (testing "cli/known-command-flags contains all expected D25 flags"
+    (let [flags (set cli/known-command-flags)]
+      (is (contains? flags "--peek"))
+      (is (contains? flags "--no-poll"))
+      (is (contains? flags "--subnets"))
+      (is (contains? flags "--subscribe-subnets"))
+      (is (contains? flags "--subnet-id"))
+      (is (contains? flags "--help"))))
+
+  (testing "inbox --peek builds peek: true without draining state"
+    (let [m1 (shell/build-one-shot-cmd-map "inbox" ["--peek"])
+          m2 (cli/build-cmd-map "inbox" ["--peek"])]
+      (is (= "inbox" (get m1 "cmd")))
+      (is (true? (get m1 "peek")))
+      (is (= m1 m2)))
+    (let [m1 (shell/build-one-shot-cmd-map "inbox" ["--subnet-id" "devnet" "--peek"])
+          m2 (cli/build-cmd-map "inbox" ["--subnet-id" "devnet" "--peek"])]
+      (is (= "inbox" (get m1 "cmd")))
+      (is (= "devnet" (get m1 "subnet_id")))
+      (is (true? (get m1 "peek")))
+      (is (= m1 m2))))
+
+  (testing "subscribe-subnets parses multiple comma-separated subnets"
+    (let [m1 (shell/build-one-shot-cmd-map "subscribe-subnets" ["--subnets" "sub1,sub2,sub3"])
+          m2 (cli/build-cmd-map "subscribe-subnets" ["--subnets" "sub1,sub2,sub3"])]
+      (is (= "subscribe-subnets" (get m1 "cmd")))
+      (is (= ["sub1" "sub2" "sub3"] (get m1 "subnets")))
+      (is (= m1 m2))))
+
+  (testing "help verb and --help flag set :mode :help and return non-mutating help map"
+    (let [p1 (shell/parse-light-node-args ["help"])
+          p2 (shell/parse-light-node-args ["--help"])
+          p3 (shell/parse-light-node-args ["-h"])]
+      (is (= :help (:mode p1)))
+      (is (= :help (:mode p2)))
+      (is (= :help (:mode p3))))
+    (let [temp-path (Files/createTempDirectory "bitecho-help-test-" (into-array FileAttribute []))
+          state-dir (.toFile temp-path)
+          non-existent-sub (io/file state-dir "should-not-exist")]
+      (try
+        (let [res (shell/run-light-node-cli! ["--help" "--state-dir" (str non-existent-sub)])]
+          (is (map? res))
+          (is (true? (get res "ok")))
+          (is (true? (get res "help")))
+          (is (vector? (get res "verbs")))
+          (is (vector? (get res "flags")))
+          (is (false? (.exists non-existent-sub))))
+        (finally
+          (doseq [f (reverse (file-seq state-dir))]
+            (try (.delete ^java.io.File f) (catch Exception _ nil))))))
+
+    (testing "Flags before verb ordering flexibility"
+      (let [parsed (shell/parse-light-node-args ["--state-dir" "/tmp/custom" "--relay-url" "http://relay.org" "--subnet-id" "axiom" "inbox" "--peek"])]
+        (is (= :one-shot (:mode parsed)))
+        (is (= "inbox" (:verb parsed)))
+        (is (= "/tmp/custom" (:state-dir parsed)))
+        (is (= "http://relay.org" (:relay-url parsed)))
+        (is (= "axiom" (get-in parsed [:cmd-map "subnet_id"])))
+        (is (true? (get-in parsed [:cmd-map "peek"])))))))

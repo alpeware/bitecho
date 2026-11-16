@@ -174,6 +174,17 @@
                                                      (assoc eff :type :diagnose)))
                          (assoc m-res :reachability gate-res :ok? (boolean (:ok? gate-res))))
                        m-res)))
+        upnp-renewal (when (and (:enabled? upnp-cfg) (:ok? upnp-res))
+                       (let [map-opts (merge {:dns-udp-port (:udp-port dns-srv)
+                                              :dns-tcp-port (:tcp-port dns-srv)
+                                              :http-port (:http-port http-srv)
+                                              :https-port (:https-port http-srv)
+                                              :domain (:domain cfg)}
+                                             upnp-cfg)]
+                         (upnp/start-upnp-renewal-loop! map-opts
+                                                        {:diagnose-fn (fn [eff]
+                                                                        (infra/apply-shell-event! (:shell-atom runtime)
+                                                                                                  (assoc eff :type :diagnose)))})))
         acme-gate-ok? (or (not (:enabled? upnp-cfg))
                           (boolean (:ok? upnp-res)))
         acme-mgr (when (and (get-in cfg [:acme :enabled?] false) acme-gate-ok?)
@@ -190,10 +201,12 @@
      :http http-srv
      :smtp smtp-srv
      :upnp upnp-res
+     :upnp-renewal upnp-renewal
      :acme acme-mgr
      :stop! (fn []
               (when val-node (mesh/stop-mesh-node! val-node))
               (when acme-mgr (acme-shell/stop-acme-loop! acme-mgr))
+              (when upnp-renewal (upnp/stop-upnp-renewal-loop! upnp-renewal))
               (when (and upnp-res (:gateway upnp-res))
                 (upnp/teardown-ingress-port-mappings! (:gateway upnp-res) (:mappings upnp-res) upnp-cfg))
               (when smtp-srv (smtp-shell/stop-smtp-server! smtp-srv))

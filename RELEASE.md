@@ -33,30 +33,32 @@ clojure -M:lint
 # 2. Full unit + generative test.check suite (AGENTS.md Rule 1)
 clojure -M:test --skip-integration
 
-# 3. Multi-network release proof generator (devnet/testnet/mainnet + 6-pair replay matrix + N/N+1 rolling interop + S1-S8 scenarios)
-clojure -M:simulate -m bitecho.stress.release-proof docs/releases/v0.23.2-proof.edn
+# 3. Multi-network release proof generator (devnet/testnet/mainnet + 6-pair replay matrix + N/N+1 rolling interop + S1-S15 scenarios)
+clojure -M:proof docs/releases/v0.23.3-proof.edn
 
 # 4. Pre-deploy E2E wire negotiation & 3-epoch Streamlet finalization gate
 ./scripts/cluster.sh verify-e2e
 
 # 5. Production uberjar & Node/Browser light-node bundle build
-clojure -T:build uber
-npx shadow-cljs release light-cli browser
+./scripts/build-node-light-node.sh
+./scripts/build-browser-bundle.sh
 ```
 
 ---
 
 ## 3. Deterministic Artifact Build & SHA-256 Attestation
 
-1. Build the release uberjar and compute its reproducible SHA-256 digest:
+1. Build the release uberjar and light-node bundles and compute reproducible SHA-256 digests:
    ```bash
    clojure -T:build uber
-   sha256sum target/bitecho.jar
+   ./scripts/build-node-light-node.sh
+   ./scripts/build-browser-bundle.sh
+   sha256sum dist/bitecho-light-node.cjs dist/bitecho-browser.js
    ```
-2. Record the artifact SHA-256 and commit the generated release proof (`docs/releases/<version>-proof.edn`) alongside any `BIP` governance proposal (`:deterministic-bundle-sha256`).
+2. Record artifact SHA-256 digests and commit the generated release proof (`docs/releases/<version>-proof.edn`) alongside any `BIP` governance proposal (`:deterministic-bundle-sha256`).
 3. Tag the release commit with an annotated Git tag:
    ```bash
-   git tag -a v0.23.2 -m "Release v0.23.2: Milestone D24 Follow-up, Node.js FIFO relay queue, candidate failover, shuttle suppression, and S1-S8 verification suite"
+   git tag -a v0.23.3 -m "Release v0.23.3: Milestone D25 Overnight Remediation, stateless one-shot offer handshake continuity, inbox --peek, subnet-filtered relay polling, flag-before-verb CLI parsing, UPnP lease renewal loop, and S9-S15 verification suite"
    ```
 
 ---

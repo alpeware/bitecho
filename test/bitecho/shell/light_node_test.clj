@@ -1266,7 +1266,7 @@
                   "--cmd-file" "--events-out" "--min-seq" "--after-ts"
                   "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"
                   "--relay-url" "--daemon" "--control-port" "--max-epoch-skew"
-                  "--block" "--until-event"
+                  "--block" "--until-event" "--help" "--no-poll" "--peek" "--subscribe-subnets"
                   "--timeout-epoch" "--epoch" "--path" "--data-hex" "--capability-type"
                   "--puzzle-hash" "--puzzle-source" "--target-cid" "--authority" "--data"
                   "--slot-id" "--metadata" "--capability-id" "--payer" "--burn-floor" "--solution"

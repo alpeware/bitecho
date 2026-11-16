@@ -68,10 +68,23 @@
                    "identity" {"cmd" "identity"}
                    "status"   {"cmd" "status"}
                    "discover" {"cmd" "discover"}
+                   "help"     {"cmd" "help"}
                    "inbox"    (let [sub (or (extract-flag-value args "--subnet-id" nil)
-                                            (extract-flag-value args "--subnet" nil))]
+                                            (extract-flag-value args "--subnet" nil))
+                                    peek? (some #{"--peek"} args)]
                                 (cond-> {"cmd" "inbox"}
-                                  sub (assoc "subnet_id" sub)))
+                                  sub (assoc "subnet_id" sub)
+                                  peek? (assoc "peek" true)))
+                   "subscribe-subnets"
+                   (let [subnets-raw (or (extract-flag-value args "--subnets" nil)
+                                         (extract-flag-value args "--subscribe-subnets" nil)
+                                         (extract-flag-value args "--subnet-id" nil)
+                                         (extract-flag-value args "--subnet" nil))
+                         subnets (if subnets-raw
+                                   (mapv str/trim (str/split subnets-raw #","))
+                                   [])]
+                     {"cmd" "subscribe-subnets"
+                      "subnets" subnets})
                    "offer"    (let [m {"cmd" "offer"
                                        "callee" (or (extract-flag-value args "--callee" nil)
                                                     (extract-flag-value args "--peer" nil)
@@ -723,16 +736,27 @@
      (when candidate
        (relay/normalize-relay-base-url candidate)))))
 
-(defn- extract-subverb-and-args
+(defn extract-subverb-and-args
   "Extracts the subverb and remaining arguments, allowing global flags like
    --state-dir <path> or --control-port <port> to appear before or after the subverb."
   [tokens]
-  (let [global-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
+  (let [pre-verb-valued-flags #{"--state-dir" "--control-port" "--bootstrap" "--relay-url"
+                                "--subnet-id" "--subnet" "--subscribe-subnets" "--subnets"
+                                "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
+                                "--cmd-file" "--events-out" "--session-id" "--session"
+                                "--min-seq" "--after-ts" "--ingress-tcp-port"
+                                "--trusted-dac-anchors" "--turn-server" "--turn-username"
+                                "--turn-password" "--turn-realm" "--sync-interval-ms"
+                                "--price" "--price-max" "--burn" "--to" "--from"
+                                "--callee" "--peer" "--receiver" "--recipient"
+                                "--amount" "--text" "--message" "--payload-hex"
+                                "--wait-open-ms" "--until-event"}
+        runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
         {:subverb nil :subargs []}
         (let [tok (first rem)]
-          (if (contains? global-valued-flags tok)
+          (if (contains? pre-verb-valued-flags tok)
             (recur (vec (drop 2 rem)))
             (if (str/starts-with? tok "--")
               (recur (vec (rest rem)))
@@ -744,7 +768,7 @@
                                       (if (empty? in)
                                         out
                                         (let [t (first in)]
-                                          (if (contains? global-valued-flags t)
+                                          (if (contains? runner-valued-flags t)
                                             (recur (vec (drop 2 in)) out)
                                             (recur (vec (rest in)) (conj out t))))))]
                 {:subverb subverb
@@ -761,6 +785,8 @@
                           (:subverb (extract-subverb-and-args clean-args))
                           first-tok)
          verb first-non-flag
+         help? (boolean (or (some #{"--help" "-h"} clean-args) (= verb "help")))
+         no-poll? (boolean (some #{"--no-poll"} clean-args))
          ctl? (= verb "ctl")
          serve? (= verb "serve")
          daemon? (= verb "daemon")
@@ -831,6 +857,7 @@
                           :realm turn-realm
                           :force-relay? turn-force-relay?}))]
      (cond-> {:mode (cond
+                      help? :help
                       (or daemon? ctl-ensure? serve-daemon?) :daemon
                       ctl? :ctl
                       serve? :serve
@@ -844,12 +871,13 @@
               :auto-register-home-set? (boolean auto-register-home-set?)
               :keep-alive-eof? keep-alive-eof?
               :transport transport
-              :cmd-map (let [m (when-not (or ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
+              :cmd-map (let [m (when-not (or help? ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
                                  (build-one-shot-cmd-map verb (if (and (string? first-tok) (str/starts-with? first-tok "--"))
                                                                 (:subargs (extract-subverb-and-args clean-args))
                                                                 (rest clean-args))))]
                          (cond-> m
-                           subnet-id (assoc "subnet_id" subnet-id)))}
+                           (and subnet-id (nil? (get m "subnet_id"))) (assoc "subnet_id" subnet-id)))}
+       no-poll? (assoc :no-poll? true)
        control-port (assoc :control-port control-port)
        max-epoch-skew (assoc :max-epoch-skew max-epoch-skew)
        (or daemon? ctl-ensure? serve-daemon?)
@@ -1092,12 +1120,15 @@
                                                :since-seq since-seq
                                                :timestamp-ms now-ms
                                                :nonce nonce})
+         sub-param (when-let [s (:subnets opts)]
+                     (if (coll? s) (str/join "," s) (str s)))
          params (cond-> {"pubkey" pk-hex
                          "since_seq" (str since-seq)}
                   (:since-broadcast-seq opts) (assoc "since_broadcast_seq" (str (:since-broadcast-seq opts)))
                   (:limit opts) (assoc "limit" (str (:limit opts)))
                   (:timeout-ms opts) (assoc "timeout_ms" (str (:timeout-ms opts)))
-                  (:since-ms opts) (assoc "since_ms" (str (:since-ms opts))))
+                  (:since-ms opts) (assoc "since_ms" (str (:since-ms opts)))
+                  sub-param (assoc "subnets" sub-param))
          q-str (str/join "&" (map (fn [[k v]] (str (java.net.URLEncoder/encode (name k) StandardCharsets/UTF_8)
                                                    "="
                                                    (java.net.URLEncoder/encode (str v) StandardCharsets/UTF_8)))
@@ -1111,6 +1142,7 @@
                true (.header "X-Bitecho-Nonce" nonce)
                true (.header "X-Bitecho-Signature" sig)
                (some? wait-ms) (.header "X-Bitecho-Wait-Ms" (str wait-ms))
+               sub-param (.header "X-Bitecho-Subnets" sub-param)
                true (.timeout (Duration/ofMillis (long (+ (or (:timeout-ms opts) 0) 5000))))
                true (.GET)
                true (.build))]
@@ -2322,98 +2354,100 @@
             success? (atom false)]
         (doseq [cand parsed-candidates
                 :while (not @success?)]
-          (try
-            (let [host (:host cand)
-                  port (int (:port cand))
-                  transport (or (:transport cand) :tcp)
-                  connected-prom (promise)
-                  channel-id (atom nil)
-                  assigned-gen (atom nil)
-                  on-close-fired? (atom false)
-                  client-node (api/create-node {:port 0 :setup "active"})
-                  peer-send! (fn [env]
-                               (if-let [cid @channel-id]
-                                 (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch Throwable _ nil))]
-                                   (if payload
-                                     (try (api/send! client-node payload cid) true (catch Throwable _ false))
-                                     false))
-                                 false))
-                  on-close-fn (fn [_]
-                                (when (compare-and-set! on-close-fired? false true)
-                                  (let [my-gen @assigned-gen
-                                        cur-gen (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0))]
-                                    (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
-                                      (when state-atom
-                                        (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
-                                      (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
-                                        (when p2p-peers-atom
-                                          (swap! p2p-peers-atom dissoc peer-pk))
+          (let [client-node (api/create-node {:port 0 :setup "active"})]
+            (try
+              (let [host (:host cand)
+                    port (int (:port cand))
+                    transport (or (:transport cand) :tcp)
+                    connected-prom (promise)
+                    channel-id (atom nil)
+                    assigned-gen (atom nil)
+                    on-close-fired? (atom false)
+                    peer-send! (fn [env]
+                                 (if-let [cid @channel-id]
+                                   (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch Throwable _ nil))]
+                                     (if payload
+                                       (try (api/send! client-node payload cid) true (catch Throwable _ false))
+                                       false))
+                                   false))
+                    on-close-fn (fn [_]
+                                  (when (compare-and-set! on-close-fired? false true)
+                                    (let [my-gen @assigned-gen
+                                          cur-gen (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0))]
+                                      (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
                                         (when state-atom
-                                          (let [cmd-res (light-core/handle-command @state-atom
-                                                                                   {"cmd" "p2p-channel-state"
-                                                                                    "session_id" sid
-                                                                                    "connected" false
-                                                                                    "error" "channel-closed"}
-                                                                                   privkey-bytes)]
-                                            (reset! state-atom (:state cmd-res))
-                                            (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))))
-                  peer-close! (fn []
-                                (try
-                                  (api/close! client-node)
-                                  (on-close-fn {:type :on-close})
-                                  (catch Throwable _ nil)))
-                  remote-sdp (cond-> {:ip host
-                                      :port port
-                                      :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
-                                      :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
-                               (:remote-fingerprint dial-info)
-                               (assoc :fingerprint (identity/normalize-fingerprint (:remote-fingerprint dial-info)))
-                               (:proxy-connect? cand)
-                               (assoc :proxy (resolve-proxy-url nil)))
-                  callbacks {:on-open (fn [evt]
-                                        (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                          (reset! channel-id cid)
-                                          (deliver connected-prom true)))
-                             :on-data-channel (fn [evt]
-                                                (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                                  (reset! channel-id cid)
-                                                  (deliver connected-prom true)))
-                             :on-message (fn [evt]
-                                           (when-let [payload (:payload evt)]
-                                             (when state-atom
-                                               (let [st @state-atom
-                                                     res (light-core/handle-wire-payload st payload privkey-bytes)]
-                                                 (reset! state-atom (:state res))
-                                                 (when (seq (:stdout-events res))
-                                                   (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
-                                                 (when (seq (:net-envelopes res))
-                                                   (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
-                             :on-close on-close-fn}]
-              (api/set-callbacks! client-node callbacks)
-              (if (or (= transport :tcp) (= transport :connect))
-                (api/start-tcp! client-node remote-sdp callbacks)
-                (api/start! client-node remote-sdp callbacks))
-              (let [res (deref connected-prom 3000 :timeout)]
-                (when (= res true)
-                  (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
-                    (reset! assigned-gen my-gen)
-                    (reset! success? true)
-                    (when p2p-peers-atom
-                      (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
-                                                           :close-fn peer-close!
-                                                           :session-id sid
-                                                           :generation my-gen}))
-                    (let [local-pub (or (:pubkey @state-atom) "")
-                          bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
-                      (peer-send! bind-env))
-                    (let [cmd-res (light-core/handle-command @state-atom
-                                                             {"cmd" "p2p-channel-state"
-                                                              "session_id" sid
-                                                              "connected" true}
-                                                             privkey-bytes)]
-                      (reset! state-atom (:state cmd-res))
-                      (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))
-            (catch Throwable _ nil)))
+                                          (swap! state-atom update-in [:diagnostics :ignored-stale] (fnil inc 0)))
+                                        (when (or (zero? cur-gen) (and my-gen (pos? (long my-gen)) (= (long my-gen) cur-gen)))
+                                          (when p2p-peers-atom
+                                            (swap! p2p-peers-atom dissoc peer-pk))
+                                          (when state-atom
+                                            (let [cmd-res (light-core/handle-command @state-atom
+                                                                                     {"cmd" "p2p-channel-state"
+                                                                                      "session_id" sid
+                                                                                      "connected" false
+                                                                                      "error" "channel-closed"}
+                                                                                     privkey-bytes)]
+                                              (reset! state-atom (:state cmd-res))
+                                              (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))))
+                    peer-close! (fn []
+                                  (try
+                                    (api/close! client-node)
+                                    (on-close-fn {:type :on-close})
+                                    (catch Throwable _ nil)))
+                    remote-sdp (cond-> {:ip host
+                                        :port port
+                                        :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
+                                        :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
+                                 (:remote-fingerprint dial-info)
+                                 (assoc :fingerprint (identity/normalize-fingerprint (:remote-fingerprint dial-info)))
+                                 (:proxy-connect? cand)
+                                 (assoc :proxy (resolve-proxy-url nil)))
+                    callbacks {:on-open (fn [evt]
+                                          (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                            (reset! channel-id cid)
+                                            (deliver connected-prom true)))
+                               :on-data-channel (fn [evt]
+                                                  (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                                    (reset! channel-id cid)
+                                                    (deliver connected-prom true)))
+                               :on-message (fn [evt]
+                                             (when-let [payload (:payload evt)]
+                                               (when state-atom
+                                                 (let [st @state-atom
+                                                       res (light-core/handle-wire-payload st payload privkey-bytes)]
+                                                   (reset! state-atom (:state res))
+                                                   (when (seq (:stdout-events res))
+                                                     (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
+                                                   (when (seq (:net-envelopes res))
+                                                     (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
+                               :on-close on-close-fn}]
+                (api/set-callbacks! client-node callbacks)
+                (if (or (= transport :tcp) (= transport :connect))
+                  (api/start-tcp! client-node remote-sdp callbacks)
+                  (api/start! client-node remote-sdp callbacks))
+                (let [res (deref connected-prom 3000 :timeout)]
+                  (if (= res true)
+                    (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
+                      (reset! assigned-gen my-gen)
+                      (reset! success? true)
+                      (when p2p-peers-atom
+                        (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
+                                                             :close-fn peer-close!
+                                                             :session-id sid
+                                                             :generation my-gen}))
+                      (let [local-pub (or (:pubkey @state-atom) "")
+                            bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
+                        (peer-send! bind-env))
+                      (let [cmd-res (light-core/handle-command @state-atom
+                                                               {"cmd" "p2p-channel-state"
+                                                                "session_id" sid
+                                                                "connected" true}
+                                                               privkey-bytes)]
+                        (reset! state-atom (:state cmd-res))
+                        (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev)))))
+                    (try (api/close! client-node) (catch Throwable _ nil)))))
+              (catch Throwable _
+                (try (api/close! client-node) (catch Throwable _ nil))))))
         (when (and (not @success?) (not (get-in @state-atom [:sessions sid :p2p :connected?])))
           (let [cmd-res (light-core/handle-command @state-atom
                                                    {"cmd" "p2p-channel-state"
@@ -2616,7 +2650,8 @@
   "Processes a single STDIN, --cmd-file JSON line, or control-socket command map in serve mode,
    handling network retries and returning response map."
   [cmd-or-line ctx]
-  (let [{:keys [state-atom conn-atom out-writer events-out state-file identity bootstrap conn-opts ingress-peers-atom p2p-peers-atom mdns-atom]} ctx
+  (let [{:keys [state-atom out-writer events-out state-file identity bootstrap conn-opts ingress-peers-atom p2p-peers-atom mdns-atom]} ctx
+        conn-atom (or (:conn-atom ctx) (atom nil))
         emit! (fn [payload] (emit-json-line! out-writer payload events-out))
         cmd-map (cond
                   (map? cmd-or-line) cmd-or-line
@@ -2647,7 +2682,10 @@
                                   (cond-> cmd-map
                                     desc (assoc "descriptor" desc)))
                                 cmd-map)
+                prev-state @state-atom
                 res (light-core/handle-command @state-atom effective-map (:privkey-bytes identity))
+                _ (when (:state res)
+                    (reset! state-atom (:state res)))
                 _ (when-let [dial-info (:p2p-dial res)]
                     (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info))
                 shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
@@ -2678,9 +2716,7 @@
                     (when-let [resp (:response res)]
                       (emit! resp))
                     (:response res))
-                  (let [prev-state @state-atom
-                        _ (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))
-                        sent-ingress? (boolean
+                  (let [sent-ingress? (boolean
                                        (when (and ingress-peers-atom (seq @ingress-peers-atom))
                                          (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
                         sent-val? (when currently-live?
@@ -2695,7 +2731,7 @@
                           (emit! resp))
                         (:response res))
                       (do
-                        (reset! state-atom prev-state)
+                        (swap! state-atom assoc :connected? false :connection-error "send-failed")
                         (when conn-atom
                           (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
                         (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
@@ -2711,8 +2747,7 @@
                               (when conn-atom
                                 (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
                               (let [replay-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
-                                    all-envs (into (vec replay-envs) (:net-envelopes res))
-                                    _ (reset! state-atom (assoc (:state res) :connected? true :connection-error nil))]
+                                    all-envs (into (vec replay-envs) (:net-envelopes res))]
                                 (if (send-all-envelopes! (:send-fn reconn) all-envs)
                                   (do
                                     (swap! state-atom assoc :connected? true :connection-error nil)
@@ -2722,12 +2757,11 @@
                                       (emit! resp))
                                     (:response res))
                                   (let [err "send-failed"]
-                                    (reset! state-atom prev-state)
+                                    (swap! state-atom assoc :connected? false :connection-error err)
                                     (when conn-atom
                                       (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
                                     (if (= verb "send")
                                       (do
-                                        (reset! state-atom (assoc (:state res) :connected? false :connection-error err))
                                         (sync-conn-diagnostics! state-atom conn-atom)
                                         (save-light-state! state-file @state-atom)
                                         (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
@@ -2735,7 +2769,11 @@
                                           err-map))
                                       (do
                                         (when state-atom
-                                          (swap! state-atom assoc :connected? false :connection-error err))
+                                          (swap! state-atom (fn [curr]
+                                                              (assoc (merge prev-state (when-let [p2p-sess (into {} (keep (fn [[k s]] (when-let [p (:p2p s)] [k {:p2p p}]))) (:sessions curr))]
+                                                                                         {:sessions (merge-with merge (:sessions prev-state) p2p-sess)}))
+                                                                     :connected? false
+                                                                     :connection-error err))))
                                         (sync-conn-diagnostics! state-atom conn-atom)
                                         (let [err-map {"ok" false "error" err}]
                                           (emit! err-map)
@@ -2743,9 +2781,9 @@
                             (let [err (or (:error reconn) "listener-disabled")]
                               (when conn-atom
                                 (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
+                              (swap! state-atom assoc :connected? false :connection-error err)
                               (if (= verb "send")
                                 (do
-                                  (reset! state-atom (assoc (:state res) :connected? false :connection-error err))
                                   (sync-conn-diagnostics! state-atom conn-atom)
                                   (save-light-state! state-file @state-atom)
                                   (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
@@ -2753,7 +2791,11 @@
                                     err-map))
                                 (do
                                   (when state-atom
-                                    (swap! state-atom assoc :connected? false :connection-error err))
+                                    (swap! state-atom (fn [curr]
+                                                        (assoc (merge prev-state (when-let [p2p-sess (into {} (keep (fn [[k s]] (when-let [p (:p2p s)] [k {:p2p p}]))) (:sessions curr))]
+                                                                                   {:sessions (merge-with merge (:sessions prev-state) p2p-sess)}))
+                                                               :connected? false
+                                                               :connection-error err))))
                                   (sync-conn-diagnostics! state-atom conn-atom)
                                   (let [err-map {"ok" false "error" err}]
                                     (emit! err-map)
@@ -3301,19 +3343,28 @@
                      (loop [since-mseq (long (or (:relay-since-seq @state-atom) 0))
                             since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))]
                        (when @daemon-running?
-                         (let [poll-res (try
+                         (let [eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
+                                                          (empty? (disj (or (:subscribed-subnets @state-atom) #{})
+                                                                        light-core/simon-nexus-axiom-subnet-id)))
+                                             (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+                               subnets (or (:subnets opts) eff-subnets)
+                               poll-res (try
                                           (poll-relay-envelopes! (:relay-url opts)
                                                                  (:pubkey-hex identity)
                                                                  (:privkey-bytes identity)
-                                                                 {:since-seq since-mseq
-                                                                  :since-broadcast-seq since-bseq
-                                                                  :wait-ms 5000})
+                                                                 (cond-> {:since-seq since-mseq
+                                                                          :since-broadcast-seq since-bseq
+                                                                          :wait-ms 5000}
+                                                                   subnets (assoc :subnets subnets)))
                                           (catch Exception _ nil))
                                msgs (or (get poll-res "messages") (get poll-res :messages) [])
                                bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                               last-bseq (or (get poll-res "last_broadcast_seq")
+                                             (get poll-res "last-broadcast-seq")
+                                             (get poll-res :last_broadcast_seq))
                                all-items (concat msgs bcasts)
                                new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") since-mseq))
-                               new-bseq (long (or (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))]
+                               new-bseq (long (or last-bseq (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))]
                            (when (or (not= new-mseq since-mseq) (not= new-bseq since-bseq))
                              (swap! state-atom assoc :relay-since-seq new-mseq :relay-since-broadcast-seq new-bseq))
                            (doseq [item all-items]
@@ -3342,7 +3393,7 @@
                                                                ingress-peers-atom
                                                                state-atom
                                                                (:privkey-bytes identity))))))))
-                           (when (seq msgs)
+                           (when (or (seq msgs) (seq bcasts) (> new-bseq since-bseq))
                              (try
                                (ack-relay-envelopes! (:relay-url opts)
                                                      (:pubkey-hex identity)
@@ -3467,22 +3518,104 @@
           (when-let [stop-fn (:stop! ingress-listener)]
             (try (stop-fn) (catch Exception _ nil))))))))
 
+(defn- pid-alive? [pid]
+  (try
+    (when-let [p (ProcessHandle/of (long pid))]
+      (.isPresent p))
+    (catch Exception _ false)))
+
 (defn- try-delegate-one-shot-to-daemon!
   "If <state-dir>/control.json exists and the daemon's /ctl socket is reachable,
-   delegates the one-shot command map to the running serve daemon (Rule 4)."
+   delegates the one-shot command map to the running serve daemon (Rule 4).
+   If unreachable and the daemon process is alive, fails closed with daemon-control-unreachable (F-D25-1)."
   [state-dir cmd-map opts]
   (let [ctrl-file (when state-dir (io/file state-dir "control.json"))]
     (when (and ctrl-file (.exists ctrl-file) (map? cmd-map) (contains? cmd-map "cmd"))
       (try
         (let [info (json/read-str (slurp ctrl-file))
+              pid (or (get info "pid") (:pid info))
               port (or (:control-port opts) (get info "port") (:port info))
               token (or (get info "token") (:token info))
               eff-cmd (if (and (:auto-sync? opts) (contains? #{"account" "escrows"} (get cmd-map "cmd")))
                         (assoc cmd-map "sync" true)
-                        cmd-map)]
-          (when (and port token)
-            (post-control-request! port token eff-cmd (or (:timeout-ms opts) 15000))))
+                        cmd-map)
+              timeout-ms (or (:timeout-ms opts) 15000)]
+          (if (and port token)
+            (let [res (try (post-control-request! port token eff-cmd timeout-ms) (catch Exception _ nil))]
+              (cond
+                res res
+                (and pid (pid-alive? pid))
+                {"ok" false
+                 "error" "daemon-control-unreachable"
+                 "pid" pid
+                 "port" port
+                 "status" "rejected"}
+                :else nil))
+            (when (and pid (pid-alive? pid))
+              {"ok" false
+               "error" "daemon-control-unreachable"
+               "pid" pid
+               "port" port
+               "status" "rejected"})))
         (catch Exception _ nil)))))
+
+(defn poll-and-ingest-relay-once!
+  "Polls the relay once, ingests incoming messages/broadcasts, saves state to disk,
+   and acks to the relay. Returns a vector of net-envelopes generated during ingestion."
+  [relay-url identity state-atom state-file opts]
+  (let [pk-hex (or (:pubkey-hex identity) (:pubkey identity))
+        priv-bytes (:privkey-bytes identity)
+        since-mseq (long (or (:relay-since-seq @state-atom) 0))
+        since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))
+        eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
+                                   (empty? (disj (or (:subscribed-subnets @state-atom) #{})
+                                                 light-core/simon-nexus-axiom-subnet-id)))
+                      (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+        subnets (or (:subnets opts) eff-subnets)
+        poll-res (try
+                   (poll-relay-envelopes! relay-url
+                                          pk-hex
+                                          priv-bytes
+                                          (cond-> {:since-seq since-mseq
+                                                   :since-broadcast-seq since-bseq
+                                                   :timeout-ms 0}
+                                            subnets (assoc :subnets subnets)))
+                   (catch Exception _ nil))
+        msgs (or (get poll-res "messages") (get poll-res :messages) [])
+        bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+        last-bseq (or (get poll-res "last_broadcast_seq")
+                      (get poll-res "last-broadcast-seq")
+                      (get poll-res :last_broadcast_seq))
+        new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") since-mseq))
+        new-bseq (long (or last-bseq (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))
+        all-items (concat msgs bcasts)
+        auto-net-envs (atom [])]
+    (when (and (not (:peek? opts))
+               (or (not= new-mseq since-mseq) (not= new-bseq since-bseq)))
+      (swap! state-atom assoc :relay-since-seq new-mseq :relay-since-broadcast-seq new-bseq))
+    (doseq [item all-items]
+      (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                        (get item :envelope_hex) (get item :envelope))
+            wire-bytes (when env-raw (try (basalt/hex->bytes (str env-raw)) (catch Exception _ nil)))]
+        (when wire-bytes
+          (let [r (light-core/handle-wire-payload @state-atom wire-bytes priv-bytes)]
+            (reset! state-atom (:state r))
+            (when (seq (:net-envelopes r))
+              (swap! auto-net-envs into (:net-envelopes r)))))))
+    (when (and (not (:peek? opts))
+               (or (not= new-mseq since-mseq) (not= new-bseq since-bseq) (seq all-items)))
+      (when state-file
+        (try (save-light-state! state-file @state-atom) (catch Exception _ nil))))
+    (when (and (not (:peek? opts))
+               (or (seq msgs) (seq bcasts) (> new-bseq since-bseq)))
+      (try
+        (ack-relay-envelopes! relay-url
+                              pk-hex
+                              priv-bytes
+                              new-mseq
+                              {:ack-broadcast-seq new-bseq})
+        (catch Exception _ nil)))
+    @auto-net-envs))
 
 (defn run-one-shot!
   "Executes a single one-shot light-node command and outputs JSON response.
@@ -3547,7 +3680,21 @@
                                (and (= verb "escrows") sync-explicit?)))
             sync-opts (assoc opts :identity identity)
             sync-res (when sync-wanted?
-                       (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts))]
+                       (maybe-sync-account-state! state-atom bootstrap (or (:pubkey-hex identity) (:pubkey identity)) (:privkey-bytes identity) sync-opts))
+            effective-relay-url (or (:relay-url opts)
+                                    (:relay_url opts)
+                                    (when-let [u (resolve-relay-url nil #(System/getenv %))] u)
+                                    (when-let [u (:relay-url bootstrap)] (resolve-relay-url u #(System/getenv %))))
+            poll-verb? (and (not (:no-poll? opts))
+                            effective-relay-url
+                            (not= (:connect? opts) false)
+                            (or (contains? #{"inbox" "wait" "accept" "rendezvous-accept" "send"
+                                             "p2p-offer" "p2p-answer" "close" "sync-account"
+                                             "account" "escrows"} verb)
+                                (and (= verb "status") (or (:sync? opts) (get cmd-map "sync") (:poll? opts) (get cmd-map "poll")))))
+            poll-auto-envs (if poll-verb?
+                             (poll-and-ingest-relay-once! effective-relay-url identity state-atom state-file opts)
+                             [])]
         (if (and sync-res (false? (:ok? sync-res)))
           (let [err-resp {"ok" false "error" (:error sync-res)}]
             (emit-json-line! out-writer err-resp)
@@ -3555,30 +3702,33 @@
           (binding [*out* *err*]
             (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
                   new-state (:state res)
+                  all-net-envs (into (vec poll-auto-envs) (:net-envelopes res))
                   connect-explicit? (contains? opts :connect?)
                   connect-wanted? (if connect-explicit?
                                     (boolean (:connect? opts))
                                     (not shuttle-verb?))
-                  needs-network? (and (seq (:net-envelopes res)) connect-wanted?)]
+                  needs-network? (and (seq all-net-envs) connect-wanted?)]
               (if needs-network?
                 (let [conn-res (connect-validators! identity bootstrap opts)]
                   (if-not (:ok? conn-res)
                     (let [err-resp {"ok" false "error" (or (:error conn-res) "listener-disabled")}]
                       (emit-json-line! out-writer err-resp)
                       err-resp)
-                    (let [sent? (send-all-envelopes! (:send-fn conn-res) (:net-envelopes res))]
+                    (let [sent? (send-all-envelopes! (:send-fn conn-res) all-net-envs)]
                       (when-let [n (:node conn-res)]
                         (try (api/close! n) (catch Exception _ nil)))
                       (if sent?
                         (do
-                          (save-light-state! state-file new-state)
+                          (when-not (get cmd-map "peek")
+                            (save-light-state! state-file new-state))
                           (emit-json-line! out-writer (:response res))
                           (:response res))
                         (let [err-resp {"ok" false "error" "connection-closed"}]
                           (emit-json-line! out-writer err-resp)
                           err-resp)))))
                 (do
-                  (save-light-state! state-file new-state)
+                  (when-not (get cmd-map "peek")
+                    (save-light-state! state-file new-state))
                   (emit-json-line! out-writer (:response res))
                   (:response res))))))))))
 
@@ -3714,6 +3864,14 @@
   [args]
   (let [parsed (parse-light-node-args args)]
     (case (:mode parsed)
+      :help
+      (let [res {"ok" true
+                 "help" true
+                 "verbs" cli/supported-cli-verbs
+                 "modes" ["one-shot" "serve" "ctl" "wait-event"]
+                 "flags" cli/known-command-flags}]
+        (println (json/write-str res))
+        res)
       :daemon (run-daemon! parsed)
       :ctl (run-ctl! parsed)
       :serve (run-serve! parsed)

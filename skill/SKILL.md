@@ -22,7 +22,7 @@ Built under the strict Sans-IO architectural pattern, the core protocol logic (`
 
 ## Execution Modes (3-Runtime Parity: JVM, Node.js, Browser)
 
-The light node shares a unified 55-verb CLI/JSONL parser (`bitecho.light-node.cli`) and pure Sans-IO core (`bitecho.light-node.core`) across all three runtimes:
+The light node shares a unified 63-verb CLI/JSONL parser (`bitecho.light-node.cli`) and 51 canonical flags across a pure Sans-IO core (`bitecho.light-node.core`) across all three runtimes:
 
 ```bash
 # 1. JVM (Clojure CLI or standalone Uberjar)
@@ -73,6 +73,10 @@ const res = await BitechoBrowser.ctl(node, "puzzle-hash --puzzle-source '[{:type
 - `--daemon`: Spawns `serve` mode as a detached background daemon process, logging to `<state-dir>/daemon.log` and writing `<state-dir>/daemon.pid`.
 - `--control-port <port>`: Port for loopback HTTP control socket in `serve` mode (default: `5020`, falls back to ephemeral port if unavailable).
 - `--max-epoch-skew <skew>`: Maximum allowed epoch skew when validating chain state snapshots (default: `15`, minimum: `1`).
+- `--peek`: Non-destructive read for `inbox` (returns messages without draining `:inbox` or `:broadcast-inbox`, without writing state to disk, and without burning relay envelopes).
+- `--no-poll`: Bypasses automatic relay poll during one-shot commands.
+- `--subscribe-subnets <s1,s2,...>`: Subscribes light node to additional subnets (default includes `chat/simon-nexus-axiom`).
+- `--help`: Returns comprehensive verbs, flags, and execution modes inventory without initializing state directories.
 - `--block`: Blocks indefinitely in `ctl wait` until at least 1 matching actionable event arrives (never exiting on an empty timeout).
 - `--until-event`: Alias for `--block` in `ctl wait`.
 
