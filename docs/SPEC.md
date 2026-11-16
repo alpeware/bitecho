@@ -244,5 +244,19 @@ Bitecho implements a pure Sans-IO 4-layer autonomous protocol evolution and gove
 3. **Formal Release Runbook & Canary Rolling Deploy ([`RELEASE.md`](../RELEASE.md)):**
    - Defines the 6-gate pre-release verification pipeline, deterministic artifact SHA-256 attestation, canary rolling order (`ns3` -> `node3` -> E2E gate -> `ns2` -> `ns1` -> `node2` -> `node1`), and `./scripts/cluster.sh rollback`.
 
+---
+
+## 7. P2P Single-Responder Contract & Hook Newline Discipline
+
+### 7.1 Single-Responder Contract (`bitecho.light-node.core`)
+To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric state splits when establishing direct P2P connections:
+1. **Deterministic Single-Responder Rule:** When two peers exchange WebRTC signaling offers and answers, only the designated responder (the peer with deterministic lower pubkey or callee) establishes the active connection; stale or concurrent cross-offers are ignored with counted diagnostics (`:p2p-offer-answered-while-open`).
+2. **Candidate Fallback (`INV-D24-1`):** In symmetric NAT environments or local proxy scenarios where filtered remote candidates match local candidate addresses, the node automatically falls back to raw remote candidates and increments `[:diagnostics :p2p-answer-candidate-self-filter-fallback]`.
+3. **Signaling Metadata Persistence (`Rule 4`):** Derived runtime connection liveness (`:p2p` containing `:phase`, `:connected?`, `:error`) is stripped prior to disk or browser storage persistence. Immutable remote signaling credentials (`:p2p-meta` containing `:remote-candidates`, `:remote-ice-ufrag`, `:remote-fingerprint`, `:remote-transport`, `:preferred-transport`, `:preferred-candidates`) are persisted and restored across node restarts.
+
+### 7.2 Hook Newline Discipline & Control Concurrency
+1. **Streaming JSONL Discipline:** Streaming CLI commands, subagent inputs, or stdin pipelines (`--cmd-file` or stdin pipe) must strictly maintain single-line JSON (`\n`) formatting. If adjacent, un-delimited JSON commands arrive (e.g. `}{`), `cli/split-jsonl-commands` parses and splits valid JSON objects without dropping envelopes or throwing syntax errors.
+2. **Control Socket Concurrency:** All `/ctl` command executions are serialized through a single reentrant mutex (`light-ctl-exec-lock` / sequential dispatch) to prevent concurrent command races and state corruption across multiple subagents.
+
 
 

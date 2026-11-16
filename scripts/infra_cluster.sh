@@ -397,6 +397,19 @@ REMOTE_ID
         :http-port 80
         :https-port 443
         :ingress-target {:host "127.0.0.1" :port 5010}
+        :connect-routes {"node1.ingress.${DOMAIN}:443" {:host "35.212.129.138" :port 5010}
+                         "node2.ingress.${DOMAIN}:443" {:host "35.206.120.143" :port 5010}
+                         "node3.ingress.${DOMAIN}:443" {:host "35.211.71.139" :port 5010}
+                         "ns1.${DOMAIN}:443" {:host "127.0.0.1" :port 5010}
+                         "ns2.${DOMAIN}:443" {:host "127.0.0.1" :port 5010}
+                         "ns3.${DOMAIN}:443" {:host "127.0.0.1" :port 5010}}
+        :connect-targets #{"node1.ingress.${DOMAIN}:443"
+                           "node2.ingress.${DOMAIN}:443"
+                           "node3.ingress.${DOMAIN}:443"
+                           "ns1.${DOMAIN}:443"
+                           "ns2.${DOMAIN}:443"
+                           "ns3.${DOMAIN}:443"
+                           "*.ingress.${DOMAIN}:443"}
         :content-root "/var/www/clj-web/public"
         :directory-listing? true}
  :smtp {:enabled? true

@@ -1476,6 +1476,112 @@ cmd_bootstrap_sdp() {
 }
 
 # ------------------------------------------------------------------------------
+# Subcommand: print-fingerprint
+# ------------------------------------------------------------------------------
+
+cmd_print_fingerprint() {
+  local bootstrap_file="${ROOT_DIR}/devnet/bootstrap.edn"
+  if [[ ! -f "$bootstrap_file" ]]; then
+    echo "Warning: ${bootstrap_file} not found. Reading from devnet/bootstrap.txt if available." >&2
+  fi
+
+  echo "=== Live Cluster DTLS Fingerprint Inspection ==="
+  echo "Target Nodes: ${ALL_NODES[*]}"
+  echo ""
+
+  local mismatches=0
+  for node in "${ALL_NODES[@]}"; do
+    local ip
+    ip="$(get_ip "$node")"
+    if [[ -z "$ip" ]]; then
+      echo "[-] ${node}: IP unresolvable"
+      ((mismatches++))
+      continue
+    fi
+
+    local id_out=""
+    if [[ "$node" == ns* ]]; then
+      id_out="$(ssh_cmd "$node" bash -s << 'REMOTE_NS_ID' 2>/dev/null || true
+set -euo pipefail
+TMP_CFG="/tmp/bootstrap-ns-config.edn"
+echo "{:node/id :${node} :domain \"bitecho.org\" :state-dir \"/var/lib/clj-web\"}" > "$TMP_CFG"
+/opt/jdk-25/bin/java \
+  -Xms64m -Xmx128m \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho-infra/bitecho.jar print-fingerprint "$TMP_CFG" 2>/dev/null || \
+/opt/jdk-25/bin/java \
+  -Xms64m -Xmx128m \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho-infra/bitecho.jar print-identity "$TMP_CFG" 2>/dev/null
+rm -f "$TMP_CFG"
+REMOTE_NS_ID
+)"
+    else
+      id_out="$(ssh_cmd "$node" bash -s << 'REMOTE_ID' 2>/dev/null || true
+set -euo pipefail
+CFG_FILE="/etc/bitecho/config.edn"
+if [ ! -f "$CFG_FILE" ]; then
+  TMP_CFG="/tmp/bootstrap-config.edn"
+  echo "{:node/id :${node} :state-dir \"/var/lib/bitecho\"}" > "$TMP_CFG"
+  CFG_FILE="$TMP_CFG"
+fi
+/opt/jdk-25/bin/java \
+  -Xms128m -Xmx256m \
+  --enable-native-access=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+  -jar /opt/bitecho/bitecho.jar print-identity "$CFG_FILE" 2>/dev/null
+rm -f /tmp/bootstrap-config.edn
+REMOTE_ID
+)"
+    fi
+
+    local live_fp
+    live_fp="$(echo "$id_out" | grep -i 'Fingerprint:' | awk '{print $NF}' | tr -d '\r')"
+
+    local expected_fp=""
+    if [[ -f "$bootstrap_file" ]]; then
+      expected_fp="$(grep -A 1 ":${node} " "$bootstrap_file" | grep -o ':fingerprint "[^"]*"' | head -1 | cut -d'"' -f2 || true)"
+      if [[ -z "$expected_fp" ]]; then
+        expected_fp="$(grep -o ":${node} [^}]*" "$bootstrap_file" | grep -o ':fingerprint "[^"]*"' | head -1 | cut -d'"' -f2 || true)"
+      fi
+    fi
+
+    if [[ -z "$live_fp" ]]; then
+      echo "[-] ${node} (${ip}): UNREACHABLE or FINGERPRINT NOT RETRIEVED"
+      if [[ -n "$expected_fp" ]]; then
+        echo "    Expected: ${expected_fp}"
+      fi
+      ((mismatches++))
+    elif [[ -n "$expected_fp" && "${live_fp^^}" != "${expected_fp^^}" ]]; then
+      echo "[!] ${node} (${ip}): MISMATCH!"
+      echo "    Live:     ${live_fp}"
+      echo "    Expected: ${expected_fp}"
+      ((mismatches++))
+    else
+      echo "[+] ${node} (${ip}): OK"
+      echo "    Fingerprint: ${live_fp}"
+      if [[ -n "$expected_fp" ]]; then
+        echo "    Matches devnet/bootstrap.edn"
+      fi
+    fi
+  done
+
+  echo ""
+  if [[ $mismatches -eq 0 ]]; then
+    echo "Summary: All live node fingerprints match devnet/bootstrap.edn."
+    return 0
+  else
+    echo "Summary: ${mismatches} node(s) had unreachable status or fingerprint mismatch."
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
 # Subcommand: ssh
 # ------------------------------------------------------------------------------
 
@@ -1912,6 +2018,7 @@ Commands:
   chaos [--rounds N] [--interval SEC] Run chaos monkey restarting random nodes and checking convergence
   logs [node1|node2|node3]            Stream systemd journal logs from a cluster node
   bootstrap-sdp                       Display WebRTC DataChannel bootstrap connection parameters for agents
+  print-fingerprint                   Inspect and verify live DTLS fingerprints against devnet/bootstrap.edn
   ssh <node1|node2|node3>             Open interactive SSH shell into a cluster node
   help, -h, --help                    Show this help message
 
@@ -1977,6 +2084,9 @@ main() {
       ;;
     bootstrap-sdp|bootstrap_sdp)
       cmd_bootstrap_sdp "$@"
+      ;;
+    print-fingerprint|print_fingerprint)
+      cmd_print_fingerprint "$@"
       ;;
     ssh)
       cmd_ssh "$@"

@@ -507,7 +507,7 @@
         (is (some? (:p2p-dial res2)) "p2p-dial is non-nil for answer with remote candidate")
         (is (= [peer-cand] (:remote-candidates (:p2p-dial res2))) "Self-candidate filtered out and peer candidate dialed")
         (is (= :connecting (get-in (:state res2) [:sessions sid :p2p :phase]))))
-      ;; Also verify exec-p2p-answer produces nil p2p-dial when remote candidates are empty or self-candidates
+      ;; Also verify exec-p2p-answer candidate fallback per D24 (A-CARB-D24-1) and nil p2p-dial when raw remote candidates are empty
       (let [resp-state (assoc (light-core/init-light-state {:pubkey-hex pub-remote :pubkey pub-remote} {})
                               :sessions {sid {:session-id sid
                                               :peer pub-local
@@ -517,5 +517,16 @@
             ans-res (light-core/handle-command resp-state
                                                {"cmd" "p2p-answer" "session_id" sid "candidates" [gateway-cand]}
                                                (:private kp-remote))]
-        (is (nil? (:p2p-dial ans-res)) "exec-p2p-answer returns nil p2p-dial when dialable remote candidates are empty")
-        (is (= :connecting (get-in (:state ans-res) [:sessions sid :p2p :phase])) "Responder remains in :connecting to wait passively")))))
+        (is (some? (:p2p-dial ans-res)) "exec-p2p-answer falls back to raw-remote-cands per D24 when filtered candidates are empty")
+        (is (= 1 (get-in (:state ans-res) [:diagnostics :p2p-answer-candidate-self-filter-fallback])) "fallback diagnostic incremented")
+        (is (= :connecting (get-in (:state ans-res) [:sessions sid :p2p :phase])) "Responder enters :connecting"))
+      (let [empty-resp-state (assoc (light-core/init-light-state {:pubkey-hex pub-remote :pubkey pub-remote} {})
+                                    :sessions {sid {:session-id sid
+                                                    :peer pub-local
+                                                    :state "open"
+                                                    :p2p {:phase :offered
+                                                          :remote-candidates []}}})
+            ans-res-empty (light-core/handle-command empty-resp-state
+                                                     {"cmd" "p2p-answer" "session_id" sid "candidates" [gateway-cand]}
+                                                     (:private kp-remote))]
+        (is (nil? (:p2p-dial ans-res-empty)) "exec-p2p-answer returns nil p2p-dial when raw remote candidates are empty")))))

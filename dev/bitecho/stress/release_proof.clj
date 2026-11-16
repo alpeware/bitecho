@@ -317,9 +317,11 @@
      :passed? (boolean passed?)}))
 
 (defn run-release-proof
-  "Runs the complete Milestone D23 release verification proof and returns a deterministic EDN map."
-  [_opts]
-  (let [devnet-res (run-single-network-e2e :devnet)
+  "Runs the complete Milestone D24 (v0.23.1) release verification proof and returns a deterministic EDN map."
+  [opts]
+  (let [ver (or (:version opts) "v0.23.1")
+        ms (or (:milestone opts) "D24")
+        devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
         replay-res (run-cross-network-replay-matrix)
@@ -329,8 +331,8 @@
                                   (:passed? mainnet-res)
                                   (:all-rejected? replay-res)
                                   (:passed? rolling-res)))]
-    {:milestone "D23"
-     :version "v0.23.0"
+    {:milestone ms
+     :version ver
      :all-passed? all-passed?
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
@@ -339,9 +341,9 @@
      :rolling-upgrade rolling-res}))
 
 (defn -main
-  "CLI entrypoint generating the Milestone D23 release proof EDN artifact."
+  "CLI entrypoint generating the Milestone D24 release proof EDN artifact."
   [& args]
-  (let [out-path (or (first args) "docs/releases/v0.23.0-proof.edn")
+  (let [out-path (or (first args) "docs/releases/v0.23.1-proof.edn")
         proof (run-release-proof {})
         out-file (io/file out-path)]
     (when-let [parent (.getParentFile out-file)]

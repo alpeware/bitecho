@@ -1589,11 +1589,47 @@
             ingress-target
             {:host h :port p})))))
 
+(defn- build-ingress-routes
+  "Builds ufrag-routes and sni-routes from cluster config and bootstrap nodes."
+  [config val-bootstrap]
+  (let [node-entries (concat (when (map? (get-in config [:validator :cluster :nodes]))
+                               (vals (get-in config [:validator :cluster :nodes])))
+                             (when (map? val-bootstrap)
+                               (if (map? (:nodes val-bootstrap))
+                                 (vals (:nodes val-bootstrap))
+                                 (:nodes val-bootstrap)))
+                             (when (map? (get-in config [:cluster :nodes]))
+                               (vals (get-in config [:cluster :nodes]))))
+        my-node-id (or (get-in config [:validator :node-id])
+                       (get-in config [:node :node-id])
+                       (get config :node-id))
+        connect-routes (get-in config [:http :connect-routes] {})]
+    (reduce
+     (fn [acc node]
+       (let [node-id (or (:node-id node) (:id node))
+             ip (:ip node)
+             port (int (or (:agent-tcp-port node) (:agent-port node) (:port node) 5010))
+             ice-ufrag (when-let [u (or (:ice-ufrag node) (get-in node [:ice-creds :ufrag]))]
+                         (str/lower-case (str u)))
+             ingress-host (when-let [h (:ingress-host node)]
+                            (str/lower-case (str h)))]
+         (if (or (= node-id my-node-id) (nil? ip))
+           acc
+           (let [target {:host ip :port port}]
+             (-> acc
+                 (cond->
+                  ice-ufrag (assoc-in [:ufrag-routes ice-ufrag] target)
+                  ingress-host (-> (assoc-in [:sni-routes ingress-host] target)
+                                   (assoc-in [:sni-routes (str ingress-host ":443")] target))))))))
+     {:ufrag-routes {}
+      :sni-routes (into {} (for [[k v] connect-routes] [(str/lower-case (str k)) v]))}
+     node-entries)))
+
 (defn- handle-passthrough-connection!
   "Classifies initial `<= 1024` peeked bytes on port `:443` and splices to `HTTP CONNECT` target,
    `:ingress-target`, or internal `HttpsServer`."
   [^Socket client-sock ctx]
-  (let [{:keys [domain internal-https-port ingress-target connect-targets connect-routes peek-timeout-ms
+  (let [{:keys [domain internal-https-port ingress-target connect-targets connect-routes ufrag-routes sni-routes peek-timeout-ms
                 forwarded-ips-atom shell-atom ^ExecutorService vthread-executor]} ctx]
     (try
       (let [[^bytes buf n] (peek-initial-bytes client-sock (long (or peek-timeout-ms 2000)))]
@@ -1626,8 +1662,16 @@
 
             ;; 2. Ingress stream (RFC 4571 DTLS/STUN or SNI *.ingress.<domain>) vs internal HttpsServer
             (let [ingress? (and (some? ingress-target) (dns-proto/ingress-stream? buf n domain))
+                  ufrag (when ingress? (dns-proto/extract-stun-target-ufrag buf n))
+                  sni (when ingress? (dns-proto/extract-tls-sni buf n))
+                  routed-target (or (when (and ufrag ufrag-routes)
+                                      (get ufrag-routes (str/lower-case ufrag)))
+                                    (when (and sni sni-routes)
+                                      (or (get sni-routes (str/lower-case sni))
+                                          (get sni-routes (str/lower-case (str sni ":443")))))
+                                    ingress-target)
                   target (if ingress?
-                           ingress-target
+                           routed-target
                            {:host "127.0.0.1" :port internal-https-port})
                   backend-sock (Socket. ^String (:host target) (int (:port target)))
                   local-backend-port (.getLocalPort backend-sock)
@@ -1773,11 +1817,14 @@
             _ (.createContext https-server "/" (make-port-443-handler effective-config shell-atom subnet-runtime limiter-atom forwarded-ips-atom relay-atom relay-waiters-atom))
             _ (.start https-server)
             internal-https-port (.getPort (.getAddress https-server))
+            ingress-routes (build-ingress-routes effective-config val-bootstrap)
             passthrough-ctx {:domain domain
                              :internal-https-port internal-https-port
                              :ingress-target (get-in config [:http :ingress-target])
                              :connect-targets (get-in config [:http :connect-targets])
                              :connect-routes (get-in config [:http :connect-routes])
+                             :ufrag-routes (:ufrag-routes ingress-routes)
+                             :sni-routes (:sni-routes ingress-routes)
                              :peek-timeout-ms (get-in config [:http :peek-timeout-ms] 2000)
                              :forwarded-ips-atom forwarded-ips-atom
                              :shell-atom shell-atom

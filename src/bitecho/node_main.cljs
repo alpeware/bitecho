@@ -8,6 +8,7 @@
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [cljs.reader :as edn]
             [clojure.string :as str]
@@ -1113,7 +1114,10 @@
                    "export-poll" (let [mseq (or (extract-long-flag args "--since-seq" nil)
                                                 (extract-long-flag args "--since-relay-seq" nil))
                                        bseq (extract-long-flag args "--since-broadcast-seq" nil)
-                                       m {"cmd" "export-poll"}]
+                                       now (or (extract-long-flag args "--now-ms" nil)
+                                               (extract-long-flag args "--now" nil)
+                                               (js/Date.now))
+                                       m {"cmd" "export-poll" "now_ms" now}]
                                    (cond-> m
                                      mseq (assoc "since_seq" mseq)
                                      bseq (assoc "since_broadcast_seq" bseq)))
@@ -1125,6 +1129,13 @@
                                                      (when (seq (remove #(str/starts-with? % "-") args))
                                                        (first (remove #(str/starts-with? % "-") args)))))]
                                    {"cmd" "import-poll" "file_content" (or content "")})
+                   "import-envelope" (let [f (extract-flag-value args "--file" nil)
+                                           h (or (extract-flag-value args "--hex" nil)
+                                                 (if f
+                                                   (try (.readFileSync node-fs f "utf8") (catch :default _ nil))
+                                                   (when (seq (remove #(str/starts-with? % "-") args))
+                                                     (first (remove #(str/starts-with? % "-") args)))))]
+                                       {"cmd" "import-envelope" "hex" (or h "")})
                    "import" (let [f (extract-flag-value args "--file" nil)
                                   h (or (extract-flag-value args "--hex" nil)
                                         (if f
@@ -1143,6 +1154,34 @@
                                       to (assoc "to" to)
                                       ep (assoc "epoch" ep)
                                       hn (assoc "home_node" hn)))
+                   "export-reveal" (let [oh (extract-flag-value args "--offer-hash" nil)
+                                         from (extract-flag-value args "--from" nil)
+                                         m {"cmd" "export-reveal"}]
+                                     (cond-> m
+                                       oh (assoc "offer_hash" oh)
+                                       from (assoc "from" from)))
+                   "export-p2p-offer" (let [sid (or (extract-flag-value args "--session-id" nil)
+                                                    (extract-flag-value args "--session" nil)
+                                                    (extract-flag-value args "--to" nil)
+                                                    (extract-flag-value args "--peer" nil))
+                                            cands (extract-flag-value args "--candidates" nil)
+                                            b (extract-long-flag args "--burn" nil)
+                                            m {"cmd" "export-p2p-offer"}]
+                                        (cond-> m
+                                          sid (assoc "session_id" sid "to" sid)
+                                          cands (assoc "candidates" cands)
+                                          (some? b) (assoc "burn" b)))
+                   "export-p2p-answer" (let [sid (or (extract-flag-value args "--session-id" nil)
+                                                     (extract-flag-value args "--session" nil)
+                                                     (extract-flag-value args "--to" nil)
+                                                     (extract-flag-value args "--peer" nil))
+                                             cands (extract-flag-value args "--candidates" nil)
+                                             b (extract-long-flag args "--burn" nil)
+                                             m {"cmd" "export-p2p-answer"}]
+                                         (cond-> m
+                                           sid (assoc "session_id" sid "to" sid)
+                                           cands (assoc "candidates" cands)
+                                           (some? b) (assoc "burn" b)))
                    "export-send" (let [to (or (extract-flag-value args "--to" nil)
                                               (extract-flag-value args "--peer" nil)
                                               (extract-flag-value args "--session-id" nil)
@@ -1178,7 +1217,10 @@
                                              (extract-flag-value args "--peer" nil)
                                              (extract-flag-value args "--session-id" nil)
                                              (extract-flag-value args "--session" nil))
-                                      m {"cmd" "export-ack"}]
+                                      now (or (extract-long-flag args "--now-ms" nil)
+                                              (extract-long-flag args "--now" nil)
+                                              (js/Date.now))
+                                      m {"cmd" "export-ack" "now_ms" now}]
                                   (cond-> m
                                     seq-num (assoc "up_to_seq" seq-num "ack_seq" seq-num)
                                     bseq (assoc "up_to_broadcast_seq" bseq "ack_broadcast_seq" bseq)
@@ -1186,10 +1228,12 @@
                    "wait" (let [t (or (extract-long-flag args "--timeout-ms" nil)
                                       (extract-long-flag args "--timeout" nil))
                                 ms (extract-long-flag args "--min-seq" nil)
-                                block? (boolean (or (some #{"--block"} args) (some #{"--until-event"} args)))]
+                                block? (boolean (or (some #{"--block"} args) (some #{"--until-event"} args)))
+                                peek? (boolean (some #{"--peek"} args))]
                             (cond-> {"cmd" "wait" "timeout_ms" (or t 30000)}
                               ms (assoc "min_seq" ms)
-                              block? (assoc "block" true)))
+                              block? (assoc "block" true)
+                              peek? (assoc "peek" true)))
                    "retransmit-outbox" (let [sid (or (extract-flag-value args "--session-id" nil)
                                                      (extract-flag-value args "--session" nil))]
                                          (cond-> {"cmd" "retransmit-outbox"}
@@ -1386,6 +1430,11 @@
          no-auto-sync? (boolean (some #{"--no-auto-sync"} clean-args))
          explicit-auto-sync? (boolean (some #{"--auto-sync"} clean-args))
          auto-sync? (and (not no-auto-sync?) (or explicit-auto-sync? serve?))
+         sync? (boolean (some #{"--sync"} clean-args))
+         connect? (cond
+                    (some #{"--no-connect"} clean-args) false
+                    (some #{"--connect"} clean-args) true
+                    :else nil)
          sync-interval-ms (extract-long-flag clean-args "--sync-interval-ms" (when auto-sync? 15000))
          no-auto-reg? (boolean (some #{"--no-auto-register-home-set"} clean-args))
          explicit-auto-reg? (boolean (some #{"--auto-register-home-set"} clean-args))
@@ -1478,6 +1527,8 @@
        timeout-ms (assoc :timeout-ms timeout-ms)
        ingress-tcp-port (assoc :ingress-tcp-port ingress-tcp-port)
        (seq trusted-dac-anchors) (assoc :trusted-dac-anchors trusted-dac-anchors)
+       (some? sync?) (assoc :sync? sync?)
+       (some? connect?) (assoc :connect? connect?)
        proxy-url (assoc :proxy proxy-url)
        relay-url (assoc :relay-url relay-url)
        turn-config (assoc :turn-config turn-config)))))
@@ -1885,12 +1936,27 @@
          true)))
 
 (defn send-all-envelopes!
-  "Transmits all envelopes using `send-fn` and returns true only if all succeeded."
-  [send-fn envelopes]
-  (if (empty? envelopes)
-    true
-    (and (fn? send-fn)
-         (every? true? (mapv #(boolean (send-fn %)) envelopes)))))
+  "Transmits all envelopes using `send-fn` and returns true only if all succeeded.
+   Supports optional callback `(send-all-envelopes! send-fn envelopes cb)` chaining
+   sequential delivery over async transports (such as HTTP gateway relay)."
+  ([send-fn envelopes]
+   (if (empty? envelopes)
+     true
+     (and (fn? send-fn)
+          (every? true? (mapv #(boolean (send-fn %)) envelopes)))))
+  ([send-fn envelopes cb]
+   (if (empty? envelopes)
+     (when (fn? cb) (cb true))
+     (letfn [(step [rem]
+               (if-let [env (first rem)]
+                 (if (fn? send-fn)
+                   (send-fn env (fn [ok?]
+                                  (if ok?
+                                    (step (rest rem))
+                                    (when (fn? cb) (cb false)))))
+                   (when (fn? cb) (cb false)))
+                 (when (fn? cb) (cb true))))]
+       (step (vec envelopes))))))
 
 (defn build-reconnect-recovery-envelopes
   "Pure helper to build recovery envelopes upon reconnection."
@@ -2495,7 +2561,7 @@
      (try (append-event-jsonl! events-out-path data) (catch :default _ nil)))))
 
 (defn read-new-cmd-file-lines!
-  "Reads newly appended complete UTF-8 lines from `cmd-file-path` starting at byte `offset`."
+  "Reads newly appended complete UTF-8 lines or balanced JSON objects from `cmd-file-path` starting at byte `offset`."
   [cmd-file-path offset]
   (let [p (str cmd-file-path)]
     (if-not (.existsSync node-fs p)
@@ -2516,17 +2582,32 @@
                                   (cond
                                     (neg? idx) -1
                                     (= (.readUInt8 buf idx) 10) idx
-                                    :else (recur (dec idx))))]
-                    (if (neg? last-nl)
+                                    :else (recur (dec idx))))
+                        nl-consumed (if (neg? last-nl) 0 (inc last-nl))
+                        nl-text (when (pos? nl-consumed)
+                                  (.toString buf "utf8" 0 nl-consumed))
+                        nl-lines (if nl-text
+                                   (mapcat cli/split-jsonl-commands (str/split-lines nl-text))
+                                   [])
+                        trailing-len (- read-n nl-consumed)
+                        trailing-text (when (pos? trailing-len)
+                                        (.toString buf "utf8" nl-consumed read-n))
+                        trailing-cmds (when (seq trailing-text)
+                                        (cli/split-jsonl-commands trailing-text))
+                        trailing-consumed (if (seq trailing-cmds)
+                                            (let [last-cmd (last trailing-cmds)
+                                                  last-idx (.lastIndexOf trailing-text last-cmd)]
+                                              (if (>= last-idx 0)
+                                                (let [sub (.substring trailing-text 0 (+ last-idx (count last-cmd)))]
+                                                  (.-length (js/Buffer.from sub "utf8")))
+                                                0))
+                                            0)
+                        total-consumed (+ nl-consumed trailing-consumed)
+                        all-lines (vec (concat nl-lines (when (pos? trailing-consumed) trailing-cmds)))]
+                    (if (zero? total-consumed)
                       {:lines [] :next-offset safe-off}
-                      (let [consumed (inc last-nl)
-                            text (.toString buf "utf8" 0 consumed)
-                            lines (->> (str/split-lines text)
-                                       (map str/trim)
-                                       (remove str/blank?)
-                                       vec)]
-                        {:lines lines
-                         :next-offset (+ safe-off consumed)})))))
+                      {:lines (->> all-lines (map str/trim) (remove str/blank?) vec)
+                       :next-offset (+ safe-off total-consumed)}))))
               (finally
                 (try (.closeSync node-fs fd) (catch :default _ nil))))))))))
 
@@ -3178,26 +3259,31 @@
 (defn- handle-ctl-wait!
   "Non-blocking wait handler for control server /ctl endpoint."
   [cmd-map ctx cb]
-  (let [state-atom (:state-atom ctx)
-        block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
-        timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))
-        min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
-                  (long ms))
-        deadline (+ (.now js/Date) timeout-ms)
-        check! (fn check! []
-                 (let [q (:event-queue @state-atom)
-                       has-event? (if min-seq
-                                    (boolean (some (fn [ev]
-                                                     (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "event_seq") (:event-seq ev) 0))
-                                                           s   (long (or (get ev "seq") (:seq ev) 0))]
-                                                       (or (>= eid min-seq) (>= s min-seq))))
-                                                   q))
-                                    (boolean (seq q)))]
-                   (if (or has-event?
-                           (and (not block?) (>= (.now js/Date) deadline)))
-                     (handle-serve-line! cmd-map ctx cb)
-                     (js/setTimeout check! 50))))]
-    (check!)))
+  (let [peek? (or (true? (get cmd-map "peek"))
+                  (true? (:peek cmd-map))
+                  (= (get cmd-map "peek") "true"))]
+    (if peek?
+      (handle-serve-line! cmd-map ctx cb)
+      (let [state-atom (:state-atom ctx)
+            block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
+            timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))
+            min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
+                      (long ms))
+            deadline (+ (.now js/Date) timeout-ms)
+            check! (fn check! []
+                     (let [q (:event-queue @state-atom)
+                           has-event? (if min-seq
+                                        (boolean (some (fn [ev]
+                                                         (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "event_seq") (:event-seq ev) 0))
+                                                               s   (long (or (get ev "seq") (:seq ev) 0))]
+                                                           (or (>= eid min-seq) (>= s min-seq))))
+                                                       q))
+                                        (boolean (seq q)))]
+                       (if (or has-event?
+                               (and (not block?) (>= (.now js/Date) deadline)))
+                         (handle-serve-line! cmd-map ctx cb)
+                         (js/setTimeout check! 50))))]
+        (check!)))))
 
 (defn start-control-server!
   "Starts loopback-only (127.0.0.1) control HTTP server on control-port (default 5020 or ephemeral).
@@ -3756,19 +3842,30 @@
                verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
                run-cmd-with-map!
                (fn [cmd-map]
-                 (let [sync-wanted? (or (boolean (:auto-sync? opts))
-                                        (and (= verb "sync-account")
-                                             (nil? (get cmd-map "balance"))
-                                             (nil? (get cmd-map "snapshots"))
-                                             (nil? (get cmd-map "snapshot")))
-                                        (and (= verb "account") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map)))
-                                        (and (= verb "escrows") (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map))))
+                 (let [shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal"
+                                                  "export-p2p-offer" "export-p2p-answer" "export-send"
+                                                  "import-envelope" "import-poll" "import"}
+                                                verb)
+                       sync-explicit? (boolean (or (:sync? opts) (get cmd-map "sync") (:sync? cmd-map)))
+                       sync-wanted? (if shuttle-verb?
+                                      sync-explicit?
+                                      (or (boolean (:auto-sync? opts))
+                                          (and (= verb "sync-account")
+                                               (nil? (get cmd-map "balance"))
+                                               (nil? (get cmd-map "snapshots"))
+                                               (nil? (get cmd-map "snapshot")))
+                                          (and (= verb "account") sync-explicit?)
+                                          (and (= verb "escrows") sync-explicit?)))
                        sync-opts (assoc opts :identity identity)
                        after-sync!
                        (fn []
                          (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
                                new-state (:state res)
-                               needs-network? (and (seq (:net-envelopes res)) (:connect? opts true))]
+                               connect-explicit? (contains? opts :connect?)
+                               connect-wanted? (if connect-explicit?
+                                                 (boolean (:connect? opts))
+                                                 (not shuttle-verb?))
+                               needs-network? (and (seq (:net-envelopes res)) connect-wanted?)]
                            (if needs-network?
                              (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
                                                   (when (and (string? u) (not (str/blank? u))) u))]

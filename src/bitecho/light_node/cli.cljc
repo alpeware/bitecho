@@ -77,8 +77,60 @@
   (set supported-cli-verbs))
 
 ;; =============================================================================
-;; 2. Pure CLI Tokenizer (Rule 2)
+;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
 ;; =============================================================================
+
+(defn split-jsonl-commands
+  "Splits a text containing one or more JSON objects (possibly concatenated without newlines,
+   e.g. '{\"cmd\":\"status\"}{\"cmd\":\"identity\"}') into a vector of separate JSON strings."
+  [text]
+  (if (str/blank? text)
+    []
+    (let [chars (vec text)
+          n (count chars)]
+      (loop [idx 0
+             start 0
+             brace-depth 0
+             in-string? false
+             escape? false
+             objs []]
+        (if (>= idx n)
+          (let [tail (str/trim (subs text start n))]
+            (if (and (zero? brace-depth) (seq tail))
+              (conj objs tail)
+              objs))
+          (let [ch (nth chars idx)]
+            (cond
+              escape?
+              (recur (inc idx) start brace-depth in-string? false objs)
+
+              (and in-string? (= ch \\))
+              (recur (inc idx) start brace-depth in-string? true objs)
+
+              (= ch \")
+              (recur (inc idx) start brace-depth (not in-string?) false objs)
+
+              in-string?
+              (recur (inc idx) start brace-depth in-string? false objs)
+
+              (= ch \{)
+              (recur (inc idx)
+                     (if (zero? brace-depth)
+                       (let [skipped-ws (subs text start idx)]
+                         (if (str/blank? skipped-ws) idx start))
+                       start)
+                     (inc brace-depth)
+                     false false objs)
+
+              (= ch \})
+              (let [new-depth (dec brace-depth)]
+                (if (zero? new-depth)
+                  (let [cand (str/trim (subs text start (inc idx)))]
+                    (recur (inc idx) (inc idx) 0 false false (if (seq cand) (conj objs cand) objs)))
+                  (recur (inc idx) start new-depth false false objs)))
+
+              :else
+              (recur (inc idx) start brace-depth in-string? false objs))))))))
 
 (defn- whitespace-char?
   [ch]
@@ -511,10 +563,12 @@
             ms (extract-long-flag clean-tokens "--min-seq" nil)
             block? (or (has-flag? clean-tokens "--block")
                        (has-flag? clean-tokens "--until-event"))
+            peek? (has-flag? clean-tokens "--peek")
             m {"cmd" "wait" "timeout_ms" (or t 30000)}]
         (cond-> m
           ms (assoc "min_seq" ms)
-          block? (assoc "block" true)))
+          block? (assoc "block" true)
+          peek? (assoc "peek" true)))
 
       "retransmit-outbox"
       (let [sid (or (extract-flag-value clean-tokens "--session-id" nil)

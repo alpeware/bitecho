@@ -1112,6 +1112,23 @@ Bitecho networks are separated by canonical root network URIs (`devnet.bitecho.o
 - Light nodes and validators resolve `:network-uri` from `--subnet-id`, bootstrap descriptors (`:network-uri` / `:network`), or config presets (`devnet-config`, `testnet-config`, `mainnet-config`).
 - Signed transfers and escrow IDs bind `:network-uri` to prevent cross-network replay attacks; any foreign `:network-uri` transfer or intent is rejected fail-closed with a counted `:network-replay-rejected` diagnostic.
 
+---
+
+## 15. Single-Responder Contract & Hook Newline Discipline
+
+### Single-Responder Contract
+When two peers establish direct P2P connections or exchange WebRTC signaling:
+- Only the responder (callee or peer with deterministic lower pubkey) initiates the active transport upgrade.
+- Outdated or concurrent cross-offers are ignored safely with counted `:p2p-offer-answered-while-open` diagnostics.
+- When NAT reflection or loopback causes filtered candidate addresses to match local candidates, light nodes automatically fall back to raw remote candidates and record `:p2p-answer-candidate-self-filter-fallback`.
+- Static signaling metadata (`:p2p-meta`) is persistently saved across restarts while derived runtime liveness (`:p2p`) is stripped per Single-Authority Lifecycle state rules (`AGENTS.md` Rule 4).
+
+### Hook Newline Discipline
+When piping JSONL commands to light nodes via stdin, subagent scripts, or `--cmd-file`:
+- Commands must be delimited by standard `\n` newlines.
+- If multiple un-delimited JSON commands are concatenated (e.g. `}{`), `cli/split-jsonl-commands` cleanly extracts and sequences them without drops or parse errors.
+- Control interface (`/ctl`) serializes concurrent requests to ensure safe state transitions across multiple concurrent threads and processes.
+
 
 
 

@@ -174,45 +174,57 @@
 
 (defn verify-poll-request
   "Verifies a canonical poll Proof-of-Possession (PoP) request map against relay state."
-  [state {:keys [pubkey since-seq timestamp-ms nonce signature now-ms]}]
-  (let [now (long (or now-ms 0))
-        ts (long (or timestamp-ms 0))
-        max-skew (long (get state :max-skew-ms 300000))
-        max-n (long (get state :max-nonces 2048))
-        norm-pk (when pubkey (normalize-pubkey-hex pubkey))
-        nonce-str (str (or nonce ""))
-        cutoff (- now max-skew)
-        used-nonces (let [un (get state :used-poll-nonces {})]
-                      (if (map? un) un (into {} (map (fn [p] [p now])) un)))
-        active-nonces (if (pos? now)
-                        (into {} (filter (fn [[_k t]] (>= (long t) cutoff))) used-nonces)
-                        used-nonces)]
-    (cond
-      (or (nil? norm-pk) (not (re-matches #"(?:302a300506032b6570032100)?[0-9a-f]{64}" norm-pk)))
-      {:ok? false :error :poll-auth-failed :reason :invalid-pubkey}
+  ([req]
+   (verify-poll-request {} req nil))
+  ([state-or-req req-or-now]
+   (if (number? req-or-now)
+     (verify-poll-request {} state-or-req req-or-now)
+     (verify-poll-request state-or-req req-or-now nil)))
+  ([state req now-override]
+   (let [pubkey (or (:pubkey req) (get req "pubkey"))
+         since-seq (or (:since-seq req) (:since_seq req) (get req "since-seq") (get req "since_seq"))
+         timestamp-ms (or (:timestamp-ms req) (:timestamp_ms req) (get req "timestamp-ms") (get req "timestamp_ms"))
+         nonce (or (:nonce req) (get req "nonce"))
+         signature (or (:signature req) (get req "signature"))
+         now-ms (or now-override (:now-ms req) (:now_ms req) (get req "now-ms") (get req "now_ms"))
+         now (long (or now-ms 0))
+         ts (long (or timestamp-ms 0))
+         max-skew (long (get state :max-skew-ms 300000))
+         max-n (long (get state :max-nonces 2048))
+         norm-pk (when pubkey (normalize-pubkey-hex pubkey))
+         nonce-str (str (or nonce ""))
+         cutoff (- now max-skew)
+         used-nonces (let [un (get state :used-poll-nonces {})]
+                       (if (map? un) un (into {} (map (fn [p] [p now])) un)))
+         active-nonces (if (pos? now)
+                         (into {} (filter (fn [[_k t]] (>= (long t) cutoff))) used-nonces)
+                         used-nonces)]
+     (cond
+       (or (nil? norm-pk) (not (re-matches #"(?:302a300506032b6570032100)?[0-9a-f]{64}" norm-pk)))
+       {:ok? false :error :poll-auth-failed :reason :invalid-pubkey}
 
-      (or (str/blank? nonce-str) (str/blank? (str signature)))
-      {:ok? false :error :poll-auth-failed :reason :missing-auth-fields}
+       (or (str/blank? nonce-str) (str/blank? (str signature)))
+       {:ok? false :error :poll-auth-failed :reason :missing-auth-fields}
 
-      (or (<= ts 0)
-          (and (pos? now) (> (Math/abs (- now ts)) max-skew)))
-      {:ok? false :error :poll-skew-exceeded :skew-ms (if (pos? ts) (Math/abs (- now ts)) now) :max-skew-ms max-skew}
+       (or (<= ts 0)
+           (and (pos? now) (> (Math/abs (- now ts)) max-skew)))
+       {:ok? false :error :poll-skew-exceeded :skew-ms (if (pos? ts) (Math/abs (- now ts)) now) :max-skew-ms max-skew}
 
-      (contains? active-nonces [norm-pk nonce-str])
-      {:ok? false :error :poll-replay-rejected :pubkey norm-pk :nonce nonce-str}
+       (contains? active-nonces [norm-pk nonce-str])
+       {:ok? false :error :poll-replay-rejected :pubkey norm-pk :nonce nonce-str}
 
-      (>= (count active-nonces) max-n)
-      {:ok? false :error :poll-rate-limited :pubkey norm-pk}
+       (>= (count active-nonces) max-n)
+       {:ok? false :error :poll-rate-limited :pubkey norm-pk}
 
-      :else
-      (let [signing-str (poll-signing-str norm-pk (or since-seq 0) ts nonce-str)
-            sig-bytes (try (basalt/hex->bytes signature) (catch #?(:clj Exception :cljs :default) _ nil))
-            valid? (and (some? sig-bytes)
-                        (try (crypto/verify norm-pk (fressian/utf8->bytes signing-str) sig-bytes)
-                             (catch #?(:clj Exception :cljs :default) _ false)))]
-        (if valid?
-          {:ok? true :pubkey norm-pk :nonce nonce-str :now-ms (if (pos? now) now ts)}
-          {:ok? false :error :poll-auth-failed :reason :invalid-signature})))))
+       :else
+       (let [signing-str (poll-signing-str norm-pk (or since-seq 0) ts nonce-str)
+             sig-bytes (try (basalt/hex->bytes signature) (catch #?(:clj Exception :cljs :default) _ nil))
+             valid? (and (some? sig-bytes)
+                         (try (crypto/verify norm-pk (fressian/utf8->bytes signing-str) sig-bytes)
+                              (catch #?(:clj Exception :cljs :default) _ false)))]
+         (if valid?
+           {:ok? true :pubkey norm-pk :nonce nonce-str :now-ms (if (pos? now) now ts)}
+           {:ok? false :error :poll-auth-failed :reason :invalid-signature}))))))
 
 ;; =============================================================================
 ;; 3. State Machine Helpers (Pure & Bounded)
@@ -374,8 +386,8 @@
   [state event]
   (let [now-ms (long (or (:now-ms event) 0))]
     (case (:type event)
-      :relay-submit
-      (let [raw-env (:envelope event)
+      (:relay-submit :submit)
+      (let [raw-env (or (:envelope event) (:wire-bytes event))
             max-payload (long (get state :max-payload-bytes 65536))
             max-total (long (get state :max-total-queued-bytes 16777216))
             wire-bytes (cond
@@ -471,46 +483,71 @@
                         inner-msg (when (bytes? raw-inner-payload)
                                     (try (fressian/decode-wire raw-inner-payload)
                                          (catch #?(:clj Exception :cljs :default) _ nil)))
-                        sender (or (when-let [s (:sender decoded)] (normalize-pubkey-hex s))
-                                   (when-let [s (get-in decoded [:message :sender])] (normalize-pubkey-hex s))
-                                   (when-let [s (:agent-pubkey decoded)] (normalize-pubkey-hex s))
-                                   (when-let [s (:from decoded)] (normalize-pubkey-hex s))
-                                   (when-let [s (:caller inner-msg)] (normalize-pubkey-hex s))
-                                   (when-let [s (:sender inner-msg)] (normalize-pubkey-hex s))
-                                   (when snap?
-                                     (when-let [s (or (:validator-pubkey decoded)
-                                                      (get decoded "validator-pubkey")
-                                                      (get decoded "validator_pubkey")
-                                                      (:validator decoded)
-                                                      (get decoded "validator"))]
-                                       (normalize-pubkey-hex s))))
-                        recipient (or (when-let [r (:recipient decoded)] (normalize-pubkey-hex r))
-                                      (when-let [r (get-in decoded [:event :recipient])] (normalize-pubkey-hex r))
-                                      (when-let [r (get-in decoded [:event :to])] (normalize-pubkey-hex r))
-                                      (when-let [r (get-in decoded [:event :callee])] (normalize-pubkey-hex r))
-                                      (when-let [r (get-in decoded [:payload :recipient])] (normalize-pubkey-hex r))
-                                      (when-let [r (get-in decoded [:payload :to])] (normalize-pubkey-hex r))
-                                      (when-let [r (:recipient inner-msg)] (normalize-pubkey-hex r))
-                                      (when-let [r (:to inner-msg)] (normalize-pubkey-hex r))
-                                      (when-let [r (:callee inner-msg)] (normalize-pubkey-hex r))
-                                      (when snap?
-                                        (when-let [r (or (:pubkey decoded) (get decoded "pubkey"))]
-                                          (normalize-pubkey-hex r))))
+                        inner-type (keyword (or (:bitecho/type inner-msg)
+                                                (:type inner-msg)
+                                                (get-in decoded [:event :type])
+                                                (:type decoded)))
+                        callee-response? (or (contains? #{:rendezvous-ack-voucher :channel-accept} inner-type)
+                                             (contains? #{"rendezvous-ack-voucher" "channel-accept"} (str inner-type)))
+                        sender (cond
+                                 callee-response?
+                                 (or (when-let [s (:callee inner-msg)] (normalize-pubkey-hex s))
+                                     (when-let [s (:sender inner-msg)] (normalize-pubkey-hex s))
+                                     (when-let [s (:sender decoded)] (normalize-pubkey-hex s)))
+                                 :else
+                                 (or (when-let [s (:sender decoded)] (normalize-pubkey-hex s))
+                                     (when-let [s (get-in decoded [:message :sender])] (normalize-pubkey-hex s))
+                                     (when-let [s (:agent-pubkey decoded)] (normalize-pubkey-hex s))
+                                     (when-let [s (:from decoded)] (normalize-pubkey-hex s))
+                                     (when-let [s (:caller inner-msg)] (normalize-pubkey-hex s))
+                                     (when-let [s (:sender inner-msg)] (normalize-pubkey-hex s))
+                                     (when snap?
+                                       (when-let [s (or (:validator-pubkey decoded)
+                                                        (get decoded "validator-pubkey")
+                                                        (get decoded "validator_pubkey")
+                                                        (:validator decoded)
+                                                        (get decoded "validator"))]
+                                         (normalize-pubkey-hex s)))))
+                        recipient (cond
+                                    callee-response?
+                                    (or (when-let [r (:caller inner-msg)] (normalize-pubkey-hex r))
+                                        (when-let [r (:recipient inner-msg)] (normalize-pubkey-hex r))
+                                        (when-let [r (:recipient decoded)] (normalize-pubkey-hex r)))
+                                    :else
+                                    (or (when-let [r (:recipient decoded)] (normalize-pubkey-hex r))
+                                        (when-let [r (get-in decoded [:event :recipient])] (normalize-pubkey-hex r))
+                                        (when-let [r (get-in decoded [:event :to])] (normalize-pubkey-hex r))
+                                        (when-let [r (get-in decoded [:event :callee])] (normalize-pubkey-hex r))
+                                        (when-let [r (get-in decoded [:payload :recipient])] (normalize-pubkey-hex r))
+                                        (when-let [r (get-in decoded [:payload :to])] (normalize-pubkey-hex r))
+                                        (when-let [r (:recipient inner-msg)] (normalize-pubkey-hex r))
+                                        (when-let [r (:to inner-msg)] (normalize-pubkey-hex r))
+                                        (when-let [r (:callee inner-msg)] (normalize-pubkey-hex r))
+                                        (when snap?
+                                          (when-let [r (or (:pubkey decoded) (get decoded "pubkey"))]
+                                            (normalize-pubkey-hex r)))))
                         raw-recip (or (:recipient decoded)
                                       (get-in decoded [:event :recipient])
                                       (get-in decoded [:payload :recipient])
+                                      (when callee-response? (:caller inner-msg))
                                       (:recipient inner-msg)
+                                      (:callee inner-msg)
                                       (when snap? (or (:pubkey decoded) (get decoded "pubkey"))))
                         validator-only? (and (not snap?)
                                              (or (contains? #{:on-deliver :transfer :settle-escrow :burn :mint :burn-for-credit} ev-type)
                                                  (and (map? (:event decoded))
                                                       (contains? #{:on-deliver :transfer :settle-escrow :burn} (:type (:event decoded))))))
+                        unicast-inner? (contains? #{:sealed-message :session-ack :rendezvous-offer-header :rendezvous-ack-voucher :rendezvous-reveal :channel-offer :channel-accept :channel-close :p2p-offer :p2p-answer} inner-type)
                         broadcast? (or (= raw-recip "*")
-                                       (nil? recipient)
-                                       (= :broadcast (:type decoded))
-                                       (= :p2p-broadcast (:type decoded))
-                                       (= :broadcast (get-in decoded [:event :type]))
-                                       (= :receive-gossip (get-in decoded [:event :type])))
+                                       (and (not unicast-inner?) (nil? recipient))
+                                       (and (nil? recipient)
+                                            (or (= :broadcast (:type decoded))
+                                                (= :p2p-broadcast (:type decoded))
+                                                (= :broadcast (get-in decoded [:event :type]))
+                                                (= :receive-gossip (get-in decoded [:event :type]))))
+                                       (and (= :receive-gossip (get-in decoded [:event :type]))
+                                            (not unicast-inner?)
+                                            (nil? recipient)))
                         from-val? (or (boolean (:from-validator? event)) snap?)]
                     (cond
                       (and snap? (seq (:known-validators state))
@@ -636,6 +673,7 @@
                                             new-inbox)
                             new-st (-> (record-envelope-and-gossip-ids capped-st envelope-id gossip-id now-ms)
                                        (assoc-in [:inboxes] (assoc pruned-inboxes recipient trimmed-inbox))
+                                       (assoc-in [:mailboxes] (assoc pruned-inboxes recipient trimmed-inbox))
                                        (assoc-in [:inbox-seqs recipient] next-seq)
                                        (update-in [:diagnostics :submitted] (fnil inc 0))
                                        (update-in [:diagnostics :delivered] (fnil inc 0))

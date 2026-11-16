@@ -34,7 +34,7 @@ clojure -M:lint
 clojure -M:test --skip-integration
 
 # 3. Multi-network release proof generator (devnet/testnet/mainnet + 6-pair replay matrix + N/N+1 rolling interop)
-clojure -M:simulate -m bitecho.stress.release-proof docs/releases/v0.23.0-proof.edn
+clojure -M:simulate -m bitecho.stress.release-proof docs/releases/v0.23.1-proof.edn
 
 # 4. Pre-deploy E2E wire negotiation & 3-epoch Streamlet finalization gate
 ./scripts/cluster.sh verify-e2e
@@ -56,7 +56,7 @@ npx shadow-cljs release light-cli browser
 2. Record the artifact SHA-256 and commit the generated release proof (`docs/releases/<version>-proof.edn`) alongside any `BIP` governance proposal (`:deterministic-bundle-sha256`).
 3. Tag the release commit with an annotated Git tag:
    ```bash
-   git tag -a v0.23.0 -m "Release v0.23.0: Network URI separation, replay protection, and canary rolling deploy"
+   git tag -a v0.23.1 -m "Release v0.23.1: Milestone D24 remediation, P2P candidate fallback, STUN ufrag/SNI routing, and relay auth"
    ```
 
 ---

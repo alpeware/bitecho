@@ -1188,6 +1188,36 @@
                             (recur ext-data-end)))))))))))))
     (catch #?(:clj Exception :cljs :default) _ nil)))
 
+(defn extract-stun-target-ufrag
+  "Purely extracts lowercase STUN target remote-ufrag from an RFC 4571 STUN Binding Request, or `nil`."
+  [buf ^long len]
+  (try
+    (when (and (bytes? buf) (>= len 22)
+               (= (u8 buf 2) 0x00)
+               (= (u8 buf 3) 0x01)
+               (= (u8 buf 6) 0x21)
+               (= (u8 buf 7) 0x12)
+               (= (u8 buf 8) 0xa4)
+               (= (u8 buf 9) 0x42))
+      (let [stun-msg-len (u16 buf 4)
+            stun-end (min len (+ 22 stun-msg-len))]
+        (loop [curr 22]
+          (when (<= (+ curr 4) stun-end)
+            (let [attr-type (u16 buf curr)
+                  attr-len (u16 buf (+ curr 2))
+                  attr-val-start (+ curr 4)
+                  attr-val-end (+ attr-val-start attr-len)
+                  padded-next (+ attr-val-start (bit-and (+ attr-len 3) (bit-not 3)))]
+              (if (= attr-type 0x0006)
+                (when (<= attr-val-end stun-end)
+                  (let [uname (fressian/bytes->utf8 (slice-bytes buf attr-val-start attr-len))]
+                    (when-let [target-ufrag (first (str/split uname #":" 2))]
+                      (when-not (str/blank? target-ufrag)
+                        (str/lower-case (str/trim target-ufrag))))))
+                (when (and (> padded-next curr) (<= padded-next stun-end))
+                  (recur padded-next))))))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
 (defn parse-http-connect-request
   "Purely detects and parses an initial `CONNECT <host>:<port> HTTP/1.x` request in `buf` (`<= len` bytes).
    Returns `{:host <lowercase-host> :port <int>}` or `nil`."

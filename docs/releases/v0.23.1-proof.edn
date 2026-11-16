@@ -1,0 +1,61 @@
+{:milestone "D24",
+ :version "v0.23.1",
+ :all-passed? true,
+ :networks
+ {"devnet.bitecho.org"
+  {:network :devnet,
+   :network-uri "devnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 50,
+   :governance-passed? true,
+   :passed? true},
+  "testnet.bitecho.org"
+  {:network :testnet,
+   :network-uri "testnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true},
+  "mainnet.bitecho.org"
+  {:network :mainnet,
+   :network-uri "mainnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true}},
+ :cross-network-replay
+ {:pairs
+  [{:source "devnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}
+   {:source "devnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}],
+  :mainnet-unscoped-rejected? true,
+  :devnet-unscoped-accepted? true,
+  :all-rejected? true},
+ :rolling-upgrade
+ {:node-n-subnet "global",
+  :node-n-plus-1-subnet "devnet.bitecho.org",
+  :n-accepted-n1-event? true,
+  :n1-accepted-n-event? true,
+  :foreign-subnet-dropped? true,
+  :passed? true}}
