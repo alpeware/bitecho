@@ -1589,33 +1589,45 @@
             ingress-target
             {:host h :port p})))))
 
+(defn- normalize-node-entries
+  [m]
+  (cond
+    (map? m) (for [[k v] m :when (map? v)]
+               (assoc v :node-id (or (:node-id v) (:id v) (:node/id v) k)))
+    (sequential? m) m
+    :else nil))
+
 (defn- build-ingress-routes
   "Builds ufrag-routes and sni-routes from cluster config and bootstrap nodes."
   [config val-bootstrap]
-  (let [node-entries (concat (when (map? (get-in config [:validator :cluster :nodes]))
-                               (vals (get-in config [:validator :cluster :nodes])))
+  (let [node-entries (concat (normalize-node-entries (get-in config [:validator :cluster :nodes]))
                              (when (map? val-bootstrap)
-                               (if (map? (:nodes val-bootstrap))
-                                 (vals (:nodes val-bootstrap))
-                                 (:nodes val-bootstrap)))
-                             (when (map? (get-in config [:cluster :nodes]))
-                               (vals (get-in config [:cluster :nodes]))))
-        my-node-id (or (get-in config [:validator :node-id])
-                       (get-in config [:node :node-id])
-                       (get config :node-id))
+                               (normalize-node-entries (:nodes val-bootstrap)))
+                             (normalize-node-entries (get-in config [:cluster :nodes])))
+        raw-my-id (or (:node/id config)
+                      (:node-id config)
+                      (get-in config [:validator :node/id])
+                      (get-in config [:validator :node-id])
+                      (get-in config [:node :node-id]))
+        my-node-id (when raw-my-id (keyword (name raw-my-id)))
+        local-ingress (get-in config [:http :ingress-target] {:host "127.0.0.1" :port 5010})
         connect-routes (get-in config [:http :connect-routes] {})]
     (reduce
      (fn [acc node]
-       (let [node-id (or (:node-id node) (:id node))
-             ip (:ip node)
+       (let [raw-nid (or (:node-id node) (:id node) (:node/id node))
+             node-id (when raw-nid (keyword (name raw-nid)))
+             self? (and (some? my-node-id) (= node-id my-node-id))
+             ip (or (:ip node) (:ip4 node))
              port (int (or (:agent-tcp-port node) (:agent-port node) (:port node) 5010))
              ice-ufrag (when-let [u (or (:ice-ufrag node) (get-in node [:ice-creds :ufrag]))]
                          (str/lower-case (str u)))
              ingress-host (when-let [h (:ingress-host node)]
                             (str/lower-case (str h)))]
-         (if (or (= node-id my-node-id) (nil? ip))
+         (if (and (not self?) (nil? ip))
            acc
-           (let [target {:host ip :port port}]
+           (let [target (if self?
+                          local-ingress
+                          {:host ip :port port})]
              (-> acc
                  (cond->
                   ice-ufrag (assoc-in [:ufrag-routes ice-ufrag] target)
