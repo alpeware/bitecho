@@ -1263,7 +1263,7 @@
                   "--connected" "--error"
                   "--auto-sync" "--no-auto-sync" "--sync-interval-ms"
                   "--auto-register-home-set" "--no-auto-register-home-set"
-                  "--cmd-file" "--events-out" "--min-seq" "--after-ts"
+                  "--cmd-file" "--events-out" "--min-seq" "--min-broadcast-seq" "--min-balance" "--after-ts"
                   "--turn-server" "--turn-username" "--turn-password" "--turn-realm" "--turn-force-relay"
                   "--relay-url" "--daemon" "--control-port" "--max-epoch-skew"
                   "--block" "--until-event" "--help" "--no-poll" "--peek" "--subscribe-subnets"

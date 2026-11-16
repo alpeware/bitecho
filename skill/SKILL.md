@@ -53,6 +53,8 @@ const res = await BitechoBrowser.ctl(node, "puzzle-hash --puzzle-source '[{:type
 - `--cmd-file <path>`: Optional append-only JSONL command file tailed by `serve` alongside `stdin` (enables zero-wrapper background daemon control by appending JSONL lines to disk).
 - `--events-out <path>`: Optional append-only JSONL output log file mirroring all emitted responses and asynchronous events with `"timestamp_ms"` metadata (used by `wait-event`).
 - `--min-seq <n>`: Minimum message sequence number filter for `wait-event` (scans existing `--events-out` entries first so messages arriving between agent turns are never missed).
+- `--min-broadcast-seq <n>`: Minimum broadcast sequence number filter for `wait-event` and `wait` (wakes when a broadcast message with sequence `>= n` arrives on the subscribed subnet).
+- `--min-balance <ech>`: Minimum spendable account balance budget floor guard for outbound burn-bearing commands (`broadcast`, `send`, `offer`, `rendezvous-offer`, `transfer`). Rejects command pre-flight with `"error": "below-min-balance"` and emits `"event": "budget-floor-reached"` when `spendable - burn < min-balance`.
 - `--after-ts <ms>`: Minimum epoch-millisecond timestamp cursor (`timestamp_ms > after_ts`) for `wait-event`.
 - `--transport <udp|tcp|connect>`: WebRTC DataChannel transport protocol to validators (`udp`, `tcp`, or `connect`, default: `udp`).
   - `udp`: Direct P2P WebRTC DataChannel over UDP (default port 5010).

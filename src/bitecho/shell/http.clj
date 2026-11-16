@@ -14,6 +14,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.protocol.acme :as acme-proto]
             [bitecho.core.protocol.dns :as dns-proto]
+            [bitecho.core.protocol.faucet :as faucet]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.core.subnet :as subnet]
             [bitecho.fressian :as fressian]
@@ -594,18 +595,30 @@
 (defn- resolve-web-blob!
   [config rt req-path now-ms]
   (if-let [subpath (sanitize-web-subpath req-path)]
-    (let [ptr-res (if (str/blank? subpath)
+    (let [ptr-res (cond
+                    (str/blank? subpath)
                     (let [r1 (infra/resolve-path-blob! rt "web/index.html" now-ms)]
                       (if (:ok? r1)
                         r1
                         (infra/resolve-path-blob! rt "web/index.md" now-ms)))
+
+                    (= subpath "blog")
+                    (let [r1 (infra/resolve-path-blob! rt "web/blog/index.html" now-ms)]
+                      (if (:ok? r1)
+                        r1
+                        (infra/resolve-path-blob! rt "web/blog/index.md" now-ms)))
+
+                    :else
                     (let [r-direct (infra/resolve-path-blob! rt (str "web/" subpath) now-ms)]
                       (if (:ok? r-direct)
                         r-direct
-                        (let [r-idx (infra/resolve-path-blob! rt (str "web/" subpath "/index.html") now-ms)]
-                          (if (:ok? r-idx)
-                            r-idx
-                            (infra/resolve-path-blob! rt (str "web/" subpath "/index.md") now-ms))))))]
+                        (let [r-html (infra/resolve-path-blob! rt (str "web/" subpath ".html") now-ms)]
+                          (if (:ok? r-html)
+                            r-html
+                            (let [r-idx (infra/resolve-path-blob! rt (str "web/" subpath "/index.html") now-ms)]
+                              (if (:ok? r-idx)
+                                r-idx
+                                (infra/resolve-path-blob! rt (str "web/" subpath "/index.md") now-ms))))))))]
       (if (:ok? ptr-res)
         ptr-res
         (if-let [content-root (get-in config [:http :content-root])]
@@ -1364,6 +1377,149 @@
                          :response/headers {"Content-Type" "application/json; charset=utf-8"}
                          :response/body (json/write-str {"ok" false "error" "not-found" "path" path})}))))))
 
+(defn handle-faucet-endpoint
+  "Dispatches HTTP /faucet/v1/* endpoints:
+   - POST/GET /faucet/v1/challenge
+   - POST /faucet/v1/claim"
+  [^HttpExchange exchange req faucet-atom config _target-rt limiter-atom]
+  (let [path (get-in req [:request/uri :path])
+        method (:request/method req)
+        clean-path (str/replace path #"/+$" "")
+        remote-ip (:request/remote-ip req "127.0.0.1")
+        subnet-key (dns-proto/ip->subnet-key remote-ip)
+        now-ms (System/currentTimeMillis)]
+    (if (and limiter-atom
+             (let [res-box (atom nil)
+                   _ (swap! limiter-atom
+                            (fn [st]
+                              (let [r (dns-proto/check-and-consume st subnet-key 1.0 now-ms)]
+                                (reset! res-box r)
+                                (:state r))))
+                   rl-res @res-box]
+               (and rl-res (not (:allowed? rl-res)))))
+      (send-response exchange
+                     {:response/status 429
+                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                      :response/body (json/write-str {"ok" false "error" "rate-limited"})})
+      (cond
+        (= clean-path "/faucet/v1/challenge")
+        (let [query-params (parse-query-params (get-in req [:request/uri :query]))
+              body-json (when (= method :POST)
+                          (with-open [is (.getRequestBody exchange)]
+                            (let [[body-bytes _] (read-body-bounded is 16384)]
+                              (when (and body-bytes (pos? (alength ^bytes body-bytes)))
+                                (try (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))
+                                     (catch Exception _ nil))))))
+              net-uri (or (get body-json "network_uri")
+                          (get query-params "network_uri")
+                          (:network-uri config)
+                          "devnet.bitecho.org")
+              res-box (atom nil)
+              _ (swap! faucet-atom
+                       (fn [st]
+                         (let [res (faucet/issue-faucet-challenge st {:network-uri net-uri} now-ms)]
+                           (reset! res-box res)
+                           (:state res))))
+              ch (:challenge @res-box)]
+          (send-response exchange
+                         {:response/status 200
+                          :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" true "challenge" ch})}))
+
+        (= clean-path "/faucet/v1/claim")
+        (if-not (= method :POST)
+          (send-response exchange
+                         {:response/status 405
+                          :response/headers {"Allow" "POST" "Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
+          (let [[body-bytes body-exceeded?] (with-open [is (.getRequestBody exchange)]
+                                              (read-body-bounded is 65536))]
+            (if body-exceeded?
+              (send-response exchange
+                             {:response/status 413
+                              :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                              :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
+              (let [body-json (try
+                                (when (and body-bytes (pos? (alength ^bytes body-bytes)))
+                                  (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8)))
+                                (catch Exception _ nil))
+                    nonce (get body-json "nonce")
+                    cred-hash (or (get body-json "credential_id_hash") (get body-json "credential_hash"))
+                    claimant-pk (or (get body-json "claimant_pubkey") (get body-json "pubkey"))
+                    claim-net (or (get body-json "network_uri") (:network-uri config) "devnet.bitecho.org")
+                    auth-ver (get body-json "authenticator_verified?" (get body-json "authenticator_verified" true))
+                    claim-req {:nonce nonce
+                               :credential-id-hash cred-hash
+                               :claimant-pubkey claimant-pk
+                               :network-uri claim-net
+                               :authenticator-verified? auth-ver}
+                    res-box (atom nil)
+                    _ (swap! faucet-atom
+                             (fn [st]
+                               (let [res (faucet/reduce-faucet-claim st claim-req now-ms)]
+                                 (reset! res-box res)
+                                 (:state res))))
+                    claim-res @res-box]
+                (if-not (:ok? claim-res)
+                  (send-response exchange
+                                 {:response/status 400
+                                  :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                  :response/body (json/write-str {"ok" false
+                                                                  "error" (name (or (:error claim-res) :faucet-claim-rejected))
+                                                                  "reason" (:reason claim-res)})})
+                  (send-response exchange
+                                 {:response/status 200
+                                  :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                  :response/body (json/write-str {"ok" true
+                                                                  "transfer_intent" (:transfer-intent claim-res)
+                                                                  "receipt_path" (:receipt-path claim-res)})}))))))
+
+        :else
+        (send-response exchange
+                       {:response/status 404
+                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                        :response/body (json/write-str {"ok" false "error" "not-found" "path" path})})))))
+
+(defn handle-directory-endpoint
+  "Dispatches HTTP /directory/v1/* endpoints:
+   - GET/HEAD /directory/v1/<network-uri>/<nickname>
+   - GET/HEAD /directory/v1/<nickname>"
+  [^HttpExchange exchange req config target-rt]
+  (let [path (get-in req [:request/uri :path])
+        method (:request/method req)
+        clean-path (str/replace path #"/+$" "")
+        now-ms (System/currentTimeMillis)]
+    (if-not (or (= method :GET) (= method :HEAD))
+      (send-response exchange
+                     {:response/status 405
+                      :response/headers {"Allow" "GET, HEAD" "Content-Type" "application/json; charset=utf-8"}
+                      :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
+      (let [subpath (subs clean-path (count "/directory/v1/"))
+            segs (remove str/blank? (str/split subpath #"/"))
+            [net-uri nick] (if (>= (count segs) 2)
+                             [(first segs) (second segs)]
+                             [(or (:network-uri config) "bitecho.org") (first segs)])
+            resolved (when (and target-rt nick)
+                       (let [r1 (infra/resolve-path-blob! target-rt (str "dir/" net-uri "/" nick) now-ms)]
+                         (if (:ok? r1)
+                           r1
+                           (infra/resolve-path-blob! target-rt (str "dir/" nick) now-ms))))]
+        (if (and resolved (:ok? resolved))
+          (let [blob (:blob resolved)
+                bs (or (:blob/bytes blob)
+                       (when-let [^File f (:file resolved)]
+                         (when (.exists f) (Files/readAllBytes (.toPath f))))
+                       (byte-array 0))]
+            (send-response exchange
+                           {:response/status 200
+                            :response/headers {"Content-Type" "application/json; charset=utf-8"
+                                               "Cache-Control" "public, max-age=60"}
+                            :response/body (if (= method :HEAD) nil bs)}))
+          (send-response exchange
+                         {:response/status 404
+                          :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "nickname-not-found" "nickname" nick "network_uri" net-uri})}))))))
+
 (defn- make-port-80-handler
   ([subnet-runtime https-port limiter-atom]
    (make-port-80-handler {} subnet-runtime https-port limiter-atom (atom (relay/init-relay-state)) (atom {})))
@@ -1377,6 +1533,13 @@
          (cond
            (str/starts-with? path "/relay/v1/")
            (handle-relay-endpoint exchange req relay-atom relay-waiters-atom config subnet-runtime limiter-atom)
+
+           (str/starts-with? path "/faucet/v1/")
+           (let [f-atom (or (:faucet-atom config) (atom (faucet/init-faucet-state (or (:faucet config) {}))))]
+             (handle-faucet-endpoint exchange req f-atom config subnet-runtime limiter-atom))
+
+           (str/starts-with? path "/directory/v1/")
+           (handle-directory-endpoint exchange req config subnet-runtime)
 
            (and (or (= method :GET) (= method :HEAD))
                 (str/starts-with? path "/.well-known/acme-challenge/"))
@@ -1446,6 +1609,13 @@
            (cond
              (str/starts-with? path "/relay/v1/")
              (handle-relay-endpoint exchange req relay-atom relay-waiters-atom config target-rt limiter-atom)
+
+             (str/starts-with? path "/faucet/v1/")
+             (let [f-atom (or (:faucet-atom config) (atom (faucet/init-faucet-state (or (:faucet config) {}))))]
+               (handle-faucet-endpoint exchange req f-atom config target-rt limiter-atom))
+
+             (str/starts-with? path "/directory/v1/")
+             (handle-directory-endpoint exchange req config target-rt)
 
              (and (or (= method :GET) (= method :HEAD)) (= path "/healthz"))
              (send-response exchange
@@ -1816,7 +1986,8 @@
                                                      (light-node/send-all-envelopes! (:send-fn reconn) [payload-to-send]))))))
                                            (catch Exception _ nil))))))
         relay-chain-state-cache (or (:relay-chain-state-cache config) (atom {}))
-        effective-config (cond-> (assoc config :relay-chain-state-cache relay-chain-state-cache)
+        faucet-atom (or (:faucet-atom config) (atom (faucet/init-faucet-state (or (:faucet config) {}))))
+        effective-config (cond-> (assoc config :relay-chain-state-cache relay-chain-state-cache :faucet-atom faucet-atom)
                            default-forwarder (assoc :on-relay-forward default-forwarder))
         bridge-enabled? (and (get-in config [:http :relay-validator-bridge?] true)
                              (:peer-identity subnet-runtime)
@@ -1890,6 +2061,7 @@
          :limiter-atom limiter-atom
          :relay-atom relay-atom
          :relay-waiters-atom relay-waiters-atom
+         :faucet-atom faucet-atom
          :stop-fn (fn []
                     (infra/apply-shell-event! shell-atom {:type :stop} close-resources!))})
       (catch Exception e

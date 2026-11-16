@@ -1,0 +1,32 @@
+{:bip-id "BIP-000"
+ :title "Bitecho Constitutional Charter & Sociocratic Governance Architecture"
+ :author-pubkey "302a300506032b65700321001111111111111111111111111111111111111111111111111111111111111111"
+ :subnet-id "bitecho.org/dev"
+ :status :ratified
+ :human-anchor-sunset "2027-06-30"
+ :jurisdiction-map {:foundation-legal-seat "Zug, Switzerland"
+                    :regulatory-classification "Decentralized Utility & Zero-Burn Cryptographic Protocol"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"
+                    :arbitration "Decentralized Oracle Dispute Mechanism"}
+ :invariant-diff {:defspec-vars ["prop-bip-charter-constitutional-invariants"
+                                 "prop-offer-hash-network-binding-and-rolling-upgrade"
+                                 "prop-min-balance-budget-floor-invariant"]
+                  :seed 42
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 42
+                                            :executed-at 1731776400000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 42
+                                             :executed-at 1731776400000}
+                   :deterministic-bundle-sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :executed-at 1731776400000}}
+ :decision-records [{:decision-id "D-1" :title "Network-Qualified Directory Service" :status "CONSENT"}
+                    {:decision-id "D-2" :title "Pre-Transition Budget Floor Guard" :status "CONSENT"}
+                    {:decision-id "D-3" :title "Offer-Hash Network URI Domain Separation" :status "CONSENT"}
+                    {:decision-id "D-4" :title "Strict BIP Admission Gates" :status "CONSENT"}
+                    {:decision-id "D-5" :title "Treasury Hardware Key Attestation Faucet" :status "CONSENT"}
+                    {:decision-id "D-6" :title "Fractal Infrastructure Blog & Content Storage" :status "CONSENT"}]}

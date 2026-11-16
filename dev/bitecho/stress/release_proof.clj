@@ -11,6 +11,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.d24-remediation-scenarios-test :as d24-test]
             [bitecho.d25-remediation-scenarios-test :as d25-test]
+            [bitecho.d26-remediation-scenarios-test :as d26-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
             [bitecho.fressian :as fressian]
@@ -18,7 +19,9 @@
             [bitecho.state-machine :as sm]
             [bitecho.streamlet.core :as streamlet]
             [clojure.java.io :as io]
+            [clojure.java.shell :as sh]
             [clojure.pprint :as pprint]
+            [clojure.string :as str]
             [clojure.test :as t])
   (:import [java.nio.file Files]))
 
@@ -371,11 +374,38 @@
      :count (count results)
      :scenarios results}))
 
+(defn run-d26-scenarios
+  "Executes Milestone D26 remediation and scenario verification suite (S16-S24)."
+  []
+  (let [scenarios [{:id "S16" :name "accountz-fallback-removal-and-fail-closed" :test-fn d26-test/test-scenario-s16-accountz-fallback-removal-and-fail-closed}
+                   {:id "S17" :name "second-p2p-answer-preserves-open-state" :test-fn d26-test/test-scenario-s17-second-p2p-answer-preserves-open-state}
+                   {:id "S18" :name "offer-hash-network-binding-and-rolling-upgrade" :test-fn d26-test/test-scenario-s18-offer-hash-network-binding-and-rolling-upgrade}
+                   {:id "S19" :name "bip-000-charter-and-strict-admission" :test-fn d26-test/test-scenario-s19-bip-000-charter-and-strict-admission}
+                   {:id "S20" :name "release-proof-generator-and-deploy-gate" :test-fn d26-test/test-scenario-s20-release-proof-generator-and-deploy-gate}
+                   {:id "S21" :name "multi-cluster-network-profiles" :test-fn d26-test/test-scenario-s21-multi-cluster-network-profiles}
+                   {:id "S22" :name "wait-event-broadcast-and-min-balance-guard" :test-fn d26-test/test-scenario-s22-wait-event-broadcast-and-min-balance-guard}
+                   {:id "S23" :name "treasury-faucet-directory-and-blog" :test-fn d26-test/test-scenario-s23-treasury-faucet-directory-and-blog}
+                   {:id "S24" :name "sea-build-script-and-skill-regrounding" :test-fn d26-test/test-scenario-s24-sea-build-script-and-skill-regrounding}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D25 (v0.23.3) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D26 (v0.23.4) release verification proof and returns a deterministic EDN map."
   [opts]
-  (let [ver (or (:version opts) "v0.23.3")
-        ms (or (:milestone opts) "D25")
+  (let [ver (or (:version opts) "v0.23.4")
+        ms (or (:milestone opts) "D26")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
@@ -383,26 +413,33 @@
         rolling-res (run-rolling-upgrade-interop)
         d24-scenarios (run-d24-scenarios)
         d25-scenarios (run-d25-scenarios)
+        d26-scenarios (run-d26-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
         bundle-sha (when (.exists bundle-file)
                      (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath bundle-file)))))
         browser-file (io/file "dist/bitecho-browser.js")
         browser-sha (when (.exists browser-file)
                       (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath browser-file)))))
+        commit-sha (try (str/trim (slurp (io/file ".git/refs/heads/main"))) (catch Exception _ "uncommitted"))
+        tree-sha (try (str/trim (:out (sh/sh "git" "write-tree"))) (catch Exception _ nil))
         all-passed? (boolean (and (:passed? devnet-res)
                                   (:passed? testnet-res)
                                   (:passed? mainnet-res)
                                   (:all-rejected? replay-res)
                                   (:passed? rolling-res)
                                   (:all-passed? d24-scenarios)
-                                  (:all-passed? d25-scenarios)))]
+                                  (:all-passed? d25-scenarios)
+                                  (:all-passed? d26-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
+     :commit-sha commit-sha
+     :tree-sha tree-sha
      :node-bundle-sha256 bundle-sha
      :browser-bundle-sha256 browser-sha
      :d24-remediation-scenarios d24-scenarios
      :d25-remediation-scenarios d25-scenarios
+     :d26-remediation-scenarios d26-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}
@@ -410,9 +447,9 @@
      :rolling-upgrade rolling-res}))
 
 (defn -main
-  "CLI entrypoint generating the Milestone D25 release proof EDN artifact."
+  "CLI entrypoint generating the Milestone D26 release proof EDN artifact."
   [& args]
-  (let [out-path (or (first args) "docs/releases/v0.23.3-proof.edn")
+  (let [out-path (or (first args) "docs/releases/v0.23.4-proof.edn")
         proof (run-release-proof {})
         out-file (io/file out-path)]
     (when-let [parent (.getParentFile out-file)]

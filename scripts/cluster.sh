@@ -421,6 +421,71 @@ EDN_EOF
 # Subcommand: deploy
 # ------------------------------------------------------------------------------
 
+verify_release_proof_gate() {
+  local version="${1:-$(sed -n -E 's/.*version\s+"([^"]+)".*/\1/p' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
+  version="${version:-0.23.4}"
+  local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
+
+  echo "--> Step 0a/8: Verifying Release Proof Gate for v${version}..."
+  if [[ "${RELEASE_PROOF:-}" == "skip" || "${RELEASE_PROOF:-}" == "false" ]]; then
+    echo "Warning: Release Proof Gate skipped via RELEASE_PROOF=${RELEASE_PROOF}."
+    return 0
+  fi
+
+  if [[ ! -f "${proof_file}" ]]; then
+    echo "Error: Release proof file ${proof_file} not found. Generate it via 'clojure -M:proof ${proof_file}' before deploying." >&2
+    return 1
+  fi
+
+  local passed
+  passed=$(grep -o ':all-passed? true' "${proof_file}" || true)
+  if [[ -z "${passed}" ]]; then
+    echo "Error: Release proof in ${proof_file} does not contain ':all-passed? true'. Aborting deploy." >&2
+    return 1
+  fi
+
+  local proof_commit proof_tree head_commit parent_commit head_tree parent_tree
+  proof_commit=$(sed -n -E 's/.*:commit-sha\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
+  proof_tree=$(sed -n -E 's/.*:tree-sha\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
+  head_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || true)
+  parent_commit=$(git -C "${ROOT_DIR}" rev-parse HEAD~1 2>/dev/null || true)
+  head_tree=$(git -C "${ROOT_DIR}" rev-parse HEAD^{tree} 2>/dev/null || true)
+  parent_tree=$(git -C "${ROOT_DIR}" rev-parse HEAD~1^{tree} 2>/dev/null || true)
+
+  if [[ -z "${proof_commit}" || "${proof_commit}" == "uncommitted" ]]; then
+    echo "Error: Release proof in ${proof_file} is missing a valid :commit-sha." >&2
+    return 1
+  fi
+  if [[ "${proof_commit}" != "${head_commit}" && "${proof_commit}" != "${parent_commit}" ]]; then
+    echo "Error: Release proof :commit-sha (${proof_commit}) does not match HEAD (${head_commit}) or HEAD~1 (${parent_commit})." >&2
+    return 1
+  fi
+  if [[ -z "${proof_tree}" ]]; then
+    echo "Error: Release proof in ${proof_file} is missing a valid :tree-sha." >&2
+    return 1
+  fi
+  if [[ "${proof_tree}" != "${head_tree}" && "${proof_tree}" != "${parent_tree}" ]]; then
+    echo "Error: Release proof :tree-sha (${proof_tree}) does not match HEAD^{tree} (${head_tree}) or HEAD~1^{tree} (${parent_tree})." >&2
+    return 1
+  fi
+
+  local proof_node_sha actual_node_sha proof_browser_sha actual_browser_sha
+  proof_node_sha=$(sed -n -E 's/.*:node-bundle-sha256\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
+  actual_node_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-light-node.cjs" | awk '{print $1}')
+  if [[ "${proof_node_sha}" != "${actual_node_sha}" ]]; then
+    echo "Error: Release proof :node-bundle-sha256 (${proof_node_sha}) does not match dist/bitecho-light-node.cjs (${actual_node_sha})." >&2
+    return 1
+  fi
+  proof_browser_sha=$(sed -n -E 's/.*:browser-bundle-sha256\s+"([^"]+)".*/\1/p' "${proof_file}" | head -n1)
+  actual_browser_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-browser.js" | awk '{print $1}')
+  if [[ "${proof_browser_sha}" != "${actual_browser_sha}" ]]; then
+    echo "Error: Release proof :browser-bundle-sha256 (${proof_browser_sha}) does not match dist/bitecho-browser.js (${actual_browser_sha})." >&2
+    return 1
+  fi
+
+  echo "Release Proof Gate PASSED (${proof_file}, commit=${proof_commit}, tree=${proof_tree})."
+}
+
 run_pre_deploy_e2e_gate() {
   echo "--> Step 0/8: Running Pre-Deploy E2E Transfer & Finalization Gate (60s bound)..."
   (cd "${ROOT_DIR}" && timeout 60s clojure \
@@ -444,6 +509,18 @@ cmd_deploy() {
   local streamlet_validators="node1,node2,node3"
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --network)
+        local net="$2"
+        shift 2
+        if [[ -f "${ROOT_DIR}/ops/networks/${net}.env" ]]; then
+          # shellcheck disable=SC1090
+          source "${ROOT_DIR}/ops/networks/${net}.env"
+        fi
+        ;;
+      --project)
+        GCP_PROJECT="$2"
+        shift 2
+        ;;
       --reset-state)
         reset_state=true
         shift
@@ -477,6 +554,10 @@ cmd_deploy() {
   echo "=== Deploying Bitecho Devnet to 3-Node Cluster ==="
 
   if [[ "$skip_e2e_gate" != "true" ]]; then
+    if ! verify_release_proof_gate; then
+      echo "Error: Release Proof Gate FAILED. Aborting deploy before touching any validator node." >&2
+      return 1
+    fi
     if ! run_pre_deploy_e2e_gate; then
       echo "Error: Pre-Deploy E2E Transfer Gate FAILED. Aborting deploy before touching any validator node." >&2
       return 1

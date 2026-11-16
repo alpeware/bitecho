@@ -14,6 +14,18 @@
   (:require [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
+;; Protocol Release Version & Sunsets (Milestone D26)
+;; ---------------------------------------------------------------------------
+
+(def version
+  "Current protocol and release milestone version."
+  "0.23.4")
+
+(def legacy-unbound-offer-hash-sunset
+  "Sunset ISO timestamp after which unbound offer hashes (|net:<uri> missing) are strictly rejected."
+  "2026-12-31")
+
+;; ---------------------------------------------------------------------------
 ;; Network URI Registry & Root Subnet Equivalence (Milestone D23)
 ;; ---------------------------------------------------------------------------
 

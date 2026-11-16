@@ -402,7 +402,7 @@
       (is (= 63 (count (or (:verbs cli-res) (get cli-res "verbs")))))
       (is (contains? (set (or (:verbs cli-res) (get cli-res "verbs"))) "help"))
       (is (contains? (set (or (:verbs cli-res) (get cli-res "verbs"))) "subscribe-subnets"))
-      (is (= 51 (count (or (:flags cli-res) (get cli-res "flags")))))
+      (is (= 53 (count (or (:flags cli-res) (get cli-res "flags")))))
       (is (not (.exists non-existent-dir)) "Help mode MUST NOT create state directory on disk")))
 
   (testing "Executable Node bundle exists and has shebang"

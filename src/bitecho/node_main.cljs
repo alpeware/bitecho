@@ -745,7 +745,8 @@
                                    [])]
                      {"cmd" "subscribe-subnets"
                       "subnets" subnets})
-                   "offer"    (let [m {"cmd" "offer"
+                   "offer"    (let [min-bal (extract-long-flag args "--min-balance" nil)
+                                    m {"cmd" "offer"
                                        "callee" (or (extract-flag-value args "--callee" nil)
                                                     (extract-flag-value args "--peer" nil)
                                                     (extract-flag-value args "--to" nil))
@@ -755,7 +756,8 @@
                                     wait-open-ms (extract-long-flag args "--wait-open-ms" nil)]
                                 (cond-> m
                                   hn (assoc "home_node" hn)
-                                  (some? wait-open-ms) (assoc "wait_open_ms" wait-open-ms)))
+                                  (some? wait-open-ms) (assoc "wait_open_ms" wait-open-ms)
+                                  (some? min-bal) (assoc "min_balance" min-bal)))
                    "accept"   {"cmd" "accept"
                                "session_id" (or (extract-flag-value args "--session-id" nil)
                                                 (extract-flag-value args "--session" nil))}
@@ -784,13 +786,15 @@
                                             topic (extract-flag-value args "--topic" nil)
                                             hn (extract-flag-value args "--home-node" nil)
                                             text (extract-flag-value args "--text" nil)
+                                            min-bal (extract-long-flag args "--min-balance" nil)
                                             m {"cmd" "rendezvous-offer"
                                                "callee" callee}]
                                         (cond-> m
                                           burn (assoc "burn" burn)
                                           topic (assoc "topic" topic)
                                           hn (assoc "home_node" hn)
-                                          text (assoc "text" text)))
+                                          text (assoc "text" text)
+                                          (some? min-bal) (assoc "min_balance" min-bal)))
                    "rendezvous-accept" (let [oh (extract-flag-value args "--offer-hash" nil)
                                              from (extract-flag-value args "--from" nil)
                                              m {"cmd" "rendezvous-accept"}]
@@ -802,6 +806,7 @@
                                     sid (or (extract-flag-value args "--session-id" nil)
                                             (extract-flag-value args "--session" nil)
                                             to)
+                                    min-bal (extract-long-flag args "--min-balance" nil)
                                     m {"cmd" "send"
                                        "session_id" sid
                                        "burn" (extract-long-flag args "--burn" 500)}
@@ -812,18 +817,21 @@
                                   to (assoc "to" to)
                                   t (assoc "text" t)
                                   msg (assoc "message" msg "text" (or t msg))
-                                  h (assoc "payload_hex" h)))
+                                  h (assoc "payload_hex" h)
+                                  (some? min-bal) (assoc "min_balance" min-bal)))
                    "close"    {"cmd" "close"
                                "session_id" (or (extract-flag-value args "--session-id" nil)
                                                 (extract-flag-value args "--session" nil))}
-                   "transfer" {"cmd" "transfer"
-                               "receiver" (or (extract-flag-value args "--receiver" nil)
-                                              (extract-flag-value args "--recipient" nil))
-                               "recipient" (or (extract-flag-value args "--receiver" nil)
-                                               (extract-flag-value args "--recipient" nil))
-                               "amount" (extract-long-flag args "--amount" 0)
-                               "seq" (extract-long-flag args "--seq" nil)
-                               "burn" (extract-long-flag args "--burn" 500)}
+                   "transfer" (let [min-bal (extract-long-flag args "--min-balance" nil)]
+                                (cond-> {"cmd" "transfer"
+                                         "receiver" (or (extract-flag-value args "--receiver" nil)
+                                                        (extract-flag-value args "--recipient" nil))
+                                         "recipient" (or (extract-flag-value args "--receiver" nil)
+                                                         (extract-flag-value args "--recipient" nil))
+                                         "amount" (extract-long-flag args "--amount" 0)
+                                         "seq" (extract-long-flag args "--seq" nil)
+                                         "burn" (extract-long-flag args "--burn" 500)}
+                                  (some? min-bal) (assoc "min_balance" min-bal)))
                    "register-home-set" (let [nodes (extract-flag-value args "--nodes" nil)
                                              p (extract-long-flag args "--price" 0)
                                              p-max (extract-long-flag args "--price-max" nil)
@@ -1098,11 +1106,13 @@
                                      sub (or (extract-flag-value args "--subnet-id" nil)
                                              (extract-flag-value args "--subnet" nil))
                                      b (extract-long-flag args "--burn" nil)
+                                     min-bal (extract-long-flag args "--min-balance" nil)
                                      m {"cmd" "broadcast"}]
                                  (cond-> m
                                    t (assoc "text" t)
                                    sub (assoc "subnet_id" sub)
-                                   (some? b) (assoc "burn" b)))
+                                   (some? b) (assoc "burn" b)
+                                   (some? min-bal) (assoc "min_balance" min-bal)))
                    "anchor-subnet" (let [sub (or (extract-flag-value args "--subnet-id" nil)
                                                  (extract-flag-value args "--subnet" nil)
                                                  (extract-flag-value args "--child-subnet" nil))
@@ -1247,10 +1257,15 @@
                    "wait" (let [t (or (extract-long-flag args "--timeout-ms" nil)
                                       (extract-long-flag args "--timeout" nil))
                                 ms (extract-long-flag args "--min-seq" nil)
+                                mb-seq (extract-long-flag args "--min-broadcast-seq" nil)
+                                sub (or (extract-flag-value args "--subnet-id" nil)
+                                        (extract-flag-value args "--subnet" nil))
                                 block? (boolean (or (some #{"--block"} args) (some #{"--until-event"} args)))
                                 peek? (boolean (some #{"--peek"} args))]
                             (cond-> {"cmd" "wait" "timeout_ms" (or t 30000)}
                               ms (assoc "min_seq" ms)
+                              mb-seq (assoc "min_broadcast_seq" mb-seq)
+                              sub (assoc "subnet_id" sub)
                               block? (assoc "block" true)
                               peek? (assoc "peek" true)))
                    "retransmit-outbox" (let [sid (or (extract-flag-value args "--session-id" nil)
@@ -1403,7 +1418,8 @@
                                 "--subnet-id" "--subnet" "--subscribe-subnets" "--subnets"
                                 "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
                                 "--cmd-file" "--events-out" "--session-id" "--session"
-                                "--min-seq" "--after-ts" "--ingress-tcp-port"
+                                "--min-seq" "--min-broadcast-seq" "--min-balance"
+                                "--after-ts" "--ingress-tcp-port"
                                 "--trusted-dac-anchors" "--turn-server" "--turn-username"
                                 "--turn-password" "--turn-realm" "--sync-interval-ms"
                                 "--price" "--price-max" "--burn" "--to" "--from"
@@ -1480,6 +1496,8 @@
          wait-session-id (or (extract-flag-value clean-args "--session-id" nil)
                              (extract-flag-value clean-args "--session" nil))
          min-seq (extract-long-flag clean-args "--min-seq" nil)
+         min-broadcast-seq (extract-long-flag clean-args "--min-broadcast-seq" nil)
+         min-balance (extract-long-flag clean-args "--min-balance" nil)
          after-ts (extract-long-flag clean-args "--after-ts" nil)
          transport-str (extract-flag-value clean-args "--transport" "udp")
          transport (case (str/lower-case transport-str)
@@ -1556,6 +1574,8 @@
        events-out (assoc :events-out events-out)
        wait-session-id (assoc :session-id wait-session-id)
        min-seq (assoc :min-seq min-seq)
+       min-broadcast-seq (assoc :min-broadcast-seq min-broadcast-seq)
+       min-balance (assoc :min-balance min-balance)
        after-ts (assoc :after-ts after-ts)
        subnet-id (assoc :subnet-id subnet-id)
        timeout-ms (assoc :timeout-ms timeout-ms)
@@ -2401,13 +2421,18 @@
   "Queries all validator nodes in `bootstrap` in parallel and verifies quorum via `light-core/verify-chain-state-quorum`."
   [identity bootstrap pubkey privkey-bytes opts cb]
   (if-let [fetcher (:inband-snapshot-fetcher opts)]
-    (let [snaps (fetcher pubkey)
-          trusted (set (keep :pubkey (vals (:nodes bootstrap))))
-          q-opts (assoc opts
-                        :expected-pubkey pubkey
-                        :trusted-validators trusted
-                        :min-finalized-epoch (or (:min-finalized-epoch opts) 0))]
-      (cb (light-core/verify-chain-state-quorum snaps q-opts)))
+    (let [res (fetcher pubkey)]
+      (if (and (map? res) (contains? res :ok?) (false? (:ok? res)))
+        (cb res)
+        (let [snaps (if (map? res) (or (:snapshots res) [res]) res)
+              trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+              q-opts (assoc opts
+                            :expected-pubkey pubkey
+                            :trusted-validators trusted
+                            :min-finalized-epoch (or (:min-finalized-epoch opts) 0))]
+          (cb (if (empty? snaps)
+                {:ok? false :error "no-inband-snapshots-returned"}
+                (light-core/verify-chain-state-quorum snaps q-opts))))))
     (let [nodes (vec (vals (:nodes bootstrap)))]
       (if (empty? nodes)
         (cb {:ok? false :error "empty-bootstrap-nodes"})
@@ -2511,12 +2536,11 @@
                                   "https://bitecho.org/relay/v1")]
              (maybe-sync-account-state! state-atom bootstrap pubkey privkey-bytes (assoc opts :relay-url fallback-url) cb))
 
-           (or (:inband-snapshot-fetcher opts)
-               (and (not= (:error inband-res) "no-inband-snapshots-returned")
-                    (not= (:error inband-res) "empty-bootstrap-nodes")))
+           (and (not= (:error inband-res) "no-inband-snapshots-returned")
+                (not= (:error inband-res) "empty-bootstrap-nodes"))
            (cb {:ok? false :error (:error inband-res)})
 
-           :else
+           (:accountz-fetcher opts)
            (fetch-validator-accountz!
             bootstrap pubkey opts
             (fn [resp]
@@ -2532,7 +2556,15 @@
                     (reset! state-atom (:state res))
                     (cb {:ok? true :state @state-atom :accountz resp}))
                   (cb {:ok? false :error "no-account-in-accountz"}))
-                (cb {:ok? false :error (or (:error inband-res) "all-sync-methods-failed")}))))))))))
+                (cb {:ok? false :error "accountz-fetcher-returned-nil"}))))
+
+           :else
+           (let [err (or (:error inband-res) "no-inband-snapshots-returned")]
+             (swap! state-atom (fn [st]
+                                 (-> st
+                                     (update-in [:diagnostics :account-sync-inband-failed] (fnil inc 0))
+                                     (update-in [:diagnostics :chain-state-sync-failed] (fnil inc 0)))))
+             (cb {:synced false :ok? false :reason err :error err}))))))))
 
 (defn fetch-directory-descriptor!
   "Fetches and parses a directory descriptor for `nickname` under `domain`."
@@ -2546,22 +2578,29 @@
               :else nil)))
       (catch :default _ (cb nil)))
     (let [dom (if (or (nil? domain) (str/blank? domain)) "bitecho.org" (str/trim domain))
+          net-uri (or (:network-uri opts) "bitecho.org")
+          url-v1 (str "https://" dom "/directory/v1/" net-uri "/" nickname)
           url1 (str "https://" dom "/directory/" nickname ".json")
           url2 (str "https://" dom "/" nickname)
           local-path (.join node-path "devnet" "directory" (str nickname ".json"))]
       (http-get-string!
-       url1 4000
-       (fn [body1]
-         (if-let [d1 (when body1 (light-core/parse-directory-descriptor-text body1))]
-           (cb d1)
+       url-v1 4000
+       (fn [body-v1]
+         (if-let [dv1 (when body-v1 (light-core/parse-directory-descriptor-text body-v1))]
+           (cb dv1)
            (http-get-string!
-            url2 4000
-            (fn [body2]
-              (if-let [d2 (when body2 (light-core/parse-directory-descriptor-text body2))]
-                (cb d2)
-                (if (.existsSync node-fs local-path)
-                  (cb (light-core/parse-directory-descriptor-text (.readFileSync node-fs local-path "utf8")))
-                  (cb nil)))))))))))
+            url1 4000
+            (fn [body1]
+              (if-let [d1 (when body1 (light-core/parse-directory-descriptor-text body1))]
+                (cb d1)
+                (http-get-string!
+                 url2 4000
+                 (fn [body2]
+                   (if-let [d2 (when body2 (light-core/parse-directory-descriptor-text body2))]
+                     (cb d2)
+                     (if (.existsSync node-fs local-path)
+                       (cb (light-core/parse-directory-descriptor-text (.readFileSync node-fs local-path "utf8")))
+                       (cb nil))))))))))))))
 
 ;; =============================================================================
 ;; 6. JSONL Output, `wait-event`, `serve`, & `one-shot` Execution Modes
@@ -2582,16 +2621,23 @@
           waitable? (contains? waitable-event-types ev-type)
           target-sid (:session-id opts)
           ev-sid (or (get evt "session_id") (get evt "session-id") (:session-id evt) (:session_id evt))
+          target-subnet (or (:subnet-id opts) (:subnet opts))
+          ev-subnet (or (get evt "subnet_id") (get evt "subnet-id") (:subnet-id evt) (:subnet_id evt))
           min-seq (:min-seq opts)
           raw-seq (or (get evt "seq") (:seq evt))
           ev-seq (when (some? raw-seq) (parse-long-safe raw-seq nil))
+          min-bseq (:min-broadcast-seq opts)
+          raw-bseq (or (get evt "broadcast_seq") (get evt "broadcast-seq") (:broadcast-seq evt) (:broadcast_seq evt))
+          ev-bseq (when (some? raw-bseq) (parse-long-safe raw-bseq nil))
           after-ts (:after-ts opts)
           raw-ts (or (get evt "timestamp_ms") (:timestamp-ms evt) (:timestamp_ms evt))
           ev-ts (if (some? raw-ts) (parse-long-safe raw-ts 0) 0)
           sid-ok? (or (nil? target-sid) (= (str ev-sid) (str target-sid)))
+          subnet-ok? (or (nil? target-subnet) (= (str ev-subnet) (str target-subnet)))
           seq-ok? (or (nil? min-seq) (and (some? ev-seq) (>= (or ev-seq 0) (or min-seq 0))))
+          bseq-ok? (or (nil? min-bseq) (and (some? ev-bseq) (>= (or ev-bseq 0) (or min-bseq 0))))
           ts-ok? (or (nil? after-ts) (> (or ev-ts 0) (or after-ts 0)))]
-      (boolean (and waitable? sid-ok? seq-ok? ts-ok?)))))
+      (boolean (and waitable? sid-ok? subnet-ok? seq-ok? bseq-ok? ts-ok?)))))
 
 (defn- write-json-str
   [data]
@@ -2675,7 +2721,7 @@
         events-path (or (:events-out opts) (.join node-path state-dir "events.jsonl"))
         timeout-ms (max 1 (or (:timeout-ms opts) 300000))
         poll-ms (or (:poll-ms opts) 50)
-        scan-from-start? (or (some? (:min-seq opts)) (some? (:after-ts opts)))
+        scan-from-start? (or (some? (:min-seq opts)) (some? (:min-broadcast-seq opts)) (some? (:after-ts opts)))
         initial-offset (if (and (not scan-from-start?) (.existsSync node-fs events-path))
                          (.-size (.statSync node-fs events-path))
                          0)
@@ -3187,7 +3233,6 @@
                                 (:net-envelopes res))]
                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
                   (do
-                    (reset! state-atom (:state res))
                     (send-routed-envelopes! live-envs
                                             (when currently-live? (:send-fn @conn-atom))
                                             p2p-peers-atom
@@ -3274,7 +3319,6 @@
                                        (emit! resp)
                                        (done-cb resp))))))))))))))
               (do
-                (reset! state-atom (:state res))
                 (sync-conn-diagnostics! state-atom conn-atom)
                 (save-light-state! state-file @state-atom)
                 (when-let [resp (:response res)]

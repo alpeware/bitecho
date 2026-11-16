@@ -277,5 +277,31 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 1. **Background Lease Renewal:** `upnp/start-upnp-renewal-loop!` starts a daemon thread periodically renewing router port mappings for `:ingress-tcp-port` and `:agent-port`.
 2. **SSDP Gateway Re-Discovery & Fail-Closed Diagnostics:** If gateway mapping fails or times out, the renewal loop attempts re-discovery and emits counted `:diagnose` effects per Rule 5. Clean termination via `upnp/stop-upnp-renewal-loop!` is wired into node shutdown.
 
+---
+
+## 9. Milestone D26: BIP-000 Charter, Parallel Track Foundation, & Remediation (`v0.23.4`)
+
+### 9.1 Network-Bound Offer Hashes & Rolling Upgrade Interop (`F-D26-3`, `F-D26-7`, `A-D26-1`, `A-CARB-D26-3`)
+1. **5-Field Network Binding:** `compute-offer-hash` binds canonical `:network-uri` into the SHA-256 preimage format:
+   `sha256(session-id|caller|callee|epoch|burn|net:<network-uri>)`.
+2. **Rolling Upgrade Sunset (`config/legacy-unbound-offer-hash-sunset`):** `matching-offer-hash?` accepts legacy 4-field unbound hashes on non-Mainnet networks through `2026-12-31`. Mainnet rejects unbound hashes unconditionally.
+
+### 9.2 BIP-000 Charter Ratification & Strict Admission Guard (`F-D26-6`, `F-D26-10`, `A-D26-3`, `A-CARB-D26-4`)
+1. **BIP-000 Charter:** Ratified in `docs/bips/bip-000-charter.edn` with complete `:invariant-diff`, `:oracle-receipts`, `:jurisdiction-map`, `:decision-records`, and `:human-anchor-sunset "2027-06-30"`.
+2. **Strict Admission Guard:** `exec-bip-submit` rejects proposals with fabricated/empty admission defaults when `strict_admission` is true or proposal is `"BIP-000"`, incrementing `[:diagnostics :bip-admission-rejected]`.
+
+### 9.3 Budget Floor Pre-Transition Guard & Monotonic Broadcast Filtering (`F-D26-8`, `F-D26-13`, `A-D26-4`, `A-D26-5`)
+1. **Pre-Transition Budget Floor Guard (`--min-balance`):** Pure core reducer rejects burn-bearing commands (`"send"`, `"broadcast"`, `"offer"`, `"rendezvous-offer"`, `"transfer"`) before mutating state if `spendable - required-burn < min-balance`, incrementing `[:diagnostics :below-min-balance-rejected]` and emitting `{"event" "budget-floor-reached"}`.
+2. **Monotonic Broadcast Filtering (`--min-broadcast-seq`):** `wait-event` and `poll` filter incoming broadcasts to return only items strictly `>= min-broadcast-seq`.
+
+### 9.4 Multi-Cluster Network Profiles & Standalone SEA Packaging (`F-D26-11`, `F-D26-12`, `A-CARB-D26-5`, `A-CARB-D26-6`)
+1. **Multi-Cluster Profiles:** Formalized in `ops/networks/{devnet,testnet,mainnet}.env` containing `NETWORK_URI`, `GCP_PROJECT`, `BOOTSTRAP_FILE`, and `TREASURY_PUBKEY`.
+2. **Release Proof Deploy Gate:** `verify_release_proof_gate` in `cluster.sh` and `infra_cluster.sh` asserts verified `docs/releases/v${VERSION}-proof.edn` before remote deployment.
+3. **Single Executable Application (SEA):** `scripts/build-sea.sh` injects code cache and deterministic blobs into standalone node binary without experimental warnings.
+
+### 9.5 Treasury Faucet & Network Directory Service (`F-D26-2`, `F-D26-9`)
+1. **Pure Faucet Reducer (`bitecho.core.protocol.faucet`):** Cryptographic challenge-response faucet with 60-second TTL, network-uri scoping, and single-use claim tracking.
+2. **Multi-Network Directory Endpoints:** Ingress HTTP shells support `/directory/v1/<network-uri>/<nickname>` alongside legacy fallbacks.
+
 
 

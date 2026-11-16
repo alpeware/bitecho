@@ -4,6 +4,7 @@
   (:require [bitecho.anchor.core :as anchor]
             [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
+            [bitecho.config :as config]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
@@ -1302,18 +1303,20 @@
            price (or (:price opts-map) burn)
            memo (or (:memo opts-map) "")
            sub-id (or (:subnet-id node) "global")
+           net-uri (or (:network-uri node) (config/resolve-network-uri (:subnet-id node)))
            suites (or (:crypto-suites opts-map) ["suite-v1-aes256gcm"])
            sid (light-core/compute-session-id caller-pub callee-pub caller-eph)
-           offer-hash (light-core/compute-offer-hash {:session-id sid
-                                                      :caller caller-pub
-                                                      :callee callee-pub
-                                                      :caller-ephemeral-pub caller-eph
-                                                      :epoch epoch
-                                                      :price price
-                                                      :burn burn
-                                                      :home-node ""
-                                                      :crypto-suites suites
-                                                      :subnet-id sub-id})
+           offer-hash (light-core/compute-offer-hash (cond-> {:session-id sid
+                                                              :caller caller-pub
+                                                              :callee callee-pub
+                                                              :caller-ephemeral-pub caller-eph
+                                                              :epoch epoch
+                                                              :price price
+                                                              :burn burn
+                                                              :home-node ""
+                                                              :crypto-suites suites
+                                                              :subnet-id sub-id}
+                                                       net-uri (assoc :network-uri net-uri)))
            privkey-bytes (:private-key keypair)
            sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
            offer (cond-> {:type :rendezvous-offer
@@ -1335,6 +1338,7 @@
                           :burn-amount burn
                           :offer-hash offer-hash
                           :signature sig-hex}
+                   net-uri (assoc :network-uri net-uri)
                    (and (string? memo) (seq memo)) (assoc :memo memo))]
        (swap! node-atom update :burned-ech (fnil + 0) burn)
        (clj->js offer))

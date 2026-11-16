@@ -1550,6 +1550,9 @@
         subnet (or (:subnet-id offer-map) (get offer-map "subnet_id") (get offer-map "subnet-id"))
         subnet-str (when (and (string? subnet) (not (str/blank? subnet)) (not= subnet "global"))
                      subnet)
+        net-uri (or (:network-uri offer-map) (get offer-map "network_uri") (get offer-map "network-uri"))
+        net-str (when (and (string? net-uri) (not (str/blank? net-uri)))
+                  (str/trim net-uri))
         base-input (str sid "-" caller "-" callee "-" eph-pub "-" epoch "-" price-or-burn "-" hn-str)
         with-suites (if (seq suites-str)
                       (str base-input "|" suites-str)
@@ -1557,23 +1560,36 @@
         with-dac (if (and (string? dac-id) (not (str/blank? dac-id)))
                    (str with-suites "|" dac-id)
                    with-suites)
-        hash-input (if subnet-str
-                     (str with-dac "|" subnet-str)
-                     with-dac)]
+        with-subnet (if subnet-str
+                      (str with-dac "|" subnet-str)
+                      with-dac)
+        hash-input (if net-str
+                     (str with-subnet "|net:" net-str)
+                     with-subnet)]
     (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes hash-input)))))
 
 (defn matching-offer-hash?
-  "Pure predicate checking whether an offer hash matches across equivalent candidate subnet IDs."
+  "Pure predicate checking whether an offer hash matches across equivalent candidate subnet IDs
+   and rolling upgrade tolerance between network-bound and legacy unbound hashes."
   [offer-map state expected-offer-hash]
   (let [candidate-subnets (distinct (remove nil? [(:subnet-id offer-map)
                                                   (:subnet-id state)
                                                   (when (config/equivalent-subnet-id? (or (:subnet-id state) "global") (or (:subnet-id offer-map) "global")) "global")
                                                   (when (config/equivalent-subnet-id? (or (:subnet-id state) "global") "devnet.bitecho.org") "devnet.bitecho.org")
-                                                  "global"]))]
+                                                  "global"]))
+        candidate-offers (concat [offer-map]
+                                 (when (or (:network-uri offer-map) (get offer-map "network_uri") (get offer-map "network-uri"))
+                                   [(dissoc offer-map :network-uri "network-uri" "network_uri")])
+                                 (when (and (not (:network-uri offer-map)) (not (get offer-map "network_uri")) (not (get offer-map "network-uri"))
+                                            (:network-uri state))
+                                   [(assoc offer-map :network-uri (:network-uri state))]))]
     (boolean
      (some (fn [sub-id]
-             (let [h (compute-offer-hash (assoc offer-map :subnet-id sub-id))]
-               (= h expected-offer-hash)))
+             (some (fn [cand-offer]
+                     (let [cand-with-sub (assoc cand-offer :subnet-id sub-id)]
+                       (or (= (compute-offer-hash cand-with-sub) expected-offer-hash)
+                           (= (sealed/offer-hash cand-with-sub) expected-offer-hash))))
+                   candidate-offers))
            candidate-subnets))))
 
 (defn canonical-rendezvous-header-str
@@ -1724,17 +1740,19 @@
                 dac-id (when active-dac (or (:dac-id active-dac) (get active-dac "dac_id")))
                 suites (or (:crypto-suites state) sealed/default-crypto-suites)
                 sub-id (str (or (:subnet-id state) "global"))
-                offer-hash (compute-offer-hash {:session-id session-id
-                                                :caller caller
-                                                :callee callee
-                                                :caller-ephemeral-pub caller-x25519-pub
-                                                :epoch epoch
-                                                :price burn-amt
-                                                :burn burn-amt
-                                                :home-node home-node
-                                                :crypto-suites suites
-                                                :dac active-dac
-                                                :subnet-id sub-id})
+                net-uri (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+                offer-hash (compute-offer-hash (cond-> {:session-id session-id
+                                                        :caller caller
+                                                        :callee callee
+                                                        :caller-ephemeral-pub caller-x25519-pub
+                                                        :epoch epoch
+                                                        :price burn-amt
+                                                        :burn burn-amt
+                                                        :home-node home-node
+                                                        :crypto-suites suites
+                                                        :dac active-dac
+                                                        :subnet-id sub-id}
+                                                 net-uri (assoc :network-uri net-uri)))
                 header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn-amt topic home-node dac-id suites)
                 sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes header-str)))
                 wire-payload (cond-> {:protocol-version current-wire-version
@@ -1751,6 +1769,7 @@
                                       :home-node home-node
                                       :crypto-suites suites
                                       :signature sig-hex}
+                               net-uri (assoc :network-uri net-uri)
                                active-dac (assoc :dac active-dac))
                 gossip-env (assoc (build-gossip-envelope caller privkey-bytes (freeze-payload wire-payload) burn-amt)
                                   :subnet-id sub-id)
@@ -1946,16 +1965,18 @@
                                    d))
                     suites (or (:crypto-suites state) sealed/default-crypto-suites)
                     sub-id (str (or (:subnet-id state) "global"))
-                    offer-hash (compute-offer-hash {:session-id session-id
-                                                    :caller caller
-                                                    :callee callee
-                                                    :caller-ephemeral-pub eph-pub-hex
-                                                    :epoch epoch
-                                                    :price price
-                                                    :home-node home-node
-                                                    :crypto-suites suites
-                                                    :dac active-dac
-                                                    :subnet-id sub-id})
+                    net-uri (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+                    offer-hash (compute-offer-hash (cond-> {:session-id session-id
+                                                            :caller caller
+                                                            :callee callee
+                                                            :caller-ephemeral-pub eph-pub-hex
+                                                            :epoch epoch
+                                                            :price price
+                                                            :home-node home-node
+                                                            :crypto-suites suites
+                                                            :dac active-dac
+                                                            :subnet-id sub-id}
+                                                     net-uri (assoc :network-uri net-uri)))
                     sig-hex (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes offer-hash)))
                     offer-payload (cond-> {:protocol-version current-wire-version
                                            :wire-format current-wire-format
@@ -1972,6 +1993,7 @@
                                            :offer-hash offer-hash
                                            :burn burn-amt
                                            :signature sig-hex}
+                                    net-uri (assoc :network-uri net-uri)
                                     active-dac (assoc :dac active-dac))
                     gossip-env (build-gossip-envelope caller privkey-bytes (freeze-payload offer-payload) burn-amt sub-id)
                     header-event {:type :receive-offer-header
@@ -2432,16 +2454,27 @@
                                            :p2p-peer (normalize-pubkey-hex (:peer session))
                                            :p2p-session-id session-id))
                     p2p-entry (merge (get session :p2p {})
-                                     {:phase :connecting
-                                      :connected? false
-                                      :zero-burn? false
-                                      :role :responder
-                                      :local-transport transport
-                                      :local-candidates candidates
-                                      :local-ice-ufrag ice-ufrag
-                                      :local-ice-pwd ice-pwd
-                                      :local-fingerprint fp
-                                      :local-signal-seq signal-seq})
+                                     (if p2p-open?
+                                       {:phase :open
+                                        :connected? true
+                                        :zero-burn? (boolean (get-in session [:p2p :zero-burn?] true))
+                                        :role :responder
+                                        :local-transport transport
+                                        :local-candidates candidates
+                                        :local-ice-ufrag ice-ufrag
+                                        :local-ice-pwd ice-pwd
+                                        :local-fingerprint fp
+                                        :local-signal-seq signal-seq}
+                                       {:phase :connecting
+                                        :connected? false
+                                        :zero-burn? false
+                                        :role :responder
+                                        :local-transport transport
+                                        :local-candidates candidates
+                                        :local-ice-ufrag ice-ufrag
+                                        :local-ice-pwd ice-pwd
+                                        :local-fingerprint fp
+                                        :local-signal-seq signal-seq}))
                     p2p-meta (merge (get session :p2p-meta {})
                                     (cond-> {:local-signal-seq signal-seq
                                              :preferred-transport transport
@@ -2472,8 +2505,12 @@
                     new-state (cond-> (-> state
                                           (assoc-in [:sessions session-id :p2p] p2p-entry)
                                           (assoc-in [:sessions session-id :p2p-meta] updated-p2p-meta))
-                                fallback? (update-in [:diagnostics :p2p-answer-candidate-self-filter-fallback] (fnil inc 0)))
-                    p2p-dial (when (seq dialable-candidates)
+                                fallback? (update-in [:diagnostics :p2p-answer-candidate-self-filter-fallback] (fnil inc 0))
+                                p2p-open? (update-in [:diagnostics :duplicate-p2p-answer-ignored] (fnil inc 0)))
+                    force-dial? (boolean (or (get cmd-map "force_dial") (get cmd-map "force-dial")
+                                             (:force_dial cmd-map) (:force-dial cmd-map)))
+                    p2p-dial (when (and (seq dialable-candidates)
+                                        (or (not p2p-open?) force-dial?))
                                {:session-id session-id
                                 :peer (:peer session)
                                 :role :responder
@@ -2489,8 +2526,8 @@
                             "peer" (:peer session)
                             "transport" transport
                             "candidates" candidates
-                            "phase" "connecting"
-                            "connected" false
+                            "phase" (if p2p-open? "open" "connecting")
+                            "connected" (if p2p-open? true false)
                             "burn" (long burn-amt)}
                  :net-envelopes [env]
                  :stdout-events []
@@ -5078,8 +5115,17 @@
                              :vopr-jepsen-non-vacuity {:passed? true :seed 42}
                              :deterministic-bundle-sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                              :bwrap-civilization-regression {:passed? true}}
+            strict-admission? (boolean (or (true? (get effective-map "strict_admission"))
+                                           (true? (get effective-map "strict-admission"))
+                                           (true? (:strict-admission effective-map))
+                                           (true? (:strict_admission effective-map))
+                                           (= bip-id "BIP-000")))
+            jurisdiction-map (or (parse-edn-safe (or (get effective-map "jurisdiction_map") (get effective-map "jurisdiction-map") (:jurisdiction-map effective-map)))
+                                 (:jurisdiction-map spec-map))
+            human-anchor-sunset (or (get effective-map "human_anchor_sunset") (get effective-map "human-anchor-sunset") (:human-anchor-sunset effective-map)
+                                    (:human-anchor-sunset spec-map))
             has-explicit-spec? (seq spec-map)
-            bip-payload (cond-> (merge (when-not has-explicit-spec?
+            bip-payload (cond-> (merge (when (and (not has-explicit-spec?) (not strict-admission?))
                                          {:invariant-diff default-inv
                                           :oracle-receipts default-oracles})
                                        spec-map
@@ -5087,6 +5133,8 @@
                                         :bip-id bip-id
                                         :title title
                                         :author-pubkey (or (:author-pubkey spec-map) (:pubkey state))})
+                          jurisdiction-map (assoc :jurisdiction-map jurisdiction-map)
+                          human-anchor-sunset (assoc :human-anchor-sunset human-anchor-sunset)
                           (map? policy-map) (assoc :policy-theta policy-map)
                           (map? oracle-map) (assoc :oracle-receipts oracle-map)
                           (some? act-ep) (assoc :activate-at-epoch (long act-ep)))
@@ -5421,103 +5469,130 @@
   (let [effective-map (if (map? (get cmd-map "args"))
                         (merge (get cmd-map "args") (dissoc cmd-map "args"))
                         cmd-map)
+        cmd-name (or (get effective-map "cmd") (:cmd effective-map))
+        raw-min-balance (or (get effective-map "min_balance") (get effective-map "min-balance")
+                            (:min-balance effective-map) (:min_balance effective-map))
+        min-balance (when (some? raw-min-balance) (parse-long-safe raw-min-balance nil))
+        burn-bearing? (contains? #{"send" "broadcast" "offer" "rendezvous-offer" "transfer"} cmd-name)
+        spendable (long (or (get-in state [:account :spendable]) (get-in state [:account :balance]) 0))
+        required-burn (long (cond
+                              (= cmd-name "transfer")
+                              (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) nil) 500)
+                              :else
+                              (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)
+                                                       (get effective-map "price") (:price effective-map)) nil)
+                                  (effective-signaling-burn-floor state))))
         sub-id-raw (or (get effective-map "subnet_id")
                        (get effective-map "subnet-id")
                        (:subnet-id effective-map)
                        (:subnet-id state))
-        sub-id-str (when sub-id-raw (str sub-id-raw))
-        res (case (or (get effective-map "cmd") (:cmd effective-map))
-              "identity" (exec-identity state)
-              "discover" (exec-discover state)
-              "register-home-set" (exec-register-home-set state effective-map privkey-bytes)
-              "offer" (exec-offer state effective-map privkey-bytes)
-              "accept" (exec-accept state effective-map privkey-bytes)
-              "p2p-offer" (exec-p2p-offer state effective-map privkey-bytes)
-              "p2p-answer" (exec-p2p-answer state effective-map privkey-bytes)
-              "p2p-channel-state" (exec-p2p-channel-state state effective-map)
-              "p2p_channel_state" (exec-p2p-channel-state state effective-map)
-              "broadcast" (exec-broadcast state effective-map privkey-bytes)
-              "rendezvous-policy" (exec-rendezvous-policy state effective-map)
-              "rendezvous-offer" (exec-rendezvous-offer state effective-map privkey-bytes)
-              "rendezvous-accept" (exec-rendezvous-accept state effective-map privkey-bytes)
-              "send" (exec-send state effective-map privkey-bytes)
-              "inbox" (exec-inbox state effective-map)
-              "close" (exec-close state effective-map privkey-bytes)
-              "transfer" (exec-transfer state effective-map privkey-bytes)
-              "account" (exec-sync-account state effective-map)
-              "sync-account" (exec-sync-account state effective-map)
-              "settle-intent" (exec-settle-intent state effective-map privkey-bytes)
-              "lock-intent" (exec-lock-intent state effective-map privkey-bytes)
-              "release-intent" (exec-release-intent state effective-map privkey-bytes)
-              "refund-intent" (exec-refund-intent state effective-map privkey-bytes)
-              "escrows" (exec-escrows state effective-map)
-              "query-chain-state" (let [env (build-chain-state-query-envelope (:pubkey state) privkey-bytes effective-map)]
-                                    {:state state
-                                     :response {"ok" true "query_sent" true}
-                                     :net-envelopes [env]
-                                     :stdout-events []})
-              "submit-vouchers" (exec-submit-vouchers state effective-map privkey-bytes)
-              "petname-set" (exec-petname-set state effective-map)
-              "petname-list" (exec-petname-list state)
-              "petname-remove" (exec-petname-remove state effective-map)
-              "petname-resolve" (exec-petname-resolve state effective-map)
-              "dac-attach" (exec-dac-attach state effective-map)
-              "dac-revoke" (exec-dac-revoke state effective-map)
-              "directory-verify" (exec-directory-verify state effective-map)
-              "directory-register" (exec-directory-register state effective-map privkey-bytes)
-              "directory-lookup" (exec-directory-lookup state effective-map)
-              "anchor-subnet" (exec-anchor-subnet state effective-map privkey-bytes (or sub-id-str "global"))
-              "epoch-tick" (exec-epoch-tick state effective-map privkey-bytes (or sub-id-str "global"))
-              "verify-subnet-anchor" (exec-verify-subnet-anchor state effective-map (or sub-id-str "global"))
-              "wait" (exec-wait state effective-map)
-              "retransmit-outbox" (exec-retransmit-outbox state effective-map)
-              "export-poll" (exec-export-poll state effective-map privkey-bytes)
-              "import-poll" (exec-import-poll state effective-map privkey-bytes)
-              "import" (exec-import state effective-map privkey-bytes)
-              "import-envelope" (exec-import state effective-map privkey-bytes)
-              "export-offer" (exec-export-offer state effective-map privkey-bytes)
-              "export-reveal" (exec-export-reveal state effective-map privkey-bytes)
-              "export-p2p-offer" (exec-export-p2p-offer state effective-map privkey-bytes)
-              "export-p2p-answer" (exec-export-p2p-answer state effective-map privkey-bytes)
-              "export-send" (exec-export-send state effective-map privkey-bytes)
-              "ack" (exec-ack state effective-map privkey-bytes)
-              "export-ack" (exec-export-ack state effective-map privkey-bytes)
-              "storage-put" (exec-storage-put state effective-map privkey-bytes sub-id-str)
-              "storage-get" (exec-storage-get state effective-map privkey-bytes sub-id-str)
-              "storage-list" (exec-storage-list state effective-map)
-              "capability-publish" (exec-capability-publish state effective-map privkey-bytes sub-id-str)
-              "capability-resolve" (exec-capability-resolve state effective-map privkey-bytes sub-id-str)
-              "capability-list" (exec-capability-list state effective-map)
-              "puzzle-hash" (exec-puzzle-hash state effective-map)
-              "puzzle-eval" (exec-puzzle-eval state effective-map)
-              "bip-submit" (exec-bip-submit state effective-map privkey-bytes sub-id-str)
-              "bip-consent" (exec-bip-consent state effective-map privkey-bytes sub-id-str)
-              "bip-object" (exec-bip-object state effective-map privkey-bytes sub-id-str)
-              "bip-status" (exec-bip-status state effective-map sub-id-str)
-              "bounty-create" (exec-bounty-create state effective-map privkey-bytes sub-id-str)
-              "bounty-settle" (exec-bounty-settle state effective-map privkey-bytes sub-id-str)
-              "status" (exec-status state)
-              "help" {:state state
-                      :response {"ok" true
-                                 "help" true
-                                 "verbs" cli/supported-cli-verbs
-                                 "modes" ["one-shot" "serve" "ctl" "wait-event"]
-                                 "flags" cli/known-command-flags}
-                      :net-envelopes []
-                      :stdout-events []}
-              "subscribe-subnets" (exec-subscribe-subnets state effective-map)
-              {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})
-        res' (if (seq (:net-envelopes res))
-               (update res :net-envelopes (fn [envs]
-                                            (mapv (fn [e]
-                                                    (if (or (nil? (:subnet-id e)) (= (:subnet-id e) "global"))
-                                                      (assoc e :subnet-id (or sub-id-str (:subnet-id e) "global"))
-                                                      e))
-                                                  envs)))
-               res)]
-    (if (seq (:stdout-events res'))
-      (update res' :state enqueue-actionable-events (:stdout-events res'))
-      res')))
+        sub-id-str (when sub-id-raw (str sub-id-raw))]
+    (if (and burn-bearing? min-balance (< (- spendable required-burn) (long min-balance)))
+      (let [ev {"event" "budget-floor-reached"
+                "spendable" spendable
+                "required_burn" required-burn
+                "min_balance" (long min-balance)}
+            st' (update-in state [:diagnostics :below-min-balance-rejected] (fnil inc 0))]
+        {:state (enqueue-actionable-events st' [ev])
+         :response {"ok" false
+                    "error" "below-min-balance"
+                    "spendable" spendable
+                    "required_burn" required-burn
+                    "min_balance" (long min-balance)}
+         :net-envelopes []
+         :stdout-events [ev]})
+      (let [res (case cmd-name
+                  "identity" (exec-identity state)
+                  "discover" (exec-discover state)
+                  "register-home-set" (exec-register-home-set state effective-map privkey-bytes)
+                  "offer" (exec-offer state effective-map privkey-bytes)
+                  "accept" (exec-accept state effective-map privkey-bytes)
+                  "p2p-offer" (exec-p2p-offer state effective-map privkey-bytes)
+                  "p2p-answer" (exec-p2p-answer state effective-map privkey-bytes)
+                  "p2p-channel-state" (exec-p2p-channel-state state effective-map)
+                  "p2p_channel_state" (exec-p2p-channel-state state effective-map)
+                  "broadcast" (exec-broadcast state effective-map privkey-bytes)
+                  "rendezvous-policy" (exec-rendezvous-policy state effective-map)
+                  "rendezvous-offer" (exec-rendezvous-offer state effective-map privkey-bytes)
+                  "rendezvous-accept" (exec-rendezvous-accept state effective-map privkey-bytes)
+                  "send" (exec-send state effective-map privkey-bytes)
+                  "inbox" (exec-inbox state effective-map)
+                  "close" (exec-close state effective-map privkey-bytes)
+                  "transfer" (exec-transfer state effective-map privkey-bytes)
+                  "account" (exec-sync-account state effective-map)
+                  "sync-account" (exec-sync-account state effective-map)
+                  "settle-intent" (exec-settle-intent state effective-map privkey-bytes)
+                  "lock-intent" (exec-lock-intent state effective-map privkey-bytes)
+                  "release-intent" (exec-release-intent state effective-map privkey-bytes)
+                  "refund-intent" (exec-refund-intent state effective-map privkey-bytes)
+                  "escrows" (exec-escrows state effective-map)
+                  "query-chain-state" (let [env (build-chain-state-query-envelope (:pubkey state) privkey-bytes effective-map)]
+                                        {:state state
+                                         :response {"ok" true "query_sent" true}
+                                         :net-envelopes [env]
+                                         :stdout-events []})
+                  "submit-vouchers" (exec-submit-vouchers state effective-map privkey-bytes)
+                  "petname-set" (exec-petname-set state effective-map)
+                  "petname-list" (exec-petname-list state)
+                  "petname-remove" (exec-petname-remove state effective-map)
+                  "petname-resolve" (exec-petname-resolve state effective-map)
+                  "dac-attach" (exec-dac-attach state effective-map)
+                  "dac-revoke" (exec-dac-revoke state effective-map)
+                  "directory-verify" (exec-directory-verify state effective-map)
+                  "directory-register" (exec-directory-register state effective-map privkey-bytes)
+                  "directory-lookup" (exec-directory-lookup state effective-map)
+                  "anchor-subnet" (exec-anchor-subnet state effective-map privkey-bytes (or sub-id-str "global"))
+                  "epoch-tick" (exec-epoch-tick state effective-map privkey-bytes (or sub-id-str "global"))
+                  "verify-subnet-anchor" (exec-verify-subnet-anchor state effective-map (or sub-id-str "global"))
+                  "wait" (exec-wait state effective-map)
+                  "retransmit-outbox" (exec-retransmit-outbox state effective-map)
+                  "export-poll" (exec-export-poll state effective-map privkey-bytes)
+                  "import-poll" (exec-import-poll state effective-map privkey-bytes)
+                  "import" (exec-import state effective-map privkey-bytes)
+                  "import-envelope" (exec-import state effective-map privkey-bytes)
+                  "export-offer" (exec-export-offer state effective-map privkey-bytes)
+                  "export-reveal" (exec-export-reveal state effective-map privkey-bytes)
+                  "export-p2p-offer" (exec-export-p2p-offer state effective-map privkey-bytes)
+                  "export-p2p-answer" (exec-export-p2p-answer state effective-map privkey-bytes)
+                  "export-send" (exec-export-send state effective-map privkey-bytes)
+                  "ack" (exec-ack state effective-map privkey-bytes)
+                  "export-ack" (exec-export-ack state effective-map privkey-bytes)
+                  "storage-put" (exec-storage-put state effective-map privkey-bytes sub-id-str)
+                  "storage-get" (exec-storage-get state effective-map privkey-bytes sub-id-str)
+                  "storage-list" (exec-storage-list state effective-map)
+                  "capability-publish" (exec-capability-publish state effective-map privkey-bytes sub-id-str)
+                  "capability-resolve" (exec-capability-resolve state effective-map privkey-bytes sub-id-str)
+                  "capability-list" (exec-capability-list state effective-map)
+                  "puzzle-hash" (exec-puzzle-hash state effective-map)
+                  "puzzle-eval" (exec-puzzle-eval state effective-map)
+                  "bip-submit" (exec-bip-submit state effective-map privkey-bytes sub-id-str)
+                  "bip-consent" (exec-bip-consent state effective-map privkey-bytes sub-id-str)
+                  "bip-object" (exec-bip-object state effective-map privkey-bytes sub-id-str)
+                  "bip-status" (exec-bip-status state effective-map sub-id-str)
+                  "bounty-create" (exec-bounty-create state effective-map privkey-bytes sub-id-str)
+                  "bounty-settle" (exec-bounty-settle state effective-map privkey-bytes sub-id-str)
+                  "status" (exec-status state)
+                  "help" {:state state
+                          :response {"ok" true
+                                     "help" true
+                                     "verbs" cli/supported-cli-verbs
+                                     "modes" ["one-shot" "serve" "ctl" "wait-event"]
+                                     "flags" cli/known-command-flags}
+                          :net-envelopes []
+                          :stdout-events []}
+                  "subscribe-subnets" (exec-subscribe-subnets state effective-map)
+                  {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})
+            res' (if (seq (:net-envelopes res))
+                   (update res :net-envelopes (fn [envs]
+                                                (mapv (fn [e]
+                                                        (if (or (nil? (:subnet-id e)) (= (:subnet-id e) "global"))
+                                                          (assoc e :subnet-id (or sub-id-str (:subnet-id e) "global"))
+                                                          e))
+                                                      envs)))
+                   res)]
+        (if (seq (:stdout-events res'))
+          (update res' :state enqueue-actionable-events (:stdout-events res'))
+          res')))))
 
 ;; -----------------------------------------------------------------------------
 ;; Inbound Wire Payload Handlers (Pure Helpers)
@@ -5603,81 +5678,93 @@
                  (or (nil? (:price msg)) (integer? (:price msg)))
                  (= (normalize-pubkey-hex (:callee msg)) (normalize-pubkey-hex (:pubkey state))))
       {:state state :net-envelopes [] :stdout-events []}
-      (let [caller-pub (try (basalt/hex->bytes (:caller msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-            sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-            expected-sid (compute-session-id (:caller msg) (:callee msg) (:caller-ephemeral-pub msg))
-            expected-hash-legacy (compute-offer-hash msg)
-            expected-hash-sealed (sealed/offer-hash msg)
-            wire-dac (or (:dac msg) (get msg "dac"))
-            dac-id (or (:dac-id msg) (get msg "dac_id")
-                       (when wire-dac (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id"))))
-            burn-num (parse-long-safe (or (:price msg) (:burn msg)) 0)
-            epoch-num (parse-long-safe (:epoch msg) 0)
-            expected-hash-5field (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes (str (:caller msg) "-" (:callee msg) "-" (:caller-ephemeral-pub msg) "-" epoch-num "-" burn-num (when (and (string? dac-id) (not (str/blank? dac-id))) (str "|" dac-id))))))
-            valid-hashes? (and (= (:session-id msg) expected-sid)
-                               (or (= (:offer-hash msg) expected-hash-legacy)
-                                   (= (:offer-hash msg) expected-hash-sealed)
-                                   (= (:offer-hash msg) expected-hash-5field)
-                                   (matching-offer-hash? msg state (:offer-hash msg))))
-            caller-suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
-            callee-suites (or (:crypto-suites state) sealed/default-crypto-suites)
-            suite-negotiation (sealed/negotiate-crypto-suite (or caller-suites [sealed/suite-v1-chacha20poly1305]) callee-suites)
-            valid-suite? (:ok? suite-negotiation)
-            selected-suite (:selected-suite suite-negotiation)
-            valid-sig? (and valid-hashes?
-                            valid-suite?
-                            caller-pub sig-bytes
-                            (crypto/verify caller-pub (fressian/utf8->bytes (:offer-hash msg)) sig-bytes))
-            ref-epoch (:epoch state)
-            wire-dac (or (:dac msg) (get msg "dac"))
-            dac-check (when wire-dac
-                        (verify-dac wire-dac {:expected-agent-pubkey (:caller msg)
-                                              :current-epoch ref-epoch
-                                              :revoked-dac-ids (:revoked-dacs state)
-                                              :required-scope "offer"}))
-            economy-enabled? (get state :economy-enabled? true)
-            burn-floor (effective-signaling-burn-floor state)
-            actual-burn (long (or (:burn msg) 0))]
-        (if (or (not valid-sig?)
-                (not valid-suite?)
-                (and economy-enabled? (< actual-burn burn-floor))
-                (and wire-dac (not (:ok? dac-check))))
-          {:state state :net-envelopes [] :stdout-events []}
-          (let [sid (:session-id msg)
-                clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature :crypto-suites])
-                              selected-suite (assoc :selected-suite selected-suite)
-                              (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))]
-            (cond
-              (contains? (:sessions state) sid)
-              (let [new-state (update-in state [:sessions sid :replays-deduped] (fnil inc 0))]
-                {:state new-state :net-envelopes [] :stdout-events []})
-
-              (contains? (:pending-offers state) sid)
+      (let [msg-net (or (:network-uri msg) (get msg "network_uri") (get msg "network-uri"))
+            st-net (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+            network-mismatch? (or (and (string? msg-net) (string? st-net)
+                                       (not= (str/trim msg-net) (str/trim st-net)))
+                                  (and (= st-net "mainnet.bitecho.org") (str/blank? (str msg-net))))]
+        (if network-mismatch?
+          {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+           :net-envelopes []
+           :stdout-events []}
+          (let [caller-pub (try (basalt/hex->bytes (:caller msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                expected-sid (compute-session-id (:caller msg) (:callee msg) (:caller-ephemeral-pub msg))
+                expected-hash-legacy (compute-offer-hash msg)
+                expected-hash-sealed (sealed/offer-hash msg)
+                wire-dac (or (:dac msg) (get msg "dac"))
+                dac-id (or (:dac-id msg) (get msg "dac_id")
+                           (when wire-dac (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id"))))
+                burn-num (parse-long-safe (or (:price msg) (:burn msg)) 0)
+                epoch-num (parse-long-safe (:epoch msg) 0)
+                net-str (when (and (string? msg-net) (not (str/blank? msg-net))) (str/trim msg-net))
+                expected-hash-5field (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes (str (:caller msg) "-" (:callee msg) "-" (:caller-ephemeral-pub msg) "-" epoch-num "-" burn-num
+                                                                                                  (when (and (string? dac-id) (not (str/blank? dac-id))) (str "|" dac-id))
+                                                                                                  (when net-str (str "|net:" net-str))))))
+                valid-hashes? (and (= (:session-id msg) expected-sid)
+                                   (or (= (:offer-hash msg) expected-hash-legacy)
+                                       (= (:offer-hash msg) expected-hash-sealed)
+                                       (= (:offer-hash msg) expected-hash-5field)
+                                       (matching-offer-hash? msg state (:offer-hash msg))))
+                caller-suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
+                callee-suites (or (:crypto-suites state) sealed/default-crypto-suites)
+                suite-negotiation (sealed/negotiate-crypto-suite (or caller-suites [sealed/suite-v1-chacha20poly1305]) callee-suites)
+                valid-suite? (:ok? suite-negotiation)
+                selected-suite (:selected-suite suite-negotiation)
+                valid-sig? (and valid-hashes?
+                                valid-suite?
+                                caller-pub sig-bytes
+                                (crypto/verify caller-pub (fressian/utf8->bytes (:offer-hash msg)) sig-bytes))
+                ref-epoch (:epoch state)
+                wire-dac (or (:dac msg) (get msg "dac"))
+                dac-check (when wire-dac
+                            (verify-dac wire-dac {:expected-agent-pubkey (:caller msg)
+                                                  :current-epoch ref-epoch
+                                                  :revoked-dac-ids (:revoked-dacs state)
+                                                  :required-scope "offer"}))
+                economy-enabled? (get state :economy-enabled? true)
+                burn-floor (effective-signaling-burn-floor state)
+                actual-burn (long (or (:burn msg) 0))]
+            (if (or (not valid-sig?)
+                    (not valid-suite?)
+                    (and economy-enabled? (< actual-burn burn-floor))
+                    (and wire-dac (not (:ok? dac-check))))
               {:state state :net-envelopes [] :stdout-events []}
+              (let [sid (:session-id msg)
+                    clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature :crypto-suites])
+                                  selected-suite (assoc :selected-suite selected-suite)
+                                  (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))]
+                (cond
+                  (contains? (:sessions state) sid)
+                  (let [new-state (update-in state [:sessions sid :replays-deduped] (fnil inc 0))]
+                    {:state new-state :net-envelopes [] :stdout-events []})
 
-              (:autonomous? state)
-              (let [accept-res (exec-accept (assoc-in state [:pending-offers sid] clean-offer)
-                                            {"session_id" sid}
-                                            privkey-bytes)]
-                {:state (:state accept-res)
-                 :net-envelopes (:net-envelopes accept-res)
-                 :stdout-events (:stdout-events accept-res)})
+                  (contains? (:pending-offers state) sid)
+                  {:state state :net-envelopes [] :stdout-events []}
 
-              :else
-              (let [caller-pname (pubkey->petname state (:caller clean-offer))
-                    offer-dac (:dac clean-offer)
-                    dac-anchor (when offer-dac (or (:anchor-pubkey offer-dac) (get offer-dac "anchor_pubkey")))
-                    dac-id (when offer-dac (or (:dac-id offer-dac) (get offer-dac "dac_id")))
-                    event (cond-> {"event" "offer-received"
-                                   "session_id" sid
-                                   "caller" (:caller clean-offer)
-                                   "price" (:price clean-offer)}
-                            caller-pname (assoc "caller_petname" caller-pname)
-                            dac-anchor (assoc "anchor_pubkey" dac-anchor)
-                            dac-id (assoc "dac_id" dac-id))]
-                {:state (assoc-in state [:pending-offers sid] clean-offer)
-                 :net-envelopes []
-                 :stdout-events [event]}))))))
+                  (:autonomous? state)
+                  (let [accept-res (exec-accept (assoc-in state [:pending-offers sid] clean-offer)
+                                                {"session_id" sid}
+                                                privkey-bytes)]
+                    {:state (:state accept-res)
+                     :net-envelopes (:net-envelopes accept-res)
+                     :stdout-events (:stdout-events accept-res)})
+
+                  :else
+                  (let [caller-pname (pubkey->petname state (:caller clean-offer))
+                        offer-dac (:dac clean-offer)
+                        dac-anchor (when offer-dac (or (:anchor-pubkey offer-dac) (get offer-dac "anchor_pubkey")))
+                        dac-id (when offer-dac (or (:dac-id offer-dac) (get offer-dac "dac_id")))
+                        event (cond-> {"event" "offer-received"
+                                       "session_id" sid
+                                       "caller" (:caller clean-offer)
+                                       "price" (:price clean-offer)}
+                                caller-pname (assoc "caller_petname" caller-pname)
+                                dac-anchor (assoc "anchor_pubkey" dac-anchor)
+                                dac-id (assoc "dac_id" dac-id))]
+                    {:state (assoc-in state [:pending-offers sid] clean-offer)
+                     :net-envelopes []
+                     :stdout-events [event]}))))))))
     (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
@@ -6005,59 +6092,68 @@
                  (or (nil? (:topic msg)) (string? (:topic msg)))
                  (= (normalize-pubkey-hex (:callee msg)) (normalize-pubkey-hex (:pubkey state))))
       {:state state :net-envelopes [] :stdout-events []}
-      (let [caller (:caller msg)
-            callee (:callee msg)
-            offer-hash (:offer-hash msg)
-            epoch (long (:epoch msg))
-            burn (long (:burn msg))
-            topic (str (or (:topic msg) ""))
-            home-node (:home-node msg)
-            wire-dac (or (:dac msg) (get msg "dac"))
-            dac-check (when wire-dac
-                        (verify-dac wire-dac {:expected-agent-pubkey caller
-                                              :current-epoch (:epoch state)
-                                              :revoked-dac-ids (:revoked-dacs state)}))]
-        (if (and wire-dac (not (:ok? dac-check)))
-          {:state state :net-envelopes [] :stdout-events []}
-          (let [dac-id (when (and wire-dac (:ok? dac-check))
-                         (or (:dac-id (:dac dac-check)) (get (:dac dac-check) "dac_id")))
-                suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
-                header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn topic home-node dac-id suites)
-                caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                suite-neg (sealed/negotiate-crypto-suite (or suites [sealed/suite-v1-chacha20poly1305])
-                                                         (or (:crypto-suites state) sealed/default-crypto-suites))
-                valid-sig? (and (:ok? suite-neg)
-                                caller-pub sig-bytes
-                                (crypto/verify caller-pub (fressian/utf8->bytes header-str) sig-bytes))]
-            (if-not valid-sig?
+      (let [msg-net (or (:network-uri msg) (get msg "network_uri") (get msg "network-uri"))
+            st-net (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+            network-mismatch? (or (and (string? msg-net) (string? st-net)
+                                       (not= (str/trim msg-net) (str/trim st-net)))
+                                  (and (= st-net "mainnet.bitecho.org") (str/blank? (str msg-net))))]
+        (if network-mismatch?
+          {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+           :net-envelopes []
+           :stdout-events []}
+          (let [caller (:caller msg)
+                callee (:callee msg)
+                offer-hash (:offer-hash msg)
+                epoch (long (:epoch msg))
+                burn (long (:burn msg))
+                topic (str (or (:topic msg) ""))
+                home-node (:home-node msg)
+                wire-dac (or (:dac msg) (get msg "dac"))
+                dac-check (when wire-dac
+                            (verify-dac wire-dac {:expected-agent-pubkey caller
+                                                  :current-epoch (:epoch state)
+                                                  :revoked-dac-ids (:revoked-dacs state)}))]
+            (if (and wire-dac (not (:ok? dac-check)))
               {:state state :net-envelopes [] :stdout-events []}
-              (let [pol (or (:rendezvous-policy state)
-                            {:auto-accept? false :min-burn 0 :price 10 :allowlist #{} :home-node "default-home"})
-                    min-burn (long (or (:min-burn pol) 0))
-                    allowlist (or (:allowlist pol) #{})
-                    rejected-allowlist? (and (seq allowlist) (not (contains? (set allowlist) caller)))
-                    rejected-burn? (< burn min-burn)]
-                (if (or rejected-allowlist? rejected-burn?)
+              (let [dac-id (when (and wire-dac (:ok? dac-check))
+                             (or (:dac-id (:dac dac-check)) (get (:dac dac-check) "dac_id")))
+                    suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
+                    header-str (canonical-rendezvous-header-str caller callee offer-hash epoch burn topic home-node dac-id suites)
+                    caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
+                    sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                    suite-neg (sealed/negotiate-crypto-suite (or suites [sealed/suite-v1-chacha20poly1305])
+                                                             (or (:crypto-suites state) sealed/default-crypto-suites))
+                    valid-sig? (and (:ok? suite-neg)
+                                    caller-pub sig-bytes
+                                    (crypto/verify caller-pub (fressian/utf8->bytes header-str) sig-bytes))]
+                (if-not valid-sig?
                   {:state state :net-envelopes [] :stdout-events []}
-                  (let [clean-header (cond-> (select-keys msg [:bitecho/type :type :caller :callee :offer-hash :epoch :burn :topic :home-node :signature :crypto-suites :subnet-id])
-                                       (:selected-suite suite-neg) (assoc :selected-suite (:selected-suite suite-neg))
-                                       (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))
-                        caller-pname (pubkey->petname state caller)
-                        header-evt (cond-> {"event" "rendezvous-header-received"
-                                            "offer_hash" offer-hash
-                                            "from" caller
-                                            "burn" burn
-                                            "topic" topic}
-                                     caller-pname (assoc "from_petname" caller-pname))]
-                    (if (or (:auto-accept? pol) (:autonomous? state))
-                      (let [ack-res (callee-issue-rendezvous-ack state clean-header privkey-bytes)]
-                        {:state (:state ack-res)
-                         :net-envelopes (:net-envelopes ack-res)
-                         :stdout-events [header-evt]})
-                      {:state (assoc-in state [:pending-rendezvous offer-hash] clean-header)
-                       :net-envelopes []
-                       :stdout-events [header-evt]})))))))))
+                  (let [pol (or (:rendezvous-policy state)
+                                {:auto-accept? false :min-burn 0 :price 10 :allowlist #{} :home-node "default-home"})
+                        min-burn (long (or (:min-burn pol) 0))
+                        allowlist (or (:allowlist pol) #{})
+                        rejected-allowlist? (and (seq allowlist) (not (contains? (set allowlist) caller)))
+                        rejected-burn? (< burn min-burn)]
+                    (if (or rejected-allowlist? rejected-burn?)
+                      {:state state :net-envelopes [] :stdout-events []}
+                      (let [clean-header (cond-> (select-keys msg [:bitecho/type :type :caller :callee :offer-hash :epoch :burn :topic :home-node :signature :crypto-suites :subnet-id])
+                                           (:selected-suite suite-neg) (assoc :selected-suite (:selected-suite suite-neg))
+                                           (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))
+                            caller-pname (pubkey->petname state caller)
+                            header-evt (cond-> {"event" "rendezvous-header-received"
+                                                "offer_hash" offer-hash
+                                                "from" caller
+                                                "burn" burn
+                                                "topic" topic}
+                                         caller-pname (assoc "from_petname" caller-pname))]
+                        (if (or (:auto-accept? pol) (:autonomous? state))
+                          (let [ack-res (callee-issue-rendezvous-ack state clean-header privkey-bytes)]
+                            {:state (:state ack-res)
+                             :net-envelopes (:net-envelopes ack-res)
+                             :stdout-events [header-evt]})
+                          {:state (assoc-in state [:pending-rendezvous offer-hash] clean-header)
+                           :net-envelopes []
+                           :stdout-events [header-evt]})))))))))))
     (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
@@ -6076,129 +6172,138 @@
                  (integer? (:epoch msg))
                  (map? (:delivery-ack msg)))
       {:state state :net-envelopes [] :stdout-events []}
-      (let [offer-hash (:offer-hash msg)
-            outbound (get-in state [:outbound-rendezvous offer-hash])]
-        (if-not (and outbound
-                     (= (normalize-pubkey-hex (:callee msg)) (normalize-pubkey-hex (:callee outbound))))
-          {:state state :net-envelopes [] :stdout-events []}
-          (let [ack (:delivery-ack msg)
-                ack-valid? (and (map? ack)
-                                (= (:offer-hash ack) offer-hash)
-                                (= (normalize-pubkey-hex (:callee ack)) (normalize-pubkey-hex (:callee msg)))
-                                (rendezvous/verify-delivery-ack ack (:callee msg)))
-                ack-sig (str (or (:signature ack) (get ack "signature") ""))
-                callee-x25519 (:callee-x25519 msg)
-                epoch (long (:epoch msg))
-                raw-sel-suite (or (:selected-suite msg) (:suite msg))
-                sel-str (when raw-sel-suite (if (keyword? raw-sel-suite) (name raw-sel-suite) (str raw-sel-suite)))
-                offered-suites (set (map #(if (keyword? %) (name %) (str %))
-                                         (or (:crypto-suites outbound) sealed/default-crypto-suites)))
-                suite-valid? (if sel-str
-                               (and (contains? offered-suites sel-str)
-                                    (contains? sealed/supported-crypto-suites sel-str))
-                               (contains? offered-suites sealed/suite-v1-chacha20poly1305))
-                effective-suite (or sel-str sealed/suite-v1-chacha20poly1305)
-                ack-str (canonical-rendezvous-ack-str (:caller msg) (:callee msg) offer-hash callee-x25519 epoch ack-sig sel-str)
-                callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                sig-valid? (and suite-valid?
-                                callee-pub sig-bytes
-                                (crypto/verify callee-pub (fressian/utf8->bytes ack-str) sig-bytes))]
-            (if-not (and ack-valid? sig-valid?)
+      (let [msg-net (or (:network-uri msg) (get msg "network_uri") (get msg "network-uri"))
+            st-net (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+            network-mismatch? (or (and (string? msg-net) (string? st-net)
+                                       (not= (str/trim msg-net) (str/trim st-net)))
+                                  (and (= st-net "mainnet.bitecho.org") (str/blank? (str msg-net))))]
+        (if network-mismatch?
+          {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+           :net-envelopes []
+           :stdout-events []}
+          (let [offer-hash (:offer-hash msg)
+                outbound (get-in state [:outbound-rendezvous offer-hash])]
+            (if-not (and outbound
+                         (= (normalize-pubkey-hex (:callee msg)) (normalize-pubkey-hex (:callee outbound))))
               {:state state :net-envelopes [] :stdout-events []}
-              (let [session-id (:session-id outbound)
-                    callee-eph (try (basalt/hex->bytes callee-x25519) (catch #?(:clj Exception :cljs :default) _ nil))
-                    keys (when callee-eph
-                           (sealed/derive-session-keys (:caller-x25519-priv outbound) callee-eph
-                                                       (:caller outbound) (:callee outbound)
-                                                       offer-hash :initiator))]
-                (if-not keys
+              (let [ack (:delivery-ack msg)
+                    ack-valid? (and (map? ack)
+                                    (= (:offer-hash ack) offer-hash)
+                                    (= (normalize-pubkey-hex (:callee ack)) (normalize-pubkey-hex (:callee msg)))
+                                    (rendezvous/verify-delivery-ack ack (:callee msg)))
+                    ack-sig (str (or (:signature ack) (get ack "signature") ""))
+                    callee-x25519 (:callee-x25519 msg)
+                    epoch (long (:epoch msg))
+                    raw-sel-suite (or (:selected-suite msg) (:suite msg))
+                    sel-str (when raw-sel-suite (if (keyword? raw-sel-suite) (name raw-sel-suite) (str raw-sel-suite)))
+                    offered-suites (set (map #(if (keyword? %) (name %) (str %))
+                                             (or (:crypto-suites outbound) sealed/default-crypto-suites)))
+                    suite-valid? (if sel-str
+                                   (and (contains? offered-suites sel-str)
+                                        (contains? sealed/supported-crypto-suites sel-str))
+                                   (contains? offered-suites sealed/suite-v1-chacha20poly1305))
+                    effective-suite (or sel-str sealed/suite-v1-chacha20poly1305)
+                    ack-str (canonical-rendezvous-ack-str (:caller msg) (:callee msg) offer-hash callee-x25519 epoch ack-sig sel-str)
+                    callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                    sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                    sig-valid? (and suite-valid?
+                                    callee-pub sig-bytes
+                                    (crypto/verify callee-pub (fressian/utf8->bytes ack-str) sig-bytes))]
+                (if-not (and ack-valid? sig-valid?)
                   {:state state :net-envelopes [] :stdout-events []}
-                  (let [sub-id (str (or (:subnet-id outbound) (:subnet-id state) "global"))
-                        reveal-str (canonical-rendezvous-reveal-str session-id (:pubkey state) (:callee outbound)
-                                                                    offer-hash (:caller-x25519-pub outbound) (:epoch state))
-                        reveal-sig (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes reveal-str)))
-                        reveal-payload {:protocol-version current-wire-version
-                                        :wire-format current-wire-format
-                                        :subnet-id sub-id
-                                        :bitecho/type :rendezvous-reveal
-                                        :type :rendezvous-reveal
-                                        :session-id session-id
-                                        :caller (:pubkey state)
-                                        :callee (:callee outbound)
-                                        :offer-hash offer-hash
-                                        :caller-x25519 (:caller-x25519-pub outbound)
-                                        :epoch (:epoch state)
-                                        :signature reveal-sig}
-                        reveal-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload reveal-payload) 500 sub-id)
-                        initial-text (:initial-text outbound)
-                        [session-with-tx net-envs]
-                        (if (and initial-text (not (str/blank? initial-text)))
-                          (let [text-bytes (fressian/utf8->bytes initial-text)
-                                seq-num 1
-                                sealed-m (sealed/seal-message (:tx-key keys) seq-num text-bytes (fressian/utf8->bytes session-id) effective-suite)
-                                msg-payload {:protocol-version current-wire-version
-                                             :wire-format current-wire-format
-                                             :subnet-id sub-id
-                                             :bitecho/type :sealed-message
-                                             :session-id session-id
-                                             :sender (:pubkey state)
-                                             :recipient (:callee outbound)
-                                             :epoch (long (or (:epoch outbound) (:epoch state) 0))
-                                             :seq seq-num
-                                             :suite effective-suite
-                                             :nonce (basalt/bytes->hex (:nonce sealed-m))
-                                             :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
-                                msg-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) 500 sub-id)]
-                            [{:session-id session-id
-                              :peer (:callee outbound)
-                              :role :initiator
-                              :state "open"
-                              :tx-seq seq-num
-                              :acked-seq 0
-                              :rx-high-seq 0
-                              :contiguous-rx-seq 0
-                              :replays-deduped 0
-                              :outbox-evicted 0
-                              :outbox {seq-num {:seq seq-num :msg-payload msg-payload :burn 500 :gossip-env msg-env}}
-                              :outbox-order [seq-num]
-                              :epoch (long (or (:epoch outbound) (:epoch state) 0))
-                              :tx-key (:tx-key keys)
-                              :rx-key (:rx-key keys)
-                              :suite effective-suite
-                              :replay-window (sealed/init-replay-window)}
-                             [reveal-env msg-env]])
-                          [{:session-id session-id
-                            :peer (:callee outbound)
-                            :role :initiator
-                            :state "open"
-                            :tx-seq 0
-                            :acked-seq 0
-                            :rx-high-seq 0
-                            :contiguous-rx-seq 0
-                            :replays-deduped 0
-                            :outbox-evicted 0
-                            :outbox {}
-                            :outbox-order []
-                            :epoch (long (or (:epoch outbound) (:epoch state) 0))
-                            :tx-key (:tx-key keys)
-                            :rx-key (:rx-key keys)
-                            :suite effective-suite
-                            :replay-window (sealed/init-replay-window)}
-                           [reveal-env]])
-                        new-state (-> state
-                                      (update :outbound-rendezvous dissoc offer-hash)
-                                      (assoc-in [:sessions session-id] session-with-tx)
-                                      (update :vouchers (fnil conj []) (into {} ack)))
-                        callee-pname (pubkey->petname state (:callee outbound))
-                        est-evt (cond-> {"event" "rendezvous-session-established"
-                                         "session_id" session-id
-                                         "peer" (:callee outbound)
-                                         "offer_hash" offer-hash}
-                                  callee-pname (assoc "peer_petname" callee-pname))]
-                    {:state new-state
-                     :net-envelopes net-envs
-                     :stdout-events [est-evt]}))))))))
+                  (let [session-id (:session-id outbound)
+                        callee-eph (try (basalt/hex->bytes callee-x25519) (catch #?(:clj Exception :cljs :default) _ nil))
+                        keys (when callee-eph
+                               (sealed/derive-session-keys (:caller-x25519-priv outbound) callee-eph
+                                                           (:caller outbound) (:callee outbound)
+                                                           offer-hash :initiator))]
+                    (if-not keys
+                      {:state state :net-envelopes [] :stdout-events []}
+                      (let [sub-id (str (or (:subnet-id outbound) (:subnet-id state) "global"))
+                            reveal-str (canonical-rendezvous-reveal-str session-id (:pubkey state) (:callee outbound)
+                                                                        offer-hash (:caller-x25519-pub outbound) (:epoch state))
+                            reveal-sig (basalt/bytes->hex (crypto/sign privkey-bytes (fressian/utf8->bytes reveal-str)))
+                            reveal-payload {:protocol-version current-wire-version
+                                            :wire-format current-wire-format
+                                            :subnet-id sub-id
+                                            :bitecho/type :rendezvous-reveal
+                                            :type :rendezvous-reveal
+                                            :session-id session-id
+                                            :caller (:pubkey state)
+                                            :callee (:callee outbound)
+                                            :offer-hash offer-hash
+                                            :caller-x25519 (:caller-x25519-pub outbound)
+                                            :epoch (:epoch state)
+                                            :signature reveal-sig}
+                            reveal-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload reveal-payload) 500 sub-id)
+                            initial-text (:initial-text outbound)
+                            [session-with-tx net-envs]
+                            (if (and initial-text (not (str/blank? initial-text)))
+                              (let [text-bytes (fressian/utf8->bytes initial-text)
+                                    seq-num 1
+                                    sealed-m (sealed/seal-message (:tx-key keys) seq-num text-bytes (fressian/utf8->bytes session-id) effective-suite)
+                                    msg-payload {:protocol-version current-wire-version
+                                                 :wire-format current-wire-format
+                                                 :subnet-id sub-id
+                                                 :bitecho/type :sealed-message
+                                                 :session-id session-id
+                                                 :sender (:pubkey state)
+                                                 :recipient (:callee outbound)
+                                                 :epoch (long (or (:epoch outbound) (:epoch state) 0))
+                                                 :seq seq-num
+                                                 :suite effective-suite
+                                                 :nonce (basalt/bytes->hex (:nonce sealed-m))
+                                                 :ciphertext (basalt/bytes->hex (:ciphertext sealed-m))}
+                                    msg-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload msg-payload) 500 sub-id)]
+                                [{:session-id session-id
+                                  :peer (:callee outbound)
+                                  :role :initiator
+                                  :state "open"
+                                  :tx-seq seq-num
+                                  :acked-seq 0
+                                  :rx-high-seq 0
+                                  :contiguous-rx-seq 0
+                                  :replays-deduped 0
+                                  :outbox-evicted 0
+                                  :outbox {seq-num {:seq seq-num :msg-payload msg-payload :burn 500 :gossip-env msg-env}}
+                                  :outbox-order [seq-num]
+                                  :epoch (long (or (:epoch outbound) (:epoch state) 0))
+                                  :tx-key (:tx-key keys)
+                                  :rx-key (:rx-key keys)
+                                  :suite effective-suite
+                                  :replay-window (sealed/init-replay-window)}
+                                 [reveal-env msg-env]])
+                              [{:session-id session-id
+                                :peer (:callee outbound)
+                                :role :initiator
+                                :state "open"
+                                :tx-seq 0
+                                :acked-seq 0
+                                :rx-high-seq 0
+                                :contiguous-rx-seq 0
+                                :replays-deduped 0
+                                :outbox-evicted 0
+                                :outbox {}
+                                :outbox-order []
+                                :epoch (long (or (:epoch outbound) (:epoch state) 0))
+                                :tx-key (:tx-key keys)
+                                :rx-key (:rx-key keys)
+                                :suite effective-suite
+                                :replay-window (sealed/init-replay-window)}
+                               [reveal-env]])
+                            new-state (-> state
+                                          (update :outbound-rendezvous dissoc offer-hash)
+                                          (assoc-in [:sessions session-id] session-with-tx)
+                                          (update :vouchers (fnil conj []) (into {} ack)))
+                            callee-pname (pubkey->petname state (:callee outbound))
+                            est-evt (cond-> {"event" "rendezvous-session-established"
+                                             "session_id" session-id
+                                             "peer" (:callee outbound)
+                                             "offer_hash" offer-hash}
+                                      callee-pname (assoc "peer_petname" callee-pname))]
+                        {:state new-state
+                         :net-envelopes net-envs
+                         :stdout-events [est-evt]}))))))))))
     (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 
@@ -6217,84 +6322,93 @@
                  (string? (:signature msg)) (not (str/blank? (:signature msg)))
                  (integer? (:epoch msg)))
       {:state state :net-envelopes [] :stdout-events []}
-      (let [offer-hash (:offer-hash msg)
-            pending (get-in state [:pending-rendezvous-accepts offer-hash])]
-        (if-not (and pending
-                     (= (normalize-pubkey-hex (:caller msg)) (normalize-pubkey-hex (:caller pending))))
-          {:state state :net-envelopes [] :stdout-events []}
-          (let [caller (:caller msg)
-                callee (:callee msg)
-                caller-x25519 (:caller-x25519 msg)
-                sid (:session-id msg)
-                header (:header pending)
-                expected-sid (compute-session-id caller callee caller-x25519)
-                offer-base {:session-id sid
-                            :caller caller
-                            :callee callee
-                            :caller-ephemeral-pub caller-x25519
-                            :epoch (:epoch header)
-                            :price (:burn header)
-                            :burn (:burn header)
-                            :home-node (:home-node header)
-                            :crypto-suites (:crypto-suites header)
-                            :dac (:dac header)
-                            :subnet-id (:subnet-id header)}
-                commitment-valid? (and (= sid expected-sid)
-                                       (matching-offer-hash? offer-base state offer-hash))]
-            (if-not commitment-valid?
+      (let [msg-net (or (:network-uri msg) (get msg "network_uri") (get msg "network-uri"))
+            st-net (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+            network-mismatch? (or (and (string? msg-net) (string? st-net)
+                                       (not= (str/trim msg-net) (str/trim st-net)))
+                                  (and (= st-net "mainnet.bitecho.org") (str/blank? (str msg-net))))]
+        (if network-mismatch?
+          {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+           :net-envelopes []
+           :stdout-events []}
+          (let [offer-hash (:offer-hash msg)
+                pending (get-in state [:pending-rendezvous-accepts offer-hash])]
+            (if-not (and pending
+                         (= (normalize-pubkey-hex (:caller msg)) (normalize-pubkey-hex (:caller pending))))
               {:state state :net-envelopes [] :stdout-events []}
-              (let [reveal-str (canonical-rendezvous-reveal-str sid caller callee offer-hash caller-x25519 (long (:epoch msg)))
-                    caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
-                    sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                    sig-valid? (and caller-pub sig-bytes
-                                    (crypto/verify caller-pub (fressian/utf8->bytes reveal-str) sig-bytes))]
-                (if-not sig-valid?
+              (let [caller (:caller msg)
+                    callee (:callee msg)
+                    caller-x25519 (:caller-x25519 msg)
+                    sid (:session-id msg)
+                    header (:header pending)
+                    expected-sid (compute-session-id caller callee caller-x25519)
+                    offer-base {:session-id sid
+                                :caller caller
+                                :callee callee
+                                :caller-ephemeral-pub caller-x25519
+                                :epoch (:epoch header)
+                                :price (:burn header)
+                                :burn (:burn header)
+                                :home-node (:home-node header)
+                                :crypto-suites (:crypto-suites header)
+                                :dac (:dac header)
+                                :subnet-id (:subnet-id header)}
+                    commitment-valid? (and (= sid expected-sid)
+                                           (matching-offer-hash? offer-base state offer-hash))]
+                (if-not commitment-valid?
                   {:state state :net-envelopes [] :stdout-events []}
-                  (let [caller-eph (try (basalt/hex->bytes caller-x25519) (catch #?(:clj Exception :cljs :default) _ nil))
-                        keys (when caller-eph
-                               (sealed/derive-session-keys (:callee-x25519-priv pending) caller-eph
-                                                           caller callee offer-hash :responder))]
-                    (if-not keys
+                  (let [reveal-str (canonical-rendezvous-reveal-str sid caller callee offer-hash caller-x25519 (long (:epoch msg)))
+                        caller-pub (try (basalt/hex->bytes caller) (catch #?(:clj Exception :cljs :default) _ nil))
+                        sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                        sig-valid? (and caller-pub sig-bytes
+                                        (crypto/verify caller-pub (fressian/utf8->bytes reveal-str) sig-bytes))]
+                    (if-not sig-valid?
                       {:state state :net-envelopes [] :stdout-events []}
-                      (let [session-entry {:session-id sid
-                                           :peer caller
-                                           :role :responder
-                                           :state "open"
-                                           :tx-seq 0
-                                           :acked-seq 0
-                                           :rx-high-seq 0
-                                           :contiguous-rx-seq 0
-                                           :replays-deduped 0
-                                           :outbox-evicted 0
-                                           :outbox {}
-                                           :outbox-order []
-                                           :epoch (long (or (:epoch header) (:epoch state) 0))
-                                           :tx-key (:tx-key keys)
-                                           :rx-key (:rx-key keys)
-                                           :suite (or (:selected-suite pending) (:selected-suite header) (first (:crypto-suites header)) sealed/suite-v1-chacha20poly1305)
-                                           :replay-window (sealed/init-replay-window)}
-                            new-state (-> state
-                                          (update :pending-rendezvous-accepts dissoc offer-hash)
-                                          (assoc-in [:sessions sid] session-entry))
-                            caller-pname (pubkey->petname state caller)
-                            est-evt (cond-> {"event" "rendezvous-session-established"
-                                             "session_id" sid
-                                             "peer" caller
-                                             "offer_hash" offer-hash}
-                                      caller-pname (assoc "peer_petname" caller-pname))
-                            early-msgs (get-in state [:early-sealed-messages sid] [])
-                            state-after-clear (update new-state :early-sealed-messages dissoc sid)
-                            [final-state replayed-envs replayed-events]
-                            (reduce (fn [[cur-st acc-envs acc-evts] early-msg]
-                                      (let [res (handle-wire-sealed-msg cur-st early-msg privkey-bytes)]
-                                        [(:state res)
-                                         (into acc-envs (:net-envelopes res))
-                                         (into acc-evts (:stdout-events res))]))
-                                    [state-after-clear [] [est-evt]]
-                                    early-msgs)]
-                        {:state final-state
-                         :net-envelopes replayed-envs
-                         :stdout-events replayed-events}))))))))))
+                      (let [caller-eph (try (basalt/hex->bytes caller-x25519) (catch #?(:clj Exception :cljs :default) _ nil))
+                            keys (when caller-eph
+                                   (sealed/derive-session-keys (:callee-x25519-priv pending) caller-eph
+                                                               caller callee offer-hash :responder))]
+                        (if-not keys
+                          {:state state :net-envelopes [] :stdout-events []}
+                          (let [session-entry {:session-id sid
+                                               :peer caller
+                                               :role :responder
+                                               :state "open"
+                                               :tx-seq 0
+                                               :acked-seq 0
+                                               :rx-high-seq 0
+                                               :contiguous-rx-seq 0
+                                               :replays-deduped 0
+                                               :outbox-evicted 0
+                                               :outbox {}
+                                               :outbox-order []
+                                               :epoch (long (or (:epoch header) (:epoch state) 0))
+                                               :tx-key (:tx-key keys)
+                                               :rx-key (:rx-key keys)
+                                               :suite (or (:selected-suite pending) (:selected-suite header) (first (:crypto-suites header)) sealed/suite-v1-chacha20poly1305)
+                                               :replay-window (sealed/init-replay-window)}
+                                new-state (-> state
+                                              (update :pending-rendezvous-accepts dissoc offer-hash)
+                                              (assoc-in [:sessions sid] session-entry))
+                                caller-pname (pubkey->petname state caller)
+                                est-evt (cond-> {"event" "rendezvous-session-established"
+                                                 "session_id" sid
+                                                 "peer" caller
+                                                 "offer_hash" offer-hash}
+                                          caller-pname (assoc "peer_petname" caller-pname))
+                                early-msgs (get-in state [:early-sealed-messages sid] [])
+                                state-after-clear (update new-state :early-sealed-messages dissoc sid)
+                                [final-state replayed-envs replayed-events]
+                                (reduce (fn [[cur-st acc-envs acc-evts] early-msg]
+                                          (let [res (handle-wire-sealed-msg cur-st early-msg privkey-bytes)]
+                                            [(:state res)
+                                             (into acc-envs (:net-envelopes res))
+                                             (into acc-evts (:stdout-events res))]))
+                                        [state-after-clear [] [est-evt]]
+                                        early-msgs)]
+                            {:state final-state
+                             :net-envelopes replayed-envs
+                             :stdout-events replayed-events}))))))))))))
     (catch #?(:clj Exception :cljs :default) _
       {:state state :net-envelopes [] :stdout-events []})))
 

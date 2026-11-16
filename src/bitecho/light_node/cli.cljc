@@ -82,7 +82,8 @@
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
   ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--subnet-id" "--subnet"
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
-   "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--after-ts"
+   "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
+   "--after-ts" "--min-balance"
    "--ingress-tcp-port" "--trusted-dac-anchors" "--turn-server" "--turn-username"
    "--turn-password" "--turn-realm" "--turn-force-relay" "--sync-interval-ms" "--price"
    "--price-max" "--burn" "--to" "--from" "--callee" "--peer" "--receiver" "--recipient"
@@ -275,13 +276,15 @@
                        (extract-flag-value clean-tokens "--to" nil))
             price (extract-long-flag clean-tokens "--price" 0)
             burn (extract-long-flag clean-tokens "--burn" 500)
+            min-bal (extract-long-flag clean-tokens "--min-balance" nil)
             hn (extract-flag-value clean-tokens "--home-node" nil)
             wait-open-ms (extract-long-flag clean-tokens "--wait-open-ms" nil)
             m {"cmd" "offer" "callee" callee "price" price "burn" burn}]
         (cond-> m
           callee (assoc "to" callee)
           hn (assoc "home_node" hn)
-          (some? wait-open-ms) (assoc "wait_open_ms" wait-open-ms)))
+          (some? wait-open-ms) (assoc "wait_open_ms" wait-open-ms)
+          min-bal (assoc "min_balance" min-bal)))
 
       "accept"
       {"cmd" "accept"
@@ -303,11 +306,13 @@
                     (extract-flag-value clean-tokens "--text" nil))
             hex (extract-flag-value clean-tokens "--payload-hex" nil)
             burn (extract-long-flag clean-tokens "--burn" 500)
+            min-bal (extract-long-flag clean-tokens "--min-balance" nil)
             m {"cmd" "send" "session_id" sid "burn" burn}]
         (cond-> m
           to (assoc "to" to)
           msg (assoc "text" msg "message" msg)
-          hex (assoc "payload_hex" hex)))
+          hex (assoc "payload_hex" hex)
+          min-bal (assoc "min_balance" min-bal)))
 
       "transfer"
       (let [recv (or (extract-flag-value clean-tokens "--receiver" nil)
@@ -316,9 +321,11 @@
             amt (extract-long-flag clean-tokens "--amount" 0)
             seq-num (extract-long-flag clean-tokens "--seq" nil)
             burn (extract-long-flag clean-tokens "--burn" 500)
+            min-bal (extract-long-flag clean-tokens "--min-balance" nil)
             m {"cmd" "transfer" "receiver" recv "recipient" recv "amount" amt "burn" burn}]
         (cond-> m
-          seq-num (assoc "seq" seq-num)))
+          seq-num (assoc "seq" seq-num)
+          min-bal (assoc "min_balance" min-bal)))
 
       "account"
       (let [sync? (has-flag? clean-tokens "--sync")
@@ -413,11 +420,13 @@
             sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil))
             b (extract-long-flag clean-tokens "--burn" nil)
+            min-bal (extract-long-flag clean-tokens "--min-balance" nil)
             m {"cmd" "broadcast"}]
         (cond-> m
           t (assoc "text" t)
           sub (assoc "subnet_id" sub)
-          (some? b) (assoc "burn" b)))
+          (some? b) (assoc "burn" b)
+          min-bal (assoc "min_balance" min-bal)))
 
       "rendezvous-policy"
       (let [min-burn (extract-long-flag clean-tokens "--min-burn" nil)
@@ -442,6 +451,7 @@
       (let [callee (or (extract-flag-value clean-tokens "--callee" nil)
                        (extract-flag-value clean-tokens "--to" nil))
             burn (extract-long-flag clean-tokens "--burn" nil)
+            min-bal (extract-long-flag clean-tokens "--min-balance" nil)
             topic (extract-flag-value clean-tokens "--topic" nil)
             hn (extract-flag-value clean-tokens "--home-node" nil)
             text (extract-flag-value clean-tokens "--text" nil)
@@ -450,7 +460,8 @@
           burn (assoc "burn" burn)
           topic (assoc "topic" topic)
           hn (assoc "home_node" hn)
-          text (assoc "text" text)))
+          text (assoc "text" text)
+          min-bal (assoc "min_balance" min-bal)))
 
       "rendezvous-accept"
       (let [oh (extract-flag-value clean-tokens "--offer-hash" nil)
@@ -589,12 +600,17 @@
       (let [t (or (extract-long-flag clean-tokens "--timeout-ms" nil)
                   (extract-long-flag clean-tokens "--timeout" nil))
             ms (extract-long-flag clean-tokens "--min-seq" nil)
+            bcast-seq (extract-long-flag clean-tokens "--min-broadcast-seq" nil)
+            sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil))
             block? (or (has-flag? clean-tokens "--block")
                        (has-flag? clean-tokens "--until-event"))
             peek? (has-flag? clean-tokens "--peek")
             m {"cmd" "wait" "timeout_ms" (or t 30000)}]
         (cond-> m
           ms (assoc "min_seq" ms)
+          bcast-seq (assoc "min_broadcast_seq" bcast-seq)
+          sub (assoc "subnet_id" sub)
           block? (assoc "block" true)
           peek? (assoc "peek" true)))
 

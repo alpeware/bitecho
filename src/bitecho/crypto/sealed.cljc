@@ -1006,13 +1006,19 @@
         suites (or (:crypto-suites offer-map) (get offer-map "crypto_suites") (get offer-map "crypto-suites"))
         suites-str (when (seq suites)
                      (str/join "," (map #(if (keyword? %) (name %) (str %)) suites)))
+        net-uri (or (:network-uri offer-map) (get offer-map "network_uri") (get offer-map "network-uri"))
+        net-str (when (and (string? net-uri) (not (str/blank? net-uri)))
+                  (str/trim net-uri))
         base-str (str "bitecho-sealed-offer-v1|" sid "|" caller "|" callee "|" eph "|" epoch "|" price "|" hn-str)
         with-suites (if (seq suites-str)
                       (str base-str "|" suites-str)
                       base-str)
-        canonical-str (if (and dac (seq (str dac-id)))
-                        (str with-suites "|" dac-id)
-                        with-suites)]
+        with-dac (if (and dac (seq (str dac-id)))
+                   (str with-suites "|" dac-id)
+                   with-suites)
+        canonical-str (if net-str
+                        (str with-dac "|net:" net-str)
+                        with-dac)]
     (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes canonical-str)))))
 
 ;; -----------------------------------------------------------------------------
