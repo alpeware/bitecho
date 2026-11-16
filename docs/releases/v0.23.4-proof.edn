@@ -56,7 +56,7 @@
   :foreign-subnet-dropped? true,
   :passed? true},
  :node-bundle-sha256
- "cbd986c8108ccbfd820901158b2f24df8554619982d39f3ce72a9a376610e7be",
+ "2c8d97181c6c98edae9defc47a64ede4b9ee6a2212913aca6cff7edad7bba62c",
  :networks
  {"devnet.bitecho.org"
   {:network :devnet,
@@ -144,8 +144,8 @@
    {:scenario "S24",
     :name "sea-build-script-and-skill-regrounding",
     :passed? true}]},
- :commit-sha "643b389800577c2d52c7e5ecfb1a0742f31f3738",
+ :commit-sha "e616ded3c2a467d7e962d48a5d0f08975c80c02d",
  :version "v0.23.4",
  :browser-bundle-sha256
- "dffa22558ea09080a0006c1dabb305476e4a8584237916e2652a7188731a0cb4",
- :tree-sha "727197b96632c095156c429cdb910fecd2a5a4c9"}
+ "99005965d85d07d3e125405ce93fc6c25c64cae0b908d58c5288a421c50e13b0",
+ :tree-sha "9a2e9bbfbd29e0e01b16193960f44740bf79b3c1"}
