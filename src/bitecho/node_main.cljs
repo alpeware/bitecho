@@ -729,7 +729,9 @@
                                 (cond-> {"cmd" "inbox"}
                                   sub (assoc "subnet_id" sub)))
                    "offer"    (let [m {"cmd" "offer"
-                                       "callee" (extract-flag-value args "--callee" nil)
+                                       "callee" (or (extract-flag-value args "--callee" nil)
+                                                    (extract-flag-value args "--peer" nil)
+                                                    (extract-flag-value args "--to" nil))
                                        "price" (extract-long-flag args "--price" 0)
                                        "burn" (extract-long-flag args "--burn" 500)}
                                     hn (extract-flag-value args "--home-node" nil)
@@ -2210,18 +2212,45 @@
    rotating through candidates and invoking `(cb res)`."
   [identity bootstrap-descriptor opts cb]
   (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
-    (cb {:ok? true
-         :node nil
-         :validator-id :http-relay
-         :transport :http-relay
-         :failover-attempts 0
-         :failed-nodes []
-         :send-fn (fn [env send-cb]
-                    (submit-relay-envelope! (:relay-url opts) env opts
-                                            (fn [r]
-                                              (let [ok? (true? (or (get r "ok") (:ok r)))]
-                                                (when (fn? send-cb) (send-cb ok?))
-                                                ok?))))})
+    (let [queue-atom (atom #queue [])
+          in-flight? (atom false)
+          state-atom (:state-atom opts)
+          relay-url (:relay-url opts)
+          drain! (fn drain! []
+                   (if (empty? @queue-atom)
+                     (reset! in-flight? false)
+                     (let [[env send-cb] (peek @queue-atom)]
+                       (submit-relay-envelope!
+                        relay-url env opts
+                        (fn [r]
+                          (let [ok? (true? (or (get r "ok") (:ok r)))]
+                            (when-not ok?
+                              (record-conn-diagnostic! state-atom :validator-relay-send-failed {:error (or (get r "error") (:error r) "relay-send-failed")}))
+                            (when (fn? send-cb)
+                              (try (send-cb ok?) (catch :default _ nil)))
+                            (swap! queue-atom pop)
+                            (drain!)))))))
+          send-fn (fn send-fn
+                    ([env]
+                     (send-fn env nil))
+                    ([env send-cb]
+                     (if (>= (count @queue-atom) 256)
+                       (do
+                         (record-conn-diagnostic! state-atom :validator-relay-queue-overflow {:max 256})
+                         (when (fn? send-cb) (send-cb false))
+                         false)
+                       (do
+                         (swap! queue-atom conj [env send-cb])
+                         (when (compare-and-set! in-flight? false true)
+                           (drain!))
+                         true))))]
+      (cb {:ok? true
+           :node nil
+           :validator-id :http-relay
+           :transport :http-relay
+           :failover-attempts 0
+           :failed-nodes []
+           :send-fn send-fn}))
     (if-let [err (validate-node-fingerprints bootstrap-descriptor)]
       (cb err)
       (if-let [dialer (:dialer-fn opts)]
@@ -2239,17 +2268,11 @@
                         (dial-single-node!
                          identity node opts
                          (fn [res]
-                           (cond
-                             (:ok? res)
+                           (if (:ok? res)
                              (cb (assoc res
                                         :validator-id (:node-id node)
                                         :failover-attempts (count failed-nodes)
                                         :failed-nodes failed-nodes))
-
-                             (= (:error res) "bad-fingerprint")
-                             (cb res)
-
-                             :else
                              (step (rest rem-candidates)
                                    (conj failed-nodes {:validator-id (:node-id node)
                                                        :error (or (:error res) "listener-disabled")})))))
@@ -2263,7 +2286,9 @@
                           (if fallback-url
                             (connect-validators! identity bootstrap-descriptor (assoc opts :relay-url fallback-url) cb)
                             (cb {:ok? false
-                                 :error "listener-disabled"
+                                 :error (if (some #(= (:error %) "bad-fingerprint") failed-nodes)
+                                          "bad-fingerprint"
+                                          "listener-disabled")
                                  :failed-nodes failed-nodes})))))]
               (step candidates []))))))))
 
@@ -3125,7 +3150,9 @@
           (let [res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
                 _ (when-let [dial-info (:p2p-dial res)]
                     (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file))
-                needs-net? (seq (:net-envelopes res))]
+                shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
+                connect-explicit? (true? (or (get cmd-map "connect") (:connect cmd-map)))
+                needs-net? (and (seq (:net-envelopes res)) (if shuttle-verb? connect-explicit? true))]
             (if needs-net?
               (let [currently-live? (connection-live? @conn-atom @state-atom)
                     replay-envs (when (= verb "register-home-set")
@@ -3870,21 +3897,25 @@
                              (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
                                                   (when (and (string? u) (not (str/blank? u))) u))]
                                (let [relay-opts (assoc opts :timeout-ms (or (:timeout-ms opts) 5000))
-                                     promises (mapv (fn [env]
-                                                      (submit-relay-envelope! relay-url env relay-opts))
-                                                    (:net-envelopes res))]
-                                 (-> (js/Promise.all (clj->js promises))
-                                     (.then (fn [results]
-                                              (save-light-state! state-file new-state)
-                                              (let [res-clj (js->clj results :keywordize-keys true)
-                                                    failed (first (filter #(false? (or (get % :ok) (get % "ok"))) res-clj))]
-                                                (if failed
-                                                  (emit-json-line! {"ok" false "error" (or (:error failed) "relay-submit-failed")})
-                                                  (emit-json-line! (:response res))))
-                                              (.exit js/process 0)))
-                                     (.catch (fn [err]
-                                               (emit-json-line! {"ok" false "error" (str err)})
-                                               (.exit js/process 0)))))
+                                     envs (vec (:net-envelopes res))
+                                     step (fn step [idx]
+                                            (if (>= idx (count envs))
+                                              (do
+                                                (save-light-state! state-file new-state)
+                                                (emit-json-line! (:response res))
+                                                (.exit js/process 0))
+                                              (-> (submit-relay-envelope! relay-url (nth envs idx) relay-opts)
+                                                  (.then (fn [item-res]
+                                                           (let [res-map (if (map? item-res) item-res (js->clj item-res :keywordize-keys true))]
+                                                             (if (false? (or (:ok res-map) (get res-map "ok")))
+                                                               (do
+                                                                 (emit-json-line! {"ok" false "error" (or (:error res-map) "relay-submit-failed")})
+                                                                 (.exit js/process 0))
+                                                               (step (inc idx))))))
+                                                  (.catch (fn [err]
+                                                            (emit-json-line! {"ok" false "error" (str err)})
+                                                            (.exit js/process 0))))))]
+                                 (step 0))
                                (connect-validators!
                                 identity bootstrap opts
                                 (fn [conn-res]
@@ -3892,20 +3923,26 @@
                                     (do
                                       (emit-json-line! {"ok" false "error" (or (:error conn-res) "listener-disabled")})
                                       (.exit js/process 0))
-                                    (let [sent? (send-all-envelopes! (:send-fn conn-res) (:net-envelopes res))]
-                                      (js/setTimeout
-                                       (fn []
-                                         (when-let [n (:node conn-res)]
-                                           (try (api/close! n) (catch :default _ nil)))
-                                         (if sent?
-                                           (do
-                                             (save-light-state! state-file new-state)
-                                             (emit-json-line! (:response res))
-                                             (.exit js/process 0))
-                                           (do
-                                             (emit-json-line! {"ok" false "error" "connection-closed"})
-                                             (.exit js/process 0))))
-                                       50))))))
+                                    (let [send-fn (:send-fn conn-res)
+                                          envs (:net-envelopes res)
+                                          finish! (fn [sent?]
+                                                    (when-let [n (:node conn-res)]
+                                                      (try (api/close! n) (catch :default _ nil)))
+                                                    (if sent?
+                                                      (do
+                                                        (save-light-state! state-file new-state)
+                                                        (emit-json-line! (:response res))
+                                                        (.exit js/process 0))
+                                                      (do
+                                                        (emit-json-line! {"ok" false "error" "connection-closed"})
+                                                        (.exit js/process 0))))]
+                                      (if (= :http-relay (:transport conn-res))
+                                        (send-all-envelopes! send-fn envs (fn [sent?] (finish! sent?)))
+                                        (let [sent? (send-all-envelopes! send-fn envs)]
+                                          (js/setTimeout
+                                           (fn []
+                                             (finish! sent?))
+                                           50))))))))
                              (do
                                (save-light-state! state-file new-state)
                                (emit-json-line! (:response res))

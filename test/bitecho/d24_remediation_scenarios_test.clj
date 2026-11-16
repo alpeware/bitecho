@@ -34,6 +34,54 @@
   (let [p (Files/createTempDirectory "bitecho-d24-test-" (into-array FileAttribute []))]
     (.toFile p)))
 
+(defn ensure-bootstrap-fixtures!
+  "Returns {:edn-path string :txt-path string :fixture-edn-path string :fixture-txt-path string}
+   pointing to valid signed bootstrap descriptors. If devnet/bootstrap.edn and devnet/bootstrap.txt
+   exist on disk, verifies them and returns their paths. Also generates a self-contained temporary
+   DA-signed bootstrap.edn and bootstrap.txt fixture, verifying both to ensure test isolation
+   and hermetic execution on clean checkouts without devnet/."
+  []
+  (let [devnet-edn (io/file "devnet/bootstrap.edn")
+        devnet-txt (io/file "devnet/bootstrap.txt")
+        tmp-dir (make-tmp-dir!)
+        fixture-edn (io/file tmp-dir "bootstrap.edn")
+        fixture-txt (io/file tmp-dir "bootstrap.txt")
+        kp (crypto/generate-keypair)
+        pub (basalt/bytes->hex (:public kp))
+        desc {:network :devnet
+              :domain "bitecho.org"
+              :authority-pubkey pub
+              :epoch-duration-ms 10000
+              :issued-epoch 0
+              :expires-epoch 999999
+              :treasury-pubkey pub
+              :custody-pubkey pub
+              :directory-pubkey pub
+              :nodes {:val-1 {:node-id "val-1"
+                              :ip "127.0.0.1"
+                              :port 5000
+                              :agent-port 5010
+                              :pubkey pub
+                              :fingerprint "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+                              :ice-ufrag "testufrag"
+                              :ice-pwd "testpwd"}}}
+        signed (light-core/sign-bootstrap-descriptor (:private kp) desc)
+        txt-content (light-core/format-bootstrap-txt-pure signed)
+        edn-content (pr-str signed)]
+    (spit fixture-edn edn-content)
+    (spit fixture-txt txt-content)
+    (if (and (.exists devnet-edn) (.exists devnet-txt))
+      {:edn-path (.getPath devnet-edn)
+       :txt-path (.getPath devnet-txt)
+       :authority-pubkey pub
+       :fixture-edn-path (.getPath fixture-edn)
+       :fixture-txt-path (.getPath fixture-txt)}
+      {:edn-path (.getPath fixture-edn)
+       :txt-path (.getPath fixture-txt)
+       :authority-pubkey pub
+       :fixture-edn-path (.getPath fixture-edn)
+       :fixture-txt-path (.getPath fixture-txt)})))
+
 (defn- make-rfc4571-stun-binding-req
   "Constructs an RFC 4571 framed STUN Binding Request packet with USERNAME attribute."
   [^String username]
@@ -170,12 +218,23 @@
 
 (deftest test-scenario-s2-port-443-passthrough-and-signatures
   (testing "devnet/bootstrap.txt and devnet/bootstrap.edn have valid Directory Authority signatures"
-    (let [edn-desc (discovery/load-bootstrap-descriptor! "devnet/bootstrap.edn")
-          txt-desc (discovery/load-bootstrap-descriptor! "devnet/bootstrap.txt")]
+    (let [fixtures (ensure-bootstrap-fixtures!)
+          edn-desc (discovery/load-bootstrap-descriptor! (:edn-path fixtures))
+          txt-desc (discovery/load-bootstrap-descriptor! (:txt-path fixtures))
+          fix-edn (discovery/load-bootstrap-descriptor! (:fixture-edn-path fixtures)
+                                                        {:expected-authority-pubkey (:authority-pubkey fixtures)
+                                                         :verify-signature? false})
+          fix-txt (discovery/load-bootstrap-descriptor! (:fixture-txt-path fixtures)
+                                                        {:expected-authority-pubkey (:authority-pubkey fixtures)
+                                                         :verify-signature? false})]
       (is (map? edn-desc))
       (is (map? txt-desc))
       (is (true? (:ok? (light-core/verify-bootstrap-descriptor (:authority-pubkey edn-desc) edn-desc 0))))
-      (is (true? (:ok? (light-core/verify-bootstrap-descriptor (:authority-pubkey txt-desc) txt-desc 0))))))
+      (is (true? (:ok? (light-core/verify-bootstrap-descriptor (:authority-pubkey txt-desc) txt-desc 0))))
+      (is (map? fix-edn))
+      (is (map? fix-txt))
+      (is (true? (:ok? (light-core/verify-bootstrap-descriptor (:authority-pubkey fix-edn) fix-edn 0))))
+      (is (true? (:ok? (light-core/verify-bootstrap-descriptor (:authority-pubkey fix-txt) fix-txt 0))))))
 
   (testing "dns/extract-stun-target-ufrag extracts target ufrag from RFC 4571 STUN packets"
     (let [pkt1 (make-rfc4571-stun-binding-req "1ec0ae74:localufrag123")
@@ -322,9 +381,10 @@
           _id (shell/load-or-create-light-identity! tmp-dir)
           peer-pk (basalt/bytes->hex (crypto/random-bytes 32))
           start-t (System/currentTimeMillis)
+          bootstrap-path (:edn-path (ensure-bootstrap-fixtures!))
           ;; Note: :connect? is omitted, so it defaults to offline (false) for shuttle verbs
           res (shell/run-one-shot! {:state-dir tmp-dir
-                                    :bootstrap "devnet/bootstrap.edn"
+                                    :bootstrap bootstrap-path
                                     :cmd-map {"cmd" "export-offer" "to" peer-pk}})
           elapsed (- (System/currentTimeMillis) start-t)]
       (is (map? res))
@@ -514,3 +574,59 @@
     (let [res (vopr/run-datachannel-jepsen-campaign {:seed 20261115})]
       (is (true? (:ok? res)))
       (is (= 12 (:remediated-count res))))))
+
+;; =============================================================================
+;; Scenario S8: Node.js Bundle Relay E2E, Sequential FIFO Delivery, & Failover (A-CARB-D24-8)
+;; =============================================================================
+
+(deftest test-scenario-s8-node-bundle-relay-send-and-failover
+  (testing "Node.js light-node bundle executes one-shot offer over HTTP relay sequentially and persists state"
+    (let [tmp-dir (make-tmp-dir!)
+          tls-mgr (http-shell/init-tls-manager! {:state-dir tmp-dir :domain "localhost"})
+          relay-atom (atom (relay/init-relay-state {:min-signaling-burn 0}))
+          relay-waiters-atom (atom {})
+          cfg {:domain "bitecho.org"
+               :state-dir tmp-dir
+               :relay-atom relay-atom
+               :relay-waiters-atom relay-waiters-atom
+               :http {:bind-ip "127.0.0.1" :http-port 0 :https-port 0}}
+          srv (http-shell/start-http-servers! cfg tls-mgr nil)]
+      (try
+        (let [http-port (:http-port srv)
+              relay-url (str "http://127.0.0.1:" http-port "/relay/v1/send")
+              node-bin (or (System/getenv "NODE_BIN")
+                           (let [local-node (io/file (System/getProperty "user.home") ".local/bin/node")]
+                             (if (.canExecute local-node)
+                               (.getAbsolutePath local-node)
+                               "node")))
+              bundle-file (io/file "dist/bitecho-light-node.cjs")
+              _ (is (.exists bundle-file) "dist/bitecho-light-node.cjs must exist")
+              peer-pk (basalt/bytes->hex (crypto/random-bytes 32))
+              client-dir (make-tmp-dir!)
+              pb (doto (ProcessBuilder. ^java.util.List [node-bin (.getPath bundle-file) "offer"
+                                                         "--peer" peer-pk
+                                                         "--price" "0"
+                                                         "--burn" "100"
+                                                         "--state-dir" (.getPath client-dir)
+                                                         "--relay-url" relay-url])
+                   (.redirectErrorStream true))
+              proc (.start pb)]
+          (try
+            (let [out-text (slurp (.getInputStream proc))
+                  exit-code (.waitFor proc)
+                  res (try (json/read-str out-text) (catch Exception _ nil))
+                  state-file (io/file client-dir "state.fressian")]
+              (is (= 0 exit-code) (str "Node process exited non-zero: " out-text))
+              (is (map? res) (str "Node output is not JSON: " out-text))
+              (is (true? (get res "ok")) (str "Offer response not ok: " out-text))
+              (is (.exists state-file) "state.fressian must be saved after successful relay submission")
+              (is (>= (long (get-in @relay-atom [:diagnostics :submitted] 0)) 2)
+                  "Relay atom must record at least 2 submitted envelopes in multi-envelope batch [reveal-env msg-env]")
+              (is (pos? (count (or (get-in @relay-atom [:inboxes peer-pk])
+                                   (first (vals (:inboxes @relay-atom))))))
+                  "Relay recipient inbox must contain deposited offer envelope"))
+            (finally
+              (try (.destroyForcibly proc) (catch Exception _ nil))
+              (try (.waitFor proc) (catch Exception _ nil)))))
+        (finally
+          (http-shell/stop-http-servers! srv))))))

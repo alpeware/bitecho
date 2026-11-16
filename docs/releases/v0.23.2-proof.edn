@@ -1,0 +1,91 @@
+{:milestone "D24",
+ :version "v0.23.2",
+ :all-passed? true,
+ :node-bundle-sha256
+ "02ae0421d82bf689cbe899280f04522dcdc9799b65ad66abbe37b277dfc7e315",
+ :d24-remediation-scenarios
+ {:all-passed? true,
+  :count 8,
+  :scenarios
+  [{:scenario "S1",
+    :name "p2p-answer-candidate-fallback-and-persistence",
+    :passed? true}
+   {:scenario "S2",
+    :name "port-443-passthrough-and-signatures",
+    :passed? true}
+   {:scenario "S3",
+    :name "cross-subnet-relay-and-early-sealed-buffering",
+    :passed? true}
+   {:scenario "S4",
+    :name "now-ms-injection-and-offline-shuttle",
+    :passed? true}
+   {:scenario "S5",
+    :name "replication-auth-and-ctl-concurrency",
+    :passed? true}
+   {:scenario "S6",
+    :name "single-responder-and-newline-discipline",
+    :passed? true}
+   {:scenario "S7",
+    :name "jepsen-and-datachannel-campaigns",
+    :passed? true}
+   {:scenario "S8",
+    :name "node-bundle-relay-send-and-failover",
+    :passed? true}]},
+ :networks
+ {"devnet.bitecho.org"
+  {:network :devnet,
+   :network-uri "devnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 50,
+   :governance-passed? true,
+   :passed? true},
+  "testnet.bitecho.org"
+  {:network :testnet,
+   :network-uri "testnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true},
+  "mainnet.bitecho.org"
+  {:network :mainnet,
+   :network-uri "mainnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true}},
+ :cross-network-replay
+ {:pairs
+  [{:source "devnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}
+   {:source "devnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}],
+  :mainnet-unscoped-rejected? true,
+  :devnet-unscoped-accepted? true,
+  :all-rejected? true},
+ :rolling-upgrade
+ {:node-n-subnet "global",
+  :node-n-plus-1-subnet "devnet.bitecho.org",
+  :n-accepted-n1-event? true,
+  :n1-accepted-n-event? true,
+  :foreign-subnet-dropped? true,
+  :passed? true}}

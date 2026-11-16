@@ -256,7 +256,7 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 
 ### 7.2 Hook Newline Discipline & Control Concurrency
 1. **Streaming JSONL Discipline:** Streaming CLI commands, subagent inputs, or stdin pipelines (`--cmd-file` or stdin pipe) must strictly maintain single-line JSON (`\n`) formatting. If adjacent, un-delimited JSON commands arrive (e.g. `}{`), `cli/split-jsonl-commands` parses and splits valid JSON objects without dropping envelopes or throwing syntax errors.
-2. **Control Socket Concurrency:** All `/ctl` command executions are serialized through a single reentrant mutex (`light-ctl-exec-lock` / sequential dispatch) to prevent concurrent command races and state corruption across multiple subagents.
+2. **Control Socket Concurrency:** All `/ctl` command executions are serialized through a single reentrant mutex (`serve-cmd-lock` / sequential dispatch) to prevent concurrent command races and state corruption across multiple subagents.
 
 
 

@@ -73,7 +73,9 @@
                                 (cond-> {"cmd" "inbox"}
                                   sub (assoc "subnet_id" sub)))
                    "offer"    (let [m {"cmd" "offer"
-                                       "callee" (extract-flag-value args "--callee" nil)
+                                       "callee" (or (extract-flag-value args "--callee" nil)
+                                                    (extract-flag-value args "--peer" nil)
+                                                    (extract-flag-value args "--to" nil))
                                        "price" (extract-long-flag args "--price" 0)
                                        "burn" (extract-long-flag args "--burn" 500)}
                                     hn (extract-flag-value args "--home-node" nil)
@@ -2648,7 +2650,9 @@
                 res (light-core/handle-command @state-atom effective-map (:privkey-bytes identity))
                 _ (when-let [dial-info (:p2p-dial res)]
                     (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info))
-                needs-net? (seq (:net-envelopes res))]
+                shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
+                connect-explicit? (true? (or (get cmd-map "connect") (:connect cmd-map)))
+                needs-net? (and (seq (:net-envelopes res)) (if shuttle-verb? connect-explicit? true))]
             (if needs-net?
               (let [currently-live? (connection-live? @conn-atom @state-atom)
                     replay-envs (when (= verb "register-home-set")

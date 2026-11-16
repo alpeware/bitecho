@@ -1501,40 +1501,40 @@ cmd_print_fingerprint() {
 
     local id_out=""
     if [[ "$node" == ns* ]]; then
-      id_out="$(ssh_cmd "$node" bash -s << 'REMOTE_NS_ID' 2>/dev/null || true
+      id_out="$(ssh_cmd "$node" bash -s << REMOTE_NS_ID 2>/dev/null || true
 set -euo pipefail
 TMP_CFG="/tmp/bootstrap-ns-config.edn"
-echo "{:node/id :${node} :domain \"bitecho.org\" :state-dir \"/var/lib/clj-web\"}" > "$TMP_CFG"
+echo "{:node/id :${node} :domain \"bitecho.org\" :state-dir \"/var/lib/clj-web\"}" > "\$TMP_CFG"
 /opt/jdk-25/bin/java \
   -Xms64m -Xmx128m \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
   --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
-  -jar /opt/bitecho-infra/bitecho.jar print-fingerprint "$TMP_CFG" 2>/dev/null || \
+  -jar /opt/bitecho-infra/bitecho.jar print-fingerprint "\$TMP_CFG" 2>/dev/null || \
 /opt/jdk-25/bin/java \
   -Xms64m -Xmx128m \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
   --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
-  -jar /opt/bitecho-infra/bitecho.jar print-identity "$TMP_CFG" 2>/dev/null
-rm -f "$TMP_CFG"
+  -jar /opt/bitecho-infra/bitecho.jar print-identity "\$TMP_CFG" 2>/dev/null
+rm -f "\$TMP_CFG"
 REMOTE_NS_ID
 )"
     else
-      id_out="$(ssh_cmd "$node" bash -s << 'REMOTE_ID' 2>/dev/null || true
+      id_out="$(ssh_cmd "$node" bash -s << REMOTE_ID 2>/dev/null || true
 set -euo pipefail
 CFG_FILE="/etc/bitecho/config.edn"
-if [ ! -f "$CFG_FILE" ]; then
+if [ ! -f "\$CFG_FILE" ]; then
   TMP_CFG="/tmp/bootstrap-config.edn"
-  echo "{:node/id :${node} :state-dir \"/var/lib/bitecho\"}" > "$TMP_CFG"
-  CFG_FILE="$TMP_CFG"
+  echo "{:node/id :${node} :state-dir \"/var/lib/bitecho\"}" > "\$TMP_CFG"
+  CFG_FILE="\$TMP_CFG"
 fi
 /opt/jdk-25/bin/java \
   -Xms128m -Xmx256m \
   --enable-native-access=ALL-UNNAMED \
   --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
   --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
-  -jar /opt/bitecho/bitecho.jar print-identity "$CFG_FILE" 2>/dev/null
+  -jar /opt/bitecho/bitecho.jar print-identity "\$CFG_FILE" 2>/dev/null
 rm -f /tmp/bootstrap-config.edn
 REMOTE_ID
 )"
@@ -1556,12 +1556,12 @@ REMOTE_ID
       if [[ -n "$expected_fp" ]]; then
         echo "    Expected: ${expected_fp}"
       fi
-      ((mismatches++))
+      mismatches=$((mismatches + 1))
     elif [[ -n "$expected_fp" && "${live_fp^^}" != "${expected_fp^^}" ]]; then
       echo "[!] ${node} (${ip}): MISMATCH!"
       echo "    Live:     ${live_fp}"
       echo "    Expected: ${expected_fp}"
-      ((mismatches++))
+      mismatches=$((mismatches + 1))
     else
       echo "[+] ${node} (${ip}): OK"
       echo "    Fingerprint: ${live_fp}"

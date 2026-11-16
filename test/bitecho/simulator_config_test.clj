@@ -8,7 +8,7 @@
     (let [deps (-> "deps.edn" io/file slurp edn/read-string)]
       (is (contains? (:aliases deps) :simulate) "deps.edn must have a :simulate alias")
       (let [simulate-alias (get-in deps [:aliases :simulate])]
-        (is (= ["dev"] (:extra-paths simulate-alias)) ":simulate alias must have :extra-paths [\"dev\"]"))))
+        (is (contains? (set (:extra-paths simulate-alias)) "dev") ":simulate alias must include \"dev\" in :extra-paths"))))
 
   (testing "Simulator core namespace file exists"
     (let [f (io/file "dev/bitecho/simulator/core.clj")]

@@ -14,10 +14,11 @@
                                    "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
                                    "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"]
                         :main-opts ["-m" "bitecho.main" "light-node"]}
-           :simulate {:extra-paths ["dev"]
+           :simulate {:extra-paths ["dev" "test"]
                       :extra-deps {elle/elle {:mvn/version "0.2.1"}
                                    spootnik/unilog {:mvn/version "0.7.31"}
-                                   knossos/knossos {:mvn/version "0.3.8"}}
+                                   knossos/knossos {:mvn/version "0.3.8"}
+                                   org.clojure/test.check {:mvn/version "1.1.1"}}
                       :jvm-opts ["-XX:+IgnoreUnrecognizedVMOptions" "--sun-misc-unsafe-memory-access=allow"
                                  "--enable-native-access=ALL-UNNAMED"
                                  "--add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED"
