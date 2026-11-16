@@ -5104,35 +5104,26 @@
             title (str (or (get effective-map "title") (:title effective-map) (:title spec-map) bip-id))
             act-ep (or (parse-long-safe (or (get effective-map "activate_at_epoch") (get effective-map "activate-at-epoch") (:activate-at-epoch effective-map)) nil)
                        (:activate-at-epoch spec-map))
-            default-inv {:defspec-vars (if (string? defspec-csv)
-                                         (vec (remove str/blank? (map str/trim (str/split defspec-csv #","))))
-                                         ["prop-bip-default"])
-                         :seed 42
-                         :sans-io-pure? true
-                         :diagnose-coverage? true
-                         :co-committed-spec-and-flags? true}
-            default-oracles {:four-way-golden-oracle {:passed? true :seed 42}
-                             :vopr-jepsen-non-vacuity {:passed? true :seed 42}
-                             :deterministic-bundle-sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                             :bwrap-civilization-regression {:passed? true}}
-            strict-admission? (boolean (or (true? (get effective-map "strict_admission"))
-                                           (true? (get effective-map "strict-admission"))
-                                           (true? (:strict-admission effective-map))
-                                           (true? (:strict_admission effective-map))
-                                           (= bip-id "BIP-000")))
+            defspec-vec (when (and (string? defspec-csv) (not (str/blank? defspec-csv)))
+                          (vec (remove str/blank? (map str/trim (str/split defspec-csv #",")))))
             jurisdiction-map (or (parse-edn-safe (or (get effective-map "jurisdiction_map") (get effective-map "jurisdiction-map") (:jurisdiction-map effective-map)))
                                  (:jurisdiction-map spec-map))
             human-anchor-sunset (or (get effective-map "human_anchor_sunset") (get effective-map "human-anchor-sunset") (:human-anchor-sunset effective-map)
                                     (:human-anchor-sunset spec-map))
-            has-explicit-spec? (seq spec-map)
-            bip-payload (cond-> (merge (when (and (not has-explicit-spec?) (not strict-admission?))
-                                         {:invariant-diff default-inv
-                                          :oracle-receipts default-oracles})
-                                       spec-map
+            inv-map (or (parse-edn-safe (or (get effective-map "invariant_diff_edn") (get effective-map "invariant-diff-edn") (:invariant-diff-edn effective-map)))
+                        (:invariant-diff spec-map))
+            eff-inv (cond
+                      (and (map? inv-map) (seq defspec-vec) (empty? (:defspec-vars inv-map)))
+                      (assoc inv-map :defspec-vars defspec-vec)
+                      (map? inv-map)
+                      inv-map
+                      :else nil)
+            bip-payload (cond-> (merge spec-map
                                        {:subnet-id subnet
                                         :bip-id bip-id
                                         :title title
                                         :author-pubkey (or (:author-pubkey spec-map) (:pubkey state))})
+                          eff-inv (assoc :invariant-diff eff-inv)
                           jurisdiction-map (assoc :jurisdiction-map jurisdiction-map)
                           human-anchor-sunset (assoc :human-anchor-sunset human-anchor-sunset)
                           (map? policy-map) (assoc :policy-theta policy-map)
@@ -5143,7 +5134,9 @@
             gov-st (or (:governance st-after-burn) (gov/init-governance-state))
             res (gov/submit-bip gov-st bip-payload eff-priv)]
         (if-not (:ok? res)
-          {:state (assoc st-after-burn :governance (:state res))
+          {:state (-> st-after-burn
+                      (assoc :governance (:state res))
+                      (update-in [:diagnostics :bip-admission-rejected] (fnil inc 0)))
            :response {"ok" false
                       "error" "bip-admission-rejected"
                       "missing_gates" (mapv #(if (keyword? %) (subs (str %) 1) (str %)) (:missing-gates res))}

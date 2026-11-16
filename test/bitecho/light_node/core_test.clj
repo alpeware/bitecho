@@ -4149,12 +4149,22 @@
                   (assoc :account {:balance 5000 :spendable 5000 :seq 0}))]
     (testing "1. bip-submit, bip-consent, bip-object, bip-status, and epoch-tick upgrade activation across peers"
       ;; Euler submits BIP-001 on bitecho-dev with policy_edn and activate_at_epoch 20
-      (let [sub-res (light-core/handle-command
+      (let [test-spec-edn (pr-str {:invariant-diff {:defspec-vars ["prop-1" "prop-2"]
+                                                    :seed 42
+                                                    :sans-io-pure? true
+                                                    :diagnose-coverage? true
+                                                    :co-committed-spec-and-flags? true}
+                                   :oracle-receipts {:four-way-golden-oracle {:passed? true :seed 42}
+                                                     :vopr-jepsen-non-vacuity {:passed? true :seed 42}
+                                                     :deterministic-bundle-sha256 "1d2423d488f8516e6ee4561002cea62d3f47a9ea2e18f9a614247bb93dae666d"
+                                                     :bwrap-civilization-regression {:passed? true}}})
+            sub-res (light-core/handle-command
                      st-e0
                      {"cmd" "bip-submit"
                       "bip_id" "BIP-001"
                       "title" "Pareto-Optimal Tokenomics v2.2"
                       "subnet_id" "bitecho-dev"
+                      "spec_edn" test-spec-edn
                       "policy_edn" "{:k-bps 4582 :max-stake-multiplier 2.2}"
                       "activate_at_epoch" 20
                       "defspec_vars" "prop-1,prop-2"
@@ -4242,6 +4252,7 @@
                            "bip_id" "NAF-BIP-99"
                            "title" "Flawed Child Policy"
                            "subnet_id" "new-alexandria"
+                           "spec_edn" test-spec-edn
                            "burn" 50}
                           priv-e)
               obj-res (light-core/handle-command

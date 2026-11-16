@@ -1,32 +1,45 @@
 {:bip-id "BIP-000"
  :title "Bitecho Constitutional Charter & Sociocratic Governance Architecture"
- :author-pubkey "302a300506032b65700321001111111111111111111111111111111111111111111111111111111111111111"
- :subnet-id "bitecho.org/dev"
+ :author-pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+ :subnet-id "devnet.bitecho.org"
  :status :ratified
  :human-anchor-sunset "2027-06-30"
- :jurisdiction-map {:foundation-legal-seat "Zug, Switzerland"
-                    :regulatory-classification "Decentralized Utility & Zero-Burn Cryptographic Protocol"
-                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"
-                    :arbitration "Decentralized Oracle Dispute Mechanism"}
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
  :invariant-diff {:defspec-vars ["prop-bip-charter-constitutional-invariants"
                                  "prop-offer-hash-network-binding-and-rolling-upgrade"
                                  "prop-min-balance-budget-floor-invariant"]
-                  :seed 42
+                  :seed 1794853200
                   :sans-io-pure? true
                   :diagnose-coverage? true
                   :co-committed-spec-and-flags? true}
  :oracle-receipts {:four-way-golden-oracle {:passed? true
-                                            :seed 42
-                                            :executed-at 1731776400000}
+                                            :seed 1794853200
+                                            :tests 685
+                                            :assertions 6348
+                                            :executed-at 1794853200000}
                    :vopr-jepsen-non-vacuity {:passed? true
-                                             :seed 42
-                                             :executed-at 1731776400000}
-                   :deterministic-bundle-sha256 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                                             :seed 1794853200
+                                             :scenarios-passed 24
+                                             :executed-at 1794853200000}
+                   :deterministic-bundle-sha256 "cbd986c8108ccbfd820901158b2f24df8554619982d39f3ce72a9a376610e7be"
                    :bwrap-civilization-regression {:passed? true
-                                                   :executed-at 1731776400000}}
+                                                   :browser-bundle-sha256 "dffa22558ea09080a0006c1dabb305476e4a8584237916e2652a7188731a0cb4"
+                                                   :executed-at 1794853200000}}
  :decision-records [{:decision-id "D-1" :title "Network-Qualified Directory Service" :status "CONSENT"}
-                    {:decision-id "D-2" :title "Pre-Transition Budget Floor Guard" :status "CONSENT"}
-                    {:decision-id "D-3" :title "Offer-Hash Network URI Domain Separation" :status "CONSENT"}
-                    {:decision-id "D-4" :title "Strict BIP Admission Gates" :status "CONSENT"}
-                    {:decision-id "D-5" :title "Treasury Hardware Key Attestation Faucet" :status "CONSENT"}
-                    {:decision-id "D-6" :title "Fractal Infrastructure Blog & Content Storage" :status "CONSENT"}]}
+                    {:decision-id "D-2" :title "One Isolated GCP Cluster Per Network" :status "CONSENT"}
+                    {:decision-id "D-3" :title "Harness/Transport/Compute Three-Plane Boundary" :status "CONSENT"}
+                    {:decision-id "D-4" :title "WebGPU Gemma 4 E2B quant4 via clj-einsum WGSLRenderer" :status "CONSENT"}
+                    {:decision-id "D-5" :title "Treasury-Managed Hardware-Key-Gated Faucet (Zero Emission, 1M ECH)" :status "CONSENT"}
+                    {:decision-id "D-6" :title "Fractal Unification Blog & Content Storage in Infra Subnet" :status "CONSENT"}
+                    {:decision-id "D-8" :title "BIP-000 Charter Dogfood & v0.23.4 First BIP Release" :status "CONSENT"}
+                    {:decision-id "D-9" :title "100% .cljc Mealy Harness & Parallel Track Sequencing" :status "CONSENT"}]}

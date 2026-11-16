@@ -172,9 +172,16 @@
 
       ;; sealed/offer-hash parity
       (is (not= (sealed/offer-hash dev-offer) (sealed/offer-hash test-offer)))
-      (is (not= (sealed/offer-hash dev-offer) (sealed/offer-hash unbound-offer)))))
+      (is (not= (sealed/offer-hash dev-offer) (sealed/offer-hash unbound-offer)))
 
-  (testing "matching-offer-hash? accepts both network-bound and legacy unbound during rolling upgrade"
+      ;; 5-field variant parity (caller-callee-eph-epoch-burn[|dac][|net:<uri>])
+      (let [h5-dev (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes "caller-pubkey-hex-callee-pubkey-hex-eph-pubkey-hex-10-0|net:devnet.bitecho.org")))
+            h5-test (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes "caller-pubkey-hex-callee-pubkey-hex-eph-pubkey-hex-10-0|net:testnet.bitecho.org")))
+            h5-unbound (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes "caller-pubkey-hex-callee-pubkey-hex-eph-pubkey-hex-10-0")))]
+        (is (not= h5-dev h5-test))
+        (is (not= h5-dev h5-unbound)))))
+
+  (testing "matching-offer-hash? accepts both network-bound and legacy unbound during rolling upgrade across compute-offer-hash and sealed/offer-hash"
     (let [st {:network-uri "devnet.bitecho.org" :subnet-id "devnet.bitecho.org"}
           base-offer {:session-id "sid-rolling-upgrade-test"
                       :caller "caller-pubkey-hex"
@@ -185,11 +192,17 @@
                       :home-node "node1"}
           bound-offer (assoc base-offer :network-uri "devnet.bitecho.org")
           h-bound (light-core/compute-offer-hash bound-offer)
-          h-unbound (light-core/compute-offer-hash base-offer)]
+          h-unbound (light-core/compute-offer-hash base-offer)
+          h-sealed-bound (sealed/offer-hash bound-offer)
+          h-sealed-unbound (sealed/offer-hash base-offer)]
       (is (true? (light-core/matching-offer-hash? bound-offer st h-bound))
-          "Must match bound offer hash")
+          "Must match bound compute-offer-hash")
       (is (true? (light-core/matching-offer-hash? bound-offer st h-unbound))
-          "Must match legacy unbound offer hash during rolling upgrade")))
+          "Must match legacy unbound compute-offer-hash during rolling upgrade")
+      (is (true? (light-core/matching-offer-hash? bound-offer st h-sealed-bound))
+          "Must match bound sealed/offer-hash")
+      (is (true? (light-core/matching-offer-hash? bound-offer st h-sealed-unbound))
+          "Must match legacy unbound sealed/offer-hash during rolling upgrade")))
 
   (testing "handle-wire-offer rejects foreign :network-uri fail-closed"
     (let [tmp-dir (make-tmp-dir!)
@@ -245,25 +258,40 @@
         (is (true? (get-in bip [:oracle-receipts :four-way-golden-oracle :passed?])))
         (is (true? (get-in bip [:oracle-receipts :vopr-jepsen-non-vacuity :passed?])))
         (is (string? (get-in bip [:oracle-receipts :deterministic-bundle-sha256])))
+        (is (not= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  (get-in bip [:oracle-receipts :deterministic-bundle-sha256]))
+            "BIP-000 bundle SHA-256 must be a real bundle hash, never the empty-input hash")
         (is (true? (get-in bip [:oracle-receipts :bwrap-civilization-regression :passed?])))
         (let [gate-res (gov/verify-bip-admission-gates bip)]
           (is (true? (:ok? gate-res)) (str "BIP-000 admission gates must pass: " (:missing-gates gate-res)))))))
 
-  (testing "exec-bip-submit rejects empty admission defaults when strict_admission is true"
+  (testing "exec-bip-submit has zero fabricated passing defaults and admits BIP-000 with explicit spec"
     (let [tmp-dir (make-tmp-dir!)
           id (shell/load-or-create-light-identity! (str tmp-dir))
           st (-> (light-core/init-light-state id {:subnet-id "devnet.bitecho.org"})
                  (assoc-in [:account :balance] 10000)
                  (assoc-in [:account :spendable] 10000))
-          cmd {"cmd" "bip-submit"
-               "bip_id" "BIP-999"
-               "title" "Strict Admission Test BIP"
-               "strict_admission" true
-               "burn" 100}
-          res (light-core/handle-command st cmd (:privkey-bytes id))]
-      (is (false? (get-in res [:response "ok"])))
-      (is (= "bip-admission-rejected" (get-in res [:response "error"])))
-      (is (seq (get-in res [:response "missing_gates"]))))))
+          ;; 1. Submitting without spec_edn fails closed unconditionally (no fabricated defaults)
+          cmd-empty {"cmd" "bip-submit"
+                     "bip_id" "BIP-999"
+                     "title" "Unadmitted BIP Without Spec"
+                     "burn" 100}
+          res-empty (light-core/handle-command st cmd-empty (:privkey-bytes id))
+          ;; 2. Submitting BIP-000 with explicit charter spec succeeds
+          charter-edn-str (slurp "docs/bips/bip-000-charter.edn")
+          cmd-charter {"cmd" "bip-submit"
+                       "bip_id" "BIP-000"
+                       "subnet_id" "devnet.bitecho.org"
+                       "spec_edn" charter-edn-str
+                       "burn" 100}
+          res-charter (light-core/handle-command st cmd-charter (:privkey-bytes id))]
+      (is (false? (get-in res-empty [:response "ok"])))
+      (is (= "bip-admission-rejected" (get-in res-empty [:response "error"])))
+      (is (seq (get-in res-empty [:response "missing_gates"])))
+      (is (pos? (long (get-in res-empty [:state :diagnostics :bip-admission-rejected] 0))))
+      (is (true? (get-in res-charter [:response "ok"])))
+      (is (= "BIP-000" (get-in res-charter [:response "bip_id"])))
+      (is (= "under-review" (get-in res-charter [:response "status"]))))))
 
 ;; =============================================================================
 ;; Scenario S20: Release Proof Generator & Deploy Gate R7
