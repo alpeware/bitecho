@@ -5206,7 +5206,7 @@
             gov-st1 (ensure-default-circle-member gov-st0 subnet circle-kw my-pub weight)
             resp-res (gov/submit-circle-response gov-st1 subnet bip-id circle-kw my-pub {:stance :consent :subnet-id subnet})
             eval-res (gov/evaluate-tri-circle-consent (:state resp-res) subnet bip-id)
-            member-weight (get-in (:state eval-res) [:circles [subnet circle-kw] my-pub :weight] 100.0)
+            member-weight (long (or (get-in (:state eval-res) [:circles [subnet circle-kw] my-pub :weight]) weight 100))
             rep-env (build-governance-replicate-envelope
                      st-after-burn
                      privkey-bytes
@@ -5249,7 +5249,7 @@
             response-map {:stance :paramount-objection :counterexample ce :subnet-id subnet}
             resp-res (gov/submit-circle-response gov-st1 subnet bip-id circle-kw my-pub response-map)
             eval-res (gov/evaluate-tri-circle-consent (:state resp-res) subnet bip-id)
-            member-weight (get-in (:state eval-res) [:circles [subnet circle-kw] my-pub :weight] 100.0)
+            member-weight (long (or (get-in (:state eval-res) [:circles [subnet circle-kw] my-pub :weight]) weight 100))
             rep-env (build-governance-replicate-envelope
                      st-after-burn
                      privkey-bytes
@@ -7067,9 +7067,18 @@
                       (try
                         (let [sender-bytes (basalt/hex->bytes sender)
                               sig-bytes (basalt/hex->bytes sig-hex)
-                              payload (canonical-governance-replicate-payload subnet op sender ep body)]
+                              cand-bodies (distinct
+                                           (cond-> [body]
+                                             (and (map? body) (number? (:weight body)))
+                                             (conj (assoc body :weight (long (:weight body)))
+                                                   (assoc body :weight (double (:weight body))))))]
                           (and sender-bytes sig-bytes
-                               (crypto/verify-with-fallback sender-bytes payload sig-bytes)))
+                               (some (fn [b]
+                                       (crypto/verify-with-fallback
+                                        sender-bytes
+                                        (canonical-governance-replicate-payload subnet op sender ep b)
+                                        sig-bytes))
+                                     cand-bodies)))
                         (catch #?(:clj Exception :cljs :default) _ false))))]
     (if-not valid-sig?
       (let [diag-event {"event" "diagnostic"

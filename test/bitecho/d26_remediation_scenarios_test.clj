@@ -291,7 +291,32 @@
       (is (pos? (long (get-in res-empty [:state :diagnostics :bip-admission-rejected] 0))))
       (is (true? (get-in res-charter [:response "ok"])))
       (is (= "BIP-000" (get-in res-charter [:response "bip_id"])))
-      (is (= "under-review" (get-in res-charter [:response "status"]))))))
+      (is (= "under-review" (get-in res-charter [:response "status"])))
+      ;; 3. Verify bip-consent emits integer (long) :weight in :bip-response and replicates cleanly across Fressian roundtrip
+      (let [st-after-sub (:state res-charter)
+            consent-res (light-core/handle-command
+                         st-after-sub
+                         {"cmd" "bip-consent"
+                          "bip_id" "BIP-000"
+                          "subnet_id" "devnet.bitecho.org"
+                          "circle" "builders-stewards"
+                          "weight" 12
+                          "burn" 100}
+                         (:privkey-bytes id))
+            rep-env (first (:net-envelopes consent-res))
+            peer-dir (make-tmp-dir!)
+            peer-id (shell/load-or-create-light-identity! (str peer-dir))
+            peer-st0 (-> (light-core/init-light-state peer-id {:subnet-id "devnet.bitecho.org"})
+                         (light-core/handle-wire-payload (fressian/encode-wire (first (:net-envelopes res-charter))) (:privkey-bytes peer-id))
+                         :state)
+            ;; Simulate JS/Node.js Fressian roundtrip where :weight is integer long 12
+            wire-bytes (fressian/encode-wire rep-env)
+            peer-res (light-core/handle-wire-payload peer-st0 wire-bytes (:privkey-bytes peer-id))]
+        (is (integer? (get-in rep-env [:body :weight]))
+            ":weight in :bip-response body must be a long integer for JVM/Node.js Fressian parity")
+        (is (= 12 (get-in rep-env [:body :weight])))
+        (is (zero? (long (get-in peer-res [:state :diagnostics :governance-replication-rejected] 0)))
+            "Peer must verify :bip-response signature without governance-replication-rejected")))))
 
 ;; =============================================================================
 ;; Scenario S20: Release Proof Generator & Deploy Gate R7
