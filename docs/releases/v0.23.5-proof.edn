@@ -83,7 +83,7 @@
     :name "version-and-cold-root-pins",
     :passed? true}]},
  :node-bundle-sha256
- "2c8d97181c6c98edae9defc47a64ede4b9ee6a2212913aca6cff7edad7bba62c",
+ "e34f16478699d7a2b513c05d384e28ee9c2a4cb4d420bfb571d2547626aaf2ff",
  :networks
  {"devnet.bitecho.org"
   {:network :devnet,
@@ -171,8 +171,8 @@
    {:scenario "S24",
     :name "sea-build-script-and-skill-regrounding",
     :passed? true}]},
- :commit-sha "bc96a30425b4b502cb74a1fb50a75cf218c12949",
+ :commit-sha "74c61d837312c370e0856301febdee8e9068b8f2",
  :version "v0.23.5",
  :browser-bundle-sha256
- "99005965d85d07d3e125405ce93fc6c25c64cae0b908d58c5288a421c50e13b0",
- :tree-sha "f21fee5b5fde25b4e9c11315f36512804ab7b315"}
+ "33994330ce4c3b372dc42f5395af78ce421d925a264a5e6d6f1fa743125ddb09",
+ :tree-sha "6420f46f8c8ae43ec7a8e1ecd606f64e61799cbc"}
