@@ -772,6 +772,89 @@
                             tier1? raw-bs
                             :else {:file disk-file :offset 0 :length total-size})})))))
 
+(defn serve-dist-request
+  "Serves /dist/* bundle artifacts, Node.js scripts, SEA binaries, and their .sha256 digests (F-D29-19, F-R6, A-D29-5)."
+  ([path ctx]
+   (serve-dist-request path ctx :GET))
+  ([path ctx method]
+   (let [dist-dir-path (or (get-in ctx [:config :dist-dir])
+                           (get-in ctx [:config :http :dist-dir])
+                           (get-in ctx [:dist-dir])
+                           "dist")
+         dist-dir (io/file dist-dir-path)
+         raw-p (or path "")
+         subpath (sanitize-web-subpath raw-p)
+         rel-path (cond
+                    (nil? subpath) nil
+                    (str/starts-with? subpath "dist/") (subs subpath 5)
+                    (= subpath "dist") ""
+                    :else subpath)]
+     (if (or (nil? rel-path) (str/blank? rel-path))
+       {:status 404
+        :response/status 404
+        :headers {"Content-Type" "text/plain; charset=utf-8"}
+        :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+        :body "Not Found\n"
+        :response/body "Not Found\n"}
+       (let [sha-req? (str/ends-with? rel-path ".sha256")
+             target-name (if sha-req? (subs rel-path 0 (- (count rel-path) 7)) rel-path)
+             target-file (io/file dist-dir target-name)
+             direct-file (io/file dist-dir rel-path)]
+         (cond
+           (and sha-req? (.exists target-file))
+           (let [sha (sha256-file-hex target-file)
+                 body (str sha "  " (.getName target-file) "\n")]
+             {:status 200
+              :response/status 200
+              :headers {"Content-Type" "text/plain; charset=utf-8"
+                        "Content-Length" (str (count body))}
+              :response/headers {"Content-Type" "text/plain; charset=utf-8"
+                                 "Content-Length" (str (count body))}
+              :body body
+              :response/body body})
+
+           (and sha-req? (.exists direct-file))
+           (let [body (slurp direct-file)]
+             {:status 200
+              :response/status 200
+              :headers {"Content-Type" "text/plain; charset=utf-8"
+                        "Content-Length" (str (count body))}
+              :response/headers {"Content-Type" "text/plain; charset=utf-8"
+                                 "Content-Length" (str (count body))}
+              :body body
+              :response/body body})
+
+           (.exists target-file)
+           (let [total-size (.length target-file)
+                 ct (content-type-for-file (.getName target-file))
+                 max-tier1 (long (get-in ctx [:config :http :cache-max-file-bytes] 2097152))
+                 tier1? (<= total-size max-tier1)
+                 sha (sha256-file-hex target-file)
+                 body (cond
+                        (= method :HEAD) nil
+                        tier1? (Files/readAllBytes (.toPath target-file))
+                        :else {:file target-file :offset 0 :length total-size})]
+             {:status 200
+              :response/status 200
+              :headers {"Content-Type" ct
+                        "Content-Length" (str total-size)
+                        "X-Checksum-SHA256" sha
+                        "ETag" (str "\"" sha "\"")}
+              :response/headers {"Content-Type" ct
+                                 "Content-Length" (str total-size)
+                                 "X-Checksum-SHA256" sha
+                                 "ETag" (str "\"" sha "\"")}
+              :body body
+              :response/body body})
+
+           :else
+           {:status 404
+            :response/status 404
+            :headers {"Content-Type" "text/plain; charset=utf-8"}
+            :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+            :body "Not Found\n"
+            :response/body "Not Found\n"}))))))
+
 (defn serve-subnet-request
   "Evaluates target Subnet `:subnet/gate` (Gap G12 & `F-B1`) and serves Pointer -> Blob with `ETag: \"<cid>\"`,
    `304`, `206`, gzip, and Tier-2 zero-heap `blob-fs` / `content-root` file streaming (Gap G6)."
@@ -859,6 +942,9 @@
                       {:response/status 404
                        :response/headers {"Content-Type" "text/plain; charset=utf-8"}
                        :response/body "Not Found\n"})))
+
+                (str/starts-with? subpath "dist/")
+                (serve-dist-request raw-path {:config config} method)
 
                 (or (= subpath "blog") (str/starts-with? subpath "blog/"))
                 (let [target-path subpath

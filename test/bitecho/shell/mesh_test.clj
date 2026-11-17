@@ -1287,9 +1287,10 @@
           (is (= :chain-state-snapshot (:type resp-snapshot)))
           (is (= 50000 (:balance resp-snapshot))))
 
-        ;; 4. Persistent connection is NOT evicted or closed!
+        ;; 4. Persistent connection is NOT evicted or closed, while ephemeral query-node is cleanly closed (F-D29-16)
         (is (= persistent-node (get-in @agent-conns [agent-pub :node])))
-        (is (empty? @closed-nodes))))))
+        (is (not (contains? (set @closed-nodes) persistent-node)))
+        (is (contains? (set @closed-nodes) query-node))))))
 
 (deftest test-record-sent-msg-fifo-eviction-at-1024-cap
   (testing "inserting the 1025th message ID evicts only the 1st message ID while retaining 2..1025"

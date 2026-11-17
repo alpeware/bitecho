@@ -275,7 +275,7 @@ REMOTE_CUT
 
 verify_release_proof_gate() {
   local version="${1:-$(sed -n -E 's/.*version\s+"([^"]+)".*/\1/p' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.5}"
+  version="${version:-0.23.7}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Verifying Release Proof Gate for v${version}..."
@@ -648,7 +648,12 @@ cmd_publish_git() {
   declare -A REPO_SHAS=()
   declare -A REPO_SHORT_SHAS=()
 
-  for repo in bitecho clj-datachannel clj-fressian; do
+  local repos=("bitecho" "clj-datachannel" "clj-fressian")
+  if [[ -d "${ROOT_DIR}/../mealy/.git" ]]; then
+    repos+=("mealy")
+  fi
+
+  for repo in "${repos[@]}"; do
     local src_repo="${ROOT_DIR}/../${repo}"
     local bare_repo="${stage_dir}/${repo}.git"
     if [[ ! -d "${src_repo}/.git" ]]; then
@@ -869,7 +874,7 @@ EOF_GIT_INDEX
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
     echo "--> Syncing bare git repositories, SKILL.md, ONBOARDING.md, app/, and index.md to ${node} (${ip})..."
-    for repo in bitecho clj-datachannel clj-fressian; do
+    for repo in "${repos[@]}"; do
       rsync -az --delete -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${stage_dir}/${repo}.git/" "${SSH_USER}@${ip}:/var/www/clj-web/public/git/${repo}.git/"
     done

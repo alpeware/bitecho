@@ -813,6 +813,11 @@
       :ignored-stale 0
       :diagnostics []})))
 
+(defn anon-conn-key?
+  "Returns true if k represents an unauthenticated anonymous agent connection (Gap F-D29-16)."
+  [k]
+  (and (vector? k) (= :anon (first k))))
+
 (defn push-mesh-diagnostic
   "Appends an effect to the connection diagnostics ring-buffer (capped at 64 entries) and updates :last-diagnostic."
   [conn eff]
@@ -968,7 +973,7 @@
                            (push-mesh-diagnostic diag-eff))]
           [new-conn effects])
 
-        :shutdown
+        (:shutdown :reap)
         (let [node-to-close (:node conn)
               effects (if node-to-close
                         [{:effect :close-node :node node-to-close :generation (:generation conn 0)}]
@@ -1058,6 +1063,28 @@
                 (prune-closed-conn-tombstones updated))))
      (execute-mesh-conn-effects! @effects-ref opts)
      (get @conns-atom key))))
+
+(defn reap-idle-anon-agent-conns!
+  "Reaps idle unauthenticated anonymous agent connections exceeding max-age-ms (default 10,000ms),
+   closing their nodes and transitioning them to :down via apply-mesh-conn-event! (F-D29-16, A-D29-3)."
+  ([agent-conns]
+   (reap-idle-anon-agent-conns! agent-conns 10000))
+  ([agent-conns max-age-ms]
+   (when agent-conns
+     (let [now-ms (System/currentTimeMillis)
+           max-age (long (or max-age-ms 10000))
+           stale-keys (->> (if (instance? clojure.lang.IAtom agent-conns)
+                             @agent-conns
+                             agent-conns)
+                           (keep (fn [[k c]]
+                                   (when (and (anon-conn-key? k)
+                                              (not= :down (:phase c))
+                                              (not= :failed (:phase c)))
+                                     (let [ts (long (or (:last-rx-at c) (:connected-at c) (:created-at c) 0))]
+                                       (when (>= (- now-ms ts) max-age)
+                                         k))))))]
+       (doseq [k stale-keys]
+         (apply-mesh-conn-event! agent-conns k {:type :reap :now-ms now-ms}))))))
 
 (defn rebind-agent-conn-sender
   "Pure helper. Moves connection entry from anon-key to sender-hex when an agent authenticates.
@@ -1616,6 +1643,8 @@
                               (when (= transport :datachannel)
                                 (send-peer-keepalives! (:peer-conns ctx))
                                 (check-and-reconnect-peers! ctx timeout-ms))
+                              (when-let [ac (:agent-conns ctx)]
+                                (reap-idle-anon-agent-conns! ac 10000))
                               (catch Exception e
                                 (log-mesh-error "Ticker loop error" e))))
                           initial-delay
@@ -1676,7 +1705,8 @@
     (if-let [wire-bytes (ensure-fressian-wire-bytes frozen-evt)]
       (let [msg-id (extract-gossip-msg-id wire-bytes)]
         (doseq [[pk conn] @agent-conns
-                :when (not= pk exclude-sender)]
+                :when (and (not= pk exclude-sender)
+                           (not (anon-conn-key? pk)))]
           (let [sent-ids (conn-sent-msg-ids conn)]
             (when-not (and msg-id (contains? sent-ids msg-id))
               (when-let [cid (or (conn-channel-id conn) 0)]
@@ -1949,14 +1979,16 @@
                                     (apply-mesh-conn-event! agent-conns @conn-key
                                                             {:type :on-open :generation @node-gen :node agent-node :channel-id cid}))]
                       (when (and has-cid? (or (nil? agent-conns) (= agent-node (:node updated))))
-                        (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
+                        (when-not (anon-conn-key? @conn-key)
+                          (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key)))))
          :on-data-channel (fn [evt]
                             (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
                                   updated (when agent-conns
                                             (apply-mesh-conn-event! agent-conns @conn-key
                                                                     {:type :on-data-channel :generation @node-gen :node agent-node :channel-id cid}))]
                               (when (or (nil? agent-conns) (= agent-node (:node updated)))
-                                (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key))))
+                                (when-not (anon-conn-key? @conn-key)
+                                  (replay-cached-gossip-to-agent! shell-node agent-conns @conn-key)))))
          :on-message
          (fn [evt]
            (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)
@@ -2022,7 +2054,13 @@
                                  (try
                                    (api/send! agent-node (fressian/encode-wire snapshot) cid)
                                    (catch Exception e
-                                     (log-mesh-error "Failed to send chain-state-snapshot to agent" e)))))
+                                     (log-mesh-error "Failed to send chain-state-snapshot to agent" e))))
+                               (try
+                                 (api/close! agent-node)
+                                 (catch Exception _ nil))
+                               (when agent-conns
+                                 (apply-mesh-conn-event! agent-conns @conn-key
+                                                         {:type :on-close :generation @node-gen :node agent-node})))
                              (do
                                (async/put! (:network-in shell-node) unwrapped)
                                (when (and (= (:type unwrapped) :receive-gossip) agent-conns)

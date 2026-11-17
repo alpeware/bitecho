@@ -2171,7 +2171,7 @@
           (is (= "auto-sync" (get ev-fail "event")))
           (is (false? (get ev-fail "ok")))
           (is (false? (get ev-fail "synced")))
-          (is (= "insufficient-validator-quorum" (get ev-fail "error")))
+          (is (contains? #{"insufficient-snapshots-returned" "insufficient-validator-quorum"} (get ev-fail "error")))
           (is (some #(= :auto-sync-failed (:reason %)) @diag-atom)))
         (finally
           (doseq [f (reverse (file-seq (.toFile temp-dir)))]

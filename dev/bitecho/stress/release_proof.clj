@@ -14,6 +14,7 @@
             [bitecho.d26-remediation-scenarios-test :as d26-test]
             [bitecho.d27-publishing-and-remediation-test :as d27-test]
             [bitecho.d28-autosync-and-p2p-ack-hotfix-test :as d28-test]
+            [bitecho.e2e.d29-remediation-scenario-test :as d29-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
             [bitecho.fressian :as fressian]
@@ -453,11 +454,38 @@
      :count (count results)
      :scenarios results}))
 
+(defn run-d29-scenarios
+  "Runs Milestone D29 (v0.23.7 / BIP-003) overnight campaign remediation scenario suite."
+  []
+  (let [scenarios [{:id "D29-1" :name "receipt-epoch-horizon-and-gossiped-sig-auth" :test-fn d29-test/scenario-1-receipt-epoch-horizon-and-gossiped-sig-auth}
+                   {:id "D29-2" :name "on-chain-bounty-escrow-lifecycle-survives-autosync" :test-fn d29-test/scenario-2-on-chain-bounty-escrow-lifecycle-survives-autosync}
+                   {:id "D29-3" :name "validator-anon-query-reap-and-quorum-sync-under-flood" :test-fn d29-test/scenario-3-validator-anon-query-reap-and-quorum-sync-under-flood}
+                   {:id "D29-4" :name "bounded-p2p-reoffer-backoff-and-peer-silence-watch" :test-fn d29-test/scenario-4-bounded-p2p-reoffer-backoff-and-peer-silence-watch}
+                   {:id "D29-5" :name "strict-network-uri-accept-and-https-relay-p2p-candidate" :test-fn d29-test/scenario-5-strict-network-uri-accept-and-https-relay-p2p-candidate}
+                   {:id "D29-6" :name "http-dist-bundle-sea-and-sha256-bridge" :test-fn d29-test/scenario-6-http-dist-bundle-sea-and-sha256-bridge}
+                   {:id "D29-7" :name "relay-poll-subnet-filter-and-no-default-private-chat" :test-fn d29-test/scenario-7-relay-poll-subnet-filter-and-no-default-private-chat}
+                   {:id "D29-8" :name "ctl-wait-block-honors-timeout-and-cursor" :test-fn d29-test/scenario-8-ctl-wait-block-honors-timeout-and-cursor}
+                   {:id "D29-9" :name "cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid" :test-fn d29-test/scenario-9-cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D28 (v0.23.6) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D29 (v0.23.7) release verification proof and returns a deterministic EDN map."
   [opts]
   (let [ver (or (:version opts) (str "v" config/version))
-        ms (or (:milestone opts) "D28")
+        ms (or (:milestone opts) "D29")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
@@ -468,6 +496,7 @@
         d26-scenarios (run-d26-scenarios)
         d27-scenarios (run-d27-scenarios)
         d28-scenarios (run-d28-scenarios)
+        d29-scenarios (run-d29-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
         _ (assert (and (.exists bundle-file) (pos? (.length bundle-file)))
                   "dist/bitecho-light-node.cjs must exist and be non-empty before release proof generation!")
@@ -487,7 +516,8 @@
                                   (:all-passed? d25-scenarios)
                                   (:all-passed? d26-scenarios)
                                   (:all-passed? d27-scenarios)
-                                  (:all-passed? d28-scenarios)))]
+                                  (:all-passed? d28-scenarios)
+                                  (:all-passed? d29-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
@@ -500,12 +530,14 @@
                        "bitecho.d26-remediation-scenarios-test"
                        "bitecho.d27-publishing-and-remediation-test"
                        "bitecho.d28-autosync-and-p2p-ack-hotfix-test"
+                       "bitecho.e2e.d29-remediation-scenario-test"
                        "bitecho.state-machine-test"]
      :d24-remediation-scenarios d24-scenarios
      :d25-remediation-scenarios d25-scenarios
      :d26-remediation-scenarios d26-scenarios
      :d27-remediation-scenarios d27-scenarios
      :d28-remediation-scenarios d28-scenarios
+     :d29-remediation-scenarios d29-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}
@@ -522,5 +554,5 @@
       (.mkdirs parent))
     (spit out-file (with-out-str (pprint/pprint proof)))
     (println (str "Wrote release proof to " out-path " (all-passed?=" (:all-passed? proof) ")"))
-    (when-not (:all-passed? proof)
-      (System/exit 1))))
+    (shutdown-agents)
+    (System/exit (if (:all-passed? proof) 0 1))))

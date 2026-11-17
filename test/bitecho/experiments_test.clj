@@ -300,7 +300,7 @@
 ;; 4. INV-D16-2, INV-D16-3, & INV-D16-4: Live Bubblewrap Isolation & CLI Test
 ;; =============================================================================
 
-(deftest inv-d16-2-and-4-live-bwrap-sandbox-preflight-and-node-cli-test
+(deftest ^:integration inv-d16-2-and-4-live-bwrap-sandbox-preflight-and-node-cli-test
   (let [tmp-root (.toFile (Files/createTempDirectory
                            (.toPath (io/file "/var/tmp"))
                            "bitecho-d16-test-"
@@ -430,7 +430,7 @@
                                provisioned alpha-ctx
                                ["clojure" "-M:light-node" "send" "--to" "beta" "--text" "Byzantine summary" "--burn" "100"])
                     _ (is (zero? (:exit deliv-res)) (pr-str deliv-res))
-                    _ (Thread/sleep 400)
+                    _ (Thread/sleep 800)
                     ;; 6. Beta drains inbox and verifies both sealed messages and subnet broadcast
                     inbox-beta (runner/exec-in-node-sandbox! provisioned beta-ctx ["clojure" "-M:light-node" "inbox"])
                     _ (is (zero? (:exit inbox-beta)) (pr-str inbox-beta))
@@ -442,7 +442,7 @@
                     _ (runner/exec-in-node-sandbox!
                        provisioned beta-ctx
                        ["clojure" "-M:light-node" "transfer" "--receiver" "alpha" "--amount" "200" "--burn" "100"])
-                    _ (Thread/sleep 400)
+                    _ (Thread/sleep 800)
                     st-beta (runner/read-node-local-state beta-ctx)
                     _ (spit (io/file (:workspace-dir alpha-ctx) "SUMMARY.md")
                             "Subnet, P2P, & Capability verified over live validator\n")

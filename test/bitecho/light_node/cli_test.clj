@@ -12,14 +12,15 @@
 ;; =============================================================================
 
 (deftest test-supported-verbs-inventory
-  (testing "Exact 63 canonical verbs in supported-cli-verbs"
-    (is (= 63 (count cli/supported-cli-verbs)))
+  (testing "Exact 64 canonical verbs in supported-cli-verbs"
+    (is (= 64 (count cli/supported-cli-verbs)))
     (is (= (count (distinct cli/supported-cli-verbs)) (count cli/supported-cli-verbs)))
     (is (= cli/supported-cli-verbs (vec (sort cli/supported-cli-verbs))))
     (is (every? #(re-matches #"^[a-z0-9]+(-[a-z0-9]+)*$" %) cli/supported-cli-verbs))
     (is (= (set cli/supported-cli-verbs) cli/supported-cli-verbs-set)))
 
-  (testing "Presence of Milestone 2, 3, 4, and D22 governance/bounty verbs"
+  (testing "Presence of Milestone 2, 3, 4, D22, and D29 governance/bounty verbs"
+    (is (contains? cli/supported-cli-verbs-set "bounties"))
     (is (contains? cli/supported-cli-verbs-set "storage-put"))
     (is (contains? cli/supported-cli-verbs-set "storage-get"))
     (is (contains? cli/supported-cli-verbs-set "storage-list"))

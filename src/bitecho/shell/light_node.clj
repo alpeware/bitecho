@@ -676,7 +676,8 @@
                    "bounty-create" (let [sub (or (extract-flag-value args "--subnet-id" nil)
                                                  (extract-flag-value args "--subnet" nil))
                                          bounty-id (extract-flag-value args "--bounty-id" nil)
-                                         target-cid (or (extract-flag-value args "--target-bip-cid" nil)
+                                         target-cid (or (extract-flag-value args "--bip-cid" nil)
+                                                        (extract-flag-value args "--target-bip-cid" nil)
                                                         (extract-flag-value args "--bip-id" nil))
                                          gross (or (extract-long-flag args "--gross-amount" nil)
                                                    (extract-long-flag args "--amount" nil))
@@ -689,7 +690,7 @@
                                      (cond-> m
                                        sub (assoc "subnet_id" sub)
                                        bounty-id (assoc "bounty_id" bounty-id)
-                                       target-cid (assoc "target_bip_cid" target-cid "bip_id" target-cid)
+                                       target-cid (assoc "target_bip_cid" target-cid "bip_id" target-cid "bip_cid" target-cid "bip-cid" target-cid)
                                        (some? gross) (assoc "gross_amount" gross "amount" gross)
                                        m-pub (assoc "maintainer_pubkey" m-pub)
                                        (some? take-bps) (assoc "take_bps" take-bps)
@@ -3027,7 +3028,7 @@
                                                           (= (get cmd-map "peek") "true"))]
                                             (if peek?
                                               (locking cmd-lock (handle-serve-line! cmd-map ctx))
-                                              (let [block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
+                                              (let [_block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
                                                     timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))
                                                     min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
                                                               (long ms))
@@ -3050,10 +3051,10 @@
                                                       (if (and (:daemon-running? ctx) (false? @(:daemon-running? ctx)))
                                                         {"ok" false "error" "daemon-shutting-down"}
                                                         (let [rem (- deadline (System/currentTimeMillis))]
-                                                          (if (and (not block?) (<= rem 0))
+                                                          (if (<= rem 0)
                                                             (locking cmd-lock (handle-serve-line! cmd-map ctx))
                                                             (do
-                                                              (Thread/sleep (min 50 (if block? 50 (max 10 rem))))
+                                                              (Thread/sleep (min 50 (max 10 rem)))
                                                               (recur)))))))))))
                                           (let [raw-res (locking cmd-lock
                                                           (handle-serve-line! cmd-map ctx))
@@ -3424,10 +3425,7 @@
                      (loop [since-mseq (long (or (:relay-since-seq @state-atom) 0))
                             since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))]
                        (when @daemon-running?
-                         (let [eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
-                                                          (empty? (disj (or (:subscribed-subnets @state-atom) #{})
-                                                                        light-core/simon-nexus-axiom-subnet-id)))
-                                             (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+                         (let [eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
                                subnets (or (:subnets opts) eff-subnets)
                                poll-res (try
                                           (poll-relay-envelopes! (:relay-url opts)
@@ -3648,10 +3646,7 @@
         priv-bytes (:privkey-bytes identity)
         since-mseq (long (or (:relay-since-seq @state-atom) 0))
         since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))
-        eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
-                                   (empty? (disj (or (:subscribed-subnets @state-atom) #{})
-                                                 light-core/simon-nexus-axiom-subnet-id)))
-                      (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+        eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
         subnets (or (:subnets opts) eff-subnets)
         poll-res (try
                    (poll-relay-envelopes! relay-url

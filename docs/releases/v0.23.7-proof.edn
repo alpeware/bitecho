@@ -1,0 +1,236 @@
+{:test-namespaces
+ ["bitecho.d24-remediation-scenarios-test"
+  "bitecho.d25-remediation-scenarios-test"
+  "bitecho.d26-remediation-scenarios-test"
+  "bitecho.d27-publishing-and-remediation-test"
+  "bitecho.d28-autosync-and-p2p-ack-hotfix-test"
+  "bitecho.e2e.d29-remediation-scenario-test"
+  "bitecho.state-machine-test"],
+ :d25-remediation-scenarios
+ {:all-passed? true,
+  :count 7,
+  :scenarios
+  [{:scenario "S9",
+    :name "handle-serve-line-state-commit-and-sequential-p2p-dial",
+    :passed? true}
+   {:scenario "S10",
+    :name "relay-poll-ingest-ordering-and-no-poll-escape-hatch",
+    :passed? true}
+   {:scenario "S11",
+    :name "stateless-offer-handshake-continuity-and-nonce-recovery",
+    :passed? true}
+   {:scenario "S12",
+    :name "inbox-peek-and-dual-key-broadcast-normalization",
+    :passed? true}
+   {:scenario "S13",
+    :name "subnet-filtering-relay-poll-and-wire-payload",
+    :passed? true}
+   {:scenario "S14",
+    :name "flag-before-verb-parsing-and-help-isolation",
+    :passed? true}
+   {:scenario "S15",
+    :name "upnp-renewal-loop-lifecycle",
+    :passed? true}]},
+ :all-passed? true,
+ :milestone "D29",
+ :cross-network-replay
+ {:pairs
+  [{:source "devnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}
+   {:source "devnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "testnet.bitecho.org",
+    :target "mainnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "devnet.bitecho.org",
+    :rejected? true}
+   {:source "mainnet.bitecho.org",
+    :target "testnet.bitecho.org",
+    :rejected? true}],
+  :mainnet-unscoped-rejected? true,
+  :devnet-unscoped-accepted? true,
+  :all-rejected? true},
+ :rolling-upgrade
+ {:node-n-subnet "global",
+  :node-n-plus-1-subnet "devnet.bitecho.org",
+  :n-accepted-n1-event? true,
+  :n1-accepted-n-event? true,
+  :foreign-subnet-dropped? true,
+  :passed? true},
+ :d27-remediation-scenarios
+ {:all-passed? true,
+  :count 9,
+  :scenarios
+  [{:scenario "D27-1",
+    :name "quorum-5-of-6-supermajority",
+    :passed? true}
+   {:scenario "D27-2",
+    :name "credited-tx-ids-hydration",
+    :passed? true}
+   {:scenario "D27-3",
+    :name "network-uri-and-replay-equivalence",
+    :passed? true}
+   {:scenario "D27-4",
+    :name "recipient-first-unicast-filter",
+    :passed? true}
+   {:scenario "D27-5",
+    :name "contagion-summary-pull-known-burn-mids",
+    :passed? true}
+   {:scenario "D27-6", :name "p2p-half-open-redial", :passed? true}
+   {:scenario "D27-7",
+    :name "exec-status-auto-sync-diagnostics",
+    :passed? true}
+   {:scenario "D27-8", :name "http-subnet-publishing", :passed? true}
+   {:scenario "D27-9",
+    :name "version-and-cold-root-pins",
+    :passed? true}]},
+ :d29-remediation-scenarios
+ {:all-passed? true,
+  :count 9,
+  :scenarios
+  [{:scenario "D29-1",
+    :name "receipt-epoch-horizon-and-gossiped-sig-auth",
+    :passed? true}
+   {:scenario "D29-2",
+    :name "on-chain-bounty-escrow-lifecycle-survives-autosync",
+    :passed? true}
+   {:scenario "D29-3",
+    :name "validator-anon-query-reap-and-quorum-sync-under-flood",
+    :passed? true}
+   {:scenario "D29-4",
+    :name "bounded-p2p-reoffer-backoff-and-peer-silence-watch",
+    :passed? true}
+   {:scenario "D29-5",
+    :name "strict-network-uri-accept-and-https-relay-p2p-candidate",
+    :passed? true}
+   {:scenario "D29-6",
+    :name "http-dist-bundle-sea-and-sha256-bridge",
+    :passed? true}
+   {:scenario "D29-7",
+    :name "relay-poll-subnet-filter-and-no-default-private-chat",
+    :passed? true}
+   {:scenario "D29-8",
+    :name "ctl-wait-block-honors-timeout-and-cursor",
+    :passed? true}
+   {:scenario "D29-9",
+    :name "cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid",
+    :passed? true}]},
+ :node-bundle-sha256
+ "04a68cca1b6a7e548fbb3f1c0a4b0bb2d47c49483e292e7768a96585d8126c25",
+ :networks
+ {"devnet.bitecho.org"
+  {:network :devnet,
+   :network-uri "devnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 50,
+   :governance-passed? true,
+   :passed? true},
+  "testnet.bitecho.org"
+  {:network :testnet,
+   :network-uri "testnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true},
+  "mainnet.bitecho.org"
+  {:network :mainnet,
+   :network-uri "mainnet.bitecho.org",
+   :bft-finalized? true,
+   :finalized-blocks-count 2,
+   :escrow-passed? true,
+   :settlement-take-bps 150,
+   :governance-passed? true,
+   :passed? true}},
+ :d24-remediation-scenarios
+ {:all-passed? true,
+  :count 8,
+  :scenarios
+  [{:scenario "S1",
+    :name "p2p-answer-candidate-fallback-and-persistence",
+    :passed? true}
+   {:scenario "S2",
+    :name "port-443-passthrough-and-signatures",
+    :passed? true}
+   {:scenario "S3",
+    :name "cross-subnet-relay-and-early-sealed-buffering",
+    :passed? true}
+   {:scenario "S4",
+    :name "now-ms-injection-and-offline-shuttle",
+    :passed? true}
+   {:scenario "S5",
+    :name "replication-auth-and-ctl-concurrency",
+    :passed? true}
+   {:scenario "S6",
+    :name "single-responder-and-newline-discipline",
+    :passed? true}
+   {:scenario "S7",
+    :name "jepsen-and-datachannel-campaigns",
+    :passed? true}
+   {:scenario "S8",
+    :name "node-bundle-relay-send-and-failover",
+    :passed? true}]},
+ :d26-remediation-scenarios
+ {:all-passed? true,
+  :count 9,
+  :scenarios
+  [{:scenario "S16",
+    :name "accountz-fallback-removal-and-fail-closed",
+    :passed? true}
+   {:scenario "S17",
+    :name "second-p2p-answer-preserves-open-state",
+    :passed? true}
+   {:scenario "S18",
+    :name "offer-hash-network-binding-and-rolling-upgrade",
+    :passed? true}
+   {:scenario "S19",
+    :name "bip-000-charter-and-strict-admission",
+    :passed? true}
+   {:scenario "S20",
+    :name "release-proof-generator-and-deploy-gate",
+    :passed? true}
+   {:scenario "S21",
+    :name "multi-cluster-network-profiles",
+    :passed? true}
+   {:scenario "S22",
+    :name "wait-event-broadcast-and-min-balance-guard",
+    :passed? true}
+   {:scenario "S23",
+    :name "treasury-faucet-directory-and-blog",
+    :passed? true}
+   {:scenario "S24",
+    :name "sea-build-script-and-skill-regrounding",
+    :passed? true}]},
+ :commit-sha "2dad73c60ccee58f3b282371323f5990ea8c74ce",
+ :version "v0.23.7",
+ :browser-bundle-sha256
+ "5328b9a1ba72492b49fdc8a39f720c9cec3b5fd53754bd353e2d01a6282f8b45",
+ :tree-sha "bd9120338a415a4754b6a336707014134833bd3c",
+ :d28-remediation-scenarios
+ {:all-passed? true,
+  :count 5,
+  :scenarios
+  [{:scenario "D28-1",
+    :name "preserve-dynamic-validators-across-restarts",
+    :passed? true}
+   {:scenario "D28-2",
+    :name "three-node-lagging-peer-zombie-gossip-e2e",
+    :passed? true}
+   {:scenario "D28-3",
+    :name "lock-free-query-chain-state-and-no-empty-signing",
+    :passed? true}
+   {:scenario "D28-4",
+    :name "direct-leg-session-ack-and-outbox-fallback",
+    :passed? true}
+   {:scenario "D28-5",
+    :name "relay-watermark-reset-on-restart",
+    :passed? true}]}}

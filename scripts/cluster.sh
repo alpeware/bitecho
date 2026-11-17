@@ -422,8 +422,8 @@ EDN_EOF
 # ------------------------------------------------------------------------------
 
 verify_release_proof_gate() {
-  local version="${1:-$(sed -n -E 's/.*version\s+"([^"]+)".*/\1/p' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.5}"
+  local version="${1:-$(tr '\n' ' ' < "${ROOT_DIR}/src/bitecho/config.cljc" | sed -n -E 's/.*\(def[[:space:]]+version[^"]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p')}"
+  version="${version:-0.23.7}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Step 0a/8: Verifying Release Proof Gate for v${version}..."
@@ -1552,9 +1552,37 @@ else:
 
 cmd_logs() {
   local node="${1:-node1}"
-  local lines="${2:-100}"
-  echo "Streaming logs for bitecho on ${node}..."
-  ssh_cmd "$node" sudo journalctl -u bitecho -n "$lines" -f
+  local lines="${2:-${LINES:-100}}"
+  local follow=false
+  if [[ "$#" -ge 3 && ( "$3" == "-f" || "$3" == "--follow" ) ]]; then
+    follow=true
+  elif [[ -t 1 ]]; then
+    follow=true
+  fi
+
+  if [[ "$follow" == true ]]; then
+    echo "Streaming logs for bitecho on ${node}..."
+    ssh_cmd "$node" sudo journalctl -u bitecho -n "$lines" -f
+  else
+    ssh_cmd "$node" sudo journalctl -u bitecho -n "$lines" --no-pager
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Subcommand: sample
+# ------------------------------------------------------------------------------
+
+cmd_sample() {
+  local count="${1:-5}"
+  local interval="${2:-2}"
+  echo "=== Sampling Cluster Status (${count} samples, ${interval}s interval) ==="
+  for ((i=1; i<=count; i++)); do
+    echo "--- Sample ${i}/${count} ($(date -u +"%Y-%m-%dT%H:%M:%SZ")) ---"
+    cmd_status --all
+    if [[ "$i" -lt "$count" ]]; then
+      sleep "$interval"
+    fi
+  done
 }
 
 # ------------------------------------------------------------------------------
@@ -1833,11 +1861,35 @@ cmd_fund() {
   echo "Amount:    ${amount} ECH"
   echo "Custody:   ${CUSTODY_PUB:0:16}..."
 
-  echo "--> Querying current Custody state from node1 /accountz..."
-  local custody_edn
-  custody_edn="$(ssh_cmd node1 curl -sf "http://127.0.0.1:8080/accountz?pubkey=${CUSTODY_PUB}" 2>/dev/null || echo "")"
+  echo "--> Querying current Custody state quorum (4-of-6) from /accountz..."
+  local custody_edn=""
+  local max_agree=0
+  declare -A custody_snaps=()
+  for node in "${ALL_NODES[@]}"; do
+    local snap
+    snap="$(ssh_cmd "$node" curl -sf "http://127.0.0.1:8080/accountz?pubkey=${CUSTODY_PUB}" 2>/dev/null || echo "")"
+    if [[ -n "$snap" ]]; then
+      local seq_val
+      seq_val="$(echo "$snap" | grep -o ':seq [0-9]*' | head -n1 || echo "")"
+      if [[ -n "$seq_val" ]]; then
+        local cur_count=$(( ${custody_snaps["$seq_val"]:-0} + 1 ))
+        custody_snaps["$seq_val"]="$cur_count"
+        if [[ "$cur_count" -gt "$max_agree" ]]; then
+          max_agree="$cur_count"
+          custody_edn="$snap"
+        fi
+        if [[ "$cur_count" -ge 4 ]]; then
+          echo "Quorum verified: ${cur_count}/6 validators agree on Custody state (${seq_val})."
+          break
+        fi
+      fi
+    fi
+  done
   if [[ -z "$custody_edn" ]]; then
-    echo "Error: Failed to query /accountz from node1." >&2
+    custody_edn="$(ssh_cmd node1 curl -sf "http://127.0.0.1:8080/accountz?pubkey=${CUSTODY_PUB}" 2>/dev/null || echo "")"
+  fi
+  if [[ -z "$custody_edn" ]]; then
+    echo "Error: Failed to query /accountz from devnet nodes." >&2
     return 1
   fi
 
@@ -1869,16 +1921,24 @@ print(f'{seq} {deps}')
     "${ROOT_DIR}/devnet/bootstrap.edn" "${CUSTODY_KEY_FILE}" \
     "$recipient" "$amount" --seq "$next_seq" --deps "$deps_edn"
 
-  echo "--> Waiting for Streamlet finalization..."
+  echo "--> Waiting for Streamlet finalization (4-of-6 quorum)..."
   local funded=false
   for _ in {1..20}; do
     sleep 2
-    local rec_edn
-    rec_edn="$(ssh_cmd node1 curl -sf "http://127.0.0.1:8080/accountz?pubkey=${recipient}" 2>/dev/null || echo "")"
-    local bal=""
-    bal="$(echo "$rec_edn" | grep -o ':balance [0-9]*' | awk '{print $2}' || true)"
-    if [[ -n "$bal" && "$bal" -gt 0 ]]; then
-      echo "Verified: Recipient ${recipient:0:16}... balance is now ${bal} ECH."
+    local agreeing=0
+    local confirmed_bal=""
+    for node in "${ALL_NODES[@]}"; do
+      local rec_edn
+      rec_edn="$(ssh_cmd "$node" curl -sf "http://127.0.0.1:8080/accountz?pubkey=${recipient}" 2>/dev/null || echo "")"
+      local bal=""
+      bal="$(echo "$rec_edn" | grep -o ':balance [0-9]*' | awk '{print $2}' || true)"
+      if [[ -n "$bal" && "$bal" -gt 0 ]]; then
+        ((agreeing++))
+        confirmed_bal="$bal"
+      fi
+    done
+    if [[ "$agreeing" -ge 4 ]]; then
+      echo "Verified: Recipient ${recipient:0:16}... balance is now ${confirmed_bal} ECH (confirmed on ${agreeing}/6 nodes)."
       funded=true
       break
     fi
@@ -2113,6 +2173,7 @@ Commands:
   register-directory <nickname> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]
                                       Sign agent PoP and publish directory attestation descriptor
   chaos [--rounds N] [--interval SEC] Run chaos monkey restarting random nodes and checking convergence
+  sample [count] [interval_sec]       Sample non-blocking cluster telemetry during load waves (default: 5 2)
   logs [node1|node2|node3]            Stream systemd journal logs from a cluster node
   bootstrap-sdp                       Display WebRTC DataChannel bootstrap connection parameters for agents
   print-fingerprint                   Inspect and verify live DTLS fingerprints against devnet/bootstrap.edn
@@ -2175,6 +2236,9 @@ main() {
       ;;
     chaos)
       cmd_chaos "$@"
+      ;;
+    sample)
+      cmd_sample "$@"
       ;;
     logs)
       cmd_logs "$@"

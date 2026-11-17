@@ -45,6 +45,48 @@
 
 (declare apply-payload-to-ledger execute-finalized-blocks derive-authoritative-roles)
 
+(def max-receipt-age-epochs
+  "Maximum epoch age for executable/gossiped receipts before rejection as stale (F-D29-10, A-CARB-D29-1)."
+  64)
+
+(defn receipt-signing-bytes
+  "Returns the canonical Fressian bytes of a receipt for signing/verification
+   with :signature / \"signature\" omitted."
+  [receipt]
+  (fressian/encode-canonical (dissoc receipt :signature "signature")))
+
+(defn verify-receipt-sig?
+  "Verifies that :signature on receipt is a valid Ed25519 signature over
+   the canonical bytes using expected-pubkey."
+  [receipt expected-pubkey]
+  (try
+    (let [sig (or (:signature receipt) (get receipt "signature"))
+          sig-bytes (cond
+                      (fressian/bytes? sig) sig
+                      (string? sig) (fressian/hex->bytes sig)
+                      :else nil)
+          pk-bytes (cond
+                     (fressian/bytes? expected-pubkey) expected-pubkey
+                     (string? expected-pubkey) (fressian/hex->bytes expected-pubkey)
+                     :else nil)]
+      (if (and sig-bytes pk-bytes)
+        (crypto/verify pk-bytes (receipt-signing-bytes receipt) sig-bytes)
+        false))
+    (catch #?(:clj Exception :cljs :default) _ false)))
+
+(defn- receipt-sig-valid-or-exempt?
+  "Returns true if the receipt signature is valid for expected-pubkey,
+   or if unsigned receipts are permitted by state config / gossip-burn exemption."
+  [state receipt expected-pubkey]
+  (let [sig (or (:signature receipt) (get receipt "signature"))
+        exempt? (or (true? (:allow-unsigned-legacy-receipts? state))
+                    (string/starts-with? (str (:receipt-id receipt)) "gossip-burn:")
+                    (and (not (true? (:require-signed-receipts? state))) (nil? sig)))]
+    (cond
+      (and (nil? sig) exempt?) true
+      (nil? sig) false
+      :else (verify-receipt-sig? receipt expected-pubkey))))
+
 (defn- peer-hex
   "Normalizes a peer's pubkey to a hex string."
   [peer]
@@ -130,12 +172,14 @@
       :known-receipt-order []
       :executed-receipt-ids #{}
       :executed-receipt-order []
+      :executed-receipts-by-epoch {}
       :executed-finalized-blocks #{}
       :executed-finalized-blocks-order []
       :last-executed-finalized-epoch 0
       :receipt-seq 0
       :failed-receipts-count 0
       :escrows {}
+      :bounty-escrows {}
       :settled-escrow-ids #{}
       :settled-escrow-order []
       ;; Subnet & Economy configuration (Milestone 12 / D23)
@@ -1812,9 +1856,21 @@
              receipts (filter #(and (map? %) (:receipt-id %)) (when (sequential? payload) payload))
              st-applied (reduce
                          (fn [s r]
-                           (let [rid (:receipt-id r)]
-                             (if (contains? (or (:executed-receipt-ids s) #{}) rid)
+                           (let [rid (:receipt-id r)
+                                 r-ep (:epoch r)
+                                 stale? (and (integer? r-ep)
+                                             (> (- (long closing-ep) (long r-ep)) max-receipt-age-epochs))]
+                             (cond
+                               stale?
+                               (-> s
+                                   (update :failed-receipts-count (fnil inc 0))
+                                   (update-in [:diagnostics :stale-receipt-epoch-rejected] (fnil inc 0)))
+
+                               (or (contains? (or (:executed-receipt-ids s) #{}) rid)
+                                   (some (fn [[_ rids]] (contains? rids rid)) (:executed-receipts-by-epoch s)))
                                s
+
+                               :else
                                (let [s-effect
                                      (case (:type r)
                                        :burn
@@ -1833,6 +1889,75 @@
                                            (assoc s :ledger new-ledger)
                                            (update s :failed-receipts-count (fnil inc 0)))
                                          (update s :failed-receipts-count (fnil inc 0)))
+
+                                       :bounty-create
+                                       (let [bounty-id (:bounty-id r)
+                                             m-pub (:maintainer-pubkey r)
+                                             m-pub-hex (when m-pub (if (string? m-pub) m-pub (basalt/bytes->hex m-pub)))
+                                             gross (long (or (:gross-amount r) (:amount r) 0))
+                                             m-acct (when m-pub-hex (get-in s [:ledger m-pub-hex]))
+                                             m-bal (long (or (:balance m-acct) 0))
+                                             take-bps (long (or (:take-bps r) 50))
+                                             builder-bps (long (or (:builder-bps r) 8450))
+                                             proto-take (quot (* gross take-bps) 10000)
+                                             b-net (quot (* gross builder-bps) 10000)
+                                             a-net (- gross (+ proto-take b-net))
+                                             existing (get-in s [:bounty-escrows bounty-id])]
+                                         (if (and (string? bounty-id) (not (string/blank? bounty-id))
+                                                  m-pub-hex (pos? gross) m-acct (>= m-bal gross)
+                                                  (nil? existing))
+                                           (let [new-m (assoc m-acct :balance (- m-bal gross))
+                                                 escrow-entry {:bounty-id bounty-id
+                                                               :maintainer-pubkey m-pub-hex
+                                                               :subnet-id (or (:subnet-id r) "global")
+                                                               :target-bip-cid (or (:target-bip-cid r) (:bip-cid r))
+                                                               :gross-amount gross
+                                                               :take-bps take-bps
+                                                               :builder-bps builder-bps
+                                                               :protocol-take proto-take
+                                                               :builder-net b-net
+                                                               :auditor-net a-net
+                                                               :created-epoch (or (:epoch r) closing-ep)
+                                                               :status :locked}]
+                                             (-> s
+                                                 (assoc-in [:ledger m-pub-hex] new-m)
+                                                 (assoc-in [:bounty-escrows bounty-id] escrow-entry)))
+                                           (update s :failed-receipts-count (fnil inc 0))))
+
+                                       :bounty-settle
+                                       (let [bounty-id (:bounty-id r)
+                                             b-escrow (get-in s [:bounty-escrows bounty-id])
+                                             m-pub (:maintainer-pubkey r)
+                                             m-pub-hex (when m-pub (if (string? m-pub) m-pub (basalt/bytes->hex m-pub)))
+                                             builder (:builder-pubkey r)
+                                             builder-hex (when builder (if (string? builder) builder (basalt/bytes->hex builder)))
+                                             auditor (:auditor-pubkey r)
+                                             auditor-hex (when auditor (if (string? auditor) auditor (basalt/bytes->hex auditor)))]
+                                         (if (and b-escrow (= :locked (:status b-escrow))
+                                                  builder-hex auditor-hex
+                                                  (or (nil? m-pub-hex) (= m-pub-hex (:maintainer-pubkey b-escrow))))
+                                           (let [b-net (long (or (:builder-net b-escrow) 0))
+                                                 a-net (long (or (:auditor-net b-escrow) 0))
+                                                 proto-take (long (or (:protocol-take b-escrow) 0))
+                                                 created-ep (or (:created-epoch b-escrow) closing-ep)
+                                                 b-acct (get-in s [:ledger builder-hex]
+                                                                (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                                 a-acct (get-in s [:ledger auditor-hex]
+                                                                (account/map->AccountState {:balance 0 :seq 0 :deps []}))
+                                                 new-b (assoc b-acct :balance (+ (or (:balance b-acct) 0) b-net))
+                                                 new-a (assoc a-acct :balance (+ (or (:balance a-acct) 0) a-net))
+                                                 updated-escrow (assoc b-escrow
+                                                                       :status :settled
+                                                                       :builder-pubkey builder-hex
+                                                                       :auditor-pubkey auditor-hex
+                                                                       :settled-epoch closing-ep
+                                                                       :claim (:claim r))]
+                                             (-> s
+                                                 (assoc-in [:ledger builder-hex] new-b)
+                                                 (assoc-in [:ledger auditor-hex] new-a)
+                                                 (assoc-in [:bounty-escrows bounty-id] updated-escrow)
+                                                 (update-in [:epoch-settlement-takes created-ep] (fnil + 0) proto-take)))
+                                           (update s :failed-receipts-count (fnil inc 0))))
 
                                        :settle-intent
                                        (let [payer (:payer r)
@@ -2195,23 +2320,27 @@
                                                                              (:known-receipt-order s-effect)
                                                                              rid
                                                                              max-tracked)]
-                                 (assoc s-effect
-                                        :executed-receipt-ids next-exec
-                                        :executed-receipt-order next-exec-ord
-                                        :known-receipt-ids next-known
-                                        :known-receipt-order next-known-ord)))))
+                                 (-> s-effect
+                                     (assoc :executed-receipt-ids next-exec
+                                            :executed-receipt-order next-exec-ord
+                                            :known-receipt-ids next-known
+                                            :known-receipt-order next-known-ord)
+                                     (update-in [:executed-receipts-by-epoch closing-ep] (fnil conj #{}) rid))))))
                          st-skipped
                          (let [reconfig-rcpts (filter #(= :reconfigure-membership (:type %)) receipts)
                                other-rcpts (remove #(= :reconfigure-membership (:type %)) receipts)]
                            (concat reconfig-rcpts other-rcpts)))
-             exec-rids (or (:executed-receipt-ids st-applied) #{})
-             st-clean (assoc st-applied
+             st-pruned-epochs (update st-applied :executed-receipts-by-epoch
+                                      (fn [m]
+                                        (into {} (filter (fn [[ep _]] (>= (long ep) (- closing-ep 65))) m))))
+             exec-rids (or (:executed-receipt-ids st-pruned-epochs) #{})
+             st-clean (assoc st-pruned-epochs
                              :pending-receipts (filterv #(not (contains? exec-rids (:receipt-id %)))
-                                                        (or (:pending-receipts st-applied) []))
+                                                        (or (:pending-receipts st-pruned-epochs) []))
                              :mempool (filterv #(if (and (map? %) (:receipt-id %))
                                                   (not (contains? exec-rids (:receipt-id %)))
                                                   true)
-                                               (or (:mempool st-applied) [])))
+                                               (or (:mempool st-pruned-epochs) [])))
              st-advanced (if (> b-epoch last-exec)
                            (let [st-settled (apply-epoch-voucher-settlement st-clean closing-ep)
                                  st-treasury (apply-epoch-treasury-boundary st-settled b-epoch)
@@ -3233,178 +3362,211 @@
 
 (defn validate-gossiped-receipt?
   "Validates cryptographic signatures and state preconditions for a gossiped receipt
-   before staging into :pending-receipts (B-CARB-1, A-D15-4)."
+   before staging into :pending-receipts (B-CARB-1, A-D15-4, F-D29-10, F-D29-13)."
   [state receipt]
-  (and (map? receipt)
-       (string? (:receipt-id receipt))
-       (not (string/blank? (:receipt-id receipt)))
-       (case (:type receipt)
-         :register-home-set
-         (let [callee (:callee receipt)
-               ep (:epoch receipt)
-               p-b (:price receipt)
-               p-b-max (or (:price-max receipt) p-b)
-               cands (:candidates receipt)
-               existing (get-in state [:home-sets [callee ep]])]
-           (and (string? callee)
-                (not (string/blank? callee))
-                (integer? ep)
-                (>= (long ep) 0)
-                (integer? p-b)
-                (not (neg? (long p-b)))
-                (integer? p-b-max)
-                (>= (long p-b-max) (long p-b))
-                (coll? cands)
-                (seq cands)
-                (or (nil? existing) (nil? (:price existing)) (= (:price existing) p-b))))
+  (let [cur-ep (long (or (:epoch state) 0))
+        r-ep (when-let [e (:epoch receipt)] (long e))
+        stale? (and r-ep (> (- cur-ep r-ep) max-receipt-age-epochs))]
+    (and (not stale?)
+         (map? receipt)
+         (string? (:receipt-id receipt))
+         (not (string/blank? (:receipt-id receipt)))
+         (case (:type receipt)
+           :register-home-set
+           (let [callee (:callee receipt)
+                 ep (:epoch receipt)
+                 p-b (:price receipt)
+                 p-b-max (or (:price-max receipt) p-b)
+                 cands (:candidates receipt)
+                 existing (get-in state [:home-sets [callee ep]])]
+             (and (string? callee)
+                  (not (string/blank? callee))
+                  (receipt-sig-valid-or-exempt? state receipt callee)
+                  (integer? ep)
+                  (>= (long ep) 0)
+                  (integer? p-b)
+                  (not (neg? (long p-b)))
+                  (integer? p-b-max)
+                  (>= (long p-b-max) (long p-b))
+                  (coll? cands)
+                  (seq cands)
+                  (or (nil? existing) (nil? (:price existing)) (= (:price existing) p-b))))
 
-         :burn
-         (let [sender (:sender receipt)
-               amt (:amount receipt)
-               floor (burn/effective-signaling-burn-floor state)]
-           (and (string? sender)
-                (integer? amt)
-                (>= (long amt) floor)
-                (some? (get-in state [:ledger sender]))
-                (>= (spendable-balance state sender) (long amt))))
+           :burn
+           (let [sender (:sender receipt)
+                 amt (:amount receipt)
+                 floor (burn/effective-signaling-burn-floor state)]
+             (and (string? sender)
+                  (receipt-sig-valid-or-exempt? state receipt sender)
+                  (integer? amt)
+                  (>= (long amt) floor)
+                  (some? (get-in state [:ledger sender]))
+                  (>= (spendable-balance state sender) (long amt))))
 
-         :transfer
-         (if-let [pb (:payload-bytes receipt)]
-           (some? (apply-transfer-payload-to-ledger (projected-ledger state) (to-byte-array pb) (transfer-validation-opts state)))
-           false)
+           :transfer
+           (if-let [pb (:payload-bytes receipt)]
+             (some? (apply-transfer-payload-to-ledger (projected-ledger state) (to-byte-array pb) (transfer-validation-opts state)))
+             false)
 
-         :settle-intent
-         (let [payer (:payer receipt)
-               receiver (:receiver receipt)
-               amt (:amount receipt)]
-           (and (string? payer)
-                (string? receiver)
-                (integer? amt)
-                (pos? (long amt))
-                (some? (get-in state [:ledger payer]))
-                (>= (spendable-balance state payer) (long amt))))
+           :settle-intent
+           (let [payer (:payer receipt)
+                 receiver (:receiver receipt)
+                 amt (:amount receipt)]
+             (and (string? payer)
+                  (receipt-sig-valid-or-exempt? state receipt payer)
+                  (string? receiver)
+                  (integer? amt)
+                  (pos? (long amt))
+                  (some? (get-in state [:ledger payer]))
+                  (>= (spendable-balance state payer) (long amt))))
 
-         :lock-intent
-         (let [escrow-id (:escrow-id receipt)
-               payer (:payer receipt)
-               receiver (:receiver receipt)
-               amt (:amount receipt)
-               d-hash (or (:deliverable-hash receipt) (:puzzle-hash receipt))
-               created-ep (:created-epoch receipt)
-               expires-ep (:expires-epoch receipt)
-               already? (or (contains? (or (:escrows state) #{}) escrow-id)
-                            (contains? (or (:settled-escrow-ids state) #{}) escrow-id))]
-           (and (string? escrow-id)
-                (not (string/blank? escrow-id))
-                (not already?)
-                (string? payer)
-                (string? receiver)
-                (not= payer receiver)
-                (integer? amt)
-                (pos? (long amt))
-                (escrow/valid-deliverable-hash? d-hash)
-                (integer? created-ep)
-                (integer? expires-ep)
-                (> (long expires-ep) (long created-ep))
-                (<= (- (long expires-ep) (long created-ep)) 168)
-                (some? (get-in state [:ledger payer]))
-                (>= (spendable-balance state payer) (long amt))))
+           :lock-intent
+           (let [escrow-id (:escrow-id receipt)
+                 payer (:payer receipt)
+                 receiver (:receiver receipt)
+                 amt (:amount receipt)
+                 d-hash (or (:deliverable-hash receipt) (:puzzle-hash receipt))
+                 created-ep (:created-epoch receipt)
+                 expires-ep (:expires-epoch receipt)
+                 already? (or (contains? (or (:escrows state) #{}) escrow-id)
+                              (contains? (or (:settled-escrow-ids state) #{}) escrow-id))]
+             (and (string? escrow-id)
+                  (not (string/blank? escrow-id))
+                  (not already?)
+                  (string? payer)
+                  (receipt-sig-valid-or-exempt? state receipt payer)
+                  (string? receiver)
+                  (not= payer receiver)
+                  (integer? amt)
+                  (pos? (long amt))
+                  (escrow/valid-deliverable-hash? d-hash)
+                  (integer? created-ep)
+                  (integer? expires-ep)
+                  (> (long expires-ep) (long created-ep))
+                  (<= (- (long expires-ep) (long created-ep)) 168)
+                  (some? (get-in state [:ledger payer]))
+                  (>= (spendable-balance state payer) (long amt))))
 
-         :release-intent
-         (let [escrow-id (:escrow-id receipt)
-               pending-lock (some (fn [r]
-                                    (when (and (= (:type r) :lock-intent)
-                                               (= (:escrow-id r) escrow-id))
-                                      {:escrow-id escrow-id
-                                       :payer (:payer r)
-                                       :receiver (:receiver r)
-                                       :amount (:amount r)
-                                       :deliverable-hash (or (:deliverable-hash r) (:puzzle-hash r))
-                                       :puzzle-hash (:puzzle-hash r)
-                                       :created-epoch (:created-epoch r)
-                                       :expires-epoch (:expires-epoch r)
-                                       :status :locked}))
-                                  (or (:pending-receipts state) []))
-               escrow (or (get-in state [:escrows escrow-id]) pending-lock)
-               current-ep (long (or (:epoch state) 0))]
-           (if-not (and escrow (= :locked (:status escrow)))
-             false
-             (let [payer (:payer escrow)
-                   receiver (:receiver escrow)
-                   d-hash (:deliverable-hash escrow)
-                   p-hash (:puzzle-hash escrow)
-                   expires-ep (long (or (:expires-epoch escrow) 0))
-                   amount (long (:amount escrow))
-                   preimage (:preimage receipt)
-                   payer-sig (:payer-signature receipt)
-                   puzzle-src (:puzzle-source receipt)
-                   solution (:solution receipt)
-                   sender (:sender receipt)
-                   htlc-cid (puzzle/standard-htlc-cid)
-                   custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
-                   env-ctx {:amount amount
-                            :receiver receiver
-                            :payer payer
-                            :deliverable-hash d-hash
-                            :puzzle-hash p-hash
-                            :epoch current-ep
-                            :escrow-id escrow-id}
-                   puzzle-res (when (and p-hash puzzle-src (<= current-ep expires-ep))
-                                (puzzle/eval-puzzle puzzle-src solution env-ctx))
-                   puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
-                   payer-sig-valid? (and (not custom-puzzle?)
-                                         (or (= sender payer)
-                                             (and (string? payer-sig)
-                                                  (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig))))
-                   preimage-sig-valid? (and (not custom-puzzle?)
-                                            (string? preimage)
-                                            (<= current-ep expires-ep))
-                   payer-auth? (and payer-sig-valid?
-                                    (not puzzle-auth?)
-                                    (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :payer-authorized} env-ctx)))
-                   preimage-auth? (and preimage-sig-valid?
-                                       (not puzzle-auth?)
-                                       (not payer-auth?)
-                                       (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :preimage :preimage preimage} env-ctx)))]
-               (boolean (or payer-auth? preimage-auth? puzzle-auth?)))))
+           :release-intent
+           (let [escrow-id (:escrow-id receipt)
+                 pending-lock (some (fn [r]
+                                      (when (and (= (:type r) :lock-intent)
+                                                 (= (:escrow-id r) escrow-id))
+                                        {:escrow-id escrow-id
+                                         :payer (:payer r)
+                                         :receiver (:receiver r)
+                                         :amount (:amount r)
+                                         :deliverable-hash (or (:deliverable-hash r) (:puzzle-hash r))
+                                         :puzzle-hash (:puzzle-hash r)
+                                         :created-epoch (:created-epoch r)
+                                         :expires-epoch (:expires-epoch r)
+                                         :status :locked}))
+                                    (or (:pending-receipts state) []))
+                 escrow (or (get-in state [:escrows escrow-id]) pending-lock)
+                 current-ep (long (or (:epoch state) 0))]
+             (if-not (and escrow (= :locked (:status escrow)))
+               false
+               (let [payer (:payer escrow)
+                     receiver (:receiver escrow)
+                     d-hash (:deliverable-hash escrow)
+                     p-hash (:puzzle-hash escrow)
+                     expires-ep (long (or (:expires-epoch escrow) 0))
+                     amount (long (:amount escrow))
+                     preimage (:preimage receipt)
+                     payer-sig (:payer-signature receipt)
+                     puzzle-src (:puzzle-source receipt)
+                     solution (:solution receipt)
+                     sender (:sender receipt)
+                     htlc-cid (puzzle/standard-htlc-cid)
+                     custom-puzzle? (and (some? p-hash) (not= p-hash htlc-cid))
+                     env-ctx {:amount amount
+                              :receiver receiver
+                              :payer payer
+                              :deliverable-hash d-hash
+                              :puzzle-hash p-hash
+                              :epoch current-ep
+                              :escrow-id escrow-id}
+                     puzzle-res (when (and p-hash puzzle-src (<= current-ep expires-ep))
+                                  (puzzle/eval-puzzle puzzle-src solution env-ctx))
+                     puzzle-auth? (boolean (and puzzle-res (:valid? puzzle-res)))
+                     payer-sig-valid? (and (not custom-puzzle?)
+                                           (or (= sender payer)
+                                               (and (string? payer-sig)
+                                                    (escrow/verify-escrow-release-sig payer escrow-id d-hash payer-sig))))
+                     preimage-sig-valid? (and (not custom-puzzle?)
+                                              (string? preimage)
+                                              (<= current-ep expires-ep))
+                     payer-auth? (and payer-sig-valid?
+                                      (not puzzle-auth?)
+                                      (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :payer-authorized} env-ctx)))
+                     preimage-auth? (and preimage-sig-valid?
+                                         (not puzzle-auth?)
+                                         (not payer-auth?)
+                                         (:valid? (puzzle/eval-puzzle puzzle/standard-htlc-puzzle-source {:mode :preimage :preimage preimage} env-ctx)))]
+                 (boolean (or payer-auth? preimage-auth? puzzle-auth?)))))
 
-         :refund-intent
-         (let [escrow-id (:escrow-id receipt)
-               pending-lock (some (fn [r]
-                                    (when (and (= (:type r) :lock-intent)
-                                               (= (:escrow-id r) escrow-id))
-                                      {:escrow-id escrow-id
-                                       :payer (:payer r)
-                                       :receiver (:receiver r)
-                                       :amount (:amount r)
-                                       :expires-epoch (:expires-epoch r)
-                                       :status :locked}))
-                                  (or (:pending-receipts state) []))
-               escrow (or (get-in state [:escrows escrow-id]) pending-lock)
-               current-ep (long (or (:epoch state) 0))
-               sender (:sender receipt)]
-           (if-not (and escrow (= :locked (:status escrow)))
-             false
-             (let [payer (:payer escrow)
-                   receiver (:receiver escrow)
-                   expires-ep (long (or (:expires-epoch escrow) 0))]
-               (boolean (or (and (> current-ep expires-ep)
-                                 (or (nil? sender) (contains? #{payer receiver} sender)))
-                            (= sender receiver))))))
+           :refund-intent
+           (let [escrow-id (:escrow-id receipt)
+                 pending-lock (some (fn [r]
+                                      (when (and (= (:type r) :lock-intent)
+                                                 (= (:escrow-id r) escrow-id))
+                                        {:escrow-id escrow-id
+                                         :payer (:payer r)
+                                         :receiver (:receiver r)
+                                         :amount (:amount r)
+                                         :expires-epoch (:expires-epoch r)
+                                         :status :locked}))
+                                    (or (:pending-receipts state) []))
+                 escrow (or (get-in state [:escrows escrow-id]) pending-lock)
+                 current-ep (long (or (:epoch state) 0))
+                 sender (:sender receipt)]
+             (if-not (and escrow (= :locked (:status escrow)))
+               false
+               (let [payer (:payer escrow)
+                     receiver (:receiver escrow)
+                     expires-ep (long (or (:expires-epoch escrow) 0))]
+                 (boolean (or (and (> current-ep expires-ep)
+                                   (or (nil? sender) (contains? #{payer receiver} sender)))
+                              (= sender receiver))))))
 
-         :voucher
-         (let [raw (:ack receipt)
-               ack (when raw
-                     (if (record? raw)
-                       raw
-                       (try (rendezvous/map->DeliveryAck raw)
-                            (catch #?(:clj Exception :cljs :default) _ nil))))]
-           (boolean (and ack (rendezvous/verify-delivery-ack ack))))
+           :voucher
+           (let [raw (:ack receipt)
+                 ack (when raw
+                       (if (record? raw)
+                         raw
+                         (try (rendezvous/map->DeliveryAck raw)
+                              (catch #?(:clj Exception :cljs :default) _ nil))))]
+             (boolean (and ack (rendezvous/verify-delivery-ack ack))))
 
-         :reconfigure-membership
-         (verify-reconfigure-membership? state receipt)
+           :bounty-create
+           (let [bounty-id (:bounty-id receipt)
+                 m-pub (:maintainer-pubkey receipt)
+                 gross (long (or (:gross-amount receipt) (:amount receipt) 0))]
+             (and (string? bounty-id)
+                  (not (string/blank? bounty-id))
+                  (string? m-pub)
+                  (pos? gross)
+                  (receipt-sig-valid-or-exempt? state receipt m-pub)
+                  (some? (get-in state [:ledger m-pub]))
+                  (>= (spendable-balance state m-pub) gross)))
 
-         false)))
+           :bounty-settle
+           (let [bounty-id (:bounty-id receipt)
+                 m-pub (:maintainer-pubkey receipt)
+                 builder (:builder-pubkey receipt)
+                 auditor (:auditor-pubkey receipt)
+                 claim (:claim receipt)]
+             (and (string? bounty-id)
+                  (string? m-pub)
+                  (string? builder)
+                  (string? auditor)
+                  (map? claim)
+                  (receipt-sig-valid-or-exempt? state receipt m-pub)))
+
+           :reconfigure-membership
+           (verify-reconfigure-membership? state receipt)
+
+           false))))
 
 (defn handle-receive-receipt
   "Handles an inbound single-hop :receive-receipt gossip event from a peer validator.

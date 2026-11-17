@@ -822,15 +822,17 @@
                    "close"    {"cmd" "close"
                                "session_id" (or (extract-flag-value args "--session-id" nil)
                                                 (extract-flag-value args "--session" nil))}
-                   "transfer" (let [min-bal (extract-long-flag args "--min-balance" nil)]
+                   "transfer" (let [min-bal (extract-long-flag args "--min-balance" nil)
+                                    recv (or (extract-flag-value args "--to" nil)
+                                             (extract-flag-value args "--receiver" nil)
+                                             (extract-flag-value args "--recipient" nil))]
                                 (cond-> {"cmd" "transfer"
-                                         "receiver" (or (extract-flag-value args "--receiver" nil)
-                                                        (extract-flag-value args "--recipient" nil))
-                                         "recipient" (or (extract-flag-value args "--receiver" nil)
-                                                         (extract-flag-value args "--recipient" nil))
+                                         "receiver" recv
+                                         "recipient" recv
                                          "amount" (extract-long-flag args "--amount" 0)
                                          "seq" (extract-long-flag args "--seq" nil)
                                          "burn" (extract-long-flag args "--burn" 500)}
+                                  recv (assoc "to" recv)
                                   (some? min-bal) (assoc "min_balance" min-bal)))
                    "register-home-set" (let [nodes (extract-flag-value args "--nodes" nil)
                                              p (extract-long-flag args "--price" 0)
@@ -855,12 +857,14 @@
                                     (cond-> m
                                       b (assoc "balance" b)
                                       s (assoc "seq" s)))
-                   "settle-intent" {"cmd" "settle-intent"
-                                    "receiver" (or (extract-flag-value args "--receiver" nil)
-                                                   (extract-flag-value args "--recipient" nil))
-                                    "recipient" (or (extract-flag-value args "--receiver" nil)
-                                                    (extract-flag-value args "--recipient" nil))
-                                    "amount" (extract-long-flag args "--amount" 0)}
+                   "settle-intent" (let [recv (or (extract-flag-value args "--to" nil)
+                                                  (extract-flag-value args "--receiver" nil)
+                                                  (extract-flag-value args "--recipient" nil))]
+                                     (cond-> {"cmd" "settle-intent"
+                                              "receiver" recv
+                                              "recipient" recv
+                                              "amount" (extract-long-flag args "--amount" 0)}
+                                       recv (assoc "to" recv)))
                    "lock-intent" (let [recv (or (extract-flag-value args "--receiver" nil)
                                                 (extract-flag-value args "--recipient" nil)
                                                 (extract-flag-value args "--to" nil))
@@ -1260,9 +1264,11 @@
                                 mb-seq (extract-long-flag args "--min-broadcast-seq" nil)
                                 sub (or (extract-flag-value args "--subnet-id" nil)
                                         (extract-flag-value args "--subnet" nil))
+                                cursor (extract-long-flag args "--cursor" nil)
                                 block? (boolean (or (some #{"--block"} args) (some #{"--until-event"} args)))
                                 peek? (boolean (some #{"--peek"} args))]
                             (cond-> {"cmd" "wait" "timeout_ms" (or t 30000)}
+                              cursor (assoc "cursor" cursor)
                               ms (assoc "min_seq" ms)
                               mb-seq (assoc "min_broadcast_seq" mb-seq)
                               sub (assoc "subnet_id" sub)
@@ -1282,6 +1288,9 @@
                                       policy-edn (extract-flag-value args "--policy-edn" nil)
                                       defspec-vars (extract-flag-value args "--defspec-vars" nil)
                                       oracle-edn (extract-flag-value args "--oracle-receipts-edn" nil)
+                                      inv-diff (extract-flag-value args "--invariant-diff-edn" nil)
+                                      jurisdiction (extract-flag-value args "--jurisdiction-map" nil)
+                                      sunset (extract-long-flag args "--human-anchor-sunset" nil)
                                       act-ep (extract-long-flag args "--activate-at-epoch" nil)
                                       b (extract-long-flag args "--burn" nil)
                                       m {"cmd" "bip-submit"}]
@@ -1294,6 +1303,9 @@
                                     policy-edn (assoc "policy_edn" policy-edn)
                                     defspec-vars (assoc "defspec_vars" defspec-vars)
                                     oracle-edn (assoc "oracle_receipts_edn" oracle-edn)
+                                    inv-diff (assoc "invariant_diff_edn" inv-diff "invariant-diff-edn" inv-diff)
+                                    jurisdiction (assoc "jurisdiction_map" jurisdiction "jurisdiction-map" jurisdiction)
+                                    (some? sunset) (assoc "human_anchor_sunset" sunset "human-anchor-sunset" sunset)
                                     (some? act-ep) (assoc "activate_at_epoch" act-ep)
                                     (some? b) (assoc "burn" b)))
                    "bip-consent" (let [sub (or (extract-flag-value args "--subnet-id" nil)
@@ -1337,6 +1349,7 @@
                                                  (extract-flag-value args "--subnet" nil))
                                          bounty-id (extract-flag-value args "--bounty-id" nil)
                                          target-cid (or (extract-flag-value args "--target-bip-cid" nil)
+                                                        (extract-flag-value args "--bip-cid" nil)
                                                         (extract-flag-value args "--bip-id" nil))
                                          gross (or (extract-long-flag args "--gross-amount" nil)
                                                    (extract-long-flag args "--amount" nil))
@@ -1349,7 +1362,7 @@
                                      (cond-> m
                                        sub (assoc "subnet_id" sub)
                                        bounty-id (assoc "bounty_id" bounty-id)
-                                       target-cid (assoc "target_bip_cid" target-cid "bip_id" target-cid)
+                                       target-cid (assoc "target_bip_cid" target-cid "bip_id" target-cid "bip_cid" target-cid "bip-cid" target-cid)
                                        (some? gross) (assoc "gross_amount" gross "amount" gross)
                                        m-pub (assoc "maintainer_pubkey" m-pub)
                                        (some? take-bps) (assoc "take_bps" take-bps)
@@ -1378,6 +1391,11 @@
                                        patch-cid (assoc "patch_cid" patch-cid)
                                        sha256 (assoc "sha256" sha256)
                                        (some? b) (assoc "burn" b)))
+                   "bounties" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                            (extract-flag-value args "--subnet" nil))
+                                    m {"cmd" "bounties"}]
+                                (cond-> m
+                                  sub (assoc "subnet_id" sub)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -3399,7 +3417,7 @@
     (if peek?
       (handle-serve-line! cmd-map ctx cb)
       (let [state-atom (:state-atom ctx)
-            block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
+            _block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
             timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))
             min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
                       (long ms))
@@ -3414,7 +3432,7 @@
                                                        q))
                                         (boolean (seq q)))]
                        (if (or has-event?
-                               (and (not block?) (>= (.now js/Date) deadline)))
+                               (>= (.now js/Date) deadline))
                          (handle-serve-line! cmd-map ctx cb)
                          (js/setTimeout check! 50))))]
         (check!)))))
@@ -3849,10 +3867,7 @@
                       poll-tick!
                       (fn poll-tick! []
                         (when (compare-and-set! polling? false true)
-                          (let [eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
-                                                           (empty? (disj (or (:subscribed-subnets @state-atom) #{})
-                                                                         light-core/simon-nexus-axiom-subnet-id)))
-                                              (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+                          (let [eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
                                 subnets (or (:subnets opts) eff-subnets)]
                             (poll-relay-envelopes!
                              (:relay-url opts)

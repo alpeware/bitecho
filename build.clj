@@ -37,5 +37,6 @@
     (b/uber {:class-dir class-dir
              :uber-file uber-file
              :basis basis
-             :main 'bitecho.main})
+             :main 'bitecho.main
+             :manifest {"Add-Exports" "java.base/sun.security.tools.keytool java.base/sun.security.x509"}})
     (println (format "Uberjar built successfully at %s" uber-file))))

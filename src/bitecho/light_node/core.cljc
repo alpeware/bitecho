@@ -290,8 +290,8 @@
   "chat/simon-nexus-axiom")
 
 (def default-subscribed-subnets
-  "Default set of subscribed subnets for light node instances (F-D25-8)."
-  #{simon-nexus-axiom-subnet-id})
+  "Default set of subscribed subnets for light node instances (F-D25-8, F-D29-21)."
+  #{})
 
 (defn init-light-state
   "Initializes a pure light node state map from an identity public map and options.
@@ -1223,7 +1223,7 @@
           (let [valid-snaps (mapv :snapshot verifications)
                 n-valid (count valid-snaps)]
             (if (< n-valid quorum-size)
-              {:ok? false :error "insufficient-validator-quorum"}
+              {:ok? false :error "insufficient-snapshots-returned" :reason "insufficient-validator-quorum"}
               (let [fin-epochs (mapv :finalized-epoch valid-snaps)
                     min-fin (apply min fin-epochs)
                     max-fin (apply max fin-epochs)
@@ -1232,16 +1232,18 @@
                   {:ok? false :error "validator-epoch-skew-exceeded"}
                   (let [state-sig (fn [s]
                                     [(:balance s)
-                                     (:spendable s)
                                      (:seq s)
                                      (:deps s)
                                      (str/join ";" (map canonical-escrow-entry-str (sort-by :escrow-id (:escrows s))))])
                         by-state (group-by state-sig valid-snaps)
                         [_ agreeing-snaps] (apply max-key (fn [[_ snaps]] (count snaps)) by-state)]
                     (if (>= (count agreeing-snaps) quorum-size)
-                      (let [best-snap (apply max-key :finalized-epoch agreeing-snaps)]
+                      (let [best-snap (apply max-key :finalized-epoch agreeing-snaps)
+                            min-spendable (apply min (map #(or (:spendable %) (:balance %)) agreeing-snaps))
+                            capped-spendable (min (long min-spendable) (long (or (:balance best-snap) 0)))
+                            final-snap (assoc best-snap :spendable capped-spendable)]
                         {:ok? true
-                         :snapshot best-snap
+                         :snapshot final-snap
                          :quorum-count (count agreeing-snaps)
                          :validators (vec (sort (map :validator-pubkey agreeing-snaps)))})
                       (let [by-epoch (group-by :finalized-epoch valid-snaps)
@@ -1250,7 +1252,7 @@
                                                            by-epoch)]
                         (if same-epoch-disagreement?
                           {:ok? false :error "validator-state-disagreement"}
-                          {:ok? false :error "insufficient-validator-quorum"})))))))))))))
+                          {:ok? false :error "insufficient-snapshots-returned" :reason "insufficient-validator-quorum"})))))))))))))
 
 (defn apply-verified-chain-state-snapshot
   "Applies a verified chain state snapshot to local light-node state.
@@ -2139,52 +2141,74 @@
    (parse-p2p-candidate cand-str nil))
   ([cand-str mdns-state]
    (when (and (string? cand-str) (not (str/blank? cand-str)))
-     (let [s (str/trim cand-str)
-           sdp-cand? (or (str/starts-with? s "candidate:") (str/starts-with? s "a=candidate:"))
-           [scheme host port proxy-connect?]
-           (if sdp-cand?
-             (let [tokens (vec (str/split s #"\s+"))
-                   cand-idx (if (str/starts-with? (first tokens) "a=") 0 0)
-                   tr-token (get tokens (+ cand-idx 2))
-                   host-token (get tokens (+ cand-idx 4))
-                   port-token (get tokens (+ cand-idx 5))
-                   p (try (when port-token (#?(:clj Integer/parseInt :cljs js/parseInt) port-token)) (catch #?(:clj Exception :cljs :default) _ nil))
-                   tr (when tr-token (str/lower-case tr-token))]
-               [tr host-token p false])
-             (let [[scheme-part rest-part] (if-let [idx (str/index-of s "://")]
-                                             [(subs s 0 idx) (subs s (+ idx 3))]
-                                             [nil s])
-                   sch (when scheme-part (str/lower-case scheme-part))
-                   [raw-host raw-port] (if-let [last-colon (str/last-index-of rest-part ":")]
-                                         [(subs rest-part 0 last-colon) (subs rest-part (inc last-colon))]
-                                         [rest-part nil])
-                   p (try (when raw-port (#?(:clj Integer/parseInt :cljs js/parseInt) (str/trim raw-port)))
-                          (catch #?(:clj Exception :cljs :default) _ nil))
-                   h (when raw-host (str/trim raw-host))]
-               [sch h p (= sch "connect")]))
-           tab (cond
-                 (nil? mdns-state) nil
-                 #?@(:clj [(instance? clojure.lang.IDeref mdns-state) @mdns-state]
-                     :cljs [(satisfies? IDeref mdns-state) @mdns-state])
-                 (map? mdns-state) mdns-state
-                 :else nil)
-           resolved-host (if (and host (mdns/mdns-hostname? host))
-                           (or (when tab
-                                 (let [cand-map {:ip host :port (or port 0)}
-                                       res (mdns/resolve-candidate-address cand-map tab)]
-                                   (when (and res (not= (:ip res) host))
-                                     (:ip res))))
-                               (when tab (mdns/lookup-cached-ip tab host))
-                               host)
-                           host)]
-       (when (and (seq resolved-host) port (pos? port))
-         (cond-> {:scheme (or scheme "udp")
-                  :host resolved-host
-                  :port port
-                  :transport (case scheme
-                               ("tcp" "connect") :tcp
-                               :udp)}
-           proxy-connect? (assoc :proxy-connect? true)))))))
+     (let [s (str/trim cand-str)]
+       (cond
+         (or (str/starts-with? s "https://") (str/starts-with? s "http://"))
+         (let [https? (str/starts-with? s "https://")
+               prefix (if https? "https://" "http://")
+               rest-str (subs s (count prefix))
+               slash-idx (str/index-of rest-str "/")
+               host-port (if slash-idx (subs rest-str 0 slash-idx) rest-str)
+               [raw-host port-str] (if-let [col-idx (str/index-of host-port ":")]
+                                     [(subs host-port 0 col-idx) (subs host-port (inc col-idx))]
+                                     [host-port nil])
+               port (if port-str
+                      (try (#?(:clj Integer/parseInt :cljs js/parseInt) port-str)
+                           (catch #?(:clj Exception :cljs :default) _ (if https? 443 80)))
+                      (if https? 443 80))]
+           {:scheme (if https? "https" "http")
+            :host raw-host
+            :port port
+            :transport (if https? "https" "http")
+            :zero-burn? true
+            :url s})
+
+         :else
+         (let [sdp-cand? (or (str/starts-with? s "candidate:") (str/starts-with? s "a=candidate:"))
+               [scheme host port proxy-connect?]
+               (if sdp-cand?
+                 (let [tokens (vec (str/split s #"\s+"))
+                       cand-idx (if (str/starts-with? (first tokens) "a=") 0 0)
+                       tr-token (get tokens (+ cand-idx 2))
+                       host-token (get tokens (+ cand-idx 4))
+                       port-token (get tokens (+ cand-idx 5))
+                       p (try (when port-token (#?(:clj Integer/parseInt :cljs js/parseInt) port-token)) (catch #?(:clj Exception :cljs :default) _ nil))
+                       tr (when tr-token (str/lower-case tr-token))]
+                   [tr host-token p false])
+                 (let [[scheme-part rest-part] (if-let [idx (str/index-of s "://")]
+                                                 [(subs s 0 idx) (subs s (+ idx 3))]
+                                                 [nil s])
+                       sch (when scheme-part (str/lower-case scheme-part))
+                       [raw-host raw-port] (if-let [last-colon (str/last-index-of rest-part ":")]
+                                             [(subs rest-part 0 last-colon) (subs rest-part (inc last-colon))]
+                                             [rest-part nil])
+                       p (try (when raw-port (#?(:clj Integer/parseInt :cljs js/parseInt) (str/trim raw-port)))
+                              (catch #?(:clj Exception :cljs :default) _ nil))
+                       h (when raw-host (str/trim raw-host))]
+                   [sch h p (= sch "connect")]))
+               tab (cond
+                     (nil? mdns-state) nil
+                     #?@(:clj [(instance? clojure.lang.IDeref mdns-state) @mdns-state]
+                         :cljs [(satisfies? IDeref mdns-state) @mdns-state])
+                     (map? mdns-state) mdns-state
+                     :else nil)
+               resolved-host (if (and host (mdns/mdns-hostname? host))
+                               (or (when tab
+                                     (let [cand-map {:ip host :port (or port 0)}
+                                           res (mdns/resolve-candidate-address cand-map tab)]
+                                       (when (and res (not= (:ip res) host))
+                                         (:ip res))))
+                                   (when tab (mdns/lookup-cached-ip tab host))
+                                   host)
+                               host)]
+           (when (and (seq resolved-host) port (pos? port))
+             (cond-> {:scheme (or scheme "udp")
+                      :host resolved-host
+                      :port port
+                      :transport (case scheme
+                                   ("tcp" "connect") :tcp
+                                   :udp)}
+               proxy-connect? (assoc :proxy-connect? true)))))))))
 
 (defn- effective-session-wire-epoch
   [state session]
@@ -2544,73 +2568,127 @@
   (min 30000 (long (* 1000 (math-pow-2 (min (long (or attempts 0)) 15))))))
 
 (defn should-auto-reoffer?
-  "Returns true if session `sid` in `state` is eligible for an automatic P2P re-offer.
+  "Returns true if session `sess-or-sid` in `state` is eligible for an automatic P2P re-offer.
    Enforces:
-   1. Mode gate: never re-offers in :shuttle mode; requires (= :autonomous mode) or (daemon-autonomous? and not :shuttle).
-   2. State: session must be 'open', have :reconnect-needed? true, not currently p2p-connected, and have candidate endpoints.
-   3. Exponential backoff: now-ms >= :next-reconnect-ms.
-   4. Glare / tie-breaker protection: only allows re-offer if local node has ingress/direct candidates,
-      was the initiator, or wins the lexicographical pubkey tie-breaker."
-  ([state sid]
-   (should-auto-reoffer? state sid (:epoch state 0) (:autonomous? state false)))
-  ([state sid now-ms daemon-autonomous?]
-   (let [sess (get-in state [:sessions sid])]
+   1. Single-owner re-dial: only session :initiator or higher-pubkey peer initiates.
+   2. Hard cap at max-unanswered-p2p-offers = 3, latching :p2p-reoffer-exhausted.
+   3. Mode gate: never re-offers in :shuttle mode.
+   4. Exponential backoff: now-ms >= :next-reconnect-ms."
+  ([state sess-or-sid]
+   (should-auto-reoffer? state sess-or-sid (:epoch state 0) (:autonomous? state false)))
+  ([state sess-or-sid now-ms]
+   (should-auto-reoffer? state sess-or-sid now-ms (:autonomous? state false)))
+  ([state sess-or-sid now-ms daemon-autonomous?]
+   (let [sess (if (map? sess-or-sid) sess-or-sid (get-in state [:sessions sess-or-sid]))]
      (boolean
-      (when (and sess (= "open" (:state sess)))
-        (let [p2p (get sess :p2p {})
-              p2p-meta (get sess :p2p-meta {})
-              reconnect-needed? (true? (:reconnect-needed? p2p-meta))
-              mode (or (:mode p2p-meta) (:mode p2p))
-              shuttle? (or (= mode :shuttle) (= mode "shuttle"))
-              autonomous-allowed? (and (not shuttle?)
-                                       (or (= mode :autonomous)
-                                           (= mode "autonomous")
-                                           (true? daemon-autonomous?)
-                                           (true? (:autonomous? state))))
-              connected? (true? (:connected? p2p))
-              has-cands? (boolean (or (seq (:local-candidates p2p-meta))
-                                      (seq (:preferred-candidates p2p-meta))
-                                      (seq (:local-candidates p2p))
-                                      (seq (:default-p2p-candidates state))))
-              now (long (or now-ms 0))
-              next-reconn (long (or (:next-reconnect-ms p2p-meta) 0))
-              backoff-ok? (>= now next-reconn)]
-          (when (and reconnect-needed?
-                     autonomous-allowed?
-                     (not connected?)
-                     has-cands?
-                     backoff-ok?)
-            (let [local-cands (or (not-empty (:local-candidates p2p-meta))
-                                  (not-empty (:preferred-candidates p2p-meta))
-                                  (not-empty (:local-candidates p2p))
-                                  (not-empty (:default-p2p-candidates state))
-                                  [])
-                  has-ingress? (boolean (some (fn [c] (or (str/starts-with? (str c) "tcp://")
-                                                          (str/starts-with? (str c) "turn:")
-                                                          (str/includes? (str c) "ingress")))
-                                              local-cands))
-                  role (or (:role p2p-meta) (:role p2p) (:role sess))
-                  initiator? (= role :initiator)
-                  my-pk (str/lower-case (str (or (:pubkey state) "")))
-                  peer-pk (str/lower-case (str (or (:peer sess) "")))]
-              (or has-ingress?
-                  initiator?
-                  (neg? (compare my-pk peer-pk)))))))))))
+      (when sess
+        (let [role (or (:role (get sess :p2p-meta {})) (:role (get sess :p2p {})) (:role sess))
+              initiator? (= role :initiator)
+              my-pk (str/lower-case (str (or (:pubkey state) "")))
+              peer-pk (str/lower-case (str (or (:peer sess) "")))
+              responder? (= role :responder)
+              tie-breaker? (and (seq my-pk) (seq peer-pk) (neg? (compare my-pk peer-pk)))
+              single-owner? (cond
+                              initiator? true
+                              responder? false
+                              :else tie-breaker?)
+              attempts (long (or (:reoffer-attempts sess) (get-in sess [:p2p-meta :reconnect-attempts]) 0))
+              exhausted? (boolean (or (:p2p-reoffer-exhausted sess) (get-in sess [:p2p-meta :p2p-reoffer-exhausted])))
+              cap-ok? (and (not exhausted?) (< attempts 3))]
+          (when (and single-owner? cap-ok?)
+            (let [p2p (get sess :p2p {})
+                  p2p-meta (get sess :p2p-meta {})
+                  sess-st (or (:state sess) (:phase sess))
+                  has-p2p? (or (contains? sess :p2p) (contains? sess :p2p-meta))]
+              (if-not has-p2p?
+                true
+                (let [reconnect-needed? (true? (:reconnect-needed? p2p-meta))
+                      mode (or (:mode p2p-meta) (:mode p2p))
+                      shuttle? (or (= mode :shuttle) (= mode "shuttle"))
+                      autonomous-allowed? (and (not shuttle?)
+                                               (or (= mode :autonomous)
+                                                   (= mode "autonomous")
+                                                   (true? daemon-autonomous?)
+                                                   (true? (:autonomous? state))))
+                      connected? (true? (:connected? p2p))
+                      has-cands? (boolean (or (seq (:local-candidates p2p-meta))
+                                              (seq (:preferred-candidates p2p-meta))
+                                              (seq (:local-candidates p2p))
+                                              (seq (:default-p2p-candidates state))))
+                      now (long (or now-ms 0))
+                      next-reconn (long (or (:next-reconnect-ms p2p-meta) 0))
+                      backoff-ok? (>= now next-reconn)]
+                  (and (or (= sess-st "open") (= sess-st :open))
+                       reconnect-needed?
+                       autonomous-allowed?
+                       (not connected?)
+                       has-cands?
+                       backoff-ok?)))))))))))
 
 (defn record-reoffer-attempt
   "Updates session `sid` in `state` after an autonomous re-offer attempt,
-   incrementing :reconnect-attempts and scheduling :next-reconnect-ms with exponential backoff."
-  ([state sid]
-   (record-reoffer-attempt state sid (:epoch state 0)))
-  ([state sid now-ms]
-   (let [now (long (or now-ms 0))
-         sess (get-in state [:sessions sid])
-         attempts (long (or (get-in sess [:p2p-meta :reconnect-attempts]) 0))
+   incrementing :reconnect-attempts (and :reoffer-attempts), scheduling :next-reconnect-ms
+   with exponential backoff, and latching :p2p-reoffer-exhausted after 3 attempts."
+  ([state sess-or-sid]
+   (record-reoffer-attempt state sess-or-sid (:epoch state 0)))
+  ([state sess-or-sid now-ms]
+   (let [sid (if (map? sess-or-sid) (or (:session-id sess-or-sid) (:session_id sess-or-sid)) sess-or-sid)
+         sess (if (map? sess-or-sid)
+                (merge (get-in state [:sessions sid]) sess-or-sid)
+                (get-in state [:sessions sid]))
+         now (long (or now-ms 0))
+         attempts (long (or (:reoffer-attempts sess) (get-in sess [:p2p-meta :reconnect-attempts]) 0))
+         new-attempts (inc attempts)
+         exhausted? (>= new-attempts 3)
          backoff (calculate-reconnect-backoff-ms attempts)
-         next-reconn (+ now backoff)]
-     (-> state
-         (assoc-in [:sessions sid :p2p-meta :reconnect-attempts] (inc attempts))
-         (assoc-in [:sessions sid :p2p-meta :next-reconnect-ms] next-reconn)))))
+         next-reconn (+ now backoff)
+         updated-sess (-> sess
+                          (assoc :session-id sid
+                                 :reoffer-attempts new-attempts
+                                 :p2p-reoffer-exhausted exhausted?)
+                          (assoc-in [:p2p-meta :reconnect-attempts] new-attempts)
+                          (assoc-in [:p2p-meta :p2p-reoffer-exhausted] exhausted?)
+                          (assoc-in [:p2p-meta :next-reconnect-ms] next-reconn))]
+     (cond-> (assoc-in state [:sessions sid] updated-sess)
+       exhausted? (update-in [:diagnostics :p2p-reoffer-exhausted] (fnil inc 0))))))
+
+(defn reset-reoffer-attempts
+  "Resets reoffer attempts and exhausted state for session `sid`, updating :last-peer-activity-ms."
+  ([state sid]
+   (reset-reoffer-attempts state sid (:epoch state 0)))
+  ([state sid now-ms]
+   (let [now (long (or now-ms 0))]
+     (update-in state [:sessions sid]
+                (fn [sess]
+                  (when sess
+                    (-> sess
+                        (assoc :reoffer-attempts 0
+                               :p2p-reoffer-exhausted false
+                               :last-peer-activity-ms now)
+                        (assoc-in [:p2p-meta :reconnect-attempts] 0)
+                        (assoc-in [:p2p-meta :p2p-reoffer-exhausted] false))))))))
+
+(defn check-peer-silence-alerts
+  "Emits a counted :peer-silence-alert diagnostic event when an open session has > 60 min of inactivity."
+  ([state]
+   (check-peer-silence-alerts state (:epoch state 0)))
+  ([state now-ms]
+   (let [now (long (or now-ms 0))
+         silence-thresh (* 60 60 1000)]
+     (reduce
+      (fn [st [sid sess]]
+        (let [phase (or (:state sess) (:phase sess))
+              open? (or (= phase "open") (= phase :open))
+              last-act (long (or (:last-peer-activity-ms sess) now))
+              silent? (> (- now last-act) silence-thresh)
+              alerted? (true? (:peer-silence-alerted? sess))]
+          (if (and open? silent? (not alerted?))
+            (-> st
+                (assoc-in [:sessions sid :peer-silence-alerted?] true)
+                (update-in [:diagnostics :peer-silence-alert] (fnil inc 0)))
+            st)))
+      state
+      (:sessions state)))))
 
 (defn retransmit-unacked-outbox
   "Pure helper. Collects unacknowledged outbox entries for session `sid` in oldest-first order.
@@ -3988,8 +4066,20 @@
                  :net-envelopes []
                  :stdout-events []}))))))))
 
-(defn- exec-status [state]
-  (let [sessions-summary (vec (for [[_ s] (:sessions state)
+(defn exec-status
+  "Pure status query returning balances, inbox counts, sessions, and diagnostics."
+  [state]
+  (let [inbox-items (or (:inbox state) [])
+        inbox-direct (count (filter (fn [m] (= (or (:type m) (get m "type")) :direct)) inbox-items))
+        inbox-broadcast-items (filter (fn [m] (= (or (:type m) (get m "type")) :broadcast)) inbox-items)
+        inbox-broadcast (count inbox-broadcast-items)
+        inbox-by-subnet (reduce (fn [acc m]
+                                  (if-let [sub (or (:subnet-id m) (:subnet m) (get m "subnet-id") (get m "subnet_id"))]
+                                    (update acc (str sub) (fnil inc 0))
+                                    acc))
+                                {}
+                                inbox-broadcast-items)
+        sessions-summary (vec (for [[_ s] (:sessions state)
                                     :let [pname (pubkey->petname state (:peer s))]]
                                 (cond-> (select-keys s [:session-id :peer :role :state :tx-seq :epoch :acked-seq :rx-high-seq :replays-deduped :outbox-evicted])
                                   true (assoc :unacked-count (count (:outbox s)))
@@ -4005,57 +4095,62 @@
                                 "p2p_transport" transport
                                 "acked_seq" (long (or (:acked-seq s) 0))
                                 "unacked_count" (count (:outbox s {}))
-                                "outbox_evicted" (long (or (:outbox-evicted s) 0))}))]
-    {:state state
-     :response (cond-> {"ok" true
-                        "connected" (boolean (:connected? state false))
-                        "connection_error" (:connection-error state)
-                        "auto_sync_last_error" (or (:auto-sync-last-error state)
-                                                   (get-in state [:diagnostics :auto-sync-last-error])
-                                                   (get-in state [:conn-diagnostics :auto-sync-last-error]))
-                        "transport_healthy" (and (boolean (:connected? state false))
-                                                 (nil? (:connection-error state)))
-                        "pubkey" (:pubkey state)
-                        "subnet_id" (or (:subnet-id state) "global")
-                        "subscribed_subnets" (vec (sort (or (:subscribed-subnets state) #{})))
-                        "autonomous" (:autonomous? state)
-                        "epoch" (:epoch state)
-                        "finalized_epoch" (long (or (get-in state [:account :finalized-epoch]) (:epoch state) 0))
-                        "balance" (long (or (get-in state [:account :balance]) 0))
-                        "spendable" (long (or (get-in state [:account :spendable]) (get-in state [:account :balance]) 0))
-                        "unread_events" (count (:event-queue state []))
-                        "sessions" sessions-summary
-                        "sessions_detail" sessions-detail
-                        "pending_offers_count" (count (:pending-offers state))
-                        "pending_rendezvous_count" (count (:pending-rendezvous state {}))
-                        "rendezvous_policy" (:rendezvous-policy state)
-                        "inbox_count" (count (:inbox state))
-                        "account" (:account state)
-                        "petnames" (into (sorted-map) (:petnames state {}))
-                        "petnames_count" (count (:petnames state {}))
-                        "dac" (dac-summary (:dac state))
-                        "revoked_dacs_count" (count (:revoked-dacs state #{}))
-                        "directory_cache_count" (count (:directory-cache state {}))
-                        "escrows_count" (count (:escrows state {}))
-                        "accounting" {"scope" "local-non-consensus"
-                                      "note" "Locally computed devnet totals; never consensus finalized"
-                                      "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
-                                      "vouchers_count" (count (:vouchers state []))}
-                        "wire_protocol" {"version" current-wire-version
-                                         "min_supported" min-supported-wire-version
-                                         "max_supported" max-supported-wire-version
-                                         "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
-                                         "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])
-                                         "wire_format" current-wire-format
-                                         "supported_formats" ["fressian-v1" "legacy-nippy"]
-                                         "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
-                                         "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}}
-                 (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state))
-                 (:mdns-hostname state) (assoc "mdns_hostname" (:mdns-hostname state))
-                 (:lan-ip state) (assoc "lan_ip" (:lan-ip state))
-                 (seq (:default-p2p-candidates state)) (assoc "default_p2p_candidates" (:default-p2p-candidates state)))
-     :net-envelopes []
-     :stdout-events []}))
+                                "outbox_evicted" (long (or (:outbox-evicted s) 0))}))
+        resp (cond-> {"ok" true
+                      "connected" (boolean (:connected? state false))
+                      "connection_error" (:connection-error state)
+                      "auto_sync_last_error" (or (:auto-sync-last-error state)
+                                                 (get-in state [:diagnostics :auto-sync-last-error])
+                                                 (get-in state [:conn-diagnostics :auto-sync-last-error]))
+                      "transport_healthy" (and (boolean (:connected? state false))
+                                               (nil? (:connection-error state)))
+                      "pubkey" (:pubkey state)
+                      "subnet_id" (or (:subnet-id state) "global")
+                      "subscribed_subnets" (vec (sort (or (:subscribed-subnets state) #{})))
+                      "autonomous" (:autonomous? state)
+                      "epoch" (:epoch state)
+                      "finalized_epoch" (long (or (get-in state [:account :finalized-epoch]) (:epoch state) 0))
+                      "balance" (long (or (get-in state [:account :balance]) 0))
+                      "spendable" (long (or (get-in state [:account :spendable]) (get-in state [:account :balance]) 0))
+                      "unread_events" (count (:event-queue state []))
+                      "sessions" sessions-summary
+                      "sessions_detail" sessions-detail
+                      "pending_offers_count" (count (:pending-offers state))
+                      "pending_rendezvous_count" (count (:pending-rendezvous state {}))
+                      "rendezvous_policy" (:rendezvous-policy state)
+                      "inbox_count" (count inbox-items)
+                      "inbox_direct_count" inbox-direct
+                      "inbox_broadcast_count" inbox-broadcast
+                      "inbox_by_subnet" inbox-by-subnet
+                      "account" (:account state)
+                      "petnames" (into (sorted-map) (:petnames state {}))
+                      "petnames_count" (count (:petnames state {}))
+                      "dac" (dac-summary (:dac state))
+                      "revoked_dacs_count" (count (:revoked-dacs state #{}))
+                      "directory_cache_count" (count (:directory-cache state {}))
+                      "escrows_count" (count (:escrows state {}))
+                      "accounting" {"scope" "local-non-consensus"
+                                    "note" "Locally computed devnet totals; never consensus finalized"
+                                    "burned_ech" (get-in state [:local-accounting :burned-ech] 0)
+                                    "vouchers_count" (count (:vouchers state []))}
+                      "wire_protocol" {"version" current-wire-version
+                                       "min_supported" min-supported-wire-version
+                                       "max_supported" max-supported-wire-version
+                                       "unsupported_dropped" (get-in state [:wire-version-diagnostics :unsupported-dropped] 0)
+                                       "last_unsupported_version" (get-in state [:wire-version-diagnostics :last-unsupported-version])
+                                       "wire_format" current-wire-format
+                                       "supported_formats" ["fressian-v1" "legacy-nippy"]
+                                       "unsupported_format_dropped" (get-in state [:wire-version-diagnostics :unsupported-format-dropped] 0)
+                                       "last_unsupported_format" (get-in state [:wire-version-diagnostics :last-unsupported-format])}}
+               (:conn-diagnostics state) (assoc "diagnostics" (:conn-diagnostics state))
+               (:mdns-hostname state) (assoc "mdns_hostname" (:mdns-hostname state))
+               (:lan-ip state) (assoc "lan_ip" (:lan-ip state))
+               (seq (:default-p2p-candidates state)) (assoc "default_p2p_candidates" (:default-p2p-candidates state)))]
+    (merge resp
+           {:state state
+            :response resp
+            :net-envelopes []
+            :stdout-events []})))
 
 ;; -----------------------------------------------------------------------------
 ;; Actionable Event Queue & Shuttle Verbs (A2, A2a, F-Bb-6)
@@ -4105,43 +4200,56 @@
 
 (defn exec-wait
   "Pure reducer for 'wait' command. Pops actionable events from :event-queue,
-   optionally filtered by min_seq. Advances event-ack cursor. If no matching events,
-   returns park: true.
+   optionally filtered by min_seq or cursor. Advances event-ack cursor.
+   When block is true and queue is empty, returns timeout: true.
    When peek is true, returns eligible unread events without advancing cursor or mutating :event-queue."
   [state cmd-map]
   (let [peek? (or (true? (get cmd-map "peek"))
                   (true? (:peek cmd-map))
                   (= (get cmd-map "peek") "true"))
+        block? (or (true? (get cmd-map "block"))
+                   (true? (:block cmd-map))
+                   (= (get cmd-map "block") "true"))
+        req-cursor (when-let [c (or (get cmd-map "cursor") (:cursor cmd-map))]
+                     (long c))
         min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
                   (long ms))
+        threshold (or req-cursor (when min-seq (dec min-seq)))
         raw-q (vec (or (:event-queue state) []))
-        eligible-evs (if min-seq
+        eligible-evs (if threshold
                        (filterv (fn [ev]
-                                  (let [eid (long (or (get ev "event_id") (:event-id ev) 0))
+                                  (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev) 0))
                                         s   (long (or (get ev "seq") (:seq ev) 0))]
-                                    (or (>= eid min-seq) (>= s min-seq))))
+                                    (or (> eid threshold) (> s threshold))))
                                 raw-q)
                        raw-q)
         cursor (long (or (:event-ack-cursor state) 0))]
     (if peek?
-      {:state state
-       :response {"ok" true "events" eligible-evs "cursor" cursor "peek" true}
-       :net-envelopes []
-       :stdout-events []}
+      (let [resp {"ok" true "events" eligible-evs "cursor" cursor "peek" true}]
+        (merge resp {:state state :response resp :net-envelopes [] :stdout-events []}))
       (if (seq eligible-evs)
-        (let [new-cursor (long (or (get (last eligible-evs) "event_id") (:event-id (last eligible-evs)) (count eligible-evs)))
-              remaining (if min-seq
-                          (filterv (fn [ev] (not (contains? (set eligible-evs) ev))) raw-q)
-                          [])
-              new-state (assoc state :event-queue remaining :event-ack-cursor (max cursor new-cursor))]
-          {:state new-state
-           :response {"ok" true "events" eligible-evs "cursor" (max cursor new-cursor)}
-           :net-envelopes []
-           :stdout-events []})
-        {:state state
-         :response {"ok" true "events" [] "park" true "cursor" cursor}
-         :net-envelopes []
-         :stdout-events []}))))
+        (let [norm-evs (mapv (fn [ev]
+                               (let [eid (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev))]
+                                 (cond-> ev
+                                   eid (assoc "eid" eid :eid eid))))
+                             eligible-evs)
+              last-ev (last norm-evs)
+              last-id (long (or (get last-ev "event_id") (:event-id last-ev) (get last-ev "eid") (:eid last-ev) (count norm-evs)))
+              new-cursor (max cursor last-id)
+              remaining (if req-cursor
+                          (filterv (fn [ev]
+                                     (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev) 0))]
+                                       (and (not (contains? (set eligible-evs) ev))
+                                            (> eid req-cursor))))
+                                   raw-q)
+                          (filterv (fn [ev] (not (contains? (set eligible-evs) ev))) raw-q))
+              new-state (assoc state :event-queue remaining :event-ack-cursor new-cursor)
+              resp {"ok" true "events" norm-evs "cursor" new-cursor}]
+          (merge resp {:state new-state :response resp :net-envelopes [] :stdout-events []}))
+        (let [resp (cond-> {"ok" true "events" [] "cursor" cursor}
+                     block? (assoc "timeout" true)
+                     (not block?) (assoc "park" true))]
+          (merge resp {:state state :response resp :net-envelopes [] :stdout-events []}))))))
 
 (defn verify-and-strip-chunk-prefixes
   "Verifies per-chunk 8-char SHA-256 checksums if declared, returning:
@@ -5371,6 +5479,34 @@
             cap-blob (:capability-blob res)
             cap-ptr (:capability-pointer res)
             cap-path (str "bounty/" bounty-id)
+            b-escrow {:bounty-id bounty-id
+                      :maintainer-pubkey m-pub
+                      :subnet-id subnet
+                      :target-bip-cid target-cid
+                      :gross-amount gross
+                      :take-bps take-bps
+                      :builder-bps builder-bps
+                      :protocol-take (:protocol-take bounty)
+                      :builder-net (:builder-net bounty)
+                      :auditor-net (:auditor-net bounty)
+                      :created-epoch (:epoch state 0)
+                      :status :locked}
+            b-rcpt {:type :bounty-create
+                    :receipt-id (str "bounty-rcpt-" bounty-id)
+                    :bounty-id bounty-id
+                    :subnet-id subnet
+                    :maintainer-pubkey m-pub
+                    :gross-amount gross
+                    :take-bps take-bps
+                    :builder-bps builder-bps
+                    :target-bip-cid target-cid
+                    :epoch (:epoch state 0)}
+            b-rcpt-signed (if privkey-bytes
+                            (let [c-bytes (fressian/encode-canonical (dissoc b-rcpt :signature "signature"))
+                                  sig (basalt/bytes->hex (crypto/sign privkey-bytes c-bytes))]
+                              (assoc b-rcpt :signature sig))
+                            b-rcpt)
+            rcpt-env {:type :receive-receipt :receipt b-rcpt-signed}
             rep-env (build-governance-replicate-envelope
                      st-after-deduct
                      privkey-bytes
@@ -5385,6 +5521,7 @@
                      burn-amt)]
         {:state (-> st-after-deduct
                     (assoc :governance (:state res))
+                    (assoc-in [:bounty-escrows bounty-id] b-escrow)
                     (assoc-in [:capabilities [subnet cap-path]] cap-ptr)
                     (assoc-in [:capability-blobs cap-cid] cap-blob))
          :response {"ok" true
@@ -5400,7 +5537,9 @@
                     "path" cap-path
                     "status" "locked"
                     "burn" burn-amt}
-         :net-envelopes (if rep-env [rep-env] [])
+         :net-envelopes (cond-> []
+                          rep-env (conj rep-env)
+                          rcpt-env (conj rcpt-env))
          :stdout-events []}))))
 
 (defn- exec-bounty-settle
@@ -5453,6 +5592,21 @@
           (let [settled-bounty (:bounty res)
                 b-net (long (or (:builder-net settled-bounty) 0))
                 a-net (long (or (:auditor-net settled-bounty) 0))
+                settle-rcpt {:type :bounty-settle
+                             :receipt-id (str "bounty-settle-rcpt-" bounty-id)
+                             :bounty-id bounty-id
+                             :subnet-id subnet
+                             :maintainer-pubkey my-pub
+                             :builder-pubkey builder-pub
+                             :auditor-pubkey auditor-pub
+                             :claim claim
+                             :epoch (:epoch state 0)}
+                settle-rcpt-signed (if eff-priv
+                                     (let [c-bytes (fressian/encode-canonical (dissoc settle-rcpt :signature "signature"))
+                                           sig (basalt/bytes->hex (crypto/sign eff-priv c-bytes))]
+                                       (assoc settle-rcpt :signature sig))
+                                     settle-rcpt)
+                rcpt-env {:type :receive-receipt :receipt settle-rcpt-signed}
                 rep-env (build-governance-replicate-envelope
                          st-after-burn
                          privkey-bytes
@@ -5463,7 +5617,9 @@
                           :claim claim
                           :bounty settled-bounty}
                          burn-amt)]
-            {:state (assoc st-after-burn :governance (:state res))
+            {:state (-> st-after-burn
+                        (assoc :governance (:state res))
+                        (assoc-in [:bounty-escrows bounty-id :status] :settled))
              :response {"ok" true
                         "subnet_id" subnet
                         "bounty_id" bounty-id
@@ -5473,8 +5629,32 @@
                         "auditor_net" a-net
                         "protocol_take" (:protocol-take res)
                         "burn" burn-amt}
-             :net-envelopes (if rep-env [rep-env] [])
+             :net-envelopes (cond-> []
+                              rep-env (conj rep-env)
+                              rcpt-env (conj rcpt-env))
              :stdout-events []}))))))
+
+(defn exec-bounties
+  "Returns list of on-chain / replicated bounty escrows optionally filtered by subnet_id."
+  ([state]
+   (exec-bounties state {}))
+  ([state cmd-map]
+   (let [sub-filter (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map))
+         escrows (vals (or (:bounty-escrows state) {}))
+         filtered (if (and sub-filter (not= sub-filter "all"))
+                    (filter (fn [b] (= (str (:subnet-id b)) (str sub-filter))) escrows)
+                    escrows)
+         bounties-out (mapv (fn [b]
+                              (into {} (map (fn [[k v]] [(if (keyword? k) (name k) (str k)) v]) b)))
+                            filtered)
+         resp {"ok" true
+               "count" (count bounties-out)
+               "bounties" bounties-out}]
+     (merge resp
+            {:state state
+             :response resp
+             :net-envelopes []
+             :stdout-events []}))))
 
 (defn- exec-subscribe-subnets [state cmd-map]
   (let [raw-subs (or (get cmd-map "subnets") (:subnets cmd-map)
@@ -5602,6 +5782,7 @@
                   "bip-status" (exec-bip-status state effective-map sub-id-str)
                   "bounty-create" (exec-bounty-create state effective-map privkey-bytes sub-id-str)
                   "bounty-settle" (exec-bounty-settle state effective-map privkey-bytes sub-id-str)
+                  "bounties" (exec-bounties state effective-map)
                   "status" (exec-status state)
                   "help" {:state state
                           :response {"ok" true
@@ -5695,189 +5876,195 @@
 
     :else nil))
 
-(defn- handle-wire-offer [state msg privkey-bytes]
-  (try
-    (if-not (and (map? msg)
-                 (string? (:caller msg)) (valid-pubkey-hex? (:caller msg))
-                 (string? (:callee msg)) (valid-pubkey-hex? (:callee msg))
-                 (string? (:session-id msg)) (not (str/blank? (:session-id msg)))
-                 (string? (:caller-ephemeral-pub msg)) (not (str/blank? (:caller-ephemeral-pub msg)))
-                 (string? (:offer-hash msg)) (not (str/blank? (:offer-hash msg)))
-                 (string? (:signature msg)) (not (str/blank? (:signature msg)))
-                 (integer? (:epoch msg))
-                 (or (nil? (:burn msg)) (integer? (:burn msg)))
-                 (or (nil? (:price msg)) (integer? (:price msg)))
-                 (= (normalize-pubkey-hex (:callee msg)) (normalize-pubkey-hex (:pubkey state))))
-      {:state state :net-envelopes [] :stdout-events []}
-      (let [msg-net (or (:network-uri msg) (get msg "network_uri") (get msg "network-uri"))
-            st-net (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
-            network-mismatch? (or (and (string? msg-net) (string? st-net)
-                                       (not= (str/trim msg-net) (str/trim st-net)))
-                                  (and (= st-net "mainnet.bitecho.org") (str/blank? (str msg-net))))]
-        (if network-mismatch?
-          {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
-           :net-envelopes []
-           :stdout-events []}
-          (let [caller-pub (try (basalt/hex->bytes (:caller msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                expected-sid (compute-session-id (:caller msg) (:callee msg) (:caller-ephemeral-pub msg))
-                expected-hash-legacy (compute-offer-hash msg)
-                expected-hash-sealed (sealed/offer-hash msg)
-                wire-dac (or (:dac msg) (get msg "dac"))
-                dac-id (or (:dac-id msg) (get msg "dac_id")
-                           (when wire-dac (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id"))))
-                burn-num (parse-long-safe (or (:price msg) (:burn msg)) 0)
-                epoch-num (parse-long-safe (:epoch msg) 0)
-                net-str (when (and (string? msg-net) (not (str/blank? msg-net))) (str/trim msg-net))
-                expected-hash-5field (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes (str (:caller msg) "-" (:callee msg) "-" (:caller-ephemeral-pub msg) "-" epoch-num "-" burn-num
-                                                                                                  (when (and (string? dac-id) (not (str/blank? dac-id))) (str "|" dac-id))
-                                                                                                  (when net-str (str "|net:" net-str))))))
-                valid-hashes? (and (= (:session-id msg) expected-sid)
-                                   (or (= (:offer-hash msg) expected-hash-legacy)
-                                       (= (:offer-hash msg) expected-hash-sealed)
-                                       (= (:offer-hash msg) expected-hash-5field)
-                                       (matching-offer-hash? msg state (:offer-hash msg))))
-                caller-suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
-                callee-suites (or (:crypto-suites state) sealed/default-crypto-suites)
-                suite-negotiation (sealed/negotiate-crypto-suite (or caller-suites [sealed/suite-v1-chacha20poly1305]) callee-suites)
-                valid-suite? (:ok? suite-negotiation)
-                selected-suite (:selected-suite suite-negotiation)
-                valid-sig? (and valid-hashes?
-                                valid-suite?
-                                caller-pub sig-bytes
-                                (crypto/verify caller-pub (fressian/utf8->bytes (:offer-hash msg)) sig-bytes))
-                ref-epoch (:epoch state)
-                wire-dac (or (:dac msg) (get msg "dac"))
-                dac-check (when wire-dac
-                            (verify-dac wire-dac {:expected-agent-pubkey (:caller msg)
-                                                  :current-epoch ref-epoch
-                                                  :revoked-dac-ids (:revoked-dacs state)
-                                                  :required-scope "offer"}))
-                economy-enabled? (get state :economy-enabled? true)
-                burn-floor (effective-signaling-burn-floor state)
-                actual-burn (long (or (:burn msg) 0))]
-            (if (or (not valid-sig?)
-                    (not valid-suite?)
-                    (and economy-enabled? (< actual-burn burn-floor))
-                    (and wire-dac (not (:ok? dac-check))))
-              {:state state :net-envelopes [] :stdout-events []}
-              (let [sid (:session-id msg)
-                    clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature :crypto-suites])
-                                  selected-suite (assoc :selected-suite selected-suite)
-                                  (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))]
-                (cond
-                  (contains? (:sessions state) sid)
-                  (let [new-state (update-in state [:sessions sid :replays-deduped] (fnil inc 0))]
-                    {:state new-state :net-envelopes [] :stdout-events []})
+(defn handle-wire-offer
+  "Handles incoming wire channel-offer message, validating signatures, hashes, and network-uri."
+  ([state msg] (handle-wire-offer state msg nil))
+  ([state msg privkey-bytes]
+   (try
+     (let [msg-net (or (:network-uri msg) (get msg "network_uri") (get msg "network-uri"))
+           st-net (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+           network-mismatch? (or (and (string? msg-net) (string? st-net)
+                                      (not= (str/trim msg-net) (str/trim st-net))
+                                      (not (and (= (str/trim msg-net) "global") (true? (:allow-legacy-global-offers? state)))))
+                                 (and (= st-net "mainnet.bitecho.org") (str/blank? (str msg-net))))]
+       (if network-mismatch?
+         {:state (update-in state [:diagnostics :network-replay-rejected] (fnil inc 0))
+          :net-envelopes []
+          :stdout-events []}
+         (if-not (and (map? msg)
+                      (string? (:caller msg))
+                      (string? (:callee msg))
+                      (= (normalize-pubkey-hex (:callee msg)) (normalize-pubkey-hex (:pubkey state)))
+                      (string? (:caller-ephemeral-pub msg))
+                      (string? (:signature msg))
+                      (integer? (:epoch msg))
+                      (valid-pubkey-hex? (:caller msg))
+                      (valid-pubkey-hex? (:callee msg)))
+           {:state state :net-envelopes [] :stdout-events []}
+           (let [caller-pub (try (basalt/hex->bytes (:caller msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                 expected-sid (compute-session-id (:caller msg) (:callee msg) (:caller-ephemeral-pub msg))
+                 expected-hash-legacy (compute-offer-hash msg)
+                 expected-hash-sealed (sealed/offer-hash msg)
+                 wire-dac (or (:dac msg) (get msg "dac"))
+                 dac-id (or (:dac-id msg) (get msg "dac_id")
+                            (when wire-dac (or (:dac-id wire-dac) (get wire-dac "dac_id") (get wire-dac "dac-id"))))
+                 burn-num (parse-long-safe (or (:price msg) (:burn msg)) 0)
+                 epoch-num (parse-long-safe (:epoch msg) 0)
+                 net-str (when (and (string? msg-net) (not (str/blank? msg-net))) (str/trim msg-net))
+                 expected-hash-5field (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes (str (:caller msg) "-" (:callee msg) "-" (:caller-ephemeral-pub msg) "-" epoch-num "-" burn-num
+                                                                                                   (when (and (string? dac-id) (not (str/blank? dac-id))) (str "|" dac-id))
+                                                                                                   (when net-str (str "|net:" net-str))))))
+                 valid-hashes? (and (= (:session-id msg) expected-sid)
+                                    (or (= (:offer-hash msg) expected-hash-legacy)
+                                        (= (:offer-hash msg) expected-hash-sealed)
+                                        (= (:offer-hash msg) expected-hash-5field)
+                                        (matching-offer-hash? msg state (:offer-hash msg))))
+                 caller-suites (or (:crypto-suites msg) (get msg "crypto_suites") (get msg "crypto-suites"))
+                 callee-suites (or (:crypto-suites state) sealed/default-crypto-suites)
+                 suite-negotiation (sealed/negotiate-crypto-suite (or caller-suites [sealed/suite-v1-chacha20poly1305]) callee-suites)
+                 valid-suite? (:ok? suite-negotiation)
+                 selected-suite (:selected-suite suite-negotiation)
+                 valid-sig? (and valid-hashes?
+                                 valid-suite?
+                                 caller-pub sig-bytes
+                                 (crypto/verify caller-pub (fressian/utf8->bytes (:offer-hash msg)) sig-bytes))
+                 ref-epoch (:epoch state)
+                 wire-dac (or (:dac msg) (get msg "dac"))
+                 dac-check (when wire-dac
+                             (verify-dac wire-dac {:expected-agent-pubkey (:caller msg)
+                                                   :current-epoch ref-epoch
+                                                   :revoked-dac-ids (:revoked-dacs state)
+                                                   :required-scope "offer"}))
+                 economy-enabled? (get state :economy-enabled? true)
+                 burn-floor (effective-signaling-burn-floor state)
+                 actual-burn (long (or (:burn msg) 0))]
+             (if (or (not valid-sig?)
+                     (not valid-suite?)
+                     (and economy-enabled? (< actual-burn burn-floor))
+                     (and wire-dac (not (:ok? dac-check))))
+               {:state state :net-envelopes [] :stdout-events []}
+               (let [sid (:session-id msg)
+                     clean-offer (cond-> (select-keys msg [:bitecho/type :session-id :caller :callee :caller-ephemeral-pub :epoch :price :home-node :offer-hash :burn :signature :crypto-suites :network-uri])
+                                   selected-suite (assoc :selected-suite selected-suite)
+                                   (and wire-dac (:ok? dac-check)) (assoc :dac (:dac dac-check)))]
+                 (cond
+                   (contains? (:sessions state) sid)
+                   (let [new-state (update-in state [:sessions sid :replays-deduped] (fnil inc 0))]
+                     {:state new-state :net-envelopes [] :stdout-events []})
 
-                  (contains? (:pending-offers state) sid)
-                  {:state state :net-envelopes [] :stdout-events []}
+                   (contains? (:pending-offers state) sid)
+                   {:state state :net-envelopes [] :stdout-events []}
 
-                  (:autonomous? state)
-                  (let [accept-res (exec-accept (assoc-in state [:pending-offers sid] clean-offer)
-                                                {"session_id" sid}
-                                                privkey-bytes)]
-                    {:state (:state accept-res)
-                     :net-envelopes (:net-envelopes accept-res)
-                     :stdout-events (:stdout-events accept-res)})
+                   (:autonomous? state)
+                   (let [accept-res (exec-accept (assoc-in state [:pending-offers sid] clean-offer)
+                                                 {"session_id" sid}
+                                                 privkey-bytes)]
+                     {:state (:state accept-res)
+                      :net-envelopes (:net-envelopes accept-res)
+                      :stdout-events (:stdout-events accept-res)})
 
-                  :else
-                  (let [caller-pname (pubkey->petname state (:caller clean-offer))
-                        offer-dac (:dac clean-offer)
-                        dac-anchor (when offer-dac (or (:anchor-pubkey offer-dac) (get offer-dac "anchor_pubkey")))
-                        dac-id (when offer-dac (or (:dac-id offer-dac) (get offer-dac "dac_id")))
-                        event (cond-> {"event" "offer-received"
-                                       "session_id" sid
-                                       "caller" (:caller clean-offer)
-                                       "price" (:price clean-offer)}
-                                caller-pname (assoc "caller_petname" caller-pname)
-                                dac-anchor (assoc "anchor_pubkey" dac-anchor)
-                                dac-id (assoc "dac_id" dac-id))]
-                    {:state (assoc-in state [:pending-offers sid] clean-offer)
-                     :net-envelopes []
-                     :stdout-events [event]}))))))))
-    (catch #?(:clj Exception :cljs :default) _
-      {:state state :net-envelopes [] :stdout-events []})))
+                   :else
+                   (let [caller-pname (pubkey->petname state (:caller clean-offer))
+                         offer-dac (:dac clean-offer)
+                         dac-anchor (when offer-dac (or (:anchor-pubkey offer-dac) (get offer-dac "anchor_pubkey")))
+                         dac-id (when offer-dac (or (:dac-id offer-dac) (get offer-dac "dac_id")))
+                         event (cond-> {"event" "offer-received"
+                                        "session_id" sid
+                                        "caller" (:caller clean-offer)
+                                        "price" (:price clean-offer)}
+                                 caller-pname (assoc "caller_petname" caller-pname)
+                                 dac-anchor (assoc "anchor_pubkey" dac-anchor)
+                                 dac-id (assoc "dac_id" dac-id))]
+                     {:state (assoc-in state [:pending-offers sid] clean-offer)
+                      :net-envelopes []
+                      :stdout-events [event]}))))))))
+     (catch #?(:clj Exception :cljs :default) _
+       {:state state :net-envelopes [] :stdout-events []}))))
 
-(defn- handle-wire-accept
+(defn handle-wire-accept
+  "Handles incoming wire channel-accept message, validating delivery ack and network-uri."
   ([state msg] (handle-wire-accept state msg nil))
   ([state msg privkey-bytes]
    (try
-     (if-not (and (map? msg)
-                  (string? (:caller msg)) (= (normalize-pubkey-hex (:caller msg)) (normalize-pubkey-hex (:pubkey state)))
-                  (string? (:callee msg)) (valid-pubkey-hex? (:callee msg))
-                  (string? (:session-id msg)) (not (str/blank? (:session-id msg)))
-                  (string? (:callee-ephemeral-pub msg)) (not (str/blank? (:callee-ephemeral-pub msg)))
-                  (string? (:signature msg)) (not (str/blank? (:signature msg)))
-                  (map? (:delivery-ack msg))
-                  (or (nil? (:epoch msg)) (integer? (:epoch msg))))
-       {:state state :net-envelopes [] :stdout-events []}
-       (let [session-id (:session-id msg)
-             session (get-in state [:sessions session-id])]
-         (cond
-           (and session (= "open" (:state session)))
-           {:state (update-in state [:sessions session-id :replays-deduped] (fnil inc 0))
-            :net-envelopes []
-            :stdout-events []}
-
-           (not (and session (= "offered" (:state session))))
+     (let [msg-net (or (:network-uri msg) (get msg "network_uri") (get msg "network-uri"))
+           st-net (or (:network-uri state) (config/resolve-network-uri (:subnet-id state)))
+           network-mismatch? (and (string? msg-net) (string? st-net)
+                                  (not= (str/trim msg-net) (str/trim st-net)))]
+       (if network-mismatch?
+         {:state (update-in state [:diagnostics :cross-network-accept-rejected] (fnil inc 0))
+          :net-envelopes []
+          :stdout-events []}
+         (if-not (and (map? msg)
+                      (string? (:session-id msg))
+                      (or (nil? (:caller msg)) (= (normalize-pubkey-hex (:caller msg)) (normalize-pubkey-hex (:pubkey state)))))
            {:state state :net-envelopes [] :stdout-events []}
+           (let [session-id (:session-id msg)
+                 session (get-in state [:sessions session-id])]
+             (cond
+               (and session (or (= "open" (:state session)) (= :open (:phase session))))
+               {:state (update-in state [:sessions session-id :replays-deduped] (fnil inc 0))
+                :net-envelopes []
+                :stdout-events []}
 
-           :else
-           (let [callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                 sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                 raw-sel-suite (or (:selected-suite msg) (:suite msg))
-                 sel-str (when raw-sel-suite (if (keyword? raw-sel-suite) (name raw-sel-suite) (str raw-sel-suite)))
-                 offered-suites (set (map #(if (keyword? %) (name %) (str %))
-                                          (or (:crypto-suites session) sealed/default-crypto-suites)))
-                 suite-valid? (if sel-str
-                                (and (contains? offered-suites sel-str)
-                                     (contains? sealed/supported-crypto-suites sel-str))
-                                (contains? offered-suites sealed/suite-v1-chacha20poly1305))
-                 effective-suite (or sel-str sealed/suite-v1-chacha20poly1305)
-                 sig-input (if sel-str
-                             (str session-id "-" (:callee-ephemeral-pub msg) "|" sel-str)
-                             (str session-id "-" (:callee-ephemeral-pub msg)))
-                 valid-ack? (rendezvous/verify-delivery-ack (:delivery-ack msg) (:callee msg))
-                 valid-sig? (and suite-valid?
-                                 callee-pub sig-bytes
-                                 (crypto/verify callee-pub
-                                                (fressian/utf8->bytes sig-input)
-                                                sig-bytes))]
-             (if-not (and valid-ack? valid-sig?)
+               (not (and session (or (= "offered" (:state session)) (= :offered (:phase session)))))
                {:state state :net-envelopes [] :stdout-events []}
-               (let [callee-eph (try (basalt/hex->bytes (:callee-ephemeral-pub msg)) (catch #?(:clj Exception :cljs :default) _ nil))
-                     eph-priv (or (:ephemeral-priv session)
-                                  (when (and (:offer-nonce session) privkey-bytes)
-                                    (:private (sealed/derive-offer-x25519-keypair privkey-bytes (:offer-nonce session) (:caller msg) (:callee msg)))))
-                     shared-sec (when (and callee-eph eph-priv) (sealed/x25519-shared-secret eph-priv callee-eph))]
-                 (if-not shared-sec
+
+               :else
+               (let [callee-pub (try (basalt/hex->bytes (:callee msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                     sig-bytes (try (basalt/hex->bytes (:signature msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                     raw-sel-suite (or (:selected-suite msg) (:suite msg))
+                     sel-str (when raw-sel-suite (if (keyword? raw-sel-suite) (name raw-sel-suite) (str raw-sel-suite)))
+                     offered-suites (set (map #(if (keyword? %) (name %) (str %))
+                                              (or (:crypto-suites session) sealed/default-crypto-suites)))
+                     suite-valid? (if sel-str
+                                    (and (contains? offered-suites sel-str)
+                                         (contains? sealed/supported-crypto-suites sel-str))
+                                    (contains? offered-suites sealed/suite-v1-chacha20poly1305))
+                     effective-suite (or sel-str sealed/suite-v1-chacha20poly1305)
+                     sig-input (if sel-str
+                                 (str session-id "-" (:callee-ephemeral-pub msg) "|" sel-str)
+                                 (str session-id "-" (:callee-ephemeral-pub msg)))
+                     valid-ack? (rendezvous/verify-delivery-ack (:delivery-ack msg) (:callee msg))
+                     valid-sig? (and suite-valid?
+                                     callee-pub sig-bytes
+                                     (crypto/verify callee-pub
+                                                    (fressian/utf8->bytes sig-input)
+                                                    sig-bytes))]
+                 (if-not (and valid-ack? valid-sig?)
                    {:state state :net-envelopes [] :stdout-events []}
-                   (let [keys (sealed/derive-channel-keys shared-sec session-id :initiator)
-                         updated-sess (-> session
-                                          (assoc :state "open"
-                                                 :suite effective-suite
-                                                 :tx-seq 0
-                                                 :acked-seq 0
-                                                 :rx-high-seq 0
-                                                 :contiguous-rx-seq 0
-                                                 :replays-deduped 0
-                                                 :outbox-evicted 0
-                                                 :outbox {}
-                                                 :outbox-order []
-                                                 :tx-key (:tx-key keys)
-                                                 :rx-key (:rx-key keys)
-                                                 :replay-window (sealed/init-replay-window))
-                                          (dissoc :ephemeral-priv :offer-nonce))
-                         new-state (-> state
-                                       (assoc-in [:sessions session-id] updated-sess)
-                                       (update :vouchers (fnil conj []) (:delivery-ack msg)))
-                         callee-pname (pubkey->petname state (:callee msg))
-                         event (cond-> {"event" "channel-opened" "session_id" session-id "peer" (:callee msg)}
-                                 callee-pname (assoc "peer_petname" callee-pname))]
-                     {:state new-state
-                      :net-envelopes []
-                      :stdout-events [event]}))))))))
+                   (let [callee-eph (try (basalt/hex->bytes (:callee-ephemeral-pub msg)) (catch #?(:clj Exception :cljs :default) _ nil))
+                         eph-priv (or (:ephemeral-priv session)
+                                      (when (and (:offer-nonce session) privkey-bytes)
+                                        (:private (sealed/derive-offer-x25519-keypair privkey-bytes (:offer-nonce session) (:caller msg) (:callee msg)))))
+                         shared-sec (when (and callee-eph eph-priv) (sealed/x25519-shared-secret eph-priv callee-eph))]
+                     (if-not shared-sec
+                       {:state state :net-envelopes [] :stdout-events []}
+                       (let [keys (sealed/derive-channel-keys shared-sec session-id :initiator)
+                             updated-sess (-> session
+                                              (assoc :state "open"
+                                                     :suite effective-suite
+                                                     :tx-seq 0
+                                                     :acked-seq 0
+                                                     :rx-high-seq 0
+                                                     :contiguous-rx-seq 0
+                                                     :replays-deduped 0
+                                                     :outbox-evicted 0
+                                                     :outbox {}
+                                                     :outbox-order []
+                                                     :tx-key (:tx-key keys)
+                                                     :rx-key (:rx-key keys)
+                                                     :replay-window (sealed/init-replay-window))
+                                              (dissoc :ephemeral-priv :offer-nonce))
+                             new-state (-> state
+                                           (assoc-in [:sessions session-id] updated-sess)
+                                           (update :vouchers (fnil conj []) (:delivery-ack msg)))
+                             callee-pname (pubkey->petname state (:callee msg))
+                             event (cond-> {"event" "channel-opened" "session_id" session-id "peer" (:callee msg)}
+                                     callee-pname (assoc "peer_petname" callee-pname))]
+                         {:state new-state
+                          :net-envelopes []
+                          :stdout-events [event]}))))))))))
      (catch #?(:clj Exception :cljs :default) _
        {:state state :net-envelopes [] :stdout-events []}))))
 

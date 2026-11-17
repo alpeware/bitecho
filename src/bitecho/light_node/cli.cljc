@@ -18,6 +18,7 @@
    "bip-object"
    "bip-status"
    "bip-submit"
+   "bounties"
    "bounty-create"
    "bounty-settle"
    "broadcast"
@@ -83,13 +84,14 @@
   ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--subnet-id" "--subnet"
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
    "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
-   "--after-ts" "--min-balance"
+   "--cursor" "--after-ts" "--min-balance"
    "--ingress-tcp-port" "--trusted-dac-anchors" "--turn-server" "--turn-username"
    "--turn-password" "--turn-realm" "--turn-force-relay" "--sync-interval-ms" "--price"
    "--price-max" "--burn" "--to" "--from" "--callee" "--peer" "--receiver" "--recipient"
    "--amount" "--text" "--message" "--payload-hex" "--peek" "--poll" "--sync" "--no-poll"
    "--autonomous" "--auto-sync" "--auto-register-home-set" "--no-auto-register-home-set"
-   "--wait-open-ms" "--block" "--until-event" "--help"])
+   "--wait-open-ms" "--block" "--until-event" "--help"
+   "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -195,30 +197,51 @@
 ;; 3. Pure Flag and Option Extraction Helpers
 ;; =============================================================================
 
+(defn- flag->kw [flag]
+  (keyword (if (str/starts-with? flag "--") (subs flag 2) flag)))
+
+(defn- flag->str-k [flag]
+  (if (str/starts-with? flag "--") (subs flag 2) flag))
+
+(defn- flag->snake-k [flag]
+  (str/replace (flag->str-k flag) "-" "_"))
+
 (defn- extract-flag-value
   [tokens flag default-val]
-  (loop [toks tokens]
-    (if (empty? toks)
-      default-val
-      (if (= (first toks) flag)
-        (if (and (seq (rest toks)) (not (str/starts-with? (second toks) "--")))
-          (second toks)
-          default-val)
-        (recur (rest toks))))))
+  (if (map? tokens)
+    (or (get tokens (flag->kw flag))
+        (get tokens (flag->str-k flag))
+        (get tokens (flag->snake-k flag))
+        (get tokens flag)
+        default-val)
+    (loop [toks tokens]
+      (if (empty? toks)
+        default-val
+        (if (= (first toks) flag)
+          (if (and (seq (rest toks)) (not (str/starts-with? (second toks) "--")))
+            (second toks)
+            default-val)
+          (recur (rest toks)))))))
 
 (defn- extract-long-flag
   [tokens flag default-val]
-  (if-let [v (extract-flag-value tokens flag nil)]
-    (try
-      #?(:clj (Long/parseLong (str v))
-         :cljs (let [n (js/parseInt (str v) 10)]
-                 (if (js/isNaN n) default-val n)))
-      (catch #?(:clj Exception :cljs :default) _ default-val))
-    default-val))
+  (let [v (extract-flag-value tokens flag nil)]
+    (if (nil? v)
+      default-val
+      (try
+        #?(:clj (Long/parseLong (str v))
+           :cljs (let [n (js/parseInt (str v) 10)]
+                   (if (js/isNaN n) default-val n)))
+        (catch #?(:clj Exception :cljs :default) _ default-val)))))
 
 (defn- has-flag?
   [tokens flag]
-  (boolean (some #{flag} tokens)))
+  (if (map? tokens)
+    (boolean (or (get tokens (flag->kw flag))
+                 (get tokens (flag->str-k flag))
+                 (get tokens (flag->snake-k flag))
+                 (get tokens flag)))
+    (boolean (some #{flag} tokens))))
 
 (defn- parse-tokens-into-opts-and-args
   [tokens]
@@ -322,7 +345,7 @@
             seq-num (extract-long-flag clean-tokens "--seq" nil)
             burn (extract-long-flag clean-tokens "--burn" 500)
             min-bal (extract-long-flag clean-tokens "--min-balance" nil)
-            m {"cmd" "transfer" "receiver" recv "recipient" recv "amount" amt "burn" burn}]
+            m {"cmd" "transfer" "receiver" recv "recipient" recv "to" recv "amount" amt "burn" burn}]
         (cond-> m
           seq-num (assoc "seq" seq-num)
           min-bal (assoc "min_balance" min-bal)))
@@ -350,7 +373,7 @@
                      (extract-flag-value clean-tokens "--recipient" nil)
                      (extract-flag-value clean-tokens "--to" nil))
             amt (extract-long-flag clean-tokens "--amount" 0)]
-        {"cmd" "settle-intent" "receiver" recv "recipient" recv "amount" amt})
+        {"cmd" "settle-intent" "receiver" recv "recipient" recv "to" recv "amount" amt})
 
       "lock-intent"
       (let [recv (or (extract-flag-value clean-tokens "--receiver" nil)
@@ -601,6 +624,7 @@
                   (extract-long-flag clean-tokens "--timeout" nil))
             ms (extract-long-flag clean-tokens "--min-seq" nil)
             bcast-seq (extract-long-flag clean-tokens "--min-broadcast-seq" nil)
+            cursor (extract-long-flag clean-tokens "--cursor" nil)
             sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil))
             block? (or (has-flag? clean-tokens "--block")
@@ -610,6 +634,7 @@
         (cond-> m
           ms (assoc "min_seq" ms)
           bcast-seq (assoc "min_broadcast_seq" bcast-seq)
+          cursor (assoc "cursor" cursor)
           sub (assoc "subnet_id" sub)
           block? (assoc "block" true)
           peek? (assoc "peek" true)))
@@ -855,6 +880,12 @@
             defspec-vars (extract-flag-value clean-tokens "--defspec-vars" nil)
             oracle-edn (extract-flag-value clean-tokens "--oracle-receipts-edn" nil)
             act-ep (extract-long-flag clean-tokens "--activate-at-epoch" nil)
+            inv-diff (or (extract-flag-value clean-tokens "--invariant-diff-edn" nil)
+                         (extract-flag-value clean-tokens "--invariant-diff" nil))
+            juris-map (or (extract-flag-value clean-tokens "--jurisdiction-map" nil)
+                          (extract-flag-value clean-tokens "--jurisdiction" nil))
+            sunset (or (extract-long-flag clean-tokens "--human-anchor-sunset" nil)
+                       (extract-long-flag clean-tokens "--sunset" nil))
             b (extract-long-flag clean-tokens "--burn" nil)
             m {"cmd" "bip-submit"}]
         (cond-> m
@@ -867,6 +898,9 @@
           defspec-vars (assoc "defspec_vars" defspec-vars)
           oracle-edn (assoc "oracle_receipts_edn" oracle-edn)
           (some? act-ep) (assoc "activate_at_epoch" act-ep)
+          inv-diff (assoc "invariant-diff-edn" inv-diff "invariant_diff_edn" inv-diff)
+          juris-map (assoc "jurisdiction-map" juris-map "jurisdiction_map" juris-map)
+          (some? sunset) (assoc "human-anchor-sunset" sunset "human_anchor_sunset" sunset)
           (some? b) (assoc "burn" b)))
 
       "bip-consent"
@@ -912,11 +946,21 @@
           sub (assoc "subnet_id" sub)
           bip-id (assoc "bip_id" bip-id)))
 
+      "bounties"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil))
+            st (extract-flag-value clean-tokens "--status" nil)
+            m {"cmd" "bounties"}]
+        (cond-> m
+          sub (assoc "subnet_id" sub "subnet-id" sub)
+          st (assoc "status" st)))
+
       "bounty-create"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil))
             bounty-id (extract-flag-value clean-tokens "--bounty-id" nil)
-            target-cid (or (extract-flag-value clean-tokens "--target-bip-cid" nil)
+            target-cid (or (extract-flag-value clean-tokens "--bip-cid" nil)
+                           (extract-flag-value clean-tokens "--target-bip-cid" nil)
                            (extract-flag-value clean-tokens "--bip-id" nil))
             gross (or (extract-long-flag clean-tokens "--gross-amount" nil)
                       (extract-long-flag clean-tokens "--amount" nil))
@@ -929,7 +973,7 @@
         (cond-> m
           sub (assoc "subnet_id" sub)
           bounty-id (assoc "bounty_id" bounty-id)
-          target-cid (assoc "target_bip_cid" target-cid "bip_id" target-cid)
+          target-cid (assoc "target_bip_cid" target-cid "bip_id" target-cid "bip-cid" target-cid "bip_cid" target-cid)
           (some? gross) (assoc "gross_amount" gross "amount" gross)
           m-pub (assoc "maintainer_pubkey" m-pub)
           (some? take-bps) (assoc "take_bps" take-bps)
