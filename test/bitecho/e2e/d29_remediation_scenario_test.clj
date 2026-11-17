@@ -9,6 +9,7 @@
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.http :as http]
+            [bitecho.shell.light-node :as light-shell]
             [bitecho.shell.mesh :as mesh]
             [bitecho.state-machine :as sm]
             [clojure.java.io :as io]
@@ -382,11 +383,49 @@
 ;; -----------------------------------------------------------------------------
 
 (deftest scenario-7-relay-poll-subnet-filter-and-no-default-private-chat
-  (testing "init-light-state does not subscribe to chat/simon-nexus-axiom by default"
-    (let [id {:pubkey-hex "pk-1"}
-          st (light-core/init-light-state id {:subnet-id "devnet.bitecho.org"})]
+  (testing "init-light-state and effective-subscribed-subnets do not subscribe to chat/simon-nexus-axiom by default (F-D29-21, F-V237-1)"
+    (let [kp (crypto/generate-keypair)
+          id {:pubkey-hex (basalt/bytes->hex (:public kp))}
+          st (light-core/init-light-state id {:subnet-id "devnet.bitecho.org"})
+          sender-kp (crypto/generate-keypair)
+          sender-st (light-core/init-light-state {:pubkey-hex (basalt/bytes->hex (:public sender-kp))}
+                                                 {:subnet-id "chat/simon-nexus-axiom"})
+          bcast-res (light-core/handle-command sender-st
+                                               {"cmd" "broadcast" "text" "private chat msg" "subnet_id" "chat/simon-nexus-axiom"}
+                                               (:private sender-kp))
+          bcast-env (first (:net-envelopes bcast-res))
+          ingest-res (light-core/handle-wire-payload st bcast-env (:private kp))]
       (is (not (contains? (:subscribed-subnets st) "chat/simon-nexus-axiom")))
-      (is (= #{} (:subscribed-subnets st)))))
+      (is (= #{} (:subscribed-subnets st)))
+      (is (not (contains? (light-core/effective-subscribed-subnets st) "chat/simon-nexus-axiom")))
+      (is (= #{"devnet.bitecho.org" "global"} (light-core/effective-subscribed-subnets st)))
+      (is (empty? (:broadcast-inbox (:state ingest-res))))
+      (is (= 1 (get-in (:state ingest-res) [:diagnostics :subnet-mismatch-dropped])))
+      ;; Explicit subscription enables chat/simon-nexus-axiom
+      (let [sub-res (light-core/handle-command st {"cmd" "subscribe-subnets" "subnets" ["chat/simon-nexus-axiom"]} (:private kp))
+            st-sub (:state sub-res)
+            ingest-sub (light-core/handle-wire-payload st-sub bcast-env (:private kp))]
+        (is (contains? (light-core/effective-subscribed-subnets st-sub) "chat/simon-nexus-axiom"))
+        (is (= 1 (count (:broadcast-inbox (:state ingest-sub))))))))
+
+  (testing "export-poll and poll-and-ingest-relay-once! emit effective subnet filter without chat/simon-nexus-axiom (F-D29-20, F-V237-4)"
+    (let [kp (crypto/generate-keypair)
+          id {:pubkey-hex (basalt/bytes->hex (:public kp))
+              :privkey-bytes (:private kp)}
+          st (light-core/init-light-state id {:subnet-id "devnet.bitecho.org"})
+          poll-cmd-res (light-core/handle-command st {"cmd" "export-poll"} (:private kp))
+          poll-req (get-in poll-cmd-res [:response "poll_request"])
+          captured-opts (atom nil)
+          state-atom (atom st)]
+      (is (= ["devnet.bitecho.org" "global"] (get poll-req "subnet_ids")))
+      (is (= ["devnet.bitecho.org" "global"] (get poll-req "subnets")))
+      (is (not (some #{"chat/simon-nexus-axiom"} (get poll-req "subnet_ids"))))
+      (with-redefs [light-shell/poll-relay-envelopes! (fn [_url _pk _priv opts]
+                                                        (reset! captured-opts opts)
+                                                        {"ok" true "messages" [] "broadcasts" []})]
+        (light-shell/poll-and-ingest-relay-once! "https://bitecho.org" id state-atom nil {}))
+      (is (= ["devnet.bitecho.org" "global"] (:subnets @captured-opts)))
+      (is (not (some #{"chat/simon-nexus-axiom"} (:subnets @captured-opts))))))
 
   (testing "exec-status reports inbox_direct_count, inbox_broadcast_count, and inbox_by_subnet"
     (let [id {:pubkey-hex "pk-1"}
@@ -449,6 +488,31 @@
           cmd-bounty (cli/build-cmd-map "bounty-create" {:bip-cid "cid-xyz" :amount 1000})]
       (is (= "target-pk" (or (get cmd-xfer "to") (get cmd-xfer "receiver"))))
       (is (= "cid-xyz" (or (get cmd-bounty "bip-cid") (get cmd-bounty "bip_cid")))))))
+
+;; -----------------------------------------------------------------------------
+;; Scenario 10: Ops, Build, & Release-Proof Hygiene Invariants
+;; (F-D29-1, F-D29-2, F-D29-6, F-D29-8, F-D29-18)
+;; -----------------------------------------------------------------------------
+
+(deftest scenario-10-ops-build-and-release-hygiene-invariants
+  (testing "F-D29-1 & F-D29-18: scripts/cluster.sh cmd_fund uses 4-of-6 quorum and cmd_logs/cmd_sample are non-blocking"
+    (let [cluster-sh (slurp "scripts/cluster.sh")]
+      (is (str/includes? cluster-sh "Querying current Custody state quorum (4-of-6) from /accountz"))
+      (is (str/includes? cluster-sh "cmd_sample()"))
+      (is (str/includes? cluster-sh "sample)"))))
+
+  (testing "F-D29-2: scripts/infra_cluster.sh publish-git includes mealy in bare-repo loop"
+    (let [infra-sh (slurp "scripts/infra_cluster.sh")]
+      (is (str/includes? infra-sh "repos+=(\"mealy\")"))))
+
+  (testing "F-D29-6: dev/bitecho/stress/release_proof.clj shuts down agents and exits cleanly in -main"
+    (let [proof-src (slurp "dev/bitecho/stress/release_proof.clj")]
+      (is (str/includes? proof-src "(shutdown-agents)"))
+      (is (str/includes? proof-src "(System/exit (if (:all-passed? proof) 0 1))"))))
+
+  (testing "F-D29-8: build.clj b/uber manifest includes Add-Exports for keytool and x509"
+    (let [build-src (slurp "build.clj")]
+      (is (str/includes? build-src "\"Add-Exports\" \"java.base/sun.security.tools.keytool java.base/sun.security.x509\"")))))
 
 ;; -----------------------------------------------------------------------------
 ;; Generative Properties (Rule 1 Strict TDD)

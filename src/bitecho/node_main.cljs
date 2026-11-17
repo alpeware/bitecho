@@ -3421,14 +3421,17 @@
             timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))
             min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
                       (long ms))
+            cursor (when-let [c (or (get cmd-map "cursor") (:cursor cmd-map))]
+                     (long c))
             deadline (+ (.now js/Date) timeout-ms)
             check! (fn check! []
                      (let [q (:event-queue @state-atom)
-                           has-event? (if min-seq
+                           has-event? (if (or min-seq cursor)
                                         (boolean (some (fn [ev]
-                                                         (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "event_seq") (:event-seq ev) 0))
+                                                         (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "event_seq") (:event-seq ev) (get ev "eid") (:eid ev) 0))
                                                                s   (long (or (get ev "seq") (:seq ev) 0))]
-                                                           (or (>= eid min-seq) (>= s min-seq))))
+                                                           (and (or (nil? min-seq) (>= eid min-seq) (>= s min-seq))
+                                                                (or (nil? cursor) (> eid cursor)))))
                                                        q))
                                         (boolean (seq q)))]
                        (if (or has-event?
@@ -4054,10 +4057,7 @@
         priv-bytes (:privkey-bytes identity)
         since-mseq (long (or (:relay-since-seq @state-atom) 0))
         since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))
-        eff-subnets (when-not (and (= (or (:subnet-id @state-atom) "global") "global")
-                                   (empty? (disj (or (:subscribed-subnets @state-atom) #{})
-                                                 light-core/simon-nexus-axiom-subnet-id)))
-                      (vec (sort (light-core/effective-subscribed-subnets @state-atom))))
+        eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
         subnets (or (:subnets opts) eff-subnets)]
     (poll-relay-envelopes!
      relay-url pk-hex priv-bytes

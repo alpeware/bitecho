@@ -465,7 +465,8 @@
                    {:id "D29-6" :name "http-dist-bundle-sea-and-sha256-bridge" :test-fn d29-test/scenario-6-http-dist-bundle-sea-and-sha256-bridge}
                    {:id "D29-7" :name "relay-poll-subnet-filter-and-no-default-private-chat" :test-fn d29-test/scenario-7-relay-poll-subnet-filter-and-no-default-private-chat}
                    {:id "D29-8" :name "ctl-wait-block-honors-timeout-and-cursor" :test-fn d29-test/scenario-8-ctl-wait-block-honors-timeout-and-cursor}
-                   {:id "D29-9" :name "cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid" :test-fn d29-test/scenario-9-cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid}]
+                   {:id "D29-9" :name "cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid" :test-fn d29-test/scenario-9-cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid}
+                   {:id "D29-10" :name "ops-build-and-release-hygiene-invariants" :test-fn d29-test/scenario-10-ops-build-and-release-hygiene-invariants}]
         results (mapv (fn [{:keys [id name test-fn]}]
                         (let [pass? (try
                                       (binding [t/*report-counters* (ref t/*initial-report-counters*)]

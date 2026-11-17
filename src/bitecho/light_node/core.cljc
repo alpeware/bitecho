@@ -386,7 +386,6 @@
                            "devnet.bitecho.org")
         explicit (into #{} (map str (or (:subscribed-subnets state) #{})))]
     (cond-> explicit
-      true (conj simon-nexus-axiom-subnet-id)
       expected-subnet (conj expected-subnet)
       (config/equivalent-subnet-id? "global" expected-subnet active-net-uri) (conj "global"))))
 
@@ -4484,9 +4483,12 @@
         signing-str (str "bitecho-relay-poll-v1|" pk "|" since-seq "|" ts "|" nonce)
         sig-bytes (crypto/sign privkey-bytes (fressian/utf8->bytes signing-str))
         sig-hex (if (string? sig-bytes) sig-bytes (basalt/bytes->hex sig-bytes))
+        eff-subnets (vec (sort (effective-subscribed-subnets state)))
         req {"pubkey" pk
              "since_seq" since-seq
              "since_broadcast_seq" since-bseq
+             "subnets" eff-subnets
+             "subnet_ids" eff-subnets
              "timestamp_ms" ts
              "nonce" nonce
              "signature" sig-hex}]

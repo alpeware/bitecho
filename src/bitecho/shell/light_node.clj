@@ -3032,15 +3032,18 @@
                                                     timeout-ms (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))
                                                     min-seq (when-let [ms (or (get cmd-map "min_seq") (get cmd-map "min-seq") (:min-seq cmd-map))]
                                                               (long ms))
+                                                    cursor (when-let [c (or (get cmd-map "cursor") (:cursor cmd-map))]
+                                                             (long c))
                                                     deadline (+ (System/currentTimeMillis) timeout-ms)]
                                                 (loop []
                                                   (let [popped (locking cmd-lock
                                                                  (let [q (:event-queue @state-atom)
-                                                                       has-events? (if min-seq
+                                                                       has-events? (if (or min-seq cursor)
                                                                                      (some (fn [ev]
-                                                                                             (let [eid (long (or (get ev "event_id") (:event-id ev) 0))
+                                                                                             (let [eid (long (or (get ev "event_id") (:event-id ev) (get ev "eid") (:eid ev) 0))
                                                                                                    s   (long (or (get ev "seq") (:seq ev) 0))]
-                                                                                               (or (>= eid min-seq) (>= s min-seq))))
+                                                                                               (and (or (nil? min-seq) (>= eid min-seq) (>= s min-seq))
+                                                                                                    (or (nil? cursor) (> eid cursor)))))
                                                                                            q)
                                                                                      (seq q))]
                                                                    (if has-events?
