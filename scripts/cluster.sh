@@ -1556,7 +1556,8 @@ cmd_logs() {
   local follow=false
   if [[ "$#" -ge 3 && ( "$3" == "-f" || "$3" == "--follow" ) ]]; then
     follow=true
-  elif [[ -t 1 ]]; then
+  elif [[ "$#" -ge 2 && ( "$2" == "-f" || "$2" == "--follow" ) ]]; then
+    lines="${LINES:-100}"
     follow=true
   fi
 

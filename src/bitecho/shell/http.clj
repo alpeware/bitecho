@@ -2193,17 +2193,24 @@
                                        ^Runnable
                                        (fn []
                                          (try
-                                           (let [env (:envelope eff)
+                                           (let [raw-env (:envelope eff)
+                                                 env (if (bytes? raw-env)
+                                                       (try (fressian/decode-wire raw-env) (catch Exception _ raw-env))
+                                                       raw-env)
                                                  edge-id (:peer-identity subnet-runtime)
                                                  edge-pk (or (:pubkey-hex edge-id) (:pubkey edge-id))
                                                  edge-priv (:privkey-bytes edge-id)
-                                                 ev-type (or (get-in env [:event :type]) (:type env))
-                                                 gossip-msg (when (= :receive-gossip ev-type)
-                                                              (or (get-in env [:event :message]) (:message env)))
+                                                 ev-type (when (map? env) (or (get-in env [:event :type]) (:type env)))
+                                                 gossip-msg (when (map? env)
+                                                              (if (= :receive-gossip ev-type)
+                                                                (or (get-in env [:event :message]) (:message env))
+                                                                (or (:message env) (get-in env [:event :message]))))
                                                  payload-to-send (if (and edge-pk edge-priv gossip-msg)
                                                                    (let [rewrapped (mesh/wrap-agent-event
                                                                                     {:type :receive-gossip
-                                                                                     :subnet-id (or (:subnet-id env) (get-in env [:event :subnet-id]) "global")
+                                                                                     :subnet-id (or (when (map? env) (:subnet-id env))
+                                                                                                    (when (map? env) (get-in env [:event :subnet-id]))
+                                                                                                    "global")
                                                                                      :message gossip-msg}
                                                                                     edge-pk edge-priv)]
                                                                      (fressian/encode-wire rewrapped))

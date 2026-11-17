@@ -344,12 +344,44 @@
             res-allow (light-core/handle-wire-offer state-allow global-offer (kp->sk kp))]
         (is (= 1 (count (get-in res-allow [:state :pending-offers]))) "Accepted when allow-legacy-global-offers? is true"))))
 
-  (testing "parse-p2p-candidate parses HTTPS relay candidate as zero-burn transport"
+  (testing "parse-p2p-candidate parses HTTPS relay candidate as zero-burn transport and dial-p2p-peer! connects over HTTPS relay leg (F-D29-3)"
     (let [cand (light-core/parse-p2p-candidate "https://nexus.ingress.bitecho.org/relay/v1")]
       (is (= "https" (:transport cand)))
       (is (= 443 (:port cand)))
       (is (true? (:zero-burn? cand)))
-      (is (= "https://nexus.ingress.bitecho.org/relay/v1" (:url cand))))))
+      (is (= "https://nexus.ingress.bitecho.org/relay/v1" (:url cand)))
+      (let [kp (test-keypair)
+            pk (kp->pk-hex kp)
+            peer-kp (test-keypair)
+            peer-pk (kp->pk-hex peer-kp)
+            sid "sid-https-leg-1"
+            st0 (-> (light-core/init-light-state {:pubkey-hex pk} {:subnet-id "devnet.bitecho.org"})
+                    (assoc-in [:sessions sid] {:session-id sid :peer peer-pk :state "open" :phase :open}))
+            state-atom (atom st0)
+            p2p-peers-atom (atom {})
+            ingress-peers-atom (atom {})
+            mdns-atom (atom {})
+            emitted (atom [])
+            polled-urls (atom [])
+            submitted-envs (atom [])]
+        (with-redefs [light-shell/poll-relay-envelopes! (fn [url _pk _priv _opts]
+                                                          (swap! polled-urls conj url)
+                                                          {"ok" true "messages" [] "broadcasts" []})
+                      light-shell/submit-relay-envelope! (fn [url env _opts]
+                                                           (swap! submitted-envs conj {:url url :env env})
+                                                           {"ok" true})]
+          (light-shell/dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (kp->sk kp)
+                                      #(swap! emitted conj %)
+                                      {:peer peer-pk
+                                       :session-id sid
+                                       :remote-candidates ["https://nexus.ingress.bitecho.org/relay/v1"]})
+          (is (seq @polled-urls) "dial-p2p-peer! must probe HTTPS relay candidate via poll-relay-envelopes!")
+          (is (true? (get-in @state-atom [:sessions sid :p2p :connected?])) "HTTPS relay leg must mark session p2p connected")
+          (is (some? (get @p2p-peers-atom peer-pk)) "p2p-peers-atom must register peer-send! and close-fn for peer")
+          (is (seq @submitted-envs) "dial-p2p-peer! must emit link-bind envelope over HTTPS relay")
+          (when-let [close-fn (get-in @p2p-peers-atom [peer-pk :close-fn])]
+            (close-fn))
+          (is (nil? (get @p2p-peers-atom peer-pk)) "peer-close! must cleanly remove peer from p2p-peers-atom"))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Scenario 6: HTTP Dist Bundle SEA & SHA256 Bridge

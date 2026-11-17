@@ -81,3 +81,113 @@ Cipher.getAuthTag = function() {};
 Cipher.setAuthTag = function(tag) {};
 Cipher.update = function(data) {};
 Cipher.final = function() {};
+
+var NodeExterns = {
+  publicKeyEncoding: {},
+  privateKeyEncoding: {},
+  type: "",
+  format: "",
+  key: {},
+  privateKey: {},
+  publicKey: {},
+  namedCurve: "",
+  authTagLength: 0,
+  saltLength: 0,
+  padding: 0,
+  constants: { RSA_PKCS1_PSS_PADDING: 0 },
+  reuseAddr: true,
+  recursive: true,
+  mode: 0,
+  encoding: "",
+  stdio: "",
+  detached: true,
+  input: {},
+  crlfDelay: 0,
+  terminal: false,
+  protocol: "",
+  hostname: "",
+  port: 0,
+  path: "",
+  pathname: "",
+  search: "",
+  method: "",
+  timeout: 0,
+  headers: {},
+  createConnection: function() {},
+  socket: {},
+  servername: "",
+  envelope_hex: "",
+  statusCode: 0,
+  remoteAddress: "",
+  remotePort: 0,
+  address: "",
+  family: "",
+  internal: false,
+  size: 0,
+  pid: 0,
+  env: {},
+  argv: [],
+  execPath: "",
+  stdin: {},
+  stdout: {},
+  stderr: {},
+  Buffer: {}
+};
+NodeExterns.appendFileSync = function() {};
+NodeExterns.chmodSync = function() {};
+NodeExterns.closeSync = function() {};
+NodeExterns.existsSync = function() {};
+NodeExterns.fsyncSync = function() {};
+NodeExterns.mkdirSync = function() {};
+NodeExterns.openSync = function() {};
+NodeExterns.readFileSync = function() {};
+NodeExterns.readSync = function() {};
+NodeExterns.renameSync = function() {};
+NodeExterns.statSync = function() {};
+NodeExterns.unlinkSync = function() {};
+NodeExterns.writeFileSync = function() {};
+NodeExterns.writeSync = function() {};
+NodeExterns.dirname = function() {};
+NodeExterns.join = function() {};
+NodeExterns.homedir = function() {};
+NodeExterns.networkInterfaces = function() {};
+NodeExterns.createServer = function() {};
+NodeExterns.createSocket = function() {};
+NodeExterns.createInterface = function() {};
+NodeExterns.createHash = function() {};
+NodeExterns.createHmac = function() {};
+NodeExterns.createECDH = function() {};
+NodeExterns.computeSecret = function() {};
+NodeExterns.generateKeys = function() {};
+NodeExterns.getPublicKey = function() {};
+NodeExterns.getPrivateKey = function() {};
+NodeExterns.digest = function() {};
+NodeExterns.request = function() {};
+NodeExterns.get = function() {};
+NodeExterns.connect = function() {};
+NodeExterns.listen = function() {};
+NodeExterns.bind = function() {};
+NodeExterns.send = function() {};
+NodeExterns.write = function() {};
+NodeExterns.writeHead = function() {};
+NodeExterns.end = function() {};
+NodeExterns.destroy = function() {};
+NodeExterns.resume = function() {};
+NodeExterns.close = function() {};
+NodeExterns.unref = function() {};
+NodeExterns.kill = function() {};
+NodeExterns.spawn = function() {};
+NodeExterns.setNoDelay = function() {};
+NodeExterns.addMembership = function() {};
+NodeExterns.readUInt8 = function() {};
+NodeExterns.readUInt16BE = function() {};
+NodeExterns.readUIntBE = function() {};
+NodeExterns.writeUInt8 = function() {};
+NodeExterns.writeUInt16BE = function() {};
+NodeExterns.writeUIntBE = function() {};
+NodeExterns.subarray = function() {};
+NodeExterns.copy = function() {};
+NodeExterns.equals = function() {};
+NodeExterns.concat = function() {};
+NodeExterns.alloc = function() {};
+NodeExterns.from = function() {};

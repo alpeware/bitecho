@@ -2031,7 +2031,7 @@
                                         :remote-ice-pwd pwd)))))))
                      (let [sender (:sender unwrapped)
                            query-only? (= (:type unwrapped) :query-chain-state)]
-                       (when (and sender (not query-only?) (not= sender @conn-key))
+                       (when (and sender (not query-only?) (anon-conn-key? @conn-key) (not= sender @conn-key))
                          (let [old-key @conn-key]
                            (if agent-conns
                              (let [rebound (apply-agent-sender-rebind! agent-conns old-key sender cid (System/currentTimeMillis))]
@@ -2054,13 +2054,7 @@
                                  (try
                                    (api/send! agent-node (fressian/encode-wire snapshot) cid)
                                    (catch Exception e
-                                     (log-mesh-error "Failed to send chain-state-snapshot to agent" e))))
-                               (try
-                                 (api/close! agent-node)
-                                 (catch Exception _ nil))
-                               (when agent-conns
-                                 (apply-mesh-conn-event! agent-conns @conn-key
-                                                         {:type :on-close :generation @node-gen :node agent-node})))
+                                     (log-mesh-error "Failed to send chain-state-snapshot to agent" e)))))
                              (do
                                (async/put! (:network-in shell-node) unwrapped)
                                (when (and (= (:type unwrapped) :receive-gossip) agent-conns)

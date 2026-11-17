@@ -21,6 +21,7 @@
 (def ^:private node-os (js/require "node:os"))
 (def ^:private node-http (js/require "node:http"))
 (def ^:private node-https (js/require "node:https"))
+(def ^:private node-tls (js/require "node:tls"))
 (def ^:private node-readline (js/require "node:readline"))
 (def ^:private node-crypto (js/require "node:crypto"))
 (def ^:private node-child-process (js/require "node:child_process"))
@@ -41,7 +42,7 @@
   "Pinned Directory Authority public key for bitecho.org devnet."
   "302a300506032b657003210056b505baa32c3b99663d163d6ee00b5018a26e182405f5ec4d5062f12f633ce9")
 
-(declare dial-p2p-peer! send-routed-envelopes!)
+(declare dial-p2p-peer! send-routed-envelopes! resolve-proxy-url)
 
 (defn normalize-fingerprint
   "Normalizes a SHA-256 DTLS fingerprint string to 32 uppercase colon-separated hex pairs."
@@ -416,9 +417,47 @@
       (catch :default _
         (done! nil)))))
 
+(defn- open-https-proxy-tls-socket!
+  "Opens an HTTP CONNECT tunnel through `proxy-url-str` to `target-host`:`target-port`
+   and upgrades the socket via `node:tls`, invoking `(cb tls-socket-or-nil err-or-nil)`."
+  [proxy-url-str target-host target-port timeout-ms cb]
+  (try
+    (let [proxy-u (js/URL. (if (re-find #"^https?://" proxy-url-str)
+                             proxy-url-str
+                             (str "http://" proxy-url-str)))
+          p-host (.-hostname proxy-u)
+          p-port (int (or (not-empty (str (.-port proxy-u))) 3128))
+          settled? (atom false)
+          done! (fn [sock err]
+                  (when (compare-and-set! settled? false true)
+                    (cb sock err)))
+          connect-req (.request node-http
+                                #js {:hostname p-host
+                                     :port p-port
+                                     :method "CONNECT"
+                                     :path (str target-host ":" target-port)
+                                     :timeout (or timeout-ms 5000)})]
+      (.on connect-req "connect"
+           (fn [res sock _head]
+             (if (not= 200 (.-statusCode res))
+               (do (try (.destroy sock) (catch :default _ nil))
+                   (done! nil (str "proxy-connect-status-" (.-statusCode res))))
+               (try
+                 (let [tls-sock (.connect node-tls #js {:socket sock :servername target-host})]
+                   (done! tls-sock nil))
+                 (catch :default e
+                   (try (.destroy sock) (catch :default _ nil))
+                   (done! nil (str e)))))))
+      (.on connect-req "timeout" (fn [] (try (.destroy connect-req) (catch :default _ nil)) (done! nil "proxy-connect-timeout")))
+      (.on connect-req "error" (fn [e] (done! nil (str e))))
+      (.end connect-req))
+    (catch :default e
+      (cb nil (str e)))))
+
 (defn- http-get-json!
-  "Fetches `url-str` over HTTP/HTTPS with a timeout, reading body on any status code,
-   parsing JSON, attaching `:status (.-statusCode res)`, and invoking `(cb parsed-map)`."
+  "Fetches `url-str` over HTTP/HTTPS with a timeout (tunneling via HTTPS_PROXY when present),
+   reading body on any status code, parsing JSON, attaching `:status (.-statusCode res)`,
+   and invoking `(cb parsed-map)`."
   ([url-str timeout-ms cb]
    (http-get-json! url-str nil timeout-ms cb))
   ([url-str headers timeout-ms cb]
@@ -427,36 +466,62 @@
                  (when (compare-and-set! settled? false true)
                    (cb res)))]
      (try
-       (let [client (if (str/starts-with? (str/lower-case url-str) "https://")
-                      node-https
-                      node-http)
-             opts-obj (let [o #js {:timeout (or timeout-ms 4000)}]
-                        (when (map? headers)
-                          (set! (.-headers o) (clj->js headers)))
-                        o)
-             req (.get client url-str opts-obj
-                       (fn [res]
-                         (let [status-code (.-statusCode res)
-                               chunks #js []]
-                           (.on res "data" (fn [c] (.push chunks c)))
-                           (.on res "end" (fn []
-                                            (try
-                                              (let [buf (js/Buffer.concat chunks)
-                                                    txt (.toString buf "utf8")
-                                                    parsed (try (js->clj (js/JSON.parse txt)) (catch :default _ nil))]
-                                                (done! (if (map? parsed)
-                                                         (assoc parsed :status status-code)
-                                                         {:status status-code :raw-body txt})))
-                                              (catch :default _
-                                                (done! {:status status-code :error "json-parse-failed"})))))
-                           (.on res "error" (fn [err] (done! {:error (str err) :status status-code}))))))]
-         (.on req "timeout" (fn [] (.destroy req) (done! {:error "timeout" :status 408})))
-         (.on req "error" (fn [err] (done! {:error (str err) :status 500}))))
+       (let [https? (str/starts-with? (str/lower-case url-str) "https://")
+             url-obj (js/URL. url-str)
+             target-host (.-hostname url-obj)
+             target-port (int (or (not-empty (str (.-port url-obj))) (if https? 443 80)))
+             proxy-str (when (and https?
+                                  (not= target-host "127.0.0.1")
+                                  (not= target-host "localhost"))
+                         (resolve-proxy-url nil))
+             run-get! (fn [tls-sock]
+                        (try
+                          (let [client (if https? node-https node-http)
+                                opts-obj #js {:protocol (.-protocol url-obj)
+                                              :hostname target-host
+                                              :port target-port
+                                              :path (str (.-pathname url-obj) (.-search url-obj))
+                                              :method "GET"
+                                              :timeout (or timeout-ms 4000)}
+                                _ (when (map? headers)
+                                    (set! (.-headers opts-obj) (clj->js headers)))
+                                _ (when tls-sock
+                                    (set! (.-createConnection opts-obj) (fn [_ _] tls-sock)))
+                                req (.request client opts-obj
+                                              (fn [res]
+                                                (let [status-code (.-statusCode res)
+                                                      chunks #js []]
+                                                  (.on res "data" (fn [c] (.push chunks c)))
+                                                  (.on res "end" (fn []
+                                                                   (try
+                                                                     (let [buf (js/Buffer.concat chunks)
+                                                                           txt (.toString buf "utf8")
+                                                                           parsed (try (js->clj (js/JSON.parse txt)) (catch :default _ nil))]
+                                                                       (done! (if (map? parsed)
+                                                                                (assoc parsed :status status-code)
+                                                                                {:status status-code :raw-body txt})))
+                                                                     (catch :default _
+                                                                       (done! {:status status-code :error "json-parse-failed"})))))
+                                                  (.on res "error" (fn [err] (done! {:error (str err) :status status-code}))))))]
+                            (.on req "timeout" (fn [] (.destroy req) (done! {:error "timeout" :status 408})))
+                            (.on req "error" (fn [err] (done! {:error (str err) :status 500})))
+                            (.end req))
+                          (catch :default e
+                            (done! {:error (str e) :status 500}))))]
+         (if proxy-str
+           (open-https-proxy-tls-socket!
+            proxy-str target-host target-port (or timeout-ms 4000)
+            (fn [tls-sock err]
+              (if tls-sock
+                (run-get! tls-sock)
+                (done! {:error (or err "proxy-connect-failed") :status 502}))))
+           (run-get! nil)))
        (catch :default e
          (done! {:error (str e) :status 500}))))))
 
 (defn- http-post-json!
-  "Posts `json-body-str` to `url-str` over HTTP/HTTPS with a timeout, invoking `(cb body-or-nil)`."
+  "Posts `json-body-str` to `url-str` over HTTP/HTTPS with a timeout (tunneling via HTTPS_PROXY when present),
+   invoking `(cb body-or-nil)`."
   ([url-str json-body-str timeout-ms cb]
    (http-post-json! url-str json-body-str nil timeout-ms cb))
   ([url-str json-body-str headers timeout-ms cb]
@@ -465,33 +530,52 @@
                  (when (compare-and-set! settled? false true)
                    (cb res)))]
      (try
-       (let [client (if (str/starts-with? (str/lower-case url-str) "https://")
-                      node-https
-                      node-http)
+       (let [https? (str/starts-with? (str/lower-case url-str) "https://")
              body-buf (.from (.-Buffer js/globalThis) (str json-body-str) "utf8")
              url-obj (js/URL. url-str)
+             target-host (.-hostname url-obj)
+             target-port (int (or (not-empty (str (.-port url-obj))) (if https? 443 80)))
+             proxy-str (when (and https?
+                                  (not= target-host "127.0.0.1")
+                                  (not= target-host "localhost"))
+                         (resolve-proxy-url nil))
              hdrs (cond-> {"Content-Type" "application/json"
                            "Content-Length" (.-length body-buf)}
                     (map? headers) (merge headers))
-             options #js {:protocol (.-protocol url-obj)
-                          :hostname (.-hostname url-obj)
-                          :port (or (.-port url-obj) (if (= (.-protocol url-obj) "https:") 443 80))
-                          :path (str (.-pathname url-obj) (.-search url-obj))
-                          :method "POST"
-                          :timeout (or timeout-ms 5000)
-                          :headers (clj->js hdrs)}
-             req (.request client options
-                           (fn [res]
-                             (let [chunks #js []]
-                               (.on res "data" (fn [c] (.push chunks c)))
-                               (.on res "end" (fn []
-                                                (let [buf (.concat (.-Buffer js/globalThis) chunks)]
-                                                  (done! (.toString buf "utf8")))))
-                               (.on res "error" (fn [_] (done! nil))))))]
-         (.on req "timeout" (fn [] (.destroy req) (done! nil)))
-         (.on req "error" (fn [_] (done! nil)))
-         (.write req body-buf)
-         (.end req))
+             run-post! (fn [tls-sock]
+                         (try
+                           (let [client (if https? node-https node-http)
+                                 options #js {:protocol (.-protocol url-obj)
+                                              :hostname target-host
+                                              :port target-port
+                                              :path (str (.-pathname url-obj) (.-search url-obj))
+                                              :method "POST"
+                                              :timeout (or timeout-ms 5000)
+                                              :headers (clj->js hdrs)}
+                                 _ (when tls-sock
+                                     (set! (.-createConnection options) (fn [_ _] tls-sock)))
+                                 req (.request client options
+                                               (fn [res]
+                                                 (let [chunks #js []]
+                                                   (.on res "data" (fn [c] (.push chunks c)))
+                                                   (.on res "end" (fn []
+                                                                    (let [buf (.concat (.-Buffer js/globalThis) chunks)]
+                                                                      (done! (.toString buf "utf8")))))
+                                                   (.on res "error" (fn [_] (done! nil))))))]
+                             (.on req "timeout" (fn [] (.destroy req) (done! nil)))
+                             (.on req "error" (fn [_] (done! nil)))
+                             (.write req body-buf)
+                             (.end req))
+                           (catch :default _
+                             (done! nil))))]
+         (if proxy-str
+           (open-https-proxy-tls-socket!
+            proxy-str target-host target-port (or timeout-ms 5000)
+            (fn [tls-sock _err]
+              (if tls-sock
+                (run-post! tls-sock)
+                (done! nil))))
+           (run-post! nil)))
        (catch :default _
          (done! nil))))))
 
@@ -2424,7 +2508,7 @@
                            (done! msg)))
                        (catch :default _ nil)))
                    :on-error (fn [_] (done! nil))
-                   :on-close (fn [_] (done! nil))}
+                   :on-close (fn [_] (js/setTimeout #(done! nil) 50))}
         timeout-ms (or (:timeout-ms opts) 4000)]
     (reset! timer-atom (js/setTimeout #(done! nil) timeout-ms))
     (try
@@ -2454,7 +2538,7 @@
     (let [nodes (vec (vals (:nodes bootstrap)))]
       (if (empty? nodes)
         (cb {:ok? false :error "empty-bootstrap-nodes"})
-        (let [timeout-ms (or (:timeout-ms opts) 2500)
+        (let [timeout-ms (or (:timeout-ms opts) 4000)
               nonce (str (js/Date.now) "-" (.toString (.randomBytes node-crypto 8) "hex"))
               q-opts (assoc opts :timeout-ms timeout-ms :nonce nonce)
               remaining (atom (count nodes))
@@ -2923,28 +3007,49 @@
                             (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))
                           (let [cand (nth parsed-candidates idx)
                                 host (:host cand)
-                                port (int (:port cand))
+                                port (int (or (:port cand) 443))
                                 transport (or (:transport cand) :tcp)
+                                https-leg? (contains? #{:https :http "https" "http"} transport)
                                 channel-id (atom nil)
                                 assigned-gen (atom nil)
                                 on-close-fired? (atom false)
                                 timeout-id (atom nil)
-                                client-node (api/create-node {:port 0 :setup "active"})
+                                poll-timer (atom nil)
+                                client-node (when-not https-leg?
+                                              (api/create-node {:port 0 :setup "active"}))
                                 advance! (fn []
                                            (when-let [tid @timeout-id]
                                              (js/clearTimeout tid)
                                              (reset! timeout-id nil))
-                                           (try (api/close! client-node) (catch :default _ nil))
+                                           (when-let [pt @poll-timer]
+                                             (js/clearTimeout pt)
+                                             (reset! poll-timer nil))
+                                           (when client-node
+                                             (try (api/close! client-node) (catch :default _ nil)))
                                            (dial-step! (inc idx)))
-                                peer-send! (fn [env]
-                                             (if-let [cid @channel-id]
-                                               (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch :default _ nil))]
-                                                 (if payload
-                                                   (try (api/send! client-node payload cid) true (catch :default _ false))
-                                                   false))
-                                               false))
+                                relay-base-url (when https-leg?
+                                                 (relay/normalize-relay-base-url
+                                                  (or (:url cand)
+                                                      (str (name transport) "://" host ":" port "/relay/v1"))))
+                                peer-send! (if https-leg?
+                                             (fn [env]
+                                               (if @on-close-fired?
+                                                 false
+                                                 (do
+                                                   (submit-relay-envelope! relay-base-url env {:timeout-ms 5000} (fn [_] nil))
+                                                   true)))
+                                             (fn [env]
+                                               (if-let [cid @channel-id]
+                                                 (let [payload (try (if (bytes? env) env (fressian/encode-wire env)) (catch :default _ nil))]
+                                                   (if payload
+                                                     (try (api/send! client-node payload cid) true (catch :default _ false))
+                                                     false))
+                                                 false)))
                                 on-close-fn (fn [_]
                                               (when (compare-and-set! on-close-fired? false true)
+                                                (when-let [pt @poll-timer]
+                                                  (js/clearTimeout pt)
+                                                  (reset! poll-timer nil))
                                                 (let [my-gen @assigned-gen
                                                       cur-gen (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0))]
                                                   (if (and (pos? cur-gen) (or (nil? my-gen) (not (pos? (long my-gen))) (< (long my-gen) cur-gen)))
@@ -2965,17 +3070,22 @@
                                                           (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev))))))))))
                                 peer-close! (fn []
                                               (try
-                                                (api/close! client-node)
+                                                (when-let [pt @poll-timer]
+                                                  (js/clearTimeout pt)
+                                                  (reset! poll-timer nil))
+                                                (when client-node
+                                                  (api/close! client-node))
                                                 (on-close-fn {:type :on-close})
                                                 (catch :default _ nil)))
-                                remote-sdp (cond-> {:ip host
-                                                    :port port
-                                                    :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
-                                                    :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
-                                             (:remote-fingerprint dial-info)
-                                             (assoc :fingerprint (normalize-fingerprint (:remote-fingerprint dial-info)))
-                                             (:proxy-connect? cand)
-                                             (assoc :proxy (resolve-proxy-url nil)))
+                                remote-sdp (when-not https-leg?
+                                             (cond-> {:ip host
+                                                      :port port
+                                                      :remote-ice-ufrag (or (:remote-ice-ufrag dial-info) "ufrag")
+                                                      :remote-ice-pwd (or (:remote-ice-pwd dial-info) "pwd")}
+                                               (:remote-fingerprint dial-info)
+                                               (assoc :fingerprint (normalize-fingerprint (:remote-fingerprint dial-info)))
+                                               (:proxy-connect? cand)
+                                               (assoc :proxy (resolve-proxy-url nil))))
                                 on-opened! (fn [cid]
                                              (when-let [tid @timeout-id]
                                                (js/clearTimeout tid)
@@ -2985,10 +3095,11 @@
                                                (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
                                                  (reset! assigned-gen my-gen)
                                                  (when p2p-peers-atom
-                                                   (swap! p2p-peers-atom assoc peer-pk {:send-fn peer-send!
-                                                                                        :close-fn peer-close!
-                                                                                        :session-id sid
-                                                                                        :generation my-gen}))
+                                                   (swap! p2p-peers-atom assoc peer-pk (cond-> {:send-fn peer-send!
+                                                                                                :close-fn peer-close!
+                                                                                                :session-id sid
+                                                                                                :generation my-gen}
+                                                                                         https-leg? (assoc :transport "https" :relay-url relay-base-url))))
                                                  (let [local-pub (or (:pubkey @state-atom) "")
                                                        bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
                                                    (peer-send! bind-env))
@@ -3000,32 +3111,84 @@
                                                    (reset! state-atom (:state cmd-res))
                                                    (when state-file (try (save-light-state! state-file (:state cmd-res)) (catch :default _ nil)))
                                                    (when emit-event! (doseq [ev (:stdout-events cmd-res)] (emit-event! ev)))))))
-                                callbacks {:on-open (fn [evt]
-                                                      (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                                        (on-opened! cid)))
-                                           :on-data-channel (fn [evt]
-                                                              (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
-                                                                (on-opened! cid)))
-                                           :on-message (fn [evt]
-                                                         (when-let [payload (:payload evt)]
-                                                           (when state-atom
-                                                             (let [st @state-atom
-                                                                   res (light-core/handle-wire-payload st payload privkey-bytes)]
-                                                               (reset! state-atom (:state res))
-                                                               (when state-file (try (save-light-state! state-file (:state res)) (catch :default _ nil)))
-                                                               (when (seq (:stdout-events res))
-                                                                 (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
-                                                               (when (seq (:net-envelopes res))
-                                                                 (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
-                                           :on-close (fn [evt]
-                                                       (if-not @success?
-                                                         (advance!)
-                                                         (on-close-fn evt)))}]
+                                callbacks (when-not https-leg?
+                                            {:on-open (fn [evt]
+                                                        (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                                          (on-opened! cid)))
+                                             :on-data-channel (fn [evt]
+                                                                (let [cid (or (:channel-id evt) (:stream-id evt) (get-in evt [:channel :id]) 0)]
+                                                                  (on-opened! cid)))
+                                             :on-message (fn [evt]
+                                                           (when-let [payload (:payload evt)]
+                                                             (when state-atom
+                                                               (let [st @state-atom
+                                                                     res (light-core/handle-wire-payload st payload privkey-bytes)]
+                                                                 (reset! state-atom (:state res))
+                                                                 (when state-file (try (save-light-state! state-file (:state res)) (catch :default _ nil)))
+                                                                 (when (seq (:stdout-events res))
+                                                                   (when emit-event! (doseq [ev (:stdout-events res)] (emit-event! ev))))
+                                                                 (when (seq (:net-envelopes res))
+                                                                   (send-routed-envelopes! (:net-envelopes res) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes))))))
+                                             :on-close (fn [evt]
+                                                         (if-not @success?
+                                                           (advance!)
+                                                           (on-close-fn evt)))})]
                             (try
-                              (reset! timeout-id (js/setTimeout advance! 3000))
-                              (if (or (= transport :tcp) (= transport :connect))
-                                (api/start-tcp! client-node remote-sdp callbacks)
-                                (api/start! client-node remote-sdp callbacks))
+                              (reset! timeout-id (js/setTimeout advance! (if https-leg? 5000 3000)))
+                              (if https-leg?
+                                (let [local-pub (or (:pubkey @state-atom) "")]
+                                  (poll-relay-envelopes!
+                                   relay-base-url local-pub privkey-bytes
+                                   {:since-seq 0 :timeout-ms 0}
+                                   (fn [probe-res]
+                                     (if (and (map? probe-res)
+                                              (or (true? (get probe-res "ok"))
+                                                  (true? (:ok probe-res))
+                                                  (vector? (get probe-res "messages"))
+                                                  (vector? (:messages probe-res))))
+                                       (let [my-gen-fn (fn [] @assigned-gen)
+                                             since-mseq-atom (atom 0)
+                                             since-bseq-atom (atom 0)
+                                             poll-https-leg!
+                                             (fn poll-https-leg! []
+                                               (when (and (not @on-close-fired?)
+                                                          p2p-peers-atom
+                                                          (some? (my-gen-fn))
+                                                          (= (my-gen-fn) (get-in @p2p-peers-atom [peer-pk :generation])))
+                                                 (poll-relay-envelopes!
+                                                  relay-base-url local-pub privkey-bytes
+                                                  {:since-seq @since-mseq-atom
+                                                   :since-broadcast-seq @since-bseq-atom
+                                                   :timeout-ms 1500}
+                                                  (fn [poll-res]
+                                                    (when (and (not @on-close-fired?)
+                                                               p2p-peers-atom
+                                                               (= (my-gen-fn) (get-in @p2p-peers-atom [peer-pk :generation])))
+                                                      (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
+                                                            bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                                                            all-items (concat msgs bcasts)
+                                                            new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") @since-mseq-atom))
+                                                            new-bseq (long (or (get poll-res "last_broadcast_seq") (get poll-res :last_broadcast_seq) @since-bseq-atom))]
+                                                        (reset! since-mseq-atom new-mseq)
+                                                        (reset! since-bseq-atom new-bseq)
+                                                        (doseq [item all-items]
+                                                          (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                                                                            (get item :envelope_hex) (get item :envelope))
+                                                                wire-bytes (when env-raw (try (fressian/hex->bytes (str env-raw)) (catch :default _ nil)))]
+                                                            (when (and wire-bytes state-atom)
+                                                              (let [r (light-core/handle-wire-payload @state-atom wire-bytes privkey-bytes)]
+                                                                (reset! state-atom (:state r))
+                                                                (when state-file (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
+                                                                (when emit-event! (doseq [ev (:stdout-events r)] (emit-event! ev)))
+                                                                (when (seq (:net-envelopes r))
+                                                                  (send-routed-envelopes! (:net-envelopes r) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes)))))))
+                                                      (reset! poll-timer (js/setTimeout poll-https-leg! 250)))))))]
+                                         (on-opened! 0)
+                                         (reset! poll-timer (js/setTimeout poll-https-leg! 100)))
+                                       (advance!)))))
+                                (if (or (= transport :tcp) (= transport :connect))
+                                  (api/start-tcp! client-node remote-sdp callbacks)
+                                  (api/start! client-node remote-sdp callbacks)))
                               (catch :default _
                                 (advance!)))))))]
                 (dial-step! 0)))]

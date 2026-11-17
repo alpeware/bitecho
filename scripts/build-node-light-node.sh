@@ -18,7 +18,7 @@ echo "Working directory: ${ROOT_DIR}"
 mkdir -p dist
 rm -rf target/cljs-node target/cljs-nod2
 
-echo "Compiling bitecho.node-main via ClojureScript (:target :nodejs, :optimizations :simple)..."
+echo "Compiling bitecho.node-main via ClojureScript (:target :nodejs, :optimizations :advanced)..."
 clojure -M:build-browser -e '
 (require (quote [cljs.build.api :as b]))
 (b/build (b/inputs "src")
@@ -26,8 +26,10 @@ clojure -M:build-browser -e '
           :output-to "dist/bitecho-light-node.cjs"
           :output-dir "target/cljs-node/out"
           :target :nodejs
+          :externs ["resources/closure-externs.js"]
+          :infer-externs true
           :parallel-build false
-          :optimizations :simple})'
+          :optimizations :advanced})'
 
 if [ ! -f "dist/bitecho-light-node.cjs" ]; then
   echo "ERROR: dist/bitecho-light-node.cjs was not generated!" >&2
@@ -94,8 +96,10 @@ clojure -M:build-browser -e '
           :output-to "target/cljs-nod2/bitecho-light-node.cjs"
           :output-dir "target/cljs-nod2/out"
           :target :nodejs
+          :externs ["resources/closure-externs.js"]
+          :infer-externs true
           :parallel-build false
-          :optimizations :simple})'
+          :optimizations :advanced})'
 
 normalize_bundle "target/cljs-nod2/bitecho-light-node.cjs"
 
