@@ -1891,10 +1891,13 @@
           (is (= 4500 (get parsed "spendable"))))
 
         ;; (d) Fail-closed on bad sync in handle-serve-line!
-        (let [disagree-snap (light-core/sign-chain-state-snapshot
-                             (assoc base-snap :validator-pubkey (nth val-pubs 1) :balance 999999)
-                             (:private (nth val-kps 1)))
-              disagree-snaps [(nth valid-snaps 0) disagree-snap (nth valid-snaps 2)]
+        (let [disagree-snap-1 (light-core/sign-chain-state-snapshot
+                               (assoc base-snap :validator-pubkey (nth val-pubs 1) :balance 999999)
+                               (:private (nth val-kps 1)))
+              disagree-snap-2 (light-core/sign-chain-state-snapshot
+                               (assoc base-snap :validator-pubkey (nth val-pubs 2) :balance 888888)
+                               (:private (nth val-kps 2)))
+              disagree-snaps [(nth valid-snaps 0) disagree-snap-1 disagree-snap-2]
               bad-ctx (assoc ctx :conn-opts {:inband-snapshot-fetcher (fn [_pk] disagree-snaps)})]
           (light-shell/handle-serve-line! (json/write-str {"cmd" "account" "sync" true}) bad-ctx)
           (let [line (last (str/split-lines (.toString sw)))

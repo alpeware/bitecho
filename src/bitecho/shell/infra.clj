@@ -58,7 +58,10 @@
   (let [reason (or (:reason diag) (:error diag) :unknown)]
     (-> state
         (update-in [:diagnostics-counts reason] (fnil inc 0))
-        (update :diagnostics (fn [ds] (vec (take-last 64 (conj (vec ds) diag))))))))
+        (update :diagnostics (fn [ds]
+                               (if (map? ds)
+                                 (update-in ds [reason :count] (fnil inc 0))
+                                 (vec (take-last 64 (conj (vec ds) diag)))))))))
 
 (defn transition-shell
   "Pure reducer `(transition-shell state event) -> [new-state effects]`.
@@ -266,6 +269,8 @@
                                 {:pattern "acme/challenge/*" :principal {:type :leader}}
                                 {:pattern "tls/*" :principal {:type :leader}}
                                 {:pattern "web/*" :principal {:type :allowlist}}
+                                {:pattern "releases/*" :principal {:type :allowlist}}
+                                {:pattern "bip/*" :principal {:type :allowlist}}
                                 {:pattern "mail/*" :principal {:type :allowlist}}
                                 dns-rule]
               :subnet/economy {:economy/mode :none
@@ -1321,6 +1326,98 @@
          (publish-dns! "MX" "@" mxs))
        (when-let [caas (seq (get-in config [:dns :caa-records]))]
          (publish-dns! "CAA" "@" caas)))
+
+     ;; 5. Ingest repo docs, BIPs, and blog posts into Blob + Pointer store (F-D27-3, F-D27-5)
+     (let [docs-cnt (atom 0)
+           bips-cnt (atom 0)
+           blog-cnt (atom 0)
+           repo-docs ["ONBOARDING.md" "RELEASE.md" "skill/SKILL.md" "llms.txt"]
+           resolve-repo-file (fn [rel-path]
+                               (let [candidates [(io/file rel-path)
+                                                 (io/file state-dir rel-path)
+                                                 (when content-root (io/file content-root rel-path))]]
+                                 (first (filter (fn [^File f] (and f (.exists f))) candidates))))]
+       ;; 5a. Ingest repo docs into web/<name> (and root aliases)
+       (doseq [doc-rel repo-docs
+               :let [^File f (resolve-repo-file doc-rel)]
+               :when (and f (.isFile f))]
+         (let [bs (Files/readAllBytes (.toPath f))
+               ct (content-type-for-filename doc-rel)
+               b (data/make-blob bs ct)
+               web-name (str "web/" (.getName f))
+               cur-ptr (data/resolve-pointer (:data @(:subnet-atom rt)) sid web-name now-ms)]
+           (when-not (= (:blob/cid b) (:pointer/target cur-ptr))
+             (let [r (publish-blob-and-pointer! rt {:blob b
+                                                    :path web-name
+                                                    :seq (next-seq-for-path rt web-name)
+                                                    :authority-pubkey auth-pub
+                                                    :authority-privkey auth-priv
+                                                    :now-ms now-ms})]
+               (when (:applied? r)
+                 (swap! docs-cnt inc))))
+           ;; Root alias for llms.txt
+           (when (= (.getName f) "llms.txt")
+             (let [cur-root (data/resolve-pointer (:data @(:subnet-atom rt)) sid "llms.txt" now-ms)]
+               (when-not (= (:blob/cid b) (:pointer/target cur-root))
+                 (publish-blob-and-pointer! rt {:blob b
+                                                :path "llms.txt"
+                                                :seq (next-seq-for-path rt "llms.txt")
+                                                :authority-pubkey auth-pub
+                                                :authority-privkey auth-priv
+                                                :now-ms now-ms}))))))
+
+       ;; 5b. Ingest docs/bips/*.edn into bip/<id>
+       (let [^File bips-dir (or (resolve-repo-file "docs/bips") (io/file "docs/bips"))]
+         (when (and bips-dir (.exists bips-dir) (.isDirectory bips-dir))
+           (doseq [^File f (.listFiles bips-dir)
+                   :when (and (.isFile f) (str/ends-with? (.getName f) ".edn"))]
+             (let [raw (slurp f)
+                   parsed (try (edn/read-string raw) (catch Exception _ nil))
+                   bip-id (or (:bip-id parsed)
+                              (when-let [[_ num] (re-find #"bip-(\d+)" (.getName f))]
+                                (str "BIP-" num)))
+                   b (data/make-blob (fressian/utf8->bytes raw) "application/edn")]
+               (when bip-id
+                 (let [path (str "bip/" bip-id)
+                       cur-ptr (data/resolve-pointer (:data @(:subnet-atom rt)) sid path now-ms)]
+                   (when-not (= (:blob/cid b) (:pointer/target cur-ptr))
+                     (let [r (publish-blob-and-pointer! rt {:blob b
+                                                            :path path
+                                                            :seq (next-seq-for-path rt path)
+                                                            :authority-pubkey auth-pub
+                                                            :authority-privkey auth-priv
+                                                            :now-ms now-ms})]
+                       (when (:applied? r)
+                         (swap! bips-cnt inc)))))
+                 (let [web-path (str "web/bip/" bip-id)
+                       cur-web (data/resolve-pointer (:data @(:subnet-atom rt)) sid web-path now-ms)]
+                   (when-not (= (:blob/cid b) (:pointer/target cur-web))
+                     (publish-blob-and-pointer! rt {:blob b
+                                                    :path web-path
+                                                    :seq (next-seq-for-path rt web-path)
+                                                    :authority-pubkey auth-pub
+                                                    :authority-privkey auth-priv
+                                                    :now-ms now-ms}))))))))
+
+       ;; 5c. Ingest web/blog/* into web/blog/<name>
+       (let [^File blog-dir (or (resolve-repo-file "web/blog") (io/file "web/blog"))]
+         (when (and blog-dir (.exists blog-dir) (.isDirectory blog-dir))
+           (doseq [^File f (.listFiles blog-dir)
+                   :when (.isFile f)]
+             (let [bs (Files/readAllBytes (.toPath f))
+                   ct (content-type-for-filename (.getName f))
+                   b (data/make-blob bs ct)
+                   path (str "web/blog/" (.getName f))
+                   cur-ptr (data/resolve-pointer (:data @(:subnet-atom rt)) sid path now-ms)]
+               (when-not (= (:blob/cid b) (:pointer/target cur-ptr))
+                 (let [r (publish-blob-and-pointer! rt {:blob b
+                                                        :path path
+                                                        :seq (next-seq-for-path rt path)
+                                                        :authority-pubkey auth-pub
+                                                        :authority-privkey auth-priv
+                                                        :now-ms now-ms})]
+                   (when (:applied? r)
+                     (swap! blog-cnt inc)))))))))
 
      {:ok? true
       :tls-migrated? @tls-migrated?

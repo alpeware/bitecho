@@ -12,6 +12,7 @@
             [bitecho.d24-remediation-scenarios-test :as d24-test]
             [bitecho.d25-remediation-scenarios-test :as d25-test]
             [bitecho.d26-remediation-scenarios-test :as d26-test]
+            [bitecho.d27-publishing-and-remediation-test :as d27-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
             [bitecho.fressian :as fressian]
@@ -401,11 +402,38 @@
      :count (count results)
      :scenarios results}))
 
+(defn run-d27-scenarios
+  "Runs Milestone D27 (v0.23.5) remediation & scenario verification suite."
+  []
+  (let [scenarios [{:id "D27-1" :name "quorum-5-of-6-supermajority" :test-fn d27-test/test-f-d27-7-quorum-5-of-6-supermajority}
+                   {:id "D27-2" :name "credited-tx-ids-hydration" :test-fn d27-test/test-f-d27-8-credited-tx-ids-hydration-prevents-double-credit}
+                   {:id "D27-3" :name "network-uri-and-replay-equivalence" :test-fn d27-test/test-f-d27-12-network-uri-and-replay-equivalence}
+                   {:id "D27-4" :name "recipient-first-unicast-filter" :test-fn d27-test/test-f-d27-12-recipient-first-unicast-filter-before-epoch-skew}
+                   {:id "D27-5" :name "contagion-summary-pull-known-burn-mids" :test-fn d27-test/test-f-d27-13-contagion-summary-pull-known-burn-mids}
+                   {:id "D27-6" :name "p2p-half-open-redial" :test-fn d27-test/test-p2p-half-open-redial-on-incoming-offer}
+                   {:id "D27-7" :name "exec-status-auto-sync-diagnostics" :test-fn d27-test/test-exec-status-auto-sync-diagnostics}
+                   {:id "D27-8" :name "http-subnet-publishing" :test-fn d27-test/test-http-subnet-publishing-bip-releases-and-blog}
+                   {:id "D27-9" :name "version-and-cold-root-pins" :test-fn d27-test/test-d27-version-and-cold-root-pins}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D26 (v0.23.4) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D27 (v0.23.5) release verification proof and returns a deterministic EDN map."
   [opts]
-  (let [ver (or (:version opts) "v0.23.4")
-        ms (or (:milestone opts) "D26")
+  (let [ver (or (:version opts) "v0.23.5")
+        ms (or (:milestone opts) "D27")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
@@ -414,12 +442,15 @@
         d24-scenarios (run-d24-scenarios)
         d25-scenarios (run-d25-scenarios)
         d26-scenarios (run-d26-scenarios)
+        d27-scenarios (run-d27-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
-        bundle-sha (when (.exists bundle-file)
-                     (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath bundle-file)))))
+        _ (assert (and (.exists bundle-file) (pos? (.length bundle-file)))
+                  "dist/bitecho-light-node.cjs must exist and be non-empty before release proof generation!")
+        bundle-sha (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath bundle-file))))
         browser-file (io/file "dist/bitecho-browser.js")
-        browser-sha (when (.exists browser-file)
-                      (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath browser-file)))))
+        _ (assert (and (.exists browser-file) (pos? (.length browser-file)))
+                  "dist/bitecho-browser.js must exist and be non-empty before release proof generation!")
+        browser-sha (basalt/bytes->hex (crypto/sha256 (Files/readAllBytes (.toPath browser-file))))
         commit-sha (try (str/trim (slurp (io/file ".git/refs/heads/main"))) (catch Exception _ "uncommitted"))
         tree-sha (try (str/trim (:out (sh/sh "git" "write-tree"))) (catch Exception _ nil))
         all-passed? (boolean (and (:passed? devnet-res)
@@ -429,7 +460,8 @@
                                   (:passed? rolling-res)
                                   (:all-passed? d24-scenarios)
                                   (:all-passed? d25-scenarios)
-                                  (:all-passed? d26-scenarios)))]
+                                  (:all-passed? d26-scenarios)
+                                  (:all-passed? d27-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
@@ -440,6 +472,7 @@
      :d24-remediation-scenarios d24-scenarios
      :d25-remediation-scenarios d25-scenarios
      :d26-remediation-scenarios d26-scenarios
+     :d27-remediation-scenarios d27-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}
@@ -447,9 +480,9 @@
      :rolling-upgrade rolling-res}))
 
 (defn -main
-  "CLI entrypoint generating the Milestone D26 release proof EDN artifact."
+  "CLI entrypoint generating the Milestone D27 release proof EDN artifact."
   [& args]
-  (let [out-path (or (first args) "docs/releases/v0.23.4-proof.edn")
+  (let [out-path (or (first args) "docs/releases/v0.23.5-proof.edn")
         proof (run-release-proof {})
         out-file (io/file out-path)]
     (when-let [parent (.getParentFile out-file)]

@@ -1651,9 +1651,9 @@
           (let [sent-ids (conn-sent-msg-ids conn)]
             (when-not (and msg-id (contains? sent-ids msg-id))
               (when-let [cid (or (conn-channel-id conn) 0)]
-                (when-let [node (:node conn)]
+                (if-let [on-msg (:on-message conn)]
                   (try
-                    (api/send! node wire-bytes cid)
+                    (on-msg wire-bytes)
                     (when msg-id
                       (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
                         (swap! (:sent-msg-ids conn) conj msg-id)
@@ -1661,7 +1661,18 @@
                     (catch Exception e
                       (apply-mesh-conn-event! agent-conns pk
                                               {:type :send-failed :error (or (.getMessage e) "send-failed")})
-                      nil))))))))
+                      nil))
+                  (when-let [node (:node conn)]
+                    (try
+                      (api/send! node wire-bytes cid)
+                      (when msg-id
+                        (if (instance? clojure.lang.IAtom (:sent-msg-ids conn))
+                          (swap! (:sent-msg-ids conn) conj msg-id)
+                          (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id})))
+                      (catch Exception e
+                        (apply-mesh-conn-event! agent-conns pk
+                                                {:type :send-failed :error (or (.getMessage e) "send-failed")})
+                        nil)))))))))
       (doseq [[pk _] @agent-conns
               :when (not= pk exclude-sender)]
         (apply-mesh-conn-event! agent-conns pk

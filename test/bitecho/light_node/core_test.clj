@@ -2826,11 +2826,14 @@
                          (and (false? (:ok? stale-res))
                               (= "stale-finalized-epoch" (:error stale-res))))
 
-             ;; 6. Disagreement among validators (different balances at same epoch) fails closed ("validator-state-disagreement")
-                       (let [disagree-snap (light-core/sign-chain-state-snapshot
-                                            (assoc base-snap :validator-pubkey (nth val-pubs 2) :balance (+ bal 1000))
-                                            (:private (nth val-kps 2)))
-                             d-res (light-core/verify-chain-state-quorum [(nth signed-snaps 0) (nth signed-snaps 1) disagree-snap] opts)]
+             ;; 6. Disagreement among validators (no quorum at same epoch) fails closed ("validator-state-disagreement")
+                       (let [disagree-snap-1 (light-core/sign-chain-state-snapshot
+                                              (assoc base-snap :validator-pubkey (nth val-pubs 1) :balance (+ bal 1000))
+                                              (:private (nth val-kps 1)))
+                             disagree-snap-2 (light-core/sign-chain-state-snapshot
+                                              (assoc base-snap :validator-pubkey (nth val-pubs 2) :balance (+ bal 2000))
+                                              (:private (nth val-kps 2)))
+                             d-res (light-core/verify-chain-state-quorum [(nth signed-snaps 0) disagree-snap-1 disagree-snap-2] opts)]
                          (and (false? (:ok? d-res))
                               (= "validator-state-disagreement" (:error d-res))))
 

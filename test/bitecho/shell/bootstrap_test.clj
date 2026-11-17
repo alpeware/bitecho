@@ -1,6 +1,7 @@
 (ns bitecho.shell.bootstrap-test
   "Tests for the bootstrap node entry point."
   (:require [bitecho.shell.bootstrap :as bootstrap]
+            [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
@@ -35,7 +36,10 @@
 
 (deftest test-browser-bundle-and-index-html-refresh-restore-wiring
   (testing "M1 & L7: dist/index.html calls exact BitechoBrowser.loadStateFromIndexedDB exported by dist/bitecho-browser.js and preserves identity across reload"
-    (let [html (slurp "dist/index.html")
+    (let [index-f (if (.exists (io/file "resources/public/index.html"))
+                    (io/file "resources/public/index.html")
+                    (io/file "dist/index.html"))
+          html (slurp index-f)
           sri-lines (str/split-lines (str/trim (slurp "dist/bitecho-browser.js.sri")))
           sri-384 (first sri-lines)]
       (is (str/includes? html "globalThis.BitechoBrowser.loadStateFromIndexedDB"))

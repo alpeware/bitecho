@@ -339,12 +339,12 @@
 
 (defn -main
   "CLI entrypoint to execute the full Track A in-memory simulation for `BIP-001` and
-   write `/var/tmp/bitecho-experiments/bip001-in-memory/summary.edn` and `docs/bip001_simulation_report.md`."
+   write `/var/tmp/bitecho-experiments/bip001-in-memory/summary.edn` and `docs/reports/bip001_simulation_report.md`."
   [& _args]
   (let [res (run-bip001-in-memory-e2e-sim {:fast? false :horizon-epochs 30000 :mc-epochs 360})
         out-dir (io/file "/var/tmp/bitecho-experiments/bip001-in-memory")
         summary-file (io/file out-dir "summary.edn")
-        report-file (io/file "docs/bip001_simulation_report.md")
+        report-file (io/file "docs/reports/bip001_simulation_report.md")
         md (render-bip001-report-md res)]
     (.mkdirs out-dir)
     (spit summary-file (with-out-str (pprint/pprint res)))

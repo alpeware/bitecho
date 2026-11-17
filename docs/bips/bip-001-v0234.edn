@@ -1,0 +1,12 @@
+{:bip-id "BIP-001"
+ :title "BIP-001 Tokenomics v2.2 Activation & Multi-Agent Experiment Protocol"
+ :status :activated
+ :author-pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+ :subnet-id "devnet.bitecho.org"
+ :activation-epoch 16400
+ :parameters {:max-stake-multiplier 2.2
+              :treasury-trailing-epochs 78
+              :k-bps 4582
+              :settlement-take-bps 125
+              :streamlet-share-pct 28}
+ :oracle-receipts {:deterministic-bundle-sha256 "2c8d97181c6c98edae9defc47a64ede4b9ee6a2212913aca6cff7edad7bba62c"}}

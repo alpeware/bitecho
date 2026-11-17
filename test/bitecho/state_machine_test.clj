@@ -2478,8 +2478,8 @@
         (is (contains? (:contagion-known-ids st-b) hash-b))
         (is (= (* 2 burn) (get-in st-b [:epoch-burns 0])))))))
 
-(deftest test-ttl-pruned-gossip-prevents-pull-and-reburn
-  (testing "Gossip message that is TTL-pruned from :messages and :contagion-known-ids is retained in :murmur-cache, preventing re-burn and duplicate pull request"
+(deftest test-ttl-pruned-gossip-pulls-and-prevents-reburn
+  (testing "Gossip message that is TTL-pruned from :messages and :contagion-known-ids is pulled on remote summary advertisement, but prevents double burn deduction on receipt (F-D27-13)"
     (let [kp (crypto/generate-keypair)
           sender (basalt/bytes->hex (:public kp))
           payload (.getBytes "test-ttl-pruned-payload" "UTF-8")
@@ -2502,16 +2502,16 @@
         (is (not (contains? (:contagion-known-ids st-pruned) msg-id)))
         (is (not (contains? (get-in st-pruned [:murmur-cache :set]) msg-id)))
         (let [res-summary (sm/handle-event st-pruned {:type :receive-summary :sender "peer-remote" :summary #{msg-id}})]
-          (is (empty? (filter (fn [cmd]
-                                (and (= :send-pull-request (:type cmd))
-                                     (contains? (:missing-ids cmd) msg-id)))
-                              (:commands res-summary)))))
+          (is (seq (filter (fn [cmd]
+                             (and (= :send-pull-request (:type cmd))
+                                  (contains? (:missing-ids cmd) msg-id)))
+                           (:commands res-summary)))))
         (let [res2 (sm/handle-event st-pruned {:type :receive-gossip :message sieve-msg})
               st2 (:state res2)]
           (is (= 9500 (get-in st2 [:ledger sender :balance])))
           (is (nil? (get-in st2 [:epoch-burns (:epoch st2)]))))))))
 
-(defspec ^{:doc "Property: TTL-pruned gossip messages retained in murmur cache prevent redundant lazy pulls and double burn deduction across subsequent epochs"}
+(defspec ^{:doc "Property: TTL-pruned gossip messages allow lazy pull when advertised in anti-entropy summaries, but prevent double burn deduction on receipt (F-D27-13)"}
   prop-ttl-pruned-gossip-no-reburn-or-pull 25
   (prop/for-all [initial-balance (gen/choose 1000 5000)
                  burn-amt (gen/choose 100 500)
@@ -2541,7 +2541,7 @@
                        (not (contains? (:messages st-pruned) msg-id))
                        (not (contains? (:contagion-known-ids st-pruned) msg-id))
                        (not (contains? (get-in st-pruned [:murmur-cache :set]) msg-id))
-                       (empty? pull-commands)
+                       (seq pull-commands)
                        (= bal-after-1 bal-after-2)))))
 
 (defn- exchange-block-and-votes

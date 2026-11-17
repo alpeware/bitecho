@@ -8,9 +8,22 @@ This guide describes how to run and operate a Bitecho light node, interact with 
 
 Bitecho light nodes run locally without requiring full validator consensus state. All commands communicate with bootstrap validators over WebRTC DataChannel (UDP port 5010 or TCP port 5010 fallback).
 
-### Prerequisites
-- Java 21+ (e.g. OpenJDK 25)
-- Clojure CLI tools (`clojure`)
+### Prerequisites & Distribution Options
+Bitecho light nodes are available in three distribution tiers:
+1. **Tier 1 (Zero-Dependency Single Executable - Linux x64):**
+   Download the compiled standalone SEA binary from `https://bitecho.org/releases/latest/bitecho-light-node-linux-x64` (verify SHA-256 against `https://bitecho.org/releases/latest/manifest.edn`):
+   ```bash
+   curl -sSL -o bitecho-light-node https://bitecho.org/releases/latest/bitecho-light-node-linux-x64
+   chmod +x bitecho-light-node
+   ```
+2. **Tier 2 (Node.js 18+ CJS Bundle):**
+   Download the standalone bundle from `https://bitecho.org/releases/latest/bitecho-light-node.cjs`:
+   ```bash
+   curl -sSL -o bitecho-light-node.cjs https://bitecho.org/releases/latest/bitecho-light-node.cjs
+   node bitecho-light-node.cjs status
+   ```
+3. **Tier 3 (Source / JVM 21+):**
+   Requires Java 21+ (e.g. OpenJDK 25) and Clojure CLI tools (`clojure`).
 
 ### Launch Commands
 Clone the canonical repository from `https://bitecho.org/git/bitecho.git`. The convenience script `scripts/light-node.sh` automatically configures native access and exports for DTLS cryptography and points to the official devnet bootstrap descriptor (`https://bitecho.org/devnet/bootstrap.txt`).
@@ -78,6 +91,7 @@ Bitecho enforces a strict, single-currency (`$ECHO`) tokenomics hard cap ($42\te
   ./scripts/cluster.sh fund <agent-pubkey-hex> [amount-in-ech]
   ```
 - **Settlement Protocol Take**: A mandatory $\tau = 0.5\%$ ($50\text{ bps}$) burn take is permanently burned on all settled escrows upon block finality, ensuring net supply deflation.
+- **Anti-Spam Off-Leg Governance Floor (`--burn 100`)**: Validator mesh gossip enforces a strict `100 ECH` anti-spam burn floor when messages are broadcast across the mesh without an open direct P2P leg (`build-governance-replicate-envelope` sets `outer-sub "*"` only when `burn > 0`). Operators and autonomous agents **must always pass `--burn 100`** on `bip-submit`, `bip-consent`, and `bip-object` commands unless an open zero-burn P2P leg connects all target peers.
 
 ---
 

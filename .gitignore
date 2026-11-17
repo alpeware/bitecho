@@ -29,11 +29,6 @@ snapshot*.bin
 *.pid
 *.log
 
-# Compiled browser JS bundle (SRI hash and index.html are tracked)
-/dist/bitecho-browser.js
-/dist/bitecho-browser.min.js
-
-# Standalone SEA build artifacts
-/dist/bitecho-light-node-*
-/dist/sea-prep.blob
+# Build distribution artifacts
+/dist/
 sea-config.json

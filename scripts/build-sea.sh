@@ -65,22 +65,32 @@ if [[ "$OS_NAME" == "darwin" ]] && command -v codesign >/dev/null 2>&1; then
   codesign --remove-signature "${TARGET_BIN}" || true
 fi
 
-# Inject blob using postject or npx postject
+# Inject blob using postject or npx postject (F-D27-10: loud assertion, no || true)
 if command -v npx >/dev/null 2>&1; then
   echo "--> Injecting blob into ${TARGET_BIN}..."
   SENTINEL_FUSE="NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2"
   if [[ "$OS_NAME" == "darwin" ]]; then
     npx --yes postject "${TARGET_BIN}" NODE_SEA_BLOB dist/sea-prep.blob \
       --sentinel-fuse "${SENTINEL_FUSE}" \
-      --macho-segment-name NODE_SEA || true
+      --macho-segment-name NODE_SEA
     if command -v codesign >/dev/null 2>&1; then
-      codesign --sign - "${TARGET_BIN}" || true
+      codesign --sign - "${TARGET_BIN}"
     fi
   else
     npx --yes postject "${TARGET_BIN}" NODE_SEA_BLOB dist/sea-prep.blob \
-      --sentinel-fuse "${SENTINEL_FUSE}" || true
+      --sentinel-fuse "${SENTINEL_FUSE}"
   fi
+else
+  echo "FATAL: npx command not found for postject blob injection." >&2
+  exit 1
 fi
 
 chmod +x "${TARGET_BIN}"
-echo "=== SEA Build Complete: ${TARGET_BIN} ==="
+
+# Verify blob injection loudly (F-D27-10)
+if ! grep -a -q "NODE_SEA_BLOB" "${TARGET_BIN}" 2>/dev/null && ! grep -a -q "${SENTINEL_FUSE}" "${TARGET_BIN}" 2>/dev/null; then
+  echo "FATAL: SEA blob injection verification failed on ${TARGET_BIN}." >&2
+  exit 1
+fi
+
+echo "=== SEA Build Complete & Verified: ${TARGET_BIN} ==="

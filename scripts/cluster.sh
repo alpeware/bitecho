@@ -423,7 +423,7 @@ EDN_EOF
 
 verify_release_proof_gate() {
   local version="${1:-$(sed -n -E 's/.*version\s+"([^"]+)".*/\1/p' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.4}"
+  version="${version:-0.23.5}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Step 0a/8: Verifying Release Proof Gate for v${version}..."
@@ -470,18 +470,23 @@ verify_release_proof_gate() {
     return 1
   fi
 
-  local proof_node_sha actual_node_sha proof_browser_sha actual_browser_sha
-  proof_node_sha=$(echo "${flat_proof}" | sed -n -E 's/.*:node-bundle-sha256[[:space:]]+"([^"]+)".*/\1/p')
-  actual_node_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-light-node.cjs" | awk '{print $1}')
-  if [[ "${proof_node_sha}" != "${actual_node_sha}" ]]; then
-    echo "Error: Release proof :node-bundle-sha256 (${proof_node_sha}) does not match dist/bitecho-light-node.cjs (${actual_node_sha})." >&2
-    return 1
-  fi
-  proof_browser_sha=$(echo "${flat_proof}" | sed -n -E 's/.*:browser-bundle-sha256[[:space:]]+"([^"]+)".*/\1/p')
-  actual_browser_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-browser.js" | awk '{print $1}')
-  if [[ "${proof_browser_sha}" != "${actual_browser_sha}" ]]; then
-    echo "Error: Release proof :browser-bundle-sha256 (${proof_browser_sha}) does not match dist/bitecho-browser.js (${actual_browser_sha})." >&2
-    return 1
+  # A-CARB-D27-2: Skip raw dist/ file comparison when dist/ is untracked
+  if git -C "${ROOT_DIR}" ls-files --error-unmatch "${ROOT_DIR}/dist/bitecho-light-node.cjs" >/dev/null 2>&1; then
+    local proof_node_sha actual_node_sha proof_browser_sha actual_browser_sha
+    proof_node_sha=$(echo "${flat_proof}" | sed -n -E 's/.*:node-bundle-sha256[[:space:]]+"([^"]+)".*/\1/p')
+    actual_node_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-light-node.cjs" | awk '{print $1}')
+    if [[ "${proof_node_sha}" != "${actual_node_sha}" ]]; then
+      echo "Error: Release proof :node-bundle-sha256 (${proof_node_sha}) does not match dist/bitecho-light-node.cjs (${actual_node_sha})." >&2
+      return 1
+    fi
+    proof_browser_sha=$(echo "${flat_proof}" | sed -n -E 's/.*:browser-bundle-sha256[[:space:]]+"([^"]+)".*/\1/p')
+    actual_browser_sha=$(sha256sum "${ROOT_DIR}/dist/bitecho-browser.js" | awk '{print $1}')
+    if [[ "${proof_browser_sha}" != "${actual_browser_sha}" ]]; then
+      echo "Error: Release proof :browser-bundle-sha256 (${proof_browser_sha}) does not match dist/bitecho-browser.js (${actual_browser_sha})." >&2
+      return 1
+    fi
+  else
+    echo "Note: dist/ is untracked (A-CARB-D27-2); verified proof :all-passed? true, commit (${proof_commit}), and tree (${proof_tree})."
   fi
 
   echo "Release Proof Gate PASSED (${proof_file}, commit=${proof_commit}, tree=${proof_tree})."

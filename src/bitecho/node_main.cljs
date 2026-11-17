@@ -2842,8 +2842,13 @@
   [state-atom p2p-peers-atom ingress-peers-atom mdns-atom privkey-bytes emit-event! dial-info & [state-file]]
   (let [peer-pk (light-core/normalize-pubkey-hex (:peer dial-info))
         sid (:session-id dial-info)
+        force? (true? (:force-redial? dial-info))
         existing-p2p (when p2p-peers-atom (get @p2p-peers-atom peer-pk))]
-    (if (and existing-p2p (:send-fn existing-p2p))
+    (when (and force? existing-p2p)
+      (when-let [cf (:close-fn existing-p2p)]
+        (try (cf) (catch :default _ nil)))
+      (when p2p-peers-atom (swap! p2p-peers-atom dissoc peer-pk)))
+    (if (and (not force?) existing-p2p (:send-fn existing-p2p))
       (let [cmd-res (light-core/handle-command @state-atom
                                                {"cmd" "p2p-channel-state"
                                                 "session_id" sid
@@ -3197,6 +3202,39 @@
                   (try (api/close! listener) (catch :default _ nil))
                   (when udp-listener (try (api/close! udp-listener) (catch :default _ nil))))}))))
 
+(defn- maybe-wait-open!
+  [resp sid wait-ms state-atom conn-opts relay-url emit! done-cb]
+  (if (and resp (true? (or (get resp "ok") (get resp :ok))) (string? sid) (pos? wait-ms))
+    (let [deadline (+ (.now js/Date) wait-ms)
+          poll-step!
+          (fn poll-step! []
+            (let [st (get-in @state-atom [:sessions sid :state])]
+              (cond
+                (= st "open")
+                (let [final-resp (assoc resp "state" "open")]
+                  (when emit! (emit! final-resp))
+                  (done-cb final-resp))
+
+                (>= (.now js/Date) deadline)
+                (let [final-resp (assoc resp "state" (or st "offered") "wait_timed_out" true)]
+                  (when emit! (emit! final-resp))
+                  (done-cb final-resp))
+
+                :else
+                (do
+                  (when relay-url
+                    (try
+                      (let [pk (or (:pubkey-hex (:identity conn-opts)) (:pubkey @state-atom))
+                            sk (or (:privkey-bytes (:identity conn-opts)) (:privkey @state-atom))]
+                        (when (and pk sk)
+                          (poll-relay-envelopes! relay-url pk sk nil nil)))
+                      (catch :default _ nil)))
+                  (js/setTimeout poll-step! 50)))))]
+      (poll-step!))
+    (do
+      (when (and resp emit!) (emit! resp))
+      (done-cb resp))))
+
 (defn handle-serve-line!
   "Processes a single STDIN or `--cmd-file` JSON line in `serve` mode, invoking `(done-cb resp)` when complete."
   [line ctx done-cb]
@@ -3205,6 +3243,8 @@
         cmd-map (parse-json-safe line)
         line-str (if (string? line) line (write-json-str line))
         verb (when (map? cmd-map) (get cmd-map "cmd"))
+        wait-ms (long (or (get cmd-map "wait_open_ms") (get cmd-map "wait-open-ms") (get cmd-map :wait-open-ms) (get cmd-map :wait_open_ms) 0))
+        relay-url (or (:relay-url conn-opts) (get-in conn-opts [:relay :url]))
         sync-wanted? (or (and (= verb "sync-account")
                               (nil? (get cmd-map "balance"))
                               (nil? (get cmd-map "snapshots"))
@@ -3212,6 +3252,15 @@
                          (and (= verb "account") (or (get cmd-map "sync") (:sync? cmd-map)))
                          (and (= verb "escrows") (or (get cmd-map "sync") (:sync? cmd-map))))
         sync-opts (assoc (or conn-opts {}) :identity identity)
+        finish-resp!
+        (fn [res-map]
+          (let [resp (:response res-map)]
+            (if (and (contains? #{"offer" "rendezvous-offer"} verb) (pos? wait-ms))
+              (let [sid (or (get resp "session_id") (get resp "session-id") (get resp :session-id))]
+                (maybe-wait-open! resp sid wait-ms state-atom conn-opts relay-url emit! done-cb))
+              (do
+                (when (and resp emit!) (emit! resp))
+                (done-cb resp)))))
         execute-cmd!
         (fn [effective-line]
           (let [res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
@@ -3241,9 +3290,7 @@
                                             (:privkey-bytes identity))
                     (sync-conn-diagnostics! state-atom conn-atom)
                     (save-light-state! state-file @state-atom)
-                    (when-let [resp (:response res)]
-                      (emit! resp))
-                    (done-cb (:response res)))
+                    (finish-resp! res))
                   (let [sent-ingress? (boolean
                                        (when (and ingress-peers-atom (seq @ingress-peers-atom))
                                          (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
@@ -3255,9 +3302,7 @@
                         (swap! state-atom assoc :connected? true :connection-error nil)
                         (sync-conn-diagnostics! state-atom conn-atom)
                         (save-light-state! state-file @state-atom)
-                        (when-let [resp (:response res)]
-                          (emit! resp))
-                        (done-cb (:response res)))
+                        (finish-resp! res))
                       (do
                         (swap! state-atom assoc :connected? false :connection-error "send-failed")
                         (when conn-atom
@@ -3283,9 +3328,7 @@
                                        (swap! state-atom assoc :connected? true :connection-error nil)
                                        (sync-conn-diagnostics! state-atom conn-atom)
                                        (save-light-state! state-file @state-atom)
-                                       (when-let [resp (:response res)]
-                                         (emit! resp))
-                                       (done-cb (:response res)))
+                                       (finish-resp! res))
                                      (let [err "send-failed"]
                                        (when conn-atom
                                          (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
@@ -3321,9 +3364,7 @@
               (do
                 (sync-conn-diagnostics! state-atom conn-atom)
                 (save-light-state! state-file @state-atom)
-                (when-let [resp (:response res)]
-                  (emit! resp))
-                (done-cb (:response res))))))
+                (finish-resp! res)))))
         after-sync!
         (fn []
           (if (and (contains? #{"directory-lookup" "directory-verify"} verb)

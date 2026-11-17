@@ -21,9 +21,9 @@ Every Bitecho network is identified by an explicit canonical `:network-uri` that
 
 ---
 
-## 2. Pre-Release Verification Gate (Mandatory Before Any Tag or Deploy)
+## 2. Pre-Release Verification Gate & BIP Governance Machine Workflow
 
-Every release candidate MUST pass all 6 local verification gates with zero warnings or failures before building release artifacts:
+Every release candidate MUST pass all 6 local verification gates with zero warnings or failures before building release artifacts or initiating on-chain governance:
 
 ```bash
 # 1. Code formatting & static analysis (AGENTS.md Rule 3)
@@ -34,7 +34,7 @@ clojure -M:lint
 clojure -M:test --skip-integration
 
 # 3. Multi-network release proof generator (devnet/testnet/mainnet + 6-pair replay matrix + N/N+1 rolling interop + S1-S24 scenarios)
-clojure -M:proof docs/releases/v0.23.4-proof.edn
+clojure -M:proof docs/releases/v0.23.5-proof.edn
 
 # 4. Pre-deploy E2E wire negotiation & 3-epoch Streamlet finalization gate
 ./scripts/cluster.sh verify-e2e
@@ -42,23 +42,42 @@ clojure -M:proof docs/releases/v0.23.4-proof.edn
 # 5. Production uberjar & Node/Browser light-node bundle build
 ./scripts/build-node-light-node.sh
 ./scripts/build-browser-bundle.sh
+./scripts/build-sea.sh
 ```
+
+### The BIP Governance Machine Workflow (`--burn 100` Off-Leg Rule)
+Upgrades and parameter modifications are governed on-chain via the Tri-Circle Sociocratic Governance Machine:
+1. **Proof Generation & Gate Assertion:** Generate bit-for-bit release proof with `clojure -M:proof docs/releases/v0.23.5-proof.edn`. `scripts/cluster.sh` asserts that all test gates passed and verifies commit and tree SHAs.
+2. **Proposal Submission (`--burn 100`):** Submit the BIP proposal using `--burn 100` (mandatory anti-spam burn floor across validator mesh gossip):
+   ```bash
+   ./scripts/light-node.sh bip-submit \
+     --bip-id BIP-002 \
+     --title "Release v0.23.5" \
+     --proof-file docs/releases/v0.23.5-proof.edn \
+     --burn 100
+   ```
+3. **Tri-Circle Sociocratic Consent (`--burn 100`):** All three circles (`:mesh-validators`, `:builders-stewards`, `:token-anchors`) evaluate the proposal and record consent via `bip-consent --burn 100` (or substantiate objections with bit-for-bit reproducible regression vectors via `bip-object --burn 100`).
+4. **Scheduled Upgrade Epoch Activation:** Once 3-of-3 circle consent is achieved with 0 paramount objections, the proposal state transitions to `:ratified`, and its target epoch is scheduled in `:scheduled-upgrades`.
+5. **On-Network Artifact Publishing (`migrate-infra` / `publish-release`):** Binaries and web documents are published as content-addressed `Blob`s and Cold-Root-signed `Pointer`s into `bitecho.org/infra`, serving live at `https://bitecho.org/releases/v0.23.5/...` and `/bip/<bip-id>`.
 
 ---
 
-## 3. Deterministic Artifact Build & SHA-256 Attestation
+## 3. Deterministic Artifact Build & On-Network Publishing Pipeline
 
-1. Build the release uberjar and light-node bundles and compute reproducible SHA-256 digests:
+1. Build the release uberjar, Node/Browser bundles, and SEA standalone binaries:
    ```bash
    clojure -T:build uber
    ./scripts/build-node-light-node.sh
    ./scripts/build-browser-bundle.sh
+   ./scripts/build-sea.sh
    sha256sum dist/bitecho-light-node.cjs dist/bitecho-browser.js
    ```
-2. Record artifact SHA-256 digests and commit the generated release proof (`docs/releases/<version>-proof.edn`) alongside any `BIP` governance proposal (`:deterministic-bundle-sha256`).
+2. Ingest compiled artifacts and web resources into the `bitecho.org/infra` subnet:
+   - Git tracks **source code and cryptographic proofs only** (`docs/releases/v0.23.5-proof.edn`). Compiled distribution artifacts in `dist/` are untracked in git.
+   - The infra cluster replicates artifacts across `ns1..ns3` via `migrate-clj-web-state!`, serving them with content-addressed `ETag`s and Ed25519 authenticity headers (`X-Bitecho-Pointer-Signature`, `X-Bitecho-Blob-Cid`).
 3. Tag the release commit with an annotated Git tag:
    ```bash
-   git tag -a v0.23.4 -m "Release v0.23.4: Milestone D26 BIP-000 Charter Ratification, Parallel Track Foundation, Offer Hash Network Binding, Budget Floor Guard, SEA Builder, and S16-S24 Verification Suite"
+   git tag -a v0.23.5 -m "Release v0.23.5: Milestone D27 Docs Clean-Up, On-Network Publishing, Mealy Lab Foundation, and Mesh/Relay Offer Delivery Remediation"
    ```
 
 ---

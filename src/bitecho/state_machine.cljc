@@ -184,7 +184,9 @@
                 (not (string/blank? expected-uri))
                 (string? item-uri)
                 (not (string/blank? item-uri))
-                (not= expected-uri item-uri))
+                (if strict?
+                  (not= expected-uri item-uri)
+                  (not (config/equivalent-subnet-id? item-uri expected-uri expected-uri))))
            (and strict?
                 is-transfer?
                 (or (not (string? item-uri))
@@ -1230,15 +1232,8 @@
   "Handles an incoming Contagion anti-entropy summary."
   [state event]
   (let [remote-summary (:summary event)
-        known-burn-mids (into #{}
-                              (keep (fn [rid]
-                                      (when (string/starts-with? rid "gossip-burn:")
-                                        (subs rid (count "gossip-burn:")))))
-                              (set/union (or (:known-receipt-ids state) #{})
-                                         (or (:executed-receipt-ids state) #{})))
         known-ids (set/union (:contagion-known-ids state)
-                             (get-in state [:murmur-cache :set] #{})
-                             known-burn-mids)
+                             (get-in state [:murmur-cache :set] #{}))
         missing-ids (contagion/lazy-pull known-ids remote-summary)
         commands (if (seq missing-ids)
                    [{:type :send-pull-request

@@ -14,12 +14,16 @@
   (:require [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
-;; Protocol Release Version & Sunsets (Milestone D26)
+;; Protocol Release Version & Sunsets (Milestone D27)
 ;; ---------------------------------------------------------------------------
 
 (def version
   "Current protocol and release milestone version."
-  "0.23.4")
+  "0.23.5")
+
+(def infra-cold-root-pubkey
+  "Pinned Cold Offline Infra Root Ed25519 public key (HEX) for on-network artifact attestation."
+  "302a300506032b6570032100d88b92f094f65be1d32c8c1fb6c85f7913458a99ebdc142009ab2f18fd1bf641")
 
 (def legacy-unbound-offer-hash-sunset
   "Sunset ISO timestamp after which unbound offer hashes (|net:<uri> missing) are strictly rejected."
@@ -37,10 +41,13 @@
 
 (defn resolve-network-uri
   "Resolves a network keyword (:devnet, :testnet, :mainnet), URI string, or config map
-   to its canonical network URI string (or nil if unspecified)."
+   to its canonical network URI string (or nil if unspecified).
+   Returns nil for generic subnet aliases ('global', 'validator-core')."
   [x]
   (cond
-    (string? x) (when-not (str/blank? x) (str/trim x))
+    (string? x) (let [s (when-not (str/blank? x) (str/trim x))]
+                  (when-not (or (= s "global") (= s "validator-core"))
+                    s))
     (keyword? x) (get network-uris x)
     (map? x) (or (resolve-network-uri (:network-uri x))
                  (resolve-network-uri (:network x))
@@ -193,7 +200,7 @@
            :quorum-threshold     4
            :epoch-length-ms      10000
            :tick-interval-ms     10000
-           :murmur-k             3
+           :murmur-k             5
            :basalt-max-view-size 10
            :echo-sample-size     5
            :echo-threshold       4

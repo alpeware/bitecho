@@ -1193,7 +1193,7 @@
    Requires:
    - All snapshots pass verify-chain-state-snapshot (fails closed on any invalid snapshot)
    - Unique validators count >= quorum-size (default: 2f+1 where n = (count trusted-validators) or (count snapshots))
-   - Max finalized-epoch skew <= max-epoch-skew (default 2)
+   - Max finalized-epoch skew <= max-epoch-skew (default 15)
    - Strict agreement on [:balance :spendable :seq :deps :canonical-escrows] across agreeing quorum
    Returns {:ok? true :snapshot best-agreed :quorum-count n :validators [...]} or {:ok? false :error <reason>}."
   [snapshots opts]
@@ -1236,21 +1236,21 @@
                                      (:seq s)
                                      (:deps s)
                                      (str/join ";" (map canonical-escrow-entry-str (sort-by :escrow-id (:escrows s))))])
-                        by-epoch (group-by :finalized-epoch valid-snaps)
-                        same-epoch-disagreement? (some (fn [[_ snaps]]
-                                                         (> (count (distinct (map state-sig snaps))) 1))
-                                                       by-epoch)]
-                    (if same-epoch-disagreement?
-                      {:ok? false :error "validator-state-disagreement"}
-                      (let [by-state (group-by state-sig valid-snaps)
-                            [_ agreeing-snaps] (apply max-key (fn [[_ snaps]] (count snaps)) by-state)]
-                        (if (< (count agreeing-snaps) quorum-size)
+                        by-state (group-by state-sig valid-snaps)
+                        [_ agreeing-snaps] (apply max-key (fn [[_ snaps]] (count snaps)) by-state)]
+                    (if (>= (count agreeing-snaps) quorum-size)
+                      (let [best-snap (apply max-key :finalized-epoch agreeing-snaps)]
+                        {:ok? true
+                         :snapshot best-snap
+                         :quorum-count (count agreeing-snaps)
+                         :validators (vec (sort (map :validator-pubkey agreeing-snaps)))})
+                      (let [by-epoch (group-by :finalized-epoch valid-snaps)
+                            same-epoch-disagreement? (some (fn [[_ snaps]]
+                                                             (> (count (distinct (map state-sig snaps))) 1))
+                                                           by-epoch)]
+                        (if same-epoch-disagreement?
                           {:ok? false :error "validator-state-disagreement"}
-                          (let [best-snap (apply max-key :finalized-epoch agreeing-snaps)]
-                            {:ok? true
-                             :snapshot best-snap
-                             :quorum-count (count agreeing-snaps)
-                             :validators (vec (sort (map :validator-pubkey agreeing-snaps)))}))))))))))))))
+                          {:ok? false :error "insufficient-validator-quorum"})))))))))))))
 
 (defn apply-verified-chain-state-snapshot
   "Applies a verified chain state snapshot to local light-node state.
@@ -1299,7 +1299,8 @@
                    :last-transfer-hash (last (:deps new-account))
                    :epoch (max (long (or (:epoch state) 0)) fin-epoch)
                    :epoch-initialized? true
-                   :escrows merged-escrows))))))
+                   :escrows merged-escrows)
+            (update :credited-tx-ids (fn [c] (into (or c #{}) (map str (:deps new-account))))))))))
 
 (defn build-chain-state-query-envelope
   "Builds and wraps an authenticated :query-chain-state agent envelope.
@@ -3175,15 +3176,16 @@
                                (get acct "finalized_epoch")
                                (:epoch state)
                                0))
-              new-state (cond-> (assoc state
-                                       :account {:balance bal
-                                                 :spendable spendable
-                                                 :seq seq-num
-                                                 :deps deps
-                                                 :finalized-epoch fin-ep}
-                                       :transfer-seq seq-num
-                                       :last-transfer-hash (last deps)
-                                       :epoch (max (long (or (:epoch state) 0)) fin-ep))
+              new-state (cond-> (-> state
+                                    (assoc :account {:balance bal
+                                                     :spendable spendable
+                                                     :seq seq-num
+                                                     :deps deps
+                                                     :finalized-epoch fin-ep}
+                                           :transfer-seq seq-num
+                                           :last-transfer-hash (last deps)
+                                           :epoch (max (long (or (:epoch state) 0)) fin-ep))
+                                    (update :credited-tx-ids (fn [c] (into (or c #{}) (map str deps)))))
                           (pos? fin-ep) (assoc :epoch-initialized? true))]
           {:state new-state
            :response {"ok" true
@@ -3977,6 +3979,11 @@
      :response (cond-> {"ok" true
                         "connected" (boolean (:connected? state false))
                         "connection_error" (:connection-error state)
+                        "auto_sync_last_error" (or (:auto-sync-last-error state)
+                                                   (get-in state [:diagnostics :auto-sync-last-error])
+                                                   (get-in state [:conn-diagnostics :auto-sync-last-error]))
+                        "transport_healthy" (and (boolean (:connected? state false))
+                                                 (nil? (:connection-error state)))
                         "pubkey" (:pubkey state)
                         "subnet_id" (or (:subnet-id state) "global")
                         "subscribed_subnets" (vec (sort (or (:subscribed-subnets state) #{})))
@@ -6538,10 +6545,25 @@
                                new-state (-> state
                                              (assoc-in [:sessions sid :p2p] p2p-entry)
                                              (assoc-in [:sessions sid :p2p-meta] p2p-meta)
-                                             (update-in [:diagnostics :p2p-offer-answered-while-open] (fnil inc 0)))]
-                           {:state new-state
-                            :net-envelopes (if env [env] [])
-                            :stdout-events [ans-evt]})
+                                             (update-in [:diagnostics :p2p-offer-answered-while-open] (fnil inc 0)))
+                               local-cands-set (set (concat (get-in session [:p2p :local-candidates])
+                                                            (get-in session [:p2p-meta :local-candidates])
+                                                            (get-in session [:p2p-meta :preferred-candidates])))
+                               dialable-candidates (vec (remove #(contains? local-cands-set %) candidates))
+                               dial-effect (when (seq dialable-candidates)
+                                             {:session-id sid
+                                              :peer (normalize-pubkey-hex (:sender msg))
+                                              :role :responder
+                                              :force-redial? true
+                                              :transport transport
+                                              :remote-candidates dialable-candidates
+                                              :remote-ice-ufrag ice-ufrag
+                                              :remote-ice-pwd ice-pwd
+                                              :remote-fingerprint fp})]
+                           (cond-> {:state new-state
+                                    :net-envelopes (if env [env] [])
+                                    :stdout-events [ans-evt]}
+                             dial-effect (assoc :p2p-dial dial-effect)))
                          (let [p2p-entry (merge p2p-base
                                                 {:phase :offer-received
                                                  :connected? false
@@ -6623,7 +6645,9 @@
                     (let [norm-sender (normalize-pubkey-hex (:sender msg))
                           already-connected? (or (true? (get-in session [:p2p :connected?]))
                                                  (= :open (get-in session [:p2p :phase])))
-                          local-cands-set (set (get-in session [:p2p :local-candidates]))
+                          local-cands-set (set (concat (get-in session [:p2p :local-candidates])
+                                                       (get-in session [:p2p-meta :local-candidates])
+                                                       (get-in session [:p2p-meta :preferred-candidates])))
                           dialable-candidates (vec (remove #(contains? local-cands-set %) candidates))
                           has-candidates? (boolean (seq dialable-candidates))
                           has-local-candidates? (boolean (seq (get-in session [:p2p :local-candidates])))
@@ -7367,6 +7391,24 @@
                                                  (and (= msg-type :channel-accept)
                                                       (some? target-sid)
                                                       (= "offered" (get-in state [:sessions target-sid :state]))))
+                        unicast-types #{:channel-offer :rendezvous-offer-header :channel-accept
+                                        :rendezvous-ack-voucher :rendezvous-reveal :sealed-message
+                                        :session-ack :p2p-offer :p2p-answer}
+                        target-recip (when (contains? unicast-types msg-type)
+                                       (case msg-type
+                                         (:channel-offer :rendezvous-offer-header :rendezvous-reveal)
+                                         (or (:callee msg) (get msg "callee"))
+                                         (:channel-accept :rendezvous-ack-voucher)
+                                         (or (:caller msg) (get msg "caller"))
+                                         (:sealed-message :session-ack :p2p-answer)
+                                         (or (:recipient msg) (get msg "recipient"))
+                                         :p2p-offer
+                                         (or (:recipient msg) (get msg "recipient") (:callee msg) (get msg "callee"))
+                                         nil))
+                        foreign-unicast? (and target-recip
+                                              (:pubkey state)
+                                              (not= (normalize-pubkey-hex target-recip)
+                                                    (normalize-pubkey-hex (:pubkey state))))
                         ref-epoch (if (or (:epoch-initialized? state)
                                           (and (integer? (:epoch state)) (pos? (long (:epoch state)))))
                                     (:epoch state)
@@ -7383,61 +7425,63 @@
                                                             msg-type))
                                             msg-epoch ref-epoch
                                             (> (math-abs (- msg-epoch (long ref-epoch))) max-skew))]
-                    (if skew-exceeded?
-                      (let [p2p-sig? (contains? #{:p2p-offer :p2p-answer} msg-type)
-                            sid (or target-sid (:offer-hash msg) (get msg "offer_hash"))
-                            caller-pub (or (:caller msg) (:sender msg) (get msg "caller") (get msg "sender"))
-                            diag-event (cond-> {"event" "diagnostic"
-                                                "reason" "epoch-skew-dropped"
-                                                "msg_type" (name (or msg-type :unknown))
-                                                "offer_epoch" (or msg-epoch 0)
-                                                "local_epoch" (long (or ref-epoch 0))}
-                                         sid (assoc "session_id" (str sid))
-                                         caller-pub (assoc "from" (str caller-pub)))
-                            p2p-event (when p2p-sig?
-                                        {"event" "p2p-signaling-rejected" "reason" "epoch-skew-exceeded"})
-                            evts (cond-> [diag-event]
-                                   p2p-event (conj p2p-event))
-                            new-state (cond-> state
-                                        true (update-in [:diagnostics :epoch-skew-dropped] (fnil inc 0))
-                                        p2p-sig? (update-in [:diagnostics :p2p-signaling-rejected] (fnil inc 0)))
-                            st-enq (enqueue-actionable-events new-state evts)]
-                        {:state st-enq
-                         :net-envelopes []
-                         :stdout-events evts})
-                      (let [res (case msg-type
-                                  :channel-offer (handle-wire-offer state msg privkey-bytes)
-                                  :channel-accept (handle-wire-accept state msg privkey-bytes)
-                                  :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
-                                  :session-ack (handle-wire-session-ack state msg)
-                                  :channel-close (handle-wire-close state msg)
-                                  :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
-                                  :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
-                                  :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
-                                  :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
-                                  :p2p-offer (handle-wire-p2p-offer state msg privkey-bytes)
-                                  :p2p-answer (handle-wire-p2p-answer state msg)
-                                  :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
-                                  :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
-                                  :storage-replicate (handle-wire-storage-replicate state msg)
-                                  :capability-replicate (handle-wire-capability-replicate state msg)
-                                  :governance-replicate (handle-wire-governance-replicate state msg)
-                                  :transfer (handle-wire-transfer state msg)
-                                  {:state state :net-envelopes [] :stdout-events []})
-                            res' (if (and (not= msg-type :chain-state-snapshot)
-                                          msg-epoch
-                                          (not (:epoch-initialized? (:state res))))
-                                   (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
-                                   res)
-                            res'' (if (and open-session? (get-in (:state res') [:sessions target-sid]))
-                                    (update-in res' [:state :sessions target-sid :epoch]
-                                               (fn [curr-ep]
-                                                 (max (long (or curr-ep 0))
-                                                      (long (or msg-epoch 0))
-                                                      (long (or (:epoch (:state res')) 0)))))
-                                    res')
-                            st-enq (enqueue-actionable-events (:state res'') (:stdout-events res''))]
-                        (assoc res'' :state st-enq)))))))))))))
+                    (if foreign-unicast?
+                      {:state state :net-envelopes [] :stdout-events []}
+                      (if skew-exceeded?
+                        (let [p2p-sig? (contains? #{:p2p-offer :p2p-answer} msg-type)
+                              sid (or target-sid (:offer-hash msg) (get msg "offer_hash"))
+                              caller-pub (or (:caller msg) (:sender msg) (get msg "caller") (get msg "sender"))
+                              diag-event (cond-> {"event" "diagnostic"
+                                                  "reason" "epoch-skew-dropped"
+                                                  "msg_type" (name (or msg-type :unknown))
+                                                  "offer_epoch" (or msg-epoch 0)
+                                                  "local_epoch" (long (or ref-epoch 0))}
+                                           sid (assoc "session_id" (str sid))
+                                           caller-pub (assoc "from" (str caller-pub)))
+                              p2p-event (when p2p-sig?
+                                          {"event" "p2p-signaling-rejected" "reason" "epoch-skew-exceeded"})
+                              evts (cond-> [diag-event]
+                                     p2p-event (conj p2p-event))
+                              new-state (cond-> state
+                                          true (update-in [:diagnostics :epoch-skew-dropped] (fnil inc 0))
+                                          p2p-sig? (update-in [:diagnostics :p2p-signaling-rejected] (fnil inc 0)))
+                              st-enq (enqueue-actionable-events new-state evts)]
+                          {:state st-enq
+                           :net-envelopes []
+                           :stdout-events evts})
+                        (let [res (case msg-type
+                                    :channel-offer (handle-wire-offer state msg privkey-bytes)
+                                    :channel-accept (handle-wire-accept state msg privkey-bytes)
+                                    :sealed-message (handle-wire-sealed-msg state msg privkey-bytes)
+                                    :session-ack (handle-wire-session-ack state msg)
+                                    :channel-close (handle-wire-close state msg)
+                                    :rendezvous-offer-header (handle-wire-rendezvous-header state msg privkey-bytes)
+                                    :rendezvous-ack-voucher (handle-wire-rendezvous-ack state msg privkey-bytes)
+                                    :rendezvous-reveal (handle-wire-rendezvous-reveal state msg privkey-bytes)
+                                    :chain-state-snapshot (handle-wire-chain-state-snapshot state msg)
+                                    :p2p-offer (handle-wire-p2p-offer state msg privkey-bytes)
+                                    :p2p-answer (handle-wire-p2p-answer state msg)
+                                    :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
+                                    :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
+                                    :storage-replicate (handle-wire-storage-replicate state msg)
+                                    :capability-replicate (handle-wire-capability-replicate state msg)
+                                    :governance-replicate (handle-wire-governance-replicate state msg)
+                                    :transfer (handle-wire-transfer state msg)
+                                    {:state state :net-envelopes [] :stdout-events []})
+                              res' (if (and (not= msg-type :chain-state-snapshot)
+                                            msg-epoch
+                                            (not (:epoch-initialized? (:state res))))
+                                     (update res :state assoc :epoch msg-epoch :epoch-initialized? true)
+                                     res)
+                              res'' (if (and open-session? (get-in (:state res') [:sessions target-sid]))
+                                      (update-in res' [:state :sessions target-sid :epoch]
+                                                 (fn [curr-ep]
+                                                   (max (long (or curr-ep 0))
+                                                        (long (or msg-epoch 0))
+                                                        (long (or (:epoch (:state res')) 0)))))
+                                      res')
+                              st-enq (enqueue-actionable-events (:state res'') (:stdout-events res''))]
+                          (assoc res'' :state st-enq))))))))))))))
 
 ;; -----------------------------------------------------------------------------
 ;; JSONL Line Processor

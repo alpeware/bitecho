@@ -12,6 +12,7 @@
      `206 Partial Content`, gzip compression, and zero-heap `FileChannel` streaming via `bitecho.shell.blob-fs` (Gap G6).
    - Hot-reloadable X.509 TLS manager integrated with `\"tls/current-cert\"` follower replication."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.data :as data]
             [bitecho.core.protocol.acme :as acme-proto]
             [bitecho.core.protocol.dns :as dns-proto]
             [bitecho.core.protocol.faucet :as faucet]
@@ -626,7 +627,152 @@
           ptr-res)))
     {:ok? false :error :forbidden}))
 
-(defn- serve-subnet-request
+(defn- list-all-bips
+  [rt now-ms]
+  (let [inst @(:subnet-atom rt)
+        sid (:subnet-id inst)
+        ptrs (get-in inst [:data :pointers] {})]
+    (->> ptrs
+         (keep (fn [[[psub ppath] ptr]]
+                 (when (and (= psub sid)
+                            (or (str/starts-with? ppath "bip/")
+                                (str/starts-with? ppath "web/bip/"))
+                            (some? (data/resolve-pointer (:data inst) sid ppath now-ms)))
+                   (let [bip-id (last (str/split ppath #"/"))]
+                     {:bip-id bip-id
+                      :path ppath
+                      :target (:pointer/target ptr)
+                      :seq (:pointer/seq ptr)
+                      :authority-pubkey (or (:pointer/authority ptr) (:pointer/authority-pubkey ptr))}))))
+         (group-by :bip-id)
+         (map (fn [[_ entries]] (first (sort-by :path entries))))
+         (sort-by :bip-id)
+         vec)))
+
+(defn- render-bips-index
+  [bips accept-hdr]
+  (let [accept (str/lower-case (or accept-hdr ""))]
+    (cond
+      (str/includes? accept "application/edn")
+      {:response/status 200
+       :response/headers {"Content-Type" "application/edn; charset=utf-8"
+                          "Cache-Control" "public, max-age=60"}
+       :response/body (pr-str bips)}
+
+      (str/includes? accept "application/json")
+      {:response/status 200
+       :response/headers {"Content-Type" "application/json; charset=utf-8"
+                          "Cache-Control" "public, max-age=60"}
+       :response/body (json/write-str bips)}
+
+      :else
+      {:response/status 200
+       :response/headers {"Content-Type" "text/html; charset=utf-8"
+                          "Cache-Control" "public, max-age=60"}
+       :response/body (str "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>Bitecho Improvement Proposals (BIPs)</title></head><body>\n"
+                           "<h1>Bitecho Improvement Proposals (BIPs)</h1>\n<ul>\n"
+                           (str/join "\n" (map (fn [b] (str "<li><a href=\"/bip/" (:bip-id b) "\">" (:bip-id b) "</a> (CID: " (:target b) ")</li>")) bips))
+                           "\n</ul>\n</body></html>\n")})))
+
+(defn- render-resolved-blob
+  [config req resolved method]
+  (let [blob (:blob resolved)
+        cid (:blob/cid blob)
+        raw-ct (:blob/media-type blob)
+        ptr (:pointer resolved)
+        ptr-pk (or (:pointer/authority ptr) (:pointer/authority-pubkey ptr) (:authority-pubkey ptr) (:authority ptr))
+        ptr-seq (or (:pointer/seq ptr) (:seq ptr))
+        ptr-sig (or (:pointer/sig ptr) (:pointer/signature ptr) (:signature ptr) (:sig ptr))
+        auth-hdrs (cond-> {}
+                    cid (assoc "X-Bitecho-Blob-Cid" cid)
+                    ptr-pk (assoc "X-Bitecho-Pointer-Pubkey" ptr-pk)
+                    ptr-seq (assoc "X-Bitecho-Pointer-Seq" (str ptr-seq))
+                    ptr-sig (assoc "X-Bitecho-Pointer-Signature" ptr-sig))
+        fallback-name (or (get-in resolved [:pointer :pointer/path])
+                          (when-let [^File df (:file resolved)] (.getName df))
+                          (get-in req [:request/uri :path]))
+        path-ct (content-type-for-file fallback-name)
+        ct (cond
+             (and (string? raw-ct)
+                  (not (str/blank? raw-ct))
+                  (not (contains? default-extension-media-types raw-ct)))
+             raw-ct
+
+             (not= path-ct "application/octet-stream")
+             path-ct
+
+             (and (string? raw-ct) (not (str/blank? raw-ct)))
+             raw-ct
+
+             :else
+             "application/octet-stream")
+        ^bytes raw-bs (:blob/bytes blob)
+        ^File disk-file (:file resolved)
+        total-size (long (if (and disk-file (.exists disk-file))
+                           (.length disk-file)
+                           (if raw-bs (alength raw-bs) 0)))
+        max-tier1 (long (get-in config [:http :cache-max-file-bytes] 2097152))
+        tier1? (or (<= total-size max-tier1) (nil? disk-file) (not (.exists disk-file)))
+        etag (str "\"" cid "\"")
+        inm (first (get (:request/headers req) :header/if-none-match))
+        range-hdr (first (get (:request/headers req) :header/range))]
+    (cond
+      (and inm (= (str/trim inm) etag))
+      {:response/status 304
+       :response/headers (merge auth-hdrs
+                                {"ETag" etag
+                                 "Cache-Control" "public, max-age=3600"})
+       :response/body nil}
+
+      range-hdr
+      (if-let [[start end] (parse-byte-range range-hdr total-size)]
+        (let [part-len (inc (- end start))
+              hdrs (merge auth-hdrs
+                          {"Content-Type" ct
+                           "Content-Range" (str "bytes " start "-" end "/" total-size)
+                           "Accept-Ranges" "bytes"
+                           "Content-Length" (str part-len)
+                           "ETag" etag
+                           "X-Checksum-SHA256" (or cid "")})
+              body (cond
+                     (= method :HEAD) nil
+                     tier1? (Arrays/copyOfRange raw-bs (int start) (int (inc end)))
+                     :else {:file disk-file :offset start :length part-len})]
+          {:response/status 206 :response/headers hdrs :response/body body})
+        {:response/status 416
+         :response/headers {"Content-Range" (str "bytes */" total-size)}
+         :response/body nil})
+
+      :else
+      (let [ae (first (get (:request/headers req) :header/accept-encoding))
+            want-gz? (and tier1?
+                          ae
+                          (str/includes? (str/lower-case ae) "gzip")
+                          (compressible-content-type? ct))
+            gz-bs (when want-gz? (gzip-bytes raw-bs))]
+        (if (and gz-bs (< (alength gz-bs) total-size))
+          {:response/status 200
+           :response/headers (merge auth-hdrs
+                                    {"Content-Type" ct
+                                     "Content-Encoding" "gzip"
+                                     "Vary" "Accept-Encoding"
+                                     "ETag" etag
+                                     "X-Checksum-SHA256" (or cid "")
+                                     "Content-Length" (str (alength gz-bs))})
+           :response/body (if (= method :HEAD) nil gz-bs)}
+          {:response/status 200
+           :response/headers (merge auth-hdrs
+                                    {"Content-Type" ct
+                                     "Accept-Ranges" "bytes"
+                                     "ETag" etag
+                                     "X-Checksum-SHA256" (or cid "")
+                                     "Content-Length" (str total-size)})
+           :response/body (cond
+                            (= method :HEAD) nil
+                            tier1? raw-bs
+                            :else {:file disk-file :offset 0 :length total-size})})))))
+
+(defn serve-subnet-request
   "Evaluates target Subnet `:subnet/gate` (Gap G12 & `F-B1`) and serves Pointer -> Blob with `ETag: \"<cid>\"`,
    `304`, `206`, gzip, and Tier-2 zero-heap `blob-fs` / `content-root` file streaming (Gap G6)."
   [config shell-atom rt req now-ms]
@@ -671,103 +817,78 @@
             {:response/status 403
              :response/headers {"Content-Type" "text/plain; charset=utf-8"}
              :response/body "Forbidden: Subnet Gate Denied\n"})
-          (let [resolved (resolve-web-blob! config rt (get-in req [:request/uri :path]) now-ms)]
-            (case (:error resolved)
-              :forbidden
+          (let [raw-path (get-in req [:request/uri :path] "/")
+                subpath (sanitize-web-subpath raw-path)]
+            (if-not subpath
               (do
                 (infra/apply-shell-event! shell-atom {:type :drop :reason :http-forbidden-path})
                 {:response/status 403
                  :response/headers {"Content-Type" "text/plain; charset=utf-8"}
                  :response/body "Forbidden\n"})
+              (cond
+                (= subpath "bip")
+                (let [bips (list-all-bips rt now-ms)
+                      accept (first (get (:request/headers req) :header/accept))]
+                  (render-bips-index bips accept))
 
-              (:not-found :missing-blob)
-              {:response/status 404
-               :response/headers {"Content-Type" "text/plain; charset=utf-8"}
-               :response/body "Not Found\n"}
+                (str/starts-with? subpath "bip/")
+                (let [target-path subpath
+                      r1 (infra/resolve-path-blob! rt target-path now-ms)
+                      r (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))]
+                  (if (:ok? r)
+                    (render-resolved-blob config req r method)
+                    (do
+                      (infra/apply-shell-event! shell-atom {:type :drop :reason :http-bip-not-found})
+                      {:response/status 404
+                       :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                       :response/body "Not Found\n"})))
 
-              ;; Found!
-              (let [blob (:blob resolved)
-                    cid (:blob/cid blob)
-                    raw-ct (:blob/media-type blob)
-                    fallback-name (or (get-in resolved [:pointer :pointer/path])
-                                      (when-let [^File df (:file resolved)] (.getName df))
-                                      (get-in req [:request/uri :path]))
-                    path-ct (content-type-for-file fallback-name)
-                    ct (cond
-                         (and (string? raw-ct)
-                              (not (str/blank? raw-ct))
-                              (not (contains? default-extension-media-types raw-ct)))
-                         raw-ct
+                (str/starts-with? subpath "releases/")
+                (let [target-path subpath
+                      r1 (infra/resolve-path-blob! rt target-path now-ms)
+                      r (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))]
+                  (if (:ok? r)
+                    (render-resolved-blob config req r method)
+                    (do
+                      (infra/apply-shell-event! shell-atom {:type :drop :reason :http-release-not-found})
+                      {:response/status 404
+                       :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                       :response/body "Not Found\n"})))
 
-                         (not= path-ct "application/octet-stream")
-                         path-ct
+                (or (= subpath "blog") (str/starts-with? subpath "blog/"))
+                (let [target-path subpath
+                      r1 (infra/resolve-path-blob! rt target-path now-ms)
+                      r2 (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))
+                      r3 (if (:ok? r2) r2 (infra/resolve-path-blob! rt (str "web/" target-path ".html") now-ms))
+                      r (if (:ok? r3) r3 (infra/resolve-path-blob! rt (str "web/" target-path ".md") now-ms))]
+                  (if (:ok? r)
+                    (render-resolved-blob config req r method)
+                    (do
+                      (infra/apply-shell-event! shell-atom {:type :drop :reason :http-blog-not-found})
+                      {:response/status 404
+                       :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                       :response/body "Not Found\n"})))
 
-                         (and (string? raw-ct) (not (str/blank? raw-ct)))
-                         raw-ct
+                :else
+                (let [resolved (resolve-web-blob! config rt raw-path now-ms)]
+                  (case (:error resolved)
+                    :forbidden
+                    (do
+                      (infra/apply-shell-event! shell-atom {:type :drop :reason :http-forbidden-path})
+                      {:response/status 403
+                       :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                       :response/body "Forbidden\n"})
 
-                         :else
-                         "application/octet-stream")
-                    ^bytes raw-bs (:blob/bytes blob)
-                    ^File disk-file (:file resolved)
-                    total-size (long (if (and disk-file (.exists disk-file))
-                                       (.length disk-file)
-                                       (alength raw-bs)))
-                    max-tier1 (long (get-in config [:http :cache-max-file-bytes] 2097152))
-                    tier1? (or (<= total-size max-tier1) (nil? disk-file) (not (.exists disk-file)))
-                    etag (str "\"" cid "\"")
-                    inm (first (get (:request/headers req) :header/if-none-match))
-                    range-hdr (first (get (:request/headers req) :header/range))]
-                (cond
-                  (and inm (= (str/trim inm) etag))
-                  {:response/status 304
-                   :response/headers {"ETag" etag
-                                      "Cache-Control" "public, max-age=3600"}
-                   :response/body nil}
+                    (:not-found :missing-blob)
+                    {:response/status 404
+                     :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                     :response/body "Not Found\n"}
 
-                  range-hdr
-                  (if-let [[start end] (parse-byte-range range-hdr total-size)]
-                    (let [part-len (inc (- end start))
-                          hdrs {"Content-Type" ct
-                                "Content-Range" (str "bytes " start "-" end "/" total-size)
-                                "Accept-Ranges" "bytes"
-                                "Content-Length" (str part-len)
-                                "ETag" etag
-                                "X-Checksum-SHA256" cid}
-                          body (cond
-                                 (= method :HEAD) nil
-                                 tier1? (Arrays/copyOfRange raw-bs (int start) (int (inc end)))
-                                 :else {:file disk-file :offset start :length part-len})]
-                      {:response/status 206 :response/headers hdrs :response/body body})
-                    {:response/status 416
-                     :response/headers {"Content-Range" (str "bytes */" total-size)}
-                     :response/body nil})
-
-                  :else
-                  (let [ae (first (get (:request/headers req) :header/accept-encoding))
-                        want-gz? (and tier1?
-                                      ae
-                                      (str/includes? (str/lower-case ae) "gzip")
-                                      (compressible-content-type? ct))
-                        gz-bs (when want-gz? (gzip-bytes raw-bs))]
-                    (if (and gz-bs (< (alength gz-bs) total-size))
-                      {:response/status 200
-                       :response/headers {"Content-Type" ct
-                                          "Content-Encoding" "gzip"
-                                          "Vary" "Accept-Encoding"
-                                          "ETag" etag
-                                          "X-Checksum-SHA256" cid
-                                          "Content-Length" (str (alength gz-bs))}
-                       :response/body (if (= method :HEAD) nil gz-bs)}
-                      {:response/status 200
-                       :response/headers {"Content-Type" ct
-                                          "Accept-Ranges" "bytes"
-                                          "ETag" etag
-                                          "X-Checksum-SHA256" cid
-                                          "Content-Length" (str total-size)}
-                       :response/body (cond
-                                        (= method :HEAD) nil
-                                        tier1? raw-bs
-                                        :else {:file disk-file :offset 0 :length total-size})})))))))))))
+                    (if (:ok? resolved)
+                      (render-resolved-blob config req resolved method)
+                      {:response/status 404
+                       :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                       :response/body "Not Found\n"})))))))))))
 
 ;; =============================================================================
 ;; 3. Port `:80` Handler, Port `:443` Handler, & Bounded-Peek Multiplexer
@@ -1916,6 +2037,13 @@
                                        (let [recip (or (get-in res [:response "recipient"])
                                                        (get-in res [:response "pubkey"]))
                                              broadcast? (boolean (get-in res [:response "broadcast"]))]
+                                         (when (and recip (not broadcast?))
+                                           (try
+                                             (let [payload-bytes (if (bytes? payload) payload (fressian/encode-wire payload))
+                                                   wire-hex (basalt/bytes->hex payload-bytes)
+                                                   body-bytes (.getBytes (json/write-str {"envelope_hex" wire-hex}) "UTF-8")]
+                                               (replicate-relay-request! config "/relay/v1/send" body-bytes))
+                                             (catch Exception _ nil)))
                                          (when (or recip broadcast?)
                                            (let [to-wake (concat
                                                           (when recip (get @relay-waiters-atom recip #{}))
@@ -1925,6 +2053,15 @@
                                      (:state res))))
                           (catch Exception _ nil)))
         connect-bridge! (fn []
+                          (when-let [colocated-val (:validator-node subnet-runtime)]
+                            (when-let [acs (:agent-conns colocated-val)]
+                              (let [bridge-key (keyword (str "colocated-bridge-" (or (:node-id subnet-runtime) "infra")))]
+                                (swap! acs assoc bridge-key
+                                       {:channel-id 0
+                                        :on-message on-bridge-msg
+                                        :node nil
+                                        :generation 1
+                                        :sent-msg-ids (atom #{})}))))
                           (when (and (:peer-identity subnet-runtime) val-bootstrap)
                             (try
                               (when-let [old-c @bridge-conn-atom]
@@ -1944,7 +2081,7 @@
                                           reg-env (mesh/wrap-agent-event
                                                    {:type :register-home-set
                                                     :callee edge-pk
-                                                    :candidates [{:node-id "node-1" :price 100}]
+                                                    :candidates [{:node-id "node1" :price 100}]
                                                     :price 100
                                                     :price-max 100
                                                     :epoch (long (or (infra/current-runtime-epoch subnet-runtime) 1))}

@@ -1094,6 +1094,8 @@ cat <<EOF > dist/index.html
 </body>
 </html>
 EOF
+mkdir -p resources/public
+cp dist/index.html resources/public/index.html
 
 # 5. Verify build reproducibility across consecutive runs
 echo "Verifying build reproducibility (consecutive build comparison)..."
@@ -1119,6 +1121,9 @@ fi
 # 6. Sync to ../clj-web/public/app if clj-web exists
 if [ -f "public/relay.html" ]; then
   cp public/relay.html dist/relay.html
+fi
+if [ -f "dist/relay.html" ]; then
+  cp dist/relay.html resources/public/relay.html
 fi
 CLJ_WEB_PUBLIC="${ROOT_DIR}/../clj-web/public"
 if [ -d "${CLJ_WEB_PUBLIC}" ]; then
