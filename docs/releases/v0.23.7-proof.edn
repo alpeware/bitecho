@@ -92,7 +92,7 @@
     :passed? true}]},
  :d29-remediation-scenarios
  {:all-passed? true,
-  :count 9,
+  :count 10,
   :scenarios
   [{:scenario "D29-1",
     :name "receipt-epoch-horizon-and-gossiped-sig-auth",
@@ -120,9 +120,12 @@
     :passed? true}
    {:scenario "D29-9",
     :name "cli-flag-parity-bip-submit-transfer-to-and-bounty-bip-cid",
+    :passed? true}
+   {:scenario "D29-10",
+    :name "ops-build-and-release-hygiene-invariants",
     :passed? true}]},
  :node-bundle-sha256
- "04a68cca1b6a7e548fbb3f1c0a4b0bb2d47c49483e292e7768a96585d8126c25",
+ "ad629ec7870ce374340e9dab5cf8ee8538536bf4d34ac2e2ed2bc75c0c51bbc1",
  :networks
  {"devnet.bitecho.org"
   {:network :devnet,
@@ -210,11 +213,11 @@
    {:scenario "S24",
     :name "sea-build-script-and-skill-regrounding",
     :passed? true}]},
- :commit-sha "c8b8aa147da3534cf5d7bd6a09a9aaea92a5c6ee",
+ :commit-sha "9450cac505d8818546ef24029776d9fc006bcb6c",
  :version "v0.23.7",
  :browser-bundle-sha256
- "5328b9a1ba72492b49fdc8a39f720c9cec3b5fd53754bd353e2d01a6282f8b45",
- :tree-sha "c07d07cafc6a081daf142bf24eeb30e89b8d3121",
+ "10debeb79c6f64dce2223b548be7ee69895567509c8f28bf64830a6291c47b64",
+ :tree-sha "5029829e96531da7f78dce06b6308245278761cc",
  :d28-remediation-scenarios
  {:all-passed? true,
   :count 5,
