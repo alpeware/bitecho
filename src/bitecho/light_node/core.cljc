@@ -2623,8 +2623,10 @@
    or original gossip-env, preserving the original seq without re-minting.
    Returns {:state updated-state :net-envelopes retransmitted-envs :stdout-events evts :count count}."
   ([state sid]
-   (retransmit-unacked-outbox state sid (:epoch state 0) 0))
+   (retransmit-unacked-outbox state sid (:epoch state 0) 0 nil))
   ([state sid now-ms rto-ms]
+   (retransmit-unacked-outbox state sid now-ms rto-ms nil))
+  ([state sid now-ms rto-ms privkey-bytes]
    (let [sess (get-in state [:sessions sid])]
      (if-not sess
        {:state state :net-envelopes [] :stdout-events [] :count 0}
@@ -2671,17 +2673,40 @@
                                   (update :events conj evict-evt)
                                   (update :evicted-count inc)))
                             ;; Retransmit entry (< 5 retries)
-                            (let [updated-entry (assoc entry
-                                                       :retries (inc retries)
-                                                       :last-sent-ms now
-                                                       :sent-at-ms now)
-                                  raw-env (or (:gossip-env entry) (:env entry))
-                                  env (if (and p2p-open? (:msg-payload entry) raw-env)
-                                        (cond-> raw-env
-                                          true (assoc :p2p-direct? true
-                                                      :p2p-peer (normalize-pubkey-hex (:peer sess))
-                                                      :p2p-session-id sid))
-                                        raw-env)]
+                            (let [raw-env (or (:gossip-env entry) (:env entry))
+                                  fallback-burn? (and (not p2p-open?)
+                                                      privkey-bytes
+                                                      (:msg-payload entry)
+                                                      (zero? (long (or (:burn entry) 0)))
+                                                      (get state :economy-enabled? true))
+                                  fallback-burn (when fallback-burn?
+                                                  (max 100 (effective-signaling-burn-floor state)))
+                                  env (cond
+                                        (and p2p-open? (:msg-payload entry) raw-env)
+                                        (assoc raw-env
+                                               :p2p-direct? true
+                                               :p2p-peer (normalize-pubkey-hex (:peer sess))
+                                               :p2p-session-id sid)
+
+                                        fallback-burn?
+                                        (build-gossip-envelope
+                                         (:pubkey state)
+                                         privkey-bytes
+                                         (freeze-payload (:msg-payload entry))
+                                         fallback-burn
+                                         (str (or (:subnet-id state) "global")))
+
+                                        (map? raw-env)
+                                        (dissoc raw-env :p2p-direct? :p2p-peer :p2p-session-id)
+
+                                        :else
+                                        raw-env)
+                                  updated-entry (cond-> (assoc entry
+                                                               :retries (inc retries)
+                                                               :last-sent-ms now
+                                                               :sent-at-ms now)
+                                                  (map? env) (assoc :gossip-env env)
+                                                  fallback-burn? (assoc :burn fallback-burn))]
                               (-> acc
                                   (assoc-in [:outbox sq] updated-entry)
                                   (update :retransmit-envs conj env))))))))
@@ -2703,112 +2728,118 @@
           :stdout-events (:events res)
           :count (count (:retransmit-envs res))})))))
 
-(defn- exec-retransmit-outbox [state cmd-map]
-  (let [resolved-sid (resolve-session-id state cmd-map :active)
-        now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") (:epoch state 0)))
-        rto-ms (long (or (:rto-ms cmd-map) (get cmd-map "rto_ms") 0))]
-    (cond
-      (and (map? resolved-sid) (false? (:ok? resolved-sid)))
-      {:state state :response {"ok" false "error" (:error resolved-sid) "matches" (:matches resolved-sid)} :net-envelopes [] :stdout-events []}
+(defn- exec-retransmit-outbox
+  ([state cmd-map]
+   (exec-retransmit-outbox state cmd-map nil))
+  ([state cmd-map privkey-bytes]
+   (let [resolved-sid (resolve-session-id state cmd-map :active)
+         now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") (:epoch state 0)))
+         rto-ms (long (or (:rto-ms cmd-map) (get cmd-map "rto_ms") 0))]
+     (cond
+       (and (map? resolved-sid) (false? (:ok? resolved-sid)))
+       {:state state :response {"ok" false "error" (:error resolved-sid) "matches" (:matches resolved-sid)} :net-envelopes [] :stdout-events []}
 
-      (nil? resolved-sid)
-      {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
+       (nil? resolved-sid)
+       {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
 
-      :else
-      (let [sid resolved-sid
-            res (retransmit-unacked-outbox state sid now-ms rto-ms)]
-        {:state (:state res)
-         :response {"ok" true "session_id" sid "retransmitted_count" (:count res)}
-         :net-envelopes (:net-envelopes res)
-         :stdout-events (:stdout-events res)}))))
+       :else
+       (let [sid resolved-sid
+             res (retransmit-unacked-outbox state sid now-ms rto-ms privkey-bytes)]
+         {:state (:state res)
+          :response {"ok" true "session_id" sid "retransmitted_count" (:count res)}
+          :net-envelopes (:net-envelopes res)
+          :stdout-events (:stdout-events res)})))))
 
-(defn- exec-p2p-channel-state [state cmd-map]
-  (let [raw-target (or (get cmd-map "session_id") (get cmd-map "session-id")
-                       (:session_id cmd-map) (:session-id cmd-map))
-        resolved-sid (if (and raw-target (contains? (:sessions state) raw-target))
-                       raw-target
-                       (resolve-session-id state cmd-map :active))]
-    (cond
-      (and (map? resolved-sid) (false? (:ok? resolved-sid)))
-      {:state state :response {"ok" false "error" (:error resolved-sid) "matches" (:matches resolved-sid)} :net-envelopes [] :stdout-events []}
+(defn- exec-p2p-channel-state
+  ([state cmd-map]
+   (exec-p2p-channel-state state cmd-map nil))
+  ([state cmd-map privkey-bytes]
+   (let [raw-target (or (get cmd-map "session_id") (get cmd-map "session-id")
+                        (:session_id cmd-map) (:session-id cmd-map))
+         resolved-sid (if (and raw-target (contains? (:sessions state) raw-target))
+                        raw-target
+                        (resolve-session-id state cmd-map :active))]
+     (cond
+       (and (map? resolved-sid) (false? (:ok? resolved-sid)))
+       {:state state :response {"ok" false "error" (:error resolved-sid) "matches" (:matches resolved-sid)} :net-envelopes [] :stdout-events []}
 
-      (nil? resolved-sid)
-      {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
+       (nil? resolved-sid)
+       {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
 
-      :else
-      (let [session-id resolved-sid
-            session (get-in state [:sessions session-id])]
-        (if-not session
-          {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
-          (let [connected? (let [c (or (get cmd-map "connected") (:connected cmd-map)
-                                       (get cmd-map "connected?") (:connected? cmd-map))]
-                             (if (nil? c) false (boolean c)))
-                transport (or (get cmd-map "transport") (:transport cmd-map))
-                error (or (get cmd-map "error") (:error cmd-map))
-                pname (pubkey->petname state (:peer session))]
-            (if connected?
-              (let [eff-transport (str (or transport
-                                           (get-in session [:p2p :remote-transport])
-                                           (get-in session [:p2p :local-transport])
-                                           "udp"))
-                    p2p-entry (merge (get session :p2p {})
-                                     {:phase :open
-                                      :connected? true
-                                      :zero-burn? true
-                                      :transport eff-transport})
-                    p2p-meta (merge (get session :p2p-meta {})
-                                    {:reconnect-needed? false
-                                     :reconnect-attempts 0
-                                     :next-reconnect-ms 0
-                                     :relay-fallback? false
-                                     :preferred-transport eff-transport})
-                    base-state (-> state
-                                   (assoc-in [:sessions session-id :p2p] p2p-entry)
-                                   (assoc-in [:sessions session-id :p2p-meta] p2p-meta))
-                    now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") (:epoch state 0)))
-                    retrans (retransmit-unacked-outbox base-state session-id now-ms 0)
-                    new-state (:state retrans)
-                    evt (cond-> {"event" "p2p-connected"
-                                 "session_id" session-id
-                                 "peer" (:peer session)
-                                 "transport" eff-transport
-                                 "zero_burn" true}
-                          pname (assoc "peer_petname" pname))]
-                {:state new-state
-                 :response {"ok" true
-                            "session_id" session-id
-                            "connected" true
-                            "phase" "open"}
-                 :net-envelopes (:net-envelopes retrans)
-                 :stdout-events [evt]})
-              (let [auto-relay? (not= false (:auto-relay-fallback? state))
-                    p2p-entry (cond-> (merge (get session :p2p {})
-                                             {:phase :closed
-                                              :connected? false
-                                              :zero-burn? false})
-                                error (assoc :last-error error)
-                                auto-relay? (assoc :relay-fallback? true))
-                    p2p-meta (merge (get session :p2p-meta {})
-                                    {:reconnect-needed? true
-                                     :relay-fallback? true})
-                    new-state (cond-> (-> state
-                                          (assoc-in [:sessions session-id :p2p] p2p-entry)
-                                          (assoc-in [:sessions session-id :p2p-meta] p2p-meta)
-                                          (cond-> auto-relay? (assoc-in [:sessions session-id :relay-fallback?] true)))
-                                error (update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
-                    evt (cond-> {"event" "p2p-disconnected"
-                                 "session_id" session-id
-                                 "peer" (:peer session)
-                                 "reason" (or error "closed")}
-                          auto-relay? (assoc "relay_fallback" true)
-                          pname (assoc "peer_petname" pname))]
-                {:state new-state
-                 :response {"ok" true
-                            "session_id" session-id
-                            "connected" false
-                            "phase" "closed"}
-                 :net-envelopes []
-                 :stdout-events [evt]}))))))))
+       :else
+       (let [session-id resolved-sid
+             session (get-in state [:sessions session-id])]
+         (if-not session
+           {:state state :response {"ok" false "error" "session-not-found"} :net-envelopes [] :stdout-events []}
+           (let [connected? (let [c (or (get cmd-map "connected") (:connected cmd-map)
+                                        (get cmd-map "connected?") (:connected? cmd-map))]
+                              (if (nil? c) false (boolean c)))
+                 transport (or (get cmd-map "transport") (:transport cmd-map))
+                 error (or (get cmd-map "error") (:error cmd-map))
+                 pname (pubkey->petname state (:peer session))]
+             (if connected?
+               (let [eff-transport (str (or transport
+                                            (get-in session [:p2p :remote-transport])
+                                            (get-in session [:p2p :local-transport])
+                                            "udp"))
+                     p2p-entry (merge (get session :p2p {})
+                                      {:phase :open
+                                       :connected? true
+                                       :zero-burn? true
+                                       :transport eff-transport})
+                     p2p-meta (merge (get session :p2p-meta {})
+                                     {:reconnect-needed? false
+                                      :reconnect-attempts 0
+                                      :next-reconnect-ms 0
+                                      :relay-fallback? false
+                                      :preferred-transport eff-transport})
+                     base-state (-> state
+                                    (assoc-in [:sessions session-id :p2p] p2p-entry)
+                                    (assoc-in [:sessions session-id :p2p-meta] p2p-meta))
+                     now-ms (long (or (:now-ms cmd-map) (get cmd-map "now_ms") (:epoch state 0)))
+                     retrans (retransmit-unacked-outbox base-state session-id now-ms 0 privkey-bytes)
+                     new-state (:state retrans)
+                     evt (cond-> {"event" "p2p-connected"
+                                  "session_id" session-id
+                                  "peer" (:peer session)
+                                  "transport" eff-transport
+                                  "zero_burn" true}
+                           pname (assoc "peer_petname" pname))]
+                 {:state new-state
+                  :response {"ok" true
+                             "session_id" session-id
+                             "connected" true
+                             "phase" "open"}
+                  :net-envelopes (:net-envelopes retrans)
+                  :stdout-events [evt]})
+               (let [auto-relay? (not= false (:auto-relay-fallback? state))
+                     p2p-entry (cond-> (merge (get session :p2p {})
+                                              {:phase :closed
+                                               :connected? false
+                                               :zero-burn? false})
+                                 error (assoc :last-error error)
+                                 auto-relay? (assoc :relay-fallback? true))
+                     p2p-meta (merge (get session :p2p-meta {})
+                                     {:reconnect-needed? true
+                                      :relay-fallback? true})
+                     new-state (cond-> (-> state
+                                           (assoc-in [:sessions session-id :p2p] p2p-entry)
+                                           (assoc-in [:sessions session-id :p2p-meta] p2p-meta)
+                                           (cond-> auto-relay? (assoc-in [:sessions session-id :relay-fallback?] true)))
+                                 error (update-in [:diagnostics :p2p-dial-failed] (fnil inc 0)))
+                     evt (cond-> {"event" "p2p-disconnected"
+                                  "session_id" session-id
+                                  "peer" (:peer session)
+                                  "reason" (or error "closed")}
+                           auto-relay? (assoc "relay_fallback" true)
+                           pname (assoc "peer_petname" pname))]
+                 {:state new-state
+                  :response {"ok" true
+                             "session_id" session-id
+                             "connected" false
+                             "phase" "closed"}
+                  :net-envelopes []
+                  :stdout-events [evt]})))))))))
 
 (defn handle-p2p-connection-failure
   "Pure state transition when a direct P2P connection or dial fails for a session.
@@ -5509,8 +5540,8 @@
                   "accept" (exec-accept state effective-map privkey-bytes)
                   "p2p-offer" (exec-p2p-offer state effective-map privkey-bytes)
                   "p2p-answer" (exec-p2p-answer state effective-map privkey-bytes)
-                  "p2p-channel-state" (exec-p2p-channel-state state effective-map)
-                  "p2p_channel_state" (exec-p2p-channel-state state effective-map)
+                  "p2p-channel-state" (exec-p2p-channel-state state effective-map privkey-bytes)
+                  "p2p_channel_state" (exec-p2p-channel-state state effective-map privkey-bytes)
                   "broadcast" (exec-broadcast state effective-map privkey-bytes)
                   "rendezvous-policy" (exec-rendezvous-policy state effective-map)
                   "rendezvous-offer" (exec-rendezvous-offer state effective-map privkey-bytes)
@@ -5545,7 +5576,7 @@
                   "epoch-tick" (exec-epoch-tick state effective-map privkey-bytes (or sub-id-str "global"))
                   "verify-subnet-anchor" (exec-verify-subnet-anchor state effective-map (or sub-id-str "global"))
                   "wait" (exec-wait state effective-map)
-                  "retransmit-outbox" (exec-retransmit-outbox state effective-map)
+                  "retransmit-outbox" (exec-retransmit-outbox state effective-map privkey-bytes)
                   "export-poll" (exec-export-poll state effective-map privkey-bytes)
                   "import-poll" (exec-import-poll state effective-map privkey-bytes)
                   "import" (exec-import state effective-map privkey-bytes)
@@ -5873,6 +5904,8 @@
            ack-sign-bytes (fressian/utf8->bytes (str "ack-" session-id "-" contiguous-ack-seq "-" msg-seq "-" (str/join "," seen-vec)))
            sig (crypto/sign privkey-bytes ack-sign-bytes)
            sig-hex (if (string? sig) sig (basalt/bytes->hex sig))
+           p2p-open? (true? (get-in state [:sessions session-id :p2p :connected?]))
+           burn-amt (if p2p-open? 0 100)
            ack-payload {:protocol-version current-wire-version
                         :wire-format current-wire-format
                         :subnet-id (str (or (:subnet-id state) "global"))
@@ -5884,8 +5917,12 @@
                         :ack-seq contiguous-ack-seq
                         :acked-seq msg-seq
                         :seen-seqs seen-vec
-                        :signature sig-hex}]
-       (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload ack-payload) 100 (str (or (:subnet-id state) "global")))))))
+                        :signature sig-hex}
+           raw-env (build-gossip-envelope (:pubkey state) privkey-bytes (freeze-payload ack-payload) burn-amt (str (or (:subnet-id state) "global")))]
+       (cond-> raw-env
+         p2p-open? (assoc :p2p-direct? true
+                          :p2p-peer (normalize-pubkey-hex peer-pub)
+                          :p2p-session-id session-id))))))
 
 (defn- handle-wire-sealed-msg [state msg privkey-bytes]
   (try

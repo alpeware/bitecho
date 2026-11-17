@@ -724,8 +724,14 @@
           (let [norm-pk (:pubkey v)
                 nonce (:nonce v)
                 state-with-nonce (record-poll-nonce state norm-pk nonce (or (:now-ms v) now-ms))
-                since-seq (long (or (:since-seq event) 0))
-                since-bseq (long (or (:since-broadcast-seq event) 0))
+                raw-since-seq (long (or (:since-seq event) 0))
+                raw-since-bseq (long (or (:since-broadcast-seq event) 0))
+                max-inbox-seq (long (get-in state [:inbox-seqs norm-pk] 0))
+                max-bcast-seq (long (get state :next-broadcast-seq 0))
+                reset-seq? (> raw-since-seq max-inbox-seq)
+                reset-bseq? (> raw-since-bseq max-bcast-seq)
+                since-seq (if reset-seq? 0 raw-since-seq)
+                since-bseq (if reset-bseq? 0 raw-since-bseq)
                 ttl-ms (long (get state :ttl-ms 86400000))
                 cutoff-ms (- now-ms ttl-ms)
                 inbox (filterv (fn [e] (and (> (long (:relay-seq e)) since-seq)
@@ -750,7 +756,19 @@
                                                    (contains? sub-filter-set "*"))))
                                            all-bcasts)
                                   all-bcasts)
-                new-st (update-in state-with-nonce [:diagnostics :polled] (fnil inc 0))]
+                watermark-reset? (or reset-seq? reset-bseq?)
+                new-st (cond-> (update-in state-with-nonce [:diagnostics :polled] (fnil inc 0))
+                         watermark-reset?
+                         (update-in [:diagnostics :watermark-reset] (fnil inc 0)))
+                effs (if watermark-reset?
+                       [{:effect :diagnose
+                         :reason :relay-watermark-reset
+                         :pubkey norm-pk
+                         :since-seq raw-since-seq
+                         :max-inbox-seq max-inbox-seq
+                         :since-broadcast-seq raw-since-bseq
+                         :max-broadcast-seq max-bcast-seq}]
+                       [])]
             {:state new-st
              :ok? true
              :response {"ok" true
@@ -758,7 +776,7 @@
                         "messages" inbox
                         "broadcasts" filtered-bcasts
                         "last_broadcast_seq" max-bseq}
-             :effects []})))
+             :effects effs})))
 
       :relay-ack
       (let [ack-seq (long (or (:ack-seq event) 0))

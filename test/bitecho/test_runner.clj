@@ -15,6 +15,7 @@
             [bitecho.d25-remediation-scenarios-test]
             [bitecho.d26-remediation-scenarios-test]
             [bitecho.d27-publishing-and-remediation-test]
+            [bitecho.d28-autosync-and-p2p-ack-hotfix-test]
             [bitecho.demo.angels-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

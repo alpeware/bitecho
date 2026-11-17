@@ -1270,10 +1270,14 @@
                                 st @relay-atom
                                 ttl-ms (long (get st :ttl-ms 86400000))
                                 cutoff-ms (- (System/currentTimeMillis) ttl-ms)
-                                fresh-msgs (filterv (fn [e] (and (> (long (:relay-seq e)) since-seq)
+                                max-inbox-seq (long (get-in st [:inbox-seqs norm-pk] 0))
+                                max-bcast-seq (long (get st :next-broadcast-seq 0))
+                                eff-since-seq (if (> since-seq max-inbox-seq) 0 since-seq)
+                                eff-since-bseq (if (> since-bseq max-bcast-seq) 0 since-bseq)
+                                fresh-msgs (filterv (fn [e] (and (> (long (:relay-seq e)) eff-since-seq)
                                                                  (>= (long (:received-at e 0)) cutoff-ms)))
                                                     (get-in st [:inboxes norm-pk] []))
-                                fresh-bcasts (filterv (fn [e] (and (> (long (:broadcast-seq e)) since-bseq)
+                                fresh-bcasts (filterv (fn [e] (and (> (long (:broadcast-seq e)) eff-since-bseq)
                                                                    (>= (long (:received-at e 0)) cutoff-ms)))
                                                       (get st :broadcasts []))
                                 resp {"ok" true

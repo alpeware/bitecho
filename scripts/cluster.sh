@@ -512,7 +512,7 @@ cmd_deploy() {
   local skip_e2e_gate=false
   local canary_mode=false
   local rolling_mode=false
-  local streamlet_validators="node1,node2,node3"
+  local streamlet_validators="${STREAMLET_VALIDATORS:-node1,node2,node3,ns1,ns2,ns3}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --network)
@@ -1006,6 +1006,16 @@ TXT_BOOTSTRAP_EOF
     cp -f "${ROOT_DIR}/devnet/bootstrap.edn" "${clj_web_public}/devnet/bootstrap.edn"
     chmod 644 "${clj_web_public}/devnet/bootstrap.txt" "${clj_web_public}/devnet/bootstrap.edn"
   fi
+
+  # Sync bootstrap descriptors to /etc/bitecho-infra/ and /var/www/clj-web/public/devnet/ on ns1..ns3 (F-D28-1)
+  for ns_node in ns1 ns2 ns3; do
+    if printf '%s\n' "${NODES[@]}" | grep -qx "${ns_node}"; then
+      echo "--> Syncing bootstrap descriptors to ${ns_node}..."
+      scp_to "${ROOT_DIR}/devnet/bootstrap.txt" "${ns_node}" "/tmp/bitecho-bootstrap.txt" || true
+      scp_to "${ROOT_DIR}/devnet/bootstrap.edn" "${ns_node}" "/tmp/bitecho-bootstrap.edn" || true
+      ssh_cmd "${ns_node}" "sudo mkdir -p /etc/bitecho-infra /var/www/clj-web/public/devnet && sudo cp -f /tmp/bitecho-bootstrap.txt /etc/bitecho-infra/bootstrap.txt && sudo cp -f /tmp/bitecho-bootstrap.txt /var/www/clj-web/public/devnet/bootstrap.txt && sudo cp -f /tmp/bitecho-bootstrap.edn /var/www/clj-web/public/devnet/bootstrap.edn && sudo chmod 644 /etc/bitecho-infra/bootstrap.txt /var/www/clj-web/public/devnet/bootstrap.txt /var/www/clj-web/public/devnet/bootstrap.edn" || true
+    fi
+  done
 
   # 7. Restart bitecho.service and poll healthz (supports --canary / --rolling order: ns3 -> node3 -> E2E gate -> ns2 -> ns1 -> node2 -> node1)
   echo "--> Step 7/7: Writing bitecho.service, restarting service, and verifying healthz (canary=${canary_mode}, rolling=${rolling_mode})..."

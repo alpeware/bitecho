@@ -2479,7 +2479,7 @@
         (is (= (* 2 burn) (get-in st-b [:epoch-burns 0])))))))
 
 (deftest test-ttl-pruned-gossip-pulls-and-prevents-reburn
-  (testing "Gossip message that is TTL-pruned from :messages and :contagion-known-ids is pulled on remote summary advertisement, but prevents double burn deduction on receipt (F-D27-13)"
+  (testing "Gossip message that is TTL-pruned into :expired-gossip-ids is never re-pulled or re-accepted (F-D28-2), while un-received gossip with a finalized Streamlet burn receipt is lazy-pulled once without double-burning (F-D27-13)"
     (let [kp (crypto/generate-keypair)
           sender (basalt/bytes->hex (:public kp))
           payload (.getBytes "test-ttl-pruned-payload" "UTF-8")
@@ -2496,22 +2496,46 @@
       (is (contains? (:contagion-known-ids st1) msg-id))
       (is (contains? (get-in st1 [:murmur-cache :set]) msg-id))
       (is (contains? (:messages st1) msg-id))
+      ;; Part A (F-D28-2): Once TTL-pruned into :expired-gossip-ids, zombie gossip is neither re-pulled nor re-accepted
       (let [st-pruned (reduce (fn [s _] (:state (sm/handle-event s {:type :tick}))) st1 (range 3))]
         (is (> (:epoch st-pruned) 2))
         (is (not (contains? (:messages st-pruned) msg-id)))
         (is (not (contains? (:contagion-known-ids st-pruned) msg-id)))
         (is (not (contains? (get-in st-pruned [:murmur-cache :set]) msg-id)))
+        (is (contains? (:expired-gossip-ids st-pruned) msg-id))
         (let [res-summary (sm/handle-event st-pruned {:type :receive-summary :sender "peer-remote" :summary #{msg-id}})]
-          (is (seq (filter (fn [cmd]
-                             (and (= :send-pull-request (:type cmd))
-                                  (contains? (:missing-ids cmd) msg-id)))
-                           (:commands res-summary)))))
+          (is (empty? (filter (fn [cmd]
+                                (and (= :send-pull-request (:type cmd))
+                                     (contains? (:missing-ids cmd) msg-id)))
+                              (:commands res-summary)))))
         (let [res2 (sm/handle-event st-pruned {:type :receive-gossip :message sieve-msg})
               st2 (:state res2)]
           (is (= 9500 (get-in st2 [:ledger sender :balance])))
-          (is (nil? (get-in st2 [:epoch-burns (:epoch st2)]))))))))
+          (is (nil? (get-in st2 [:epoch-burns (:epoch st2)])))
+          (is (not (contains? (:messages st2) msg-id)))
+          (is (not (contains? (:contagion-known-ids st2) msg-id)))
+          (is (not (contains? (get-in st2 [:murmur-cache :set]) msg-id)))
+          (is (empty? (:commands res2)))
+          (is (= 1 (get-in st2 [:diagnostics :expired-gossip-dropped])))))
+      ;; Part B (F-D27-13): When burn receipt arrived via Streamlet block before the gossip payload (not in :expired-gossip-ids),
+      ;; :receive-summary DOES emit :send-pull-request and :receive-gossip accepts the payload once without double-burning.
+      (let [burn-rid (str "gossip-burn:" msg-id)
+            st-burn-only (-> state
+                             (assoc-in [:ledger sender :balance] 9500)
+                             (update :known-receipt-ids conj burn-rid)
+                             (update :executed-receipt-ids conj burn-rid))
+            res-sum-b (sm/handle-event st-burn-only {:type :receive-summary :sender "peer-remote" :summary #{msg-id}})
+            res-gos-b (sm/handle-event st-burn-only {:type :receive-gossip :message sieve-msg})
+            st-gos-b (:state res-gos-b)]
+        (is (seq (filter (fn [cmd]
+                           (and (= :send-pull-request (:type cmd))
+                                (contains? (:missing-ids cmd) msg-id)))
+                         (:commands res-sum-b))))
+        (is (= 9500 (get-in st-gos-b [:ledger sender :balance])))
+        (is (contains? (:messages st-gos-b) msg-id))
+        (is (contains? (:contagion-known-ids st-gos-b) msg-id))))))
 
-(defspec ^{:doc "Property: TTL-pruned gossip messages allow lazy pull when advertised in anti-entropy summaries, but prevent double burn deduction on receipt (F-D27-13)"}
+(defspec ^{:doc "Property: TTL-pruned gossip messages recorded in :expired-gossip-ids are never re-pulled, re-burned, or re-accepted (F-D28-2), while un-expired burn-receipt-only gossip is lazy-pulled once without double-burning (F-D27-13)"}
   prop-ttl-pruned-gossip-no-reburn-or-pull 25
   (prop/for-all [initial-balance (gen/choose 1000 5000)
                  burn-amt (gen/choose 100 500)
@@ -2541,8 +2565,13 @@
                        (not (contains? (:messages st-pruned) msg-id))
                        (not (contains? (:contagion-known-ids st-pruned) msg-id))
                        (not (contains? (get-in st-pruned [:murmur-cache :set]) msg-id))
-                       (seq pull-commands)
-                       (= bal-after-1 bal-after-2)))))
+                       (contains? (:expired-gossip-ids st-pruned) msg-id)
+                       (empty? pull-commands)
+                       (= bal-after-1 bal-after-2)
+                       (not (contains? (:messages st2) msg-id))
+                       (not (contains? (:contagion-known-ids st2) msg-id))
+                       (not (contains? (get-in st2 [:murmur-cache :set]) msg-id))
+                       (empty? (:commands res-gossip2))))))
 
 (defn- exchange-block-and-votes
   "Given current 3-node states [s0 s1 s2], sorted pubs [pub0 pub1 pub2], epoch ep,

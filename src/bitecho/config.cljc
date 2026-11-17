@@ -14,12 +14,12 @@
   (:require [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
-;; Protocol Release Version & Sunsets (Milestone D27)
+;; Protocol Release Version & Sunsets (Milestone D28)
 ;; ---------------------------------------------------------------------------
 
 (def version
   "Current protocol and release milestone version."
-  "0.23.5")
+  "0.23.6")
 
 (def infra-cold-root-pubkey
   "Pinned Cold Offline Infra Root Ed25519 public key (HEX) for on-network artifact attestation."

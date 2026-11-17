@@ -13,6 +13,7 @@
             [bitecho.d25-remediation-scenarios-test :as d25-test]
             [bitecho.d26-remediation-scenarios-test :as d26-test]
             [bitecho.d27-publishing-and-remediation-test :as d27-test]
+            [bitecho.d28-autosync-and-p2p-ack-hotfix-test :as d28-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
             [bitecho.fressian :as fressian]
@@ -429,11 +430,34 @@
      :count (count results)
      :scenarios results}))
 
+(defn run-d28-scenarios
+  "Runs Milestone D28 (v0.23.6) auto-sync, zombie gossip, & direct-leg ack hotfix verification suite."
+  []
+  (let [scenarios [{:id "D28-1" :name "preserve-dynamic-validators-across-restarts" :test-fn d28-test/test-f-d28-1-preserve-dynamic-validators-across-restarts}
+                   {:id "D28-2" :name "three-node-lagging-peer-zombie-gossip-e2e" :test-fn d28-test/test-f-d28-2-three-node-lagging-peer-zombie-gossip-e2e}
+                   {:id "D28-3" :name "lock-free-query-chain-state-and-no-empty-signing" :test-fn d28-test/test-f-d28-3-lock-free-query-chain-state-and-no-empty-signing}
+                   {:id "D28-4" :name "direct-leg-session-ack-and-outbox-fallback" :test-fn d28-test/test-f-d28-4-direct-leg-session-ack-and-outbox-fallback}
+                   {:id "D28-5" :name "relay-watermark-reset-on-restart" :test-fn d28-test/test-f-d28-4-relay-watermark-reset-on-restart}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D27 (v0.23.5) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D28 (v0.23.6) release verification proof and returns a deterministic EDN map."
   [opts]
-  (let [ver (or (:version opts) "v0.23.5")
-        ms (or (:milestone opts) "D27")
+  (let [ver (or (:version opts) (str "v" config/version))
+        ms (or (:milestone opts) "D28")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
@@ -443,6 +467,7 @@
         d25-scenarios (run-d25-scenarios)
         d26-scenarios (run-d26-scenarios)
         d27-scenarios (run-d27-scenarios)
+        d28-scenarios (run-d28-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
         _ (assert (and (.exists bundle-file) (pos? (.length bundle-file)))
                   "dist/bitecho-light-node.cjs must exist and be non-empty before release proof generation!")
@@ -461,7 +486,8 @@
                                   (:all-passed? d24-scenarios)
                                   (:all-passed? d25-scenarios)
                                   (:all-passed? d26-scenarios)
-                                  (:all-passed? d27-scenarios)))]
+                                  (:all-passed? d27-scenarios)
+                                  (:all-passed? d28-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
@@ -469,10 +495,17 @@
      :tree-sha tree-sha
      :node-bundle-sha256 bundle-sha
      :browser-bundle-sha256 browser-sha
+     :test-namespaces ["bitecho.d24-remediation-scenarios-test"
+                       "bitecho.d25-remediation-scenarios-test"
+                       "bitecho.d26-remediation-scenarios-test"
+                       "bitecho.d27-publishing-and-remediation-test"
+                       "bitecho.d28-autosync-and-p2p-ack-hotfix-test"
+                       "bitecho.state-machine-test"]
      :d24-remediation-scenarios d24-scenarios
      :d25-remediation-scenarios d25-scenarios
      :d26-remediation-scenarios d26-scenarios
      :d27-remediation-scenarios d27-scenarios
+     :d28-remediation-scenarios d28-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}
@@ -480,9 +513,9 @@
      :rolling-upgrade rolling-res}))
 
 (defn -main
-  "CLI entrypoint generating the Milestone D27 release proof EDN artifact."
+  "CLI entrypoint generating the Milestone D28 release proof EDN artifact."
   [& args]
-  (let [out-path (or (first args) "docs/releases/v0.23.5-proof.edn")
+  (let [out-path (or (first args) (str "docs/releases/v" config/version "-proof.edn"))
         proof (run-release-proof {})
         out-file (io/file out-path)]
     (when-let [parent (.getParentFile out-file)]

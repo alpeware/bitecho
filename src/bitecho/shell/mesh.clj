@@ -504,73 +504,80 @@
       (or (:bootstrap-sunset-epoch cfg) (get-in cluster-cfg [:bootstrap-sunset-epoch]))
       (assoc :bootstrap-sunset-epoch (or (:bootstrap-sunset-epoch cfg) (get-in cluster-cfg [:bootstrap-sunset-epoch]))))))
 
+(declare rebind-restored-state)
+
 (defn build-initial-node-state
-  "Constructs initial Bitecho state from cluster config and node identity."
-  [cfg identity]
-  (let [node-id (or (:node/id cfg) (:node-id cfg) (:node-id identity))
-        pubkey-hex (:pubkey-hex identity)
-        pubkey-bytes (resolve-pubkey-bytes (get-in identity [:keypair :public]))
-        privkey-bytes (resolve-pubkey-bytes (get-in identity [:keypair :private]))
-        cluster-cfg (get cfg :cluster {})
-        nodes-cfg (get cluster-cfg :nodes {})
-        raw-validators (or (:validators cluster-cfg) (keys nodes-cfg))
-        validators (vec (sort (keep (fn [v] (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)) raw-validators)))
-        raw-mesh (:mesh-nodes cluster-cfg)
-        mesh-nodes (cond
-                     (map? raw-mesh)
-                     (into {} (keep (fn [[k w]]
-                                      (let [pk (if (keyword? k) (get-in nodes-cfg [k :pubkey]) k)]
-                                        (when pk [pk (double (or w 1.0))])))
-                                    raw-mesh))
-                     (coll? raw-mesh)
-                     (into {} (keep (fn [v]
-                                      (let [pk (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)]
-                                        (when pk [pk 1.0])))
-                                    raw-mesh))
-                     :else
-                     (into {} (map (fn [pk] [pk 1.0]) validators)))
-        peer-entries (for [[_ ninfo] nodes-cfg
-                           :let [pk (:pubkey ninfo)
-                                 pk-bytes (resolve-pubkey-bytes pk)]
-                           :when (some? pk-bytes)]
-                       [(if (string? pk) pk (basalt/bytes->hex pk-bytes))
-                        pk-bytes])
-        peers-map (into {pubkey-hex pubkey-bytes} peer-entries)
-        initial-peers (vec (for [[nid ninfo] nodes-cfg
-                                 :when (not= nid node-id)
-                                 :let [pk (:pubkey ninfo)
-                                       pk-bytes (resolve-pubkey-bytes pk)]
-                                 :when (some? pk-bytes)]
-                             (basalt/make-peer (or (:ip ninfo) (:ip4 ninfo) "127.0.0.1")
-                                               (or (:port ninfo) 8000)
-                                               pk-bytes)))
-        overrides (extract-top-level-overrides cfg cluster-cfg)
-        explicit-network (or (:network cfg) (get-in cfg [:cluster :network]))
-        base-proto-cfg (case explicit-network
-                         :devnet config/devnet-config
-                         :testnet config/testnet-config
-                         :mainnet config/mainnet-config
-                         config/default-config)
-        net-uri (or (config/resolve-network-uri cfg)
-                    (:network-uri base-proto-cfg)
-                    "devnet.bitecho.org")
-        proto-cfg (merge base-proto-cfg
-                         (get cfg :protocol {})
-                         (get cluster-cfg :protocol {})
-                         overrides
-                         {:network-uri net-uri
-                          :validators validators
-                          :mesh-nodes mesh-nodes})
-        base-state (sm/init-state initial-peers pubkey-hex proto-cfg)]
-    (merge base-state
-           overrides
-           {:node-id node-id
-            :node-pubkey pubkey-hex
-            :node-private-key privkey-bytes
-            :keypair (:keypair identity)
-            :validators validators
-            :peers-map peers-map
-            :mesh-nodes mesh-nodes})))
+  "Constructs initial Bitecho state from cluster config and node identity
+   (or rebinds `loaded-state` when provided as 3rd argument)."
+  ([cfg identity]
+   (let [node-id (or (:node/id cfg) (:node-id cfg) (:node-id identity))
+         pubkey-hex (:pubkey-hex identity)
+         pubkey-bytes (resolve-pubkey-bytes (get-in identity [:keypair :public]))
+         privkey-bytes (resolve-pubkey-bytes (get-in identity [:keypair :private]))
+         cluster-cfg (get cfg :cluster {})
+         nodes-cfg (get cluster-cfg :nodes {})
+         raw-validators (or (:validators cluster-cfg) (keys nodes-cfg))
+         validators (vec (sort (keep (fn [v] (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)) raw-validators)))
+         raw-mesh (:mesh-nodes cluster-cfg)
+         mesh-nodes (cond
+                      (map? raw-mesh)
+                      (into {} (keep (fn [[k w]]
+                                       (let [pk (if (keyword? k) (get-in nodes-cfg [k :pubkey]) k)]
+                                         (when pk [pk (double (or w 1.0))])))
+                                     raw-mesh))
+                      (coll? raw-mesh)
+                      (into {} (keep (fn [v]
+                                       (let [pk (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)]
+                                         (when pk [pk 1.0])))
+                                     raw-mesh))
+                      :else
+                      (into {} (map (fn [pk] [pk 1.0]) validators)))
+         peer-entries (for [[_ ninfo] nodes-cfg
+                            :let [pk (:pubkey ninfo)
+                                  pk-bytes (resolve-pubkey-bytes pk)]
+                            :when (some? pk-bytes)]
+                        [(if (string? pk) pk (basalt/bytes->hex pk-bytes))
+                         pk-bytes])
+         peers-map (into {pubkey-hex pubkey-bytes} peer-entries)
+         initial-peers (vec (for [[nid ninfo] nodes-cfg
+                                  :when (not= nid node-id)
+                                  :let [pk (:pubkey ninfo)
+                                        pk-bytes (resolve-pubkey-bytes pk)]
+                                  :when (some? pk-bytes)]
+                              (basalt/make-peer (or (:ip ninfo) (:ip4 ninfo) "127.0.0.1")
+                                                (or (:port ninfo) 8000)
+                                                pk-bytes)))
+         overrides (extract-top-level-overrides cfg cluster-cfg)
+         explicit-network (or (:network cfg) (get-in cfg [:cluster :network]))
+         base-proto-cfg (case explicit-network
+                          :devnet config/devnet-config
+                          :testnet config/testnet-config
+                          :mainnet config/mainnet-config
+                          config/default-config)
+         net-uri (or (config/resolve-network-uri cfg)
+                     (:network-uri base-proto-cfg)
+                     "devnet.bitecho.org")
+         proto-cfg (merge base-proto-cfg
+                          (get cfg :protocol {})
+                          (get cluster-cfg :protocol {})
+                          overrides
+                          {:network-uri net-uri
+                           :validators validators
+                           :mesh-nodes mesh-nodes})
+         base-state (sm/init-state initial-peers pubkey-hex proto-cfg)]
+     (merge base-state
+            overrides
+            {:node-id node-id
+             :node-pubkey pubkey-hex
+             :node-private-key privkey-bytes
+             :keypair (:keypair identity)
+             :validators validators
+             :peers-map peers-map
+             :mesh-nodes mesh-nodes})))
+  ([cfg identity loaded-state]
+   (if loaded-state
+     (rebind-restored-state loaded-state cfg identity)
+     (build-initial-node-state cfg identity))))
 
 (defn rebind-restored-state
   "Rebinds node private keys, credentials, and configuration overrides to a deserialized snapshot state."
@@ -610,7 +617,18 @@
         nodes-cfg (get cluster-cfg :nodes {})
         raw-validators (or (:validators cluster-cfg) (keys nodes-cfg))
         cfg-validators (vec (sort (keep (fn [v] (if (keyword? v) (get-in nodes-cfg [v :pubkey]) v)) raw-validators)))
-        effective-validators (if (seq cfg-validators) cfg-validators (:validators loaded-state))
+        effective-validators (cond
+                               (:force-config-validators? cluster-cfg)
+                               cfg-validators
+
+                               (seq (:validators loaded-state))
+                               (vec (sort (distinct (into (vec (:validators loaded-state)) cfg-validators))))
+
+                               (seq cfg-validators)
+                               cfg-validators
+
+                               :else
+                               (:validators loaded-state))
         raw-mesh (:mesh-nodes cluster-cfg)
         cfg-mesh-nodes (cond
                          (map? raw-mesh)
@@ -624,10 +642,15 @@
                                             (when pk [pk 1.0])))
                                         raw-mesh))
                          :else nil)
-        effective-mesh-nodes (or (when (seq cfg-mesh-nodes) cfg-mesh-nodes)
-                                 (when (seq effective-validators)
-                                   (into {} (map (fn [pk] [pk 1.0]) effective-validators)))
-                                 (:mesh-nodes loaded-state))
+        loaded-mesh (when (map? (:mesh-nodes loaded-state)) (:mesh-nodes loaded-state))
+        base-validator-mesh (when (seq effective-validators)
+                              (into {} (map (fn [pk] [pk 1.0]) effective-validators)))
+        effective-mesh-nodes (if (:force-config-validators? cluster-cfg)
+                               (or (when (seq cfg-mesh-nodes) cfg-mesh-nodes)
+                                   base-validator-mesh
+                                   loaded-mesh)
+                               (let [merged-mesh (merge base-validator-mesh loaded-mesh cfg-mesh-nodes)]
+                                 (when (seq merged-mesh) merged-mesh)))
         peer-entries (for [[_ ninfo] nodes-cfg
                            :let [pk (:pubkey ninfo)
                                  pk-bytes (resolve-pubkey-bytes pk)]
@@ -637,6 +660,11 @@
         effective-peers-map (into (or (:peers-map loaded-state) {})
                                   (cond-> peer-entries
                                     pubkey-bytes (conj [pubkey-hex pubkey-bytes])))
+        exec-receipt-ids (or (:executed-receipt-ids loaded-state) #{})
+        cleaned-pending-receipts (if (seq (:pending-receipts loaded-state))
+                                   (filterv #(not (contains? exec-receipt-ids (:receipt-id %)))
+                                            (:pending-receipts loaded-state))
+                                   (or (:pending-receipts loaded-state) []))
         merged-config (cond-> (merge (or (:config loaded-state) {})
                                      (get config :protocol {})
                                      (get cluster-cfg :protocol {})
@@ -655,6 +683,7 @@
                     :executed-finalized-blocks (or (:executed-finalized-blocks loaded-state)
                                                    (:finalized-blocks loaded-state)
                                                    #{})
+                    :pending-receipts cleaned-pending-receipts
                     :ledger merged-ledger}
              (seq effective-validators) (assoc :validators effective-validators)
              (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes)
@@ -1984,9 +2013,11 @@
                                                                {:type :on-message :generation @node-gen :node agent-node :channel-id cid}))]
                          (when (or (nil? agent-conns) query-only? (= agent-node (:node updated)))
                            (if query-only?
-                             (let [st (or (when shell-node (query-node-state shell-node 500)) {})
+                             (let [st (or (when-let [sa (:state-atom shell-node)] @sa)
+                                          (when shell-node (query-node-state shell-node 500)))
                                    v-id (or validator-identity (:identity shell-node))
-                                   snapshot (build-validator-chain-state-snapshot st v-id (:pubkey unwrapped) (:nonce unwrapped))]
+                                   snapshot (when (and (map? st) (seq st))
+                                              (build-validator-chain-state-snapshot st v-id (:pubkey unwrapped) (:nonce unwrapped)))]
                                (when (and (map? snapshot) (string? (:signature snapshot)) (not (str/blank? (:signature snapshot))))
                                  (try
                                    (api/send! agent-node (fressian/encode-wire snapshot) cid)
