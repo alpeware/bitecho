@@ -846,7 +846,12 @@
                 (str/starts-with? subpath "releases/")
                 (let [target-path subpath
                       r1 (infra/resolve-path-blob! rt target-path now-ms)
-                      r (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))]
+                      r2 (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))
+                      r (if (:ok? r2)
+                          r2
+                          (if-let [cr (get-in config [:http :content-root])]
+                            (resolve-safe-content-root cr raw-path)
+                            r2))]
                   (if (:ok? r)
                     (render-resolved-blob config req r method)
                     (do

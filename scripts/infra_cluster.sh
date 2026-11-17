@@ -892,24 +892,44 @@ EOF_GIT_INDEX
     rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding/index.md"
     if [[ -f "${ROOT_DIR}/devnet/bootstrap.txt" && -f "${ROOT_DIR}/devnet/bootstrap.edn" ]]; then
-      ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "mkdir -p /var/www/clj-web/public/devnet"
+      ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "mkdir -p /var/www/clj-web/public/devnet /var/www/clj-web/public/releases/v0.23.5 /var/www/clj-web/public/releases/latest /var/www/clj-web/public/docs/bips /var/www/clj-web/public/web/blog"
       rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/devnet/bootstrap.txt" "${SSH_USER}@${ip}:/var/www/clj-web/public/devnet/bootstrap.txt"
       rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/devnet/bootstrap.edn" "${SSH_USER}@${ip}:/var/www/clj-web/public/devnet/bootstrap.edn"
     fi
+    if [[ -d "${ROOT_DIR}/docs/bips" ]]; then
+      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        "${ROOT_DIR}/docs/bips/" "${SSH_USER}@${ip}:/var/www/clj-web/public/docs/bips/"
+    fi
+    if [[ -d "${ROOT_DIR}/web/blog" ]]; then
+      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        "${ROOT_DIR}/web/blog/" "${SSH_USER}@${ip}:/var/www/clj-web/public/web/blog/"
+    fi
+    if [[ -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-light-node.cjs" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
+      for rel_dir in "v0.23.5" "latest"; do
+        rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+          "${ROOT_DIR}/dist/bitecho-light-node.cjs" \
+          "${ROOT_DIR}/dist/bitecho-browser.js" \
+          "${ROOT_DIR}/dist/bitecho-browser.js.sri" \
+          "${ROOT_DIR}/docs/releases/v0.23.5-proof.edn" \
+          "${SSH_USER}@${ip}:/var/www/clj-web/public/releases/${rel_dir}/"
+        ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" \
+          "cp -f /var/www/clj-web/public/releases/${rel_dir}/v0.23.5-proof.edn /var/www/clj-web/public/releases/${rel_dir}/proof.edn"
+      done
+    fi
     if [[ ( "${DEPLOY_LIVE:-0}" == "1" || "${1:-}" == "--deploy" ) && -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
       rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/dist/bitecho-browser.js" \
         "${ROOT_DIR}/dist/bitecho-browser.js.sri" \
-        "${ROOT_DIR}/dist/index.html" \
+        "${ROOT_DIR}/resources/public/index.html" \
         "${SSH_USER}@${ip}:/var/www/clj-web/public/app/"
-      if [[ -f "${ROOT_DIR}/dist/relay.html" ]]; then
+      if [[ -f "${ROOT_DIR}/resources/public/relay.html" ]]; then
         rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
-          "${ROOT_DIR}/dist/relay.html" \
+          "${ROOT_DIR}/resources/public/relay.html" \
           "${SSH_USER}@${ip}:/var/www/clj-web/public/relay.html"
         rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
-          "${ROOT_DIR}/dist/relay.html" \
+          "${ROOT_DIR}/resources/public/relay.html" \
           "${SSH_USER}@${ip}:/var/www/clj-web/public/app/relay.html"
       fi
     fi
