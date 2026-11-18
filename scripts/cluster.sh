@@ -422,8 +422,8 @@ EDN_EOF
 # ------------------------------------------------------------------------------
 
 verify_release_proof_gate() {
-  local version="${1:-$(tr '\n' ' ' < "${ROOT_DIR}/src/bitecho/config.cljc" | sed -n -E 's/.*\(def[[:space:]]+version[^"]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p')}"
-  version="${version:-0.23.7}"
+  local version="${1:-$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
+  version="${version:-0.23.8}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Step 0a/8: Verifying Release Proof Gate for v${version}..."

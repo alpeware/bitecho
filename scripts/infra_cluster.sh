@@ -274,8 +274,8 @@ REMOTE_CUT
 }
 
 verify_release_proof_gate() {
-  local version="${1:-$(sed -n -E 's/.*version\s+"([^"]+)".*/\1/p' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.7}"
+  local version="${1:-$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
+  version="${version:-0.23.8}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Verifying Release Proof Gate for v${version}..."
