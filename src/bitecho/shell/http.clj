@@ -1358,7 +1358,7 @@
                           (when (map? env-val) env-val))]
         (when (map? unwrapped)
           (let [mtype (keyword (or (:bitecho/type unwrapped) (:type unwrapped) (get unwrapped "type")))]
-            (when (contains? #{:artifact-replicate :replicate-pointer} mtype)
+            (when (contains? #{:sync-pointer :artifact-replicate :replicate-pointer} mtype)
               (let [ptr (normalize-artifact-pointer (or (:pointer unwrapped) (get unwrapped "pointer") unwrapped))
                     blob-res (normalize-artifact-blob (or (:blob unwrapped) (get unwrapped "blob")))
                     sender (or (:pointer/authority ptr)

@@ -17,6 +17,7 @@
             [bitecho.economy.burn :as burn]
             [bitecho.economy.escrow :as escrow]
             [bitecho.economy.puzzle :as puzzle]
+            [bitecho.fido :as fido]
             [bitecho.fressian :as fressian]
             [bitecho.governance.core :as gov]
             [bitecho.light-node.cli :as cli]
@@ -92,6 +93,48 @@
   "Serializes sanitized light-node state into cross-platform Fressian bytes (`state.fressian`)."
   [state]
   (fressian/encode-wire-uncompressed (strip-sensitive-keys state)))
+
+(defn legacy-v0238-state?
+  "Returns true if `state` is a decoded v0.23.8 state map containing legacy split pointer/blob
+   stores without unified `:pointers` / `:blobs` projection (`BIP-005` / `F-U5`)."
+  [state]
+  (and (map? state)
+       (nil? (:pointers state))
+       (boolean (or (seq (:artifact-pointers state))
+                    (seq (:storage-pointers state))
+                    (seq (:capabilities state))
+                    (seq (get-in state [:governance :pointers]))))))
+
+(defn migrate-light-state
+  "Idempotently migrates a light-node state map so that all legacy domain pointer/blob maps
+   (`:artifact-pointers`, `:storage-pointers`, `:capabilities`, `[:governance :pointers]`,
+    `:artifact-blobs`, `:storage-blobs`, `:capability-blobs`, `[:governance :blobs]`)
+   are projected into the unified `:pointers` and `:blobs` maps (`BIP-005` / `F-U4`, `F-U5`)."
+  [state]
+  (if-not (map? state)
+    state
+    (let [cap-ptrs (into {}
+                         (keep (fn [[k v]]
+                                 (let [ptr (if (and (map? v) (:pointer v)) (:pointer v) v)]
+                                   (when (and (map? ptr) (:pointer/path ptr))
+                                     [k ptr]))))
+                         (:capabilities state))
+          merged-ptrs (merge (or (get-in state [:governance :pointers]) {})
+                             cap-ptrs
+                             (or (:storage-pointers state) {})
+                             (or (:artifact-tombstones state) {})
+                             (or (:artifact-pointers state) {})
+                             (or (:pointers state) {}))
+          merged-blobs (merge (or (get-in state [:governance :blobs]) {})
+                              (or (:capability-blobs state) {})
+                              (or (:storage-blobs state) {})
+                              (or (:artifact-blobs state) {})
+                              (or (:blobs state) {}))]
+      (cond-> state
+        (or (seq merged-ptrs) (contains? state :pointers))
+        (assoc :pointers merged-ptrs)
+        (or (seq merged-blobs) (contains? state :blobs))
+        (assoc :blobs merged-blobs)))))
 
 (defn decode-light-state
   "Deserializes light-node state from Fressian bytes (`state.fressian`) across JVM and Node.js."
@@ -2401,18 +2444,20 @@
 
 (defn- filter-p2p-remote-candidates
   "Filters remote P2P candidates against local candidates, preserving shared HTTP/HTTPS relay
-   endpoints (`https://...` / `http://...`) and falling back to `remote-cands` when self-filtering
-   would empty a non-empty candidate list."
-  [local-cands remote-cands]
-  (let [local-set (set (map str local-cands))
-        rem-vec (vec (map str remote-cands))
-        filtered (vec (remove (fn [c]
-                                (and (not (shared-http-relay-candidate? c))
-                                     (contains? local-set c)))
-                              rem-vec))
-        fallback? (and (empty? filtered) (seq rem-vec))]
-    {:dialable (if fallback? rem-vec filtered)
-     :fallback? fallback?}))
+   endpoints (`https://...` / `http://...`) and optionally falling back to `remote-cands` when
+   self-filtering would empty a non-empty candidate list."
+  ([local-cands remote-cands]
+   (filter-p2p-remote-candidates local-cands remote-cands true))
+  ([local-cands remote-cands allow-fallback?]
+   (let [local-set (set (map str local-cands))
+         rem-vec (vec (map str remote-cands))
+         filtered (vec (remove (fn [c]
+                                 (and (not (shared-http-relay-candidate? c))
+                                      (contains? local-set c)))
+                               rem-vec))
+         fallback? (and allow-fallback? (empty? filtered) (seq rem-vec))]
+     {:dialable (if fallback? rem-vec filtered)
+      :fallback? fallback?})))
 
 (defn- exec-p2p-answer [state cmd-map privkey-bytes]
   (let [resolved-sid (resolve-session-id state cmd-map :open)]
@@ -4937,6 +4982,8 @@
                                              outer-sub)]
                              (merge rep-payload gossip-env {:p2p-broadcast? true})))]
         {:state (-> st-after-burn
+                    (assoc-in [:blobs cid] blob)
+                    (assoc-in [:pointers [subnet path]] ptr)
                     (assoc-in [:storage-blobs cid] blob)
                     (assoc-in [:storage-pointers [subnet path]] ptr)
                     (assoc-in [:storage-min-seqs [subnet path]] seq-num))
@@ -5108,7 +5155,8 @@
                :net-envelopes []
                :stdout-events []}
               (let [my-pub (normalize-pubkey-hex (:pubkey st-after-burn))
-                    fallback-kp (crypto/generate-keypair (str "artifact-authority-" my-pub))
+                    fallback-kp (when-not privkey-bytes
+                                  (crypto/generate-keypair (str "artifact-authority-" my-pub)))
                     eff-priv (or privkey-bytes (:private fallback-kp))
                     eff-pub (if privkey-bytes my-pub (basalt/bytes->hex (:public fallback-kp)))
                     ts (now-utc-ms)
@@ -5144,6 +5192,8 @@
                                                      outer-sub)]
                                      (merge rep-payload gossip-env {:p2p-broadcast? true})))]
                 {:state (-> st-after-burn
+                            (assoc-in [:blobs cid] blob)
+                            (assoc-in [:pointers [subnet path]] ptr)
                             (assoc-in [:artifact-blobs cid] blob)
                             (assoc-in [:artifact-pointers [subnet path]] ptr)
                             (update :artifact-tombstones dissoc [subnet path])
@@ -5195,7 +5245,8 @@
                :net-envelopes []
                :stdout-events []}
               (let [my-pub (normalize-pubkey-hex (:pubkey st-after-burn))
-                    fallback-kp (crypto/generate-keypair (str "artifact-authority-" my-pub))
+                    fallback-kp (when-not privkey-bytes
+                                  (crypto/generate-keypair (str "artifact-authority-" my-pub)))
                     eff-priv (or privkey-bytes (:private fallback-kp))
                     eff-pub (if privkey-bytes my-pub (basalt/bytes->hex (:public fallback-kp)))
                     ts (now-utc-ms)
@@ -5232,6 +5283,7 @@
                                                      outer-sub)]
                                      (merge rep-payload gossip-env {:p2p-broadcast? true})))]
                 {:state (-> st-after-burn
+                            (assoc-in [:pointers [subnet path]] ptr)
                             (update :artifact-pointers dissoc [subnet path])
                             (assoc-in [:artifact-tombstones [subnet path]] ptr)
                             (assoc-in [:artifact-min-seqs [subnet path]] seq-num))
@@ -5401,6 +5453,8 @@
                                              outer-sub)]
                              (merge rep-payload gossip-env {:p2p-broadcast? true})))]
         {:state (-> st-after-burn
+                    (assoc-in [:pointers [subnet path]] ptr)
+                    (assoc-in [:blobs cid] blob)
                     (assoc-in [:capabilities [subnet path]] ptr)
                     (assoc-in [:capability-blobs cid] blob))
          :response {"ok" true
@@ -5613,7 +5667,8 @@
                           (map? policy-map) (assoc :policy-theta policy-map)
                           (map? oracle-map) (assoc :oracle-receipts oracle-map)
                           (some? act-ep) (assoc :activate-at-epoch (long act-ep)))
-            fallback-kp (crypto/generate-keypair (str "bip-author-" (:pubkey state)))
+            fallback-kp (when-not privkey-bytes
+                          (crypto/generate-keypair (str "bip-author-" (:pubkey state))))
             eff-priv (or privkey-bytes (:private fallback-kp))
             gov-st (or (:governance st-after-burn) (gov/init-governance-state))
             res (gov/submit-bip gov-st bip-payload eff-priv)]
@@ -5899,7 +5954,8 @@
             auditor-pub (when raw-auditor
                           (normalize-pubkey-hex (or (:pubkey (resolve-counterparty state raw-auditor)) (str raw-auditor))))
             my-pub (normalize-pubkey-hex (:pubkey state))
-            fallback-kp (crypto/generate-keypair (str "bounty-maintainer-" my-pub))
+            fallback-kp (when-not privkey-bytes
+                          (crypto/generate-keypair (str "bounty-maintainer-" my-pub)))
             eff-priv (or privkey-bytes (:private fallback-kp))
             claim (if (seq explicit-claim)
                     explicit-claim
@@ -6012,12 +6068,17 @@
 
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
-   Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps.
+   Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps,
+   plus automatic 12-canonical-verb desugaring (`BIP-005` / `F-U1`).
    Tags outgoing envelopes with :subnet-id from state or command."
   [state cmd-map privkey-bytes]
-  (let [effective-map (if (map? (get cmd-map "args"))
+  (let [raw-effective (if (map? (get cmd-map "args"))
                         (merge (get cmd-map "args") (dissoc cmd-map "args"))
                         cmd-map)
+        raw-cmd (or (get raw-effective "cmd") (:cmd raw-effective))
+        effective-map (if (contains? #{"put" "get" "list" "lock" "spend" "connect" "wait-event"} (str raw-cmd))
+                        (cli/desugar-cli-cmd-map raw-effective)
+                        raw-effective)
         cmd-name (or (get effective-map "cmd") (:cmd effective-map))
         raw-min-balance (or (get effective-map "min_balance") (get effective-map "min-balance")
                             (:min-balance effective-map) (:min_balance effective-map))
@@ -7216,7 +7277,7 @@
                           local-cands-set (set (concat (get-in session [:p2p :local-candidates])
                                                        (get-in session [:p2p-meta :local-candidates])
                                                        (get-in session [:p2p-meta :preferred-candidates])))
-                          {:keys [dialable fallback?]} (filter-p2p-remote-candidates local-cands-set candidates)
+                          {:keys [dialable fallback?]} (filter-p2p-remote-candidates local-cands-set candidates false)
                           dialable-candidates dialable
                           has-candidates? (boolean (seq dialable-candidates))
                           has-local-candidates? (boolean (seq (get-in session [:p2p :local-candidates])))
@@ -7609,6 +7670,8 @@
                  "seq" (:pointer/seq ptr)
                  "authority" (:pointer/authority ptr)}]
         {:state (-> state
+                    (assoc-in [:blobs (:blob/cid blob)] blob)
+                    (assoc-in [:pointers [subnet path]] ptr)
                     (assoc-in [:storage-blobs (:blob/cid blob)] blob)
                     (assoc-in [:storage-pointers [subnet path]] ptr)
                     (assoc-in [:storage-min-seqs [subnet path]] (:pointer/seq ptr)))
@@ -7620,9 +7683,11 @@
         ptr (normalize-wire-pointer (or (:pointer msg) (get msg "pointer") msg))
         subnet (str (or (:subnet-id msg) (get msg "subnet_id") (when ptr (:pointer/subnet ptr)) "global"))
         path (str/replace (str/trim (str (or (:path msg) (get msg "path") (when ptr (:pointer/path ptr)) ""))) #"^/+" "")
+        existing-ptr (or (get-in state [:artifact-pointers [subnet path]])
+                         (get-in state [:artifact-tombstones [subnet path]])
+                         (get-in state [:pointers [subnet path]]))
         current-seq (long (or (get-in state [:artifact-min-seqs [subnet path]])
-                              (when-let [p (get-in state [:artifact-pointers [subnet path]])] (:pointer/seq p))
-                              (when-let [t (get-in state [:artifact-tombstones [subnet path]])] (:pointer/seq t))
+                              (when existing-ptr (:pointer/seq existing-ptr))
                               0))
         valid-ptr? (boolean (and (map? ptr) (not (str/blank? path)) (:ok? (data/verify-pointer ptr))))
         tombstone? (boolean (and valid-ptr? (nil? (:pointer/target ptr))))
@@ -7631,8 +7696,13 @@
                         true
                         (if (some? blob)
                           (and valid-blob? (= (:pointer/target ptr) (:blob/cid blob)))
-                          (some? (get-in state [:artifact-blobs (:pointer/target ptr)]))))
-        seq-valid? (boolean (and valid-ptr? (> (long (:pointer/seq ptr)) current-seq)))
+                          (or (some? (get-in state [:artifact-blobs (:pointer/target ptr)]))
+                              (some? (get-in state [:blobs (:pointer/target ptr)])))))
+        seq-valid? (boolean (and valid-ptr?
+                                 (if existing-ptr
+                                   (pos? (compare (data/pointer-order-tuple ptr)
+                                                  (data/pointer-order-tuple existing-ptr)))
+                                   (> (long (:pointer/seq ptr)) current-seq))))
         valid? (and valid-ptr? target-match? seq-valid?)]
     (if-not valid?
       (let [reason (cond
@@ -7658,8 +7728,9 @@
                    "seq" (:pointer/seq ptr)
                    "authority" (:pointer/authority ptr)}]
           {:state (-> state
-                      (update :artifact-pointers dissoc [subnet path])
-                      (assoc-in [:artifact-tombstones [subnet path]] ptr)
+                      (assoc-in [:pointers [subnet path]] ptr)
+                      (assoc :artifact-pointers (dissoc (or (:artifact-pointers state) {}) [subnet path]))
+                      (assoc :artifact-tombstones (assoc (or (:artifact-tombstones state) {}) [subnet path] ptr))
                       (assoc-in [:artifact-min-seqs [subnet path]] (:pointer/seq ptr)))
            :net-envelopes []
            :stdout-events [evt]})
@@ -7670,9 +7741,11 @@
                    "seq" (:pointer/seq ptr)
                    "authority" (:pointer/authority ptr)}]
           {:state (-> state
+                      (cond-> valid-blob? (assoc-in [:blobs (:blob/cid blob)] blob))
+                      (assoc-in [:pointers [subnet path]] ptr)
                       (cond-> valid-blob? (assoc-in [:artifact-blobs (:blob/cid blob)] blob))
-                      (assoc-in [:artifact-pointers [subnet path]] ptr)
-                      (update :artifact-tombstones dissoc [subnet path])
+                      (assoc :artifact-pointers (assoc (or (:artifact-pointers state) {}) [subnet path] ptr))
+                      (assoc :artifact-tombstones (dissoc (or (:artifact-tombstones state) {}) [subnet path]))
                       (assoc-in [:artifact-min-seqs [subnet path]] (:pointer/seq ptr)))
            :net-envelopes []
            :stdout-events [evt]})))))
@@ -7712,6 +7785,8 @@
                  "seq" (:pointer/seq ptr)
                  "authority" (:pointer/authority ptr)}]
         {:state (-> state
+                    (assoc-in [:blobs (:blob/cid blob)] blob)
+                    (assoc-in [:pointers [subnet path]] ptr)
                     (assoc-in [:capability-blobs (:blob/cid blob)] blob)
                     (assoc-in [:capabilities [subnet path]] ptr))
          :net-envelopes []
@@ -7910,6 +7985,28 @@
              :net-envelopes []
              :stdout-events [evt]}))))))
 
+(defn- handle-wire-sync-pointer
+  "Unified `:sync-pointer` wire handler (`BIP-005` / `F-U4`).
+   Dispatches by path/op to governance, storage, capability, or artifact pointer replication,
+   keeping both unified `:pointers` / `:blobs` and domain views in sync."
+  [state msg]
+  (let [op (keyword (or (:op msg) (get msg "op")))
+        ptr (or (:pointer msg) (get msg "pointer") msg)
+        path (str (or (:path msg) (get msg "path") (when (map? ptr) (:pointer/path ptr)) ""))]
+    (cond
+      (contains? #{:bip-submit :bip-response :bounty-create :bounty-settle} op)
+      (handle-wire-governance-replicate state msg)
+
+      (str/starts-with? path "storage/")
+      (handle-wire-storage-replicate state msg)
+
+      (or (str/starts-with? path "capability/")
+          (str/includes? path "/capability/"))
+      (handle-wire-capability-replicate state msg)
+
+      :else
+      (handle-wire-artifact-replicate state msg))))
+
 (defn handle-wire-payload
   "Processes an incoming network event or raw payload. Enforces wire protocol version compatibility,
    2-epoch skew tolerance, and anti-replay protections before dispatching to message-specific reducers."
@@ -7970,7 +8067,8 @@
                                           (:type msg)
                                           (when (or (:transfer msg) (get msg "transfer")) :transfer)
                                           (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
-                    storage-or-cap? (or (= msg-type :storage-replicate)
+                    storage-or-cap? (or (= msg-type :sync-pointer)
+                                        (= msg-type :storage-replicate)
                                         (= msg-type :artifact-replicate)
                                         (= msg-type :replicate-pointer)
                                         (= msg-type :capability-replicate)
@@ -7978,14 +8076,10 @@
                                         (= msg-type :transfer))
                     eff-inner (or inner-subnet outer-subnet "global")
                     sub-set (effective-subscribed-subnets state)
-                    unconfigured-global? (and (= expected-subnet "global")
-                                              (empty? (disj (into #{} (map str (or (:subscribed-subnets state) #{})))
-                                                            simon-nexus-axiom-subnet-id)))
                     sub-bcast? (when (= msg-type :p2p-broadcast)
                                  (or (contains? sub-set "*")
                                      (contains? sub-set eff-inner)
-                                     (config/equivalent-subnet-id? eff-inner expected-subnet active-net-uri)
-                                     unconfigured-global?))
+                                     (config/equivalent-subnet-id? eff-inner expected-subnet active-net-uri)))
                     subnet-mismatch? (or (and outer-subnet inner-subnet (not= outer-subnet "*") (not= inner-subnet "*")
                                               (not (config/equivalent-subnet-id? outer-subnet inner-subnet active-net-uri)))
                                          (if (= msg-type :p2p-broadcast)
@@ -8061,6 +8155,7 @@
                                             (not (contains? #{:chain-state-snapshot
                                                               :p2p-hub-relay
                                                               :p2p-broadcast
+                                                              :sync-pointer
                                                               :storage-replicate
                                                               :artifact-replicate
                                                               :replicate-pointer
@@ -8107,6 +8202,7 @@
                                     :p2p-answer (handle-wire-p2p-answer state msg)
                                     :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
                                     :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
+                                    :sync-pointer (handle-wire-sync-pointer state msg)
                                     :storage-replicate (handle-wire-storage-replicate state msg)
                                     :artifact-replicate (handle-wire-artifact-replicate state msg)
                                     :replicate-pointer (handle-wire-artifact-replicate state msg)
@@ -8782,3 +8878,268 @@
      :broadcast-count (count (:broadcast-inbox nexus-final))
      :duplicates-dropped dups-dropped
      :verified? true}))
+
+;; -----------------------------------------------------------------------------
+;; Human Anchor State & Command Reducer (Folded from bitecho.anchor.core in D31)
+;; -----------------------------------------------------------------------------
+
+(defn init-anchor-state
+  "Initializes Human Anchor state wrapping light-node core with human-in-the-loop policy.
+   Default policy enforces autonomous? false (human approval required)."
+  ([] (init-anchor-state {} {}))
+  ([identity-pub-map] (init-anchor-state identity-pub-map {}))
+  ([identity-pub-map opts]
+   (let [base-node (init-light-state (or identity-pub-map {}) (merge {:autonomous? false} opts))
+         key-mode (or (:key-mode opts) :yubikey-discoverable)
+         anchor-pub (:pubkey base-node)
+         anchor-addr (when anchor-pub (bech32m/pubkey->bech32m anchor-pub "ech"))]
+     (assoc base-node
+            :anchor/role :human-anchor
+            :key-mode key-mode
+            :anchor-pubkey anchor-pub
+            :anchor-address anchor-addr
+            :hot-pubkey (or (:hot-pubkey opts) anchor-pub)
+            :active-dac (:dac base-node)
+            :privkey-bytes (:privkey-bytes opts)
+            :service-offers (or (:service-offers opts) {})
+            :pending-offers (or (:pending-offers opts) [])
+            :supervised-agents (or (:supervised-agents opts) {})
+            :offers-approved 0
+            :offers-denied 0
+            :last-denied-reason nil
+            :fido-strength (fido/evaluate-authenticator-strength
+                            {:aaguid (or (:aaguid opts) "2fc0579f-8113-47ea-b116-bb5a8db9202a")
+                             :up? true :uv? true :be? true :bs? false})
+            :team-call-subnet nil))))
+
+(defn set-service-offer
+  "Configures a service offer with price and burn floor in the anchor menu."
+  [state service-id {:keys [name price burn-floor description]}]
+  (assoc-in state [:service-offers (keyword service-id)]
+            {:service-id (keyword service-id)
+             :name (or name (clojure.core/name service-id))
+             :price (or price 10)
+             :burn-floor (or burn-floor 100)
+             :description (or description "")}))
+
+(defn queue-incoming-offer
+  "Queues an incoming offer into pending-offers for human inspection and approval."
+  [state offer]
+  (let [offer-id (or (:offer-id offer) (:session-id offer) (str "offer-" (count (:pending-offers state))))
+        offer-record (assoc offer :offer-id offer-id
+                            :queued-at (or (:epoch state) 0))]
+    (update state :pending-offers (fnil conj []) offer-record)))
+
+(defn approve-offer
+  "Human-in-the-loop action: approves a pending offer.
+   Removes offer from pending-offers, increments :offers-approved,
+   and returns [new-state effects]."
+  [state offer-id & [accept-opts]]
+  (let [pending (:pending-offers state)
+        matching (first (filter #(= (:offer-id %) offer-id) pending))]
+    (if-not matching
+      [state [{:effect :diagnose :reason :offer-not-found :offer-id offer-id}]]
+      (let [new-pending (vec (remove #(= (:offer-id %) offer-id) pending))
+            new-state (-> state
+                          (assoc :pending-offers new-pending)
+                          (update :offers-approved (fnil inc 0)))
+            effect {:effect :accept-offer
+                    :offer-id offer-id
+                    :peer-id (:peer-id matching)
+                    :accepted-at (or (:epoch state) 0)
+                    :opts accept-opts}]
+        [new-state [effect]]))))
+
+(defn deny-offer
+  "Human-in-the-loop action: denies a pending offer with an explicit reason.
+   Removes offer from pending-offers, increments :offers-denied,
+   and returns [new-state effects]."
+  [state offer-id & [reason]]
+  (let [pending (:pending-offers state)
+        matching (first (filter #(= (:offer-id %) offer-id) pending))
+        rej-reason (or reason "denied-by-human-anchor")]
+    (if-not matching
+      [state [{:effect :diagnose :reason :offer-not-found :offer-id offer-id}]]
+      (let [new-pending (vec (remove #(= (:offer-id %) offer-id) pending))
+            new-state (-> state
+                          (assoc :pending-offers new-pending)
+                          (assoc :last-denied-reason rej-reason)
+                          (update :offers-denied (fnil inc 0)))
+            effect {:effect :diagnose
+                    :reason :offer-denied-by-anchor
+                    :offer-id offer-id
+                    :peer-id (:peer-id matching)
+                    :denial-reason rej-reason}]
+        [new-state [effect]]))))
+
+(def ^:private anchor-trust-boundary-disclosure
+  "Trust boundary: when using user.id/PRF seed recovery, the 32-byte seed is reconstructed in browser memory during signing; the local device and JavaScript bundle (verified via SRI) must be trusted.")
+
+(def ^:private anchor-origin-scoping-disclosure
+  "Credentials are scoped per WebAuthn RP ID / origin; self-hosted origins must re-register or import via backup seed.")
+
+(defn register-supervised-agent
+  "Registers an autonomous or semi-autonomous agent supervised by this human anchor.
+   Requires a valid signed DAC (either explicitly provided or signed using cold key in state).
+   If no signed DAC can be established, fails closed and returns state unchanged."
+  [state {:keys [agent-id hot-pubkey dac permissions max-spend scopes issued-epoch expires-epoch]}]
+  (let [anchor-pub (:anchor-pubkey state)
+        agent-key-hex (cond
+                        (string? hot-pubkey) (normalize-pubkey-hex hot-pubkey)
+                        (some? hot-pubkey) (normalize-pubkey-hex (basalt/bytes->hex hot-pubkey))
+                        :else nil)
+        effective-dac (or dac
+                          (when (and (:privkey-bytes state) agent-key-hex anchor-pub)
+                            (create-dac
+                             (:privkey-bytes state)
+                             {:anchor-pubkey (normalize-pubkey-hex anchor-pub)
+                              :agent-pubkey agent-key-hex
+                              :issued-epoch (or issued-epoch 0)
+                              :expires-epoch (or expires-epoch 1000)
+                              :max-spend-per-epoch (or max-spend 10000)
+                              :scopes (or scopes ["gossip" "offer" "settle-intent" "transfer"])})))]
+    (if-not (and (map? effective-dac) (:signature effective-dac) (:dac-id effective-dac))
+      state
+      (let [agent-record {:agent-id agent-id
+                          :hot-pubkey agent-key-hex
+                          :hot-address (when agent-key-hex (bech32m/pubkey->bech32m agent-key-hex "ech"))
+                          :dac effective-dac
+                          :status :active
+                          :permissions (or permissions scopes [:offer :message :escrow])
+                          :activity-log []
+                          :registered-at (or (:epoch state) 0)}]
+        (assoc-in state [:supervised-agents agent-id] agent-record)))))
+
+(defn log-agent-activity
+  "Appends an activity event to a supervised agent's activity log."
+  [state agent-id event]
+  (if (get-in state [:supervised-agents agent-id])
+    (update-in state [:supervised-agents agent-id :activity-log]
+               (fnil conj [])
+               (assoc event :logged-at (or (:epoch state) 0)))
+    state))
+
+(defn pause-agent
+  "Pauses an agent's delegated authority."
+  [state agent-id]
+  (if (get-in state [:supervised-agents agent-id])
+    (assoc-in state [:supervised-agents agent-id :status] :paused)
+    state))
+
+(defn resume-agent
+  "Resumes an agent's delegated authority."
+  [state agent-id]
+  (if (get-in state [:supervised-agents agent-id])
+    (assoc-in state [:supervised-agents agent-id :status] :active)
+    state))
+
+(defn revoke-agent-dac
+  "Emergency revocation of a supervised agent's DAC.
+   Immediately updates status to :revoked, constructs signed DAC revocation,
+   records revocation in state, and returns [new-state effects].
+   Only emits :broadcast-dac-revocation effect if signed revocation was constructed."
+  [state agent-id & [reason]]
+  (let [agent (get-in state [:supervised-agents agent-id])]
+    (if-not agent
+      [state [{:effect :diagnose :reason :agent-not-found :agent-id agent-id}]]
+      (let [rev-reason (or reason "emergency-human-anchor-revocation")
+            dac (:dac agent)
+            dac-id (:dac-id dac)
+            anchor-priv (:privkey-bytes state)
+            anchor-pub (:anchor-pubkey state)
+            agent-pub (:hot-pubkey agent)
+            revocation (when (and anchor-priv anchor-pub agent-pub dac-id)
+                         (create-dac-revocation
+                          anchor-priv
+                          {:anchor-pubkey anchor-pub
+                           :agent-pubkey agent-pub
+                           :dac-id dac-id
+                           :revoked-epoch (or (:epoch state) 0)}))
+            new-state (cond-> (assoc-in state [:supervised-agents agent-id :status] :revoked)
+                        revocation (assoc-in [:supervised-agents agent-id :revocation] revocation)
+                        revocation (update :revoked-dacs (fnil conj []) revocation))
+            effects (cond-> [{:effect :diagnose
+                              :reason :supervised-agent-dac-revoked
+                              :agent-id agent-id
+                              :dac-id dac-id
+                              :revocation-reason rev-reason}]
+                      revocation (conj {:effect :broadcast-dac-revocation
+                                        :agent-id agent-id
+                                        :dac-id dac-id
+                                        :revocation revocation}))]
+        [new-state effects]))))
+
+(defn sanitize-anchor-state-for-persistence
+  "Sanitizes anchor state for persistence to disk or IndexedDB.
+   Strips all private key material (:privkey-bytes, :cold-privkey, :private-key, :seed),
+   raw keypairs, and non-serializable objects."
+  [state]
+  (let [clean (dissoc state :privkey-bytes :cold-privkey :private-key :seed :keypair)]
+    (cond-> clean
+      (:backup-key clean)
+      (update :backup-key dissoc :private-key :backup-seed :public-key)
+      (:identity clean)
+      (update :identity dissoc :private-key :seed :keypair))))
+
+(defn create-team-call-subnet
+  "Creates a team-call subnet state demonstrating how a team in a call forms a subnet.
+   Supports zero or minimal burn floor for close collaboration."
+  [state {:keys [topic-name peers burn-floor]}]
+  (let [subnet-id (str "team-call/" (or topic-name "main-room"))
+        subnet-record {:subnet-id subnet-id
+                       :topic-name (or topic-name "main-room")
+                       :peers (or peers [])
+                       :burn-floor (or burn-floor 0)
+                       :created-at (or (:epoch state) 0)
+                       :status :active}]
+    (assoc state :team-call-subnet subnet-record)))
+
+(defn anchor-dashboard-view
+  "Computes a clean, presentation-ready view model of the Human Anchor dashboard."
+  [state]
+  (let [anchor-pub (:anchor-pubkey state)
+        anchor-addr (or (:anchor-address state)
+                        (when anchor-pub (bech32m/pubkey->bech32m anchor-pub "ech")))
+        fido-hint (or (:fido-strength state)
+                      (fido/evaluate-authenticator-strength (:aaguid state "2fc0579f-8113-47ea-b116-bb5a8db9202a")))
+        supervised-summary (into {}
+                                 (map (fn [[id a]]
+                                        [id {:agent-id id
+                                             :status (:status a)
+                                             :address (:hot-address a)
+                                             :dac-id (get-in a [:dac :dac-id])
+                                             :activity-count (count (:activity-log a))}])
+                                      (:supervised-agents state)))
+        petnames-view (into {}
+                            (map (fn [[k v]]
+                                   [k {:pubkey v
+                                       :address (bech32m/pubkey->bech32m v "ech")}])
+                                 (or (:petnames state) {})))]
+    {:identity {:anchor-pubkey anchor-pub
+                :address anchor-addr
+                :hot-pubkey (:hot-pubkey state)
+                :key-mode (or (:key-mode state) :yubikey-discoverable)
+                :active-dac-id (get-in state [:active-dac :dac-id])}
+     :fido-authenticator {:strength (:strength fido-hint)
+                          :score (:score fido-hint)
+                          :verification-status (:verification-status fido-hint)
+                          :label (:label fido-hint)
+                          :warning (:warning fido-hint)
+                          :yubico-enrollment (:yubico-enrollment fido-hint)}
+     :accounting {:balance (get-in state [:accounts anchor-pub :balance] 0)
+                  :burned-ech (or (get-in state [:local-accounting :burned-ech])
+                                  (get-in state [:accounting :burned-ech])
+                                  0)
+                  :vouchers-count (or (some-> (get-in state [:local-accounting :vouchers]) count)
+                                      (get-in state [:accounting :vouchers-count])
+                                      0)
+                  :offers-approved (:offers-approved state 0)
+                  :offers-denied (:offers-denied state 0)}
+     :pending-offers (vec (:pending-offers state []))
+     :service-offers (:service-offers state {})
+     :supervised-agents supervised-summary
+     :petnames petnames-view
+     :directory-cache (:directory-cache state {})
+     :team-call-subnet (:team-call-subnet state)
+     :trust-boundary anchor-trust-boundary-disclosure
+     :origin-scoping anchor-origin-scoping-disclosure}))

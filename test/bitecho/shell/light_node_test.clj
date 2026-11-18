@@ -2287,7 +2287,8 @@
   (testing "M2b: dist/bitecho-light-node.cjs CLI flag parity, node-identity.edn + state.fressian cross-runtime interoperability, and live Node.js <-> JVM DataChannel E2E over UDP and TCP"
     (let [bundle-file (io/file "dist/bitecho-light-node.cjs")
           sha-file (io/file "dist/bitecho-light-node.cjs.sha256")
-          node-main-src (slurp "src/bitecho/node_main.cljs")
+          node-main-src (str (slurp "src/bitecho/node_main.cljs") "\n"
+                             (slurp "src/bitecho/light_node/cli.cljc"))
           skill-md (slurp "skill/SKILL.md")
           documented-flags (set (re-seq #"--[a-z][a-z-]*" skill-md))
           node-flags (set (re-seq #"--[a-z][a-z-]*" node-main-src))

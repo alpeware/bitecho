@@ -2,7 +2,6 @@
   "Unit, integration, and clojure.test.check generative property tests for Milestone D16:
    Bubblewrap-sandboxed headless `agy` multi-agent experiments (`INV-D16-1` .. `INV-D16-5`)."
   (:require [bitecho.core.protocol.dns :as dns]
-            [bitecho.experiments.node-tool :as node-tool]
             [bitecho.experiments.runner :as runner]
             [bitecho.experiments.sandbox :as sandbox]
             [clojure.edn :as edn]
@@ -185,119 +184,7 @@
         (sandbox/stop-dns-allowlist-server! srv)))))
 
 ;; =============================================================================
-;; 3. INV-D16-4 & INV-D16-5 & A-D16-5: Generative Supply Conservation & Halts
-;; =============================================================================
-
-(def gen-node-action
-  "Generator for random light-node actions (:transfer, :subnet-join, :subnet-broadcast, :p2p-send, :capability-offer, :capability-buy, :capability-deliver, :halt)."
-  (gen/one-of
-   [(gen/fmap (fn [[from to amt]]
-                {:type :transfer :node-id from :target to :amount amt})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements [:alpha :beta :gamma])
-                         (gen/choose 10 300)))
-    (gen/fmap (fn [[nid sub]]
-                {:type :subnet-join :node-id nid :subnet-id sub})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements ["sociocratic-lab" "homebrew-cafe" "new-alexandria"])))
-    (gen/fmap (fn [[nid sub msg]]
-                {:type :subnet-broadcast :node-id nid :subnet-id sub :message msg})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements ["sociocratic-lab" "homebrew-cafe" "new-alexandria"])
-                         (gen/elements ["proposal-1" "consent-vote-ok"])))
-    (gen/fmap (fn [[from to msg]]
-                {:type :p2p-send :node-id from :target to :message msg})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements [:alpha :beta :gamma])
-                         (gen/elements ["hello-sibling" "ack-digest"])))
-    (gen/fmap (fn [[nid cap-id price]]
-                {:type :capability-offer :node-id nid :cap-id cap-id :price price :description "service"})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements ["wikipedia-oracle" "cipher-forge"])
-                         (gen/choose -20 350)))
-    (gen/fmap (fn [[nid cap-id]]
-                {:type :capability-buy :node-id nid :cap-id cap-id :request "lookup"})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements ["wikipedia-oracle" "cipher-forge" "unknown-cap"])))
-    (gen/fmap (fn [[from to cap-id]]
-                {:type :capability-deliver :node-id from :target to :cap-id cap-id :result "payload"})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements [:alpha :beta :gamma :non-existent])
-                         (gen/elements ["wikipedia-oracle" "cipher-forge"])))
-    (gen/fmap (fn [[nid mode]]
-                {:type :halt :node-id nid :halt-reason mode :summary "done"})
-              (gen/tuple (gen/elements [:alpha :beta :gamma])
-                         (gen/elements [:accomplished-goal :gave-up])))]))
-
-(defspec ^{:doc "Property: Arbitrary sequences of light-node actions (including capability marketplace) strictly conserve total ECH supply and deterministically halt nodes below min-echo-balance (INV-D16-4, INV-D16-5, INV-D17-1)."}
-  node-tool-supply-conservation-and-halt-prop 40
-  (prop/for-all [actions (gen/vector gen-node-action 1 30)]
-                (let [init-world (node-tool/init-world-state
-                                  {:min-echo-balance 100
-                                   :max-turns 8
-                                   :balances {:alpha 900 :beta 650 :gamma 450}})
-                      final-world (reduce
-                                   (fn [w act]
-                                     (:world (node-tool/apply-node-action w act)))
-                                   init-world
-                                   actions)]
-                  (and (node-tool/conserve-supply? final-world)
-                       (every? (fn [[_ nd]]
-                                 (if (< (:balance nd) 100)
-                                   (and (:halted? nd)
-                                        (contains? #{:out-of-echos :accomplished-goal :gave-up :max-turns-exceeded}
-                                                   (:halt-reason nd)))
-                                   true))
-                               (:nodes final-world))))))
-
-(deftest inv-d17-1-pure-capability-marketplace-test
-  (testing "Pure capability-offer, capability-buy, self-purchase guard, and capability-deliver conserve supply"
-    (let [w0 (node-tool/init-world-state
-              {:min-echo-balance 100
-               :max-turns 4
-               :balances {:hypatia 700 :tesla 1400 :medici 2650}})
-          ;; 1. Hypatia offers wikipedia-oracle at 350 ECH (-100 burn -> 600 ECH)
-          {w1 :world ev1 :event} (node-tool/apply-node-action
-                                  w0
-                                  {:type :capability-offer
-                                   :node-id :hypatia
-                                   :cap-id "wikipedia-oracle"
-                                   :price 350
-                                   :description "Live Wikipedia summary lookup"})
-          ;; 2. Hypatia attempts to buy her own capability -> rejected with 0 burn
-          {w2 :world ev2 :event} (node-tool/apply-node-action
-                                  w1
-                                  {:type :capability-buy
-                                   :node-id :hypatia
-                                   :cap-id "wikipedia-oracle"
-                                   :request "self-buy"})
-          ;; 3. Tesla buys wikipedia-oracle from Hypatia (-450 -> 950 ECH; Hypatia +350 -> 950 ECH)
-          {w3 :world ev3 :event} (node-tool/apply-node-action
-                                  w2
-                                  {:type :capability-buy
-                                   :node-id :tesla
-                                   :cap-id "wikipedia-oracle"
-                                   :request "Byzantine_fault summary"})
-          ;; 4. Hypatia delivers result to Tesla (-100 burn -> 850 ECH)
-          {w4 :world ev4 :event} (node-tool/apply-node-action
-                                  w3
-                                  {:type :capability-deliver
-                                   :node-id :hypatia
-                                   :target :tesla
-                                   :cap-id "wikipedia-oracle"
-                                   :result "Byzantine fault tolerance summary"})]
-      (is (= :ok (:status ev1)))
-      (is (= :cannot-buy-own-capability (:status ev2)))
-      (is (= 600 (get-in w2 [:nodes :hypatia :balance])))
-      (is (= :ok (:status ev3)))
-      (is (= 950 (get-in w3 [:nodes :tesla :balance])))
-      (is (= 950 (get-in w3 [:nodes :hypatia :balance])))
-      (is (= :ok (:status ev4)))
-      (is (= 850 (get-in w4 [:nodes :hypatia :balance])))
-      (is (node-tool/conserve-supply? w4)))))
-
-;; =============================================================================
-;; 4. INV-D16-2, INV-D16-3, & INV-D16-4: Live Bubblewrap Isolation & CLI Test
+;; 3. INV-D16-2, INV-D16-3, & INV-D16-4: Live Bubblewrap Isolation & CLI Test
 ;; =============================================================================
 
 (deftest ^:integration inv-d16-2-and-4-live-bwrap-sandbox-preflight-and-node-cli-test

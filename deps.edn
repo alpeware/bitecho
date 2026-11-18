@@ -67,8 +67,8 @@
                                  elle/elle {:mvn/version "0.2.1"}
                                  spootnik/unilog {:mvn/version "0.7.31"}
                                  knossos/knossos {:mvn/version "0.3.8"}}
-                  :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "dev/bitecho/simulator" "dev/bitecho/sim" "dev/bitecho/stress" "dev/bitecho/experiments"]}
+                  :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test" "dev/bitecho/sim" "dev/bitecho/stress" "dev/bitecho/experiments"]}
            :format {:replace-deps {dev.weavejester/cljfmt {:mvn/version "0.16.1"}}
-                    :main-opts ["-m" "cljfmt.main" "fix" "src" "test" "dev/bitecho/simulator" "dev/bitecho/sim" "dev/bitecho/stress" "dev/bitecho/experiments"]}
+                    :main-opts ["-m" "cljfmt.main" "fix" "src" "test" "dev/bitecho/sim" "dev/bitecho/stress" "dev/bitecho/experiments"]}
            :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}}
                    :ns-default build}}}

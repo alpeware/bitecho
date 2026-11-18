@@ -3,8 +3,7 @@
    FIDO MDS v3 authenticator evaluation with UNVERIFIED label (Standing Constraint 6),
    WebAuthn discoverable credential seed recovery, non-extractable WebCrypto specs,
    cold-certifies-hot DAC delegation, and Human Anchor workflows (Milestone 11)."
-  (:require [bitecho.anchor.core :as anchor]
-            [bitecho.basalt.core :as basalt]
+  (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.cbor :as cbor]
             [bitecho.crypto :as crypto]
@@ -224,7 +223,7 @@
       (is (true? (:valid? validation)))))
 
   (testing "Secondary backup key registration and recovery"
-    (let [primary-state (anchor/init-anchor-state {:pubkey "302a300506032b65700321001111111111111111111111111111111111111111111111111111111111111111"})
+    (let [primary-state (light-core/init-anchor-state {:pubkey "302a300506032b65700321001111111111111111111111111111111111111111111111111111111111111111"})
           backup-seed (crypto/random-bytes 32)
           with-backup (webauthn/register-backup-key primary-state {:backup-seed backup-seed})
           recovered (webauthn/recover-from-backup-key backup-seed)]
@@ -255,18 +254,18 @@
 
 (deftest test-human-anchor-workflows
   (testing "Human-in-the-loop offer approval and denial"
-    (let [st0 (anchor/init-anchor-state {:pubkey "302a300506032b65700321002222222222222222222222222222222222222222222222222222222222222222"})
-          st1 (anchor/set-service-offer st0 :inference {:price 50 :burn-floor 100})
-          st2 (anchor/queue-incoming-offer st1 {:offer-id "off-1" :peer-id "peer-bob" :burn 100})
-          st3 (anchor/queue-incoming-offer st2 {:offer-id "off-2" :peer-id "peer-carol" :burn 100})]
+    (let [st0 (light-core/init-anchor-state {:pubkey "302a300506032b65700321002222222222222222222222222222222222222222222222222222222222222222"})
+          st1 (light-core/set-service-offer st0 :inference {:price 50 :burn-floor 100})
+          st2 (light-core/queue-incoming-offer st1 {:offer-id "off-1" :peer-id "peer-bob" :burn 100})
+          st3 (light-core/queue-incoming-offer st2 {:offer-id "off-2" :peer-id "peer-carol" :burn 100})]
       (is (= 2 (count (:pending-offers st3))))
       ;; Approve off-1
-      (let [[st4 app-effects] (anchor/approve-offer st3 "off-1")]
+      (let [[st4 app-effects] (light-core/approve-offer st3 "off-1")]
         (is (= 1 (count (:pending-offers st4))))
         (is (= 1 (:offers-approved st4)))
         (is (= :accept-offer (:effect (first app-effects))))
         ;; Deny off-2
-        (let [[st5 deny-effects] (anchor/deny-offer st4 "off-2" "price-too-low")]
+        (let [[st5 deny-effects] (light-core/deny-offer st4 "off-2" "price-too-low")]
           (is (= 0 (count (:pending-offers st5))))
           (is (= 1 (:offers-denied st5)))
           (is (= "price-too-low" (:last-denied-reason st5)))
@@ -277,20 +276,20 @@
           hot-kp (crypto/generate-keypair)
           anchor-pub (basalt/bytes->hex (:public-key cold-kp))
           agent-pub (basalt/bytes->hex (:public-key hot-kp))
-          st0 (anchor/init-anchor-state {:pubkey anchor-pub}
-                                        {:privkey-bytes (:private-key cold-kp)})
-          st1 (assoc (anchor/register-supervised-agent st0 {:agent-id "agent-worker-1"
-                                                            :hot-pubkey agent-pub
-                                                            :max-spend 5000})
+          st0 (light-core/init-anchor-state {:pubkey anchor-pub}
+                                            {:privkey-bytes (:private-key cold-kp)})
+          st1 (assoc (light-core/register-supervised-agent st0 {:agent-id "agent-worker-1"
+                                                                :hot-pubkey agent-pub
+                                                                :max-spend 5000})
                      :privkey-bytes (:private-key cold-kp))
-          st2 (anchor/log-agent-activity st1 "agent-worker-1" {:type :offer-accepted :offer-id "off-abc"})
-          dashboard (anchor/anchor-dashboard-view st2)]
+          st2 (light-core/log-agent-activity st1 "agent-worker-1" {:type :offer-accepted :offer-id "off-abc"})
+          dashboard (light-core/anchor-dashboard-view st2)]
       (is (= :active (get-in st2 [:supervised-agents "agent-worker-1" :status])))
       (is (= 1 (count (get-in st2 [:supervised-agents "agent-worker-1" :activity-log]))))
       (is (some? (get-in dashboard [:supervised-agents "agent-worker-1" :dac-id])))
 
       ;; Emergency DAC revocation
-      (let [[st3 rev-effects] (anchor/revoke-agent-dac st2 "agent-worker-1" "compromised-key")]
+      (let [[st3 rev-effects] (light-core/revoke-agent-dac st2 "agent-worker-1" "compromised-key")]
         (is (= :revoked (get-in st3 [:supervised-agents "agent-worker-1" :status])))
         (is (some? (get-in st3 [:supervised-agents "agent-worker-1" :revocation])))
         (is (= 2 (count rev-effects)))
@@ -298,9 +297,9 @@
         (is (= :broadcast-dac-revocation (:effect (second rev-effects)))))))
 
   (testing "Team-call subnet creation and presentation dashboard"
-    (let [st0 (anchor/init-anchor-state {:pubkey "302a300506032b65700321003333333333333333333333333333333333333333333333333333333333333333"})
-          st1 (anchor/create-team-call-subnet st0 {:topic-name "standup-alpha" :peers ["alice" "bob"]})
-          dashboard (anchor/anchor-dashboard-view st1)]
+    (let [st0 (light-core/init-anchor-state {:pubkey "302a300506032b65700321003333333333333333333333333333333333333333333333333333333333333333"})
+          st1 (light-core/create-team-call-subnet st0 {:topic-name "standup-alpha" :peers ["alice" "bob"]})
+          dashboard (light-core/anchor-dashboard-view st1)]
       (is (some? (:team-call-subnet dashboard)))
       (is (= "team-call/standup-alpha" (get-in dashboard [:team-call-subnet :subnet-id])))
       (is (= "UNVERIFIED" (get-in dashboard [:fido-authenticator :label])))

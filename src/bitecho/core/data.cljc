@@ -932,6 +932,50 @@
                             (first pair)))
                         (partition-all 2 level)))))))))
 
+(defn- raw-rfc6962-leaf-hash
+  "Computes RFC 6962 domain-separated leaf hash (`0x00 || leaf-bytes`) for a raw (non-Pointer) leaf."
+  [leaf]
+  (let [leaf-bytes (cond
+                     (fressian/bytes? leaf) leaf
+                     (string? leaf) (fressian/utf8->bytes leaf)
+                     :else (fressian/encode-canonical leaf))]
+    (crypto/sha256 (prefix-bytes 0 leaf-bytes))))
+
+(defn- raw-rfc6962-node-hash
+  "Computes RFC 6962 domain-separated internal node hash (`0x01 || left || right`) for raw byte hashes."
+  [left-bytes right-bytes]
+  (crypto/sha256 (fressian/concat-bytes (prefix-bytes 1 left-bytes) right-bytes)))
+
+(defn compute-rfc6962-merkle-root
+  "Unified RFC 6962 domain-separated binary Merkle root (64-char lowercase hex) over `leaves`:
+   - When `leaves` are Pointer maps (`:pointer/path`), uses `merkle-leaf-hash` and `merkle-branch-hash`
+     (matching `compute-merkle-root`, `generate-merkle-proof`, and `verify-merkle-proof`).
+   - When `leaves` are raw byte/string/EDN values, uses `0x00` leaf and `0x01` internal node prefixes."
+  [leaves]
+  (cond
+    (empty? leaves)
+    (compute-cid (fressian/utf8->bytes ""))
+
+    (every? #(and (map? %) (contains? % :pointer/path)) leaves)
+    (loop [level (mapv merkle-leaf-hash leaves)]
+      (if (= 1 (count level))
+        (first level)
+        (recur (mapv (fn [pair]
+                       (if (= 2 (count pair))
+                         (merkle-branch-hash (first pair) (second pair))
+                         (first pair)))
+                     (partition-all 2 level)))))
+
+    :else
+    (loop [level (mapv raw-rfc6962-leaf-hash leaves)]
+      (if (= 1 (count level))
+        (str/lower-case (basalt/bytes->hex (first level)))
+        (recur (mapv (fn [pair]
+                       (if (= 2 (count pair))
+                         (raw-rfc6962-node-hash (first pair) (second pair))
+                         (first pair)))
+                     (partition-all 2 level)))))))
+
 (defn generate-merkle-proof
   "Generates an RFC 6962 Merkle inclusion proof for the active Pointer at `(subnet-id, path)`."
   ([state subnet-id path]

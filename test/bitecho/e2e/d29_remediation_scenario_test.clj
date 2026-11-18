@@ -433,6 +433,11 @@
       (is (= #{"devnet.bitecho.org" "global"} (light-core/effective-subscribed-subnets st)))
       (is (empty? (:broadcast-inbox (:state ingest-res))))
       (is (= 1 (get-in (:state ingest-res) [:diagnostics :subnet-mismatch-dropped])))
+      ;; Also verify default "global" node drops unsubscribed :p2p-broadcast with :subnet-mismatch-dropped (F-D31-BUG-2)
+      (let [st-global (light-core/init-light-state id {:subnet-id "global"})
+            ingest-global (light-core/handle-wire-payload st-global bcast-env (:private kp))]
+        (is (empty? (:broadcast-inbox (:state ingest-global))))
+        (is (= 1 (get-in (:state ingest-global) [:diagnostics :subnet-mismatch-dropped]))))
       ;; Explicit subscription enables chat/simon-nexus-axiom
       (let [sub-res (light-core/handle-command st {"cmd" "subscribe-subnets" "subnets" ["chat/simon-nexus-axiom"]} (:private kp))
             st-sub (:state sub-res)

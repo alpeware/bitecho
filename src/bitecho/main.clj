@@ -2,7 +2,6 @@
   "CLI entrypoint for Bitecho node."
   (:gen-class)
   (:require [bitecho.basalt.core :as basalt]
-            [bitecho.demo.angels :as angels]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.acme :as acme-shell]
             [bitecho.shell.agent-sim :as agent-sim]
@@ -34,8 +33,7 @@
    "simulate-agents"
    "fund-agent"
    "light-node"
-   "sign-directory-pop"
-   "demo-angels"])
+   "sign-directory-pop"])
 
 (defn- print-usage
   "Prints CLI usage guide."
@@ -55,8 +53,7 @@
   (println "  bitecho simulate-agents <bootstrap.edn> <keypair.edn> [--agents N] [--messages M] [--burn B]")
   (println "  bitecho fund-agent <bootstrap.edn> <keypair.edn> <recipient-pubkey-hex> <amount> [--seq S] [--deps D] [--burn B]")
   (println "  bitecho light-node <serve|verb> [options]")
-  (println "  bitecho sign-directory-pop <dir-identity-dir-or-file> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]")
-  (println "  bitecho demo-angels"))
+  (println "  bitecho sign-directory-pop <dir-identity-dir-or-file> <pop-json-or-file> [issued-epoch] [expires-epoch] [mailbox]"))
 
 (defn- build-infra-runtime-from-config!
   ([cfg tls-mgr require-secret?]
@@ -389,20 +386,6 @@
                 (println (json/write-str stringified))
                 (System/exit 0)))))))))
 
-(defn- cmd-demo-angels
-  "Runs the Milestone 6 & 7 Angels Demos: Multi-Harness Neutrality Proof, Three-Device einsum Pipeline, and Testnet Readiness Gate."
-  [_args]
-  (try
-    (let [report (angels/run-all-angels-demos)]
-      (println (json/write-str report))
-      (if (:ok? report)
-        (System/exit 0)
-        (System/exit 1)))
-    (catch Exception e
-      (binding [*out* *err*]
-        (println (str "Error running demo-angels: " (.getMessage e))))
-      (System/exit 1))))
-
 (defn- cmd-infra-node
   "Runs a unified Bitecho edge/infra node stack given a config EDN file."
   [config-file]
@@ -573,9 +556,6 @@
 
       "sign-directory-pop"
       (cmd-sign-directory-pop rest-args)
-
-      "demo-angels"
-      (cmd-demo-angels rest-args)
 
       (do
         (print-usage)

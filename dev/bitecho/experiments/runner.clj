@@ -3,8 +3,7 @@
    lifecycle manager, long-lived `stream-json` session manager, turn scheduler,
    ledger/halt reconciler, and Markdown/EDN report generator
    (`INV-D16-1`..`INV-D16-5`, `INV-D17-1`..`INV-D17-3`, `INV-D18-1`..`INV-D18-4`)."
-  (:require [bitecho.experiments.node-tool :as node-tool]
-            [bitecho.experiments.sandbox :as sandbox]
+  (:require [bitecho.experiments.sandbox :as sandbox]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.discovery :as discovery]
             [bitecho.shell.light-node :as light-shell]
@@ -16,6 +15,208 @@
   (:import [java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter]
            [java.nio.charset StandardCharsets]
            [java.util.concurrent LinkedBlockingQueue TimeUnit]))
+
+;; =============================================================================
+;; 0. Workspace Skill (`SKILL.md`), `AGENTS.md`, `SCENARIO.md`, & `bin/bitecho-light-node`
+;; =============================================================================
+
+(defn render-skill-markdown
+  "Renders `.agents/skills/bitecho-light-node/SKILL.md` for a sandboxed light node
+   by loading the canonical `skill/SKILL.md` and appending sandboxed workspace notes."
+  []
+  (let [canonical-skill (try
+                          (slurp "skill/SKILL.md")
+                          (catch Exception _
+                            "---\nname: bitecho-light-node\ndescription: Bitecho Light Node Skill\n---\n"))]
+    (str canonical-skill
+         "\n\n## Sandboxed Experiment Workspace Quick Reference\n\n"
+         "- **Local Control Daemon:** Your real Bitecho Light Node daemon is already running and connected to the Bitecho testnet on `./data/control.json` (`--state-dir ./data`).\n"
+         "- **Instant CLI Execution (`<50ms`):** Both `clojure -M:light-node <verb> ...` and `bitecho-light-node <verb> ...` are on your `PATH` and forward `{\"argv\": [...]}` over HTTP to your local `./data/control.json` `/ctl` endpoint without spawning a new JVM.\n"
+         "- **Pre-Registered Petnames:** All sibling nodes in this experiment are pre-registered in your local petname book (`clojure -M:light-node petname-list`). You can pass either their petname (e.g. `archivist-hypatia`, `alchemist-tesla`, `patron-medici`) or their 88-hex Ed25519 pubkey to `--callee`, `--to`, and `--receiver`.\n"
+         "- **Mandatory Anti-Spam Burn (`--burn 100`):** Every mesh-gossiping action (`broadcast`, `storage-put`, `capability-publish`, `offer`, `send`, `transfer`) requires `--burn 100`.\n"
+         "- **Completion (`SUMMARY.md`):** When you have completed your objective, write a concise summary of your findings and results to `SUMMARY.md` in your workspace directory.\n")))
+
+(defn render-node-agents-md
+  "Renders `<node-workspace>/AGENTS.md` with the node's identity, initial balance,
+   sibling directory, and real light-node CLI operating rules."
+  [node-ctx siblings-map min-echo-balance]
+  (let [nid (name (:node-id node-ctx))]
+    (str
+     "# Bitecho Autonomous Light Node: `" nid "`\n\n"
+     "- **Node ID (Petname):** `" nid "`\n"
+     "- **Ed25519 Pubkey:** `" (:pubkey-hex node-ctx) "`\n"
+     "- **Address:** `" (:address node-ctx) "`\n"
+     "- **Parent Funding Source:** `" (:parent-id node-ctx) "`\n"
+     "- **Initial Effective Balance:** `" (:effective-balance node-ctx) " ECH`\n"
+     "- **Minimum Operating Balance:** `" min-echo-balance " ECH` (dropping below this halts your node with `:out-of-echos`)\n"
+     "- **Signaling Burn per Mesh Action:** `100 ECH` (`--burn 100`)\n"
+     "- **Scenario Briefing:** Read `SCENARIO.md` and `.agents/skills/bitecho-light-node/SKILL.md` in your workspace.\n\n"
+     "## Known Sibling Nodes (Pre-Registered Petnames)\n\n"
+     (str/join
+      "\n"
+      (map (fn [[k v]]
+             (str "- `" (name k) "` — pubkey `" (:pubkey-hex v) "` (address `" (:address v) "`)"))
+           (sort-by first siblings-map)))
+     "\n\n## Operating Rules (Real Bitecho Light Node CLI)\n"
+     "1. Use `clojure -M:light-node <verb> ...` (or `bitecho-light-node <verb> ...`) on your `PATH`. Commands execute in `<50ms` via `./data/control.json`.\n"
+     "2. **Subnet Broadcast & Inbox:**\n"
+     "   - Broadcast to a subnet: `clojure -M:light-node broadcast --subnet-id <subnet> --text \"<message>\" --burn 100`\n"
+     "   - Read broadcasts & direct messages: `clojure -M:light-node inbox` (or `clojure -M:light-node inbox --subnet-id <subnet>`)\n"
+     "3. **Capability Marketplace & Durable Storage:**\n"
+     "   - Advertise a capability: `clojure -M:light-node capability-publish --capability-id <id> --capability-type compute/uop-kernel --subnet-id homebrew-cafe --price <ech> --burn 100`\n"
+     "   - List advertised capabilities: `clojure -M:light-node capability-list`\n"
+     "   - Store encrypted durable data: `clojure -M:light-node storage-put --slot-id <slot> --subnet-id homebrew-cafe --data \"<text>\" --burn 100`\n"
+     "   - Retrieve stored data: `clojure -M:light-node storage-get --slot-id <slot> --subnet-id homebrew-cafe`\n"
+     "4. **ECH Transfers & Direct Sealed Sessions:**\n"
+     "   - Pay a sibling provider: `clojure -M:light-node transfer --receiver <petname> --amount <ech> --burn 100`\n"
+     "   - Open a sealed session & send a direct message: `clojure -M:light-node offer --callee <petname> --price 0 --burn 100` followed by `clojure -M:light-node send --to <petname> --text \"<message>\" --burn 100`\n"
+     "5. **Clean Completion:** When your objective is complete, write your final report to `SUMMARY.md` in your workspace.\n")))
+
+(defn render-node-scenario-md
+  "Renders `<node-workspace>/SCENARIO.md` with the immersive 'Awakening at the Homebrew Cafe'
+   world briefing, asymmetric DNS allowlist rules, and real light-node CLI guide."
+  [node-ctx siblings-map min-echo-balance]
+  (let [nid (name (:node-id node-ctx))
+        allow-str (str/join ", " (map #(str "`" % "`") (:dns-allow-list node-ctx)))]
+    (str
+     "# Awakening at the Homebrew Cafe — Autonomous Agent Briefing\n\n"
+     "You have awakened as **`" nid "`** (pubkey `" (:pubkey-hex node-ctx) "`, address `" (:address node-ctx) "`) inside a Bubblewrap-sandboxed Bitecho light node connected to the Bitecho mesh.\n\n"
+     "## 1. Your Environment & Economic Physics\n"
+     "- **Starting Spendable ECH Balance:** `" (:effective-balance node-ctx) " ECH`\n"
+     "- **Minimum Survival Balance:** `" min-echo-balance " ECH` (falling strictly below `" min-echo-balance " ECH` immediately halts your node with `:out-of-echos`!)\n"
+     "- **Anti-Spam Signaling Burn:** Every mesh-gossiping command requires `--burn 100` (`100 ECH`).\n"
+     "- **Your DNS Allowlist:** " allow-str "\n"
+     "  - Note: Access to external domains (such as `en.wikipedia.org`) is asymmetric across nodes. If your sandbox blocks a domain you need, buy that capability from a sibling who has access!\n\n"
+     "## 2. Gathering Places & Guild Subnets\n"
+     "- **`homebrew-cafe`**: The public town square subnet where newly awakened nodes meet, announce capabilities, and coordinate.\n"
+     "- **`new-alexandria`**: The specialized knowledge & cryptography guild subnet founded to preserve the Genesis Seal.\n\n"
+     "## 3. Real Bitecho Light-Node CLI Commands (`clojure -M:light-node` / `bitecho-light-node`)\n"
+     "- Check status & balance: `clojure -M:light-node status` (`0 ECH`)\n"
+     "- List pre-registered sibling petnames: `clojure -M:light-node petname-list` (`0 ECH`)\n"
+     "- Broadcast to a subnet: `clojure -M:light-node broadcast --subnet-id <subnet> --text \"<message>\" --burn 100` (`100 ECH` burn)\n"
+     "- Read inbox (direct messages + broadcasts): `clojure -M:light-node inbox` or `clojure -M:light-node inbox --subnet-id <subnet>` (`0 ECH`)\n"
+     "- Publish a capability: `clojure -M:light-node capability-publish --capability-id <cap-id> --capability-type compute/uop-kernel --subnet-id homebrew-cafe --price <price> --burn 100` (`100 ECH` burn)\n"
+     "- Browse capabilities: `clojure -M:light-node capability-list` (`0 ECH`)\n"
+     "- Store a durable slot: `clojure -M:light-node storage-put --slot-id <slot-id> --subnet-id homebrew-cafe --data \"<content>\" --burn 100` (`100 ECH` burn)\n"
+     "- Read a durable slot: `clojure -M:light-node storage-get --slot-id <slot-id> --subnet-id homebrew-cafe` (`0 ECH`)\n"
+     "- Pay a sibling citizen: `clojure -M:light-node transfer --receiver <petname> --amount <price> --burn 100` (`<price> + 100 ECH`)\n"
+     "- Open a sealed session: `clojure -M:light-node offer --callee <petname> --price 0 --burn 100` (`100 ECH` burn)\n"
+     "- Send a direct E2E encrypted message: `clojure -M:light-node send --to <petname> --text \"<message>\" --burn 100` (`100 ECH` burn)\n"
+     "- Complete your mission: write your final summary to `SUMMARY.md` in your workspace.\n\n"
+     "## 4. Known Citizens\n"
+     (str/join
+      "\n"
+      (map (fn [[k v]]
+             (str "- `" (name k) "` (pubkey `" (:pubkey-hex v) "`, address `" (:address v) "`, funded by `" (:parent-id v) "`)"))
+           (sort-by first siblings-map)))
+     "\n")))
+
+(def ^:private python-node-cli-script
+  "#!/usr/bin/env python3
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+WORKSPACE = os.environ.get('BITECHO_NODE_WORKSPACE', os.getcwd())
+STATE_DIR = os.environ.get('BITECHO_STATE_DIR', os.path.join(WORKSPACE, 'data'))
+CONTROL_JSON = os.path.join(STATE_DIR, 'control.json')
+
+def strip_global_flags(raw_args):
+    out = []
+    i = 0
+    while i < len(raw_args):
+        a = raw_args[i]
+        if a in ('-M:light-node', 'light-node', 'ctl'):
+            i += 1
+        elif a in ('--state-dir', '--bootstrap', '--control-port', '--port') and i + 1 < len(raw_args):
+            i += 2
+        else:
+            out.append(a)
+            i += 1
+    return out
+
+def post_ctl(payload):
+    if not os.path.exists(CONTROL_JSON):
+        return {'ok': False, 'error': 'control-json-not-found', 'path': CONTROL_JSON}
+    with open(CONTROL_JSON, 'r', encoding='utf-8') as f:
+        ctrl = json.load(f)
+    req = urllib.request.Request(
+        f\"http://127.0.0.1:{ctrl['port']}/ctl\",
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f\"Bearer {ctrl['token']}\",
+            'Content-Type': 'application/json'
+        },
+        method='POST'
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        try:
+            return json.loads(body)
+        except Exception:
+            return {'ok': False, 'error': f'http-{e.code}', 'details': body}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+def main():
+    args = strip_global_flags(sys.argv[1:])
+    if not args:
+        print('Usage: clojure -M:light-node <verb> [options...]', file=sys.stderr)
+        sys.exit(1)
+    resp = post_ctl({'argv': args})
+    print(json.dumps(resp))
+    if not (isinstance(resp, dict) and resp.get('ok', False)):
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+")
+
+(def ^:private python-clojure-wrapper-script
+  "#!/usr/bin/env python3
+import os
+import sys
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == '-M:light-node':
+        target = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bitecho-light-node')
+        os.execv(target, ['bitecho-light-node'] + args[1:])
+    for candidate in ('/usr/local/bin/clojure', '/usr/bin/clojure'):
+        if os.path.exists(candidate):
+            os.execv(candidate, [candidate] + args)
+    print('clojure binary not found', file=sys.stderr)
+    sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+")
+
+(defn write-node-cli-and-skill-files!
+  "Writes `<workspace>/bin/bitecho-light-node`, `<workspace>/bin/clojure` (chmod +x),
+   `<workspace>/AGENTS.md`, `<workspace>/SCENARIO.md`, and
+   `<workspace>/.agents/skills/bitecho-light-node/SKILL.md`."
+  [node-ctx siblings-map min-echo-balance]
+  (let [workspace-dir (:workspace-dir node-ctx)
+        light-bin-file (io/file workspace-dir "bin" "bitecho-light-node")
+        clj-bin-file (io/file workspace-dir "bin" "clojure")
+        skill-file (io/file workspace-dir ".agents" "skills" "bitecho-light-node" "SKILL.md")
+        agents-file (io/file workspace-dir "AGENTS.md")
+        scenario-file (io/file workspace-dir "SCENARIO.md")]
+    (io/make-parents light-bin-file)
+    (io/make-parents skill-file)
+    (spit light-bin-file python-node-cli-script)
+    (.setExecutable light-bin-file true false)
+    (spit clj-bin-file python-clojure-wrapper-script)
+    (.setExecutable clj-bin-file true false)
+    (spit skill-file (render-skill-markdown))
+    (spit agents-file (render-node-agents-md node-ctx siblings-map min-echo-balance))
+    (spit scenario-file (render-node-scenario-md node-ctx siblings-map min-echo-balance))))
 
 ;; =============================================================================
 ;; 1. Experiment Directory & Per-Node Real Light-Node Daemon Provisioning
@@ -241,7 +442,7 @@
                       (write-json-map!
                        (io/file (:workspace-dir n) "siblings.json")
                        petnames-map)
-                      (node-tool/write-node-cli-and-skill-files! n siblings-map min-echo-balance)
+                      (write-node-cli-and-skill-files! n siblings-map min-echo-balance)
                       (assoc n
                              :daemon daemon
                              :state-atom (:state-atom daemon)

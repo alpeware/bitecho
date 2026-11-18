@@ -97,6 +97,71 @@
   []
   @standard-htlc-puzzle-cid)
 
+(defn bounty-claim-message
+  "Constructs the canonical signing payload string for a 3-of-3 bounty settlement claim (`BIP-005` / `D31.5`)."
+  [bounty-id bip-cid patch-cid builder-pubkey auditor-pubkey]
+  (str "bitecho-bounty-claim-v1|"
+       bounty-id "|"
+       bip-cid "|"
+       patch-cid "|"
+       builder-pubkey "|"
+       auditor-pubkey))
+
+(def ^{:doc "Canonical ChiaLisp-style SCI puzzle source for 3-of-3 heterogeneous bounty settlement
+             (maintainer + builder + auditor distinct signers, 85/15 net-pool split + protocol take,
+             and post-timeout maintainer refund) (`BIP-005` / `D31.5`)."}
+  canonical-bounty-puzzle-source
+  "(fn [env solution]
+     (let [mode (:mode solution)
+           gross (:amount env)
+           m-pk (or (:maintainer env) (:payer env))]
+       (cond
+         (= mode :settle)
+         (let [b-pk (:builder solution)
+               a-pk (:auditor solution)
+               patch-cid (:patch-cid solution)
+               claim-msg (str \"bitecho-bounty-claim-v1|\"
+                              (:bounty-id env) \"|\"
+                              (:bip-cid env) \"|\"
+                              patch-cid \"|\"
+                              b-pk \"|\"
+                              a-pk)
+               distinct-3? (and (string? m-pk) (string? b-pk) (string? a-pk)
+                                (not= m-pk b-pk)
+                                (not= m-pk a-pk)
+                                (not= b-pk a-pk))
+               sigs-ok? (and distinct-3?
+                             (verify-sig m-pk claim-msg (:maintainer-sig solution))
+                             (verify-sig b-pk claim-msg (:builder-sig solution))
+                             (verify-sig a-pk claim-msg (:auditor-sig solution)))]
+           (if sigs-ok?
+             (let [take-bps (min 10000 (max 0 (:take-bps env 50)))
+                   builder-bps (min 10000 (max 0 (:builder-bps env 8500)))
+                   take-amt (if (pos? gross)
+                              (min gross (max 1 (quot (* gross take-bps) 10000)))
+                              0)
+                   net-pool (- gross take-amt)
+                   b-amt (quot (* net-pool builder-bps) 10000)
+                   a-amt (- net-pool b-amt)]
+               [[:release b-amt b-pk]
+                [:release a-amt a-pk]])
+             false))
+
+         (= mode :refund)
+         [{:type :assert-epoch-gte :epoch (:timeout-epoch env)}
+          {:type :refund :receiver m-pk :amount gross}]
+
+         :else false)))")
+
+(def ^{:doc "Delayed canonical CID calculation for canonical-bounty-puzzle-source."}
+  canonical-bounty-puzzle-cid
+  (delay (puzzle-cid canonical-bounty-puzzle-source)))
+
+(defn canonical-bounty-cid
+  "Returns the canonical 64-char SHA-256 hex CID of `canonical-bounty-puzzle-source`."
+  []
+  @canonical-bounty-puzzle-cid)
+
 (def ^:private metered-fn-macro
   (with-meta
     (fn [_&form _&env & decl]

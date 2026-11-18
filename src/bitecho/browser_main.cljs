@@ -1,8 +1,7 @@
 (ns bitecho.browser-main
   "Bitecho Browser Node static bundle entry point.
    Exposes high-level browser API on js/globalThis.BitechoBrowser conforming to Rules 1-6."
-  (:require [bitecho.anchor.core :as anchor]
-            [bitecho.basalt.core :as basalt]
+  (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
             [bitecho.config :as config]
             [bitecho.core.protocol.relay :as relay]
@@ -105,7 +104,7 @@
                   (let [st (or (:state s) (when (:status s) (name (:status s))))
                         survives? (cond
                                     (= st "open") (or (some? (:tx-key s)) (some? (:session-keys s)))
-                                    (= st "offered") (or (some? (:ephemeral-priv s)) (some? (:offer-nonce s)))
+                                    (= st "offered") (some? (:ephemeral-priv s))
                                     :else false)]
                     (when survives?
                       [sid (dissoc s :p2p)]))))
@@ -203,7 +202,7 @@
                          (assoc :hot-pubkey saved-pub)
                          (dissoc :privkey-bytes))))
             (reset! anchor-state-atom
-                    (anchor/init-anchor-state {:pubkey saved-pub} {})))
+                    (light-core/init-anchor-state {:pubkey saved-pub} {})))
           (notify-ui-listeners!)
           (let [hw-locked? (nil? (get-in @node-atom [:keypair :private-key]))]
             (-> clean-loaded
@@ -226,11 +225,11 @@
          privkey-bytes (or (:privkey-bytes opts-map)
                            (:cold-privkey opts-map)
                            (when fallback-kp (:private-key fallback-kp)))
-         st (anchor/init-anchor-state (assoc opts-map :pubkey pubkey-hex)
-                                      (cond-> opts-map
-                                        privkey-bytes (assoc :privkey-bytes privkey-bytes)))]
+         st (light-core/init-anchor-state (assoc opts-map :pubkey pubkey-hex)
+                                          (cond-> opts-map
+                                            privkey-bytes (assoc :privkey-bytes privkey-bytes)))]
      (reset! anchor-state-atom st)
-     (clj->js (redact-for-js (anchor/anchor-dashboard-view st))))))
+     (clj->js (redact-for-js (light-core/anchor-dashboard-view st))))))
 
 (defn get-anchor-dashboard
   "Returns the Human Anchor dashboard view as a JavaScript object, syncing live balance, burn metrics, and pending offers from active-node-atom."
@@ -258,7 +257,7 @@
                     (if (or (contains? existing-ids sid)
                             (contains? open-sessions sid))
                       acc
-                      (anchor/queue-incoming-offer
+                      (light-core/queue-incoming-offer
                        acc
                        {:offer-id sid
                         :session-id sid
@@ -273,7 +272,7 @@
   (let [hw-locked? (if-let [na @active-node-atom]
                      (nil? (get-in @na [:keypair :private-key]))
                      (nil? (:privkey-bytes @anchor-state-atom)))
-        view (-> (anchor/anchor-dashboard-view @anchor-state-atom)
+        view (-> (light-core/anchor-dashboard-view @anchor-state-atom)
                  (assoc :hardware-locked hw-locked?)
                  (assoc-in [:identity :hardware-locked] hw-locked?))]
     (clj->js (redact-for-js view))))
@@ -394,23 +393,23 @@
     (if (and live-offer? hw-locked?)
       (clj->js {:ok false
                 :error "hardware-unlock-required"
-                :dashboard (redact-for-js (anchor/anchor-dashboard-view (or @anchor-state-atom (anchor/init-anchor-state))))})
-      (let [[new-state effects] (anchor/approve-offer (or @anchor-state-atom (anchor/init-anchor-state)) id opts-map)]
+                :dashboard (redact-for-js (light-core/anchor-dashboard-view (or @anchor-state-atom (light-core/init-anchor-state))))})
+      (let [[new-state effects] (light-core/approve-offer (or @anchor-state-atom (light-core/init-anchor-state)) id opts-map)]
         (reset! anchor-state-atom new-state)
         (when live-offer?
           (accept-channel-offer na id))
-        (clj->js {:ok true :effects effects :dashboard (redact-for-js (anchor/anchor-dashboard-view new-state))})))))
+        (clj->js {:ok true :effects effects :dashboard (redact-for-js (light-core/anchor-dashboard-view new-state))})))))
 
 (defn deny-offer-cmd
   "Denies a pending offer in the Human Anchor queue with an explicit reason."
   [offer-id & [reason]]
   (let [id (str offer-id)
         rej-reason (or reason "denied-by-human-anchor")
-        [new-state effects] (anchor/deny-offer (or @anchor-state-atom (anchor/init-anchor-state)) id rej-reason)]
+        [new-state effects] (light-core/deny-offer (or @anchor-state-atom (light-core/init-anchor-state)) id rej-reason)]
     (reset! anchor-state-atom new-state)
     (when-let [na @active-node-atom]
       (swap! na update-in [:light-state :pending-offers] dissoc id))
-    (clj->js {:ok true :effects effects :dashboard (redact-for-js (anchor/anchor-dashboard-view new-state))})))
+    (clj->js {:ok true :effects effects :dashboard (redact-for-js (light-core/anchor-dashboard-view new-state))})))
 
 (defn supervise-agent-cmd
   "Registers an autonomous agent under human anchor supervision with an issued DAC."
@@ -418,21 +417,21 @@
   (let [aid (str agent-id)
         pub-str (str hot-pubkey)
         perms-vec (when perms (js->clj perms :keywordize-keys true))
-        new-state (anchor/register-supervised-agent (or @anchor-state-atom (anchor/init-anchor-state))
-                                                    {:agent-id aid
-                                                     :hot-pubkey pub-str
-                                                     :permissions perms-vec})]
+        new-state (light-core/register-supervised-agent (or @anchor-state-atom (light-core/init-anchor-state))
+                                                        {:agent-id aid
+                                                         :hot-pubkey pub-str
+                                                         :permissions perms-vec})]
     (reset! anchor-state-atom new-state)
-    (clj->js {:ok true :agentId aid :dashboard (redact-for-js (anchor/anchor-dashboard-view new-state))})))
+    (clj->js {:ok true :agentId aid :dashboard (redact-for-js (light-core/anchor-dashboard-view new-state))})))
 
 (defn revoke-agent-dac-cmd
   "Emergency revocation of a supervised agent's DAC."
   [agent-id & [reason]]
   (let [aid (str agent-id)
         rej-reason (or reason "emergency-human-anchor-revocation")
-        [new-state effects] (anchor/revoke-agent-dac (or @anchor-state-atom (anchor/init-anchor-state)) aid rej-reason)]
+        [new-state effects] (light-core/revoke-agent-dac (or @anchor-state-atom (light-core/init-anchor-state)) aid rej-reason)]
     (reset! anchor-state-atom new-state)
-    (clj->js {:ok true :effects effects :dashboard (redact-for-js (anchor/anchor-dashboard-view new-state))})))
+    (clj->js {:ok true :effects effects :dashboard (redact-for-js (light-core/anchor-dashboard-view new-state))})))
 
 (defn encode-bech32m-cmd
   "Encodes raw bytes or hex into a Bech32m address."
@@ -451,21 +450,21 @@
         recovered (webauthn/recover-seed-from-assertion {:user-handle seed})
         anchor-pub (:public-hex recovered)
         anchor-addr (:address recovered)
-        st0 (anchor/init-anchor-state {:pubkey anchor-pub}
-                                      {:privkey-bytes (:private-key recovered)
-                                       :key-mode :yubikey-discoverable})
-        st1 (anchor/set-service-offer st0 :ai-inference {:price 100 :burn-floor 100})
-        st2 (anchor/queue-incoming-offer st1 {:offer-id "off-demo-1" :peer-id "worker-node-1" :burn 100})
-        [st3 _app-effects] (anchor/approve-offer st2 "off-demo-1")
+        st0 (light-core/init-anchor-state {:pubkey anchor-pub}
+                                          {:privkey-bytes (:private-key recovered)
+                                           :key-mode :yubikey-discoverable})
+        st1 (light-core/set-service-offer st0 :ai-inference {:price 100 :burn-floor 100})
+        st2 (light-core/queue-incoming-offer st1 {:offer-id "off-demo-1" :peer-id "worker-node-1" :burn 100})
+        [st3 _app-effects] (light-core/approve-offer st2 "off-demo-1")
         hot-kp (crypto/generate-keypair)
         hot-pub (fressian/bytes->hex (:public-key hot-kp))
-        st4 (anchor/register-supervised-agent st3 {:agent-id "sub-agent-alpha"
-                                                   :hot-pubkey hot-pub
-                                                   :max-spend 5000})
-        st5 (anchor/log-agent-activity st4 "sub-agent-alpha" {:type :offer-accepted :offer-id "off-demo-1"})
-        [st6 _rev-effects] (anchor/revoke-agent-dac st5 "sub-agent-alpha" "routine-rotation")
-        st7 (anchor/create-team-call-subnet st6 {:topic-name "core-devs" :peers ["worker-node-1"]})
-        dashboard (redact-for-js (anchor/anchor-dashboard-view st7))]
+        st4 (light-core/register-supervised-agent st3 {:agent-id "sub-agent-alpha"
+                                                       :hot-pubkey hot-pub
+                                                       :max-spend 5000})
+        st5 (light-core/log-agent-activity st4 "sub-agent-alpha" {:type :offer-accepted :offer-id "off-demo-1"})
+        [st6 _rev-effects] (light-core/revoke-agent-dac st5 "sub-agent-alpha" "routine-rotation")
+        st7 (light-core/create-team-call-subnet st6 {:topic-name "core-devs" :peers ["worker-node-1"]})
+        dashboard (redact-for-js (light-core/anchor-dashboard-view st7))]
     (reset! anchor-state-atom st7)
     (clj->js {:ok true
               :anchorAddress anchor-addr
@@ -832,7 +831,7 @@
           (when-not (contains? prev-offers sid)
             (when-not @anchor-state-atom
               (init-anchor nil))
-            (swap! anchor-state-atom anchor/queue-incoming-offer
+            (swap! anchor-state-atom light-core/queue-incoming-offer
                    {:offer-id sid
                     :session-id sid
                     :peer-id (:caller offer)
@@ -1675,9 +1674,9 @@
                      :burn 500
                      :epoch 1}
                     (when offer-map (js->clj offer-map :keywordize-keys true)))
-         new-st (anchor/queue-incoming-offer @anchor-state-atom off)]
+         new-st (light-core/queue-incoming-offer @anchor-state-atom off)]
      (reset! anchor-state-atom new-st)
-     (clj->js (redact-for-js (anchor/anchor-dashboard-view new-st))))))
+     (clj->js (redact-for-js (light-core/anchor-dashboard-view new-st))))))
 
 (defn create-discoverable-credential
   "Invokes WebAuthn navigator.credentials.create with discoverable resident key

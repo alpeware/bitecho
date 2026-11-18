@@ -80,8 +80,115 @@
    "wait"])
 
 (def supported-cli-verbs-set
-  "Set of all canonical CLI verbs for O(1) membership check."
+  "Set of all 68 legacy/domain CLI verbs for O(1) membership check."
   (set supported-cli-verbs))
+
+(def canonical-cli-verbs
+  "Canonical sorted vector of the 12 unified CLI verbs (BIP-005 / Milestone D31)."
+  ["connect"
+   "ctl"
+   "get"
+   "inbox"
+   "list"
+   "lock"
+   "put"
+   "send"
+   "serve"
+   "spend"
+   "transfer"
+   "wait"])
+
+(def canonical-cli-verbs-set
+  "Set of the 12 canonical CLI verbs (BIP-005)."
+  (set canonical-cli-verbs))
+
+(def legacy-verb-desugar-table
+  "Complete 68/68 desugaring table mapping every legacy verb in `supported-cli-verbs`
+   to its canonical 1-of-12 verb (`F-U1`)."
+  {"accept"               {:canonical "connect"  :domain-cmd "accept"}
+   "account"              {:canonical "get"      :domain-cmd "account"}
+   "ack"                  {:canonical "inbox"    :domain-cmd "ack"}
+   "anchor-subnet"        {:canonical "put"      :domain-cmd "anchor-subnet"}
+   "artifact-get"         {:canonical "get"      :domain-cmd "artifact-get"}
+   "artifact-list"        {:canonical "list"     :domain-cmd "artifact-list"}
+   "artifact-put"         {:canonical "put"      :domain-cmd "artifact-put"}
+   "artifact-revoke"      {:canonical "put"      :domain-cmd "artifact-revoke"}
+   "bip-consent"          {:canonical "put"      :domain-cmd "bip-consent"}
+   "bip-object"           {:canonical "put"      :domain-cmd "bip-object"}
+   "bip-status"           {:canonical "get"      :domain-cmd "bip-status"}
+   "bip-submit"           {:canonical "put"      :domain-cmd "bip-submit"}
+   "bounties"             {:canonical "list"     :domain-cmd "bounties"}
+   "bounty-create"        {:canonical "lock"     :domain-cmd "bounty-create"}
+   "bounty-settle"        {:canonical "spend"    :domain-cmd "bounty-settle"}
+   "broadcast"            {:canonical "send"     :domain-cmd "broadcast"}
+   "capability-list"      {:canonical "list"     :domain-cmd "capability-list"}
+   "capability-publish"   {:canonical "put"      :domain-cmd "capability-publish"}
+   "capability-resolve"   {:canonical "get"      :domain-cmd "capability-resolve"}
+   "close"                {:canonical "connect"  :domain-cmd "close"}
+   "dac-attach"           {:canonical "ctl"      :domain-cmd "dac-attach"}
+   "dac-revoke"           {:canonical "ctl"      :domain-cmd "dac-revoke"}
+   "directory-lookup"     {:canonical "get"      :domain-cmd "directory-lookup"}
+   "directory-register"   {:canonical "put"      :domain-cmd "directory-register"}
+   "directory-verify"     {:canonical "get"      :domain-cmd "directory-verify"}
+   "discover"             {:canonical "list"     :domain-cmd "discover"}
+   "epoch-tick"           {:canonical "ctl"      :domain-cmd "epoch-tick"}
+   "escrows"              {:canonical "list"     :domain-cmd "escrows"}
+   "export-ack"           {:canonical "inbox"    :domain-cmd "export-ack"}
+   "export-offer"         {:canonical "connect"  :domain-cmd "export-offer"}
+   "export-poll"          {:canonical "inbox"    :domain-cmd "export-poll"}
+   "export-send"          {:canonical "send"     :domain-cmd "export-send"}
+   "help"                 {:canonical "ctl"      :domain-cmd "help"}
+   "identity"             {:canonical "get"      :domain-cmd "identity"}
+   "import"               {:canonical "inbox"    :domain-cmd "import"}
+   "import-poll"          {:canonical "inbox"    :domain-cmd "import-poll"}
+   "inbox"                {:canonical "inbox"    :domain-cmd "inbox"}
+   "lock-intent"          {:canonical "lock"     :domain-cmd "lock-intent"}
+   "offer"                {:canonical "connect"  :domain-cmd "offer"}
+   "p2p-answer"           {:canonical "connect"  :domain-cmd "p2p-answer"}
+   "p2p-channel-state"    {:canonical "connect"  :domain-cmd "p2p-channel-state"}
+   "p2p-offer"            {:canonical "connect"  :domain-cmd "p2p-offer"}
+   "petname-list"         {:canonical "list"     :domain-cmd "petname-list"}
+   "petname-remove"       {:canonical "put"      :domain-cmd "petname-remove"}
+   "petname-resolve"      {:canonical "get"      :domain-cmd "petname-resolve"}
+   "petname-set"          {:canonical "put"      :domain-cmd "petname-set"}
+   "puzzle-eval"          {:canonical "spend"    :domain-cmd "puzzle-eval"}
+   "puzzle-hash"          {:canonical "spend"    :domain-cmd "puzzle-hash"}
+   "query-chain-state"    {:canonical "get"      :domain-cmd "query-chain-state"}
+   "refund-intent"        {:canonical "spend"    :domain-cmd "refund-intent"}
+   "register-home-set"    {:canonical "connect"  :domain-cmd "register-home-set"}
+   "release-intent"       {:canonical "spend"    :domain-cmd "release-intent"}
+   "rendezvous-accept"    {:canonical "connect"  :domain-cmd "rendezvous-accept"}
+   "rendezvous-offer"     {:canonical "connect"  :domain-cmd "rendezvous-offer"}
+   "rendezvous-policy"    {:canonical "connect"  :domain-cmd "rendezvous-policy"}
+   "retransmit-outbox"    {:canonical "send"     :domain-cmd "retransmit-outbox"}
+   "send"                 {:canonical "send"     :domain-cmd "send"}
+   "settle-intent"        {:canonical "spend"    :domain-cmd "settle-intent"}
+   "status"               {:canonical "get"      :domain-cmd "status"}
+   "storage-get"          {:canonical "get"      :domain-cmd "storage-get"}
+   "storage-list"         {:canonical "list"     :domain-cmd "storage-list"}
+   "storage-put"          {:canonical "put"      :domain-cmd "storage-put"}
+   "submit-vouchers"      {:canonical "spend"    :domain-cmd "submit-vouchers"}
+   "subscribe-subnets"    {:canonical "list"     :domain-cmd "subscribe-subnets"}
+   "sync-account"         {:canonical "get"      :domain-cmd "sync-account"}
+   "transfer"             {:canonical "transfer" :domain-cmd "transfer"}
+   "verify-subnet-anchor" {:canonical "get"      :domain-cmd "verify-subnet-anchor"}
+   "wait"                 {:canonical "wait"     :domain-cmd "wait"}})
+
+(def runner-alias-desugar-table
+  "Complete 8/8 runner & shell alias desugaring table (`F-U1`)."
+  {"serve"             {:canonical "serve"   :domain-cmd "serve"}
+   "ctl"               {:canonical "ctl"     :domain-cmd "ctl"}
+   "daemon"            {:canonical "serve"   :domain-cmd "daemon"}
+   "wait-event"        {:canonical "wait"    :domain-cmd "wait"}
+   "export-p2p-offer"  {:canonical "connect" :domain-cmd "export-p2p-offer"}
+   "export-p2p-answer" {:canonical "connect" :domain-cmd "export-p2p-answer"}
+   "export-reveal"     {:canonical "connect" :domain-cmd "export-reveal"}
+   "import-envelope"   {:canonical "inbox"   :domain-cmd "import-envelope"}})
+
+(def all-recognized-cli-verbs-set
+  "Union of all 68 legacy verbs, 12 canonical verbs, and 8 shell/runner aliases."
+  (into (into supported-cli-verbs-set canonical-cli-verbs-set)
+        (keys runner-alias-desugar-table)))
 
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
@@ -281,12 +388,38 @@
       "discover" {"cmd" "discover"}
       "help"     {"cmd" "help"}
       "inbox"
-      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
-                    (extract-flag-value clean-tokens "--subnet" nil))
-            peek? (has-flag? clean-tokens "--peek")]
-        (cond-> {"cmd" "inbox"}
-          sub (assoc "subnet_id" sub)
-          peek? (assoc "peek" true)))
+      (cond
+        (has-flag? clean-tokens "--hex")
+        (assoc (build-cmd-map "import" clean-tokens) "canonical_cmd" "inbox")
+
+        (or (has-flag? clean-tokens "--payload")
+            (has-flag? clean-tokens "--json")
+            (has-flag? clean-tokens "--file"))
+        (assoc (build-cmd-map "import-poll" clean-tokens) "canonical_cmd" "inbox")
+
+        (and (or (has-flag? clean-tokens "--up-to-seq")
+                 (has-flag? clean-tokens "--ack-seq")
+                 (has-flag? clean-tokens "--up-to-broadcast-seq"))
+             (has-flag? clean-tokens "--offline"))
+        (assoc (build-cmd-map "export-ack" clean-tokens) "canonical_cmd" "inbox")
+
+        (or (has-flag? clean-tokens "--up-to-seq")
+            (has-flag? clean-tokens "--ack-seq")
+            (has-flag? clean-tokens "--up-to-broadcast-seq"))
+        (assoc (build-cmd-map "ack" clean-tokens) "canonical_cmd" "inbox")
+
+        (or (has-flag? clean-tokens "--since-seq")
+            (has-flag? clean-tokens "--since-relay-seq")
+            (has-flag? clean-tokens "--since-broadcast-seq"))
+        (assoc (build-cmd-map "export-poll" clean-tokens) "canonical_cmd" "inbox")
+
+        :else
+        (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                      (extract-flag-value clean-tokens "--subnet" nil))
+              peek? (has-flag? clean-tokens "--peek")]
+          (cond-> {"cmd" "inbox"}
+            sub (assoc "subnet_id" sub)
+            peek? (assoc "peek" true))))
 
       "subscribe-subnets"
       (let [subnets-raw (or (extract-flag-value clean-tokens "--subnets" nil)
@@ -300,8 +433,10 @@
          "subnets" subnets})
 
       "offer"
-      (let [callee (or (extract-flag-value clean-tokens "--callee" nil)
-                       (extract-flag-value clean-tokens "--to" nil))
+      (let [to-val (extract-flag-value clean-tokens "--to" nil)
+            callee (or (extract-flag-value clean-tokens "--callee" nil)
+                       (extract-flag-value clean-tokens "--peer" nil)
+                       to-val)
             price (extract-long-flag clean-tokens "--price" 0)
             burn (extract-long-flag clean-tokens "--burn" 500)
             min-bal (extract-long-flag clean-tokens "--min-balance" nil)
@@ -309,7 +444,7 @@
             wait-open-ms (extract-long-flag clean-tokens "--wait-open-ms" nil)
             m {"cmd" "offer" "callee" callee "price" price "burn" burn}]
         (cond-> m
-          callee (assoc "to" callee)
+          to-val (assoc "to" to-val)
           hn (assoc "home_node" hn)
           (some? wait-open-ms) (assoc "wait_open_ms" wait-open-ms)
           min-bal (assoc "min_balance" min-bal)))
@@ -325,22 +460,39 @@
                         (extract-flag-value clean-tokens "--session" nil))}
 
       "send"
-      (let [to (or (extract-flag-value clean-tokens "--to" nil)
-                   (extract-flag-value clean-tokens "--peer" nil))
-            sid (or (extract-flag-value clean-tokens "--session-id" nil)
-                    (extract-flag-value clean-tokens "--session" nil)
-                    to)
-            msg (or (extract-flag-value clean-tokens "--message" nil)
-                    (extract-flag-value clean-tokens "--text" nil))
-            hex (extract-flag-value clean-tokens "--payload-hex" nil)
-            burn (extract-long-flag clean-tokens "--burn" 500)
-            min-bal (extract-long-flag clean-tokens "--min-balance" nil)
-            m {"cmd" "send" "session_id" sid "burn" burn}]
-        (cond-> m
-          to (assoc "to" to)
-          msg (assoc "text" msg "message" msg)
-          hex (assoc "payload_hex" hex)
-          min-bal (assoc "min_balance" min-bal)))
+      (cond
+        (has-flag? clean-tokens "--retransmit")
+        (assoc (build-cmd-map "retransmit-outbox" clean-tokens) "canonical_cmd" "send")
+
+        (has-flag? clean-tokens "--offline")
+        (assoc (build-cmd-map "export-send" clean-tokens) "canonical_cmd" "send")
+
+        (and (or (has-flag? clean-tokens "--subnet-id")
+                 (has-flag? clean-tokens "--subnet"))
+             (not (has-flag? clean-tokens "--to"))
+             (not (has-flag? clean-tokens "--peer"))
+             (not (has-flag? clean-tokens "--session-id"))
+             (not (has-flag? clean-tokens "--session")))
+        (assoc (build-cmd-map "broadcast" clean-tokens) "canonical_cmd" "send")
+
+        :else
+        (let [to (or (extract-flag-value clean-tokens "--to" nil)
+                     (extract-flag-value clean-tokens "--peer" nil))
+              sid (or (extract-flag-value clean-tokens "--session-id" nil)
+                      (extract-flag-value clean-tokens "--session" nil)
+                      to)
+              t (extract-flag-value clean-tokens "--text" nil)
+              msg (extract-flag-value clean-tokens "--message" nil)
+              hex (extract-flag-value clean-tokens "--payload-hex" nil)
+              burn (extract-long-flag clean-tokens "--burn" 500)
+              min-bal (extract-long-flag clean-tokens "--min-balance" nil)
+              m {"cmd" "send" "session_id" sid "burn" burn}]
+          (cond-> m
+            to (assoc "to" to)
+            t (assoc "text" t)
+            msg (assoc "message" msg "text" (or t msg))
+            hex (assoc "payload_hex" hex)
+            min-bal (assoc "min_balance" min-bal))))
 
       "transfer"
       (let [recv (or (extract-flag-value clean-tokens "--receiver" nil)
@@ -655,21 +807,41 @@
       (let [mseq (or (extract-long-flag clean-tokens "--since-seq" nil)
                      (extract-long-flag clean-tokens "--since-relay-seq" nil))
             bseq (extract-long-flag clean-tokens "--since-broadcast-seq" nil)
-            m {"cmd" "export-poll"}]
+            now (or (extract-long-flag clean-tokens "--now-ms" nil)
+                    (extract-long-flag clean-tokens "--now" nil)
+                    #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)))
+            m {"cmd" "export-poll" "now_ms" now}]
         (cond-> m
           mseq (assoc "since_seq" mseq)
           bseq (assoc "since_broadcast_seq" bseq)))
 
       "import-poll"
-      (let [payload (or (extract-flag-value clean-tokens "--json" nil)
+      (let [f (extract-flag-value clean-tokens "--file" nil)
+            pos-arg (first (remove #(str/starts-with? (str %) "-") clean-tokens))
+            payload (or (extract-flag-value clean-tokens "--json" nil)
                         (extract-flag-value clean-tokens "--payload" nil)
-                        (extract-flag-value clean-tokens "--file" nil))]
-        {"cmd" "import-poll" "file_content" (or payload "")})
+                        f
+                        pos-arg)]
+        (cond-> {"cmd" "import-poll" "file_content" (or payload "")}
+          f (assoc "file" f)))
 
       "import"
-      (let [h (or (extract-flag-value clean-tokens "--hex" nil)
-                  (extract-flag-value clean-tokens "--file" nil))]
-        {"cmd" "import" "hex" (or h "")})
+      (let [f (extract-flag-value clean-tokens "--file" nil)
+            pos-arg (first (remove #(str/starts-with? (str %) "-") clean-tokens))
+            h (or (extract-flag-value clean-tokens "--hex" nil)
+                  f
+                  pos-arg)]
+        (cond-> {"cmd" "import" "hex" (or h "")}
+          f (assoc "file" f)))
+
+      "import-envelope"
+      (let [f (extract-flag-value clean-tokens "--file" nil)
+            pos-arg (first (remove #(str/starts-with? (str %) "-") clean-tokens))
+            h (or (extract-flag-value clean-tokens "--hex" nil)
+                  f
+                  pos-arg)]
+        (cond-> {"cmd" "import-envelope" "hex" (or h "")}
+          f (assoc "file" f)))
 
       "export-offer"
       (let [to (or (extract-flag-value clean-tokens "--to" nil)
@@ -683,6 +855,40 @@
           to (assoc "to" to)
           ep (assoc "epoch" ep)
           hn (assoc "home_node" hn)))
+
+      "export-reveal"
+      (let [oh (extract-flag-value clean-tokens "--offer-hash" nil)
+            from (extract-flag-value clean-tokens "--from" nil)
+            m {"cmd" "export-reveal"}]
+        (cond-> m
+          oh (assoc "offer_hash" oh)
+          from (assoc "from" from)))
+
+      "export-p2p-offer"
+      (let [sid (or (extract-flag-value clean-tokens "--session-id" nil)
+                    (extract-flag-value clean-tokens "--session" nil)
+                    (extract-flag-value clean-tokens "--to" nil)
+                    (extract-flag-value clean-tokens "--peer" nil))
+            cands (extract-flag-value clean-tokens "--candidates" nil)
+            b (extract-long-flag clean-tokens "--burn" nil)
+            m {"cmd" "export-p2p-offer"}]
+        (cond-> m
+          sid (assoc "session_id" sid "to" sid)
+          cands (assoc "candidates" cands)
+          (some? b) (assoc "burn" b)))
+
+      "export-p2p-answer"
+      (let [sid (or (extract-flag-value clean-tokens "--session-id" nil)
+                    (extract-flag-value clean-tokens "--session" nil)
+                    (extract-flag-value clean-tokens "--to" nil)
+                    (extract-flag-value clean-tokens "--peer" nil))
+            cands (extract-flag-value clean-tokens "--candidates" nil)
+            b (extract-long-flag clean-tokens "--burn" nil)
+            m {"cmd" "export-p2p-answer"}]
+        (cond-> m
+          sid (assoc "session_id" sid "to" sid)
+          cands (assoc "candidates" cands)
+          (some? b) (assoc "burn" b)))
 
       "export-send"
       (let [to (or (extract-flag-value clean-tokens "--to" nil)
@@ -724,7 +930,10 @@
                    (extract-flag-value clean-tokens "--peer" nil)
                    (extract-flag-value clean-tokens "--session-id" nil)
                    (extract-flag-value clean-tokens "--session" nil))
-            m {"cmd" "export-ack"}]
+            now (or (extract-long-flag clean-tokens "--now-ms" nil)
+                    (extract-long-flag clean-tokens "--now" nil)
+                    #?(:clj (System/currentTimeMillis) :cljs (.now js/Date)))
+            m {"cmd" "export-ack" "now_ms" now}]
         (cond-> m
           s (assoc "up_to_seq" s "ack_seq" s)
           bs (assoc "up_to_broadcast_seq" bs "ack_broadcast_seq" bs)
@@ -1087,7 +1296,318 @@
           relay-url (assoc "relay_url" relay-url)
           auth (assoc "authority" auth)))
 
+      ;; -----------------------------------------------------------------------
+      ;; Canonical 12 Verbs Flag-Driven Desugaring (BIP-005 / Milestone D31)
+      ;; -----------------------------------------------------------------------
+      "put"
+      (let [domain-verb
+            (cond
+              (and (has-flag? clean-tokens "--bip-id")
+                   (has-flag? clean-tokens "--circle")
+                   (has-flag? clean-tokens "--counterexample-edn"))
+              "bip-object"
+
+              (and (has-flag? clean-tokens "--bip-id")
+                   (has-flag? clean-tokens "--circle"))
+              "bip-consent"
+
+              (has-flag? clean-tokens "--bip-id")
+              "bip-submit"
+
+              (or (has-flag? clean-tokens "--capability-id")
+                  (has-flag? clean-tokens "--cap-id"))
+              "capability-publish"
+
+              (or (has-flag? clean-tokens "--slot-id")
+                  (has-flag? clean-tokens "--slot"))
+              "storage-put"
+
+              (and (has-flag? clean-tokens "--petname")
+                   (has-flag? clean-tokens "--remove"))
+              "petname-remove"
+
+              (has-flag? clean-tokens "--petname")
+              "petname-set"
+
+              (has-flag? clean-tokens "--nickname")
+              "directory-register"
+
+              (or (has-flag? clean-tokens "--child-subnet")
+                  (has-flag? clean-tokens "--parent-subnet")
+                  (has-flag? clean-tokens "--child-epoch"))
+              "anchor-subnet"
+
+              (or (has-flag? clean-tokens "--tombstone")
+                  (has-flag? clean-tokens "--revoke"))
+              "artifact-revoke"
+
+              :else
+              "artifact-put")]
+        (assoc (build-cmd-map domain-verb clean-tokens) "canonical_cmd" "put"))
+
+      "get"
+      (let [domain-verb
+            (cond
+              (has-flag? clean-tokens "--bip-id")
+              "bip-status"
+
+              (or (has-flag? clean-tokens "--capability-id")
+                  (has-flag? clean-tokens "--cap-id"))
+              "capability-resolve"
+
+              (or (has-flag? clean-tokens "--slot-id")
+                  (has-flag? clean-tokens "--slot"))
+              "storage-get"
+
+              (has-flag? clean-tokens "--petname")
+              "petname-resolve"
+
+              (and (has-flag? clean-tokens "--nickname")
+                   (has-flag? clean-tokens "--verify"))
+              "directory-verify"
+
+              (has-flag? clean-tokens "--nickname")
+              "directory-lookup"
+
+              (or (has-flag? clean-tokens "--child-subnet")
+                  (has-flag? clean-tokens "--parent-subnet"))
+              "verify-subnet-anchor"
+
+              (has-flag? clean-tokens "--path")
+              "artifact-get"
+
+              (or (has-flag? clean-tokens "--sync")
+                  (has-flag? clean-tokens "--balance")
+                  (has-flag? clean-tokens "--account"))
+              "account"
+
+              (has-flag? clean-tokens "--identity")
+              "identity"
+
+              (has-flag? clean-tokens "--chain-state")
+              "query-chain-state"
+
+              :else
+              "status")]
+        (assoc (build-cmd-map domain-verb clean-tokens) "canonical_cmd" "get"))
+
+      "list"
+      (let [domain-verb
+            (cond
+              (or (has-flag? clean-tokens "--subnets")
+                  (has-flag? clean-tokens "--subscribe-subnets"))
+              "subscribe-subnets"
+
+              (or (has-flag? clean-tokens "--capability-type")
+                  (has-flag? clean-tokens "--capabilities"))
+              "capability-list"
+
+              (has-flag? clean-tokens "--bounties")
+              "bounties"
+
+              (has-flag? clean-tokens "--escrows")
+              "escrows"
+
+              (has-flag? clean-tokens "--petnames")
+              "petname-list"
+
+              (has-flag? clean-tokens "--slots")
+              "storage-list"
+
+              (has-flag? clean-tokens "--discover")
+              "discover"
+
+              :else
+              "artifact-list")]
+        (assoc (build-cmd-map domain-verb clean-tokens) "canonical_cmd" "list"))
+
+      "lock"
+      (let [domain-verb (if (has-flag? clean-tokens "--bounty-id")
+                          "bounty-create"
+                          "lock-intent")]
+        (assoc (build-cmd-map domain-verb clean-tokens) "canonical_cmd" "lock"))
+
+      "spend"
+      (let [domain-verb
+            (cond
+              (has-flag? clean-tokens "--bounty-id")
+              "bounty-settle"
+
+              (has-flag? clean-tokens "--refund")
+              "refund-intent"
+
+              (has-flag? clean-tokens "--eval-only")
+              "puzzle-eval"
+
+              (has-flag? clean-tokens "--hash-only")
+              "puzzle-hash"
+
+              (has-flag? clean-tokens "--vouchers")
+              "submit-vouchers"
+
+              (or (has-flag? clean-tokens "--escrow-id")
+                  (has-flag? clean-tokens "--intent-id")
+                  (has-flag? clean-tokens "--preimage")
+                  (has-flag? clean-tokens "--solution"))
+              "release-intent"
+
+              :else
+              "settle-intent")]
+        (assoc (build-cmd-map domain-verb clean-tokens) "canonical_cmd" "spend"))
+
+      "connect"
+      (let [domain-verb
+            (cond
+              (has-flag? clean-tokens "--connected")
+              "p2p-channel-state"
+
+              (and (has-flag? clean-tokens "--candidates")
+                   (has-flag? clean-tokens "--answer"))
+              "p2p-answer"
+
+              (has-flag? clean-tokens "--candidates")
+              "p2p-offer"
+
+              (has-flag? clean-tokens "--close")
+              "close"
+
+              (or (has-flag? clean-tokens "--session-id")
+                  (has-flag? clean-tokens "--session"))
+              "accept"
+
+              (has-flag? clean-tokens "--nodes")
+              "register-home-set"
+
+              (has-flag? clean-tokens "--offer-hash")
+              "rendezvous-accept"
+
+              (or (has-flag? clean-tokens "--allowlist")
+                  (has-flag? clean-tokens "--min-burn")
+                  (has-flag? clean-tokens "--auto-accept"))
+              "rendezvous-policy"
+
+              (has-flag? clean-tokens "--topic")
+              "rendezvous-offer"
+
+              (has-flag? clean-tokens "--offline")
+              "export-offer"
+
+              :else
+              "offer")]
+        (assoc (build-cmd-map domain-verb clean-tokens) "canonical_cmd" "connect"))
+
+      "serve"
+      {"cmd" "serve" "canonical_cmd" "serve"}
+
+      "ctl"
+      {"cmd" "ctl" "canonical_cmd" "ctl"}
+
+      "daemon"
+      {"cmd" "daemon" "canonical_cmd" "serve"}
+
+      "wait-event"
+      (assoc (build-cmd-map "wait" clean-tokens) "canonical_cmd" "wait")
+
       {"cmd" verb})))
+
+(defn desugar-cli-cmd-map
+  "Pure desugaring transformation (`F-U1`): maps any command map (using one of the 12
+   canonical verbs, 68 legacy verbs, or 8 runner aliases) to a normalized command map
+   containing both `\"cmd\"` (domain handler verb) and `\"canonical_cmd\"` (1-of-12 canonical verb)."
+  [cmd-map]
+  (let [m (into {} (map (fn [[k v]] [(if (keyword? k) (name k) (str k)) v]) (or cmd-map {})))
+        raw-verb (str/lower-case (str/trim (str (or (get m "cmd") (get m "verb") "status"))))
+        legacy-entry (get legacy-verb-desugar-table raw-verb)
+        runner-entry (get runner-alias-desugar-table raw-verb)]
+    (cond
+      (some? (get m "canonical_cmd"))
+      m
+
+      legacy-entry
+      (assoc m
+             "cmd" (:domain-cmd legacy-entry)
+             "canonical_cmd" (:canonical legacy-entry))
+
+      runner-entry
+      (assoc m
+             "cmd" (:domain-cmd runner-entry)
+             "canonical_cmd" (:canonical runner-entry))
+
+      (contains? canonical-cli-verbs-set raw-verb)
+      (let [inferred-domain
+            (case raw-verb
+              "put"      (cond
+                           (and (get m "bip_id") (get m "circle") (get m "counterexample_edn")) "bip-object"
+                           (and (get m "bip_id") (get m "circle")) "bip-consent"
+                           (get m "bip_id") "bip-submit"
+                           (get m "capability_id") "capability-publish"
+                           (or (get m "slot") (get m "slot_id")) "storage-put"
+                           (and (get m "petname") (get m "remove")) "petname-remove"
+                           (get m "petname") "petname-set"
+                           (get m "nickname") "directory-register"
+                           (get m "parent_subnet") "anchor-subnet"
+                           (or (get m "tombstone") (get m "revoke")) "artifact-revoke"
+                           :else "artifact-put")
+              "get"      (cond
+                           (get m "bip_id") "bip-status"
+                           (get m "capability_id") "capability-resolve"
+                           (or (get m "slot") (get m "slot_id")) "storage-get"
+                           (get m "petname") "petname-resolve"
+                           (and (get m "nickname") (get m "verify")) "directory-verify"
+                           (get m "nickname") "directory-lookup"
+                           (get m "parent_subnet") "verify-subnet-anchor"
+                           (get m "path") "artifact-get"
+                           (or (get m "sync") (get m "balance")) "account"
+                           (get m "identity") "identity"
+                           :else "status")
+              "list"     (cond
+                           (get m "subnets") "subscribe-subnets"
+                           (get m "capability_type") "capability-list"
+                           (get m "bounties") "bounties"
+                           (get m "escrows") "escrows"
+                           (get m "petnames") "petname-list"
+                           (get m "slots") "storage-list"
+                           :else "artifact-list")
+              "lock"     (if (get m "bounty_id") "bounty-create" "lock-intent")
+              "spend"    (cond
+                           (get m "bounty_id") "bounty-settle"
+                           (get m "refund") "refund-intent"
+                           (get m "eval_only") "puzzle-eval"
+                           (get m "hash_only") "puzzle-hash"
+                           (or (get m "escrow_id") (get m "intent_id")) "release-intent"
+                           :else "settle-intent")
+              "connect"  (cond
+                           (some? (get m "connected")) "p2p-channel-state"
+                           (and (get m "candidates") (get m "answer")) "p2p-answer"
+                           (get m "candidates") "p2p-offer"
+                           (get m "close") "close"
+                           (get m "session_id") "accept"
+                           (get m "home_nodes") "register-home-set"
+                           (get m "offer_hash") "rendezvous-accept"
+                           (or (get m "allowlist") (get m "min_burn")) "rendezvous-policy"
+                           :else "offer")
+              "send"     (cond
+                           (get m "retransmit") "retransmit-outbox"
+                           (get m "offline") "export-send"
+                           (and (get m "subnet_id") (not (get m "to")) (not (get m "session_id"))) "broadcast"
+                           :else "send")
+              "inbox"    (cond
+                           (get m "hex") "import"
+                           (get m "file_content") "import-poll"
+                           (get m "up_to_seq") "ack"
+                           (get m "since_seq") "export-poll"
+                           :else "inbox")
+              "transfer" "transfer"
+              "wait"     "wait"
+              "serve"    "serve"
+              "ctl"      "ctl"
+              raw-verb)]
+        (assoc m
+               "cmd" inferred-domain
+               "canonical_cmd" raw-verb))
+
+      :else
+      (assoc m "canonical_cmd" raw-verb))))
 
 ;; =============================================================================
 ;; 5. Pure CLI Command Parser (Entry Point)
@@ -1102,7 +1622,7 @@
     (map? input)
     (let [verb (str (or (get input "cmd") (:cmd input) (get input "verb") (:verb input)))
           verb (if (str/blank? verb) "status" (str/lower-case (str/trim verb)))]
-      (if (supported-cli-verbs-set verb)
+      (if (all-recognized-cli-verbs-set verb)
         (let [str-map (into {} (map (fn [[k v]] [(if (keyword? k) (name k) (str k)) v]) input))
               cmd-map (assoc str-map "cmd" verb)]
           {:ok? true
@@ -1133,7 +1653,7 @@
                      (let [non-flag (first (remove #(str/starts-with? % "--") tokens))]
                        (if non-flag (str/lower-case non-flag) "status"))
                      first-tok)]
-          (if (supported-cli-verbs-set verb)
+          (if (all-recognized-cli-verbs-set verb)
             (let [subargs (if (= first-tok verb) (vec (rest tokens)) tokens)
                   {:keys [opts args]} (parse-tokens-into-opts-and-args subargs)
                   cmd-map (build-cmd-map verb tokens)]

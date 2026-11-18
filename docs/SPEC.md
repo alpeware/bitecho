@@ -321,6 +321,22 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 1. **Shared Relay Candidate Preservation:** `filter-p2p-remote-candidates` in `exec-p2p-answer`, `handle-wire-p2p-offer`, and `handle-wire-p2p-answer` never strips shared `https://` or `http://` relay URLs during self-filtering, and falls back to raw remote candidates with counted `:p2p-answer-candidate-self-filter-fallback` / `:p2p-offer-candidate-self-filter-fallback` diagnostics when non-relay candidates self-filter to empty.
 2. **Shuttle Import Live Forwarding:** In `handle-serve-line!`, import shuttle verbs (`import-poll`, `import`, `import-envelope`) forward generated hub-relay/gossip envelopes immediately when validator or P2P links are live, or increment `[:diagnostics :shuttle-import-forward-deferred]` and return `"pending_forward_count"` when offline.
 
+---
+
+## 11. Milestone D31: BIP-005 Unification III (`v0.23.9`)
+
+### 11.1 Live-Test Bugfixes (`F-D31-BUG-1..3`) & Dead-Code Purge
+1. **Closure `:advanced` Pure Ed25519 Direct Calls (`F-D31-BUG-1`):** `bitecho.crypto` calls `(ed-sha512 ...)`, `(ed-public-key ...)`, `(ed-sign ...)`, and `(ed-verify ...)` directly without JS dot-property access, and `exec-artifact-put`, `exec-artifact-revoke`, `exec-bip-submit`, and `exec-bounty-settle` lazily evaluate `fallback-kp` only `(when-not privkey-bytes ...)`.
+2. **Strict `:p2p-broadcast` Subnet Filtering (`F-D31-BUG-2` / `F-D29-21`):** Default `"global"` and `"devnet.bitecho.org"` light nodes drop unsubscribed `:p2p-broadcast` envelopes with counted `:subnet-mismatch-dropped` diagnostics.
+3. **Persisted Snapshot Policy Upgrade Merge (`F-D31-BUG-3`):** `infra/merge-upgraded-policy` merges newly added `:subnet/path-acl` patterns and upgraded `:signers` sets from `default-infra-policy` into persisted `subnet-pointers.fressian` snapshots on runtime startup.
+
+### 11.2 Pure Foundations, `68 -> 12` Canonical CLI Desugaring, `:sync-pointer`, & 3-of-3 Bounty Puzzle (`F-U1..F-U7`)
+1. **Pure Foundations (`bitecho.core.window`, `bitecho.core.lifecycle`, Unified RFC 6962 Merkle):** Shared bounded FIFO, byte-LRU, and 64-bit replay bitmask windows in `bitecho.core.window`; shared Rule 4/5 generation-fenced lifecycle reducer in `bitecho.core.lifecycle`; single RFC 6962 Merkle tree implementation in `bitecho.core.data`.
+2. **`68 -> 12` Canonical CLI Verb Desugaring (`F-U1`, `F-U2`):** `bitecho.light-node.cli` defines the 12 canonical verbs (`put`, `get`, `list`, `transfer`, `lock`, `spend`, `connect`, `send`, `inbox`, `wait`, `serve`, `ctl`) and desugars all 68 legacy verbs and 8 runner aliases while preserving `--burn` anti-Sybil burn deduction and `outer-subnet = "*"` global propagation.
+3. **Unified `:sync-pointer` & `.v0238.bak` State Migration (`F-U4`, `F-U5`):** Light nodes ingest `:sync-pointer` alongside N-1 legacy `*-replicate` frames, project all domain pointers/blobs into `:pointers` and `:blobs`, and automatically create `<state-dir>/state.fressian.v0238.bak` before migrating `v0.23.8` snapshots.
+4. **Canonical 3-of-3 Bounty SCI Puzzle:** `bitecho.economy.puzzle/canonical-bounty-puzzle-source` enforces pairwise-distinct 3-of-3 (`maintainer`, `builder`, `auditor`) Ed25519 signatures, exact zero-dust `85/15` net-pool split + protocol take, and post-timeout maintainer refund.
+
+
 
 
 

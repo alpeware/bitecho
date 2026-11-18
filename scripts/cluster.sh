@@ -423,7 +423,7 @@ EDN_EOF
 
 verify_release_proof_gate() {
   local version="${1:-$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.8}"
+  version="${version:-0.23.9}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Step 0a/8: Verifying Release Proof Gate for v${version}..."

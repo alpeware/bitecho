@@ -317,12 +317,13 @@
                                         {:pattern "web/agents/*"     :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "web/blog/*"       :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "blog/*"           :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/bip/*"        :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "bip/*"            :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "web/*"            :principal {:type :allowlist}}
                                         {:pattern "bootstrap"        :principal {:type :allowlist}}
                                         {:pattern "dir/*"            :principal {:type :allowlist}}
                                         {:pattern "acme/challenge/*" :principal {:type :leader}}
                                         {:pattern "tls/*"            :principal {:type :leader}}
-                                        {:pattern "bip/*"            :principal {:type :allowlist}}
                                         {:pattern "bounty/*"         :principal {:type :allowlist}}
                                         {:pattern "head/*"           :principal {:type :allowlist}}
                                         {:pattern "mail/*"           :principal {:type :allowlist}}
@@ -847,6 +848,41 @@
                  (assoc cid-res :pointer ptr)
                  (assoc cid-res :pointer ptr))))))))))
 
+(defn merge-upgraded-policy
+  "Pure helper (`F-D31-BUG-3`): merges newly added `:subnet/path-acl` patterns and upgraded
+   `:signers` sets from `default-pol` into a persisted `snap-pol` loaded from `subnet-pointers.fressian`."
+  [default-pol snap-pol]
+  (cond
+    (nil? snap-pol) default-pol
+    (nil? default-pol) snap-pol
+    :else
+    (let [def-acl (vec (or (:subnet/path-acl default-pol) []))
+          snap-acl (vec (or (:subnet/path-acl snap-pol) []))
+          snap-by-pat (into {} (map (fn [r] [(:pattern r) r]) snap-acl))
+          def-pats (set (map :pattern def-acl))
+          merge-rule (fn [def-rule snap-rule]
+                       (if (nil? snap-rule)
+                         def-rule
+                         (let [def-p (:principal def-rule)
+                               snap-p (:principal snap-rule)
+                               def-signers (:signers def-p)
+                               snap-signers (:signers snap-p)
+                               merged-p (cond-> (merge def-p snap-p)
+                                          (or (seq def-signers) (seq snap-signers))
+                                          (assoc :signers (into (set (or snap-signers #{}))
+                                                                (or def-signers #{}))))]
+                           (assoc snap-rule :principal merged-p))))
+          merged-def (mapv (fn [def-r]
+                             (merge-rule def-r (get snap-by-pat (:pattern def-r))))
+                           def-acl)
+          extra-snap (filterv #(not (contains? def-pats (:pattern %))) snap-acl)
+          final-acl (into merged-def extra-snap)
+          merged-denied (into (set (or (:subnet/denied-cids default-pol) #{}))
+                              (or (:subnet/denied-cids snap-pol) #{}))
+          merged-base (cond-> (assoc snap-pol :subnet/path-acl final-acl)
+                        (seq merged-denied) (assoc :subnet/denied-cids merged-denied))]
+      (assoc merged-base :subnet/genesis-policy-cid (subnet/policy-cid merged-base)))))
+
 (defn start-subnet-runtime!
   "Initializes and starts a single-authority Subnet shell runtime (`:phase :running`).
    Enforces `F-B2` fail-fast shared `:tls-secret` / `:tls-secret-file` on multi-node TLS-managed runtimes."
@@ -878,7 +914,7 @@
                                                                    (data/pin-blob % (:pointer/target ptr))
                                                                    %))))
                                 (cond-> (:instance init-res)
-                                  (:policy snap) (assoc :policy (:policy snap)))
+                                  (:policy snap) (assoc :policy (merge-upgraded-policy (:policy opts) (:policy snap))))
                                 (:pointers snap))
                         (:instance init-res))
                 subnet-atom (atom inst0)

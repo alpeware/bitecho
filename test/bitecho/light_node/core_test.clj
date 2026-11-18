@@ -4068,8 +4068,8 @@
           (is (false? (get-in fail-res [:response "ok"])))
           (is (= "insufficient-funds" (get-in fail-res [:response "error"]))))
 
-        ;; Bob (default "global" node) receives Alice's homebrew-cafe broadcast and drains via inbox with --subnet-id filtering
-        (let [rx-res (light-core/handle-wire-payload st-b0 env priv-b)
+        ;; Bob (subscribed to "homebrew-cafe") receives Alice's homebrew-cafe broadcast and drains via inbox with --subnet-id filtering
+        (let [rx-res (light-core/handle-wire-payload (assoc st-b0 :subscribed-subnets #{"homebrew-cafe"}) env priv-b)
               st-b1 (:state rx-res)]
           (is (= 1 (count (:broadcast-inbox st-b1))))
           (is (= "homebrew-cafe" (:subnet-id (first (:broadcast-inbox st-b1)))))

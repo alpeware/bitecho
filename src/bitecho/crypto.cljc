@@ -645,17 +645,39 @@
                            (recur (inc i)))
                          true))))))))))
 
-     (def ^:private pure-ed25519-engine
-       #js {:sha512 ed-sha512
-            :publicKey ed-public-key
-            :getPublicKey ed-public-key
-            :sign ed-sign
-            :verify ed-verify})))
+     (def ^:private ed25519-spki-prefix (fressian/hex->bytes "302a300506032b6570032100"))
+     (def ^:private ed25519-pkcs8-prefix (fressian/hex->bytes "302e020100300506032b657004220420"))
 
-#?(:cljs
-   (def ^:private ed25519-spki-prefix (fressian/hex->bytes "302a300506032b6570032100")))
-#?(:cljs
-   (def ^:private ed25519-pkcs8-prefix (fressian/hex->bytes "302e020100300506032b657004220420")))
+     (defn- cljs-ed-sha512 [b]
+       (ed-sha512 b))
+
+     (defn pure-ed25519-keypair
+       "Generates an Ed25519 keypair in pure ClojureScript (RFC 8032),
+        returning {:public spki-der (44B) :private pkcs8-der (48B)}."
+       ([] (pure-ed25519-keypair (random-bytes 32)))
+       ([seed32]
+        (let [pub-raw (ed-public-key seed32)
+              pub-der (fressian/concat-bytes ed25519-spki-prefix pub-raw)
+              priv-der (fressian/concat-bytes ed25519-pkcs8-prefix seed32)]
+          {:public pub-der :private priv-der :public-key pub-der :private-key priv-der})))
+
+     (defn pure-ed25519-sign
+       "Signs message bytes using pure ClojureScript Ed25519 (RFC 8032).
+        Accepts either 32-byte raw seed or 48-byte PKCS#8 DER private key."
+       [priv-bytes msg-bytes]
+       (let [seed32 (if (= (fressian/count-bytes priv-bytes) 48)
+                      (.subarray priv-bytes 16)
+                      priv-bytes)]
+         (ed-sign seed32 msg-bytes)))
+
+     (defn pure-ed25519-verify
+       "Verifies an Ed25519 signature using pure ClojureScript Ed25519 (RFC 8032).
+        Accepts either 32-byte raw public key or 44-byte X.509 SPKI DER public key."
+       [pub-bytes msg-bytes sig-bytes]
+       (let [pub32 (if (= (fressian/count-bytes pub-bytes) 44)
+                     (.subarray pub-bytes 12)
+                     pub-bytes)]
+         (boolean (ed-verify pub32 msg-bytes sig-bytes))))))
 
 (defn sha512
   "Computes synchronous SHA-512 digest of a byte array (or UTF-8 string).
@@ -664,38 +686,7 @@
   (let [b (if (string? input) (fressian/utf8->bytes input) input)]
     #?(:clj (let [md (MessageDigest/getInstance "SHA-512")]
               (.digest md ^bytes b))
-       :cljs (.sha512 pure-ed25519-engine b))))
-
-#?(:cljs
-   (defn pure-ed25519-keypair
-     "Generates an Ed25519 keypair in pure ClojureScript (RFC 8032),
-      returning {:public spki-der (44B) :private pkcs8-der (48B)}."
-     ([] (pure-ed25519-keypair (random-bytes 32)))
-     ([seed32]
-      (let [pub-raw (.publicKey pure-ed25519-engine seed32)
-            pub-der (fressian/concat-bytes ed25519-spki-prefix pub-raw)
-            priv-der (fressian/concat-bytes ed25519-pkcs8-prefix seed32)]
-        {:public pub-der :private priv-der :public-key pub-der :private-key priv-der}))))
-
-#?(:cljs
-   (defn pure-ed25519-sign
-     "Signs message bytes using pure ClojureScript Ed25519 (RFC 8032).
-      Accepts either 32-byte raw seed or 48-byte PKCS#8 DER private key."
-     [priv-bytes msg-bytes]
-     (let [seed32 (if (= (fressian/count-bytes priv-bytes) 48)
-                    (.subarray priv-bytes 16)
-                    priv-bytes)]
-       (.sign pure-ed25519-engine seed32 msg-bytes))))
-
-#?(:cljs
-   (defn pure-ed25519-verify
-     "Verifies an Ed25519 signature using pure ClojureScript Ed25519 (RFC 8032).
-      Accepts either 32-byte raw public key or 44-byte X.509 SPKI DER public key."
-     [pub-bytes msg-bytes sig-bytes]
-     (let [pub32 (if (= (fressian/count-bytes pub-bytes) 44)
-                   (.subarray pub-bytes 12)
-                   pub-bytes)]
-       (boolean (.verify pure-ed25519-engine pub32 msg-bytes sig-bytes)))))
+       :cljs (cljs-ed-sha512 b))))
 
 #?(:clj
    (do

@@ -11,7 +11,6 @@
             [bitecho.economy.treasury :as treasury]
             [bitecho.fressian :as fressian]
             [bitecho.rendezvous.core :as rendezvous]
-            [bitecho.shell.core :as core]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.persistence :as persistence]
             [bitecho.state-machine :as sm]
@@ -1441,19 +1440,24 @@
 ;; Embedded HTTP Server (/healthz & /statusz)
 ;; ---------------------------------------------------------------------------
 
-(defn- query-node-state
+(defn query-node-state
   "Queries the active shell node for its current internal state with timeout.
    Reads :state-atom directly in O(1) if present, falling back to channel query."
-  [shell-node timeout-ms]
-  (if-let [st-atom (or (:state-atom shell-node)
-                       (get-in shell-node [:shell-node :state-atom]))]
-    (when (instance? clojure.lang.IDeref st-atom)
-      @st-atom)
-    (let [sh (if (:shell-node shell-node) (:shell-node shell-node) shell-node)
-          reply-ch (async/promise-chan)]
-      (async/put! (:events-in sh) {:type :query-state :reply-chan reply-ch})
-      (let [[val _] (async/alts!! [reply-ch (async/timeout timeout-ms)])]
-        val))))
+  ([shell-node]
+   (query-node-state shell-node 5000))
+  ([shell-node timeout-or-opt & more]
+   (let [timeout-ms (if (number? timeout-or-opt)
+                      (long timeout-or-opt)
+                      (long (or (:timeout-ms (apply hash-map timeout-or-opt more)) 5000)))]
+     (if-let [st-atom (or (:state-atom shell-node)
+                          (get-in shell-node [:shell-node :state-atom]))]
+       (when (instance? clojure.lang.IDeref st-atom)
+         @st-atom)
+       (let [sh (if (:shell-node shell-node) (:shell-node shell-node) shell-node)
+             reply-ch (async/promise-chan)]
+         (async/put! (:events-in sh) {:type :query-state :reply-chan reply-ch})
+         (let [[val _] (async/alts!! [reply-ch (async/timeout timeout-ms)])]
+           val))))))
 
 (defn- make-http-handler
   "Creates an HttpHandler for healthz, statusz, connz, burnsz, and accountz endpoints."
@@ -2054,7 +2058,12 @@
                                  (try
                                    (api/send! agent-node (fressian/encode-wire snapshot) cid)
                                    (catch Exception e
-                                     (log-mesh-error "Failed to send chain-state-snapshot to agent" e)))))
+                                     (log-mesh-error "Failed to send chain-state-snapshot to agent" e))))
+                               (when (anon-conn-key? @conn-key)
+                                 (when agent-conns
+                                   (apply-mesh-conn-event! agent-conns @conn-key
+                                                           {:type :on-close :generation @node-gen :node agent-node}))
+                                 (try (api/close! agent-node) (catch Exception _ nil))))
                              (do
                                (async/put! (:network-in shell-node) unwrapped)
                                (when (and (= (:type unwrapped) :receive-gossip) agent-conns)
@@ -2098,6 +2107,164 @@
       (api/listen-tcp! listen-opts
                        {:on-connection (make-agent-connection-handler shell-node agent-conns peer-ice-pwds identity)}))))
 
+;; ---------------------------------------------------------------------------
+;; Transparent Go-Loop Shell Node (Inlined from bitecho.shell.core)
+;; ---------------------------------------------------------------------------
+
+(defn is-network-command?
+  "Determines if a given command map is meant for external network peers."
+  [cmd]
+  (let [t (:type cmd)]
+    (or (= :network-out t)
+        (and (keyword? t) (str/starts-with? (name t) "send-")))))
+
+(def ^:private allowed-network-events
+  #{:receive-push-view
+    :receive-summary
+    :receive-pull-request
+    :receive-gossip
+    :receive-sieve-echo
+    :receive-contagion-ready
+    :receive-subscribe
+    :receive-propose
+    :receive-vote
+    :register-home-set
+    :receive-offer-header
+    :on-deliver
+    :submit-vouchers
+    :signaling-burn
+    :settle-intent
+    :lock-intent
+    :release-intent
+    :refund-intent
+    :reconfigure-membership
+    :receive-receipt
+    :request-checkpoint
+    :receive-request-checkpoint
+    :receive-checkpoint
+    :query-chain-state
+    :submit-transcript
+    :receive-transcript-sig})
+
+(defn- valid-network-event?
+  "Validates if an incoming event map from the external network is in the whitelist."
+  [event]
+  (contains? allowed-network-events (:type event)))
+
+(defn- dispatch-commands!
+  "Routes generated commands to appropriate shell output channels."
+  [commands app-out net-out events-in node-pubkey]
+  (doseq [cmd commands]
+    (cond
+      (= (:type cmd) :app-event)
+      (async/put! app-out (assoc cmd :node-pubkey node-pubkey))
+      (or (= (:type cmd) :diagnose) (= (:effect cmd) :diagnose))
+      nil
+      (is-network-command? cmd) (async/put! net-out cmd)
+      :else (async/put! events-in cmd))))
+
+(defn- start-persistence-worker!
+  "Spawns a dedicated thread draining persist-ch to snapshot files."
+  [persist-ch snapshot-filename]
+  (async/thread
+    (loop []
+      (when-let [state-to-save (async/<!! persist-ch)]
+        (persistence/save-state-to-disk snapshot-filename state-to-save)
+        (recur)))))
+
+(defn start-node
+  "Starts a transparent go-loop wrapping the state machine.
+   Returns a map with channels :events-in, :network-in, :net-out, :app-out, :persist-ch, :stop-ch, and :state-atom.
+   Snapshots state to disk automatically via dedicated async/thread sliding-buffer channel.
+   Accepts an optional opts map:
+     :persist?  — when false, disables persistence entirely (default true)
+     :persist-every-event? — when true, persists on every event rather than throttling to :tick"
+  ([initial-state]
+   (start-node initial-state persistence/default-snapshot-filename))
+  ([initial-state snapshot-filename]
+   (start-node initial-state snapshot-filename {}))
+  ([initial-state snapshot-filename opts]
+   (let [persist? (get opts :persist? true)
+         persist-every? (get opts :persist-every-event? false)
+         state-atom (atom initial-state)
+         events-in (async/chan 8192)
+         network-in (async/chan 8192)
+         net-out (async/chan 8192)
+         app-out (async/chan 8192)
+         persist-ch (when persist? (async/chan (async/sliding-buffer 1)))
+         persist-done-ch (when persist? (start-persistence-worker! persist-ch snapshot-filename))
+         stop-ch (async/chan)]
+     (async/go-loop [state initial-state]
+       (let [[val port] (async/alts! [events-in network-in stop-ch])]
+         (cond
+           (= port stop-ch) nil
+           (nil? val) (recur state)
+           (= port network-in)
+           (if (valid-network-event? val)
+             (let [res (try
+                         (sm/handle-event state val)
+                         (catch Throwable t
+                           {:exception t}))]
+               (if-let [t (:exception res)]
+                 (let [new-state (-> state
+                                     (update :event-errors-count (fnil inc 0))
+                                     (assoc :last-event-error (or (.getMessage ^Throwable t) (str (class t)))))]
+                   (reset! state-atom new-state)
+                   (recur new-state))
+                 (let [{new-state :state commands :commands} res]
+                   (reset! state-atom new-state)
+                   (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
+                   (when (and persist? persist-every?)
+                     (async/put! persist-ch new-state))
+                   (recur new-state))))
+             (let [new-state (update state :dropped-network-events-count (fnil inc 0))]
+               (reset! state-atom new-state)
+               (recur new-state)))
+
+           (and (= port events-in) (= (:type val) :query-state))
+           (do (async/put! (:reply-chan val) state) (recur state))
+
+           (= port events-in)
+           (let [res (try
+                       (sm/handle-event state val)
+                       (catch Throwable t
+                         {:exception t}))]
+             (if-let [t (:exception res)]
+               (let [new-state (-> state
+                                   (update :event-errors-count (fnil inc 0))
+                                   (assoc :last-event-error (or (.getMessage ^Throwable t) (str (class t)))))]
+                 (reset! state-atom new-state)
+                 (recur new-state))
+               (let [{new-state :state commands :commands} res]
+                 (reset! state-atom new-state)
+                 (dispatch-commands! commands app-out net-out events-in (:node-pubkey new-state))
+                 (when (and persist? (or persist-every? (= (:type val) :tick)))
+                   (async/put! persist-ch new-state))
+                 (recur new-state)))))))
+     {:events-in events-in
+      :network-in network-in
+      :net-out net-out
+      :app-out app-out
+      :persist-ch persist-ch
+      :persist-done-ch persist-done-ch
+      :stop-ch stop-ch
+      :state-atom state-atom})))
+
+(defn stop-node
+  "Gracefully stops a running shell node."
+  [node]
+  (async/put! (:stop-ch node) true)
+  (async/close! (:events-in node))
+  (async/close! (:network-in node))
+  (async/close! (:net-out node))
+  (async/close! (:app-out node))
+  (when-let [pch (:persist-ch node)]
+    (when-let [st-atom (:state-atom node)]
+      (async/put! pch @st-atom))
+    (async/close! pch)
+    (when-let [done-ch (:persist-done-ch node)]
+      (async/alts!! [done-ch (async/timeout 2000)]))))
+
 (defn stop-mesh-node!
   "Stops all running resources of a mesh node cleanly."
   [mesh-node]
@@ -2118,7 +2285,7 @@
   (when (= (:transport mesh-node) :in-memory)
     (swap! in-memory-bus dissoc (get-in mesh-node [:identity :pubkey-hex])))
   (when-let [sh (:shell-node mesh-node)]
-    (try (core/stop-node sh) (catch Exception _ nil)))
+    (try (stop-node sh) (catch Exception _ nil)))
   true)
 
 (defn start-mesh-node!
@@ -2136,7 +2303,7 @@
          initial-state (if loaded-state
                          (rebind-restored-state loaded-state config identity)
                          (build-initial-node-state config identity))
-         shell-node (core/start-node initial-state snapshot-file {:persist? (get opts :persist? true)})
+         shell-node (start-node initial-state snapshot-file {:persist? (get opts :persist? true)})
          peer-conns (atom {})
          agent-conns (atom {})
          cluster-cfg (get config :cluster {})

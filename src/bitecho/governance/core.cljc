@@ -111,40 +111,11 @@
             st' (assoc-in state [:lab-subnets subnet-id] desc)]
         {:ok? true :subnet desc :state st' :effects []}))))
 
-(defn- rfc6962-leaf-hash
-  "Computes RFC 6962 domain-separated leaf hash: `SHA-256(0x00 || leaf-bytes)` (`A-D20-1`)."
-  [leaf]
-  (let [leaf-bytes (cond
-                     (fressian/bytes? leaf) leaf
-                     (string? leaf) (fressian/utf8->bytes leaf)
-                     :else (fressian/encode-canonical leaf))
-        prefix #?(:clj (byte-array [(byte 0x00)])
-                  :cljs (js/Uint8Array. #js [0]))]
-    (crypto/sha256 (fressian/concat-bytes prefix leaf-bytes))))
-
-(defn- rfc6962-node-hash
-  "Computes RFC 6962 domain-separated internal node hash: `SHA-256(0x01 || left || right)` (`A-D20-1`)."
-  [left-bytes right-bytes]
-  (let [prefix #?(:clj (byte-array [(byte 0x01)])
-                  :cljs (js/Uint8Array. #js [1]))]
-    (crypto/sha256 (fressian/concat-bytes prefix left-bytes right-bytes))))
-
 (defn compute-rfc6962-merkle-root
   "Computes the RFC 6962 domain-separated binary Merkle root (64-char lowercase hex)
-   over `leaves` (`0x00` leaf prefix, `0x01` internal node prefix)."
+   over `leaves` by delegating to `bitecho.core.data/compute-rfc6962-merkle-root` (`BIP-005` / `D31.2`)."
   [leaves]
-  (if (empty? leaves)
-    (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes "")))
-    (loop [level (mapv rfc6962-leaf-hash leaves)]
-      (if (= 1 (count level))
-        (str/lower-case (basalt/bytes->hex (first level)))
-        (let [next-level
-              (vec
-               (for [pair (partition-all 2 level)]
-                 (if (= 2 (count pair))
-                   (rfc6962-node-hash (first pair) (second pair))
-                   (first pair))))]
-          (recur next-level))))))
+  (data/compute-rfc6962-merkle-root leaves))
 
 (defn anchor-subnet-merkle-root
   "Computes and anchors a child lab subnet's RFC 6962 binary Merkle state root at `epoch` into `:subnet-anchors`."
