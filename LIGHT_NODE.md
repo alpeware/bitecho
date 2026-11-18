@@ -131,3 +131,15 @@ Connection and session lifecycle is managed by a single generation-tagged reduce
 `transition-conn : (state, event) -> [new-state, effects]`
 
 All I/O side effects (`:emit`, `:close-node`, `:diagnose`) are executed strictly outside the transition function. Stale callbacks (`generation < current-generation`) are ignored and counted via `:dropped-stale-callback` diagnostics.
+
+---
+
+## 5. On-Network Artifact Publishing (`BIP-004` / `v0.23.8`)
+
+Light nodes support content-addressed artifact publishing, resolution, listing, and revocation across both P2P gossip and the HTTP `/artifact/v1/{blob,pointer,list}` bridge:
+
+- **`artifact-put`**: `--subnet-id <subnet> --path <path> [--file <file> | --text <str> | --hex <hex>] [--seq <n>] [--burn <ech>] [--relay-url <url>]`
+- **`artifact-get`**: `--subnet-id <subnet> --path <path> [--out-file <file>]`
+- **`artifact-list`**: `[--subnet-id <subnet>] [--prefix <prefix>] [--authority <pubkey>]`
+- **`artifact-revoke`**: `--subnet-id <subnet> --path <path> [--seq <n>] [--burn <ech>] [--relay-url <url>]`
+

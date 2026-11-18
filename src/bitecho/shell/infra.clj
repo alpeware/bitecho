@@ -236,17 +236,59 @@
 ;; 3. Default `bitecho.org/infra` Policy & Atomic Pointer Snapshot Persistence
 ;; =============================================================================
 
+(def k-cold-root-pubkey
+  "Tier-0 Cold Root Key (K_cold) for bitecho.org/infra governance and artifact streams (BIP-004 §B.2)."
+  "302a300506032b6570032100d88b92f094f65be1d32c8c1fb6c85f7913458a99ebdc142009ab2f18fd1bf641")
+
+(def k-nexus-builder-pubkey
+  "Tier-1 Nexus Builder Key (K_nexus) for dist/*, releases/*, pkg/*, and docs/blog streams (BIP-004 §B.2)."
+  "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc")
+
+(def k-axiom-steward-pubkey
+  "Tier-1 Axiom Steward Key (K_axiom) for pkg/* and docs/blog streams (BIP-004 §B.2)."
+  "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8")
+
+(def k-lumen-researcher-pubkey
+  "Tier-1 Lumen Researcher Key (K_lumen) for web/SKILL.md, docs, and blog/* streams (BIP-004 §B.2)."
+  "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de")
+
+(def K_cold
+  "Alias for `k-cold-root-pubkey` (BIP-004 §B.2)."
+  k-cold-root-pubkey)
+
+(def K_nexus
+  "Alias for `k-nexus-builder-pubkey` (BIP-004 §B.2)."
+  k-nexus-builder-pubkey)
+
+(def K_axiom
+  "Alias for `k-axiom-steward-pubkey` (BIP-004 §B.2)."
+  k-axiom-steward-pubkey)
+
+(def K_lumen
+  "Alias for `k-lumen-researcher-pubkey` (BIP-004 §B.2)."
+  k-lumen-researcher-pubkey)
+
 (defn default-infra-policy
-  "Constructs the canonical `\"bitecho.org/infra\"` Subnet policy map (UNIFICATION.md §6 Instance #3)
-   with `:subnet/genesis-policy-cid` pinned and optional `:acme-thumbprint` (`F-B3`).
+  "Constructs the canonical `\"bitecho.org/infra\"` Subnet policy map (UNIFICATION.md §6 Instance #3,
+   BIP-004 §B.2 first-match `:subnet/path-acl` ordering) with `:subnet/genesis-policy-cid` pinned
+   and optional `:acme-thumbprint` (`F-B3`).
    Never elevates a hot node key to `:cold-pubkey` when `:cold-pubkey` is nil (`F-C3`)."
-  [{:keys [subnet-id trust-anchors cold-pubkey domain-pubkey threshold acme-thumbprint]}]
+  [{:keys [subnet-id trust-anchors cold-pubkey domain-pubkey threshold acme-thumbprint denied-cids]}]
   (let [sid (or subnet-id "bitecho.org/infra")
         anchors (set (map #(str/lower-case (str/trim (str %))) trust-anchors))
         cold-pk (when (and (string? cold-pubkey) (not (str/blank? cold-pubkey)))
                   (str/lower-case (str/trim cold-pubkey)))
         dom-pk (when (and (string? domain-pubkey) (not (str/blank? domain-pubkey)))
                  (str/lower-case (str/trim domain-pubkey)))
+        k-cold (str/lower-case (str/trim k-cold-root-pubkey))
+        k-nexus (str/lower-case (str/trim k-nexus-builder-pubkey))
+        k-axiom (str/lower-case (str/trim k-axiom-steward-pubkey))
+        k-lumen (str/lower-case (str/trim k-lumen-researcher-pubkey))
+        cold-set (cond-> #{k-cold} cold-pk (conj cold-pk))
+        dist-signers (into cold-set [k-nexus])
+        releases-signers (into anchors dist-signers)
+        pkg-signers (into dist-signers [k-axiom])
+        doc-blog-signers (into anchors (into pkg-signers [k-lumen]))
         thresh (long (or threshold (max 1 (min 2 (count anchors)))))
         gov (cond-> {:governance/type (if cold-pk :cold-key-or-quorum :quorum)
                      :threshold thresh}
@@ -260,24 +302,38 @@
         dns-rule (if dom-pk
                    {:pattern "dns/*" :principal {:type :pubkey :pubkey dom-pk}}
                    {:pattern "dns/*" :principal {:type :allowlist}})
-        base {:subnet/id sid
-              :subnet/parent-id "global"
-              :subnet/gate gate
-              :subnet/path-acl [{:pattern "subnet/policy" :principal {:type :governance}}
-                                {:pattern "bootstrap" :principal {:type :allowlist}}
-                                {:pattern "dir/*" :principal {:type :allowlist}}
-                                {:pattern "acme/challenge/*" :principal {:type :leader}}
-                                {:pattern "tls/*" :principal {:type :leader}}
-                                {:pattern "web/*" :principal {:type :allowlist}}
-                                {:pattern "releases/*" :principal {:type :allowlist}}
-                                {:pattern "bip/*" :principal {:type :allowlist}}
-                                {:pattern "mail/*" :principal {:type :allowlist}}
-                                dns-rule]
-              :subnet/economy {:economy/mode :none
-                               :economy/burn-floor 0
-                               :economy/settlement-take-bps 0}
-              :subnet/replication {:replication/pointers :leader-election
-                                   :replication/blobs :eager-push}}]
+        base (cond-> {:subnet/id sid
+                      :subnet/parent-id "global"
+                      :subnet/gate gate
+                      :subnet/path-acl [{:pattern "subnet/policy"    :principal {:type :governance}}
+                                        {:pattern "dist/*"           :principal {:type :allowlist :signers dist-signers}}
+                                        {:pattern "releases/*"       :principal {:type :allowlist :signers releases-signers}}
+                                        {:pattern "pkg/*"            :principal {:type :allowlist :signers pkg-signers}}
+                                        {:pattern "web/SKILL.md"     :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/ONBOARDING.md" :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/llms.txt"     :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "llms.txt"         :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/references/*" :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/agents/*"     :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/blog/*"       :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "blog/*"           :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/*"            :principal {:type :allowlist}}
+                                        {:pattern "bootstrap"        :principal {:type :allowlist}}
+                                        {:pattern "dir/*"            :principal {:type :allowlist}}
+                                        {:pattern "acme/challenge/*" :principal {:type :leader}}
+                                        {:pattern "tls/*"            :principal {:type :leader}}
+                                        {:pattern "bip/*"            :principal {:type :allowlist}}
+                                        {:pattern "bounty/*"         :principal {:type :allowlist}}
+                                        {:pattern "head/*"           :principal {:type :allowlist}}
+                                        {:pattern "mail/*"           :principal {:type :allowlist}}
+                                        dns-rule]
+                      :subnet/economy {:economy/mode :none
+                                       :economy/burn-floor 0
+                                       :economy/settlement-take-bps 0}
+                      :subnet/replication {:replication/pointers :leader-election
+                                           :replication/blobs :eager-push}}
+               (seq denied-cids)
+               (assoc :subnet/denied-cids (set (map #(str/lower-case (str/trim (str %))) denied-cids))))]
     (assoc base :subnet/genesis-policy-cid (subnet/policy-cid base))))
 
 (defn- snapshot-file
@@ -713,38 +769,83 @@
                             dac (assoc :dac dac)
                             (some? epoch) (assoc :epoch epoch)))))))
 
+(defn resolve-cid-blob!
+  "Resolves an immutable `cid` in `rt` (checking `:subnet/denied-cids` first and hydrating from `blob-fs` if cold)."
+  ([rt cid]
+   (resolve-cid-blob! rt cid (System/currentTimeMillis)))
+  ([rt cid now-ms]
+   (if (or (nil? rt) (nil? (:subnet-atom rt)) (nil? cid) (str/blank? (str cid)))
+     {:ok? false :error :not-found}
+     (let [norm-cid (str/lower-case (str/trim (str cid)))
+           inst @(:subnet-atom rt)
+           sid (:subnet-id inst)
+           denied-cids (into #{}
+                             (map #(str/lower-case (str/trim (str %))))
+                             (get-in inst [:policy :subnet/denied-cids] #{}))]
+       (if (contains? denied-cids norm-cid)
+         {:ok? false :denied? true :tombstoned? false :error :denied-cid :cid norm-cid}
+         (let [res-box (atom nil)
+               _ (swap! (:subnet-atom rt)
+                        (fn [cur]
+                          (let [r (data/get-blob (get-in cur [:data :blobs]) norm-cid {:subnet sid :now-ms now-ms})]
+                            (reset! res-box r)
+                            (assoc-in cur [:data :blobs] (:store r)))))
+               r1 @res-box]
+           (if (:hit? r1)
+             {:ok? true
+              :cid norm-cid
+              :blob (:blob r1)
+              :file (when (:state-dir rt) (blob-fs/blob-file (:state-dir rt) norm-cid))}
+             (do
+               (execute-subnet-effects! rt (:effects r1) {:type :get-blob :cid norm-cid})
+               (let [r2 (data/get-blob (get-in @(:subnet-atom rt) [:data :blobs]) norm-cid {:subnet sid :now-ms now-ms})]
+                 (if (:hit? r2)
+                   {:ok? true
+                    :cid norm-cid
+                    :blob (:blob r2)
+                    :file (when (:state-dir rt) (blob-fs/blob-file (:state-dir rt) norm-cid))}
+                   {:ok? false :error :missing-blob :cid norm-cid}))))))))))
+
 (defn resolve-path-blob!
-  "Resolves `(subnet, path)` in `rt`, hydrating from `blob-fs` via `:fetch-blob` if cold-evicted from RAM."
+  "Resolves `(subnet, path)` in `rt`, hydrating from `blob-fs` via `:fetch-blob` if cold-evicted from RAM.
+   Enforces hard-`404` on tombstones (`:pointer/target nil`) and `:subnet/denied-cids` (`BIP-004` `F-R7`),
+   returning `{:ok? false :denied? true :tombstoned? ... :pointer ptr :cid ...}` without blob bytes."
   ([rt path]
    (resolve-path-blob! rt path (System/currentTimeMillis)))
   ([rt path now-ms]
-   (let [inst @(:subnet-atom rt)
-         sid (:subnet-id inst)
-         ptr (data/resolve-pointer (:data inst) sid path now-ms)]
-     (if-not ptr
-       {:ok? false :error :not-found}
-       (let [cid (:pointer/target ptr)
-             res-box (atom nil)
-             _ (swap! (:subnet-atom rt)
-                      (fn [cur]
-                        (let [r (data/get-blob (get-in cur [:data :blobs]) cid {:subnet sid :now-ms now-ms})]
-                          (reset! res-box r)
-                          (assoc-in cur [:data :blobs] (:store r)))))
-             r1 @res-box]
-         (if (:hit? r1)
-           {:ok? true
-            :pointer ptr
-            :blob (:blob r1)
-            :file (when (:state-dir rt) (blob-fs/blob-file (:state-dir rt) cid))}
-           (do
-             (execute-subnet-effects! rt (:effects r1) {:type :get-blob :cid cid})
-             (let [r2 (data/get-blob (get-in @(:subnet-atom rt) [:data :blobs]) cid {:subnet sid :now-ms now-ms})]
-               (if (:hit? r2)
-                 {:ok? true
-                  :pointer ptr
-                  :blob (:blob r2)
-                  :file (when (:state-dir rt) (blob-fs/blob-file (:state-dir rt) cid))}
-                 {:ok? false :error :missing-blob :pointer ptr})))))))))
+   (if (or (nil? rt) (nil? (:subnet-atom rt)))
+     {:ok? false :error :not-found}
+     (let [inst @(:subnet-atom rt)
+           sid (:subnet-id inst)
+           path-str (str path)
+           raw-ptr (or (get-in inst [:data :pointers [(str sid) path-str]])
+                       (get-in inst [:pointers [(str sid) path-str]])
+                       (get-in inst [:pointers path-str]))
+           tombstoned-in-set? (or (contains? (:tombstones inst) path-str)
+                                  (contains? (get-in inst [:data :tombstones]) path-str))
+           tombstoned? (boolean (or tombstoned-in-set?
+                                    (and raw-ptr (nil? (:pointer/target raw-ptr)))))
+           denied-cids (into #{}
+                             (map #(str/lower-case (str/trim (str %))))
+                             (get-in inst [:policy :subnet/denied-cids] #{}))
+           raw-cid (when-let [t (:pointer/target raw-ptr)]
+                     (str/lower-case (str/trim (str t))))
+           denied-cid? (boolean (and raw-cid (contains? denied-cids raw-cid)))]
+       (if (or tombstoned? denied-cid?)
+         {:ok? false
+          :denied? true
+          :tombstoned? tombstoned?
+          :error (if tombstoned? :tombstoned :denied-cid)
+          :pointer raw-ptr
+          :cid (:pointer/target raw-ptr)}
+         (let [ptr (data/resolve-pointer (:data inst) sid path-str now-ms)]
+           (if-not ptr
+             {:ok? false :error :not-found}
+             (let [cid (:pointer/target ptr)
+                   cid-res (resolve-cid-blob! rt cid now-ms)]
+               (if (:ok? cid-res)
+                 (assoc cid-res :pointer ptr)
+                 (assoc cid-res :pointer ptr))))))))))
 
 (defn start-subnet-runtime!
   "Initializes and starts a single-authority Subnet shell runtime (`:phase :running`).

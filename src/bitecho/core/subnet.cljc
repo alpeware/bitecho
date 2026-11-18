@@ -308,6 +308,18 @@
             sig-bytes
             (crypto/verify pub-bytes (fressian/utf8->bytes canonical-str) sig-bytes))))))
 
+(defn- path-acl-signers
+  [policy]
+  (into #{}
+        (comp (map :principal)
+              (mapcat (fn [p]
+                        (cond
+                          (seq (:signers p)) (:signers p)
+                          (:pubkey p) [(:pubkey p)]
+                          :else nil)))
+              (keep normalize-hex))
+        (:subnet/path-acl policy)))
+
 (defn check-gate-admission
   "Purely evaluates whether `event` satisfies `(:subnet/gate policy)`."
   [policy state event]
@@ -315,6 +327,7 @@
         mode (:gate/mode gate)
         admission (:gate/admission gate)
         anchors (set (map normalize-hex (or (:gate/trust-anchors gate) #{})))
+        acl-signers (path-acl-signers policy)
         gov (:gate/governance gate)
         cold-pk (normalize-hex (:cold-pubkey gov))
         sender (normalize-hex (or (:sender event)
@@ -341,7 +354,8 @@
       :else
       (case admission
         :allowlist
-        (if (and sender (contains? anchors sender))
+        (if (and sender (or (contains? anchors sender)
+                            (contains? acl-signers sender)))
           {:admitted? true :member sender}
           {:admitted? false :error :not-in-allowlist})
 

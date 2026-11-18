@@ -19,6 +19,7 @@
             [bitecho.core.protocol.relay :as relay]
             [bitecho.core.subnet :as subnet]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.core :as light-core]
             [bitecho.shell.infra :as infra]
             [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
@@ -599,29 +600,31 @@
     (let [ptr-res (cond
                     (str/blank? subpath)
                     (let [r1 (infra/resolve-path-blob! rt "web/index.html" now-ms)]
-                      (if (:ok? r1)
+                      (if (or (:ok? r1) (:denied? r1))
                         r1
                         (infra/resolve-path-blob! rt "web/index.md" now-ms)))
 
                     (= subpath "blog")
                     (let [r1 (infra/resolve-path-blob! rt "web/blog/index.html" now-ms)]
-                      (if (:ok? r1)
+                      (if (or (:ok? r1) (:denied? r1))
                         r1
                         (infra/resolve-path-blob! rt "web/blog/index.md" now-ms)))
 
                     :else
                     (let [r-direct (infra/resolve-path-blob! rt (str "web/" subpath) now-ms)]
-                      (if (:ok? r-direct)
+                      (if (or (:ok? r-direct) (:denied? r-direct))
                         r-direct
                         (let [r-html (infra/resolve-path-blob! rt (str "web/" subpath ".html") now-ms)]
-                          (if (:ok? r-html)
+                          (if (or (:ok? r-html) (:denied? r-html))
                             r-html
                             (let [r-idx (infra/resolve-path-blob! rt (str "web/" subpath "/index.html") now-ms)]
-                              (if (:ok? r-idx)
+                              (if (or (:ok? r-idx) (:denied? r-idx))
                                 r-idx
                                 (infra/resolve-path-blob! rt (str "web/" subpath "/index.md") now-ms))))))))]
-      (if (:ok? ptr-res)
-        ptr-res
+      (cond
+        (:ok? ptr-res) ptr-res
+        (:denied? ptr-res) ptr-res
+        :else
         (if-let [content-root (get-in config [:http :content-root])]
           (resolve-safe-content-root content-root req-path)
           ptr-res)))
@@ -772,8 +775,38 @@
                             tier1? raw-bs
                             :else {:file disk-file :offset 0 :length total-size})})))))
 
+(declare parse-query-params)
+
+(defn- normalize-dist-response
+  [resp]
+  (let [st (or (:response/status resp) (:status resp) 200)
+        hdrs (or (:response/headers resp) (:headers resp) {})
+        body (if (contains? resp :response/body) (:response/body resp) (:body resp))]
+    (assoc resp
+           :status st
+           :response/status st
+           :headers hdrs
+           :response/headers hdrs
+           :body body
+           :response/body body)))
+
+(defn- dist-404-response
+  []
+  {:status 404
+   :response/status 404
+   :headers {"Content-Type" "text/plain; charset=utf-8"}
+   :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+   :body "Not Found\n"
+   :response/body "Not Found\n"})
+
 (defn serve-dist-request
-  "Serves /dist/* bundle artifacts, Node.js scripts, SEA binaries, and their .sha256 digests (F-D29-19, F-R6, A-D29-5)."
+  "Serves /dist/* bundle artifacts, Node.js scripts, SEA binaries, and their .sha256 digests (`F-D29-19`, `BIP-004` `F-R7`, `F-R10`).
+   When `rt` (`:rt` or `:subnet-runtime`) is present in `ctx`:
+   1. Resolves `\"dist/<rel-path>\"` (and `\"dist/<base-name>\"` for `.sha256`) via `infra/resolve-path-blob!` FIRST.
+   2. Enforces hard `404 Not Found` immediately on tombstones (`:pointer/target nil`) or `:subnet/denied-cids`,
+      never falling back to disk `dist/`.
+   3. Supports pinned immutable CID fetches via `?cid=<cid>` or `If-Match: \"<cid>\"` across Pointer advances (`S-D30-4`).
+   4. Dynamically synthesizes `<cid>  <base-name>\\n` for `.sha256` from the active Pointer's target CID."
   ([path ctx]
    (serve-dist-request path ctx :GET))
   ([path ctx method]
@@ -783,77 +816,143 @@
                            "dist")
          dist-dir (io/file dist-dir-path)
          raw-p (or path "")
-         subpath (sanitize-web-subpath raw-p)
+         [path-only inline-query] (str/split raw-p #"\?" 2)
+         subpath (sanitize-web-subpath path-only)
          rel-path (cond
                     (nil? subpath) nil
                     (str/starts-with? subpath "dist/") (subs subpath 5)
                     (= subpath "dist") ""
                     :else subpath)]
      (if (or (nil? rel-path) (str/blank? rel-path))
-       {:status 404
-        :response/status 404
-        :headers {"Content-Type" "text/plain; charset=utf-8"}
-        :response/headers {"Content-Type" "text/plain; charset=utf-8"}
-        :body "Not Found\n"
-        :response/body "Not Found\n"}
-       (let [sha-req? (str/ends-with? rel-path ".sha256")
+       (dist-404-response)
+       (let [rt (or (:rt ctx) (:subnet-runtime ctx) (get-in ctx [:config :rt]))
+             now-ms (long (or (:now-ms ctx) (System/currentTimeMillis)))
+             req-headers (or (:headers ctx) (get-in ctx [:req :request/headers]) {})
+             query-str (or (:query ctx) (get-in ctx [:req :request/uri :query]) inline-query)
+             query-params (parse-query-params query-str)
+             if-match-hdr (first (or (get req-headers :header/if-match)
+                                     (get req-headers "if-match")
+                                     (get req-headers "If-Match")))
+             if-match-cid (when (and (string? if-match-hdr) (not (str/blank? if-match-hdr)))
+                            (-> if-match-hdr str/trim (str/replace #"^\"|\"$" "") str/lower-case))
+             query-cid (get query-params "cid")
+             pinned-cid (or (when (and (string? query-cid) (re-matches #"[0-9a-fA-F]{64}" (str/trim query-cid)))
+                              (str/lower-case (str/trim query-cid)))
+                            (when (and (string? if-match-cid) (re-matches #"[0-9a-fA-F]{64}" if-match-cid))
+                              if-match-cid))
+             req-map (or (:req ctx)
+                         {:request/method method
+                          :request/uri {:path (str "/dist/" rel-path) :query query-str}
+                          :request/headers req-headers})
+             sha-req? (str/ends-with? rel-path ".sha256")
              target-name (if sha-req? (subs rel-path 0 (- (count rel-path) 7)) rel-path)
-             target-file (io/file dist-dir target-name)
-             direct-file (io/file dist-dir rel-path)]
+             dist-path (str "dist/" rel-path)
+             base-dist-path (str "dist/" target-name)
+             direct-resolved (when rt (infra/resolve-path-blob! rt dist-path now-ms))
+             base-resolved (when (and rt sha-req?) (infra/resolve-path-blob! rt base-dist-path now-ms))
+             pinned-resolved (when (and rt (not sha-req?) pinned-cid)
+                               (infra/resolve-cid-blob! rt pinned-cid now-ms))]
          (cond
-           (and sha-req? (.exists target-file))
-           (let [sha (sha256-file-hex target-file)
-                 body (str sha "  " (.getName target-file) "\n")]
+           ;; 1. Hard-404 on tombstoned or denied-cid Pointer (never fall back to disk!)
+           (or (:denied? direct-resolved)
+               (:denied? base-resolved)
+               (:denied? pinned-resolved))
+           (dist-404-response)
+
+           ;; 2. Explicit .sha256 Pointer or synthesized .sha256 from active base Pointer in rt
+           (and sha-req? (:ok? direct-resolved))
+           (normalize-dist-response (render-resolved-blob (:config ctx) req-map direct-resolved method))
+
+           (and sha-req? (:ok? base-resolved))
+           (let [cid (get-in base-resolved [:blob :blob/cid])
+                 ptr (:pointer base-resolved)
+                 ptr-pk (or (:pointer/authority ptr) (:pointer/authority-pubkey ptr))
+                 ptr-seq (:pointer/seq ptr)
+                 ptr-sig (:pointer/sig ptr)
+                 base-file-name (.getName (io/file target-name))
+                 body (str cid "  " base-file-name "\n")
+                 hdrs (cond-> {"Content-Type" "text/plain; charset=utf-8"
+                               "Content-Length" (str (count body))
+                               "ETag" (str "\"" cid "\"")
+                               "X-Checksum-SHA256" (or cid "")}
+                        cid (assoc "X-Bitecho-Blob-Cid" cid)
+                        ptr-pk (assoc "X-Bitecho-Pointer-Pubkey" ptr-pk)
+                        ptr-seq (assoc "X-Bitecho-Pointer-Seq" (str ptr-seq))
+                        ptr-sig (assoc "X-Bitecho-Pointer-Signature" ptr-sig))]
              {:status 200
               :response/status 200
-              :headers {"Content-Type" "text/plain; charset=utf-8"
-                        "Content-Length" (str (count body))}
-              :response/headers {"Content-Type" "text/plain; charset=utf-8"
-                                 "Content-Length" (str (count body))}
-              :body body
-              :response/body body})
+              :headers hdrs
+              :response/headers hdrs
+              :body (if (= method :HEAD) nil body)
+              :response/body (if (= method :HEAD) nil body)})
 
-           (and sha-req? (.exists direct-file))
-           (let [body (slurp direct-file)]
-             {:status 200
-              :response/status 200
-              :headers {"Content-Type" "text/plain; charset=utf-8"
-                        "Content-Length" (str (count body))}
-              :response/headers {"Content-Type" "text/plain; charset=utf-8"
-                                 "Content-Length" (str (count body))}
-              :body body
-              :response/body body})
+           ;; 3. Pinned immutable CID (?cid=<cid> or If-Match: "<cid>") from rt / blob-fs
+           (and (not sha-req?) (:ok? pinned-resolved))
+           (let [active-ptr (:pointer direct-resolved)
+                 eff-ptr (if (and active-ptr (= (:pointer/target active-ptr) pinned-cid))
+                           active-ptr
+                           {:pointer/path dist-path})]
+             (normalize-dist-response
+              (render-resolved-blob (:config ctx) req-map (assoc pinned-resolved :pointer eff-ptr) method)))
 
-           (.exists target-file)
-           (let [total-size (.length target-file)
-                 ct (content-type-for-file (.getName target-file))
-                 max-tier1 (long (get-in ctx [:config :http :cache-max-file-bytes] 2097152))
-                 tier1? (<= total-size max-tier1)
-                 sha (sha256-file-hex target-file)
-                 body (cond
-                        (= method :HEAD) nil
-                        tier1? (Files/readAllBytes (.toPath target-file))
-                        :else {:file target-file :offset 0 :length total-size})]
-             {:status 200
-              :response/status 200
-              :headers {"Content-Type" ct
-                        "Content-Length" (str total-size)
-                        "X-Checksum-SHA256" sha
-                        "ETag" (str "\"" sha "\"")}
-              :response/headers {"Content-Type" ct
-                                 "Content-Length" (str total-size)
-                                 "X-Checksum-SHA256" sha
-                                 "ETag" (str "\"" sha "\"")}
-              :body body
-              :response/body body})
+           ;; 4. Live active Pointer in rt for "dist/<rel-path>"
+           (and (not sha-req?) (:ok? direct-resolved))
+           (normalize-dist-response
+            (render-resolved-blob (:config ctx) req-map direct-resolved method))
 
+           ;; 5. Disk fallback when no active or denied Pointer exists in rt
            :else
-           {:status 404
-            :response/status 404
-            :headers {"Content-Type" "text/plain; charset=utf-8"}
-            :response/headers {"Content-Type" "text/plain; charset=utf-8"}
-            :body "Not Found\n"
-            :response/body "Not Found\n"}))))))
+           (let [target-file (io/file dist-dir target-name)
+                 direct-file (io/file dist-dir rel-path)]
+             (cond
+               (and sha-req? (.exists target-file))
+               (let [sha (sha256-file-hex target-file)
+                     body (str sha "  " (.getName target-file) "\n")]
+                 {:status 200
+                  :response/status 200
+                  :headers {"Content-Type" "text/plain; charset=utf-8"
+                            "Content-Length" (str (count body))}
+                  :response/headers {"Content-Type" "text/plain; charset=utf-8"
+                                     "Content-Length" (str (count body))}
+                  :body body
+                  :response/body body})
+
+               (and sha-req? (.exists direct-file))
+               (let [body (slurp direct-file)]
+                 {:status 200
+                  :response/status 200
+                  :headers {"Content-Type" "text/plain; charset=utf-8"
+                            "Content-Length" (str (count body))}
+                  :response/headers {"Content-Type" "text/plain; charset=utf-8"
+                                     "Content-Length" (str (count body))}
+                  :body body
+                  :response/body body})
+
+               (.exists target-file)
+               (let [total-size (.length target-file)
+                     ct (content-type-for-file (.getName target-file))
+                     max-tier1 (long (get-in ctx [:config :http :cache-max-file-bytes] 2097152))
+                     tier1? (<= total-size max-tier1)
+                     sha (sha256-file-hex target-file)
+                     body (cond
+                            (= method :HEAD) nil
+                            tier1? (Files/readAllBytes (.toPath target-file))
+                            :else {:file target-file :offset 0 :length total-size})]
+                 {:status 200
+                  :response/status 200
+                  :headers {"Content-Type" ct
+                            "Content-Length" (str total-size)
+                            "X-Checksum-SHA256" sha
+                            "ETag" (str "\"" sha "\"")}
+                  :response/headers {"Content-Type" ct
+                                     "Content-Length" (str total-size)
+                                     "X-Checksum-SHA256" sha
+                                     "ETag" (str "\"" sha "\"")}
+                  :body body
+                  :response/body body})
+
+               :else
+               (dist-404-response)))))))))
 
 (defn serve-subnet-request
   "Evaluates target Subnet `:subnet/gate` (Gap G12 & `F-B1`) and serves Pointer -> Blob with `ETag: \"<cid>\"`,
@@ -865,7 +964,7 @@
       {:response/status 204
        :response/headers {"Access-Control-Allow-Origin" "*"
                           "Access-Control-Allow-Methods" "GET, HEAD, OPTIONS"
-                          "Access-Control-Allow-Headers" "Content-Type, Range, If-None-Match, X-Bitecho-DAC"}
+                          "Access-Control-Allow-Headers" "Content-Type, Range, If-None-Match, If-Match, X-Bitecho-DAC"}
        :response/body nil}
 
       (not (or (= method :GET) (= method :HEAD)))
@@ -917,7 +1016,7 @@
                 (str/starts-with? subpath "bip/")
                 (let [target-path subpath
                       r1 (infra/resolve-path-blob! rt target-path now-ms)
-                      r (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))]
+                      r (if (or (:ok? r1) (:denied? r1)) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))]
                   (if (:ok? r)
                     (render-resolved-blob config req r method)
                     (do
@@ -929,9 +1028,11 @@
                 (str/starts-with? subpath "releases/")
                 (let [target-path subpath
                       r1 (infra/resolve-path-blob! rt target-path now-ms)
-                      r2 (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))
-                      r (if (:ok? r2)
-                          r2
+                      r2 (if (or (:ok? r1) (:denied? r1)) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))
+                      r (cond
+                          (:ok? r2) r2
+                          (:denied? r2) r2
+                          :else
                           (if-let [cr (get-in config [:http :content-root])]
                             (resolve-safe-content-root cr raw-path)
                             r2))]
@@ -944,14 +1045,14 @@
                        :response/body "Not Found\n"})))
 
                 (str/starts-with? subpath "dist/")
-                (serve-dist-request raw-path {:config config} method)
+                (serve-dist-request raw-path {:config config :rt rt :req req :headers (:request/headers req) :now-ms now-ms} method)
 
                 (or (= subpath "blog") (str/starts-with? subpath "blog/"))
                 (let [target-path subpath
                       r1 (infra/resolve-path-blob! rt target-path now-ms)
-                      r2 (if (:ok? r1) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))
-                      r3 (if (:ok? r2) r2 (infra/resolve-path-blob! rt (str "web/" target-path ".html") now-ms))
-                      r (if (:ok? r3) r3 (infra/resolve-path-blob! rt (str "web/" target-path ".md") now-ms))]
+                      r2 (if (or (:ok? r1) (:denied? r1)) r1 (infra/resolve-path-blob! rt (str "web/" target-path) now-ms))
+                      r3 (if (or (:ok? r2) (:denied? r2)) r2 (infra/resolve-path-blob! rt (str "web/" target-path ".html") now-ms))
+                      r (if (or (:ok? r3) (:denied? r3)) r3 (infra/resolve-path-blob! rt (str "web/" target-path ".md") now-ms))]
                   (if (:ok? r)
                     (render-resolved-blob config req r method)
                     (do
@@ -970,7 +1071,7 @@
                        :response/headers {"Content-Type" "text/plain; charset=utf-8"}
                        :response/body "Forbidden\n"})
 
-                    (:not-found :missing-blob)
+                    (:not-found :missing-blob :tombstoned :denied-cid)
                     {:response/status 404
                      :response/headers {"Content-Type" "text/plain; charset=utf-8"}
                      :response/body "Not Found\n"}
@@ -1136,77 +1237,222 @@
                           eligible-peers)]
           res)))))
 
+(defn- normalize-artifact-proof
+  [proof]
+  (if (map? proof)
+    (let [raw-type (or (:proof/type proof) (get proof "proof/type") (:type proof) (get proof "type") :self)
+          ptype (if (keyword? raw-type)
+                  raw-type
+                  (keyword (str/replace (str/trim (str raw-type)) #"^:+" "")))]
+      (cond-> {:proof/type ptype}
+        (or (:signatures proof) (get proof "signatures"))
+        (assoc :signatures (into {}
+                                 (map (fn [[k v]]
+                                        [(str/lower-case (str/trim (if (keyword? k) (name k) (str k))))
+                                         (str/lower-case (str/trim (str v)))]))
+                                 (or (:signatures proof) (get proof "signatures"))))
+        (or (:agent-pubkey proof) (get proof "agent_pubkey") (get proof "agent-pubkey"))
+        (assoc :agent-pubkey (str/lower-case (str/trim (str (or (:agent-pubkey proof) (get proof "agent_pubkey") (get proof "agent-pubkey"))))))
+        (or (:pop-sig proof) (get proof "pop_sig") (get proof "pop-sig"))
+        (assoc :pop-sig (str/lower-case (str/trim (str (or (:pop-sig proof) (get proof "pop_sig") (get proof "pop-sig"))))))))
+    {:proof/type :self}))
+
+(defn- normalize-artifact-pointer
+  [raw-p]
+  (let [p (if (and (map? raw-p) (or (map? (:pointer raw-p)) (map? (get raw-p "pointer"))))
+            (or (:pointer raw-p) (get raw-p "pointer"))
+            raw-p)]
+    (when (map? p)
+      (let [auth (or (:pointer/authority p) (get p "pointer/authority") (:authority p) (get p "authority")
+                     (:pointer/authority-pubkey p) (get p "authority_pubkey"))
+            sub (or (:pointer/subnet p) (get p "pointer/subnet") (:subnet p) (get p "subnet")
+                    (:subnet-id p) (get p "subnet_id") "bitecho.org/infra")
+            path (or (:pointer/path p) (get p "pointer/path") (:path p) (get p "path"))
+            seq-raw (or (:pointer/seq p) (get p "pointer/seq") (:seq p) (get p "seq") 1)
+            seq-num (try (Long/parseLong (str seq-raw)) (catch Exception _ 1))
+            has-term? (or (contains? p :pointer/leader-term)
+                          (contains? p "pointer/leader-term")
+                          (contains? p :leader-term)
+                          (contains? p "leader_term")
+                          (contains? p "leader-term"))
+            term-raw (or (:pointer/leader-term p) (get p "pointer/leader-term")
+                         (:leader-term p) (get p "leader_term") (get p "leader-term"))
+            has-exp? (or (contains? p :pointer/expires)
+                         (contains? p "pointer/expires")
+                         (contains? p :expires)
+                         (contains? p "expires"))
+            exp-raw (or (:pointer/expires p) (get p "pointer/expires") (:expires p) (get p "expires"))
+            has-ts? (or (contains? p :pointer/timestamp)
+                        (contains? p "pointer/timestamp")
+                        (contains? p :timestamp)
+                        (contains? p "timestamp"))
+            ts-raw (or (:pointer/timestamp p) (get p "pointer/timestamp") (:timestamp p) (get p "timestamp"))
+            raw-target (if (or (contains? p :pointer/target) (contains? p "pointer/target")
+                               (contains? p :target) (contains? p "target")
+                               (contains? p :cid) (contains? p "cid"))
+                         (or (:pointer/target p) (get p "pointer/target")
+                             (:target p) (get p "target")
+                             (:cid p) (get p "cid"))
+                         nil)
+            target (when (and (some? raw-target) (not (str/blank? (str raw-target))))
+                     (str/lower-case (str/trim (str raw-target))))
+            sig (or (:pointer/sig p) (get p "pointer/sig") (:sig p) (get p "sig")
+                    (:pointer/signature p) (get p "signature"))
+            proof (normalize-artifact-proof
+                   (or (:pointer/proof p) (get p "pointer/proof") (:proof p) (get p "proof")))]
+        (cond-> {:pointer/authority (when auth (str/lower-case (str/trim (str auth))))
+                 :pointer/subnet (str sub)
+                 :pointer/path (when path (str/replace (str/trim (str path)) #"^/+" ""))
+                 :pointer/seq (long seq-num)
+                 :pointer/target target
+                 :pointer/proof proof
+                 :pointer/sig (when sig (str/lower-case (str/trim (str sig))))}
+          (and has-term? (some? term-raw))
+          (assoc :pointer/leader-term (long (try (Long/parseLong (str term-raw)) (catch Exception _ 1))))
+          (and has-exp? (some? exp-raw))
+          (assoc :pointer/expires (long (try (Long/parseLong (str exp-raw)) (catch Exception _ 0))))
+          (and has-ts? (some? ts-raw))
+          (assoc :pointer/timestamp (long (try (Long/parseLong (str ts-raw)) (catch Exception _ 0)))))))))
+
+(defn- normalize-artifact-blob
+  [raw-b]
+  (let [b (if (and (map? raw-b) (or (map? (:blob raw-b)) (map? (get raw-b "blob"))))
+            (or (:blob raw-b) (get raw-b "blob"))
+            raw-b)]
+    (when (map? b)
+      (let [media (str (or (:blob/media-type b) (get b "blob/media-type")
+                           (:media-type b) (get b "media_type") (get b "media-type")
+                           "application/octet-stream"))
+            raw-bytes (or (:blob/bytes b) (get b "blob/bytes")
+                          (:bytes b) (get b "bytes")
+                          (:bytes-hex b) (get b "bytes_hex") (get b "bytes-hex")
+                          (:data b) (get b "data"))
+            bs (cond
+                 (bytes? raw-bytes) raw-bytes
+                 (and (string? raw-bytes)
+                      (or (contains? b :bytes-hex) (contains? b "bytes_hex") (contains? b "bytes-hex")
+                          (and (even? (count (str/trim raw-bytes)))
+                               (re-matches #"[0-9a-fA-F]+" (str/trim raw-bytes)))))
+                 (try (basalt/hex->bytes (str/trim raw-bytes))
+                      (catch Exception _ (.getBytes ^String raw-bytes StandardCharsets/UTF_8)))
+                 (string? raw-bytes)
+                 (.getBytes ^String raw-bytes StandardCharsets/UTF_8)
+                 :else nil)
+            blob (when (bytes? bs) (data/make-blob bs media))
+            declared-cid (or (:blob/cid b) (get b "blob/cid") (:cid b) (get b "cid"))]
+        (when blob
+          (if (and (string? declared-cid) (not (str/blank? declared-cid))
+                   (not= (str/lower-case (str/trim declared-cid)) (:blob/cid blob)))
+            {:ok? false :error :blob-cid-mismatch :expected (str/lower-case (str/trim declared-cid)) :actual (:blob/cid blob)}
+            {:ok? true :blob blob}))))))
+
+(defn- maybe-ingest-artifact-envelope!
+  [subnet-runtime raw-env now-ms]
+  (when subnet-runtime
+    (try
+      (let [env-val (if (and (string? raw-env) (re-matches #"[0-9a-fA-F]+" (str/trim raw-env)))
+                      (try (basalt/hex->bytes (str/trim raw-env)) (catch Exception _ raw-env))
+                      raw-env)
+            unwrapped (or (try (light-core/unwrap-wire-message env-val) (catch Exception _ nil))
+                          (when (bytes? env-val) (try (fressian/decode-wire env-val) (catch Exception _ nil)))
+                          (when (map? env-val) env-val))]
+        (when (map? unwrapped)
+          (let [mtype (keyword (or (:bitecho/type unwrapped) (:type unwrapped) (get unwrapped "type")))]
+            (when (contains? #{:artifact-replicate :replicate-pointer} mtype)
+              (let [ptr (normalize-artifact-pointer (or (:pointer unwrapped) (get unwrapped "pointer") unwrapped))
+                    blob-res (normalize-artifact-blob (or (:blob unwrapped) (get unwrapped "blob")))
+                    sender (or (:pointer/authority ptr)
+                               (:sender unwrapped)
+                               (get unwrapped "sender")
+                               (:default-sender subnet-runtime))]
+                (when (and blob-res (:ok? blob-res))
+                  (infra/submit-event! subnet-runtime
+                                       {:type :put-blob
+                                        :blob (:blob blob-res)
+                                        :sender sender
+                                        :now-ms now-ms}))
+                (when ptr
+                  (infra/submit-event! subnet-runtime
+                                       {:type :publish-pointer
+                                        :pointer ptr
+                                        :sender (or (:pointer/authority ptr) sender)
+                                        :now-ms now-ms})))))))
+      (catch Exception _ nil))))
+
 (defn- handle-relay-send
-  [^HttpExchange exchange req relay-atom relay-waiters-atom config]
-  (let [max-payload (long (or (get @relay-atom :max-payload-bytes) 65536))
-        [body-bytes body-exceeded?] (with-open [is (.getRequestBody exchange)]
-                                      (read-body-bounded is max-payload))]
-    (if body-exceeded?
-      (send-response exchange
-                     {:response/status 413
-                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                      :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
-      (let [rep-auth (check-relay-replication-auth req config "/relay/v1/send" (or body-bytes (byte-array 0)))]
-        (if-not (:ok? rep-auth)
-          (do
-            (swap! relay-atom update-in [:diagnostics :unauthorized-replication] (fnil inc 0))
-            (send-response exchange
-                           {:response/status 403
-                            :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                            :response/body (json/write-str {"ok" false "error" "unauthorized-replication"})}))
-          (let [replicated? (:replicated? rep-auth)
-                ct (first (get (:request/headers req) :header/content-type ""))
-                env (try
-                      (cond
-                        (and (string? ct) (str/includes? (str/lower-case ct) "application/json"))
-                        (let [m (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))]
-                          (or (get m "envelope_hex") (get m "envelope") m))
+  ([^HttpExchange exchange req relay-atom relay-waiters-atom config]
+   (handle-relay-send exchange req relay-atom relay-waiters-atom config nil))
+  ([^HttpExchange exchange req relay-atom relay-waiters-atom config subnet-runtime]
+   (let [max-payload (long (or (get @relay-atom :max-payload-bytes) 65536))
+         [body-bytes body-exceeded?] (with-open [is (.getRequestBody exchange)]
+                                       (read-body-bounded is max-payload))]
+     (if body-exceeded?
+       (send-response exchange
+                      {:response/status 413
+                       :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                       :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
+       (let [rep-auth (check-relay-replication-auth req config "/relay/v1/send" (or body-bytes (byte-array 0)))]
+         (if-not (:ok? rep-auth)
+           (do
+             (swap! relay-atom update-in [:diagnostics :unauthorized-replication] (fnil inc 0))
+             (send-response exchange
+                            {:response/status 403
+                             :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                             :response/body (json/write-str {"ok" false "error" "unauthorized-replication"})}))
+           (let [replicated? (:replicated? rep-auth)
+                 ct (first (get (:request/headers req) :header/content-type ""))
+                 env (try
+                       (cond
+                         (and (string? ct) (str/includes? (str/lower-case ct) "application/json"))
+                         (let [m (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))]
+                           (or (get m "envelope_hex") (get m "envelope") m))
 
-                        (and (pos? (alength ^bytes body-bytes)) (= 0x7B (aget ^bytes body-bytes 0)))
-                        (let [m (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))]
-                          (or (get m "envelope_hex") (get m "envelope") m))
+                         (and (pos? (alength ^bytes body-bytes)) (= 0x7B (aget ^bytes body-bytes 0)))
+                         (let [m (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))]
+                           (or (get m "envelope_hex") (get m "envelope") m))
 
-                        :else
-                        body-bytes)
-                      (catch Exception _ body-bytes))
-                now-ms (System/currentTimeMillis)
-                res-box (atom nil)
-                _ (swap! relay-atom
-                         (fn [st]
-                           (let [r (relay/reduce-relay st {:type :relay-submit :envelope env :now-ms now-ms})]
-                             (reset! res-box r)
-                             (:state r))))
-                r @res-box]
-            (if (:ok? r)
-              (do
-                (when-not replicated?
-                  (when-let [forwarder (:on-relay-forward config)]
-                    (doseq [eff (:effects r)]
-                      (when (= :forward-to-validators (:effect eff))
-                        (try (forwarder eff) (catch Exception _ nil)))))
-                  (replicate-relay-request! config "/relay/v1/send" body-bytes))
-                (let [recip (or (get-in r [:response "recipient"])
-                                (when-let [eff (first (filter #(= :forward-to-validators (:effect %)) (:effects r)))]
-                                  (:recipient eff)))
-                      broadcast? (boolean (get-in r [:response "broadcast"]))]
-                  (when (or recip broadcast?)
-                    (let [to-wake (concat
-                                   (when recip (get @relay-waiters-atom recip #{}))
-                                   (get @relay-waiters-atom :broadcast #{}))]
-                      (doseq [p to-wake]
-                        (deliver p :notified)))))
-                (send-response exchange
-                               {:response/status 200
-                                :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                                :response/body (json/write-str (:response r))}))
-              (let [status (case (:error r)
-                             :payload-too-large 413
-                             :invalid-signature 403
-                             400)]
-                (send-response exchange
-                               {:response/status status
-                                :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                                :response/body (json/write-str (:response r))})))))))))
+                         :else
+                         body-bytes)
+                       (catch Exception _ body-bytes))
+                 now-ms (System/currentTimeMillis)
+                 res-box (atom nil)
+                 _ (swap! relay-atom
+                          (fn [st]
+                            (let [r (relay/reduce-relay st {:type :relay-submit :envelope env :now-ms now-ms})]
+                              (reset! res-box r)
+                              (:state r))))
+                 r @res-box]
+             (if (:ok? r)
+               (do
+                 (maybe-ingest-artifact-envelope! subnet-runtime env now-ms)
+                 (when-not replicated?
+                   (when-let [forwarder (:on-relay-forward config)]
+                     (doseq [eff (:effects r)]
+                       (when (= :forward-to-validators (:effect eff))
+                         (try (forwarder eff) (catch Exception _ nil)))))
+                   (replicate-relay-request! config "/relay/v1/send" body-bytes))
+                 (let [recip (or (get-in r [:response "recipient"])
+                                 (when-let [eff (first (filter #(= :forward-to-validators (:effect %)) (:effects r)))]
+                                   (:recipient eff)))
+                       broadcast? (boolean (get-in r [:response "broadcast"]))]
+                   (when (or recip broadcast?)
+                     (let [to-wake (concat
+                                    (when recip (get @relay-waiters-atom recip #{}))
+                                    (get @relay-waiters-atom :broadcast #{}))]
+                       (doseq [p to-wake]
+                         (deliver p :notified)))))
+                 (send-response exchange
+                                {:response/status 200
+                                 :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                 :response/body (json/write-str (:response r))}))
+               (let [status (case (:error r)
+                              :payload-too-large 413
+                              :invalid-signature 403
+                              400)]
+                 (send-response exchange
+                                {:response/status status
+                                 :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                 :response/body (json/write-str (:response r))}))))))))))
 
 (defn- handle-relay-poll
   [^HttpExchange exchange req relay-atom relay-waiters-atom config]
@@ -1576,7 +1822,7 @@
                        :response/body (json/write-str {"ok" false "error" "rate-limited"})})
        (cond
          (and (= method :POST) (= clean-path "/relay/v1/send"))
-         (handle-relay-send exchange req relay-atom relay-waiters-atom config)
+         (handle-relay-send exchange req relay-atom relay-waiters-atom config subnet-runtime)
 
          (and (or (= method :GET) (= method :POST)) (= clean-path "/relay/v1/poll"))
          (handle-relay-poll exchange req relay-atom relay-waiters-atom config)
@@ -1736,6 +1982,178 @@
                           :response/headers {"Content-Type" "application/json; charset=utf-8"}
                           :response/body (json/write-str {"ok" false "error" "nickname-not-found" "nickname" nick "network_uri" net-uri})}))))))
 
+(defn handle-artifact-endpoint
+  "Dispatches HTTP /artifact/v1/* endpoints (BIP-004 D30):
+   - POST /artifact/v1/blob
+   - POST /artifact/v1/pointer
+   - GET  /artifact/v1/list"
+  [^HttpExchange exchange req config target-rt]
+  (let [path (get-in req [:request/uri :path])
+        method (:request/method req)
+        clean-path (str/replace path #"/+$" "")
+        now-ms (System/currentTimeMillis)]
+    (if-not target-rt
+      (send-response exchange
+                     {:response/status 503
+                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                      :response/body (json/write-str {"ok" false "error" "subnet-runtime-unavailable"})})
+      (cond
+        (= clean-path "/artifact/v1/blob")
+        (if-not (= method :POST)
+          (send-response exchange
+                         {:response/status 405
+                          :response/headers {"Allow" "POST" "Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
+          (let [max-blob (long (or (get-in config [:http :max-artifact-blob-bytes]) 16777216))
+                [body-bytes body-exceeded?] (with-open [is (.getRequestBody exchange)]
+                                              (read-body-bounded is max-blob))]
+            (if body-exceeded?
+              (send-response exchange
+                             {:response/status 413
+                              :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                              :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
+              (let [ct (first (get (:request/headers req) :header/content-type ""))
+                    header-cid (first (get (:request/headers req) :header/x-bitecho-blob-cid))
+                    parsed-json (when (and body-bytes
+                                           (pos? (alength ^bytes body-bytes))
+                                           (or (and (string? ct) (str/includes? (str/lower-case ct) "application/json"))
+                                               (= 0x7B (aget ^bytes body-bytes 0))))
+                                  (try
+                                    (let [m (json/read-str (String. ^bytes body-bytes StandardCharsets/UTF_8))]
+                                      (when (and (map? m)
+                                                 (some #(contains? m %) ["bytes_hex" "bytes-hex" "data" "bytes" "blob"]))
+                                        (or (get m "blob") m)))
+                                    (catch Exception _ nil)))
+                    blob-res (if parsed-json
+                               (normalize-artifact-blob parsed-json)
+                               (normalize-artifact-blob {:bytes (or body-bytes (byte-array 0))
+                                                         :cid header-cid}))]
+                (if-not (:ok? blob-res)
+                  (send-response exchange
+                                 {:response/status 400
+                                  :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                  :response/body (json/write-str {"ok" false
+                                                                  "error" (name (or (:error blob-res) :invalid-blob))})})
+                  (let [blob (:blob blob-res)
+                        sender (or (first (get (:request/headers req) :header/x-bitecho-pubkey))
+                                   (:default-sender target-rt))]
+                    (infra/submit-event! target-rt
+                                         {:type :put-blob
+                                          :blob blob
+                                          :sender sender
+                                          :now-ms now-ms})
+                    (send-response exchange
+                                   {:response/status 200
+                                    :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                    :response/body (json/write-str {"ok" true
+                                                                    "cid" (:blob/cid blob)
+                                                                    "size_bytes" (alength ^bytes (:blob/bytes blob))})})))))))
+
+        (= clean-path "/artifact/v1/pointer")
+        (if-not (= method :POST)
+          (send-response exchange
+                         {:response/status 405
+                          :response/headers {"Allow" "POST" "Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
+          (let [[body-bytes body-exceeded?] (with-open [is (.getRequestBody exchange)]
+                                              (read-body-bounded is 65536))]
+            (if body-exceeded?
+              (send-response exchange
+                             {:response/status 413
+                              :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                              :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
+              (let [body-str (when (and body-bytes (pos? (alength ^bytes body-bytes)))
+                               (String. ^bytes body-bytes StandardCharsets/UTF_8))
+                    parsed (or (when body-str
+                                 (try (json/read-str body-str) (catch Exception _ nil)))
+                               (when body-str
+                                 (try (edn/read-string body-str) (catch Exception _ nil)))
+                               (when (and body-bytes (pos? (alength ^bytes body-bytes)))
+                                 (try (fressian/decode-wire body-bytes) (catch Exception _ nil))))
+                    raw-ptr (when (map? parsed)
+                              (or (get parsed "pointer") (:pointer parsed) parsed))
+                    ptr (normalize-artifact-pointer raw-ptr)]
+                (if-not ptr
+                  (send-response exchange
+                                 {:response/status 400
+                                  :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                  :response/body (json/write-str {"ok" false "error" "invalid-pointer"})})
+                  (let [sub-res (infra/submit-event! target-rt
+                                                     {:type :publish-pointer
+                                                      :pointer ptr
+                                                      :sender (or (:pointer/authority ptr) (:default-sender target-rt))
+                                                      :now-ms now-ms})
+                        after-diag (:diagnostics @(:shell-atom target-rt))
+                        accepted? (boolean (:applied? sub-res))]
+                    (if accepted?
+                      (send-response exchange
+                                     {:response/status 200
+                                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                      :response/body (json/write-str {"ok" true
+                                                                      "path" (:pointer/path ptr)
+                                                                      "cid" (:pointer/target ptr)
+                                                                      "seq" (:pointer/seq ptr)
+                                                                      "authority" (:pointer/authority ptr)
+                                                                      "tombstoned" (nil? (:pointer/target ptr))})})
+                      (send-response exchange
+                                     {:response/status 403
+                                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                      :response/body (json/write-str {"ok" false
+                                                                      "error" (name (or (:error sub-res) (:last-error after-diag) :pointer-rejected))
+                                                                      "path" (:pointer/path ptr)
+                                                                      "seq" (:pointer/seq ptr)})}))))))))
+
+        (= clean-path "/artifact/v1/list")
+        (if-not (or (= method :GET) (= method :HEAD))
+          (send-response exchange
+                         {:response/status 405
+                          :response/headers {"Allow" "GET, HEAD" "Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
+          (let [query-params (parse-query-params (get-in req [:request/uri :query]))
+                prefix (or (get query-params "prefix") (get query-params "path_prefix") "")
+                st @(:subnet-atom target-rt)
+                raw-ptrs (merge (get-in st [:data :pointers] {}) (:pointers st {}))
+                ptrs (->> raw-ptrs
+                          (keep (fn [[k ptr]]
+                                  (let [p (if (vector? k) (str (second k)) (str k))]
+                                    (when (and (some? (:pointer/target ptr))
+                                               (or (str/blank? prefix) (str/starts-with? p prefix)))
+                                      {"path" p
+                                       "cid" (:pointer/target ptr)
+                                       "seq" (:pointer/seq ptr)
+                                       "authority" (:pointer/authority ptr)
+                                       "sig" (:pointer/sig ptr)
+                                       "timestamp" (:pointer/timestamp ptr)}))))
+                          (sort-by #(get % "path"))
+                          vec)
+                ptr-tombs (->> raw-ptrs
+                               (keep (fn [[k ptr]]
+                                       (let [p (if (vector? k) (str (second k)) (str k))]
+                                         (when (and (nil? (:pointer/target ptr))
+                                                    (or (str/blank? prefix) (str/starts-with? p prefix)))
+                                           p)))))
+                tombs (->> (concat (or (:tombstones st) #{}) ptr-tombs)
+                           (map str)
+                           distinct
+                           (filter #(or (str/blank? prefix) (str/starts-with? % prefix)))
+                           sort
+                           vec)]
+            (send-response exchange
+                           {:response/status 200
+                            :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                            :response/body (if (= method :HEAD)
+                                             nil
+                                             (json/write-str {"ok" true
+                                                              "count" (count ptrs)
+                                                              "pointers" ptrs
+                                                              "tombstones" tombs}))})))
+
+        :else
+        (send-response exchange
+                       {:response/status 404
+                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                        :response/body (json/write-str {"ok" false "error" "not-found" "path" path})})))))
+
 (defn- make-port-80-handler
   ([subnet-runtime https-port limiter-atom]
    (make-port-80-handler {} subnet-runtime https-port limiter-atom (atom (relay/init-relay-state)) (atom {})))
@@ -1749,6 +2167,9 @@
          (cond
            (str/starts-with? path "/relay/v1/")
            (handle-relay-endpoint exchange req relay-atom relay-waiters-atom config subnet-runtime limiter-atom)
+
+           (str/starts-with? path "/artifact/v1/")
+           (handle-artifact-endpoint exchange req config subnet-runtime)
 
            (str/starts-with? path "/faucet/v1/")
            (let [f-atom (or (:faucet-atom config) (atom (faucet/init-faucet-state (or (:faucet config) {}))))]
@@ -1825,6 +2246,9 @@
            (cond
              (str/starts-with? path "/relay/v1/")
              (handle-relay-endpoint exchange req relay-atom relay-waiters-atom config target-rt limiter-atom)
+
+             (str/starts-with? path "/artifact/v1/")
+             (handle-artifact-endpoint exchange req config target-rt)
 
              (str/starts-with? path "/faucet/v1/")
              (let [f-atom (or (:faucet-atom config) (atom (faucet/init-faucet-state (or (:faucet config) {}))))]
@@ -2122,6 +2546,7 @@
         bridge-conn-atom (atom nil)
         on-bridge-msg (fn [payload]
                         (try
+                          (maybe-ingest-artifact-envelope! subnet-runtime payload (System/currentTimeMillis))
                           (swap! relay-atom
                                  (fn [st]
                                    (let [res (relay/reduce-relay st {:type :relay-submit

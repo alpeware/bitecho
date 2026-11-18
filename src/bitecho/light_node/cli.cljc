@@ -9,11 +9,15 @@
 ;; =============================================================================
 
 (def supported-cli-verbs
-  "Canonical sorted vector of all 61 supported CLI verbs across Bitecho shells."
+  "Canonical sorted vector of all 68 supported CLI verbs across Bitecho shells."
   ["accept"
    "account"
    "ack"
    "anchor-subnet"
+   "artifact-get"
+   "artifact-list"
+   "artifact-put"
+   "artifact-revoke"
    "bip-consent"
    "bip-object"
    "bip-status"
@@ -91,7 +95,8 @@
    "--amount" "--text" "--message" "--payload-hex" "--peek" "--poll" "--sync" "--no-poll"
    "--autonomous" "--auto-sync" "--auto-register-home-set" "--no-auto-register-home-set"
    "--wait-open-ms" "--block" "--until-event" "--help"
-   "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"])
+   "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
+   "--path" "--file" "--hex" "--seq" "--authority" "--prefix"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -1003,6 +1008,84 @@
           patch-cid (assoc "patch_cid" patch-cid)
           sha256 (assoc "sha256" sha256)
           (some? b) (assoc "burn" b)))
+
+      "artifact-put"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil)
+                    "global")
+            path (extract-flag-value clean-tokens "--path" nil)
+            file (extract-flag-value clean-tokens "--file" nil)
+            text (or (extract-flag-value clean-tokens "--text" nil)
+                     (extract-flag-value clean-tokens "--data" nil))
+            hex (or (extract-flag-value clean-tokens "--hex" nil)
+                    (extract-flag-value clean-tokens "--data-hex" nil))
+            seq-num (extract-long-flag clean-tokens "--seq" nil)
+            b (extract-long-flag clean-tokens "--burn" nil)
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            auth (or (extract-flag-value clean-tokens "--authority" nil)
+                     (extract-flag-value clean-tokens "--pubkey" nil))
+            cid (extract-flag-value clean-tokens "--cid" nil)
+            m {"cmd" "artifact-put" "subnet_id" sub}]
+        (cond-> m
+          path (assoc "path" path)
+          file (assoc "file" file)
+          text (assoc "text" text "data" text)
+          hex (assoc "hex" hex "data_hex" hex)
+          seq-num (assoc "seq" seq-num)
+          (some? b) (assoc "burn" b)
+          relay-url (assoc "relay_url" relay-url)
+          auth (assoc "authority" auth)
+          cid (assoc "cid" cid)))
+
+      "artifact-get"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil)
+                    "global")
+            path (extract-flag-value clean-tokens "--path" nil)
+            auth (or (extract-flag-value clean-tokens "--authority" nil)
+                     (extract-flag-value clean-tokens "--pubkey" nil))
+            out-file (or (extract-flag-value clean-tokens "--out-file" nil)
+                         (extract-flag-value clean-tokens "--file" nil))
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            m {"cmd" "artifact-get" "subnet_id" sub}]
+        (cond-> m
+          path (assoc "path" path)
+          auth (assoc "authority" auth)
+          out-file (assoc "out_file" out-file)
+          relay-url (assoc "relay_url" relay-url)))
+
+      "artifact-list"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil))
+            prefix (or (extract-flag-value clean-tokens "--prefix" nil)
+                       (extract-flag-value clean-tokens "--path" nil))
+            auth (or (extract-flag-value clean-tokens "--authority" nil)
+                     (extract-flag-value clean-tokens "--pubkey" nil))
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            m {"cmd" "artifact-list"}]
+        (cond-> m
+          sub (assoc "subnet_id" sub)
+          prefix (assoc "prefix" prefix "path" prefix)
+          auth (assoc "authority" auth)
+          relay-url (assoc "relay_url" relay-url)))
+
+      "artifact-revoke"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil)
+                    "global")
+            path (extract-flag-value clean-tokens "--path" nil)
+            seq-num (extract-long-flag clean-tokens "--seq" nil)
+            b (extract-long-flag clean-tokens "--burn" nil)
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            auth (or (extract-flag-value clean-tokens "--authority" nil)
+                     (extract-flag-value clean-tokens "--pubkey" nil))
+            m {"cmd" "artifact-revoke" "subnet_id" sub}]
+        (cond-> m
+          path (assoc "path" path)
+          seq-num (assoc "seq" seq-num)
+          (some? b) (assoc "burn" b)
+          relay-url (assoc "relay_url" relay-url)
+          auth (assoc "authority" auth)))
 
       {"cmd" verb})))
 

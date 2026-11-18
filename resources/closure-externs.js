@@ -69,11 +69,16 @@ nodeCrypto.verify = function(algo, data, key, sig) {};
 nodeCrypto.diffieHellman = function(opts) {};
 nodeCrypto.createCipheriv = function(algo, key, iv, opts) {};
 nodeCrypto.createDecipheriv = function(algo, key, iv, opts) {};
+nodeCrypto.X509Certificate = function(buf) {};
+nodeCrypto.X509Certificate.prototype.raw = {};
+nodeCrypto.X509Certificate.prototype.publicKey = {};
 
 var KeyObject = {};
 KeyObject.export = function(opts) {};
 KeyObject.publicKey = {};
 KeyObject.privateKey = {};
+KeyObject.asymmetricKeyType = "";
+KeyObject.raw = {};
 
 var Cipher = {};
 Cipher.setAAD = function(aad) {};
@@ -131,7 +136,17 @@ var NodeExterns = {
   stdin: {},
   stdout: {},
   stderr: {},
-  Buffer: {}
+  Buffer: {},
+  byteLength: 0,
+  byteOffset: 0,
+  buffer: {},
+  length: 0,
+  code: "",
+  message: "",
+  cause: {},
+  raw: {},
+  asymmetricKeyType: "",
+  X509Certificate: function() {}
 };
 NodeExterns.appendFileSync = function() {};
 NodeExterns.chmodSync = function() {};

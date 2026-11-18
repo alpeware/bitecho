@@ -1172,10 +1172,10 @@ async function test() {
   console.log('BitechoBrowser loaded successfully, version:', B.version);
 
   const verbs = B.getSupportedVerbs();
-  if (!Array.isArray(verbs) || verbs.length !== 64) {
-    throw new Error('Expected 64 verbs, got: ' + (verbs ? verbs.length : 'none'));
+  if (!Array.isArray(verbs) || verbs.length !== 68) {
+    throw new Error('Expected 68 verbs, got: ' + (verbs ? verbs.length : 'none'));
   }
-  console.log('Supported verbs verified: 64 verbs');
+  console.log('Supported verbs verified: 68 verbs');
 
   const node = B.initNode();
   if (!node) throw new Error('initNode returned null');

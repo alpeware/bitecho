@@ -303,5 +303,24 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 1. **Pure Faucet Reducer (`bitecho.core.protocol.faucet`):** Cryptographic challenge-response faucet with 60-second TTL, network-uri scoping, and single-use claim tracking.
 2. **Multi-Network Directory Endpoints:** Ingress HTTP shells support `/directory/v1/<network-uri>/<nickname>` alongside legacy fallbacks.
 
+---
+
+## 10. Milestone D30: BIP-004 On-Network Artifact Publishing, First-Match Path-ACL, & P2P Relay Remediation (`v0.23.8`)
+
+### 10.1 First-Match `:subnet/path-acl` Stream Isolation & Hard-`404` Revocation (`BIP-004 §§B.2-B.4`)
+1. **First-Match Path-ACL Ordering:** In `infra/default-infra-policy`, specific stream patterns (`"subnet/policy"`, `"dist/*"`, `"releases/*"`, `"pkg/*"`, `"web/SKILL.md"`, `"web/ONBOARDING.md"`, `"web/llms.txt"`, `"web/references/*"`, `"web/agents/*"`, `"web/blog/*"`, `"blog/*"`) strictly precede the catch-all `"web/*"` rule so Tier-1 stream maintainers (`K_nexus`, `K_axiom`, `K_lumen`) can publish to their delegated paths without granting authority over `"web/index.html"` or `"dist/*"`.
+2. **Hard-`404` Tombstones & `:subnet/denied-cids`:** `infra/resolve-path-blob!` checks whether a path is tombstoned (`:pointer/target nil`) or whether its target CID is listed in `:subnet/denied-cids`, returning `{:ok? false :denied? true}` and blocking fallback to disk `dist/` or `content-root`.
+
+### 10.2 Pointer-First `serve-dist-request`, Dynamic `.sha256` Synthesis, & `/artifact/v1/*` Bridge (`BIP-004 §§C-D`)
+1. **Pointer-First `/dist/*` Resolution:** `http/serve-dist-request` resolves `"dist/<rel-path>"` via `infra/resolve-path-blob!` before any disk fallback, serving `X-Bitecho-Blob-Cid`, `X-Bitecho-Pointer-Pubkey`, `X-Bitecho-Pointer-Seq`, `X-Bitecho-Pointer-Signature`, `ETag`, and `Range` (`206 Partial Content`) headers.
+2. **Dynamic `.sha256` Synthesis:** Requests for `/dist/<name>.sha256` resolve `"dist/<name>"` in `rt` and dynamically synthesize `<cid>  <name>\n` when an active pointer exists (or return `404` if tombstoned/denied).
+3. **HTTP Artifact Bridge (`/artifact/v1/{blob,pointer,list}`):** Ingress HTTP shells expose `POST /artifact/v1/blob`, `POST /artifact/v1/pointer`, and `GET /artifact/v1/list`, and ingest `:artifact-replicate` / `:replicate-pointer` envelopes arriving via `/relay/v1/send` or the validator bridge.
+4. **Light-Node Artifact Verbs:** `artifact-put`, `artifact-get`, `artifact-list`, and `artifact-revoke` are supported across CLI, `serve`, `ctl`, and one-shot modes (`--subnet-id`, `--path`, `--file`, `--text`, `--hex`, `--seq`, `--burn`, `--relay-url`, `--authority`, `--prefix`).
+
+### 10.3 Shared Relay Candidate Preservation & Shuttle Broadcast Forwarding (`BIP-004 §E`)
+1. **Shared Relay Candidate Preservation:** `filter-p2p-remote-candidates` in `exec-p2p-answer`, `handle-wire-p2p-offer`, and `handle-wire-p2p-answer` never strips shared `https://` or `http://` relay URLs during self-filtering, and falls back to raw remote candidates with counted `:p2p-answer-candidate-self-filter-fallback` / `:p2p-offer-candidate-self-filter-fallback` diagnostics when non-relay candidates self-filter to empty.
+2. **Shuttle Import Live Forwarding:** In `handle-serve-line!`, import shuttle verbs (`import-poll`, `import`, `import-envelope`) forward generated hub-relay/gossip envelopes immediately when validator or P2P links are live, or increment `[:diagnostics :shuttle-import-forward-deferred]` and return `"pending_forward_count"` when offline.
+
+
 
 

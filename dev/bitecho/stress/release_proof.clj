@@ -14,6 +14,7 @@
             [bitecho.d26-remediation-scenarios-test :as d26-test]
             [bitecho.d27-publishing-and-remediation-test :as d27-test]
             [bitecho.d28-autosync-and-p2p-ack-hotfix-test :as d28-test]
+            [bitecho.d30-artifact-publishing-scenarios-test :as d30-test]
             [bitecho.e2e.d29-remediation-scenario-test :as d29-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
@@ -482,11 +483,34 @@
      :count (count results)
      :scenarios results}))
 
+(defn run-d30-scenarios
+  "Runs Milestone D30 (v0.23.8 / BIP-004) on-network artifact publishing & HTTPS P2P scenario suite."
+  []
+  (let [scenarios [{:id "S-D30-1" :name "live-pointer-first-dist-cutover-and-artifact-verbs" :test-fn d30-test/scenario-s-d30-1-live-pointer-first-dist-cutover-and-artifact-verbs}
+                   {:id "S-D30-2" :name "first-match-path-acl-stream-isolation" :test-fn d30-test/scenario-s-d30-2-first-match-path-acl-stream-isolation}
+                   {:id "S-D30-3" :name "tombstone-and-denied-cids-hard-404" :test-fn d30-test/scenario-s-d30-3-tombstone-and-denied-cids-hard-404}
+                   {:id "S-D30-4" :name "mid-fetch-range-immutability-across-pointer-advance" :test-fn d30-test/scenario-s-d30-4-mid-fetch-range-immutability-across-pointer-advance}
+                   {:id "S-D30-5" :name "three-node-https-relay-p2p-broadcast-and-import-poll" :test-fn d30-test/scenario-s-d30-5-three-node-https-relay-p2p-broadcast-and-import-poll}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D29 (v0.23.7) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D30 (v0.23.8) release verification proof and returns a deterministic EDN map."
   [opts]
   (let [ver (or (:version opts) (str "v" config/version))
-        ms (or (:milestone opts) "D29")
+        ms (or (:milestone opts) "D30")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
@@ -498,6 +522,7 @@
         d27-scenarios (run-d27-scenarios)
         d28-scenarios (run-d28-scenarios)
         d29-scenarios (run-d29-scenarios)
+        d30-scenarios (run-d30-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
         _ (assert (and (.exists bundle-file) (pos? (.length bundle-file)))
                   "dist/bitecho-light-node.cjs must exist and be non-empty before release proof generation!")
@@ -518,7 +543,8 @@
                                   (:all-passed? d26-scenarios)
                                   (:all-passed? d27-scenarios)
                                   (:all-passed? d28-scenarios)
-                                  (:all-passed? d29-scenarios)))]
+                                  (:all-passed? d29-scenarios)
+                                  (:all-passed? d30-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
@@ -532,6 +558,7 @@
                        "bitecho.d27-publishing-and-remediation-test"
                        "bitecho.d28-autosync-and-p2p-ack-hotfix-test"
                        "bitecho.e2e.d29-remediation-scenario-test"
+                       "bitecho.d30-artifact-publishing-scenarios-test"
                        "bitecho.state-machine-test"]
      :d24-remediation-scenarios d24-scenarios
      :d25-remediation-scenarios d25-scenarios
@@ -539,6 +566,7 @@
      :d27-remediation-scenarios d27-scenarios
      :d28-remediation-scenarios d28-scenarios
      :d29-remediation-scenarios d29-scenarios
+     :d30-artifact-publishing-scenarios d30-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}

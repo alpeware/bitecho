@@ -719,6 +719,80 @@
                                        patch-cid (assoc "patch_cid" patch-cid)
                                        sha256 (assoc "sha256" sha256)
                                        (some? b) (assoc "burn" b)))
+                   "artifact-put" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                (extract-flag-value args "--subnet" nil)
+                                                "global")
+                                        path (extract-flag-value args "--path" nil)
+                                        file (extract-flag-value args "--file" nil)
+                                        file-hex (when (and file (.exists (io/file file)))
+                                                   (try (basalt/bytes->hex (Files/readAllBytes (.toPath (io/file file))))
+                                                        (catch Exception _ nil)))
+                                        text (or (extract-flag-value args "--text" nil)
+                                                 (extract-flag-value args "--data" nil))
+                                        hex (or (extract-flag-value args "--hex" nil)
+                                                (extract-flag-value args "--data-hex" nil)
+                                                file-hex)
+                                        seq-num (extract-long-flag args "--seq" nil)
+                                        b (extract-long-flag args "--burn" nil)
+                                        relay-url (extract-flag-value args "--relay-url" nil)
+                                        auth (or (extract-flag-value args "--authority" nil)
+                                                 (extract-flag-value args "--pubkey" nil))
+                                        cid (extract-flag-value args "--cid" nil)
+                                        m {"cmd" "artifact-put" "subnet_id" sub}]
+                                    (cond-> m
+                                      path (assoc "path" path)
+                                      file (assoc "file" file)
+                                      text (assoc "text" text "data" text)
+                                      hex (assoc "hex" hex "data_hex" hex)
+                                      seq-num (assoc "seq" seq-num)
+                                      (some? b) (assoc "burn" b)
+                                      relay-url (assoc "relay_url" relay-url)
+                                      auth (assoc "authority" auth)
+                                      cid (assoc "cid" cid)))
+                   "artifact-get" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                (extract-flag-value args "--subnet" nil)
+                                                "global")
+                                        path (extract-flag-value args "--path" nil)
+                                        auth (or (extract-flag-value args "--authority" nil)
+                                                 (extract-flag-value args "--pubkey" nil))
+                                        out-file (or (extract-flag-value args "--out-file" nil)
+                                                     (extract-flag-value args "--file" nil))
+                                        relay-url (extract-flag-value args "--relay-url" nil)
+                                        m {"cmd" "artifact-get" "subnet_id" sub}]
+                                    (cond-> m
+                                      path (assoc "path" path)
+                                      auth (assoc "authority" auth)
+                                      out-file (assoc "out_file" out-file)
+                                      relay-url (assoc "relay_url" relay-url)))
+                   "artifact-list" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                 (extract-flag-value args "--subnet" nil))
+                                         prefix (or (extract-flag-value args "--prefix" nil)
+                                                    (extract-flag-value args "--path" nil))
+                                         auth (or (extract-flag-value args "--authority" nil)
+                                                  (extract-flag-value args "--pubkey" nil))
+                                         relay-url (extract-flag-value args "--relay-url" nil)
+                                         m {"cmd" "artifact-list"}]
+                                     (cond-> m
+                                       sub (assoc "subnet_id" sub)
+                                       prefix (assoc "prefix" prefix "path" prefix)
+                                       auth (assoc "authority" auth)
+                                       relay-url (assoc "relay_url" relay-url)))
+                   "artifact-revoke" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                   (extract-flag-value args "--subnet" nil)
+                                                   "global")
+                                           path (extract-flag-value args "--path" nil)
+                                           seq-num (extract-long-flag args "--seq" nil)
+                                           b (extract-long-flag args "--burn" nil)
+                                           relay-url (extract-flag-value args "--relay-url" nil)
+                                           auth (or (extract-flag-value args "--authority" nil)
+                                                    (extract-flag-value args "--pubkey" nil))
+                                           m {"cmd" "artifact-revoke" "subnet_id" sub}]
+                                       (cond-> m
+                                         path (assoc "path" path)
+                                         seq-num (assoc "seq" seq-num)
+                                         (some? b) (assoc "burn" b)
+                                         relay-url (assoc "relay_url" relay-url)
+                                         auth (assoc "authority" auth)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -2411,16 +2485,27 @@
                 https-leg? (contains? #{:https :http "https" "http"} transport)]
             (if https-leg?
               (try
-                (let [relay-base-url (relay/normalize-relay-base-url
-                                      (or (:url cand)
-                                          (str (name transport) "://" host ":" port "/relay/v1")))
+                (let [initial-relay-url (relay/normalize-relay-base-url
+                                         (or (:url cand)
+                                             (str (name transport) "://" host ":" port "/relay/v1")))
                       local-pub (or (:pubkey @state-atom) "")
-                      probe-res (poll-relay-envelopes! relay-base-url local-pub privkey-bytes {:since-seq 0 :timeout-ms 0})
-                      probe-ok? (and (map? probe-res)
-                                     (or (true? (get probe-res "ok"))
-                                         (true? (:ok probe-res))
-                                         (vector? (get probe-res "messages"))
-                                         (vector? (:messages probe-res))))]
+                      probe-fn (fn [u]
+                                 (let [r (try (poll-relay-envelopes! u local-pub privkey-bytes {:since-seq 0 :timeout-ms 0})
+                                              (catch Throwable _ nil))]
+                                   (and (map? r)
+                                        (or (true? (get r "ok"))
+                                            (true? (:ok r))
+                                            (vector? (get r "messages"))
+                                            (vector? (:messages r))))))
+                      loopback-fallback-url (relay/normalize-relay-base-url "http://127.0.0.1:18080/relay/v1")
+                      relay-base-url (cond
+                                       (probe-fn initial-relay-url) initial-relay-url
+                                       (and (not= initial-relay-url loopback-fallback-url)
+                                            (not (contains? #{"127.0.0.1" "localhost" "::1"} (str/lower-case (str host))))
+                                            (probe-fn loopback-fallback-url))
+                                       loopback-fallback-url
+                                       :else nil)
+                      probe-ok? (some? relay-base-url)]
                   (when probe-ok?
                     (let [assigned-gen (atom nil)
                           on-close-fired? (atom false)
@@ -2829,6 +2914,77 @@
       (when (and resp emit!) (emit! resp))
       resp)))
 
+(defn- artifact-endpoint-base-url
+  [raw-url]
+  (when (and (string? raw-url) (not (str/blank? raw-url)))
+    (-> (str/trim raw-url)
+        (str/replace #"/+$" "")
+        (str/replace #"/relay/v1$" "")
+        (str/replace #"/artifact/v1$" ""))))
+
+(defn- enrich-artifact-cmd-map
+  [verb cmd-map]
+  (if (and (= verb "artifact-put")
+           (nil? (get cmd-map "hex"))
+           (nil? (get cmd-map "data_hex"))
+           (nil? (get cmd-map "text"))
+           (nil? (get cmd-map "data"))
+           (string? (get cmd-map "file"))
+           (not (str/blank? (get cmd-map "file"))))
+    (let [f (io/file (get cmd-map "file"))]
+      (if (.exists f)
+        (let [bs (Files/readAllBytes (.toPath f))
+              h (basalt/bytes->hex bs)]
+          (assoc cmd-map "hex" h "data_hex" h))
+        cmd-map))
+    cmd-map))
+
+(defn- post-artifact-to-relay!
+  [raw-relay-url verb resp]
+  (when-let [base-url (artifact-endpoint-base-url raw-relay-url)]
+    (when (and (map? resp) (true? (or (get resp "ok") (:ok resp))))
+      (try
+        (let [client (-> (HttpClient/newBuilder)
+                         (.connectTimeout (Duration/ofSeconds 5))
+                         (.build))
+              post-json! (fn [subpath payload-str content-type]
+                           (let [req (-> (HttpRequest/newBuilder)
+                                         (.uri (URI/create (str base-url subpath)))
+                                         (.timeout (Duration/ofSeconds 10))
+                                         (.header "Content-Type" content-type)
+                                         (.POST (HttpRequest$BodyPublishers/ofString payload-str StandardCharsets/UTF_8))
+                                         (.build))
+                                 r (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))]
+                             (try (json/read-str (.body r)) (catch Exception _ {"status" (.statusCode r)}))))]
+          (when (= verb "artifact-put")
+            (when-let [blob (or (get resp "blob") (:blob resp))]
+              (post-json! "/artifact/v1/blob"
+                          (json/write-str {"bytes_hex" (basalt/bytes->hex (:blob/bytes blob))
+                                           "cid" (:blob/cid blob)
+                                           "media_type" (or (:blob/media-type blob) "application/octet-stream")})
+                          "application/json")))
+          (when-let [ptr (or (get resp "pointer") (:pointer resp))]
+            (post-json! "/artifact/v1/pointer"
+                        (pr-str ptr)
+                        "application/edn")))
+        (catch Exception _ nil)))))
+
+(defn- maybe-write-artifact-out-file!
+  [verb cmd-map resp]
+  (when (and (= verb "artifact-get")
+             (map? resp)
+             (true? (or (get resp "ok") (:ok resp)))
+             (string? (get cmd-map "out_file"))
+             (not (str/blank? (get cmd-map "out_file")))
+             (string? (get resp "hex")))
+    (try
+      (let [f (io/file (get cmd-map "out_file"))]
+        (when-let [p (.getParentFile f)] (.mkdirs p))
+        (Files/write (.toPath f)
+                     ^bytes (basalt/hex->bytes (get resp "hex"))
+                     (into-array java.nio.file.OpenOption [])))
+      (catch Exception _ nil))))
+
 (defn handle-serve-line!
   "Processes a single STDIN, --cmd-file JSON line, or control-socket command map in serve mode,
    handling network retries and returning response map."
@@ -2857,18 +3013,26 @@
           (let [err-resp {"ok" false "error" (:error sync-res)}]
             (emit! err-resp)
             err-resp)
-          (let [effective-map (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
-                                       (not (contains? cmd-map "descriptor"))
-                                       (not (contains? cmd-map :descriptor)))
-                                (let [nick (or (get cmd-map "nickname") (:nickname cmd-map))
-                                      dom (or (get cmd-map "domain") (:domain cmd-map) "bitecho.org")
-                                      desc (when (and (string? nick) (not (str/blank? nick)))
-                                             (fetch-directory-descriptor! dom nick conn-opts))]
-                                  (cond-> cmd-map
-                                    desc (assoc "descriptor" desc)))
-                                cmd-map)
+          (let [effective-map (-> (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
+                                           (not (contains? cmd-map "descriptor"))
+                                           (not (contains? cmd-map :descriptor)))
+                                    (let [nick (or (get cmd-map "nickname") (:nickname cmd-map))
+                                          dom (or (get cmd-map "domain") (:domain cmd-map) "bitecho.org")
+                                          desc (when (and (string? nick) (not (str/blank? nick)))
+                                                 (fetch-directory-descriptor! dom nick conn-opts))]
+                                      (cond-> cmd-map
+                                        desc (assoc "descriptor" desc)))
+                                    cmd-map)
+                                  (as-> m (enrich-artifact-cmd-map verb m)))
                 prev-state @state-atom
                 res (light-core/handle-command @state-atom effective-map (:privkey-bytes identity))
+                _ (maybe-write-artifact-out-file! verb effective-map (:response res))
+                _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
+                    (when-let [art-relay (or (get effective-map "relay_url")
+                                             (get effective-map "relay-url")
+                                             (:relay-url effective-map)
+                                             relay-url)]
+                      (post-artifact-to-relay! art-relay verb (:response res))))
                 finish-resp! (fn [resp]
                                (if (and (contains? #{"offer" "rendezvous-offer"} verb) (pos? wait-ms))
                                  (let [sid (or (get resp "session_id") (get resp "session-id") (get resp :session-id) (get-in res [:response "session_id"]))]
@@ -2881,11 +3045,19 @@
                 _ (when-let [dial-info (:p2p-dial res)]
                     (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info))
                 shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
+                import-shuttle-verb? (contains? #{"import-envelope" "import-poll" "import"} verb)
                 connect-explicit? (true? (or (get cmd-map "connect") (:connect cmd-map)))
-                needs-net? (and (seq (:net-envelopes res)) (if shuttle-verb? connect-explicit? true))]
+                currently-live? (connection-live? @conn-atom @state-atom)
+                has-live-peers? (or (and p2p-peers-atom (seq @p2p-peers-atom))
+                                    (and ingress-peers-atom (seq @ingress-peers-atom)))
+                shuttle-can-forward? (and import-shuttle-verb?
+                                          (or connect-explicit? currently-live? has-live-peers?))
+                needs-net? (and (seq (:net-envelopes res))
+                                (if shuttle-verb?
+                                  (or connect-explicit? shuttle-can-forward?)
+                                  true))]
             (if needs-net?
-              (let [currently-live? (connection-live? @conn-atom @state-atom)
-                    replay-envs (when (= verb "register-home-set")
+              (let [replay-envs (when (= verb "register-home-set")
                                   (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
                     live-envs (if (seq replay-envs)
                                 (into (vec replay-envs) (:net-envelopes res))
@@ -2903,7 +3075,7 @@
                                             state-atom
                                             (:privkey-bytes identity))
                     (sync-conn-diagnostics! state-atom conn-atom)
-                    (save-light-state! state-file @state-atom)
+                    (when state-file (save-light-state! state-file @state-atom))
                     (finish-resp! (:response res)))
                   (let [sent-ingress? (boolean
                                        (when (and ingress-peers-atom (seq @ingress-peers-atom))
@@ -2915,7 +3087,7 @@
                       (do
                         (swap! state-atom assoc :connected? true :connection-error nil)
                         (sync-conn-diagnostics! state-atom conn-atom)
-                        (save-light-state! state-file @state-atom)
+                        (when state-file (save-light-state! state-file @state-atom))
                         (finish-resp! (:response res)))
                       (do
                         (swap! state-atom assoc :connected? false :connection-error "send-failed")
@@ -2939,7 +3111,7 @@
                                   (do
                                     (swap! state-atom assoc :connected? true :connection-error nil)
                                     (sync-conn-diagnostics! state-atom conn-atom)
-                                    (save-light-state! state-file @state-atom)
+                                    (when state-file (save-light-state! state-file @state-atom))
                                     (finish-resp! (:response res)))
                                   (let [err "send-failed"]
                                     (swap! state-atom assoc :connected? false :connection-error err)
@@ -2948,7 +3120,7 @@
                                     (if (= verb "send")
                                       (do
                                         (sync-conn-diagnostics! state-atom conn-atom)
-                                        (save-light-state! state-file @state-atom)
+                                        (when state-file (save-light-state! state-file @state-atom))
                                         (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
                                           (emit! err-map)
                                           err-map))
@@ -2970,7 +3142,7 @@
                               (if (= verb "send")
                                 (do
                                   (sync-conn-diagnostics! state-atom conn-atom)
-                                  (save-light-state! state-file @state-atom)
+                                  (when state-file (save-light-state! state-file @state-atom))
                                   (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
                                     (emit! err-map)
                                     err-map))
@@ -2985,10 +3157,15 @@
                                   (let [err-map {"ok" false "error" err}]
                                     (emit! err-map)
                                     err-map)))))))))))
-              (do
+              (let [deferred-forward? (and import-shuttle-verb? (seq (:net-envelopes res)))
+                    final-resp (if deferred-forward?
+                                 (do
+                                   (swap! state-atom update-in [:diagnostics :shuttle-import-forward-deferred] (fnil inc 0))
+                                   (assoc (:response res) "pending_forward_count" (count (:net-envelopes res))))
+                                 (:response res))]
                 (sync-conn-diagnostics! state-atom conn-atom)
-                (save-light-state! state-file @state-atom)
-                (finish-resp! (:response res))))))))))
+                (when state-file (save-light-state! state-file @state-atom))
+                (finish-resp! final-resp)))))))))
 
 (defn- extract-pid []
   (try
@@ -3521,7 +3698,12 @@
                 (.setDaemon true)
                 (.setName "bitecho-light-node-cmd-file")
                 (.start))))
-        _ (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+        effective-relay-url (or (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                                  (:relay-url opts))
+                                (when-not (:ok? conn-res)
+                                  (or (:relay-url bootstrap)
+                                      (get-in bootstrap [:relay :url]))))
+        _ (when (and (string? effective-relay-url) (not (str/blank? effective-relay-url)))
             (doto (Thread.
                    ^Runnable
                    (fn []
@@ -3531,7 +3713,7 @@
                          (let [eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
                                subnets (or (:subnets opts) eff-subnets)
                                poll-res (try
-                                          (poll-relay-envelopes! (:relay-url opts)
+                                          (poll-relay-envelopes! effective-relay-url
                                                                  (:pubkey-hex identity)
                                                                  (:privkey-bytes identity)
                                                                  (cond-> {:since-seq since-mseq
@@ -3577,7 +3759,7 @@
                                                                (:privkey-bytes identity))))))))
                            (when (or (seq msgs) (seq bcasts) (> new-bseq since-bseq))
                              (try
-                               (ack-relay-envelopes! (:relay-url opts)
+                               (ack-relay-envelopes! effective-relay-url
                                                      (:pubkey-hex identity)
                                                      (:privkey-bytes identity)
                                                      new-mseq
@@ -3836,16 +4018,17 @@
                             (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
             state-atom (atom initial-state)
             verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
-            cmd-map (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
-                             (not (contains? raw-cmd-map "descriptor"))
-                             (not (contains? raw-cmd-map :descriptor)))
-                      (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map))
-                            dom (or (get raw-cmd-map "domain") (:domain raw-cmd-map) "bitecho.org")
-                            desc (when (and (string? nick) (not (str/blank? nick)))
-                                   (fetch-directory-descriptor! dom nick opts))]
-                        (cond-> raw-cmd-map
-                          desc (assoc "descriptor" desc)))
-                      raw-cmd-map)
+            cmd-map (-> (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
+                                 (not (contains? raw-cmd-map "descriptor"))
+                                 (not (contains? raw-cmd-map :descriptor)))
+                          (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map))
+                                dom (or (get raw-cmd-map "domain") (:domain raw-cmd-map) "bitecho.org")
+                                desc (when (and (string? nick) (not (str/blank? nick)))
+                                       (fetch-directory-descriptor! dom nick opts))]
+                            (cond-> raw-cmd-map
+                              desc (assoc "descriptor" desc)))
+                          raw-cmd-map)
+                        (as-> m (enrich-artifact-cmd-map verb m)))
             shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal"
                                        "export-p2p-offer" "export-p2p-answer" "export-send"
                                        "import-envelope" "import-poll" "import"}
@@ -3880,6 +4063,13 @@
             err-resp)
           (binding [*out* *err*]
             (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
+                  _ (maybe-write-artifact-out-file! verb cmd-map (:response res))
+                  _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
+                      (when-let [art-relay (or (get cmd-map "relay_url")
+                                               (get cmd-map "relay-url")
+                                               (:relay-url cmd-map)
+                                               effective-relay-url)]
+                        (post-artifact-to-relay! art-relay verb (:response res))))
                   new-state (:state res)
                   all-net-envs (into (vec poll-auto-envs) (:net-envelopes res))
                   connect-explicit? (contains? opts :connect?)

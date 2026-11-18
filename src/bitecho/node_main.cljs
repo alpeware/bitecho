@@ -1480,6 +1480,80 @@
                                     m {"cmd" "bounties"}]
                                 (cond-> m
                                   sub (assoc "subnet_id" sub)))
+                   "artifact-put" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                (extract-flag-value args "--subnet" nil)
+                                                "global")
+                                        path (extract-flag-value args "--path" nil)
+                                        file (extract-flag-value args "--file" nil)
+                                        file-hex (when (and file (.existsSync node-fs file))
+                                                   (try (.toString (.readFileSync node-fs file) "hex")
+                                                        (catch :default _ nil)))
+                                        text (or (extract-flag-value args "--text" nil)
+                                                 (extract-flag-value args "--data" nil))
+                                        hex (or (extract-flag-value args "--hex" nil)
+                                                (extract-flag-value args "--data-hex" nil)
+                                                file-hex)
+                                        seq-num (extract-long-flag args "--seq" nil)
+                                        b (extract-long-flag args "--burn" nil)
+                                        relay-url (extract-flag-value args "--relay-url" nil)
+                                        auth (or (extract-flag-value args "--authority" nil)
+                                                 (extract-flag-value args "--pubkey" nil))
+                                        cid (extract-flag-value args "--cid" nil)
+                                        m {"cmd" "artifact-put" "subnet_id" sub}]
+                                    (cond-> m
+                                      path (assoc "path" path)
+                                      file (assoc "file" file)
+                                      text (assoc "text" text "data" text)
+                                      hex (assoc "hex" hex "data_hex" hex)
+                                      seq-num (assoc "seq" seq-num)
+                                      (some? b) (assoc "burn" b)
+                                      relay-url (assoc "relay_url" relay-url)
+                                      auth (assoc "authority" auth)
+                                      cid (assoc "cid" cid)))
+                   "artifact-get" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                (extract-flag-value args "--subnet" nil)
+                                                "global")
+                                        path (extract-flag-value args "--path" nil)
+                                        auth (or (extract-flag-value args "--authority" nil)
+                                                 (extract-flag-value args "--pubkey" nil))
+                                        out-file (or (extract-flag-value args "--out-file" nil)
+                                                     (extract-flag-value args "--file" nil))
+                                        relay-url (extract-flag-value args "--relay-url" nil)
+                                        m {"cmd" "artifact-get" "subnet_id" sub}]
+                                    (cond-> m
+                                      path (assoc "path" path)
+                                      auth (assoc "authority" auth)
+                                      out-file (assoc "out_file" out-file)
+                                      relay-url (assoc "relay_url" relay-url)))
+                   "artifact-list" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                 (extract-flag-value args "--subnet" nil))
+                                         prefix (or (extract-flag-value args "--prefix" nil)
+                                                    (extract-flag-value args "--path" nil))
+                                         auth (or (extract-flag-value args "--authority" nil)
+                                                  (extract-flag-value args "--pubkey" nil))
+                                         relay-url (extract-flag-value args "--relay-url" nil)
+                                         m {"cmd" "artifact-list"}]
+                                     (cond-> m
+                                       sub (assoc "subnet_id" sub)
+                                       prefix (assoc "prefix" prefix "path" prefix)
+                                       auth (assoc "authority" auth)
+                                       relay-url (assoc "relay_url" relay-url)))
+                   "artifact-revoke" (let [sub (or (extract-flag-value args "--subnet-id" nil)
+                                                   (extract-flag-value args "--subnet" nil)
+                                                   "global")
+                                           path (extract-flag-value args "--path" nil)
+                                           seq-num (extract-long-flag args "--seq" nil)
+                                           b (extract-long-flag args "--burn" nil)
+                                           relay-url (extract-flag-value args "--relay-url" nil)
+                                           auth (or (extract-flag-value args "--authority" nil)
+                                                    (extract-flag-value args "--pubkey" nil))
+                                           m {"cmd" "artifact-revoke" "subnet_id" sub}]
+                                       (cond-> m
+                                         path (assoc "path" path)
+                                         seq-num (assoc "seq" seq-num)
+                                         (some? b) (assoc "burn" b)
+                                         relay-url (assoc "relay_url" relay-url)
+                                         auth (assoc "authority" auth)))
                    {"cmd" verb})]
     (if (map? json-args)
       (merge base-map json-args {"cmd" verb})
@@ -1527,7 +1601,8 @@
                                 "--price" "--price-max" "--burn" "--to" "--from"
                                 "--callee" "--peer" "--receiver" "--recipient"
                                 "--amount" "--text" "--message" "--payload-hex"
-                                "--wait-open-ms" "--until-event"}
+                                "--wait-open-ms" "--until-event"
+                                "--path" "--file" "--hex" "--seq" "--authority" "--prefix"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -3027,16 +3102,16 @@
                                            (when client-node
                                              (try (api/close! client-node) (catch :default _ nil)))
                                            (dial-step! (inc idx)))
-                                relay-base-url (when https-leg?
-                                                 (relay/normalize-relay-base-url
-                                                  (or (:url cand)
-                                                      (str (name transport) "://" host ":" port "/relay/v1"))))
+                                relay-base-url-atom (atom (when https-leg?
+                                                            (relay/normalize-relay-base-url
+                                                             (or (:url cand)
+                                                                 (str (name transport) "://" host ":" port "/relay/v1")))))
                                 peer-send! (if https-leg?
                                              (fn [env]
                                                (if @on-close-fired?
                                                  false
                                                  (do
-                                                   (submit-relay-envelope! relay-base-url env {:timeout-ms 5000} (fn [_] nil))
+                                                   (submit-relay-envelope! @relay-base-url-atom env {:timeout-ms 5000} (fn [_] nil))
                                                    true)))
                                              (fn [env]
                                                (if-let [cid @channel-id]
@@ -3099,7 +3174,7 @@
                                                                                                 :close-fn peer-close!
                                                                                                 :session-id sid
                                                                                                 :generation my-gen}
-                                                                                         https-leg? (assoc :transport "https" :relay-url relay-base-url))))
+                                                                                         https-leg? (assoc :transport "https" :relay-url @relay-base-url-atom))))
                                                  (let [local-pub (or (:pubkey @state-atom) "")
                                                        bind-env (build-p2p-link-bind-envelope local-pub privkey-bytes sid)]
                                                    (peer-send! bind-env))
@@ -3136,56 +3211,72 @@
                             (try
                               (reset! timeout-id (js/setTimeout advance! (if https-leg? 5000 3000)))
                               (if https-leg?
-                                (let [local-pub (or (:pubkey @state-atom) "")]
+                                (let [local-pub (or (:pubkey @state-atom) "")
+                                      probe-ok? (fn [probe-res]
+                                                  (and (map? probe-res)
+                                                       (or (true? (get probe-res "ok"))
+                                                           (true? (:ok probe-res))
+                                                           (vector? (get probe-res "messages"))
+                                                           (vector? (:messages probe-res)))))
+                                      start-https-leg!
+                                      (fn [active-relay-url]
+                                        (reset! relay-base-url-atom active-relay-url)
+                                        (let [my-gen-fn (fn [] @assigned-gen)
+                                              since-mseq-atom (atom 0)
+                                              since-bseq-atom (atom 0)
+                                              poll-https-leg!
+                                              (fn poll-https-leg! []
+                                                (when (and (not @on-close-fired?)
+                                                           p2p-peers-atom
+                                                           (some? (my-gen-fn))
+                                                           (= (my-gen-fn) (get-in @p2p-peers-atom [peer-pk :generation])))
+                                                  (poll-relay-envelopes!
+                                                   @relay-base-url-atom local-pub privkey-bytes
+                                                   {:since-seq @since-mseq-atom
+                                                    :since-broadcast-seq @since-bseq-atom
+                                                    :timeout-ms 1500}
+                                                   (fn [poll-res]
+                                                     (when (and (not @on-close-fired?)
+                                                                p2p-peers-atom
+                                                                (= (my-gen-fn) (get-in @p2p-peers-atom [peer-pk :generation])))
+                                                       (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
+                                                             bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                                                             all-items (concat msgs bcasts)
+                                                             new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") @since-mseq-atom))
+                                                             new-bseq (long (or (get poll-res "last_broadcast_seq") (get poll-res :last_broadcast_seq) @since-bseq-atom))]
+                                                         (reset! since-mseq-atom new-mseq)
+                                                         (reset! since-bseq-atom new-bseq)
+                                                         (doseq [item all-items]
+                                                           (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                                                                             (get item :envelope_hex) (get item :envelope))
+                                                                 wire-bytes (when env-raw (try (fressian/hex->bytes (str env-raw)) (catch :default _ nil)))]
+                                                             (when (and wire-bytes state-atom)
+                                                               (let [r (light-core/handle-wire-payload @state-atom wire-bytes privkey-bytes)]
+                                                                 (reset! state-atom (:state r))
+                                                                 (when state-file (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
+                                                                 (when emit-event! (doseq [ev (:stdout-events r)] (emit-event! ev)))
+                                                                 (when (seq (:net-envelopes r))
+                                                                   (send-routed-envelopes! (:net-envelopes r) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes)))))))
+                                                       (reset! poll-timer (js/setTimeout poll-https-leg! 250)))))))]
+                                          (on-opened! 0)
+                                          (reset! poll-timer (js/setTimeout poll-https-leg! 100))))]
                                   (poll-relay-envelopes!
-                                   relay-base-url local-pub privkey-bytes
+                                   @relay-base-url-atom local-pub privkey-bytes
                                    {:since-seq 0 :timeout-ms 0}
                                    (fn [probe-res]
-                                     (if (and (map? probe-res)
-                                              (or (true? (get probe-res "ok"))
-                                                  (true? (:ok probe-res))
-                                                  (vector? (get probe-res "messages"))
-                                                  (vector? (:messages probe-res))))
-                                       (let [my-gen-fn (fn [] @assigned-gen)
-                                             since-mseq-atom (atom 0)
-                                             since-bseq-atom (atom 0)
-                                             poll-https-leg!
-                                             (fn poll-https-leg! []
-                                               (when (and (not @on-close-fired?)
-                                                          p2p-peers-atom
-                                                          (some? (my-gen-fn))
-                                                          (= (my-gen-fn) (get-in @p2p-peers-atom [peer-pk :generation])))
-                                                 (poll-relay-envelopes!
-                                                  relay-base-url local-pub privkey-bytes
-                                                  {:since-seq @since-mseq-atom
-                                                   :since-broadcast-seq @since-bseq-atom
-                                                   :timeout-ms 1500}
-                                                  (fn [poll-res]
-                                                    (when (and (not @on-close-fired?)
-                                                               p2p-peers-atom
-                                                               (= (my-gen-fn) (get-in @p2p-peers-atom [peer-pk :generation])))
-                                                      (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
-                                                            bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
-                                                            all-items (concat msgs bcasts)
-                                                            new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") @since-mseq-atom))
-                                                            new-bseq (long (or (get poll-res "last_broadcast_seq") (get poll-res :last_broadcast_seq) @since-bseq-atom))]
-                                                        (reset! since-mseq-atom new-mseq)
-                                                        (reset! since-bseq-atom new-bseq)
-                                                        (doseq [item all-items]
-                                                          (let [env-raw (or (get item "envelope_hex") (get item "envelope")
-                                                                            (get item :envelope_hex) (get item :envelope))
-                                                                wire-bytes (when env-raw (try (fressian/hex->bytes (str env-raw)) (catch :default _ nil)))]
-                                                            (when (and wire-bytes state-atom)
-                                                              (let [r (light-core/handle-wire-payload @state-atom wire-bytes privkey-bytes)]
-                                                                (reset! state-atom (:state r))
-                                                                (when state-file (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
-                                                                (when emit-event! (doseq [ev (:stdout-events r)] (emit-event! ev)))
-                                                                (when (seq (:net-envelopes r))
-                                                                  (send-routed-envelopes! (:net-envelopes r) nil p2p-peers-atom ingress-peers-atom state-atom privkey-bytes)))))))
-                                                      (reset! poll-timer (js/setTimeout poll-https-leg! 250)))))))]
-                                         (on-opened! 0)
-                                         (reset! poll-timer (js/setTimeout poll-https-leg! 100)))
-                                       (advance!)))))
+                                     (if (probe-ok? probe-res)
+                                       (start-https-leg! @relay-base-url-atom)
+                                       (let [loopback-fallback (relay/normalize-relay-base-url "http://127.0.0.1:18080/relay/v1")]
+                                         (if (and (not= @relay-base-url-atom loopback-fallback)
+                                                  (not (contains? #{"127.0.0.1" "localhost" "::1"} (str/lower-case (str host)))))
+                                           (poll-relay-envelopes!
+                                            loopback-fallback local-pub privkey-bytes
+                                            {:since-seq 0 :timeout-ms 0}
+                                            (fn [fb-res]
+                                              (if (probe-ok? fb-res)
+                                                (start-https-leg! loopback-fallback)
+                                                (advance!))))
+                                           (advance!)))))))
                                 (if (or (= transport :tcp) (= transport :connect))
                                   (api/start-tcp! client-node remote-sdp callbacks)
                                   (api/start! client-node remote-sdp callbacks)))
@@ -3416,14 +3507,78 @@
       (when (and resp emit!) (emit! resp))
       (done-cb resp))))
 
+(defn- artifact-endpoint-base-url
+  [raw-url]
+  (when (and (string? raw-url) (not (str/blank? raw-url)))
+    (-> (str/trim raw-url)
+        (str/replace #"/+$" "")
+        (str/replace #"/relay/v1$" "")
+        (str/replace #"/artifact/v1$" ""))))
+
+(defn- enrich-artifact-cmd-map
+  [verb cmd-map]
+  (if (and (= verb "artifact-put")
+           (nil? (get cmd-map "hex"))
+           (nil? (get cmd-map "data_hex"))
+           (nil? (get cmd-map "text"))
+           (nil? (get cmd-map "data"))
+           (string? (get cmd-map "file"))
+           (not (str/blank? (get cmd-map "file"))))
+    (let [f (get cmd-map "file")]
+      (if (.existsSync node-fs f)
+        (let [h (.toString (.readFileSync node-fs f) "hex")]
+          (assoc cmd-map "hex" h "data_hex" h))
+        cmd-map))
+    cmd-map))
+
+(defn- maybe-write-artifact-out-file!
+  [verb cmd-map resp]
+  (when (and (= verb "artifact-get")
+             (map? resp)
+             (true? (or (get resp "ok") (:ok resp)))
+             (string? (get cmd-map "out_file"))
+             (not (str/blank? (get cmd-map "out_file")))
+             (string? (get resp "hex")))
+    (try
+      (let [out-f (get cmd-map "out_file")
+            dir (.dirname node-path out-f)]
+        (when dir (.mkdirSync node-fs dir #js {:recursive true}))
+        (.writeFileSync node-fs out-f (.from (.-Buffer js/globalThis) (get resp "hex") "hex")))
+      (catch :default _ nil))))
+
+(defn- post-artifact-to-relay!
+  [raw-relay-url verb resp cb]
+  (let [base-url (artifact-endpoint-base-url raw-relay-url)]
+    (if-not (and base-url (map? resp) (true? (or (get resp "ok") (:ok resp))))
+      (when cb (cb nil))
+      (let [post-ptr! (fn []
+                        (if-let [ptr (or (get resp "pointer") (:pointer resp))]
+                          (http-post-json! (str base-url "/artifact/v1/pointer")
+                                           (pr-str ptr)
+                                           {"Content-Type" "application/edn"}
+                                           5000
+                                           (fn [r] (when cb (cb r))))
+                          (when cb (cb nil))))]
+        (if (and (= verb "artifact-put") (or (get resp "blob") (:blob resp)))
+          (let [blob (or (get resp "blob") (:blob resp))]
+            (http-post-json! (str base-url "/artifact/v1/blob")
+                             (write-json-str {"bytes_hex" (basalt/bytes->hex (:blob/bytes blob))
+                                              "cid" (:blob/cid blob)
+                                              "media_type" (or (:blob/media-type blob) "application/octet-stream")})
+                             {"Content-Type" "application/json"}
+                             5000
+                             (fn [_] (post-ptr!))))
+          (post-ptr!))))))
+
 (defn handle-serve-line!
   "Processes a single STDIN or `--cmd-file` JSON line in `serve` mode, invoking `(done-cb resp)` when complete."
   [line ctx done-cb]
   (let [{:keys [state-atom conn-atom events-out state-file identity bootstrap conn-opts ingress-peers-atom p2p-peers-atom mdns-atom]} ctx
         emit! (fn [payload] (emit-json-line! payload events-out))
-        cmd-map (parse-json-safe line)
-        line-str (if (string? line) line (write-json-str line))
-        verb (when (map? cmd-map) (get cmd-map "cmd"))
+        raw-cmd-map (parse-json-safe line)
+        verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
+        cmd-map (if (map? raw-cmd-map) (enrich-artifact-cmd-map verb raw-cmd-map) raw-cmd-map)
+        line-str (if (map? cmd-map) (write-json-str cmd-map) (if (string? line) line (write-json-str line)))
         wait-ms (long (or (get cmd-map "wait_open_ms") (get cmd-map "wait-open-ms") (get cmd-map :wait-open-ms) (get cmd-map :wait_open_ms) 0))
         relay-url (or (:relay-url conn-opts) (get-in conn-opts [:relay :url]))
         sync-wanted? (or (and (= verb "sync-account")
@@ -3445,6 +3600,13 @@
         execute-cmd!
         (fn [effective-line]
           (let [res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
+                _ (maybe-write-artifact-out-file! verb cmd-map (:response res))
+                _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
+                    (when-let [art-relay (or (get cmd-map "relay_url")
+                                             (get cmd-map "relay-url")
+                                             (:relay-url cmd-map)
+                                             relay-url)]
+                      (post-artifact-to-relay! art-relay verb (:response res) nil)))
                 _ (when (:state res)
                     (reset! state-atom (:state res))
                     (when state-file
@@ -3452,11 +3614,19 @@
                 _ (when-let [dial-info (:p2p-dial res)]
                     (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file))
                 shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
+                import-shuttle-verb? (contains? #{"import-envelope" "import-poll" "import"} verb)
                 connect-explicit? (true? (or (get cmd-map "connect") (:connect cmd-map)))
-                needs-net? (and (seq (:net-envelopes res)) (if shuttle-verb? connect-explicit? true))]
+                currently-live? (connection-live? @conn-atom @state-atom)
+                has-live-peers? (or (and p2p-peers-atom (seq @p2p-peers-atom))
+                                    (and ingress-peers-atom (seq @ingress-peers-atom)))
+                shuttle-can-forward? (and import-shuttle-verb?
+                                          (or connect-explicit? currently-live? has-live-peers?))
+                needs-net? (and (seq (:net-envelopes res))
+                                (if shuttle-verb?
+                                  (or connect-explicit? shuttle-can-forward?)
+                                  true))]
             (if needs-net?
-              (let [currently-live? (connection-live? @conn-atom @state-atom)
-                    replay-envs (when (= verb "register-home-set")
+              (let [replay-envs (when (= verb "register-home-set")
                                   (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
                     live-envs (if (seq replay-envs)
                                 (into (vec replay-envs) (:net-envelopes res))
@@ -3542,10 +3712,15 @@
                                      (let [resp {"ok" false "error" err}]
                                        (emit! resp)
                                        (done-cb resp))))))))))))))
-              (do
+              (let [deferred-forward? (and import-shuttle-verb? (seq (:net-envelopes res)))
+                    final-res (if deferred-forward?
+                                (do
+                                  (swap! state-atom update-in [:diagnostics :shuttle-import-forward-deferred] (fnil inc 0))
+                                  (update res :response assoc "pending_forward_count" (count (:net-envelopes res))))
+                                res)]
                 (sync-conn-diagnostics! state-atom conn-atom)
                 (save-light-state! state-file @state-atom)
-                (finish-resp! res)))))
+                (finish-resp! final-res)))))
         after-sync!
         (fn []
           (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
@@ -4026,77 +4201,82 @@
                                   "connected" false
                                   "error" (:error conn-res)}
                                  events-out))
-              (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
-                (let [since-mseq (atom (long (or (:relay-since-seq @state-atom) 0)))
-                      since-bseq (atom (long (or (:relay-since-broadcast-seq @state-atom) 0)))
-                      polling? (atom false)
-                      poll-tick!
-                      (fn poll-tick! []
-                        (when (compare-and-set! polling? false true)
-                          (let [eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
-                                subnets (or (:subnets opts) eff-subnets)]
-                            (poll-relay-envelopes!
-                             (:relay-url opts)
-                             (or (:pubkey-hex identity) (:pubkey identity))
-                             (:privkey-bytes identity)
-                             (cond-> {:since-seq @since-mseq
-                                      :since-broadcast-seq @since-bseq
-                                      :timeout-ms 2000}
-                               subnets (assoc :subnets subnets))
-                             (fn [poll-res]
-                               (try
-                                 (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
-                                       bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
-                                       last-bseq (or (get poll-res "last_broadcast_seq")
-                                                     (get poll-res "last-broadcast-seq")
-                                                     (get poll-res :last_broadcast_seq))
-                                       all-items (concat msgs bcasts)
-                                       old-bseq @since-bseq]
-                                   (when (seq msgs)
-                                     (let [last-m (last msgs)
-                                           mseq (or (get last-m "relay_seq") (get last-m "relay-seq")
-                                                    (get last-m :relay_seq) (get last-m :relay-seq))]
-                                       (when mseq (reset! since-mseq (long mseq)))))
-                                   (let [bseq (or last-bseq
-                                                  (when (seq bcasts)
-                                                    (let [last-b (last bcasts)]
-                                                      (or (get last-b "broadcast_seq") (get last-b "broadcast-seq")
-                                                          (get last-b :broadcast_seq) (get last-b :broadcast-seq)))))]
-                                     (when bseq (reset! since-bseq (long bseq))))
-                                   (swap! state-atom assoc :relay-since-seq @since-mseq :relay-since-broadcast-seq @since-bseq)
-                                   (doseq [item all-items]
-                                     (let [env-raw (or (get item "envelope_hex") (get item "envelope")
-                                                       (get item :envelope_hex) (get item :envelope))
-                                           wire-bytes (when env-raw
-                                                        (try (basalt/hex->bytes (str env-raw)) (catch :default _ nil)))]
-                                       (when wire-bytes
-                                         (let [st @state-atom
-                                               r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
-                                           (reset! state-atom (:state r))
-                                           (when state-file
-                                             (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
-                                           (doseq [ev (:stdout-events r)]
-                                             (event-out ev))
-                                           (when-let [dial-info (:p2p-dial r)]
-                                             (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
-                                           (when (seq (:net-envelopes r))
-                                             (send-routed-envelopes! (:net-envelopes r)
-                                                                     (:send-fn conn-res)
-                                                                     p2p-peers-atom
-                                                                     ingress-peers-atom
-                                                                     state-atom
-                                                                     (:privkey-bytes identity)))))))
-                                   (when (or (seq msgs) (seq bcasts) (> @since-bseq old-bseq))
-                                     (ack-relay-envelopes!
-                                      (:relay-url opts)
-                                      (or (:pubkey-hex identity) (:pubkey identity))
-                                      (:privkey-bytes identity)
-                                      @since-mseq
-                                      {:ack-broadcast-seq @since-bseq})))
-                                 (finally
-                                   (reset! polling? false))))))))]
-                  (poll-tick!)
-                  (js/setInterval poll-tick! 1000)))
+              (let [effective-relay-url (or (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                                              (:relay-url opts))
+                                            (when-not (:ok? conn-res)
+                                              (or (:relay-url bootstrap)
+                                                  (get-in bootstrap [:relay :url]))))]
+                (when (and (string? effective-relay-url) (not (str/blank? effective-relay-url)))
+                  (let [since-mseq (atom (long (or (:relay-since-seq @state-atom) 0)))
+                        since-bseq (atom (long (or (:relay-since-broadcast-seq @state-atom) 0)))
+                        polling? (atom false)
+                        poll-tick!
+                        (fn poll-tick! []
+                          (when (compare-and-set! polling? false true)
+                            (let [eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
+                                  subnets (or (:subnets opts) eff-subnets)]
+                              (poll-relay-envelopes!
+                               effective-relay-url
+                               (or (:pubkey-hex identity) (:pubkey identity))
+                               (:privkey-bytes identity)
+                               (cond-> {:since-seq @since-mseq
+                                        :since-broadcast-seq @since-bseq
+                                        :timeout-ms 2000}
+                                 subnets (assoc :subnets subnets))
+                               (fn [poll-res]
+                                 (try
+                                   (let [msgs (or (get poll-res "messages") (get poll-res :messages) [])
+                                         bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                                         last-bseq (or (get poll-res "last_broadcast_seq")
+                                                       (get poll-res "last-broadcast-seq")
+                                                       (get poll-res :last_broadcast_seq))
+                                         all-items (concat msgs bcasts)
+                                         old-bseq @since-bseq]
+                                     (when (seq msgs)
+                                       (let [last-m (last msgs)
+                                             mseq (or (get last-m "relay_seq") (get last-m "relay-seq")
+                                                      (get last-m :relay_seq) (get last-m :relay-seq))]
+                                         (when mseq (reset! since-mseq (long mseq)))))
+                                     (let [bseq (or last-bseq
+                                                    (when (seq bcasts)
+                                                      (let [last-b (last bcasts)]
+                                                        (or (get last-b "broadcast_seq") (get last-b "broadcast-seq")
+                                                            (get last-b :broadcast_seq) (get last-b :broadcast-seq)))))]
+                                       (when bseq (reset! since-bseq (long bseq))))
+                                     (swap! state-atom assoc :relay-since-seq @since-mseq :relay-since-broadcast-seq @since-bseq)
+                                     (doseq [item all-items]
+                                       (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                                                         (get item :envelope_hex) (get item :envelope))
+                                             wire-bytes (when env-raw
+                                                          (try (basalt/hex->bytes (str env-raw)) (catch :default _ nil)))]
+                                         (when wire-bytes
+                                           (let [st @state-atom
+                                                 r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
+                                             (reset! state-atom (:state r))
+                                             (when state-file
+                                               (try (save-light-state! state-file (:state r)) (catch :default _ nil)))
+                                             (doseq [ev (:stdout-events r)]
+                                               (event-out ev))
+                                             (when-let [dial-info (:p2p-dial r)]
+                                               (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
+                                             (when (seq (:net-envelopes r))
+                                               (send-routed-envelopes! (:net-envelopes r)
+                                                                       (:send-fn conn-res)
+                                                                       p2p-peers-atom
+                                                                       ingress-peers-atom
+                                                                       state-atom
+                                                                       (:privkey-bytes identity)))))))
+                                     (when (or (seq msgs) (seq bcasts) (> @since-bseq old-bseq))
+                                       (ack-relay-envelopes!
+                                        effective-relay-url
+                                        (or (:pubkey-hex identity) (:pubkey identity))
+                                        (:privkey-bytes identity)
+                                        @since-mseq
+                                        {:ack-broadcast-seq @since-bseq})))
+                                   (finally
+                                     (reset! polling? false))))))))]
+                    (poll-tick!)
+                    (js/setInterval poll-tick! 1000))))
               (when (boolean (:auto-sync? opts true))
                 (let [sync-interval-ms (max 1000 (or (:sync-interval-ms opts) 15000))]
                   (run-auto-sync-tick! state-atom bootstrap identity state-file conn-opts)
@@ -4310,8 +4490,9 @@
                       state-atom (atom initial-state)
                       verb (when (map? raw-cmd-map) (get raw-cmd-map "cmd"))
                       run-cmd-with-map!
-                      (fn [cmd-map]
-                        (let [shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal"
+                      (fn [raw-map]
+                        (let [cmd-map (enrich-artifact-cmd-map verb raw-map)
+                              shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal"
                                                          "export-p2p-offer" "export-p2p-answer" "export-send"
                                                          "import-envelope" "import-poll" "import"}
                                                        verb)
@@ -4342,6 +4523,13 @@
                                       after-poll!
                                       (fn [poll-auto-envs]
                                         (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
+                                              _ (maybe-write-artifact-out-file! verb cmd-map (:response res))
+                                              _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
+                                                  (when-let [art-relay (or (get cmd-map "relay_url")
+                                                                           (get cmd-map "relay-url")
+                                                                           (:relay-url cmd-map)
+                                                                           effective-relay-url)]
+                                                    (post-artifact-to-relay! art-relay verb (:response res) nil)))
                                               new-state (:state res)
                                               connect-explicit? (contains? opts :connect?)
                                               connect-wanted? (if connect-explicit?

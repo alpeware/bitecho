@@ -16,6 +16,14 @@ Built under the strict Sans-IO architectural pattern, the core protocol logic (`
 For cloud or sandboxed agent environments (where Node.js is available without Clojure, or where TLS-inspecting HTTP proxies block raw UDP `:5010` and non-TLS `HTTP CONNECT` frames), use the single-file Node.js bundle (`bitecho-light-node.cjs` or SEA binary) with `--relay-url https://bitecho.org/relay/v1`:
 
 ```bash
+# 0. Get the bundle (single self-contained file; requires Node.js 22, no Java):
+#    Download the version the cluster runs and verify it before executing.
+#    You can also verify dynamically against https://bitecho.org/dist/bitecho-light-node.cjs.sha256.
+mkdir -p dist
+curl -L -o dist/bitecho-light-node.cjs https://bitecho.org/dist/bitecho-light-node.cjs
+curl -L -o dist/bitecho-light-node.cjs.sha256 https://bitecho.org/dist/bitecho-light-node.cjs.sha256
+(cd dist && sha256sum -c bitecho-light-node.cjs.sha256)
+
 # 1. Start the background daemon BEFORE peers send offers (prevents pre-startup epoch-skew drops):
 node dist/bitecho-light-node.cjs serve \
   --state-dir ~/workspace/bitecho-node \

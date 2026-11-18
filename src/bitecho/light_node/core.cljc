@@ -2394,6 +2394,26 @@
                  :net-envelopes [env]
                  :stdout-events []}))))))))
 
+(defn- shared-http-relay-candidate?
+  [cand]
+  (boolean (and (some? cand)
+                (re-find #"^https?://" (str/lower-case (str/trim (str cand)))))))
+
+(defn- filter-p2p-remote-candidates
+  "Filters remote P2P candidates against local candidates, preserving shared HTTP/HTTPS relay
+   endpoints (`https://...` / `http://...`) and falling back to `remote-cands` when self-filtering
+   would empty a non-empty candidate list."
+  [local-cands remote-cands]
+  (let [local-set (set (map str local-cands))
+        rem-vec (vec (map str remote-cands))
+        filtered (vec (remove (fn [c]
+                                (and (not (shared-http-relay-candidate? c))
+                                     (contains? local-set c)))
+                              rem-vec))
+        fallback? (and (empty? filtered) (seq rem-vec))]
+    {:dialable (if fallback? rem-vec filtered)
+     :fallback? fallback?}))
+
 (defn- exec-p2p-answer [state cmd-map privkey-bytes]
   (let [resolved-sid (resolve-session-id state cmd-map :open)]
     (cond
@@ -2516,9 +2536,8 @@
                     remote-trans (or (get-in session [:p2p :remote-transport])
                                      (get-in session [:p2p-meta :remote-transport])
                                      transport)
-                    filtered-cands (vec (remove #(contains? (set candidates) %) raw-remote-cands))
-                    fallback? (and (empty? filtered-cands) (seq raw-remote-cands))
-                    dialable-candidates (if fallback? raw-remote-cands filtered-cands)
+                    {:keys [dialable fallback?]} (filter-p2p-remote-candidates candidates raw-remote-cands)
+                    dialable-candidates dialable
                     updated-p2p-meta (merge p2p-meta
                                             (cond-> {}
                                               (seq raw-remote-cands) (assoc :remote-candidates raw-remote-cands)
@@ -5011,6 +5030,323 @@
      :net-envelopes []
      :stdout-events []}))
 
+(defn- extract-artifact-bytes
+  [effective-map]
+  (let [raw-bytes (or (get effective-map "bytes") (:bytes effective-map))
+        raw-hex (or (get effective-map "hex")
+                    (get effective-map "data_hex")
+                    (get effective-map "data-hex")
+                    (:hex effective-map)
+                    (:data-hex effective-map)
+                    (:data_hex effective-map))
+        raw-text (or (get effective-map "text")
+                     (get effective-map "data")
+                     (get effective-map "file_content")
+                     (get effective-map "file-content")
+                     (:text effective-map)
+                     (:data effective-map)
+                     (:file-content effective-map)
+                     (:file_content effective-map))]
+    (cond
+      (fressian/bytes? raw-bytes)
+      raw-bytes
+
+      (and (string? raw-hex) (not (str/blank? raw-hex)))
+      (let [clean (str/trim raw-hex)]
+        (when (and (even? (count clean)) (re-matches #"[0-9a-fA-F]*" clean))
+          (fressian/hex->bytes clean)))
+
+      (some? raw-text)
+      (fressian/utf8->bytes (str raw-text))
+
+      :else
+      nil)))
+
+(defn- exec-artifact-put
+  [state effective-map privkey-bytes sub-id]
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            subnet (str (or (get effective-map "subnet_id")
+                            (get effective-map "subnet-id")
+                            (:subnet-id effective-map)
+                            sub-id
+                            (:subnet-id state)
+                            "global"))
+            raw-path (str (or (get effective-map "path") (:path effective-map) ""))
+            path (str/replace (str/trim raw-path) #"^/+" "")
+            bs (extract-artifact-bytes effective-map)]
+        (cond
+          (or (str/blank? path) (str/includes? path ".."))
+          {:state (update-in state [:diagnostics :artifact-put-rejected] (fnil inc 0))
+           :response {"ok" false "error" "invalid-artifact-path" "path" path}
+           :net-envelopes []
+           :stdout-events []}
+
+          (nil? bs)
+          {:state (update-in state [:diagnostics :artifact-put-rejected] (fnil inc 0))
+           :response {"ok" false "error" "missing-artifact-payload" "path" path}
+           :net-envelopes []
+           :stdout-events []}
+
+          :else
+          (let [blob (data/make-blob bs)
+                cid (:blob/cid blob)
+                prev-seq (long (or (get-in st-after-burn [:artifact-min-seqs [subnet path]])
+                                   (when-let [p (get-in st-after-burn [:artifact-pointers [subnet path]])]
+                                     (:pointer/seq p))
+                                   (when-let [t (get-in st-after-burn [:artifact-tombstones [subnet path]])]
+                                     (:pointer/seq t))
+                                   0))
+                explicit-seq (parse-long-safe (or (get effective-map "seq") (:seq effective-map)) nil)
+                seq-num (long (if (some? explicit-seq) explicit-seq (inc prev-seq)))]
+            (if (<= seq-num prev-seq)
+              {:state (update-in state [:diagnostics :stale-pointer-seq] (fnil inc 0))
+               :response {"ok" false "error" "stale-pointer-seq" "seq" seq-num "current_seq" prev-seq "path" path}
+               :net-envelopes []
+               :stdout-events []}
+              (let [my-pub (normalize-pubkey-hex (:pubkey st-after-burn))
+                    fallback-kp (crypto/generate-keypair (str "artifact-authority-" my-pub))
+                    eff-priv (or privkey-bytes (:private fallback-kp))
+                    eff-pub (if privkey-bytes my-pub (basalt/bytes->hex (:public fallback-kp)))
+                    ts (now-utc-ms)
+                    unsigned-ptr {:pointer/subnet subnet
+                                  :pointer/path path
+                                  :pointer/authority eff-pub
+                                  :pointer/seq seq-num
+                                  :pointer/leader-term 1
+                                  :pointer/target cid
+                                  :pointer/proof {:proof/type :self}
+                                  :pointer/timestamp ts}
+                    ptr (assoc (data/sign-pointer eff-priv unsigned-ptr) :pointer/timestamp ts)
+                    rep-payload {:protocol-version current-wire-version
+                                 :wire-format current-wire-format
+                                 :bitecho/type :artifact-replicate
+                                 :type :artifact-replicate
+                                 :subnet-id subnet
+                                 :path path
+                                 :cid cid
+                                 :seq seq-num
+                                 :blob blob
+                                 :pointer ptr
+                                 :sender eff-pub
+                                 :epoch (long (or (:epoch st-after-burn) 0))
+                                 :timestamp ts}
+                    outer-sub (if (pos? burn-amt) "*" subnet)
+                    rep-envelope (when eff-priv
+                                   (let [gossip-env (build-gossip-envelope
+                                                     eff-pub
+                                                     eff-priv
+                                                     (freeze-payload rep-payload)
+                                                     burn-amt
+                                                     outer-sub)]
+                                     (merge rep-payload gossip-env {:p2p-broadcast? true})))]
+                {:state (-> st-after-burn
+                            (assoc-in [:artifact-blobs cid] blob)
+                            (assoc-in [:artifact-pointers [subnet path]] ptr)
+                            (update :artifact-tombstones dissoc [subnet path])
+                            (assoc-in [:artifact-min-seqs [subnet path]] seq-num))
+                 :response {"ok" true
+                            "subnet_id" subnet
+                            "path" path
+                            "cid" cid
+                            "seq" seq-num
+                            "authority" eff-pub
+                            "size_bytes" (fressian/count-bytes bs)
+                            "burn" burn-amt
+                            "blob" blob
+                            "pointer" ptr}
+                 :net-envelopes (if rep-envelope [rep-envelope] [])
+                 :stdout-events []}))))))))
+
+(defn- exec-artifact-revoke
+  [state effective-map privkey-bytes sub-id]
+  (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
+        burn-chk (check-and-deduct-burn state burn-amt)]
+    (if-not (:ok? burn-chk)
+      {:state state :response {"ok" false "error" (:error burn-chk)} :net-envelopes [] :stdout-events []}
+      (let [st-after-burn (:state burn-chk)
+            subnet (str (or (get effective-map "subnet_id")
+                            (get effective-map "subnet-id")
+                            (:subnet-id effective-map)
+                            sub-id
+                            (:subnet-id state)
+                            "global"))
+            raw-path (str (or (get effective-map "path") (:path effective-map) ""))
+            path (str/replace (str/trim raw-path) #"^/+" "")]
+        (if (or (str/blank? path) (str/includes? path ".."))
+          {:state (update-in state [:diagnostics :artifact-revoke-rejected] (fnil inc 0))
+           :response {"ok" false "error" "invalid-artifact-path" "path" path}
+           :net-envelopes []
+           :stdout-events []}
+          (let [prev-seq (long (or (get-in st-after-burn [:artifact-min-seqs [subnet path]])
+                                   (when-let [p (get-in st-after-burn [:artifact-pointers [subnet path]])]
+                                     (:pointer/seq p))
+                                   (when-let [t (get-in st-after-burn [:artifact-tombstones [subnet path]])]
+                                     (:pointer/seq t))
+                                   0))
+                explicit-seq (parse-long-safe (or (get effective-map "seq") (:seq effective-map)) nil)
+                seq-num (long (if (some? explicit-seq) explicit-seq (inc prev-seq)))]
+            (if (<= seq-num prev-seq)
+              {:state (update-in state [:diagnostics :stale-pointer-seq] (fnil inc 0))
+               :response {"ok" false "error" "stale-pointer-seq" "seq" seq-num "current_seq" prev-seq "path" path}
+               :net-envelopes []
+               :stdout-events []}
+              (let [my-pub (normalize-pubkey-hex (:pubkey st-after-burn))
+                    fallback-kp (crypto/generate-keypair (str "artifact-authority-" my-pub))
+                    eff-priv (or privkey-bytes (:private fallback-kp))
+                    eff-pub (if privkey-bytes my-pub (basalt/bytes->hex (:public fallback-kp)))
+                    ts (now-utc-ms)
+                    unsigned-ptr {:pointer/subnet subnet
+                                  :pointer/path path
+                                  :pointer/authority eff-pub
+                                  :pointer/seq seq-num
+                                  :pointer/leader-term 1
+                                  :pointer/target nil
+                                  :pointer/proof {:proof/type :self}
+                                  :pointer/timestamp ts}
+                    ptr (assoc (data/sign-pointer eff-priv unsigned-ptr) :pointer/timestamp ts)
+                    rep-payload {:protocol-version current-wire-version
+                                 :wire-format current-wire-format
+                                 :bitecho/type :artifact-replicate
+                                 :type :artifact-replicate
+                                 :subnet-id subnet
+                                 :path path
+                                 :cid nil
+                                 :tombstoned true
+                                 :seq seq-num
+                                 :blob nil
+                                 :pointer ptr
+                                 :sender eff-pub
+                                 :epoch (long (or (:epoch st-after-burn) 0))
+                                 :timestamp ts}
+                    outer-sub (if (pos? burn-amt) "*" subnet)
+                    rep-envelope (when eff-priv
+                                   (let [gossip-env (build-gossip-envelope
+                                                     eff-pub
+                                                     eff-priv
+                                                     (freeze-payload rep-payload)
+                                                     burn-amt
+                                                     outer-sub)]
+                                     (merge rep-payload gossip-env {:p2p-broadcast? true})))]
+                {:state (-> st-after-burn
+                            (update :artifact-pointers dissoc [subnet path])
+                            (assoc-in [:artifact-tombstones [subnet path]] ptr)
+                            (assoc-in [:artifact-min-seqs [subnet path]] seq-num))
+                 :response {"ok" true
+                            "subnet_id" subnet
+                            "path" path
+                            "cid" nil
+                            "tombstoned" true
+                            "seq" seq-num
+                            "authority" eff-pub
+                            "burn" burn-amt
+                            "pointer" ptr}
+                 :net-envelopes (if rep-envelope [rep-envelope] [])
+                 :stdout-events []}))))))))
+
+(defn- exec-artifact-get
+  [state effective-map sub-id]
+  (let [subnet (str (or (get effective-map "subnet_id")
+                        (get effective-map "subnet-id")
+                        (:subnet-id effective-map)
+                        sub-id
+                        (:subnet-id state)
+                        "global"))
+        raw-path (str (or (get effective-map "path") (:path effective-map) ""))
+        path (str/replace (str/trim raw-path) #"^/+" "")
+        tomb (or (get-in state [:artifact-tombstones [subnet path]])
+                 (some (fn [[[_ p] t]] (when (= p path) t)) (:artifact-tombstones state)))
+        ptr (or (get-in state [:artifact-pointers [subnet path]])
+                (some (fn [[[_ p] candidate-ptr]] (when (= p path) candidate-ptr)) (:artifact-pointers state)))
+        cid (when ptr (:pointer/target ptr))
+        blob (when cid (get-in state [:artifact-blobs cid]))]
+    (cond
+      (and tomb (nil? ptr))
+      {:state (update-in state [:diagnostics :artifact-get-tombstoned] (fnil inc 0))
+       :response {"ok" false
+                  "error" "artifact-tombstoned"
+                  "subnet_id" subnet
+                  "path" path
+                  "tombstoned" true
+                  "seq" (:pointer/seq tomb)}
+       :net-envelopes []
+       :stdout-events []}
+
+      (not (and ptr blob (data/verify-blob blob) (:ok? (data/verify-pointer ptr))))
+      {:state (update-in state [:diagnostics :artifact-get-missing] (fnil inc 0))
+       :response {"ok" false
+                  "error" "missing-artifact"
+                  "subnet_id" subnet
+                  "path" path}
+       :net-envelopes []
+       :stdout-events []}
+
+      :else
+      (let [bs (:blob/bytes blob)
+            hex (basalt/bytes->hex bs)
+            text (try (fressian/bytes->utf8 bs) (catch #?(:clj Exception :cljs :default) _ nil))]
+        {:state state
+         :response {"ok" true
+                    "subnet_id" (:pointer/subnet ptr subnet)
+                    "path" path
+                    "cid" cid
+                    "seq" (:pointer/seq ptr)
+                    "authority" (:pointer/authority ptr)
+                    "size_bytes" (fressian/count-bytes bs)
+                    "hex" hex
+                    "data_hex" hex
+                    "text" text
+                    "data" text
+                    "pointer" ptr}
+         :net-envelopes []
+         :stdout-events []}))))
+
+(defn- exec-artifact-list
+  [state effective-map]
+  (let [target-subnet (or (get effective-map "subnet_id") (get effective-map "subnet-id") (:subnet-id effective-map))
+        prefix (str (or (get effective-map "prefix") (:prefix effective-map) (get effective-map "path") (:path effective-map) ""))
+        clean-prefix (str/replace (str/trim prefix) #"^/+" "")
+        raw-auth (or (get effective-map "authority") (get effective-map "pubkey") (:authority effective-map) (:pubkey effective-map))
+        auth-filter (when raw-auth (str/lower-case (str/trim (str raw-auth))))
+        items (->> (:artifact-pointers state {})
+                   (keep (fn [[[sub path] ptr]]
+                           (when (and (or (nil? target-subnet) (= sub (str target-subnet)))
+                                      (or (str/blank? clean-prefix) (str/starts-with? (str path) clean-prefix))
+                                      (or (nil? auth-filter) (= (str/lower-case (str (:pointer/authority ptr))) auth-filter)))
+                             (let [cid (:pointer/target ptr)
+                                   blob (get-in state [:artifact-blobs cid])
+                                   sz (if blob (fressian/count-bytes (:blob/bytes blob)) 0)]
+                               {"subnet_id" sub
+                                "path" (str path)
+                                "cid" cid
+                                "seq" (:pointer/seq ptr)
+                                "authority" (:pointer/authority ptr)
+                                "size_bytes" sz}))))
+                   (sort-by #(get % "path"))
+                   vec)
+        tombs (->> (:artifact-tombstones state {})
+                   (keep (fn [[[sub path] ptr]]
+                           (when (and (or (nil? target-subnet) (= sub (str target-subnet)))
+                                      (or (str/blank? clean-prefix) (str/starts-with? (str path) clean-prefix)))
+                             {"subnet_id" sub
+                              "path" (str path)
+                              "seq" (:pointer/seq ptr)
+                              "authority" (:pointer/authority ptr)
+                              "tombstoned" true})))
+                   (sort-by #(get % "path"))
+                   vec)]
+    {:state state
+     :response {"ok" true
+                "count" (count items)
+                "artifacts" items
+                "pointers" items
+                "tombstones" tombs}
+     :net-envelopes []
+     :stdout-events []}))
+
 (defn- exec-capability-publish
   [state effective-map privkey-bytes sub-id]
   (let [burn-amt (max 0 (long (or (parse-long-safe (or (get effective-map "burn") (:burn effective-map)) 0) 0)))
@@ -5773,6 +6109,10 @@
                   "storage-put" (exec-storage-put state effective-map privkey-bytes sub-id-str)
                   "storage-get" (exec-storage-get state effective-map privkey-bytes sub-id-str)
                   "storage-list" (exec-storage-list state effective-map)
+                  "artifact-put" (exec-artifact-put state effective-map privkey-bytes sub-id-str)
+                  "artifact-get" (exec-artifact-get state effective-map sub-id-str)
+                  "artifact-list" (exec-artifact-list state effective-map)
+                  "artifact-revoke" (exec-artifact-revoke state effective-map privkey-bytes sub-id-str)
                   "capability-publish" (exec-capability-publish state effective-map privkey-bytes sub-id-str)
                   "capability-resolve" (exec-capability-resolve state effective-map privkey-bytes sub-id-str)
                   "capability-list" (exec-capability-list state effective-map)
@@ -6768,14 +7108,16 @@
                                                 :remote-fingerprint fp
                                                 :remote-offer-seq signal-seq
                                                 :local-signal-seq answer-seq})
-                               new-state (-> state
-                                             (assoc-in [:sessions sid :p2p] p2p-entry)
-                                             (assoc-in [:sessions sid :p2p-meta] p2p-meta)
-                                             (update-in [:diagnostics :p2p-offer-answered-while-open] (fnil inc 0)))
                                local-cands-set (set (concat (get-in session [:p2p :local-candidates])
                                                             (get-in session [:p2p-meta :local-candidates])
                                                             (get-in session [:p2p-meta :preferred-candidates])))
-                               dialable-candidates (vec (remove #(contains? local-cands-set %) candidates))
+                               {:keys [dialable fallback?]} (filter-p2p-remote-candidates local-cands-set candidates)
+                               dialable-candidates dialable
+                               new-state (cond-> (-> state
+                                                     (assoc-in [:sessions sid :p2p] p2p-entry)
+                                                     (assoc-in [:sessions sid :p2p-meta] p2p-meta)
+                                                     (update-in [:diagnostics :p2p-offer-answered-while-open] (fnil inc 0)))
+                                           fallback? (update-in [:diagnostics :p2p-offer-candidate-self-filter-fallback] (fnil inc 0)))
                                dial-effect (when (seq dialable-candidates)
                                              {:session-id sid
                                               :peer (normalize-pubkey-hex (:sender msg))
@@ -6874,7 +7216,8 @@
                           local-cands-set (set (concat (get-in session [:p2p :local-candidates])
                                                        (get-in session [:p2p-meta :local-candidates])
                                                        (get-in session [:p2p-meta :preferred-candidates])))
-                          dialable-candidates (vec (remove #(contains? local-cands-set %) candidates))
+                          {:keys [dialable fallback?]} (filter-p2p-remote-candidates local-cands-set candidates)
+                          dialable-candidates dialable
                           has-candidates? (boolean (seq dialable-candidates))
                           has-local-candidates? (boolean (seq (get-in session [:p2p :local-candidates])))
                           p2p-base (get session :p2p {})
@@ -6917,9 +7260,10 @@
                                                 :remote-ice-pwd ice-pwd
                                                 :remote-fingerprint fp
                                                 :remote-answer-seq signal-seq})
-                              new-state (-> state
-                                            (assoc-in [:sessions sid :p2p] p2p-entry)
-                                            (assoc-in [:sessions sid :p2p-meta :remote-answer-seq] signal-seq))
+                              new-state (cond-> (-> state
+                                                    (assoc-in [:sessions sid :p2p] p2p-entry)
+                                                    (assoc-in [:sessions sid :p2p-meta :remote-answer-seq] signal-seq))
+                                          fallback? (update-in [:diagnostics :p2p-answer-candidate-self-filter-fallback] (fnil inc 0)))
                               p2p-dial {:session-id sid
                                         :peer norm-sender
                                         :role :initiator
@@ -7210,18 +7554,26 @@
           path (str (or (:pointer/path p) (get p "pointer/path") (:path p) (get p "path")))
           auth (str (or (:pointer/authority p) (get p "pointer/authority") (:authority p) (get p "authority")))
           seq-num (long (or (:pointer/seq p) (get p "pointer/seq") (:seq p) (get p "seq") 0))
-          term (long (or (:pointer/leader-term p) (get p "pointer/leader-term") (:leader-term p) (get p "leader_term") 1))
-          target (str (or (:pointer/target p) (get p "pointer/target") (:target p) (get p "target")))
+          raw-term (or (:pointer/leader-term p) (get p "pointer/leader-term") (:leader-term p) (get p "leader_term"))
+          raw-target (or (:pointer/target p) (get p "pointer/target") (:target p) (get p "target") (:cid p) (get p "cid"))
+          target (when (and (some? raw-target) (not (str/blank? (str raw-target))))
+                   (str raw-target))
           sig (str (or (:pointer/sig p) (get p "pointer/sig") (:sig p) (get p "sig")))
-          proof (or (:pointer/proof p) (get p "pointer/proof") (:proof p) (get p "proof") {:proof/type :self})]
-      {:pointer/subnet sub
-       :pointer/path path
-       :pointer/authority auth
-       :pointer/seq seq-num
-       :pointer/leader-term term
-       :pointer/target target
-       :pointer/sig sig
-       :pointer/proof proof})))
+          raw-proof (or (:pointer/proof p) (get p "pointer/proof") (:proof p) (get p "proof"))
+          proof (if (map? raw-proof)
+                  (let [pt (or (:proof/type raw-proof) (get raw-proof "proof/type") (:type raw-proof) (get raw-proof "type") :self)]
+                    (-> raw-proof
+                        (dissoc "proof/type" "type" :type)
+                        (assoc :proof/type (if (keyword? pt) pt (keyword (str/replace (str pt) #"^:+" ""))))))
+                  {:proof/type :self})]
+      (cond-> {:pointer/subnet sub
+               :pointer/path path
+               :pointer/authority auth
+               :pointer/seq seq-num
+               :pointer/target target
+               :pointer/sig sig
+               :pointer/proof proof}
+        (some? raw-term) (assoc :pointer/leader-term (long raw-term))))))
 
 (defn- handle-wire-storage-replicate [state msg]
   (let [blob (normalize-wire-blob (or (:blob msg) (get msg "blob")))
@@ -7262,6 +7614,68 @@
                     (assoc-in [:storage-min-seqs [subnet path]] (:pointer/seq ptr)))
          :net-envelopes []
          :stdout-events [evt]}))))
+
+(defn- handle-wire-artifact-replicate [state msg]
+  (let [blob (normalize-wire-blob (or (:blob msg) (get msg "blob")))
+        ptr (normalize-wire-pointer (or (:pointer msg) (get msg "pointer") msg))
+        subnet (str (or (:subnet-id msg) (get msg "subnet_id") (when ptr (:pointer/subnet ptr)) "global"))
+        path (str/replace (str/trim (str (or (:path msg) (get msg "path") (when ptr (:pointer/path ptr)) ""))) #"^/+" "")
+        current-seq (long (or (get-in state [:artifact-min-seqs [subnet path]])
+                              (when-let [p (get-in state [:artifact-pointers [subnet path]])] (:pointer/seq p))
+                              (when-let [t (get-in state [:artifact-tombstones [subnet path]])] (:pointer/seq t))
+                              0))
+        valid-ptr? (boolean (and (map? ptr) (not (str/blank? path)) (:ok? (data/verify-pointer ptr))))
+        tombstone? (boolean (and valid-ptr? (nil? (:pointer/target ptr))))
+        valid-blob? (boolean (and (map? blob) (data/verify-blob blob)))
+        target-match? (if tombstone?
+                        true
+                        (if (some? blob)
+                          (and valid-blob? (= (:pointer/target ptr) (:blob/cid blob)))
+                          (some? (get-in state [:artifact-blobs (:pointer/target ptr)]))))
+        seq-valid? (boolean (and valid-ptr? (> (long (:pointer/seq ptr)) current-seq)))
+        valid? (and valid-ptr? target-match? seq-valid?)]
+    (if-not valid?
+      (let [reason (cond
+                     (not valid-ptr?) "invalid-pointer"
+                     (not target-match?) "target-mismatch"
+                     (not seq-valid?) "stale-sequence"
+                     :else "invalid-replicate")
+            diag-event {"event" "diagnostic"
+                        "reason" "artifact-replication-rejected"
+                        "cause" reason
+                        "subnet_id" subnet
+                        "path" path}]
+        {:state (-> state
+                    (update-in [:diagnostics :replication-rejected] (fnil inc 0)))
+         :net-envelopes []
+         :stdout-events [diag-event]})
+      (if tombstone?
+        (let [evt {"event" "artifact-revoked"
+                   "subnet_id" subnet
+                   "path" path
+                   "cid" nil
+                   "tombstoned" true
+                   "seq" (:pointer/seq ptr)
+                   "authority" (:pointer/authority ptr)}]
+          {:state (-> state
+                      (update :artifact-pointers dissoc [subnet path])
+                      (assoc-in [:artifact-tombstones [subnet path]] ptr)
+                      (assoc-in [:artifact-min-seqs [subnet path]] (:pointer/seq ptr)))
+           :net-envelopes []
+           :stdout-events [evt]})
+        (let [evt {"event" "artifact-replicated"
+                   "subnet_id" subnet
+                   "path" path
+                   "cid" (:pointer/target ptr)
+                   "seq" (:pointer/seq ptr)
+                   "authority" (:pointer/authority ptr)}]
+          {:state (-> state
+                      (cond-> valid-blob? (assoc-in [:artifact-blobs (:blob/cid blob)] blob))
+                      (assoc-in [:artifact-pointers [subnet path]] ptr)
+                      (update :artifact-tombstones dissoc [subnet path])
+                      (assoc-in [:artifact-min-seqs [subnet path]] (:pointer/seq ptr)))
+           :net-envelopes []
+           :stdout-events [evt]})))))
 
 (defn- handle-wire-capability-replicate [state msg]
   (let [blob (normalize-wire-blob (or (:blob msg) (get msg "blob")))
@@ -7557,6 +7971,8 @@
                                           (when (or (:transfer msg) (get msg "transfer")) :transfer)
                                           (when (or (:validator-pubkey msg) (get msg "validator_pubkey")) :chain-state-snapshot)))
                     storage-or-cap? (or (= msg-type :storage-replicate)
+                                        (= msg-type :artifact-replicate)
+                                        (= msg-type :replicate-pointer)
                                         (= msg-type :capability-replicate)
                                         (= msg-type :governance-replicate)
                                         (= msg-type :transfer))
@@ -7646,6 +8062,8 @@
                                                               :p2p-hub-relay
                                                               :p2p-broadcast
                                                               :storage-replicate
+                                                              :artifact-replicate
+                                                              :replicate-pointer
                                                               :capability-replicate
                                                               :governance-replicate}
                                                             msg-type))
@@ -7690,6 +8108,8 @@
                                     :p2p-hub-relay (handle-wire-p2p-hub-relay state msg privkey-bytes)
                                     :p2p-broadcast (handle-wire-broadcast state msg privkey-bytes)
                                     :storage-replicate (handle-wire-storage-replicate state msg)
+                                    :artifact-replicate (handle-wire-artifact-replicate state msg)
+                                    :replicate-pointer (handle-wire-artifact-replicate state msg)
                                     :capability-replicate (handle-wire-capability-replicate state msg)
                                     :governance-replicate (handle-wire-governance-replicate state msg)
                                     :transfer (handle-wire-transfer state msg)
