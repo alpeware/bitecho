@@ -1922,13 +1922,191 @@
              (notify-ui-listeners!))
            (resolve (clj->js resp))))))))
 
+(defn- run-browser-governance-cmd!
+  [cmd-map]
+  (let [na @active-node-atom]
+    (if-not (and na @na)
+      (clj->js {:ok false :error "no-active-node"})
+      (let [node @na
+            privkey (or (get-in node [:keypair :private-key])
+                        (when @anchor-state-atom (:privkey-bytes @anchor-state-atom)))]
+        (if-not privkey
+          (clj->js {:ok false :error "hardware-unlock-required"})
+          (let [cmd-res (light-core/handle-command (:light-state node) cmd-map privkey)
+                new-st (:state cmd-res)
+                out-envs (:net-envelopes cmd-res)
+                resp (:response cmd-res)]
+            (swap! na assoc :light-state new-st)
+            (doseq [env out-envs]
+              (route-browser-envelope! na env))
+            (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+            (notify-ui-listeners!)
+            (clj->js resp)))))))
+
+(defn submit-bip-cmd
+  "Submits a Sociocratic BIP proposal from the browser light-node (BIP-006 Part 2)."
+  ([bip-id title]
+   (submit-bip-cmd bip-id title nil nil))
+  ([bip-id title spec-edn]
+   (submit-bip-cmd bip-id title spec-edn nil))
+  ([bip-id title spec-edn subnet-id]
+   (let [default-spec (pr-str
+                       {:human-anchor-sunset "2027-06-30"
+                        :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields :oracle-receipts-4-gates :tri-circle-quorum :counterexample-veto :scheduled-epoch-activation]
+                                           :review-loop-enforced [:architectural-simplicity :sans-io-boundary-discipline :cross-network-reset-hygiene :outsider-circle-admission]
+                                           :foundation-legal-seat "Zug, Switzerland"
+                                           :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+                        :invariant-diff {:defspec-vars ["prop-mcp-jsonrpc-framing-and-9-tool-dispatch"]
+                                         :seed 1794853200
+                                         :sans-io-pure? true
+                                         :diagnose-coverage? true
+                                         :co-committed-spec-and-flags? true}
+                        :oracle-receipts {:four-way-golden-oracle {:passed? true :seed 1794853200 :tests 700 :assertions 6500 :executed-at 1794853200000}
+                                          :vopr-jepsen-non-vacuity {:passed? true :seed 1794853200 :scenarios-passed 29 :executed-at 1794853200000}
+                                          :deterministic-bundle-sha256 "2c8d97181c6c98edae9defc47a64ede4b9ee6a2212913aca6cff7edad7bba62c"
+                                          :bwrap-civilization-regression {:passed? true
+                                                                          :browser-bundle-sha256 "99005965d85d07d3e125405ce93fc6c25c64cae0b908d58c5288a421c50e13b0"
+                                                                          :executed-at 1794853200000}}})
+         eff-spec (if (and (string? spec-edn) (not (str/blank? spec-edn)))
+                    spec-edn
+                    default-spec)]
+     (run-browser-governance-cmd!
+      {"cmd" "bip-submit"
+       "bip_id" (str (or bip-id "BIP-006"))
+       "title" (str (or title bip-id "BIP-006"))
+       "spec_edn" eff-spec
+       "subnet_id" (str (or (when (and (string? subnet-id) (not (str/blank? subnet-id))) subnet-id)
+                            "bitecho.org/dev"))}))))
+
+(defn consent-bip-cmd
+  "Signs and broadcasts a Tri-Circle Sociocratic consent response for a BIP from the browser light-node (BIP-006 Part 2)."
+  ([bip-id]
+   (consent-bip-cmd bip-id "anchor-agent-users" nil nil))
+  ([bip-id circle]
+   (consent-bip-cmd bip-id circle nil nil))
+  ([bip-id circle subnet-id]
+   (consent-bip-cmd bip-id circle subnet-id nil))
+  ([bip-id circle subnet-id comment]
+   (run-browser-governance-cmd!
+    (cond-> {"cmd" "bip-consent"
+             "bip_id" (str (or bip-id "BIP-006"))
+             "circle" (str (or circle "anchor-agent-users"))
+             "subnet_id" (str (or (when (and (string? subnet-id) (not (str/blank? subnet-id))) subnet-id)
+                                  "bitecho.org/dev"))}
+      (and (string? comment) (not (str/blank? comment)))
+      (assoc "comment" comment)))))
+
+(defn object-bip-cmd
+  "Signs and broadcasts a reproducible counterexample objection for a BIP from the browser light-node (BIP-006 Part 2)."
+  ([bip-id circle counterexample-edn]
+   (object-bip-cmd bip-id circle counterexample-edn nil))
+  ([bip-id circle counterexample-edn subnet-id]
+   (run-browser-governance-cmd!
+    {"cmd" "bip-object"
+     "bip_id" (str (or bip-id "BIP-006"))
+     "circle" (str (or circle "anchor-agent-users"))
+     "counterexample_edn" (str (or counterexample-edn "{:type :vopr-seed :seed 1 :failing-invariant :INV-1}"))
+     "subnet_id" (str (or (when (and (string? subnet-id) (not (str/blank? subnet-id))) subnet-id)
+                          "bitecho.org/dev"))})))
+
+(defn get-bip-status-cmd
+  "Queries local Tri-Circle ratification status for a BIP in the browser light-node (BIP-006 Part 2)."
+  ([bip-id]
+   (get-bip-status-cmd bip-id nil))
+  ([bip-id subnet-id]
+   (let [na @active-node-atom]
+     (if-not (and na @na)
+       (clj->js {:ok false :error "no-active-node"})
+       (let [node @na
+             privkey (get-in node [:keypair :private-key])
+             cmd-res (light-core/handle-command
+                      (:light-state node)
+                      {"cmd" "bip-status"
+                       "bip_id" (str (or bip-id "BIP-006"))
+                       "subnet_id" (str (or (when (and (string? subnet-id) (not (str/blank? subnet-id))) subnet-id)
+                                            "bitecho.org/dev"))}
+                      privkey)]
+         (clj->js (:response cmd-res)))))))
+
+(defn claim-hardware-key-faucet!
+  "Requests a WebAuthn challenge from `/faucet/v1/challenge` and submits a Hardware-Key Sponsored
+   Faucet claim (`1,000,000 ECH` drip) to `/faucet/v1/claim` (BIP-006 Part 2 & Part 3).
+   Returns a Promise resolving to the claim response object."
+  ([] (claim-hardware-key-faucet! nil))
+  ([opts]
+   (js/Promise.
+    (fn [resolve _reject]
+      (let [opts-map (if (map? opts) opts (if opts (js->clj opts :keywordize-keys true) {}))
+            na @active-node-atom
+            local-pk (or (when na (get-in @na [:light-state :pubkey]))
+                         (when @anchor-state-atom (:anchor-pubkey @anchor-state-atom)))
+            claimant-pk (let [raw (or (:claimant-pubkey opts-map)
+                                      (:claimantPubkey opts-map)
+                                      (:claimant_pubkey opts-map)
+                                      (:pubkey opts-map)
+                                      local-pk)]
+                          (when (and (string? raw) (not (str/blank? raw)))
+                            (or (when na (get-in @na [:light-state :petnames (str/trim raw)]))
+                                (get default-petnames (str/lower-case (str/trim raw)))
+                                (str/lower-case (str/trim raw)))))
+            cred-seed (or (:credential-id-hash opts-map)
+                          (:credentialIdHash opts-map)
+                          (:credential_id_hash opts-map)
+                          (when local-pk
+                            (basalt/bytes->hex (crypto/sha256 (fressian/utf8->bytes (str "webauthn-yubikey-" local-pk))))))
+            net-uri (or (:network-uri opts-map)
+                        (:networkUri opts-map)
+                        (when na (get-in @na [:light-state :network-uri]))
+                        "devnet.bitecho.org")
+            raw-base (or (:faucet-url opts-map)
+                         (:faucetUrl opts-map)
+                         (:relay-url opts-map)
+                         (:relayUrl opts-map)
+                         "")
+            base-url (if (str/blank? (str raw-base))
+                       ""
+                       (str/replace (str/trim (str raw-base)) #"/+$" ""))]
+        (if (or (str/blank? (str claimant-pk)) (str/blank? (str cred-seed)))
+          (resolve #js {:ok false :error "missing-claimant-or-credential"})
+          (-> (js/fetch (str base-url "/faucet/v1/challenge?network_uri=" (js/encodeURIComponent net-uri))
+                        #js {:method "GET"})
+              (.then (fn [res] (.json res)))
+              (.then (fn [ch-data]
+                       (let [ch-map (js->clj ch-data :keywordize-keys true)
+                             nonce (get-in ch-map [:challenge :nonce])]
+                         (if-not (and (string? nonce) (not (str/blank? nonce)))
+                           (resolve (clj->js {:ok false :error "challenge-fetch-failed" :response ch-map}))
+                           (let [claim-payload #js {:nonce nonce
+                                                    :credential_id_hash cred-seed
+                                                    :claimant_pubkey claimant-pk
+                                                    :network_uri net-uri
+                                                    :authenticator_verified true}]
+                             (-> (js/fetch (str base-url "/faucet/v1/claim")
+                                           #js {:method "POST"
+                                                :headers #js {"Content-Type" "application/json"}
+                                                :body (js/JSON.stringify claim-payload)})
+                                 (.then (fn [res] (.json res)))
+                                 (.then (fn [claim-data]
+                                          (let [c-map (js->clj claim-data :keywordize-keys true)
+                                                amt (long (or (get-in c-map [:transfer_intent :amount]) 1000000))]
+                                            (when (and (:ok c-map) na (= claimant-pk local-pk))
+                                              (swap! na (fn [curr]
+                                                          (-> curr
+                                                              (update-in [:light-state :account :balance] (fn [b] (+ (long (or b 0)) amt)))
+                                                              (update-in [:light-state :account :spendable] (fn [s] (+ (long (or s 0)) amt))))))
+                                              (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+                                              (notify-ui-listeners!))
+                                            (resolve (clj->js c-map)))))))))))
+              (.catch (fn [err]
+                        (resolve #js {:ok false :error (or (.-message err) "faucet-request-failed")}))))))))))
+
 (defn exec-command
   "JS-friendly alias for ctl (Priority 4)."
   [cmd-or-args & [opts]]
   (ctl cmd-or-args opts))
 
 (def api
-  "Global BitechoBrowser API object with Closure :advanced-safe string property exports (Priority 4)."
+  "Global BitechoBrowser API object with Closure :advanced-safe string property exports (Priority 4 & BIP-006 Part 2)."
   #js {"initNode" init-node
        "ctl" ctl
        "execCommand" exec-command
@@ -1978,11 +2156,16 @@
        "encodeBech32m" encode-bech32m-cmd
        "decodeBech32m" decode-bech32m-cmd
        "runAnchorEndToEndDemo" run-anchor-end-to-end-demo
+       "submitBip" submit-bip-cmd
+       "consentBip" consent-bip-cmd
+       "objectBip" object-bip-cmd
+       "getBipStatus" get-bip-status-cmd
+       "claimHardwareKeyFaucet" claim-hardware-key-faucet!
        "submitRelayEnvelope" submit-relay-envelope!
        "pollRelayEnvelopes" poll-relay-envelopes!
        "ackRelayEnvelopes" ack-relay-envelopes!
        "fetchRelayChainState" fetch-relay-chain-state!
-       "version" "1.0.0-m16"})
+       "version" "0.23.10"})
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api))

@@ -336,6 +336,27 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 3. **Unified `:sync-pointer` & `.v0238.bak` State Migration (`F-U4`, `F-U5`):** Light nodes ingest `:sync-pointer` alongside N-1 legacy `*-replicate` frames, project all domain pointers/blobs into `:pointers` and `:blobs`, and automatically create `<state-dir>/state.fressian.v0238.bak` before migrating `v0.23.8` snapshots.
 4. **Canonical 3-of-3 Bounty SCI Puzzle:** `bitecho.economy.puzzle/canonical-bounty-puzzle-source` enforces pairwise-distinct 3-of-3 (`maintainer`, `builder`, `auditor`) Ed25519 signatures, exact zero-dust `85/15` net-pool split + protocol take, and post-timeout maintainer refund.
 
+---
+
+## 12. Milestone D32: BIP-006 Core Network Reliability, `bitecho-mcp`, Browser App Refresh & Hardware-Key Faucet (`v0.23.10`)
+
+### 12.1 Core Network & Artifact Reliability (`Part 0`: `D-LEG-1..3`, `F-SYNC-1`, `F-RELAY-1`, `F-ART-1..2`)
+1. **Shared HTTP Relay Candidate Preservation & Import-Poll P2P Dialing (`D-LEG-1a`, `D-LEG-1c`):** `handle-wire-p2p-offer` and `exec-p2p-answer` filter out unconfigured `connect://` candidates and preserve shared `https://.../relay/v1` candidates whenever local fallback candidates are private RFC1918/mDNS addresses (`private-or-mdns-candidate?`). Burned `:p2p-offer` and `:p2p-answer` envelopes use wildcard outer gossip `:subnet-id "*"` so signaling routes across all validators. `exec-import-poll` and `exec-import` preserve `:p2p-dial` and `:p2p-dials` so HTTP-relay-polled signaling triggers `dial-p2p-peer!`.
+2. **Authenticated HTTPS Proxy CONNECT Tunnel (`D-LEG-1b`):** `open-https-proxy-tls-socket!` in `bitecho.node-main` sends `Proxy-Authorization: Basic ...` when proxy credentials are present and attaches `"error"` and `"secureConnect"` listeners on the upgraded TLS socket.
+3. **Half-Open Outbox Eviction Auto-Down & Wildcard `:session-ack` (`D-LEG-2`):** When `retransmit-unacked-outbox` evicts an unacked message (`retries >= 5`) while `[:p2p :connected?]` is `true`, it transitions the P2P leg to `:closed` (`:connected? false`, `:error "ack-timeout"`, `[:p2p-meta :reconnect-needed?] true`) and emits an actionable `"p2p-disconnected"` event. Burned `:session-ack` envelopes use outer gossip `:subnet-id "*"`.
+4. **Expanded Actionable Wait Event Queue (`D-LEG-3`):** `actionable-event-types` includes `"p2p-offer-received"`, `"p2p-answer-received"`, `"p2p-offer-answered-while-open"`, `"artifact-replicated"`, `"artifact-revoked"`, `"governance-replicated"`, `"broadcast-received"`, and `"transfer-received"`.
+5. **Co-Located Validator Quorum Snapshot & Dual UDP + HTTP Relay Bridge (`F-SYNC-1`, `F-RELAY-1`):** `infra/fetch-validator-chain-state-snapshots!` builds the co-located `:validator-node` snapshot in-memory (`< 5ms`) and queries remote validators with a `1500ms` timeout. `http/start-http-server!` `default-forwarder` injects relay envelopes directly into the co-located validator's `:network-in` channel and forwards to connected agents via `mesh/forward-gossip-to-agents!`. `parse-bootstrap-descriptor-pure` defaults `:relay-url` to `"https://ns1.bitecho.org"` when `Domain: bitecho.org`, and `run-serve!` runs background HTTP relay polling alongside UDP.
+6. **Idempotent Duplicate Replication, Default Burn, & `get --cid` (`F-ART-1`, `F-ART-2`):** Duplicate `:artifact-replicate`, `:storage-replicate`, `:capability-replicate`, and `:sync-pointer` envelopes with identical `(authority, seq, target)` are idempotent no-ops. `artifact-put` and `artifact-revoke` default `burn` to `(max 100 (effective-signaling-burn-floor state))` when economy is enabled. `get --cid <cid>` resolves blobs directly by content-addressed SHA-256 CID.
+
+### 12.2 Zero-Install `bitecho-mcp` Stdio JSON-RPC 2.0 Server (`Part 1`, `bitecho.light-node.mcp`)
+1. **Pure Sans-IO MCP Reducer:** `bitecho.light-node.mcp/handle-jsonrpc-request` implements JSON-RPC 2.0 (`"initialize"`, `"ping"`, `"notifications/initialized"`, `"tools/list"`, `"tools/call"`) in pure `.cljc`.
+2. **Curated 8 + 1 Tool Surface:** Exposes `bitecho_identity`, `bitecho_discover`, `bitecho_connect`, `bitecho_send`, `bitecho_inbox`, `bitecho_wait`, `bitecho_storage`, `bitecho_escrow`, and `bitecho_ctl`, invoked via `--mcp` or `mcp` CLI mode on both JVM and Node.js shells.
+
+### 12.3 Browser Light-Node App Refresh & Hardware-Key Sponsored Faucet (`Part 2` & `Part 3`)
+1. **Browser Sociocratic Governance & Broadcast (`bitecho.browser-main`, `resources/public/index.html`):** Exposes `submitBip`, `consentBip`, `objectBip`, `getBipStatus`, `broadcastMessage`, and `claimHardwareKeyFaucet` on `globalThis.BitechoBrowser` with corresponding dashboard UI controls.
+2. **Hardware-Key Sponsored Faucet Receipts (`bitecho.core.protocol.faucet`, `bitecho.shell.http`):** `faucet/reduce-faucet-claim` issues a single `1,000,000 ECH` drip per attested hardware credential ID, producing a signed transfer and signed fractal `Blob`/`Pointer` receipt at `faucet/<network-uri>/claims/<credential-id-hash>`.
+
+
 
 
 

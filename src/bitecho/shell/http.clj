@@ -23,6 +23,7 @@
             [bitecho.shell.infra :as infra]
             [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
+            [clojure.core.async :as async]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -1753,10 +1754,12 @@
                             (:chain-state-fetcher config)
                             (try ((:chain-state-fetcher config) pubkey nonce) (catch Exception _ []))
 
-                            (and cached (< (- now-ms (long (or (:cached-at-ms cached) 0))) 10000))
+                            (and (nil? nonce) cached (< (- now-ms (long (or (:cached-at-ms cached) 0))) 25000))
                             (:snapshots cached)
 
-                            (and subnet-runtime (or (:validator-bootstrap config) (:validator-bootstrap subnet-runtime)))
+                            (and subnet-runtime (or (:validator-node subnet-runtime)
+                                                    (:validator-bootstrap config)
+                                                    (:validator-bootstrap subnet-runtime)))
                             (let [effective-pk (or pubkey (:default-sender subnet-runtime) (get-in subnet-runtime [:peer-identity :pubkey-hex]))]
                               (if (and effective-pk (re-matches #"^[0-9a-fA-F]{64}$|^[0-9a-fA-F]{88}$" (str/trim (str effective-pk))))
                                 (let [v-snaps (try
@@ -1765,12 +1768,19 @@
                                                  (or (:validator-bootstrap config) (:validator-bootstrap subnet-runtime))
                                                  effective-pk
                                                  (or nonce (str (System/currentTimeMillis))))
-                                                (catch Exception _ []))]
+                                                (catch Exception _ []))
+                                      merged-snaps (if (and (< (count v-snaps) 4)
+                                                            cached
+                                                            (< (- now-ms (long (or (:cached-at-ms cached) 0))) 60000))
+                                                     (let [fresh-by-val (into {} (map (fn [s] [(:validator-pubkey s) s]) v-snaps))
+                                                           cached-by-val (into {} (map (fn [s] [(:validator-pubkey s) s]) (:snapshots cached)))]
+                                                       (vec (vals (merge cached-by-val fresh-by-val))))
+                                                     v-snaps)]
                                   (when (and chain-cache (seq v-snaps))
                                     (swap! chain-cache (fn [c]
                                                          (let [trimmed (if (>= (count c) 1024) (into {} (take-last 512 c)) c)]
-                                                           (assoc trimmed effective-pk {:snapshots v-snaps :cached-at-ms now-ms})))))
-                                  (or v-snaps []))
+                                                           (assoc trimmed effective-pk {:snapshots merged-snaps :cached-at-ms now-ms})))))
+                                  (or (not-empty merged-snaps) []))
                                 []))
 
                             (and subnet-runtime (seq (:chain-state-snapshots @(:subnet-atom subnet-runtime))))
@@ -1843,7 +1853,7 @@
   "Dispatches HTTP /faucet/v1/* endpoints:
    - POST/GET /faucet/v1/challenge
    - POST /faucet/v1/claim"
-  [^HttpExchange exchange req faucet-atom config _target-rt limiter-atom]
+  [^HttpExchange exchange req faucet-atom config target-rt limiter-atom]
   (let [path (get-in req [:request/uri :path])
         method (:request/method req)
         clean-path (str/replace path #"/+$" "")
@@ -1929,12 +1939,28 @@
                                   :response/body (json/write-str {"ok" false
                                                                   "error" (name (or (:error claim-res) :faucet-claim-rejected))
                                                                   "reason" (:reason claim-res)})})
-                  (send-response exchange
-                                 {:response/status 200
-                                  :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                                  :response/body (json/write-str {"ok" true
-                                                                  "transfer_intent" (:transfer-intent claim-res)
-                                                                  "receipt_path" (:receipt-path claim-res)})}))))))
+                  (do
+                    (when (and target-rt (:subnet-atom target-rt) (:receipt-blob claim-res))
+                      (try
+                        (swap! (:subnet-atom target-rt)
+                               (fn [inst]
+                                 (let [b (:receipt-blob claim-res)
+                                       ptr (:receipt-pointer claim-res)
+                                       bs (:blob-store inst (data/init-blob-store))
+                                       bs' (:store (data/put-blob bs b {:pinned? true}))]
+                                   (cond-> (assoc inst :blob-store bs')
+                                     ptr (assoc-in [:pointers [(:pointer/path ptr)]] ptr)))))
+                        (catch Exception _ nil)))
+                    (send-response exchange
+                                   {:response/status 200
+                                    :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                    :response/body (json/write-str
+                                                    (cond-> {"ok" true
+                                                             "transfer_intent" (:transfer-intent claim-res)
+                                                             "receipt_path" (:receipt-path claim-res)
+                                                             "receipt_cid" (:receipt-cid claim-res)}
+                                                      (:signed-transfer claim-res)
+                                                      (assoc "signed_transfer" (:signed-transfer claim-res))))})))))))
 
         :else
         (send-response exchange
@@ -2611,8 +2637,9 @@
                                   c))
                               (catch Exception _ nil))))
         default-forwarder (when (and (nil? (:on-relay-forward config))
-                                     (:peer-identity subnet-runtime)
-                                     val-bootstrap)
+                                     (or (:validator-node subnet-runtime)
+                                         (and (:peer-identity subnet-runtime)
+                                              val-bootstrap)))
                             (fn [eff]
                               (.submit vthread-executor
                                        ^Runnable
@@ -2630,19 +2657,40 @@
                                                               (if (= :receive-gossip ev-type)
                                                                 (or (get-in env [:event :message]) (:message env))
                                                                 (or (:message env) (get-in env [:event :message]))))
+                                                 sub-id (or (when (map? env) (:subnet-id env))
+                                                            (when (map? env) (get-in env [:event :subnet-id]))
+                                                            "global")
+                                                 _ (when-let [colocated-val (:validator-node subnet-runtime)]
+                                                     (when gossip-msg
+                                                       (let [sender-pk (or edge-pk
+                                                                           (when (map? env) (:agent-pubkey env))
+                                                                           (get-in colocated-val [:identity :pubkey-hex]))
+                                                             gossip-ev {:type :receive-gossip
+                                                                        :subnet-id sub-id
+                                                                        :message gossip-msg
+                                                                        :sender sender-pk
+                                                                        :rng (java.util.Random.)}]
+                                                         (when-let [net-in (get-in colocated-val [:shell-node :network-in])]
+                                                           (async/put! net-in gossip-ev))
+                                                         (when-let [acs (:agent-conns colocated-val)]
+                                                           (mesh/forward-gossip-to-agents!
+                                                            acs
+                                                            (fressian/encode-wire {:type :receive-gossip
+                                                                                   :subnet-id sub-id
+                                                                                   :message gossip-msg})
+                                                            nil)))))
                                                  payload-to-send (if (and edge-pk edge-priv gossip-msg)
                                                                    (let [rewrapped (mesh/wrap-agent-event
                                                                                     {:type :receive-gossip
-                                                                                     :subnet-id (or (when (map? env) (:subnet-id env))
-                                                                                                    (when (map? env) (get-in env [:event :subnet-id]))
-                                                                                                    "global")
+                                                                                     :subnet-id sub-id
                                                                                      :message gossip-msg}
                                                                                     edge-pk edge-priv)]
                                                                      (fressian/encode-wire rewrapped))
                                                                    (:wire-bytes eff))
-                                                 active-conn (or (when-let [c @bridge-conn-atom]
-                                                                   (when (:ok? c) c))
-                                                                 (connect-bridge!))]
+                                                 active-conn (when (and (:peer-identity subnet-runtime) val-bootstrap)
+                                                               (or (when-let [c @bridge-conn-atom]
+                                                                     (when (:ok? c) c))
+                                                                   (connect-bridge!)))]
                                              (when active-conn
                                                (let [sent-res (light-node/send-all-envelopes! (:send-fn active-conn) [payload-to-send])]
                                                  (when-not (pos? (long (or (:sent sent-res) 0)))

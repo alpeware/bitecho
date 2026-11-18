@@ -419,25 +419,48 @@
     :else nil))
 
 (defn fetch-validator-chain-state-snapshots!
-  "Queries validator nodes in parallel for chain-state snapshots for target-pubkey."
+  "Queries validator nodes in parallel for chain-state snapshots for target-pubkey.
+   When a co-located `:validator-node` is present on `rt` (`ns1..ns3`), immediately builds
+   its signed snapshot in-memory (< 5ms) and queries the remaining remote validators with a
+   fast 1500ms timeout (`F-SYNC-1`)."
   [rt validator-bootstrap target-pubkey nonce]
-  (let [bootstrap (resolve-validator-bootstrap validator-bootstrap)
-        nodes (vals (:nodes bootstrap))
+  (let [vnode (:validator-node rt)
+        local-snap (when (and vnode target-pubkey)
+                     (try
+                       (let [sa (or (:state-atom vnode)
+                                    (get-in vnode [:shell-node :state-atom]))
+                             st (when (instance? clojure.lang.IDeref sa) @sa)
+                             vid (:identity vnode)
+                             build-fn (requiring-resolve 'bitecho.shell.mesh/build-validator-chain-state-snapshot)]
+                         (when (and build-fn (map? st) (seq st))
+                           (build-fn st vid target-pubkey nonce)))
+                       (catch Exception _ nil)))
+        local-val-pk (when local-snap
+                       (light-core/normalize-pubkey-hex (:validator-pubkey local-snap)))
+        bootstrap (resolve-validator-bootstrap validator-bootstrap)
+        remote-nodes (->> (vals (:nodes bootstrap))
+                          (remove (fn [node]
+                                    (and local-val-pk
+                                         (= local-val-pk (light-core/normalize-pubkey-hex (:pubkey node))))))
+                          vec)
         ident (or (:peer-identity rt)
                   (when (:state-dir rt)
                     (try
                       (load-or-create-infra-peer-identity! (:state-dir rt) (or (:node-id rt) :ns1))
                       (catch Exception _ nil))))
-        privkey (or (:privkey-bytes ident) (:node-privkey rt))]
-    (if-not (and ident (:cert-data ident) target-pubkey privkey (seq nodes))
-      []
-      (->> nodes
-           (pmap (fn [node]
-                   (try
-                     (light-node/query-validator-chain-state!
-                      ident node target-pubkey privkey {:nonce nonce :timeout-ms 2500})
-                     (catch Exception _ nil))))
-           (filterv some?)))))
+        privkey (or (:privkey-bytes ident) (:node-privkey rt))
+        remote-snaps (if-not (and ident (:cert-data ident) target-pubkey privkey (seq remote-nodes))
+                       []
+                       (->> remote-nodes
+                            (pmap (fn [node]
+                                    (try
+                                      (light-node/query-validator-chain-state!
+                                       ident node target-pubkey privkey {:nonce nonce :timeout-ms 1500})
+                                      (catch Exception _ nil))))
+                            (filterv some?)))]
+    (cond-> []
+      local-snap (conj local-snap)
+      (seq remote-snaps) (into remote-snaps))))
 
 (defn sync-runtime-epoch-from-validators!
   "Queries the validator cluster's authenticated `:5010` agent channel using the signed

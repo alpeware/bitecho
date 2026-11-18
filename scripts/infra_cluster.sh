@@ -275,7 +275,7 @@ REMOTE_CUT
 
 verify_release_proof_gate() {
   local version="${1:-$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.9}"
+  version="${version:-0.23.10}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Verifying Release Proof Gate for v${version}..."
@@ -651,6 +651,12 @@ cmd_publish_git() {
   local repos=("bitecho" "clj-datachannel" "clj-fressian")
   if [[ -d "${ROOT_DIR}/../mealy/.git" ]]; then
     repos+=("mealy")
+  fi
+  if [[ -d "${ROOT_DIR}/../clj-einsum/.git" ]]; then
+    repos+=("clj-einsum")
+  fi
+  if [[ -d "${ROOT_DIR}/../hive/.git" ]]; then
+    repos+=("hive")
   fi
 
   for repo in "${repos[@]}"; do

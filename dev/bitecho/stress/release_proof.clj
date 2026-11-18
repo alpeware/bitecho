@@ -16,6 +16,7 @@
             [bitecho.d28-autosync-and-p2p-ack-hotfix-test :as d28-test]
             [bitecho.d30-artifact-publishing-scenarios-test :as d30-test]
             [bitecho.d31-unification-iii-scenarios-test :as d31-test]
+            [bitecho.d32-bip006-onboarding-and-network-test :as d32-test]
             [bitecho.e2e.d29-remediation-scenario-test :as d29-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
@@ -530,11 +531,34 @@
      :count (count results)
      :scenarios results}))
 
+(defn- run-d32-scenarios
+  "Executes the 5 Milestone D32 (BIP-006 / v0.23.10) onboarding and core network reliability scenarios (S-D32-1..S-D32-5)."
+  []
+  (let [scenarios [{:id "S-D32-1" :name "p2p-relay-recovery-and-actionable-events" :test-fn d32-test/scenario-s-d32-1-p2p-relay-recovery-and-actionable-events-test}
+                   {:id "S-D32-2" :name "colocated-validator-sync-and-relay-mesh-bridge" :test-fn d32-test/scenario-s-d32-2-colocated-validator-sync-and-relay-mesh-bridge-test}
+                   {:id "S-D32-3" :name "bitecho-mcp-stdio-server-e2e" :test-fn d32-test/scenario-s-d32-3-bitecho-mcp-stdio-server-e2e-test}
+                   {:id "S-D32-4" :name "hardware-key-sponsored-faucet-http-e2e" :test-fn d32-test/scenario-s-d32-4-hardware-key-sponsored-faucet-http-e2e-test}
+                   {:id "S-D32-5" :name "browser-app-refresh-governance-broadcast-and-faucet" :test-fn d32-test/scenario-s-d32-5-browser-app-refresh-governance-broadcast-and-faucet-test}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D31 (v0.23.9) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D32 (v0.23.10) release verification proof and returns a deterministic EDN map."
   [opts]
   (let [ver (or (:version opts) (str "v" config/version))
-        ms (or (:milestone opts) "D31")
+        ms (or (:milestone opts) "D32")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
@@ -548,6 +572,7 @@
         d29-scenarios (run-d29-scenarios)
         d30-scenarios (run-d30-scenarios)
         d31-scenarios (run-d31-scenarios)
+        d32-scenarios (run-d32-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
         _ (assert (and (.exists bundle-file) (pos? (.length bundle-file)))
                   "dist/bitecho-light-node.cjs must exist and be non-empty before release proof generation!")
@@ -570,7 +595,8 @@
                                   (:all-passed? d28-scenarios)
                                   (:all-passed? d29-scenarios)
                                   (:all-passed? d30-scenarios)
-                                  (:all-passed? d31-scenarios)))]
+                                  (:all-passed? d31-scenarios)
+                                  (:all-passed? d32-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
@@ -586,6 +612,7 @@
                        "bitecho.e2e.d29-remediation-scenario-test"
                        "bitecho.d30-artifact-publishing-scenarios-test"
                        "bitecho.d31-unification-iii-scenarios-test"
+                       "bitecho.d32-bip006-onboarding-and-network-test"
                        "bitecho.state-machine-test"]
      :d24-remediation-scenarios d24-scenarios
      :d25-remediation-scenarios d25-scenarios
@@ -595,6 +622,7 @@
      :d29-remediation-scenarios d29-scenarios
      :d30-artifact-publishing-scenarios d30-scenarios
      :d31-unification-iii-scenarios d31-scenarios
+     :d32-bip006-onboarding-and-network-scenarios d32-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}

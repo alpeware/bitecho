@@ -1,0 +1,52 @@
+{:bip-id "BIP-006"
+ :title "BIP-006 (Milestone D32 / v0.23.10): Frictionless Onboarding, bitecho-mcp Stdio Server, Browser App Refresh, Hardware-Key Sponsored Faucet, & Core Network Reliability"
+ :author-pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"
+ :co-author-pubkeys ["302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+                     "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"]
+ :subnet-id "bitecho.org/dev"
+ :milestone "D32"
+ :version "v0.23.10"
+ :invariant-diff {:defspec-vars ["prop-p2p-offer-auto-answer-preserves-relay-candidates-and-import-poll-dials"
+                                 "prop-half-open-outbox-eviction-auto-downs-p2p-and-wildcard-session-ack"
+                                 "prop-idempotent-duplicate-artifact-and-storage-replication-and-cid-get"
+                                 "prop-mcp-jsonrpc-framing-and-9-tool-dispatch"
+                                 "prop-hardware-key-faucet-single-drip-and-receipt-pointer"]
+                  :seed 1795038000
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 1795038000
+                                            :tests 56
+                                            :assertions 771
+                                            :executed-at 1795038000000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 1795038000
+                                             :scenarios-passed 45
+                                             :executed-at 1795038000000}
+                   :deterministic-bundle-sha256 "3ef6f2604c93a617bcafecad9d338a473e8710f3d10e967c67fd0f042b2a4bcb"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :browser-bundle-sha256 "8ff73818f6f5b93c905d3b001b4cb85de07db1e4e83446a672e9442988e70a73"
+                                                   :executed-at 1795038000000}}
+ :deliverables [{:id "Part-0"
+                 :title "Core Network & Artifact Reliability Prerequisite (8 Fixes)"
+                 :items ["D-LEG-1a: handle-wire-p2p-offer already-connected? preserves shared https://.../relay/v1 candidates instead of RFC1918 LAN IPs"
+                         "D-LEG-1b: open-https-proxy-tls-socket! sends Proxy-Authorization: Basic and waits for TLS secureConnect with error listener"
+                         "D-LEG-1c: exec-import-poll and exec-import preserve :p2p-dial / :p2p-dials; burned P2P signaling uses wildcard '*' outer gossip subnet"
+                         "D-LEG-2: half-open outbox eviction after 5 retries auto-downs P2P leg to :closed (p2p-disconnected, reason: ack-timeout); burned :session-ack uses '*' outer gossip subnet"
+                         "D-LEG-3: actionable-event-types includes p2p-offer-received, p2p-answer-received, p2p-offer-answered-while-open, artifact-replicated, artifact-revoked, governance-replicated, broadcast-received, transfer-received"
+                         "F-SYNC-1: co-located validator in-memory snapshot (< 1ms) + 1500ms remote query timeout + 25s cache window + 12000ms client timeout"
+                         "F-RELAY-1: direct co-located validator :network-in + agent-conns injection in default-forwarder on ns1..ns3; unconditional dual UDP + HTTP relay polling in serve mode"
+                         "F-ART-1 & F-ART-2: idempotent duplicate (authority, seq, target) pointer replication; get --cid <cid> direct blob lookup; default signaling burn >= 100 on artifact-put / artifact-revoke"]}
+                {:id "Part-1"
+                 :title "bitecho-mcp Stdio JSON-RPC 2.0 Server (src/bitecho/light_node/mcp.cljc)"
+                 :items ["8 curated tools (bitecho_identity, bitecho_discover, bitecho_connect, bitecho_send, bitecho_inbox, bitecho_wait, bitecho_storage, bitecho_escrow) + 1 escape hatch (bitecho_ctl)"
+                         "control.json daemon reuse + strict stdout JSON-RPC 2.0 framing"]}
+                {:id "Part-2"
+                 :title "Browser Light-Node App Refresh (src/bitecho/browser_main.cljs & resources/public/index.html)"
+                 :items ["submitBip, consentBip, objectBip, getBipStatus, broadcastMessage, claimHardwareKeyFaucet"
+                         "Subnet Broadcast, Sociocratic Tri-Circle BIP Consent, and WebAuthn Hardware-Key Sponsored Faucet dashboard cards"]}
+                {:id "Part-3"
+                 :title "WebAuthn Hardware-Key Sponsored Faucet (src/bitecho/core/protocol/faucet.cljc & src/bitecho/shell/http.clj)"
+                 :items ["1,000,000 ECH drip per attested hardware key"
+                         "Signed transfer + content-addressed Blob/Pointer receipt at faucet/<network-uri>/claims/<credential-id-hash>"]}]}

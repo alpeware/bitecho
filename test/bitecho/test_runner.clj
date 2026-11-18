@@ -18,6 +18,7 @@
             [bitecho.d28-autosync-and-p2p-ack-hotfix-test]
             [bitecho.d30-artifact-publishing-scenarios-test]
             [bitecho.d31-unification-iii-scenarios-test]
+            [bitecho.d32-bip006-onboarding-and-network-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

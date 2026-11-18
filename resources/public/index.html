@@ -156,7 +156,7 @@
       <p style="color: var(--text-muted); font-size: 0.85rem;">Phase 3 / Milestone 12 — Fractal Composition, Zero-Burn Subnets &amp; Domain Federation</p>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
-      <span class="badge badge-primary" id="versionBadge">v1.0.0-m12</span>
+      <span class="badge badge-primary" id="versionBadge">v0.23.10 (BIP-006)</span>
       <span class="badge badge-success">Sans-IO Core</span>
     </div>
   </header>
@@ -315,6 +315,58 @@
     </div>
   </div>
 
+  <!-- BIP-006: Subnet Broadcast, Sociocratic BIP Consent, & WebAuthn Hardware-Key Sponsored Faucet -->
+  <div class="grid">
+    <!-- Subnet Broadcast & Sociocratic BIP Governance Consent Card -->
+    <div class="card">
+      <h2>
+        <span>Subnet Broadcast &amp; Sociocratic BIP Consent</span>
+        <span class="badge badge-primary">BIP-006</span>
+      </h2>
+      <div class="field">
+        <div class="field-label">Subnet Broadcast</div>
+        <div style="display: flex; gap: 8px; margin-bottom: 6px;">
+          <input type="text" id="subnetBroadcastTarget" class="select-input" value="chat/simon-nexus-axiom" style="font-family: var(--mono-font); font-size: 0.8rem; width: 42%;" placeholder="subnet_id">
+          <input type="text" id="subnetBroadcastInput" class="select-input" style="flex: 1; font-size: 0.85rem;" placeholder="Broadcast message to subnet...">
+          <button class="btn btn-success" id="sendSubnetBroadcastBtn" style="white-space: nowrap;">Broadcast</button>
+        </div>
+      </div>
+      <div class="field" style="margin-top: 12px; border-top: 1px solid var(--card-border); padding-top: 12px;">
+        <div class="field-label">Sociocratic Tri-Circle BIP Decision</div>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+          <input type="text" id="bipIdInput" class="select-input" value="BIP-006" style="font-family: var(--mono-font); font-size: 0.85rem; width: 35%;" placeholder="BIP-006">
+          <select class="select-input" id="bipCircleSelect" style="flex: 1; font-size: 0.85rem;">
+            <option value="anchor-agent-users">anchor-agent-users</option>
+            <option value="builders-stewards">builders-stewards</option>
+            <option value="mesh-validators">mesh-validators</option>
+          </select>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-success" id="consentBipBtn" style="flex: 1;">Sign &amp; Broadcast Consent</button>
+          <button class="btn btn-outline" id="checkBipStatusBtn">Check BIP Status</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- WebAuthn Hardware-Key Sponsored Faucet Card -->
+    <div class="card">
+      <h2>
+        <span>WebAuthn Hardware-Key Sponsored Faucet</span>
+        <span class="badge badge-success">1,000,000 ECH</span>
+      </h2>
+      <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px;">
+        Sponsor a new agent (or your own anchor identity) with a one-time 1,000,000 ECH drip attested by your WebAuthn/FIDO2 hardware key. Claim receipts are recorded as immutable Blob/Pointer entries.
+      </p>
+      <div class="field">
+        <div class="field-label">Claimant Ed25519 Pubkey (Hex — leave blank for Anchor self-drip)</div>
+        <input type="text" id="faucetClaimantInput" class="select-input" style="font-family: var(--mono-font); font-size: 0.8rem;" placeholder="302a300506032b6570032100...">
+      </div>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <button class="btn" id="claimFaucetBtn" style="flex: 1;">Sponsor 1,000,000 ECH Faucet Drip</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Pending Offers Table -->
   <div class="card" style="margin-bottom: 20px;">
     <h2>
@@ -369,7 +421,7 @@
     <pre id="outputLog">Loading BitechoBrowser bundle...</pre>
   </div>
 
-  <script src="/app/bitecho-browser.js" integrity="sha384-gZMziQgBhpdET4MUxaY3smn2/YoB1r35mlgHk17yyLT4MUJTrgXjjPTAUdGvW9vQ" crossorigin="anonymous"></script>
+  <script src="/app/bitecho-browser.js" integrity="sha384-gJ3oQtHZ5BRHBg7pf/QMmLmM+1XQ3wgkWPtH57LIUcI4t1LeMur1U9wonHplxmAs" crossorigin="anonymous"></script>
   <script>
     (function () {
       const log = document.getElementById("outputLog");
@@ -999,6 +1051,56 @@
         }
         updateUI(globalThis.BitechoBrowser.getAnchorDashboard());
       };
+
+      const sendSubnetBroadcastBtn = document.getElementById("sendSubnetBroadcastBtn");
+      if (sendSubnetBroadcastBtn) {
+        sendSubnetBroadcastBtn.onclick = function () {
+          const subEl = document.getElementById("subnetBroadcastTarget");
+          const txtEl = document.getElementById("subnetBroadcastInput");
+          const sub = (subEl && subEl.value.trim()) || "chat/simon-nexus-axiom";
+          const txt = (txtEl && txtEl.value.trim()) || "";
+          if (!txt) return;
+          writeLog("Broadcasting to subnet " + sub + ": " + txt);
+          const res = globalThis.BitechoBrowser.broadcastMessage(txt, sub);
+          writeLog("Subnet broadcast result:", res);
+          if (txtEl && res && res.ok) txtEl.value = "";
+        };
+      }
+
+      const consentBipBtn = document.getElementById("consentBipBtn");
+      if (consentBipBtn) {
+        consentBipBtn.onclick = function () {
+          const bipId = (document.getElementById("bipIdInput") && document.getElementById("bipIdInput").value.trim()) || "BIP-006";
+          const circle = (document.getElementById("bipCircleSelect") && document.getElementById("bipCircleSelect").value) || "anchor-agent-users";
+          writeLog("Signing Sociocratic BIP consent for " + bipId + " (" + circle + ")...");
+          const res = globalThis.BitechoBrowser.consentBip(bipId, circle, "bitecho.org/dev");
+          writeLog("BIP consent result:", res);
+        };
+      }
+
+      const checkBipStatusBtn = document.getElementById("checkBipStatusBtn");
+      if (checkBipStatusBtn) {
+        checkBipStatusBtn.onclick = function () {
+          const bipId = (document.getElementById("bipIdInput") && document.getElementById("bipIdInput").value.trim()) || "BIP-006";
+          const res = globalThis.BitechoBrowser.getBipStatus(bipId, "bitecho.org/dev");
+          writeLog("BIP status for " + bipId + ":", res);
+        };
+      }
+
+      const claimFaucetBtn = document.getElementById("claimFaucetBtn");
+      if (claimFaucetBtn) {
+        claimFaucetBtn.onclick = function () {
+          const claimant = document.getElementById("faucetClaimantInput") && document.getElementById("faucetClaimantInput").value.trim();
+          writeLog("Requesting hardware-key sponsored faucet drip (1,000,000 ECH)...");
+          Promise.resolve(globalThis.BitechoBrowser.claimHardwareKeyFaucet({ claimantPubkey: claimant || null })).then(function (res) {
+            writeLog("Hardware-key faucet claim result:", res);
+            updateUI(globalThis.BitechoBrowser.getAnchorDashboard());
+            renderChatAndSessions(globalThis.BitechoBrowser.getStatus());
+          }).catch(function (err) {
+            writeLog("Faucet claim error: " + (err.message || err));
+          });
+        };
+      }
     })();
   </script>
 </body>

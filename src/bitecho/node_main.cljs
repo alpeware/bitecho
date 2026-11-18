@@ -10,6 +10,7 @@
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
+            [bitecho.light-node.mcp :as mcp]
             [cljs.reader :as edn]
             [clojure.string :as str]
             [datachannel.api :as api]
@@ -129,7 +130,8 @@
         issued-ep (when-let [ie (:issued-epoch data)] (parse-long-safe ie nil))
         expires-ep (when-let [ee (:expires-epoch data)] (parse-long-safe ee nil))
         sig (when-let [s (:signature data)] (str/trim (str s)))
-        relay-url (when-let [ru (:relay-url data)] (relay/normalize-relay-base-url ru))
+        relay-url (or (when-let [ru (:relay-url data)] (relay/normalize-relay-base-url ru))
+                      (when (= dom "bitecho.org") "https://ns1.bitecho.org"))
         nodes-map (or (:nodes data) {})
         _ (when (empty? nodes-map)
             (throw (ex-info "Bootstrap descriptor contains no validator nodes"
@@ -222,7 +224,8 @@
         min-burn-raw (find-header #"(?i)^Min Signaling Burn:\s*([0-9]+)")
         relay-match (or (find-header #"(?i)^Relay URL:\s*([^\s]+)")
                         (find-header #"(?i)^relay[=:]\s*([^\s]+)"))
-        relay-url (when relay-match (relay/normalize-relay-base-url relay-match))
+        relay-url (or (when relay-match (relay/normalize-relay-base-url relay-match))
+                      (when (= dom "bitecho.org") "https://ns1.bitecho.org"))
         network (keyword (str/lower-case (or net-str "devnet")))
         auth-pk (when auth-raw (validate-pubkey! auth-raw "authority"))
         issued-ep (when issued-raw (parse-long-safe issued-raw nil))
@@ -427,6 +430,17 @@
                              (str "http://" proxy-url-str)))
           p-host (.-hostname proxy-u)
           p-port (int (or (not-empty (str (.-port proxy-u))) 3128))
+          p-user (not-empty (str (.-username proxy-u)))
+          p-pass (not-empty (str (.-password proxy-u)))
+          auth-hdr (when (or p-user p-pass)
+                     (let [u (js/decodeURIComponent (or p-user ""))
+                           p (js/decodeURIComponent (or p-pass ""))
+                           b64 (.toString (.from (.-Buffer js/globalThis) (str u ":" p) "utf8") "base64")]
+                       (str "Basic " b64)))
+          req-headers (if auth-hdr
+                        #js {"Host" (str target-host ":" target-port)
+                             "Proxy-Authorization" auth-hdr}
+                        #js {"Host" (str target-host ":" target-port)})
           settled? (atom false)
           done! (fn [sock err]
                   (when (compare-and-set! settled? false true)
@@ -436,6 +450,7 @@
                                      :port p-port
                                      :method "CONNECT"
                                      :path (str target-host ":" target-port)
+                                     :headers req-headers
                                      :timeout (or timeout-ms 5000)})]
       (.on connect-req "connect"
            (fn [res sock _head]
@@ -444,7 +459,13 @@
                    (done! nil (str "proxy-connect-status-" (.-statusCode res))))
                (try
                  (let [tls-sock (.connect node-tls #js {:socket sock :servername target-host})]
-                   (done! tls-sock nil))
+                   (.on tls-sock "error"
+                        (fn [e]
+                          (try (.destroy sock) (catch :default _ nil))
+                          (done! nil (str e))))
+                   (.once tls-sock "secureConnect"
+                          (fn []
+                            (done! tls-sock nil))))
                  (catch :default e
                    (try (.destroy sock) (catch :default _ nil))
                    (done! nil (str e)))))))
@@ -723,7 +744,7 @@
                  url (if (seq q-parts) (str base-url "?" (str/join "&" q-parts)) base-url)
                  done (fn [res]
                         (if cb (cb res) (resolve res)))]
-             (http-get-json! url (or (:timeout-ms opts) 5000) done)))]
+             (http-get-json! url (or (:timeout-ms opts) 12000) done)))]
      (if (fn? cb)
        (do (promise-fn nil nil) nil)
        (js/Promise. promise-fn)))))
@@ -886,7 +907,7 @@
                                 "--callee" "--peer" "--receiver" "--recipient"
                                 "--amount" "--text" "--message" "--payload-hex"
                                 "--wait-open-ms" "--until-event"
-                                "--path" "--file" "--hex" "--seq" "--authority" "--prefix"}
+                                "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -921,7 +942,8 @@
                           (:subverb (extract-subverb-and-args clean-args))
                           first-tok)
          help? (boolean (or (some #{"--help" "-h"} clean-args) (= first-non-flag "help")))
-         verb (if help? "help" (or first-non-flag "status"))
+         mcp? (boolean (or (some #{"--mcp"} clean-args) (= first-non-flag "mcp")))
+         verb (cond help? "help" mcp? "mcp" :else (or first-non-flag "status"))
          no-poll? (boolean (some #{"--no-poll"} clean-args))
          ctl? (= verb "ctl")
          serve? (= verb "serve")
@@ -995,6 +1017,7 @@
                           :force-relay? turn-force-relay?}))]
      (cond-> {:mode (cond
                       help? :help
+                      mcp? :mcp
                       (or daemon? ctl-ensure? serve-daemon?) :daemon
                       ctl? :ctl
                       serve? :serve
@@ -1007,7 +1030,7 @@
               :auto-sync? (boolean auto-sync?)
               :auto-register-home-set? (boolean auto-register-home-set?)
               :transport transport
-              :cmd-map (let [m (when-not (or help? ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
+              :cmd-map (let [m (when-not (or help? mcp? ctl? serve? wait-event? daemon? ctl-ensure? serve-daemon?)
                                  (build-one-shot-cmd-map verb (if (and (string? first-tok) (str/starts-with? first-tok "--"))
                                                                 (:subargs (extract-subverb-and-args clean-args))
                                                                 (rest clean-args))))]
@@ -2353,7 +2376,13 @@
             attempt-dial!
             (fn []
               (let [mdns-state' (read-mdns-state)
-                    parsed-candidates (vec (keep #(light-core/parse-p2p-candidate % mdns-state') candidates))
+                    proxy-url (resolve-proxy-url nil)
+                    parsed-candidates (->> (keep #(light-core/parse-p2p-candidate % mdns-state') candidates)
+                                           (remove (fn [c]
+                                                     (and (nil? proxy-url)
+                                                          (or (= :connect (:transport c))
+                                                              (:proxy-connect? c)))))
+                                           vec)
                     success? (atom false)
                     dial-step!
                     (fn dial-step! [idx]
@@ -2900,8 +2929,11 @@
                     (reset! state-atom (:state res))
                     (when state-file
                       (try (save-light-state! state-file @state-atom) (catch :default _ nil))))
-                _ (when-let [dial-info (:p2p-dial res)]
-                    (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file))
+                _ (if (seq (:p2p-dials res))
+                    (doseq [dial-info (:p2p-dials res)]
+                      (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file))
+                    (when-let [dial-info (:p2p-dial res)]
+                      (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file)))
                 shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
                 import-shuttle-verb? (contains? #{"import-envelope" "import-poll" "import"} verb)
                 connect-explicit? (true? (or (get cmd-map "connect") (:connect cmd-map)))
@@ -3490,11 +3522,13 @@
                                   "connected" false
                                   "error" (:error conn-res)}
                                  events-out))
-              (let [effective-relay-url (or (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
-                                              (:relay-url opts))
-                                            (when-not (:ok? conn-res)
-                                              (or (:relay-url bootstrap)
-                                                  (get-in bootstrap [:relay :url]))))]
+              (let [effective-relay-url (when-not (:no-poll? opts)
+                                          (or (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                                                (:relay-url opts))
+                                              (:relay-url bootstrap)
+                                              (get-in bootstrap [:relay :url])
+                                              (when (= (:domain bootstrap) "bitecho.org")
+                                                "https://ns1.bitecho.org")))]
                 (when (and (string? effective-relay-url) (not (str/blank? effective-relay-url)))
                   (let [since-mseq (atom (long (or (:relay-since-seq @state-atom) 0)))
                         since-bseq (atom (long (or (:relay-since-broadcast-seq @state-atom) 0)))
@@ -3717,6 +3751,15 @@
              (when wire-bytes
                (let [r (light-core/handle-wire-payload @state-atom wire-bytes priv-bytes)]
                  (reset! state-atom (:state r))
+                 (when (and (:p2p-dial r) (:p2p-peers-atom opts))
+                   (dial-p2p-peer! state-atom
+                                   (:p2p-peers-atom opts)
+                                   (:ingress-peers-atom opts)
+                                   (:mdns-atom opts)
+                                   priv-bytes
+                                   (:event-out opts)
+                                   (:p2p-dial r)
+                                   state-file))
                  (when (seq (:net-envelopes r))
                    (swap! auto-net-envs into (:net-envelopes r)))))))
          (when (and (not (:peek? opts))
@@ -4076,6 +4119,65 @@
              500))
           (run-daemon! (assoc opts :daemon-action "start")))))))
 
+(defn run-mcp!
+  "Runs the Node.js Bitecho MCP JSON-RPC 2.0 server over stdio (`--mcp` / `mcp` mode, BIP-006 Part 1).
+   All diagnostics/logging go to stderr so stdout carries strictly newline-delimited JSON-RPC 2.0 frames."
+  [opts]
+  (let [state-dir (:state-dir opts)
+        state-file (.join node-path state-dir "state.fressian")
+        identity (load-or-create-light-identity! state-dir)
+        loaded-state (load-light-state! state-file)
+        base-state (or loaded-state
+                       (light-core/init-light-state identity (cond-> {}
+                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts)))))
+        state-atom (atom base-state)
+        effective-relay-url (or (:relay-url opts) "https://ns1.bitecho.org")
+        exec-local! (fn [cmd-map]
+                      (let [verb (get cmd-map "cmd")
+                            enriched (enrich-artifact-cmd-map verb cmd-map)
+                            res (light-core/handle-command @state-atom enriched (:privkey-bytes identity))]
+                        (reset! state-atom (:state res))
+                        (when-not (get enriched "peek")
+                          (try (save-light-state! state-file (:state res)) (catch :default _ nil)))
+                        (when (and effective-relay-url (seq (:net-envelopes res)))
+                          (doseq [env (:net-envelopes res)]
+                            (submit-relay-envelope! effective-relay-url env {:timeout-ms 5000} (fn [_] nil))))
+                        (:response res)))
+        rl (.createInterface node-readline #js {:input (.-stdin js/process)
+                                                :terminal false})]
+    (.on rl "line"
+         (fn [line]
+           (let [trimmed (str/trim (str line))]
+             (when-not (str/blank? trimmed)
+               (let [req-map (parse-json-safe trimmed)]
+                 (if-not (map? req-map)
+                   (emit-json-line! {"jsonrpc" "2.0"
+                                     "id" nil
+                                     "error" {"code" -32700 "message" "Parse error"}})
+                   (let [method (str (or (get req-map "method") (:method req-map) ""))]
+                     (if (= method "tools/call")
+                       (let [id (or (get req-map "id") (:id req-map))
+                             params (or (get req-map "params") (:params req-map) {})
+                             tname (or (get params "name") (:name params))
+                             targs (or (get params "arguments") (:arguments params) {})
+                             trans (mcp/tool-call->cmd-map tname targs)]
+                         (if-not (:ok? trans)
+                           (emit-json-line! {"jsonrpc" "2.0"
+                                             "id" id
+                                             "error" {"code" -32602 "message" (:error trans)}})
+                           (try-delegate-one-shot-to-daemon!
+                            state-dir (:cmd-map trans) opts
+                            (fn [delegated]
+                              (let [cmd-resp (or delegated (exec-local! (:cmd-map trans)))]
+                                (emit-json-line! {"jsonrpc" "2.0"
+                                                  "id" id
+                                                  "result" (mcp/format-mcp-tool-result cmd-resp write-json-str)}))))))
+                       (when-let [rpc-resp (mcp/handle-jsonrpc-request req-map exec-local! write-json-str)]
+                         (emit-json-line! rpc-resp))))))))))
+    (.on rl "close"
+         (fn []
+           (js/setTimeout #(.exit js/process 0) 50)))))
+
 (defn run-light-node-cli!
   "Dispatches Node.js light-node CLI invocation based on parsed arguments."
   [args]
@@ -4085,10 +4187,11 @@
       (let [res {"ok" true
                  "help" true
                  "verbs" cli/supported-cli-verbs
-                 "modes" ["one-shot" "serve" "ctl" "wait-event"]
+                 "modes" ["one-shot" "serve" "ctl" "wait-event" "mcp"]
                  "flags" cli/known-command-flags}]
         (emit-json-line! res)
         (.exit js/process 0))
+      :mcp (run-mcp! parsed)
       :daemon (run-daemon! parsed)
       :ctl (run-ctl! parsed)
       :serve (run-serve! parsed)

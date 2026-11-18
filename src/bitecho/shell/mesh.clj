@@ -1700,7 +1700,7 @@
 
     :else nil))
 
-(defn- forward-gossip-to-agents!
+(defn forward-gossip-to-agents!
   "Forwards a frozen gossip network event to all connected agent DataChannels, optionally excluding a sender.
    Deduplicates messages per agent connection using :sent-msg-ids and enforces Fressian wire encoding.
    Drops malformed or non-Fressian garbage bytes with counted diagnostic effect across active agent connections."

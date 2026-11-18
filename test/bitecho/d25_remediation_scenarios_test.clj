@@ -7,6 +7,7 @@
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
             [bitecho.fressian :as fressian]
+            [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.light-node :as shell]
             [bitecho.shell.upnp :as upnp]
@@ -402,7 +403,7 @@
       (is (= 68 (count (or (:verbs cli-res) (get cli-res "verbs")))))
       (is (contains? (set (or (:verbs cli-res) (get cli-res "verbs"))) "help"))
       (is (contains? (set (or (:verbs cli-res) (get cli-res "verbs"))) "subscribe-subnets"))
-      (is (= 64 (count (or (:flags cli-res) (get cli-res "flags")))))
+      (is (= (count cli/known-command-flags) (count (or (:flags cli-res) (get cli-res "flags")))))
       (is (not (.exists non-existent-dir)) "Help mode MUST NOT create state directory on disk")))
 
   (testing "Executable Node bundle exists and has shebang"

@@ -175,8 +175,9 @@
    "wait"                 {:canonical "wait"     :domain-cmd "wait"}})
 
 (def runner-alias-desugar-table
-  "Complete 8/8 runner & shell alias desugaring table (`F-U1`)."
+  "Complete runner & shell alias desugaring table (`F-U1` & `BIP-006`)."
   {"serve"             {:canonical "serve"   :domain-cmd "serve"}
+   "mcp"               {:canonical "serve"   :domain-cmd "mcp"}
    "ctl"               {:canonical "ctl"     :domain-cmd "ctl"}
    "daemon"            {:canonical "serve"   :domain-cmd "daemon"}
    "wait-event"        {:canonical "wait"    :domain-cmd "wait"}
@@ -186,7 +187,7 @@
    "import-envelope"   {:canonical "inbox"   :domain-cmd "import-envelope"}})
 
 (def all-recognized-cli-verbs-set
-  "Union of all 68 legacy verbs, 12 canonical verbs, and 8 shell/runner aliases."
+  "Union of all 68 legacy verbs, 12 canonical verbs, and shell/runner aliases."
   (into (into supported-cli-verbs-set canonical-cli-verbs-set)
         (keys runner-alias-desugar-table)))
 
@@ -201,9 +202,9 @@
    "--price-max" "--burn" "--to" "--from" "--callee" "--peer" "--receiver" "--recipient"
    "--amount" "--text" "--message" "--payload-hex" "--peek" "--poll" "--sync" "--no-poll"
    "--autonomous" "--auto-sync" "--auto-register-home-set" "--no-auto-register-home-set"
-   "--wait-open-ms" "--block" "--until-event" "--help"
+   "--wait-open-ms" "--block" "--until-event" "--help" "--mcp"
    "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
-   "--path" "--file" "--hex" "--seq" "--authority" "--prefix"])
+   "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -1251,6 +1252,7 @@
                     (extract-flag-value clean-tokens "--subnet" nil)
                     "global")
             path (extract-flag-value clean-tokens "--path" nil)
+            cid (extract-flag-value clean-tokens "--cid" nil)
             auth (or (extract-flag-value clean-tokens "--authority" nil)
                      (extract-flag-value clean-tokens "--pubkey" nil))
             out-file (or (extract-flag-value clean-tokens "--out-file" nil)
@@ -1259,6 +1261,7 @@
             m {"cmd" "artifact-get" "subnet_id" sub}]
         (cond-> m
           path (assoc "path" path)
+          cid (assoc "cid" cid)
           auth (assoc "authority" auth)
           out-file (assoc "out_file" out-file)
           relay-url (assoc "relay_url" relay-url)))
@@ -1373,7 +1376,8 @@
                   (has-flag? clean-tokens "--parent-subnet"))
               "verify-subnet-anchor"
 
-              (has-flag? clean-tokens "--path")
+              (or (has-flag? clean-tokens "--path")
+                  (has-flag? clean-tokens "--cid"))
               "artifact-get"
 
               (or (has-flag? clean-tokens "--sync")
@@ -1556,7 +1560,7 @@
                            (and (get m "nickname") (get m "verify")) "directory-verify"
                            (get m "nickname") "directory-lookup"
                            (get m "parent_subnet") "verify-subnet-anchor"
-                           (get m "path") "artifact-get"
+                           (or (get m "path") (get m "cid")) "artifact-get"
                            (or (get m "sync") (get m "balance")) "account"
                            (get m "identity") "identity"
                            :else "status")

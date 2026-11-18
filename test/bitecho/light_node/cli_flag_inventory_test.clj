@@ -540,4 +540,15 @@
         (is (= "web/SKILL.md" (get ar1 "path")))
         (is (= 6 (get ar1 "seq")))
         (is (= "https://bitecho.org" (get ar1 "relay_url")))
-        (is (= ar1 ar2))))))
+        (is (= ar1 ar2)))
+      (let [ag-cid1 (shell/build-one-shot-cmd-map "get" ["--cid" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"])
+            ag-cid2 (cli/build-cmd-map "get" ["--cid" "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"])]
+        (is (contains? (set cli/known-command-flags) "--cid"))
+        (is (contains? (set cli/known-command-flags) "--mcp"))
+        (is (= "artifact-get" (get ag-cid1 "cmd")))
+        (is (= "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" (get ag-cid1 "cid")))
+        (is (= ag-cid1 ag-cid2)))
+      (let [mcp1 (shell/parse-light-node-args ["--mcp" "--state-dir" "/tmp/mcp-flag-test"])
+            mcp2 (shell/parse-light-node-args ["mcp" "--state-dir" "/tmp/mcp-flag-test"])]
+        (is (= :mcp (:mode mcp1)))
+        (is (= :mcp (:mode mcp2)))))))
