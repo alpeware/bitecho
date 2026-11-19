@@ -79,10 +79,10 @@ verify_node_health() {
   local ip="${NODE_IPS[$node]}"
   echo "  [probe] Verifying ${node} (${ip})..."
 
-  # 1. HTTP :80 /healthz
+  # 1. HTTP :80 /healthz (accepts JVM plain "ok" or Node.js JSON '{"ok":true,...}')
   local hz
   hz="$(curl -fsS --max-time 5 "http://${ip}/healthz" || true)"
-  if [[ "${hz}" != "ok" ]]; then
+  if [[ "${hz}" != "ok" && "${hz}" != *'"ok":true'* ]]; then
     echo "  [FAIL] ${node} HTTP :80 /healthz returned '${hz}'" >&2
     return 1
   fi
@@ -90,7 +90,7 @@ verify_node_health() {
   # 2. HTTPS :443 /healthz (resolve domain to target IP)
   local hsz
   hsz="$(curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/healthz" || true)"
-  if [[ "${hsz}" != "ok" ]]; then
+  if [[ "${hsz}" != "ok" && "${hsz}" != *'"ok":true'* ]]; then
     echo "  [FAIL] ${node} HTTPS :443 /healthz returned '${hsz}'" >&2
     return 1
   fi
@@ -220,10 +220,20 @@ cmd_rollback() {
 cutover_single_node() {
   local node="$1"
   local ip="${NODE_IPS[$node]}"
-  echo "=== Cutting over ${node} (${ip}) to unified bitecho infra-node ==="
+  local target_runtime="${INFRA_RUNTIME:-jvm}"
+  echo "=== Cutting over ${node} (${ip}) to unified bitecho infra-node (runtime=${target_runtime}) ==="
+
+  rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    "${ROOT_DIR}/scripts/run-infra-node.sh" "${SSH_USER}@${ip}:/opt/bitecho-infra/run-node.sh"
+  if [[ -f "${ROOT_DIR}/dist/bitecho-full-node.cjs" ]]; then
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      "${ROOT_DIR}/dist/bitecho-full-node.cjs" "${SSH_USER}@${ip}:/opt/bitecho-infra/bitecho-full-node.cjs"
+  fi
 
   ssh_ns "$node" bash -s << REMOTE_CUT
 set -euo pipefail
+chmod +x /opt/bitecho-infra/run-node.sh
+printf 'RUNTIME=%s\n' "${target_runtime}" > /opt/bitecho-infra/active-runtime.env
 if [[ "${RESET_VALIDATOR_STATE:-0}" == "1" ]]; then
   echo "  Archiving and resetting validator state snapshot on ${node}..."
   sudo rm -rf /var/lib/clj-web/state/*
@@ -231,13 +241,15 @@ elif [[ -f "/var/lib/clj-web/state/snapshot-${node}.edn" ]] && head -c 3 "/var/l
   echo "  Archiving legacy Nippy validator snapshot on ${node} before Fressian boot..."
   sudo rm -rf /var/lib/clj-web/state/*
 fi
-echo "  Running idempotent state migration on /var/lib/clj-web..."
-sudo -u cljweb /opt/jdk-25/bin/java \
-  -Xms128m -Xmx256m \
-  --enable-native-access=ALL-UNNAMED \
-  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
-  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
-  -jar /opt/bitecho-infra/bitecho.jar migrate-infra /etc/bitecho-infra/config.edn
+if [[ "${target_runtime}" == "jvm" && -x /opt/jdk-25/bin/java ]]; then
+  echo "  Running idempotent state migration on /var/lib/clj-web..."
+  sudo -u cljweb /opt/jdk-25/bin/java \
+    -Xms128m -Xmx256m \
+    --enable-native-access=ALL-UNNAMED \
+    --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
+    --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
+    -jar /opt/bitecho-infra/bitecho.jar migrate-infra /etc/bitecho-infra/config.edn
+fi
 
 sudo tee /etc/systemd/system/bitecho-infra.service >/dev/null << 'UNIT_EOF'
 [Unit]
@@ -253,7 +265,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 WorkingDirectory=/var/lib/clj-web
-ExecStart=/opt/jdk-25/bin/java -Xms128m -Xmx448m -XX:MaxMetaspaceSize=112m -XX:MaxDirectMemorySize=64m -XX:+UseCompactObjectHeaders --enable-native-access=ALL-UNNAMED --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED --add-exports=java.base/sun.security.x509=ALL-UNNAMED -jar /opt/bitecho-infra/bitecho.jar infra-node /etc/bitecho-infra/config.edn
+ExecStart=/opt/bitecho-infra/run-node.sh
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
