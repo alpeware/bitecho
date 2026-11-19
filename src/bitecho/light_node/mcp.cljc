@@ -13,7 +13,7 @@
 (def mcp-server-info
   "MCP server identification metadata."
   {"name" "bitecho-mcp"
-   "version" "0.23.10"})
+   "version" "0.23.11"})
 
 (def curated-mcp-tools
   "Vector of the 9 MCP tool descriptors (8 curated + 1 escape hatch) per BIP-006 Part 1."

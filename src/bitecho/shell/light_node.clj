@@ -792,11 +792,25 @@
             {:ok? false :error "no-inband-snapshots-returned"}
             (light-core/verify-chain-state-quorum snaps verify-opts)))))))
 
+(defn- infer-bootstrap-relay-url
+  [bootstrap opts]
+  (when (and (nil? (:inband-snapshot-fetcher opts))
+             (nil? (:accountz-fetcher opts))
+             (not (false? (:use-relay-fast-path? opts))))
+    (let [u (or (:relay-url bootstrap)
+                (get-in bootstrap [:relay :url])
+                (first (:https-relay-urls bootstrap))
+                (when (some #(contains? #{"35.212.172.159" "35.209.253.119" "35.211.30.106"} (:ip %))
+                            (vals (:nodes bootstrap)))
+                  "https://ns1.bitecho.org"))]
+      (when (and (string? u) (not (str/blank? u)))
+        u))))
+
 (defn maybe-sync-account-state!
-  "Attempts in-band validator quorum sync over Port 5010/DTLS via fetch-inband-chain-state-quorum!.
-   If in-band returns snapshots and verifies quorum, updates state-atom and returns {:ok? true :state @state-atom :quorum-result q-res}.
-   If in-band quorum verification fails, fails closed immediately and returns {:ok? false :error (:error inband-res)}.
-   If zero in-band snapshots were reachable (and no inband fetcher provided), falls back to legacy HTTP fetch-validator-accountz!."
+  "Attempts fast HTTPS `/relay/v1/chain-state` 2f+1 quorum verification first when a relay URL is configured
+   or present on `bootstrap` (`P-NET-1`), falling back to in-band validator quorum sync over Port 5010/DTLS
+   via `fetch-inband-chain-state-quorum!`.
+   If quorum verification succeeds, updates state-atom and returns {:ok? true :state @state-atom :quorum-result q-res}."
   [state-atom bootstrap pubkey privkey-bytes opts]
   (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
     (let [nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
@@ -823,49 +837,70 @@
           {:ok? false :error (or (when-not (or (true? (get relay-resp "ok")) (true? (get relay-resp :ok)))
                                    (or (get relay-resp "error") (get relay-resp :error)))
                                  "no-verified-relay-snapshots")})))
-    (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})
-          inband-res (fetch-inband-chain-state-quorum! id bootstrap pubkey privkey-bytes opts)]
-      (cond
-        (:ok? inband-res)
-        (let [snap (:snapshot inband-res)]
-          (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
-          {:ok? true :state @state-atom :quorum-result inband-res})
+    (let [fast-relay-url (infer-bootstrap-relay-url bootstrap opts)
+          fast-res (when fast-relay-url
+                     (try
+                       (let [nonce (str (System/currentTimeMillis) "-" (java.util.UUID/randomUUID))
+                             relay-resp (fetch-relay-chain-state! fast-relay-url {:pubkey pubkey :nonce nonce :timeout-ms (or (:timeout-ms opts) 3000)})
+                             raw-snaps (or (get relay-resp "snapshots") (get relay-resp :snapshots) [])
+                             signed-snaps (filterv #(or (get % "signature") (get % :signature)) raw-snaps)]
+                         (when (seq signed-snaps)
+                           (let [trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+                                 verify-opts (assoc opts
+                                                    :expected-pubkey pubkey
+                                                    :expected-nonce nonce
+                                                    :trusted-validators trusted
+                                                    :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0)))
+                                 q-res (light-core/verify-chain-state-quorum signed-snaps verify-opts)]
+                             (when (:ok? q-res)
+                               (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st (:snapshot q-res))))
+                               {:ok? true :state @state-atom :quorum-result q-res}))))
+                       (catch Exception _ nil)))]
+      (if (:ok? fast-res)
+        fast-res
+        (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})
+              inband-res (fetch-inband-chain-state-quorum! id bootstrap pubkey privkey-bytes opts)]
+          (cond
+            (:ok? inband-res)
+            (let [snap (:snapshot inband-res)]
+              (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
+              {:ok? true :state @state-atom :quorum-result inband-res})
 
-        (and (or (:auto-relay-fallback? opts)
-                 (:relay-url bootstrap)
-                 (get-in bootstrap [:relay :url]))
-             (not (:relay-url opts)))
-        (let [fallback-url (or (:relay-url bootstrap)
-                               (get-in bootstrap [:relay :url])
-                               "https://bitecho.org/relay/v1")]
-          (maybe-sync-account-state! state-atom bootstrap pubkey privkey-bytes (assoc opts :relay-url fallback-url)))
+            (and (or (:auto-relay-fallback? opts)
+                     (:relay-url bootstrap)
+                     (get-in bootstrap [:relay :url]))
+                 (not (:relay-url opts)))
+            (let [fallback-url (or (:relay-url bootstrap)
+                                   (get-in bootstrap [:relay :url])
+                                   "https://bitecho.org/relay/v1")]
+              (maybe-sync-account-state! state-atom bootstrap pubkey privkey-bytes (assoc opts :relay-url fallback-url)))
 
-        (and (not= (:error inband-res) "no-inband-snapshots-returned")
-             (not= (:error inband-res) "empty-bootstrap-nodes"))
-        {:ok? false :error (:error inband-res)}
+            (and (not= (:error inband-res) "no-inband-snapshots-returned")
+                 (not= (:error inband-res) "empty-bootstrap-nodes"))
+            {:ok? false :error (:error inband-res)}
 
-        (:accountz-fetcher opts)
-        (if-let [resp ((:accountz-fetcher opts) bootstrap pubkey opts)]
-          (if (:account resp)
-            (let [cmd {"cmd" "sync-account"
-                       "balance" (get-in resp [:account :balance] 0)
-                       "spendable" (:spendable resp)
-                       "seq" (get-in resp [:account :seq] 0)
-                       "deps" (vec (get-in resp [:account :deps] []))
-                       "finalized_epoch" (:finalized-epoch resp 0)}
-                  res (light-core/handle-command @state-atom cmd privkey-bytes)]
-              (reset! state-atom (:state res))
-              {:ok? true :state @state-atom :accountz resp})
-            {:ok? false :error "no-account-in-accountz"})
-          {:ok? false :error "accountz-fetcher-returned-nil"})
+            (:accountz-fetcher opts)
+            (if-let [resp ((:accountz-fetcher opts) bootstrap pubkey opts)]
+              (if (:account resp)
+                (let [cmd {"cmd" "sync-account"
+                           "balance" (get-in resp [:account :balance] 0)
+                           "spendable" (:spendable resp)
+                           "seq" (get-in resp [:account :seq] 0)
+                           "deps" (vec (get-in resp [:account :deps] []))
+                           "finalized_epoch" (:finalized-epoch resp 0)}
+                      res (light-core/handle-command @state-atom cmd privkey-bytes)]
+                  (reset! state-atom (:state res))
+                  {:ok? true :state @state-atom :accountz resp})
+                {:ok? false :error "no-account-in-accountz"})
+              {:ok? false :error "accountz-fetcher-returned-nil"})
 
-        :else
-        (let [err (or (:error inband-res) "no-inband-snapshots-returned")]
-          (swap! state-atom (fn [st]
-                              (-> st
-                                  (update-in [:diagnostics :account-sync-inband-failed] (fnil inc 0))
-                                  (update-in [:diagnostics :chain-state-sync-failed] (fnil inc 0)))))
-          {:synced false :ok? false :reason err :error err})))))
+            :else
+            (let [err (or (:error inband-res) "no-inband-snapshots-returned")]
+              (swap! state-atom (fn [st]
+                                  (-> st
+                                      (update-in [:diagnostics :account-sync-inband-failed] (fnil inc 0))
+                                      (update-in [:diagnostics :chain-state-sync-failed] (fnil inc 0)))))
+              {:synced false :ok? false :reason err :error err})))))))
 
 (defn init-conn-state
   "Initializes the pure single-authority connection lifecycle state map."
@@ -2237,22 +2272,30 @@
         (str/replace #"/relay/v1$" "")
         (str/replace #"/artifact/v1$" ""))))
 
+(defn- effective-artifact-domain-verb
+  [verb cmd-map]
+  (let [v (str (or verb (get cmd-map "cmd") (:cmd cmd-map) ""))]
+    (if (contains? #{"put" "get" "list" "lock" "spend" "connect" "wait-event"} v)
+      (str (get (cli/desugar-cli-cmd-map (assoc (or cmd-map {}) "cmd" v)) "cmd" v))
+      v)))
+
 (defn- enrich-artifact-cmd-map
   [verb cmd-map]
-  (if (and (= verb "artifact-put")
-           (nil? (get cmd-map "hex"))
-           (nil? (get cmd-map "data_hex"))
-           (nil? (get cmd-map "text"))
-           (nil? (get cmd-map "data"))
-           (string? (get cmd-map "file"))
-           (not (str/blank? (get cmd-map "file"))))
-    (let [f (io/file (get cmd-map "file"))]
-      (if (.exists f)
-        (let [bs (Files/readAllBytes (.toPath f))
-              h (basalt/bytes->hex bs)]
-          (assoc cmd-map "hex" h "data_hex" h))
-        cmd-map))
-    cmd-map))
+  (let [eff-verb (effective-artifact-domain-verb verb cmd-map)]
+    (if (and (= eff-verb "artifact-put")
+             (nil? (get cmd-map "hex"))
+             (nil? (get cmd-map "data_hex"))
+             (nil? (get cmd-map "text"))
+             (nil? (get cmd-map "data"))
+             (string? (get cmd-map "file"))
+             (not (str/blank? (get cmd-map "file"))))
+      (let [f (io/file (get cmd-map "file"))]
+        (if (.exists f)
+          (let [bs (Files/readAllBytes (.toPath f))
+                h (basalt/bytes->hex bs)]
+            (assoc cmd-map "hex" h "data_hex" h))
+          cmd-map))
+      cmd-map)))
 
 (defn- post-artifact-to-relay!
   [raw-relay-url verb resp]
@@ -2262,43 +2305,46 @@
         (let [client (-> (HttpClient/newBuilder)
                          (.connectTimeout (Duration/ofSeconds 5))
                          (.build))
-              post-json! (fn [subpath payload-str content-type]
+              post-json! (fn [subpath payload-str content-type timeout-ms]
                            (let [req (-> (HttpRequest/newBuilder)
                                          (.uri (URI/create (str base-url subpath)))
-                                         (.timeout (Duration/ofSeconds 10))
+                                         (.timeout (Duration/ofMillis (long timeout-ms)))
                                          (.header "Content-Type" content-type)
                                          (.POST (HttpRequest$BodyPublishers/ofString payload-str StandardCharsets/UTF_8))
                                          (.build))
                                  r (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))]
                              (try (json/read-str (.body r)) (catch Exception _ {"status" (.statusCode r)}))))]
-          (when (= verb "artifact-put")
+          (when (contains? #{"artifact-put" "put"} (str verb))
             (when-let [blob (or (get resp "blob") (:blob resp))]
               (post-json! "/artifact/v1/blob"
                           (json/write-str {"bytes_hex" (basalt/bytes->hex (:blob/bytes blob))
                                            "cid" (:blob/cid blob)
                                            "media_type" (or (:blob/media-type blob) "application/octet-stream")})
-                          "application/json")))
+                          "application/json"
+                          30000)))
           (when-let [ptr (or (get resp "pointer") (:pointer resp))]
             (post-json! "/artifact/v1/pointer"
                         (pr-str ptr)
-                        "application/edn")))
+                        "application/edn"
+                        15000)))
         (catch Exception _ nil)))))
 
 (defn- maybe-write-artifact-out-file!
   [verb cmd-map resp]
-  (when (and (= verb "artifact-get")
-             (map? resp)
-             (true? (or (get resp "ok") (:ok resp)))
-             (string? (get cmd-map "out_file"))
-             (not (str/blank? (get cmd-map "out_file")))
-             (string? (get resp "hex")))
-    (try
-      (let [f (io/file (get cmd-map "out_file"))]
-        (when-let [p (.getParentFile f)] (.mkdirs p))
-        (Files/write (.toPath f)
-                     ^bytes (basalt/hex->bytes (get resp "hex"))
-                     (into-array java.nio.file.OpenOption [])))
-      (catch Exception _ nil))))
+  (let [eff-verb (effective-artifact-domain-verb verb cmd-map)]
+    (when (and (= eff-verb "artifact-get")
+               (map? resp)
+               (true? (or (get resp "ok") (:ok resp)))
+               (string? (get cmd-map "out_file"))
+               (not (str/blank? (get cmd-map "out_file")))
+               (string? (get resp "hex")))
+      (try
+        (let [f (io/file (get cmd-map "out_file"))]
+          (when-let [p (.getParentFile f)] (.mkdirs p))
+          (Files/write (.toPath f)
+                       ^bytes (basalt/hex->bytes (get resp "hex"))
+                       (into-array java.nio.file.OpenOption [])))
+        (catch Exception _ nil)))))
 
 (defn handle-serve-line!
   "Processes a single STDIN, --cmd-file JSON line, or control-socket command map in serve mode,
@@ -2340,14 +2386,15 @@
                                     cmd-map)
                                   (as-> m (enrich-artifact-cmd-map verb m)))
                 prev-state @state-atom
+                eff-domain-verb (effective-artifact-domain-verb verb effective-map)
                 res (light-core/handle-command @state-atom effective-map (:privkey-bytes identity))
-                _ (maybe-write-artifact-out-file! verb effective-map (:response res))
-                _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
+                _ (maybe-write-artifact-out-file! eff-domain-verb effective-map (:response res))
+                _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
                     (when-let [art-relay (or (get effective-map "relay_url")
                                              (get effective-map "relay-url")
                                              (:relay-url effective-map)
                                              relay-url)]
-                      (post-artifact-to-relay! art-relay verb (:response res))))
+                      (post-artifact-to-relay! art-relay eff-domain-verb (:response res))))
                 finish-resp! (fn [resp]
                                (if (and (contains? #{"offer" "rendezvous-offer"} verb) (pos? wait-ms))
                                  (let [sid (or (get resp "session_id") (get resp "session-id") (get resp :session-id) (get-in res [:response "session_id"]))]
@@ -3390,14 +3437,15 @@
             (emit-json-line! out-writer err-resp)
             err-resp)
           (binding [*out* *err*]
-            (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
-                  _ (maybe-write-artifact-out-file! verb cmd-map (:response res))
-                  _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
+            (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
+                  res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
+                  _ (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res))
+                  _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
                       (when-let [art-relay (or (get cmd-map "relay_url")
                                                (get cmd-map "relay-url")
                                                (:relay-url cmd-map)
                                                effective-relay-url)]
-                        (post-artifact-to-relay! art-relay verb (:response res))))
+                        (post-artifact-to-relay! art-relay eff-domain-verb (:response res))))
                   new-state (:state res)
                   all-net-envs (into (vec poll-auto-envs) (:net-envelopes res))
                   connect-explicit? (contains? opts :connect?)

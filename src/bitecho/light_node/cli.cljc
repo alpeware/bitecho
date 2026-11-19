@@ -204,7 +204,7 @@
    "--autonomous" "--auto-sync" "--auto-register-home-set" "--no-auto-register-home-set"
    "--wait-open-ms" "--block" "--until-event" "--help" "--mcp"
    "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
-   "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"])
+   "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -655,24 +655,38 @@
       "p2p-offer"
       (let [sid (or (extract-flag-value clean-tokens "--session-id" nil)
                     (extract-flag-value clean-tokens "--session" nil))
-            cands (extract-flag-value clean-tokens "--candidates" nil)
+            to (or (extract-flag-value clean-tokens "--to" nil)
+                   (extract-flag-value clean-tokens "--peer" nil)
+                   (extract-flag-value clean-tokens "--callee" nil))
+            cands (or (extract-flag-value clean-tokens "--candidates" nil)
+                      (extract-flag-value clean-tokens "--endpoint" nil))
             tr (extract-flag-value clean-tokens "--transport" nil)
+            b (extract-long-flag clean-tokens "--burn" nil)
             m {"cmd" "p2p-offer"}]
         (cond-> m
           sid (assoc "session_id" sid)
+          to (assoc "to" to "peer" to)
           cands (assoc "candidates" (vec (remove str/blank? (map str/trim (str/split cands #",")))))
-          tr (assoc "transport" tr)))
+          tr (assoc "transport" tr)
+          (some? b) (assoc "burn" b)))
 
       "p2p-answer"
       (let [sid (or (extract-flag-value clean-tokens "--session-id" nil)
                     (extract-flag-value clean-tokens "--session" nil))
-            cands (extract-flag-value clean-tokens "--candidates" nil)
+            to (or (extract-flag-value clean-tokens "--to" nil)
+                   (extract-flag-value clean-tokens "--peer" nil)
+                   (extract-flag-value clean-tokens "--callee" nil))
+            cands (or (extract-flag-value clean-tokens "--candidates" nil)
+                      (extract-flag-value clean-tokens "--endpoint" nil))
             tr (extract-flag-value clean-tokens "--transport" nil)
+            b (extract-long-flag clean-tokens "--burn" nil)
             m {"cmd" "p2p-answer"}]
         (cond-> m
           sid (assoc "session_id" sid)
+          to (assoc "to" to "peer" to)
           cands (assoc "candidates" (vec (remove str/blank? (map str/trim (str/split cands #",")))))
-          tr (assoc "transport" tr)))
+          tr (assoc "transport" tr)
+          (some? b) (assoc "burn" b)))
 
       "p2p-channel-state"
       (let [sid (or (extract-flag-value clean-tokens "--session-id" nil)
@@ -1465,11 +1479,13 @@
               (has-flag? clean-tokens "--connected")
               "p2p-channel-state"
 
-              (and (has-flag? clean-tokens "--candidates")
+              (and (or (has-flag? clean-tokens "--candidates")
+                       (has-flag? clean-tokens "--endpoint"))
                    (has-flag? clean-tokens "--answer"))
               "p2p-answer"
 
-              (has-flag? clean-tokens "--candidates")
+              (or (has-flag? clean-tokens "--candidates")
+                  (has-flag? clean-tokens "--endpoint"))
               "p2p-offer"
 
               (has-flag? clean-tokens "--close")

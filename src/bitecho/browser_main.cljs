@@ -2165,7 +2165,7 @@
        "pollRelayEnvelopes" poll-relay-envelopes!
        "ackRelayEnvelopes" ack-relay-envelopes!
        "fetchRelayChainState" fetch-relay-chain-state!
-       "version" "0.23.10"})
+       "version" "0.23.11"})
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api))

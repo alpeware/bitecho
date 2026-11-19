@@ -160,6 +160,26 @@ ssh_cmd() {
   ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR -i "${key}" "${user}@${ip}" "$@"
 }
 
+scp_to() {
+  local src="$1"
+  local node="$2"
+  local dest="$3"
+  local ip
+  ip="$(get_ip "$node")"
+  if [[ -z "$ip" ]]; then
+    return 1
+  fi
+  local user="${SSH_USER}"
+  local key="${SSH_KEY}"
+  if [[ "$node" == ns* ]]; then
+    user="${INFRA_SSH_USER:-cljweb}"
+    if [[ -f "${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519" ]]; then
+      key="${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519"
+    fi
+  fi
+  scp -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR -i "${key}" "${src}" "${user}@${ip}:${dest}"
+}
+
 ensure_firewall_rule() {
   local project="$1"
   local name="$2"
@@ -423,7 +443,7 @@ EDN_EOF
 
 verify_release_proof_gate() {
   local version="${1:-$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.10}"
+  version="${version:-0.23.11}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Step 0a/8: Verifying Release Proof Gate for v${version}..."
@@ -663,7 +683,7 @@ cmd_deploy() {
     ip="$(get_ip "$node")"
     echo "Uploading to ${node} (${ip})..."
     ssh_cmd "$node" "if [ -f /opt/bitecho/bitecho.jar ]; then cp -pf /opt/bitecho/bitecho.jar /opt/bitecho/bitecho.jar.prev; fi"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
       "${ROOT_DIR}/target/bitecho.jar" "${SSH_USER}@${ip}:/opt/bitecho/bitecho.jar"
   done
   local infra_ssh_key="${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519"
@@ -671,8 +691,8 @@ cmd_deploy() {
     local ip
     ip="$(get_ip "$node")"
     echo "Uploading to ${node} (${ip})..."
-    ssh_cmd "$node" "mkdir -p /opt/bitecho-infra /etc/bitecho-infra && if [ -f /opt/bitecho-infra/bitecho.jar ]; then cp -pf /opt/bitecho-infra/bitecho.jar /opt/bitecho-infra/bitecho.jar.prev; fi"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${infra_ssh_key}" \
+    ssh_cmd "$node" "mkdir -p /opt/bitecho-infra /etc/bitecho-infra && if [ -f /opt/bitecho-infra/bitecho.jar ]; then cp -pf /opt/bitecho-infra/bitecho.jar /opt/bitecho-infra/bitecho.jar.prev; cp -pf /opt/bitecho-infra/bitecho.jar /opt/bitecho-infra/bitecho.jar.bak; fi"
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${infra_ssh_key}" \
       "${ROOT_DIR}/target/bitecho.jar" "cljweb@${ip}:/opt/bitecho-infra/bitecho.jar"
   done
 
@@ -834,7 +854,7 @@ CFG_EOF
     echo "Validating config locally for ${node}..."
     "$local_java" -jar "${ROOT_DIR}/target/bitecho.jar" validate-config "$tmp_cfg"
 
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
       "$tmp_cfg" "${SSH_USER}@${ip}:/etc/bitecho/config.edn.new"
     rm -f "$tmp_cfg"
 

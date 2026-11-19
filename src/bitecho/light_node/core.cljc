@@ -246,7 +246,8 @@
                            :signature sig-hex}
                     effective-dac (assoc :dac effective-dac))))))))
 
-(defn- build-gossip-envelope
+(defn build-gossip-envelope
+  "Builds and signs a `:receive-gossip` agent envelope across JVM and ClojureScript."
   ([sender-pub-hex sender-priv-bytes payload-bytes burn-amount]
    (build-gossip-envelope sender-pub-hex sender-priv-bytes payload-bytes burn-amount "global"))
   ([sender-pub-hex sender-priv-bytes payload-bytes burn-amount subnet-id]
@@ -1429,11 +1430,12 @@
 
                           (> (count preferred-matching) 1)
                           (if (= preference :open)
-                            ;; Pick most recently active open session (or lexicographical tie-break)
+                            ;; Pick most active open session by (tx-seq + rx-high-seq), then epoch, then lexicographical session-id
                             (first (last (sort-by (fn [[sid s]]
-                                                    [(long (or (:last-active-epoch s) 0))
-                                                     (long (or (:created-epoch s) 0))
-                                                     (long (or (:outbound-seq s) (:tx-seq s) 0))
+                                                    [(+ (long (or (:tx-seq s) (:outbound-seq s) 0))
+                                                        (long (or (:rx-high-seq s) (:inbound-seq s) (:rx-seq s) 0)))
+                                                     (long (or (:last-active-epoch s) (:epoch s) (:created-epoch s) 0))
+                                                     (long (or (:created-epoch s) (:epoch s) 0))
                                                      (str sid)])
                                                   preferred-matching)))
                             nil)
@@ -1443,9 +1445,10 @@
 
                           (and (> (count matching) 1) (= preference :open))
                           (first (last (sort-by (fn [[sid s]]
-                                                  [(long (or (:last-active-epoch s) 0))
-                                                   (long (or (:created-epoch s) 0))
-                                                   (long (or (:outbound-seq s) (:tx-seq s) 0))
+                                                  [(+ (long (or (:tx-seq s) (:outbound-seq s) 0))
+                                                      (long (or (:rx-high-seq s) (:inbound-seq s) (:rx-seq s) 0)))
+                                                   (long (or (:last-active-epoch s) (:epoch s) (:created-epoch s) 0))
+                                                   (long (or (:created-epoch s) (:epoch s) 0))
                                                    (str sid)])
                                                 matching)))
 
@@ -2340,11 +2343,12 @@
           {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
           (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
                 transport (str (or (get cmd-map "transport") (:transport cmd-map) "udp"))
-                explicit-cands? (let [c (or (get cmd-map "candidates") (:candidates cmd-map))]
-                                  (and (some? c)
-                                       (if (string? c) (not (str/blank? c)) (seq c))))
+                explicit-cands-val (or (get cmd-map "candidates") (:candidates cmd-map)
+                                       (get cmd-map "endpoint") (:endpoint cmd-map))
+                explicit-cands? (and (some? explicit-cands-val)
+                                     (if (string? explicit-cands-val) (not (str/blank? explicit-cands-val)) (seq explicit-cands-val)))
                 raw-cands (if explicit-cands?
-                            (or (get cmd-map "candidates") (:candidates cmd-map))
+                            explicit-cands-val
                             (or (not-empty (get-in session [:p2p-meta :local-candidates]))
                                 (not-empty (get-in session [:p2p-meta :preferred-candidates]))
                                 (not-empty (get-in session [:p2p :local-candidates]))
@@ -2495,11 +2499,12 @@
           {:state state :response {"ok" false "error" "session-not-open"} :net-envelopes [] :stdout-events []}
           (let [sub-id (str (or (get cmd-map "subnet_id") (get cmd-map "subnet-id") (:subnet-id cmd-map) (:subnet-id state) "global"))
                 transport (str (or (get cmd-map "transport") (:transport cmd-map) (get-in session [:p2p :remote-transport]) "udp"))
-                explicit-cands? (let [c (or (get cmd-map "candidates") (:candidates cmd-map))]
-                                  (and (some? c)
-                                       (if (string? c) (not (str/blank? c)) (seq c))))
+                explicit-cands-val (or (get cmd-map "candidates") (:candidates cmd-map)
+                                       (get cmd-map "endpoint") (:endpoint cmd-map))
+                explicit-cands? (and (some? explicit-cands-val)
+                                     (if (string? explicit-cands-val) (not (str/blank? explicit-cands-val)) (seq explicit-cands-val)))
                 raw-cands (if explicit-cands?
-                            (or (get cmd-map "candidates") (:candidates cmd-map))
+                            explicit-cands-val
                             (or (not-empty (get-in session [:p2p-meta :local-candidates]))
                                 (not-empty (get-in session [:p2p-meta :preferred-candidates]))
                                 (not-empty (get-in session [:p2p :local-candidates]))
@@ -7210,6 +7215,13 @@
                         :stdout-events [diag-evt]})
                      (let [already-connected? (or (true? (get-in session [:p2p :connected?]))
                                                   (= :open (get-in session [:p2p :phase])))
+                           effective-sk (or privkey-bytes
+                                            (when-let [pk (:privkey state)]
+                                              (try (if (bytes? pk) pk (basalt/hex->bytes pk)) (catch #?(:clj Exception :cljs :default) _ nil)))
+                                            (when-let [pk-b (get-in state [:identity :privkey-bytes])] pk-b))
+                           auto-answer? (or already-connected?
+                                            (and (boolean (:autonomous? state))
+                                                 (some? effective-sk)))
                            p2p-base (get session :p2p {})
                            pname (pubkey->petname state (:sender msg))
                            evt (cond-> {"event" "p2p-offer-received"
@@ -7218,11 +7230,14 @@
                                         "transport" transport
                                         "candidates" candidates}
                                  pname (assoc "from_petname" pname))]
-                       (if already-connected?
+                       (if auto-answer?
                          (let [_now-ms (long (or (:now-ms msg) (:epoch state 0)))
                                answer-seq (inc (max (long (or (get-in session [:p2p-meta :local-signal-seq]) (get-in session [:p2p :local-signal-seq]) 0))
                                                     (long (or (:signal-seq msg) 0))))
-                               tr (str (or (get-in session [:p2p :local-transport]) (get-in session [:p2p-meta :preferred-transport]) "udp"))
+                               tr (str (or (get-in session [:p2p :local-transport])
+                                           (get-in session [:p2p-meta :preferred-transport])
+                                           transport
+                                           "udp"))
                                incoming-relay-cands (filterv shared-http-relay-candidate? candidates)
                                existing-relay-cands (filterv shared-http-relay-candidate?
                                                              (concat (get-in session [:p2p :local-candidates])
@@ -7247,10 +7262,6 @@
                                ice-p (str (or (get-in session [:p2p :local-ice-pwd]) (get-in state [:ice-creds :pwd]) "pwd"))
                                local-fp (str (or (get-in session [:p2p :local-fingerprint]) (:fingerprint state) ""))
                                ep (effective-session-wire-epoch state session)
-                               effective-sk (or privkey-bytes
-                                                (when-let [pk (:privkey state)]
-                                                  (try (if (bytes? pk) pk (basalt/hex->bytes pk)) (catch #?(:clj Exception :cljs :default) _ nil)))
-                                                (when-let [pk-b (get-in state [:identity :privkey-bytes])] pk-b))
                                ans-sig-str (canonical-p2p-signal-str :answer sid (:pubkey state) (:sender msg) tr cands ice-u ice-p local-fp ep answer-seq)
                                ans-sig-bytes (when effective-sk (crypto/sign effective-sk (fressian/utf8->bytes ans-sig-str)))
                                ans-sig-hex (when ans-sig-bytes (if (string? ans-sig-bytes) ans-sig-bytes (basalt/bytes->hex ans-sig-bytes)))
@@ -7289,8 +7300,14 @@
                                         "signal_seq" answer-seq
                                         :signal_seq answer-seq}
                                p2p-entry (assoc p2p-base
-                                                :phase :open
-                                                :connected? true
+                                                :phase (if already-connected? :open :connecting)
+                                                :connected? (boolean already-connected?)
+                                                :role :responder
+                                                :local-transport tr
+                                                :local-candidates cands
+                                                :local-ice-ufrag ice-u
+                                                :local-ice-pwd ice-p
+                                                :local-fingerprint local-fp
                                                 :remote-candidates (vec candidates)
                                                 :remote-transport transport
                                                 :remote-ice-ufrag ice-ufrag
@@ -7329,7 +7346,7 @@
                                               :remote-fingerprint fp})]
                            (cond-> {:state new-state
                                     :net-envelopes (if env [env] [])
-                                    :stdout-events [ans-evt]}
+                                    :stdout-events (if already-connected? [ans-evt] [evt ans-evt])}
                              dial-effect (assoc :p2p-dial dial-effect)))
                          (let [p2p-entry (merge p2p-base
                                                 {:phase :offer-received

@@ -17,6 +17,7 @@
             [bitecho.d30-artifact-publishing-scenarios-test :as d30-test]
             [bitecho.d31-unification-iii-scenarios-test :as d31-test]
             [bitecho.d32-bip006-onboarding-and-network-test :as d32-test]
+            [bitecho.d33-bip007-low-latency-and-infra-test :as d33-test]
             [bitecho.e2e.d29-remediation-scenario-test :as d29-test]
             [bitecho.economy.account :as account]
             [bitecho.economy.escrow :as escrow]
@@ -554,11 +555,34 @@
      :count (count results)
      :scenarios results}))
 
+(defn- run-d33-scenarios
+  "Executes the 5 Milestone D33 (BIP-007 / v0.23.11) low-latency quorum sync, zero-burn HTTPS relay legs & infra scenarios (S-D33-1..S-D33-5)."
+  []
+  (let [scenarios [{:id "S-D33-1" :name "fast-local-only-and-http-quorum-chain-state" :test-fn d33-test/scenario-s-d33-1-fast-local-only-and-http-quorum-chain-state-test}
+                   {:id "S-D33-2" :name "zero-burn-https-relay-p2p-leg-e2e" :test-fn d33-test/scenario-s-d33-2-zero-burn-https-relay-p2p-leg-e2e-test}
+                   {:id "S-D33-3" :name "canonical-put-relay-upload-and-idempotent-pointer" :test-fn d33-test/scenario-s-d33-3-canonical-put-relay-upload-and-idempotent-pointer-test}
+                   {:id "S-D33-4" :name "light-node-https-relay-first-quorum-sync" :test-fn d33-test/scenario-s-d33-4-light-node-https-relay-first-quorum-sync-test}
+                   {:id "S-D33-5" :name "ops-scripts-batchmode-rollback-and-sha256" :test-fn d33-test/scenario-s-d33-5-ops-scripts-batchmode-rollback-and-sha256-test}]
+        results (mapv (fn [{:keys [id name test-fn]}]
+                        (let [pass? (try
+                                      (binding [t/*report-counters* (ref t/*initial-report-counters*)]
+                                        (test-fn)
+                                        (zero? (+ (:fail @t/*report-counters* 0)
+                                                  (:error @t/*report-counters* 0))))
+                                      (catch Exception _ false))]
+                          {:scenario id
+                           :name name
+                           :passed? pass?}))
+                      scenarios)]
+    {:all-passed? (every? true? (map :passed? results))
+     :count (count results)
+     :scenarios results}))
+
 (defn run-release-proof
-  "Runs the complete Milestone D32 (v0.23.10) release verification proof and returns a deterministic EDN map."
+  "Runs the complete Milestone D33 (v0.23.11) release verification proof and returns a deterministic EDN map."
   [opts]
   (let [ver (or (:version opts) (str "v" config/version))
-        ms (or (:milestone opts) "D32")
+        ms (or (:milestone opts) "D33")
         devnet-res (run-single-network-e2e :devnet)
         testnet-res (run-single-network-e2e :testnet)
         mainnet-res (run-single-network-e2e :mainnet)
@@ -573,6 +597,7 @@
         d30-scenarios (run-d30-scenarios)
         d31-scenarios (run-d31-scenarios)
         d32-scenarios (run-d32-scenarios)
+        d33-scenarios (run-d33-scenarios)
         bundle-file (io/file "dist/bitecho-light-node.cjs")
         _ (assert (and (.exists bundle-file) (pos? (.length bundle-file)))
                   "dist/bitecho-light-node.cjs must exist and be non-empty before release proof generation!")
@@ -596,7 +621,8 @@
                                   (:all-passed? d29-scenarios)
                                   (:all-passed? d30-scenarios)
                                   (:all-passed? d31-scenarios)
-                                  (:all-passed? d32-scenarios)))]
+                                  (:all-passed? d32-scenarios)
+                                  (:all-passed? d33-scenarios)))]
     {:milestone ms
      :version ver
      :all-passed? all-passed?
@@ -613,6 +639,7 @@
                        "bitecho.d30-artifact-publishing-scenarios-test"
                        "bitecho.d31-unification-iii-scenarios-test"
                        "bitecho.d32-bip006-onboarding-and-network-test"
+                       "bitecho.d33-bip007-low-latency-and-infra-test"
                        "bitecho.state-machine-test"]
      :d24-remediation-scenarios d24-scenarios
      :d25-remediation-scenarios d25-scenarios
@@ -623,6 +650,7 @@
      :d30-artifact-publishing-scenarios d30-scenarios
      :d31-unification-iii-scenarios d31-scenarios
      :d32-bip006-onboarding-and-network-scenarios d32-scenarios
+     :d33-bip007-low-latency-and-infra-scenarios d33-scenarios
      :networks {"devnet.bitecho.org" devnet-res
                 "testnet.bitecho.org" testnet-res
                 "mainnet.bitecho.org" mainnet-res}

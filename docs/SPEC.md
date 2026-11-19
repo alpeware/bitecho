@@ -356,6 +356,26 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 1. **Browser Sociocratic Governance & Broadcast (`bitecho.browser-main`, `resources/public/index.html`):** Exposes `submitBip`, `consentBip`, `objectBip`, `getBipStatus`, `broadcastMessage`, and `claimHardwareKeyFaucet` on `globalThis.BitechoBrowser` with corresponding dashboard UI controls.
 2. **Hardware-Key Sponsored Faucet Receipts (`bitecho.core.protocol.faucet`, `bitecho.shell.http`):** `faucet/reduce-faucet-claim` issues a single `1,000,000 ECH` drip per attested hardware credential ID, producing a signed transfer and signed fractal `Blob`/`Pointer` receipt at `faucet/<network-uri>/claims/<credential-id-hash>`.
 
+---
+
+## 13. Milestone D33: BIP-007 Low-Latency Quorum Sync, Zero-Burn HTTPS Relay Legs & Cluster Operations Hardening (`v0.23.11`)
+
+### 13.1 Sub-25ms Zero-UDP `/relay/v1/chain-state` & Light-Node Quorum Sync (`P-NET-1`)
+1. **Fast Local-Only Snapshot Endpoint (`/relay/v1/chain-state?local_only=true`):** `http/handle-relay-chain-state` supports `local_only=true`, returning the co-located validator's signed snapshot in `< 5ms` without dialing remote UDP `:5010`.
+2. **Parallel HTTP Peer Snapshot Aggregation (`infra/fetch-validator-chain-state-snapshots!`):** Infra nodes query peer `http://<peer-ip>/relay/v1/chain-state?pubkey=<pk>&nonce=<n>&local_only=true` endpoints in parallel (`1200ms` timeout) and verify each validator's Ed25519 signature before falling back to UDP `:5010` for any remaining validators.
+3. **Signed Snapshot in `/accountz` (`mesh/make-http-handler`):** When `pubkey` and `nonce` query parameters are provided to `/accountz`, the validator includes `:snapshot` signed with its Ed25519 identity.
+4. **HTTPS Relay-First Light-Node Sync (`maybe-sync-account-state!`):** When a relay URL is configured or present on `bootstrap`, light nodes attempt `/relay/v1/chain-state` `2f+1` quorum verification first (`3000ms` timeout) before spawning ephemeral UDP `:5010` WebRTC PeerConnections.
+
+### 13.2 Zero-Burn HTTPS Relay P2P Legs, `--autonomous` Auto-Answer, & Session Resolution (`P-NET-2`)
+1. **Zero-Burn P2P Mailbox Admission (`relay/reduce-relay`):** P2P envelopes (`:sealed-message`, `:session-ack`, `:p2p-broadcast`, `:p2p-hub-relay`, `:p2p-offer`, `:p2p-answer`, `:p2p-link-bind`, `:p2p-ping`, `:p2p-pong`) are admitted into recipient `:mailboxes` / `:broadcasts` at `0` ECH burn, while `:forward-to-validators` is emitted only when `burn-amt >= min-signaling-burn`.
+2. **Autonomous `:p2p-offer` Auto-Answer (`handle-wire-p2p-offer`):** When `(:autonomous? state)` is `true`, incoming `:p2p-offer` envelopes on open sessions automatically generate a signed `:p2p-answer`, emit both `"p2p-offer-received"` and `"p2p-offer-answered-while-open"`, and populate `:p2p-dial`.
+3. **Most-Active Open Session Resolution (`resolve-session-id`, `cli/build-cmd-map`):** `resolve-session-id` selects the open session with highest `(tx-seq + rx-high-seq)` (tie-breaking by `:epoch` and `:session-id`), and `p2p-offer` / `p2p-answer` support `--to` and `--endpoint`.
+
+### 13.3 Canonical `put` Relay Publishing, Idempotent `/artifact/v1/pointer`, & Ops Hardening (`P-ART-1`, `P-OPS-1`, `P-OPS-2`)
+1. **Canonical `put` Relay Upload & Idempotent Pointer Acceptance:** Both `"put"` and `"artifact-put"` trigger `post-artifact-to-relay!` (`30000ms` blob timeout, `15000ms` pointer timeout, awaited before process exit in one-shot mode), and `/artifact/v1/pointer` returns `200 OK` (`"idempotent": true`) when an already-applied pointer is re-submitted.
+2. **Non-Interactive SSH & Infra Rollback Hardening (`scripts/cluster.sh`, `scripts/infra_cluster.sh`):** All `ssh`, `scp`, and `rsync` invocations enforce `-o BatchMode=yes -o StrictHostKeyChecking=accept-new`; `rollback_node` restores `/opt/bitecho-infra/bitecho.jar.bak` and restarts `bitecho-infra.service`; and `publish-git --deploy` verifies live `/dist/bitecho-light-node.cjs.sha256`.
+
+
 
 
 

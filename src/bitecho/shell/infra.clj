@@ -13,6 +13,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.data :as data]
             [bitecho.core.protocol.acme :as acme-proto]
+            [bitecho.core.protocol.relay :as relay]
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
@@ -21,14 +22,18 @@
             [bitecho.shell.discovery :as discovery]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.light-node :as light-node]
+            [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [datachannel.api :as api])
   (:import [java.io File]
+           [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
            [java.nio.file CopyOption Files OpenOption StandardCopyOption]
            [java.security SecureRandom]
+           [java.time Duration]
            [java.util.concurrent Executors ScheduledExecutorService TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong]
            [javax.crypto Cipher]
@@ -418,49 +423,139 @@
 
     :else nil))
 
+(defn- normalize-http-chain-state-snapshot
+  [s]
+  (when (map? s)
+    (let [val-pub (or (:validator-pubkey s) (get s "validator_pubkey") (get s "validator-pubkey") (:validator s) (get s "validator"))
+          pk (or (:pubkey s) (get s "pubkey"))
+          fin-ep (long (or (:finalized-epoch s) (get s "finalized_epoch") (get s "finalized-epoch") 0))
+          bal (long (or (:balance s) (get s "balance") 0))
+          spd (long (or (:spendable s) (get s "spendable") bal 0))
+          sq (long (or (:seq s) (get s "seq") 0))
+          deps (vec (or (:deps s) (get s "deps") []))
+          escrows (vec (or (:escrows s) (get s "escrows") []))
+          nonce (str (or (:nonce s) (get s "nonce") ""))
+          sig (or (:signature s) (get s "signature"))
+          snap {:bitecho/type :chain-state-snapshot
+                :type :chain-state-snapshot
+                :validator-pubkey val-pub
+                :validator_pubkey val-pub
+                :pubkey pk
+                :finalized-epoch fin-ep
+                :finalized_epoch fin-ep
+                :balance bal
+                :spendable spd
+                :seq sq
+                :deps deps
+                :escrows escrows
+                :nonce nonce
+                :signature sig}]
+      (when (relay/verify-chain-state-snapshot-signature snap)
+        snap))))
+
+(defn- query-peer-http-local-snapshot!
+  [node target-pubkey nonce]
+  (let [ip (or (:ip4 node) (:ip node) (:host node))
+        http-port (or (:http-port node)
+                      (when (or (contains? #{:ns1 :ns2 :ns3 "ns1" "ns2" "ns3"} (:node-id node))
+                                (contains? #{"35.212.172.159" "35.209.253.119" "35.211.30.106"} ip)
+                                (and (string? (:ingress-host node))
+                                     (not (str/includes? (:ingress-host node) ".ingress."))))
+                        80))
+        acc-port (:accountz-port node)]
+    (or (when (and ip http-port target-pubkey)
+          (try
+            (let [client (-> (HttpClient/newBuilder)
+                             (.connectTimeout (Duration/ofMillis 1200))
+                             (.build))
+                  url (str "http://" ip ":" http-port "/relay/v1/chain-state?pubkey="
+                           (java.net.URLEncoder/encode (str target-pubkey) StandardCharsets/UTF_8)
+                           "&nonce=" (java.net.URLEncoder/encode (str (or nonce "")) StandardCharsets/UTF_8)
+                           "&local_only=true")
+                  req (-> (HttpRequest/newBuilder (URI/create url))
+                          (.timeout (Duration/ofMillis 1200))
+                          (.GET)
+                          (.build))
+                  resp (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))]
+              (when (= 200 (.statusCode resp))
+                (let [parsed (json/read-str (.body resp))
+                      raw-snaps (get parsed "snapshots" [])]
+                  (first (keep normalize-http-chain-state-snapshot raw-snaps)))))
+            (catch Exception _ nil)))
+        (when (and ip acc-port target-pubkey)
+          (try
+            (let [client (-> (HttpClient/newBuilder)
+                             (.connectTimeout (Duration/ofMillis 1000))
+                             (.build))
+                  url (str "http://" ip ":" acc-port "/accountz?pubkey="
+                           (java.net.URLEncoder/encode (str target-pubkey) StandardCharsets/UTF_8)
+                           "&nonce=" (java.net.URLEncoder/encode (str (or nonce "")) StandardCharsets/UTF_8))
+                  req (-> (HttpRequest/newBuilder (URI/create url))
+                          (.timeout (Duration/ofMillis 1000))
+                          (.GET)
+                          (.build))
+                  resp (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))]
+              (when (= 200 (.statusCode resp))
+                (let [parsed (edn/read-string (.body resp))]
+                  (normalize-http-chain-state-snapshot (:snapshot parsed)))))
+            (catch Exception _ nil))))))
+
 (defn fetch-validator-chain-state-snapshots!
   "Queries validator nodes in parallel for chain-state snapshots for target-pubkey.
    When a co-located `:validator-node` is present on `rt` (`ns1..ns3`), immediately builds
-   its signed snapshot in-memory (< 5ms) and queries the remaining remote validators with a
-   fast 1500ms timeout (`F-SYNC-1`)."
-  [rt validator-bootstrap target-pubkey nonce]
-  (let [vnode (:validator-node rt)
-        local-snap (when (and vnode target-pubkey)
-                     (try
-                       (let [sa (or (:state-atom vnode)
-                                    (get-in vnode [:shell-node :state-atom]))
-                             st (when (instance? clojure.lang.IDeref sa) @sa)
-                             vid (:identity vnode)
-                             build-fn (requiring-resolve 'bitecho.shell.mesh/build-validator-chain-state-snapshot)]
-                         (when (and build-fn (map? st) (seq st))
-                           (build-fn st vid target-pubkey nonce)))
-                       (catch Exception _ nil)))
-        local-val-pk (when local-snap
-                       (light-core/normalize-pubkey-hex (:validator-pubkey local-snap)))
-        bootstrap (resolve-validator-bootstrap validator-bootstrap)
-        remote-nodes (->> (vals (:nodes bootstrap))
-                          (remove (fn [node]
-                                    (and local-val-pk
-                                         (= local-val-pk (light-core/normalize-pubkey-hex (:pubkey node))))))
-                          vec)
-        ident (or (:peer-identity rt)
-                  (when (:state-dir rt)
-                    (try
-                      (load-or-create-infra-peer-identity! (:state-dir rt) (or (:node-id rt) :ns1))
-                      (catch Exception _ nil))))
-        privkey (or (:privkey-bytes ident) (:node-privkey rt))
-        remote-snaps (if-not (and ident (:cert-data ident) target-pubkey privkey (seq remote-nodes))
-                       []
-                       (->> remote-nodes
-                            (pmap (fn [node]
-                                    (try
-                                      (light-node/query-validator-chain-state!
-                                       ident node target-pubkey privkey {:nonce nonce :timeout-ms 1500})
-                                      (catch Exception _ nil))))
-                            (filterv some?)))]
-    (cond-> []
-      local-snap (conj local-snap)
-      (seq remote-snaps) (into remote-snaps))))
+   its signed snapshot in-memory (< 5ms). When `(:local-only? opts)` is true, returns ONLY
+   the co-located snapshot without remote queries. Otherwise queries peer HTTP `local_only=true`
+   endpoints in parallel (1200ms timeout) before falling back to UDP `:5010` (`P-NET-1`)."
+  ([rt validator-bootstrap target-pubkey nonce]
+   (fetch-validator-chain-state-snapshots! rt validator-bootstrap target-pubkey nonce nil))
+  ([rt validator-bootstrap target-pubkey nonce opts]
+   (let [vnode (:validator-node rt)
+         local-snap (when (and vnode target-pubkey)
+                      (try
+                        (let [sa (or (:state-atom vnode)
+                                     (get-in vnode [:shell-node :state-atom]))
+                              st (when (instance? clojure.lang.IDeref sa) @sa)
+                              vid (:identity vnode)
+                              build-fn (requiring-resolve 'bitecho.shell.mesh/build-validator-chain-state-snapshot)]
+                          (when (and build-fn (map? st) (seq st))
+                            (build-fn st vid target-pubkey nonce)))
+                        (catch Exception _ nil)))]
+     (if (:local-only? opts)
+       (if local-snap [local-snap] [])
+       (let [local-val-pk (when local-snap
+                            (light-core/normalize-pubkey-hex (:validator-pubkey local-snap)))
+             bootstrap (resolve-validator-bootstrap validator-bootstrap)
+             remote-nodes (->> (for [[nid node] (:nodes bootstrap)]
+                                 (assoc node :node-id (or (:node-id node) nid)))
+                               (remove (fn [node]
+                                         (and local-val-pk
+                                              (= local-val-pk (light-core/normalize-pubkey-hex (:pubkey node))))))
+                               vec)
+             http-snaps (->> remote-nodes
+                             (pmap #(query-peer-http-local-snapshot! % target-pubkey nonce))
+                             (filterv some?))
+             collected-snaps (cond-> []
+                               local-snap (conj local-snap)
+                               (seq http-snaps) (into http-snaps))
+             collected-pks (set (keep #(light-core/normalize-pubkey-hex (:validator-pubkey %)) collected-snaps))
+             remaining-nodes (filterv #(not (contains? collected-pks (light-core/normalize-pubkey-hex (:pubkey %))))
+                                      remote-nodes)
+             ident (or (:peer-identity rt)
+                       (when (:state-dir rt)
+                         (try
+                           (load-or-create-infra-peer-identity! (:state-dir rt) (or (:node-id rt) :ns1))
+                           (catch Exception _ nil))))
+             privkey (or (:privkey-bytes ident) (:node-privkey rt))
+             udp-snaps (if-not (and ident (:cert-data ident) target-pubkey privkey (seq remaining-nodes))
+                         []
+                         (->> remaining-nodes
+                              (pmap (fn [node]
+                                      (try
+                                        (light-node/query-validator-chain-state!
+                                         ident node target-pubkey privkey {:nonce nonce :timeout-ms 1200})
+                                        (catch Exception _ nil))))
+                              (filterv some?)))]
+         (into collected-snaps udp-snaps))))))
 
 (defn sync-runtime-epoch-from-validators!
   "Queries the validator cluster's authenticated `:5010` agent channel using the signed

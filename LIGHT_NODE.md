@@ -145,8 +145,8 @@ Light nodes support content-addressed artifact publishing, resolution, listing, 
 
 ---
 
-## 6. Unification III: 12 Canonical Verbs & `:sync-pointer` (`BIP-005` / `v0.23.9`)
+## 6. Unification III & Low-Latency HTTPS Relay Legs (`BIP-005`..`BIP-007` / `v0.23.11`)
 
-In `v0.23.9`, the light node unifies all 68 legacy verbs and 8 runner aliases into **12 canonical verbs** (`put`, `get`, `list`, `transfer`, `lock`, `spend`, `connect`, `send`, `inbox`, `wait`, `serve`, `ctl`) via `bitecho.light-node.cli/desugar-cli-cmd-map`, maintains a unified `:pointers` / `:blobs` projection with automatic `<state-dir>/state.fressian.v0238.bak` backup creation on migration, supports `:sync-pointer` wire replication, and provides the canonical 3-of-3 heterogeneous bounty SCI puzzle (`bitecho.economy.puzzle/canonical-bounty-puzzle-source`).
+In `v0.23.11`, the light node unifies all 68 legacy verbs and 8 runner aliases into **12 canonical verbs** (`put`, `get`, `list`, `transfer`, `lock`, `spend`, `connect`, `send`, `inbox`, `wait`, `serve`, `ctl`) via `bitecho.light-node.cli/desugar-cli-cmd-map`, provides the zero-install `bitecho-mcp` JSON-RPC 2.0 server (`--mcp`), performs sub-25ms HTTPS relay-first `2f+1` chain-state quorum sync (`P-NET-1`), and supports zero-burn HTTPS relay P2P legs (`p2p-offer --to <peer> --endpoint https://ns1.bitecho.org/relay/v1`) with autonomous auto-answer (`P-NET-2`).
 
 

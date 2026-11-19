@@ -1737,6 +1737,12 @@
                        (first (get (:request/headers req) :header/x-bitecho-pubkey)))
             nonce (or (get body-json "nonce")
                       (get query-params "nonce"))
+            local-only? (contains? #{"true" "1"}
+                                   (str/lower-case (str (or (get body-json "local_only")
+                                                            (get body-json "local-only")
+                                                            (get query-params "local_only")
+                                                            (get query-params "local-only")
+                                                            ""))))
             valid-pk? (or (nil? pubkey)
                           (and (string? pubkey)
                                (re-matches #"^[0-9a-fA-F]{64}$|^[0-9a-fA-F]{88}$" (str/trim pubkey))))]
@@ -1751,6 +1757,23 @@
                 cached (when (and chain-cache pubkey)
                          (get @chain-cache pubkey))
                 snapshots (cond
+                            (and local-only? (:validator-state-fn config))
+                            (try
+                              (let [r ((:validator-state-fn config) pubkey nonce)]
+                                (if (sequential? r) (vec r) (if (map? r) [r] [])))
+                              (catch Exception _ []))
+
+                            (and local-only? subnet-runtime (:validator-node subnet-runtime))
+                            (let [effective-pk (or pubkey (:default-sender subnet-runtime) (get-in subnet-runtime [:peer-identity :pubkey-hex]))]
+                              (if (and effective-pk (re-matches #"^[0-9a-fA-F]{64}$|^[0-9a-fA-F]{88}$" (str/trim (str effective-pk))))
+                                (infra/fetch-validator-chain-state-snapshots!
+                                 subnet-runtime
+                                 nil
+                                 effective-pk
+                                 (or nonce (str now-ms))
+                                 {:local-only? true})
+                                []))
+
                             (:chain-state-fetcher config)
                             (try ((:chain-state-fetcher config) pubkey nonce) (catch Exception _ []))
 
@@ -2110,8 +2133,22 @@
                                                       :sender (or (:pointer/authority ptr) (:default-sender target-rt))
                                                       :now-ms now-ms})
                         after-diag (:diagnostics @(:shell-atom target-rt))
-                        accepted? (boolean (:applied? sub-res))]
-                    (if accepted?
+                        accepted? (boolean (:applied? sub-res))
+                        inst (when (:subnet-atom target-rt) @(:subnet-atom target-rt))
+                        sid (:subnet-id inst)
+                        existing (when inst
+                                   (or (get-in inst [:data :pointers [(str sid) (:pointer/path ptr)]])
+                                       (get-in inst [:data :pointers [(:pointer/subnet ptr) (:pointer/path ptr)]])
+                                       (get-in inst [:pointers [(str sid) (:pointer/path ptr)]])
+                                       (get-in inst [:pointers (:pointer/path ptr)])))
+                        idempotent? (boolean
+                                     (and (not accepted?)
+                                          existing
+                                          (= (:pointer/target existing) (:pointer/target ptr))
+                                          (>= (long (or (:pointer/seq existing) 0))
+                                              (long (or (:pointer/seq ptr) 0)))))]
+                    (cond
+                      accepted?
                       (send-response exchange
                                      {:response/status 200
                                       :response/headers {"Content-Type" "application/json; charset=utf-8"}
@@ -2121,6 +2158,20 @@
                                                                       "seq" (:pointer/seq ptr)
                                                                       "authority" (:pointer/authority ptr)
                                                                       "tombstoned" (nil? (:pointer/target ptr))})})
+
+                      idempotent?
+                      (send-response exchange
+                                     {:response/status 200
+                                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                      :response/body (json/write-str {"ok" true
+                                                                      "idempotent" true
+                                                                      "path" (:pointer/path ptr)
+                                                                      "cid" (:pointer/target existing)
+                                                                      "seq" (:pointer/seq existing)
+                                                                      "authority" (:pointer/authority existing)
+                                                                      "tombstoned" (nil? (:pointer/target existing))})})
+
+                      :else
                       (send-response exchange
                                      {:response/status 403
                                       :response/headers {"Content-Type" "application/json; charset=utf-8"}

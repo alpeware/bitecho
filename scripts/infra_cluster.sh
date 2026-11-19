@@ -71,7 +71,7 @@ ssh_ns() {
     echo "FATAL: Unknown infra node '${node}'." >&2
     exit 1
   fi
-  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -i "${SSH_KEY}" "${SSH_USER}@${ip}" "$@"
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -i "${SSH_KEY}" "${SSH_USER}@${ip}" "$@"
 }
 
 verify_node_health() {
@@ -162,7 +162,7 @@ cmd_provision_secret() {
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
     echo "--> Provisioning /etc/clj-web/tls-secret.key on ${node} (${ip})..."
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${local_secret}" "${SSH_USER}@${ip}:/tmp/tls-secret.key.tmp"
     local remote_sha
     remote_sha="$(ssh_ns "$node" "sudo mkdir -p /etc/clj-web && sudo mv /tmp/tls-secret.key.tmp /etc/clj-web/tls-secret.key && sudo chown root:${SSH_USER} /etc/clj-web/tls-secret.key && sudo chmod 0640 /etc/clj-web/tls-secret.key && sudo sha256sum /etc/clj-web/tls-secret.key | awk '{print \$1}'")"
@@ -176,13 +176,26 @@ cmd_provision_secret() {
 
 rollback_node() {
   local node="$1"
-  echo "!!! Rolling back ${node} (${NODE_IPS[$node]}) to clj-web.service !!!"
+  echo "!!! Rolling back ${node} (${NODE_IPS[$node]}) to previous bitecho-infra.service artifact !!!"
   ssh_ns "$node" bash -s << 'REMOTE_RB'
 set -euo pipefail
-sudo systemctl stop bitecho-infra.service 2>/dev/null || true
-sudo systemctl disable bitecho-infra.service 2>/dev/null || true
-sudo systemctl enable clj-web.service
-sudo systemctl restart clj-web.service
+if [[ -f /opt/bitecho-infra/bitecho.jar.bak ]]; then
+  cp -pf /opt/bitecho-infra/bitecho.jar.bak /opt/bitecho-infra/bitecho.jar
+  sudo systemctl enable bitecho-infra.service
+  sudo systemctl restart bitecho-infra.service
+elif [[ -f /opt/bitecho-infra/bitecho.jar.prev ]]; then
+  cp -pf /opt/bitecho-infra/bitecho.jar.prev /opt/bitecho-infra/bitecho.jar
+  sudo systemctl enable bitecho-infra.service
+  sudo systemctl restart bitecho-infra.service
+elif [[ -f /etc/systemd/system/bitecho-infra.service ]]; then
+  sudo systemctl enable bitecho-infra.service
+  sudo systemctl restart bitecho-infra.service
+else
+  sudo systemctl stop bitecho-infra.service 2>/dev/null || true
+  sudo systemctl disable bitecho-infra.service 2>/dev/null || true
+  sudo systemctl enable clj-web.service
+  sudo systemctl restart clj-web.service
+fi
 REMOTE_RB
   sleep 3
   verify_node_health "$node"
@@ -258,7 +271,7 @@ REMOTE_CUT
 
   echo "  Waiting for ${node} bitecho-infra.service readiness..."
   local ok=false
-  for _ in $(seq 1 45); do
+  for _ in $(seq 1 75); do
     sleep 2
     if verify_node_health "$node" 2>/dev/null; then
       ok=true
@@ -275,7 +288,7 @@ REMOTE_CUT
 
 verify_release_proof_gate() {
   local version="${1:-$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' "${ROOT_DIR}/src/bitecho/config.cljc" | head -n1)}"
-  version="${version:-0.23.10}"
+  version="${version:-0.23.11}"
   local proof_file="${ROOT_DIR}/docs/releases/v${version}-proof.edn"
 
   echo "--> Verifying Release Proof Gate for v${version}..."
@@ -414,10 +427,10 @@ cmd_cutover() {
   for node in "${NODES[@]}"; do
     local ip="${NODE_IPS[$node]}"
     echo "--> Uploading bitecho.jar, validator bootstrap.txt, and reading identity on ${node} (${ip})..."
-    ssh_ns "$node" "sudo mkdir -p /opt/bitecho-infra /etc/bitecho-infra && sudo chown ${SSH_USER}:${SSH_USER} /opt/bitecho-infra /etc/bitecho-infra"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    ssh_ns "$node" "sudo mkdir -p /opt/bitecho-infra /etc/bitecho-infra && sudo chown ${SSH_USER}:${SSH_USER} /opt/bitecho-infra /etc/bitecho-infra && if [ -f /opt/bitecho-infra/bitecho.jar ]; then cp -pf /opt/bitecho-infra/bitecho.jar /opt/bitecho-infra/bitecho.jar.bak; fi"
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/target/bitecho.jar" "${SSH_USER}@${ip}:/opt/bitecho-infra/bitecho.jar"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/devnet/bootstrap.txt" "${SSH_USER}@${ip}:/etc/bitecho-infra/bootstrap.txt"
 
     local id_out
@@ -573,7 +586,7 @@ $(printf "%b" "${agent_ledger_lines}")}
                                :ns3 {:ip "${NODE_IPS[ns3]}" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :pubkey "${PUBKEYS[ns3]}" :fingerprint "${FINGERPRINTS[ns3]}" :ice-ufrag "${ICE_UFRAGS[ns3]}" :ice-pwd "${ICE_PWDS[ns3]}"}}}}}
 CFG_EOF
     clojure -M -e "(let [m (clojure.edn/read-string (slurp \"${tmp_cfg}\"))] (assert (map? (:validator m)) \"Missing :validator map in config.edn\"))"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${tmp_cfg}" "${SSH_USER}@${ip}:/etc/bitecho-infra/config.edn"
     rm -f "${tmp_cfg}"
   done
@@ -599,7 +612,7 @@ cmd_retire_clj_web() {
   for node in ns3 ns2 ns1; do
     local ip="${NODE_IPS[$node]}"
     echo "=== Phase D on ${node} (${ip}): retiring clj-web.git & rolling bitecho.jar ==="
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/target/bitecho.jar" "${SSH_USER}@${ip}:/opt/bitecho-infra/bitecho.jar"
 
     ssh_ns "$node" bash -s << 'REMOTE_RETIRE'
@@ -881,65 +894,69 @@ EOF_GIT_INDEX
     local ip="${NODE_IPS[$node]}"
     echo "--> Syncing bare git repositories, SKILL.md, ONBOARDING.md, app/, and index.md to ${node} (${ip})..."
     for repo in "${repos[@]}"; do
-      rsync -az --delete -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      rsync -az --delete -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${stage_dir}/${repo}.git/" "${SSH_USER}@${ip}:/var/www/clj-web/public/git/${repo}.git/"
     done
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${stage_dir}/index.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/index.md"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${stage_dir}/llms.txt" "${SSH_USER}@${ip}:/var/www/clj-web/public/llms.txt"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${stage_dir}/git-index.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/git/index.md"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/skill/SKILL.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/SKILL.md"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/skill/SKILL.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/skill/SKILL.md"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/skill/SKILL.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/skill/index.md"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/ONBOARDING.md"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding.md"
-    rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+    rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
       "${ROOT_DIR}/ONBOARDING.md" "${SSH_USER}@${ip}:/var/www/clj-web/public/onboarding/index.md"
     if [[ -f "${ROOT_DIR}/devnet/bootstrap.txt" && -f "${ROOT_DIR}/devnet/bootstrap.edn" ]]; then
-      ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "mkdir -p /var/www/clj-web/public/devnet /var/www/clj-web/public/releases/v0.23.5 /var/www/clj-web/public/releases/latest /var/www/clj-web/public/docs/bips /var/www/clj-web/public/web/blog"
-      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "mkdir -p /var/www/clj-web/public/devnet /var/www/clj-web/public/dist /var/www/clj-web/public/releases/v0.23.5 /var/www/clj-web/public/releases/latest /var/www/clj-web/public/docs/bips /var/www/clj-web/public/web/blog"
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/devnet/bootstrap.txt" "${SSH_USER}@${ip}:/var/www/clj-web/public/devnet/bootstrap.txt"
-      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/devnet/bootstrap.edn" "${SSH_USER}@${ip}:/var/www/clj-web/public/devnet/bootstrap.edn"
     fi
     if [[ -d "${ROOT_DIR}/docs/bips" ]]; then
-      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/docs/bips/" "${SSH_USER}@${ip}:/var/www/clj-web/public/docs/bips/"
     fi
     if [[ -d "${ROOT_DIR}/web/blog" ]]; then
-      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/web/blog/" "${SSH_USER}@${ip}:/var/www/clj-web/public/web/blog/"
     fi
     if [[ -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-light-node.cjs" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
       for rel_dir in "v0.23.5" "latest"; do
-        rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
           "${ROOT_DIR}/dist/bitecho-light-node.cjs" \
           "${ROOT_DIR}/dist/bitecho-browser.js" \
           "${ROOT_DIR}/dist/bitecho-browser.js.sri" \
           "${ROOT_DIR}/docs/releases/v0.23.5-proof.edn" \
           "${SSH_USER}@${ip}:/var/www/clj-web/public/releases/${rel_dir}/"
-        ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" \
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" \
           "cp -f /var/www/clj-web/public/releases/${rel_dir}/v0.23.5-proof.edn /var/www/clj-web/public/releases/${rel_dir}/proof.edn"
       done
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        "${ROOT_DIR}/dist/bitecho-light-node.cjs" \
+        "${ROOT_DIR}/dist/bitecho-browser.js" \
+        "${SSH_USER}@${ip}:/var/www/clj-web/public/dist/"
     fi
     if [[ ( "${DEPLOY_LIVE:-0}" == "1" || "${1:-}" == "--deploy" ) && -d "${ROOT_DIR}/dist" && -f "${ROOT_DIR}/dist/bitecho-browser.js" ]]; then
-      rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
         "${ROOT_DIR}/dist/bitecho-browser.js" \
         "${ROOT_DIR}/dist/bitecho-browser.js.sri" \
         "${ROOT_DIR}/resources/public/index.html" \
         "${SSH_USER}@${ip}:/var/www/clj-web/public/app/"
       if [[ -f "${ROOT_DIR}/resources/public/relay.html" ]]; then
-        rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
           "${ROOT_DIR}/resources/public/relay.html" \
           "${SSH_USER}@${ip}:/var/www/clj-web/public/relay.html"
-        rsync -az -e "ssh -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
+        rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_KEY}" \
           "${ROOT_DIR}/resources/public/relay.html" \
           "${SSH_USER}@${ip}:/var/www/clj-web/public/app/relay.html"
       fi
@@ -951,7 +968,7 @@ EOF_GIT_INDEX
     for node in ns3 ns2 ns1; do
       local ip="${NODE_IPS[$node]}"
       echo "--> Running migrate-infra & rolling restart on ${node} (${ip})..."
-      ssh -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "bash -s" << 'REMOTE_PUBLISH_MIGRATE'
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "${SSH_KEY}" "${SSH_USER}@${ip}" "bash -s" << 'REMOTE_PUBLISH_MIGRATE'
 set -euo pipefail
 sudo systemctl stop bitecho-infra.service || true
 sudo -u cljweb /opt/jdk-25/bin/java -Xms128m -Xmx512m \
@@ -963,14 +980,14 @@ sudo chown -R cljweb:cljweb /var/lib/clj-web
 sudo systemctl start bitecho-infra.service
 REMOTE_PUBLISH_MIGRATE
 
-      for _ in $(seq 1 60); do
+      for _ in $(seq 1 75); do
         if curl -fsS --max-time 2 "http://${ip}:80/healthz" >/dev/null 2>&1; then
           break
         fi
         sleep 2
       done
       verify_node_health "$node"
-      echo "--> Verifying SKILL.md and /devnet/bootstrap.txt on ${node} (${ip})..."
+      echo "--> Verifying SKILL.md, /devnet/bootstrap.txt, and /dist/bitecho-light-node.cjs.sha256 on ${node} (${ip})..."
       local skill_content
       skill_content="$(curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/SKILL.md")"
       if ! echo "${skill_content}" | grep -q -- "--trusted-dac-anchors"; then
@@ -983,8 +1000,27 @@ REMOTE_PUBLISH_MIGRATE
         echo "FATAL: ${node} /devnet/bootstrap.txt missing 6-validator ns1..ns3 entries" >&2
         exit 1
       fi
-      echo "  [OK] ${node} verified --trusted-dac-anchors in SKILL.md and 6-validator /devnet/bootstrap.txt"
+      if [[ -f "${ROOT_DIR}/dist/bitecho-light-node.cjs" ]]; then
+        curl -fsSL --max-time 8 --resolve "${DOMAIN}:443:${ip}" "https://${DOMAIN}/dist/bitecho-light-node.cjs.sha256" >/dev/null
+      fi
+      echo "  [OK] ${node} verified --trusted-dac-anchors in SKILL.md, 6-validator /devnet/bootstrap.txt, and /dist/bitecho-light-node.cjs.sha256"
     done
+    if [[ -d "/tmp/antigravity-light-node/identity" && -f "${ROOT_DIR}/dist/bitecho-light-node.cjs" ]]; then
+      echo "--> Publishing dist/bitecho-light-node.cjs & dist/bitecho-browser.js Pointers to bitecho.org/infra..."
+      node "${ROOT_DIR}/dist/bitecho-light-node.cjs" put \
+        --state-dir /tmp/antigravity-light-node \
+        --subnet-id bitecho.org/infra \
+        --path dist/bitecho-light-node.cjs \
+        --file "${ROOT_DIR}/dist/bitecho-light-node.cjs" \
+        --relay-url https://ns1.bitecho.org >/dev/null || true
+      node "${ROOT_DIR}/dist/bitecho-light-node.cjs" put \
+        --state-dir /tmp/antigravity-light-node \
+        --subnet-id bitecho.org/infra \
+        --path dist/bitecho-browser.js \
+        --file "${ROOT_DIR}/dist/bitecho-browser.js" \
+        --relay-url https://ns1.bitecho.org >/dev/null || true
+      curl -fsSL https://ns1.bitecho.org/dist/bitecho-light-node.cjs.sha256 >/dev/null || true
+    fi
   else
     echo "  [INFO] Skipping live migrate-infra + service restart (pass --deploy or DEPLOY_LIVE=1 after deploy go-ahead)"
   fi

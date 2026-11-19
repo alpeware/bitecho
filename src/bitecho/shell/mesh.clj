@@ -1446,23 +1446,27 @@
   ([shell-node]
    (query-node-state shell-node 5000))
   ([shell-node timeout-or-opt & more]
-   (let [timeout-ms (if (number? timeout-or-opt)
-                      (long timeout-or-opt)
-                      (long (or (:timeout-ms (apply hash-map timeout-or-opt more)) 5000)))]
-     (if-let [st-atom (or (:state-atom shell-node)
-                          (get-in shell-node [:shell-node :state-atom]))]
-       (when (instance? clojure.lang.IDeref st-atom)
-         @st-atom)
-       (let [sh (if (:shell-node shell-node) (:shell-node shell-node) shell-node)
-             reply-ch (async/promise-chan)]
-         (async/put! (:events-in sh) {:type :query-state :reply-chan reply-ch})
-         (let [[val _] (async/alts!! [reply-ch (async/timeout timeout-ms)])]
-           val))))))
+   (when shell-node
+     (let [timeout-ms (if (number? timeout-or-opt)
+                        (long timeout-or-opt)
+                        (long (or (:timeout-ms (apply hash-map timeout-or-opt more)) 5000)))]
+       (if-let [st-atom (or (:state-atom shell-node)
+                            (get-in shell-node [:shell-node :state-atom]))]
+         (when (instance? clojure.lang.IDeref st-atom)
+           @st-atom)
+         (when-let [sh (if (:shell-node shell-node) (:shell-node shell-node) shell-node)]
+           (when-let [ev-in (:events-in sh)]
+             (let [reply-ch (async/promise-chan)]
+               (async/put! ev-in {:type :query-state :reply-chan reply-ch})
+               (let [[val _] (async/alts!! [reply-ch (async/timeout timeout-ms)])]
+                 val)))))))))
 
-(defn- make-http-handler
+(declare build-validator-chain-state-snapshot)
+
+(defn make-http-handler
   "Creates an HttpHandler for healthz, statusz, connz, burnsz, and accountz endpoints."
   [ctx total-peers fallback-state]
-  (let [{:keys [shell-node peer-conns agent-conns transport in-mem-bus]} ctx]
+  (let [{:keys [shell-node peer-conns agent-conns transport in-mem-bus identity]} ctx]
     (reify HttpHandler
       (handle [_ exchange]
         (let [path (.getPath (.getRequestURI ^HttpExchange exchange))
@@ -1493,13 +1497,20 @@
                                     query (.getQuery (.getRequestURI ^HttpExchange exchange))
                                     pubkey (when query
                                              (second (re-find #"(?:^|&)pubkey=([^&]+)" query)))
+                                    nonce (when query
+                                            (second (re-find #"(?:^|&)nonce=([^&]+)" query)))
                                     include-escrows? (and query (str/includes? query "include-escrows=true"))
+                                    snap (when (and pubkey nonce identity (map? st))
+                                           (try
+                                             (build-validator-chain-state-snapshot st identity pubkey nonce)
+                                             (catch Exception _ nil)))
                                     resp (cond
                                            pubkey
-                                           {:pubkey pubkey
-                                            :account (when-let [a (get (:ledger st) pubkey)] (into {} a))
-                                            :spendable (sm/spendable-balance st pubkey)
-                                            :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
+                                           (cond-> {:pubkey pubkey
+                                                    :account (when-let [a (get (:ledger st) pubkey)] (into {} a))
+                                                    :spendable (sm/spendable-balance st pubkey)
+                                                    :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
+                                             snap (assoc :snapshot snap))
 
                                            include-escrows?
                                            {:accounts (into {} (map (fn [[k v]] [k (into {} v)]) (:ledger st)))

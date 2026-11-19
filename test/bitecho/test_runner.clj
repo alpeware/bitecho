@@ -19,6 +19,7 @@
             [bitecho.d30-artifact-publishing-scenarios-test]
             [bitecho.d31-unification-iii-scenarios-test]
             [bitecho.d32-bip006-onboarding-and-network-test]
+            [bitecho.d33-bip007-low-latency-and-infra-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

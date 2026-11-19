@@ -343,39 +343,55 @@
     (if (true? (:crypto/verified? verified))
       true
       (let [snap-type (or (:bitecho/type env) (:type env) (get env "bitecho/type") (get env "type"))]
-        (if (or (= :chain-state-snapshot snap-type) (= "chain-state-snapshot" snap-type))
+        (cond
+          (or (= :chain-state-snapshot snap-type) (= "chain-state-snapshot" snap-type))
           (boolean (verify-chain-state-snapshot-signature env))
-          (if (map? (:message env))
-            (some? (sieve/validate-message (:message env)))
-            (let [sender (or (:sender env) (:agent-pubkey env) (:from env)
-                             (get env "sender") (get env "agent-pubkey") (get env "from"))
-                  sig (or (:signature env) (:sig env)
-                          (get env "signature") (get env "sig"))]
-              (and (some? sender) (some? sig)
-                   (try
-                     (let [sig-bytes (if (string? sig) (basalt/hex->bytes sig) sig)]
-                       (cond
-                         (or (and (:agent-pubkey env) (:event env))
-                             (and (get env "agent-pubkey") (get env "event")))
-                         (let [ev (or (:event env) (get env "event"))
-                               apk (or (:agent-pubkey env) (get env "agent-pubkey"))
-                               clean (dissoc ev :sender :sender-pubkey-bytes :rng "sender" "sender-pubkey-bytes" "rng")]
-                           (crypto/verify sender
-                                          (crypto/canonical-signing-bytes [(or apk "") (crypto/canonicalize-agent-event clean)])
-                                          sig-bytes))
 
-                         (or (contains? env :payload) (contains? env "payload"))
-                         (let [p (or (:payload env) (get env "payload"))
-                               p-bytes (if (bytes? p) p (fressian/utf8->bytes (str p)))
-                               burn (or (:burn-amount env) (get env "burn-amount"))
-                               payload (if burn
-                                         (fressian/concat-bytes p-bytes (fressian/utf8->bytes (str ":burn:" burn)))
-                                         p-bytes)]
-                           (crypto/verify sender payload sig-bytes))
+          (or (= :p2p-link-bind snap-type) (= "p2p-link-bind" snap-type))
+          (let [sender (normalize-pubkey-hex (or (:sender env) (get env "sender")))
+                sid (or (:session-id env) (get env "session-id") (get env "session_id"))
+                sig (or (:signature env) (get env "signature"))]
+            (boolean
+             (and sender sid sig
+                  (try
+                    (let [sig-bytes (if (string? sig) (basalt/hex->bytes sig) sig)
+                          sig-str (str "bitecho-p2p-link-bind-v1|" sender "|" sid)]
+                      (crypto/verify (basalt/hex->bytes sender) (fressian/utf8->bytes sig-str) sig-bytes))
+                    (catch #?(:clj Exception :cljs :default) _ false)))))
 
-                         :else
-                         (crypto/verify sender (crypto/canonical-signing-bytes env) sig-bytes)))
-                     (catch #?(:clj Exception :cljs :default) _ false))))))))))
+          (map? (:message env))
+          (some? (sieve/validate-message (:message env)))
+
+          :else
+          (let [sender (or (:sender env) (:agent-pubkey env) (:from env)
+                           (get env "sender") (get env "agent-pubkey") (get env "from"))
+                sig (or (:signature env) (:sig env)
+                        (get env "signature") (get env "sig"))]
+            (and (some? sender) (some? sig)
+                 (try
+                   (let [sig-bytes (if (string? sig) (basalt/hex->bytes sig) sig)]
+                     (cond
+                       (or (and (:agent-pubkey env) (:event env))
+                           (and (get env "agent-pubkey") (get env "event")))
+                       (let [ev (or (:event env) (get env "event"))
+                             apk (or (:agent-pubkey env) (get env "agent-pubkey"))
+                             clean (dissoc ev :sender :sender-pubkey-bytes :rng "sender" "sender-pubkey-bytes" "rng")]
+                         (crypto/verify sender
+                                        (crypto/canonical-signing-bytes [(or apk "") (crypto/canonicalize-agent-event clean)])
+                                        sig-bytes))
+
+                       (or (contains? env :payload) (contains? env "payload"))
+                       (let [p (or (:payload env) (get env "payload"))
+                             p-bytes (if (bytes? p) p (fressian/utf8->bytes (str p)))
+                             burn (or (:burn-amount env) (get env "burn-amount"))
+                             payload (if burn
+                                       (fressian/concat-bytes p-bytes (fressian/utf8->bytes (str ":burn:" burn)))
+                                       p-bytes)]
+                         (crypto/verify sender payload sig-bytes))
+
+                       :else
+                       (crypto/verify sender (crypto/canonical-signing-bytes env) sig-bytes)))
+                   (catch #?(:clj Exception :cljs :default) _ false)))))))))
 
 ;; =============================================================================
 ;; 4. Pure Sans-IO Relay Reducer (`reduce-relay`)
@@ -437,6 +453,20 @@
                     burn-amt (when gossip-msg
                                (long (or (:burn-amount gossip-msg) (get gossip-msg "burn-amount") 0)))
                     min-burn (long (get state :min-signaling-burn 100))
+                    raw-inner-payload (or (get-in decoded [:event :message :payload])
+                                          (get-in decoded [:message :payload]))
+                    inner-msg (when (bytes? raw-inner-payload)
+                                (let [m (try (fressian/decode-wire raw-inner-payload)
+                                             (catch #?(:clj Exception :cljs :default) _ nil))]
+                                  (when (map? m) m)))
+                    inner-type (keyword (or (:bitecho/type inner-msg)
+                                            (:type inner-msg)
+                                            (:bitecho/type decoded)
+                                            (get-in decoded [:event :type])
+                                            (:type decoded)))
+                    p2p-relay-eligible? (contains? #{:sealed-message :session-ack :p2p-broadcast :p2p-hub-relay
+                                                     :p2p-offer :p2p-answer :p2p-link-bind :p2p-ping :p2p-pong}
+                                                   inner-type)
                     gossip-id (when gossip-msg
                                 (or (:message-id gossip-msg)
                                     (get gossip-msg "message-id")
@@ -449,7 +479,7 @@
                     dup-id (or (when (contains? seen-set envelope-id) envelope-id)
                                (when (and gossip-id (contains? seen-set gossip-id)) gossip-id))]
                 (cond
-                  (and (= :receive-gossip ev-type) (< burn-amt min-burn))
+                  (and (= :receive-gossip ev-type) (not p2p-relay-eligible?) (< burn-amt min-burn))
                   (let [diag {:effect :diagnose
                               :reason :insufficient-burn
                               :required min-burn
@@ -478,15 +508,6 @@
                                   (= :chain-state-snapshot (:bitecho/type decoded))
                                   (= "chain-state-snapshot" (:bitecho/type decoded))
                                   (= "chain-state-snapshot" (:type decoded)))
-                        raw-inner-payload (or (get-in decoded [:event :message :payload])
-                                              (get-in decoded [:message :payload]))
-                        inner-msg (when (bytes? raw-inner-payload)
-                                    (try (fressian/decode-wire raw-inner-payload)
-                                         (catch #?(:clj Exception :cljs :default) _ nil)))
-                        inner-type (keyword (or (:bitecho/type inner-msg)
-                                                (:type inner-msg)
-                                                (get-in decoded [:event :type])
-                                                (:type decoded)))
                         callee-response? (or (contains? #{:rendezvous-ack-voucher :channel-accept} inner-type)
                                              (contains? #{"rendezvous-ack-voucher" "channel-accept"} (str inner-type)))
                         sender (cond
@@ -521,6 +542,7 @@
                                         (when-let [r (get-in decoded [:payload :recipient])] (normalize-pubkey-hex r))
                                         (when-let [r (get-in decoded [:payload :to])] (normalize-pubkey-hex r))
                                         (when-let [r (:recipient inner-msg)] (normalize-pubkey-hex r))
+                                        (when-let [r (:target-pubkey inner-msg)] (normalize-pubkey-hex r))
                                         (when-let [r (:to inner-msg)] (normalize-pubkey-hex r))
                                         (when-let [r (:callee inner-msg)] (normalize-pubkey-hex r))
                                         (when snap?
@@ -531,13 +553,14 @@
                                       (get-in decoded [:payload :recipient])
                                       (when callee-response? (:caller inner-msg))
                                       (:recipient inner-msg)
+                                      (:target-pubkey inner-msg)
                                       (:callee inner-msg)
                                       (when snap? (or (:pubkey decoded) (get decoded "pubkey"))))
                         validator-only? (and (not snap?)
                                              (or (contains? #{:on-deliver :transfer :settle-escrow :burn :mint :burn-for-credit} ev-type)
                                                  (and (map? (:event decoded))
                                                       (contains? #{:on-deliver :transfer :settle-escrow :burn} (:type (:event decoded))))))
-                        unicast-inner? (contains? #{:sealed-message :session-ack :rendezvous-offer-header :rendezvous-ack-voucher :rendezvous-reveal :channel-offer :channel-accept :channel-close :p2p-offer :p2p-answer} inner-type)
+                        unicast-inner? (contains? #{:sealed-message :session-ack :rendezvous-offer-header :rendezvous-ack-voucher :rendezvous-reveal :channel-offer :channel-accept :channel-close :p2p-offer :p2p-answer :p2p-link-bind :p2p-hub-relay :p2p-ping :p2p-pong} inner-type)
                         broadcast? (or (= raw-recip "*")
                                        (and (not unicast-inner?) (nil? recipient))
                                        (and (nil? recipient)
@@ -548,7 +571,11 @@
                                        (and (= :receive-gossip (get-in decoded [:event :type]))
                                             (not unicast-inner?)
                                             (nil? recipient)))
-                        from-val? (or (boolean (:from-validator? event)) snap?)]
+                        from-val? (or (boolean (:from-validator? event)) snap?)
+                        forward-to-validators? (and (not from-val?)
+                                                    (not= :p2p-link-bind inner-type)
+                                                    (or (nil? gossip-msg)
+                                                        (>= (long (or burn-amt 0)) min-burn)))]
                     (cond
                       (and snap? (seq (:known-validators state))
                            (let [kv (:known-validators state)
@@ -637,7 +664,7 @@
                          :duplicate? false
                          :envelope-id envelope-id
                          :response {"ok" true "envelope_id" envelope-id "seq" next-bseq "broadcast" true "status" "forwarded"}
-                         :effects (into (vec cap-effects) (if from-val? [] [eff]))})
+                         :effects (into (vec cap-effects) (if forward-to-validators? [eff] []))})
 
                       :else
                       (let [[capped-st cap-effects] (enforce-global-byte-cap state payload-size now-ms)
@@ -702,7 +729,7 @@
                          :duplicate? false
                          :envelope-id envelope-id
                          :response {"ok" true "envelope_id" envelope-id "seq" next-seq "recipient" recipient "broadcast" false "status" "accepted"}
-                         :effects (into (into (vec cap-effects) inbox-evict-effects) (if from-val? [] [eff]))})))))))))
+                         :effects (into (into (vec cap-effects) inbox-evict-effects) (if forward-to-validators? [eff] []))})))))))))
 
       :relay-poll
       (let [v (verify-poll-request state event)]

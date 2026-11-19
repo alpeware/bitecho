@@ -1,0 +1,63 @@
+{:bip-id "BIP-007"
+ :title "BIP-007 (Milestone D33 / v0.23.11): Low-Latency Quorum Sync, Zero-Burn HTTPS Relay Legs & Cluster Operations Hardening"
+ :author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :co-author-pubkeys ["302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                     "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"]
+ :subnet-id "bitecho.org/dev"
+ :milestone "D33"
+ :version "v0.23.11"
+ :human-anchor-sunset "2027-06-30"
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :invariant-diff {:defspec-vars ["prop-d33-zero-burn-relay-p2p-mailbox-admission"
+                                 "prop-d33-autonomous-p2p-offer-auto-answer-and-dial"
+                                 "prop-d33-unambiguous-most-active-open-session-resolution"
+                                 "prop-d33-canonical-put-desugaring-and-endpoint-candidate-mapping"
+                                 "prop-d33-idempotent-replicated-artifact-pointer-acceptance"]
+                  :seed 1795040000
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 1795040000
+                                            :tests 66
+                                            :assertions 810
+                                            :executed-at 1795040000000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 1795040000
+                                             :scenarios-passed 68
+                                             :executed-at 1795040000000}
+                   :deterministic-bundle-sha256 "d73c78ee3110f3c80f5eeb1f689c00ce6af9240bb1f0b6a5676adb5ce1ee2d0d"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :browser-bundle-sha256 "f876ea795e240af0553cfbd0d359e8ea12c2acdddccd45f6cfe239a77e255984"
+                                                   :executed-at 1795040000000}}
+ :deliverables [{:id "P-NET-1"
+                 :title "Sub-25ms Zero-UDP /relay/v1/chain-state & Light-Node Quorum Sync"
+                 :items ["/relay/v1/chain-state?local_only=true returns co-located validator snapshot in < 5ms without UDP :5010"
+                         "infra/fetch-validator-chain-state-snapshots! aggregates peer HTTP local_only=true snapshots in parallel before UDP fallback"
+                         "mesh /accountz?pubkey=<pk>&nonce=<n> includes signed :snapshot"
+                         "maybe-sync-account-state! verifies 2f+1 quorum via HTTPS /relay/v1/chain-state before spawning UDP :5010 dials"]}
+                {:id "P-NET-2"
+                 :title "Zero-Burn HTTPS Relay P2P Legs, --autonomous Auto-Answer, & Session Resolution"
+                 :items ["relay/reduce-relay admits 0-burn P2P envelopes into recipient mailboxes while forwarding only burned envelopes to validators"
+                         "handle-wire-p2p-offer auto-answers incoming p2p-offer on open sessions when :autonomous? is true"
+                         "resolve-session-id deterministically selects the most active open session by (tx-seq + rx-high-seq)"
+                         "p2p-offer and p2p-answer support --to and --endpoint"]}
+                {:id "P-ART-1"
+                 :title "Canonical put Relay Publishing & Idempotent /artifact/v1/pointer"
+                 :items ["Both put and artifact-put trigger post-artifact-to-relay! (awaited before exit in one-shot mode)"
+                         "/artifact/v1/pointer returns HTTP 200 OK (idempotent: true) when an already-applied pointer is re-submitted"]}
+                {:id "P-OPS-1 & P-OPS-2"
+                 :title "Cluster & Infra Operations Script Hardening"
+                 :items ["All ssh, scp, and rsync commands in scripts/cluster.sh and scripts/infra_cluster.sh enforce -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+                         "rollback_node restores /opt/bitecho-infra/bitecho.jar.bak and restarts bitecho-infra.service"
+                         "publish-git --deploy verifies live /dist/bitecho-light-node.cjs.sha256"]}]}

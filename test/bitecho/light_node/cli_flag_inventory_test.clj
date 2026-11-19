@@ -549,6 +549,12 @@
         (is (= "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" (get ag-cid1 "cid")))
         (is (= ag-cid1 ag-cid2)))
       (let [mcp1 (shell/parse-light-node-args ["--mcp" "--state-dir" "/tmp/mcp-flag-test"])
-            mcp2 (shell/parse-light-node-args ["mcp" "--state-dir" "/tmp/mcp-flag-test"])]
+            mcp2 (shell/parse-light-node-args ["mcp" "--state-dir" "/tmp/mcp-flag-test"])
+            p2p1 (shell/build-one-shot-cmd-map "p2p-offer" ["--to" "nexus" "--endpoint" "https://ns1.bitecho.org/relay/v1"])
+            p2p2 (cli/build-cmd-map "p2p-offer" ["--to" "nexus" "--endpoint" "https://ns1.bitecho.org/relay/v1"])]
         (is (= :mcp (:mode mcp1)))
-        (is (= :mcp (:mode mcp2)))))))
+        (is (= :mcp (:mode mcp2)))
+        (is (contains? (set cli/known-command-flags) "--endpoint"))
+        (is (= ["https://ns1.bitecho.org/relay/v1"] (get p2p1 "candidates")))
+        (is (= "nexus" (get p2p1 "to")))
+        (is (= p2p1 p2p2))))))

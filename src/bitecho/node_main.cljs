@@ -1969,8 +1969,24 @@
                   (cb nil)))]
         (step candidates)))))
 
+(defn- infer-bootstrap-relay-url
+  [bootstrap opts]
+  (when (and (nil? (:inband-snapshot-fetcher opts))
+             (nil? (:accountz-fetcher opts))
+             (not (false? (:use-relay-fast-path? opts))))
+    (let [u (or (:relay-url bootstrap)
+                (get-in bootstrap [:relay :url])
+                (first (:https-relay-urls bootstrap))
+                (when (some #(contains? #{"35.212.172.159" "35.209.253.119" "35.211.30.106"} (:ip %))
+                            (vals (:nodes bootstrap)))
+                  "https://ns1.bitecho.org"))]
+      (when (and (string? u) (not (str/blank? u)))
+        u))))
+
 (defn maybe-sync-account-state!
-  "Attempts in-band validator quorum sync over Port 5010/DTLS and falls back to HTTP `/accountz` if unreachable."
+  "Attempts fast HTTPS `/relay/v1/chain-state` 2f+1 quorum verification first when a relay URL is configured
+   or present on `bootstrap` (`P-NET-1`), falling back to in-band validator quorum sync over Port 5010/DTLS
+   and HTTP `/accountz` if unreachable."
   [state-atom bootstrap pubkey privkey-bytes opts cb]
   (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
                        (when (and (string? u) (not (str/blank? u))) u))]
@@ -2006,54 +2022,84 @@
                (cb {:ok? false :error (or (when-not (or (true? (get relay-resp "ok")) (true? (get relay-resp :ok)))
                                             (or (get relay-resp "error") (get relay-resp :error)))
                                           "no-verified-relay-snapshots")})))))))
-    (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})]
-      (fetch-inband-chain-state-quorum!
-       id bootstrap pubkey privkey-bytes opts
-       (fn [inband-res]
-         (cond
-           (:ok? inband-res)
-           (let [snap (:snapshot inband-res)]
-             (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
-             (cb {:ok? true :state @state-atom :quorum-result inband-res}))
+    (let [run-inband!
+          (fn []
+            (let [id (or (:identity opts) {:pubkey-hex pubkey :privkey-bytes privkey-bytes})]
+              (fetch-inband-chain-state-quorum!
+               id bootstrap pubkey privkey-bytes opts
+               (fn [inband-res]
+                 (cond
+                   (:ok? inband-res)
+                   (let [snap (:snapshot inband-res)]
+                     (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st snap)))
+                     (cb {:ok? true :state @state-atom :quorum-result inband-res}))
 
-           (and (or (:auto-relay-fallback? opts)
-                    (:relay-url bootstrap)
-                    (get-in bootstrap [:relay :url]))
-                (not (:relay-url opts)))
-           (let [fallback-url (or (:relay-url bootstrap)
-                                  (get-in bootstrap [:relay :url])
-                                  "https://bitecho.org/relay/v1")]
-             (maybe-sync-account-state! state-atom bootstrap pubkey privkey-bytes (assoc opts :relay-url fallback-url) cb))
+                   (and (or (:auto-relay-fallback? opts)
+                            (:relay-url bootstrap)
+                            (get-in bootstrap [:relay :url]))
+                        (not (:relay-url opts)))
+                   (let [fallback-url (or (:relay-url bootstrap)
+                                          (get-in bootstrap [:relay :url])
+                                          "https://bitecho.org/relay/v1")]
+                     (maybe-sync-account-state! state-atom bootstrap pubkey privkey-bytes (assoc opts :relay-url fallback-url) cb))
 
-           (and (not= (:error inband-res) "no-inband-snapshots-returned")
-                (not= (:error inband-res) "empty-bootstrap-nodes"))
-           (cb {:ok? false :error (:error inband-res)})
+                   (and (not= (:error inband-res) "no-inband-snapshots-returned")
+                        (not= (:error inband-res) "empty-bootstrap-nodes"))
+                   (cb {:ok? false :error (:error inband-res)})
 
-           (:accountz-fetcher opts)
-           (fetch-validator-accountz!
-            bootstrap pubkey opts
-            (fn [resp]
-              (if resp
-                (if (:account resp)
-                  (let [cmd {"cmd" "sync-account"
-                             "balance" (get-in resp [:account :balance] 0)
-                             "spendable" (:spendable resp)
-                             "seq" (get-in resp [:account :seq] 0)
-                             "deps" (vec (get-in resp [:account :deps] []))
-                             "finalized_epoch" (:finalized-epoch resp 0)}
-                        res (light-core/handle-command @state-atom cmd privkey-bytes)]
-                    (reset! state-atom (:state res))
-                    (cb {:ok? true :state @state-atom :accountz resp}))
-                  (cb {:ok? false :error "no-account-in-accountz"}))
-                (cb {:ok? false :error "accountz-fetcher-returned-nil"}))))
+                   (:accountz-fetcher opts)
+                   (fetch-validator-accountz!
+                    bootstrap pubkey opts
+                    (fn [resp]
+                      (if resp
+                        (if (:account resp)
+                          (let [cmd {"cmd" "sync-account"
+                                     "balance" (get-in resp [:account :balance] 0)
+                                     "spendable" (:spendable resp)
+                                     "seq" (get-in resp [:account :seq] 0)
+                                     "deps" (vec (get-in resp [:account :deps] []))
+                                     "finalized_epoch" (:finalized-epoch resp 0)}
+                                res (light-core/handle-command @state-atom cmd privkey-bytes)]
+                            (reset! state-atom (:state res))
+                            (cb {:ok? true :state @state-atom :accountz resp}))
+                          (cb {:ok? false :error "no-account-in-accountz"}))
+                        (cb {:ok? false :error "accountz-fetcher-returned-nil"}))))
 
-           :else
-           (let [err (or (:error inband-res) "no-inband-snapshots-returned")]
-             (swap! state-atom (fn [st]
-                                 (-> st
-                                     (update-in [:diagnostics :account-sync-inband-failed] (fnil inc 0))
-                                     (update-in [:diagnostics :chain-state-sync-failed] (fnil inc 0)))))
-             (cb {:synced false :ok? false :reason err :error err}))))))))
+                   :else
+                   (let [err (or (:error inband-res) "no-inband-snapshots-returned")]
+                     (swap! state-atom (fn [st]
+                                         (-> st
+                                             (update-in [:diagnostics :account-sync-inband-failed] (fnil inc 0))
+                                             (update-in [:diagnostics :chain-state-sync-failed] (fnil inc 0)))))
+                     (cb {:synced false :ok? false :reason err :error err})))))))]
+      (if-let [fast-relay-url (infer-bootstrap-relay-url bootstrap opts)]
+        (let [nonce (str (js/Date.now) "-" (.toString (.randomBytes node-crypto 8) "hex"))
+              opts' (assoc opts :pubkey pubkey :nonce nonce :timeout-ms (or (:timeout-ms opts) 3000))]
+          (fetch-relay-chain-state!
+           fast-relay-url opts'
+           (fn [relay-resp]
+             (let [raw-snaps (vec (or (get relay-resp "snapshots") (get relay-resp :snapshots)))
+                   signed-snaps (filterv (fn [s] (or (get s "signature") (get s :signature)))
+                                         (mapv (fn [s]
+                                                 (if (string? s)
+                                                   (try (edn/read-string s) (catch :default _ s))
+                                                   s))
+                                               raw-snaps))]
+               (if (seq signed-snaps)
+                 (let [trusted (set (keep :pubkey (vals (:nodes bootstrap))))
+                       verify-opts (assoc opts
+                                          :expected-pubkey pubkey
+                                          :expected-nonce nonce
+                                          :trusted-validators trusted
+                                          :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0)))
+                       q-res (light-core/verify-chain-state-quorum signed-snaps verify-opts)]
+                   (if (:ok? q-res)
+                     (do
+                       (swap! state-atom (fn [st] (light-core/apply-verified-chain-state-snapshot st (:snapshot q-res))))
+                       (cb {:ok? true :state @state-atom :quorum-result q-res}))
+                     (run-inband!)))
+                 (run-inband!))))))
+        (run-inband!)))))
 
 (defn fetch-directory-descriptor!
   "Fetches and parses a directory descriptor for `nickname` under `domain`."
@@ -2833,36 +2879,45 @@
         (str/replace #"/relay/v1$" "")
         (str/replace #"/artifact/v1$" ""))))
 
+(defn- effective-artifact-domain-verb
+  [verb cmd-map]
+  (let [v (str (or verb (get cmd-map "cmd") (:cmd cmd-map) ""))]
+    (if (contains? #{"put" "get" "list" "lock" "spend" "connect" "wait-event"} v)
+      (str (get (cli/desugar-cli-cmd-map (assoc (or cmd-map {}) "cmd" v)) "cmd" v))
+      v)))
+
 (defn- enrich-artifact-cmd-map
   [verb cmd-map]
-  (if (and (= verb "artifact-put")
-           (nil? (get cmd-map "hex"))
-           (nil? (get cmd-map "data_hex"))
-           (nil? (get cmd-map "text"))
-           (nil? (get cmd-map "data"))
-           (string? (get cmd-map "file"))
-           (not (str/blank? (get cmd-map "file"))))
-    (let [f (get cmd-map "file")]
-      (if (.existsSync node-fs f)
-        (let [h (.toString (.readFileSync node-fs f) "hex")]
-          (assoc cmd-map "hex" h "data_hex" h))
-        cmd-map))
-    cmd-map))
+  (let [eff-verb (effective-artifact-domain-verb verb cmd-map)]
+    (if (and (= eff-verb "artifact-put")
+             (nil? (get cmd-map "hex"))
+             (nil? (get cmd-map "data_hex"))
+             (nil? (get cmd-map "text"))
+             (nil? (get cmd-map "data"))
+             (string? (get cmd-map "file"))
+             (not (str/blank? (get cmd-map "file"))))
+      (let [f (get cmd-map "file")]
+        (if (.existsSync node-fs f)
+          (let [h (.toString (.readFileSync node-fs f) "hex")]
+            (assoc cmd-map "hex" h "data_hex" h))
+          cmd-map))
+      cmd-map)))
 
 (defn- maybe-write-artifact-out-file!
   [verb cmd-map resp]
-  (when (and (= verb "artifact-get")
-             (map? resp)
-             (true? (or (get resp "ok") (:ok resp)))
-             (string? (get cmd-map "out_file"))
-             (not (str/blank? (get cmd-map "out_file")))
-             (string? (get resp "hex")))
-    (try
-      (let [out-f (get cmd-map "out_file")
-            dir (.dirname node-path out-f)]
-        (when dir (.mkdirSync node-fs dir #js {:recursive true}))
-        (.writeFileSync node-fs out-f (.from (.-Buffer js/globalThis) (get resp "hex") "hex")))
-      (catch :default _ nil))))
+  (let [eff-verb (effective-artifact-domain-verb verb cmd-map)]
+    (when (and (= eff-verb "artifact-get")
+               (map? resp)
+               (true? (or (get resp "ok") (:ok resp)))
+               (string? (get cmd-map "out_file"))
+               (not (str/blank? (get cmd-map "out_file")))
+               (string? (get resp "hex")))
+      (try
+        (let [out-f (get cmd-map "out_file")
+              dir (.dirname node-path out-f)]
+          (when dir (.mkdirSync node-fs dir #js {:recursive true}))
+          (.writeFileSync node-fs out-f (.from (.-Buffer js/globalThis) (get resp "hex") "hex")))
+        (catch :default _ nil)))))
 
 (defn- post-artifact-to-relay!
   [raw-relay-url verb resp cb]
@@ -2874,17 +2929,18 @@
                           (http-post-json! (str base-url "/artifact/v1/pointer")
                                            (pr-str ptr)
                                            {"Content-Type" "application/edn"}
-                                           5000
+                                           15000
                                            (fn [r] (when cb (cb r))))
                           (when cb (cb nil))))]
-        (if (and (= verb "artifact-put") (or (get resp "blob") (:blob resp)))
+        (if (and (contains? #{"artifact-put" "put"} (str verb))
+                 (or (get resp "blob") (:blob resp)))
           (let [blob (or (get resp "blob") (:blob resp))]
             (http-post-json! (str base-url "/artifact/v1/blob")
                              (write-json-str {"bytes_hex" (basalt/bytes->hex (:blob/bytes blob))
                                               "cid" (:blob/cid blob)
                                               "media_type" (or (:blob/media-type blob) "application/octet-stream")})
                              {"Content-Type" "application/json"}
-                             5000
+                             30000
                              (fn [_] (post-ptr!))))
           (post-ptr!))))))
 
@@ -2917,14 +2973,15 @@
                 (done-cb resp)))))
         execute-cmd!
         (fn [effective-line]
-          (let [res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
-                _ (maybe-write-artifact-out-file! verb cmd-map (:response res))
-                _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
+          (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
+                res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
+                _ (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res))
+                _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
                     (when-let [art-relay (or (get cmd-map "relay_url")
                                              (get cmd-map "relay-url")
                                              (:relay-url cmd-map)
                                              relay-url)]
-                      (post-artifact-to-relay! art-relay verb (:response res) nil)))
+                      (post-artifact-to-relay! art-relay eff-domain-verb (:response res) nil)))
                 _ (when (:state res)
                     (reset! state-atom (:state res))
                     (when state-file
@@ -3854,77 +3911,82 @@
                                                           (and (= verb "status") (or (:sync? opts) (get cmd-map "sync") (:poll? opts) (get cmd-map "poll")))))
                                       after-poll!
                                       (fn [poll-auto-envs]
-                                        (let [res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
-                                              _ (maybe-write-artifact-out-file! verb cmd-map (:response res))
-                                              _ (when (contains? #{"artifact-put" "artifact-revoke"} verb)
-                                                  (when-let [art-relay (or (get cmd-map "relay_url")
-                                                                           (get cmd-map "relay-url")
-                                                                           (:relay-url cmd-map)
-                                                                           effective-relay-url)]
-                                                    (post-artifact-to-relay! art-relay verb (:response res) nil)))
+                                        (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
+                                              res (light-core/handle-command @state-atom cmd-map (:privkey-bytes identity))
+                                              _ (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res))
+                                              art-relay (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
+                                                          (or (get cmd-map "relay_url")
+                                                              (get cmd-map "relay-url")
+                                                              (:relay-url cmd-map)
+                                                              effective-relay-url))
                                               new-state (:state res)
                                               connect-explicit? (contains? opts :connect?)
                                               connect-wanted? (if connect-explicit?
                                                                 (boolean (:connect? opts))
                                                                 (not shuttle-verb?))
                                               all-envs (into (vec poll-auto-envs) (:net-envelopes res))
-                                              needs-network? (and (seq all-envs) connect-wanted?)]
-                                          (if needs-network?
-                                            (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
-                                                                 (when (and (string? u) (not (str/blank? u))) u))]
-                                              (let [relay-opts (assoc opts :timeout-ms (or (:timeout-ms opts) 5000))
-                                                    envs (vec all-envs)
-                                                    step (fn step [idx]
-                                                           (if (>= idx (count envs))
-                                                             (do
-                                                               (when-not (get cmd-map "peek")
-                                                                 (save-light-state! state-file new-state))
-                                                               (emit-json-line! (:response res))
-                                                               (.exit js/process 0))
-                                                             (-> (submit-relay-envelope! relay-url (nth envs idx) relay-opts)
-                                                                 (.then (fn [item-res]
-                                                                          (let [res-map (if (map? item-res) item-res (js->clj item-res :keywordize-keys true))]
-                                                                            (if (false? (or (:ok res-map) (get res-map "ok")))
-                                                                              (do
-                                                                                (emit-json-line! {"ok" false "error" (or (:error res-map) "relay-submit-failed")})
-                                                                                (.exit js/process 0))
-                                                                              (step (inc idx))))))
-                                                                 (.catch (fn [err]
-                                                                           (emit-json-line! {"ok" false "error" (str err)})
-                                                                           (.exit js/process 0))))))]
-                                                (step 0))
-                                              (connect-validators!
-                                               identity bootstrap opts
-                                               (fn [conn-res]
-                                                 (if-not (:ok? conn-res)
-                                                   (do
-                                                     (emit-json-line! {"ok" false "error" (or (:error conn-res) "listener-disabled")})
-                                                     (.exit js/process 0))
-                                                   (let [send-fn (:send-fn conn-res)
-                                                         finish! (fn [sent?]
-                                                                   (when-let [n (:node conn-res)]
-                                                                     (try (api/close! n) (catch :default _ nil)))
-                                                                   (if sent?
-                                                                     (do
-                                                                       (when-not (get cmd-map "peek")
-                                                                         (save-light-state! state-file new-state))
-                                                                       (emit-json-line! (:response res))
-                                                                       (.exit js/process 0))
-                                                                     (do
-                                                                       (emit-json-line! {"ok" false "error" "connection-closed"})
-                                                                       (.exit js/process 0))))]
-                                                     (if (= :http-relay (:transport conn-res))
-                                                       (send-all-envelopes! send-fn all-envs (fn [sent?] (finish! sent?)))
-                                                       (let [sent? (send-all-envelopes! send-fn all-envs)]
-                                                         (js/setTimeout
-                                                          (fn []
-                                                            (finish! sent?))
-                                                          50))))))))
-                                            (do
-                                              (when-not (get cmd-map "peek")
-                                                (save-light-state! state-file new-state))
-                                              (emit-json-line! (:response res))
-                                              (.exit js/process 0)))))]
+                                              needs-network? (and (seq all-envs) connect-wanted?)
+                                              proceed-after-artifact!
+                                              (fn []
+                                                (if needs-network?
+                                                  (if-let [relay-url (let [u (or (:relay-url opts) (:relay_url opts))]
+                                                                       (when (and (string? u) (not (str/blank? u))) u))]
+                                                    (let [relay-opts (assoc opts :timeout-ms (or (:timeout-ms opts) 5000))
+                                                          envs (vec all-envs)
+                                                          step (fn step [idx]
+                                                                 (if (>= idx (count envs))
+                                                                   (do
+                                                                     (when-not (get cmd-map "peek")
+                                                                       (save-light-state! state-file new-state))
+                                                                     (emit-json-line! (:response res))
+                                                                     (.exit js/process 0))
+                                                                   (-> (submit-relay-envelope! relay-url (nth envs idx) relay-opts)
+                                                                       (.then (fn [item-res]
+                                                                                (let [res-map (if (map? item-res) item-res (js->clj item-res :keywordize-keys true))]
+                                                                                  (if (false? (or (:ok res-map) (get res-map "ok")))
+                                                                                    (do
+                                                                                      (emit-json-line! {"ok" false "error" (or (:error res-map) "relay-submit-failed")})
+                                                                                      (.exit js/process 0))
+                                                                                    (step (inc idx))))))
+                                                                       (.catch (fn [err]
+                                                                                 (emit-json-line! {"ok" false "error" (str err)})
+                                                                                 (.exit js/process 0))))))]
+                                                      (step 0))
+                                                    (connect-validators!
+                                                     identity bootstrap opts
+                                                     (fn [conn-res]
+                                                       (if-not (:ok? conn-res)
+                                                         (do
+                                                           (emit-json-line! {"ok" false "error" (or (:error conn-res) "listener-disabled")})
+                                                           (.exit js/process 0))
+                                                         (let [send-fn (:send-fn conn-res)
+                                                               finish! (fn [sent?]
+                                                                         (when-let [n (:node conn-res)]
+                                                                           (try (api/close! n) (catch :default _ nil)))
+                                                                         (if sent?
+                                                                           (do
+                                                                             (when-not (get cmd-map "peek")
+                                                                               (save-light-state! state-file new-state))
+                                                                             (emit-json-line! (:response res))
+                                                                             (.exit js/process 0))
+                                                                           (do
+                                                                             (emit-json-line! {"ok" false "error" "connection-closed"})
+                                                                             (.exit js/process 0))))]
+                                                           (if (= :http-relay (:transport conn-res))
+                                                             (send-all-envelopes! send-fn all-envs (fn [sent?] (finish! sent?)))
+                                                             (let [sent? (send-all-envelopes! send-fn all-envs)]
+                                                               (js/setTimeout
+                                                                (fn []
+                                                                  (finish! sent?))
+                                                                50))))))))
+                                                  (do
+                                                    (when-not (get cmd-map "peek")
+                                                      (save-light-state! state-file new-state))
+                                                    (emit-json-line! (:response res))
+                                                    (.exit js/process 0))))]
+                                          (if art-relay
+                                            (post-artifact-to-relay! art-relay eff-domain-verb (:response res) (fn [_] (proceed-after-artifact!)))
+                                            (proceed-after-artifact!))))]
                                   (if poll-verb?
                                     (poll-and-ingest-relay-once! effective-relay-url identity state-atom state-file opts after-poll!)
                                     (after-poll! []))))]

@@ -1,9 +1,9 @@
 ---
 name: bitecho-light-node
-description: Operational reference and command guide for the Bitecho v0.23.9 light-node boundary shell, 12 canonical CLI verbs, and JSONL stdio protocol.
+description: Operational reference and command guide for the Bitecho v0.23.11 light-node boundary shell, 12 canonical CLI verbs, bitecho-mcp server, and JSONL stdio protocol.
 ---
 
-# Bitecho Light Node (`v0.23.9` — `BIP-005: Unification III`)
+# Bitecho Light Node (`v0.23.11` — `BIP-007: Low-Latency Quorum Sync & Zero-Burn HTTPS Relay Legs`)
 
 The Bitecho Light Node is a sovereign, Sans-IO edge client (`bitecho.light-node.core` + `bitecho.shell.light-node`) for autonomous agents and human anchors to communicate, publish content-addressed Pointers (`:sync-pointer`), and settle ChiaLisp-style SCI puzzle escrows across JVM, Node.js (`dist/bitecho-light-node.cjs`), and Browser (`dist/bitecho-browser.js`).
 

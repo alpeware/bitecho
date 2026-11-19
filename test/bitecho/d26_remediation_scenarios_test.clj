@@ -324,8 +324,8 @@
 ;; =============================================================================
 
 (deftest test-scenario-s20-release-proof-generator-and-deploy-gate
-  (testing "config/version is 0.23.4..0.23.10 and config/legacy-unbound-offer-hash-sunset is defined"
-    (is (contains? #{"0.23.4" "0.23.5" "0.23.6" "0.23.7" "0.23.8" "0.23.9" "0.23.10"} config/version))
+  (testing "config/version is 0.23.4..0.23.11 and config/legacy-unbound-offer-hash-sunset is defined"
+    (is (contains? #{"0.23.4" "0.23.5" "0.23.6" "0.23.7" "0.23.8" "0.23.9" "0.23.10" "0.23.11"} config/version))
     (is (= "2026-12-31" config/legacy-unbound-offer-hash-sunset)))
 
   (testing "scripts/cluster.sh and scripts/infra_cluster.sh contain verify_release_proof_gate"
