@@ -5,6 +5,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
+            [bitecho.deploy.core :as deploy]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
@@ -2540,13 +2541,20 @@
                                 (into (vec replay-envs) (:net-envelopes res))
                                 (:net-envelopes res))
                     mirror-to-relay! (fn [envs]
-                                       (when (and (string? relay-url)
-                                                  (not (str/blank? relay-url))
-                                                  (not= :http-relay (:transport @conn-atom)))
-                                         (doseq [env (remove :p2p-direct? envs)]
-                                           (try
-                                             (submit-relay-envelope! relay-url env {:timeout-ms 5000})
-                                             (catch Exception _ nil)))))]
+                                       (if (and (string? relay-url)
+                                                (not (str/blank? relay-url))
+                                                (not= :http-relay (:transport @conn-atom)))
+                                         (let [non-direct (remove :p2p-direct? envs)]
+                                           (if (empty? non-direct)
+                                             false
+                                             (boolean
+                                              (some (fn [env]
+                                                      (try
+                                                        (let [r (submit-relay-envelope! relay-url env {:timeout-ms 5000})]
+                                                          (boolean (or (true? (get r "ok")) (true? (:ok r)))))
+                                                        (catch Exception _ false)))
+                                                    non-direct))))
+                                         false))]
                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
                   (do
                     (when (and (not currently-live?)
@@ -2568,8 +2576,8 @@
                                          (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
                         sent-val? (when currently-live?
                                     (send-all-envelopes! (:send-fn @conn-atom) live-envs))
-                        _ (mirror-to-relay! live-envs)
-                        sent? (or sent-val? sent-ingress?)]
+                        sent-relay? (mirror-to-relay! live-envs)
+                        sent? (or sent-val? sent-ingress? sent-relay?)]
                     (if sent?
                       (do
                         (swap! state-atom assoc :connected? true :connection-error nil)
@@ -2601,7 +2609,14 @@
                                     (when state-file (save-light-state! state-file @state-atom))
                                     (finish-resp! (:response res)))
                                   (let [err "send-failed"]
-                                    (swap! state-atom assoc :connected? false :connection-error err)
+                                    (swap! state-atom
+                                           (fn [st]
+                                             (:state (deploy/route-control-plane-envelope
+                                                      (assoc st :connected? false :connection-error err)
+                                                      (first all-envs)
+                                                      (cond-> [{:id :validator-udp :available? true :send-ok? false}]
+                                                        (and (string? relay-url) (not (str/blank? relay-url)))
+                                                        (conj {:id :https-relay :available? true :send-ok? false}))))))
                                     (when conn-atom
                                       (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
                                     (if (= verb "send")
@@ -2625,7 +2640,14 @@
                             (let [err (or (:error reconn) "listener-disabled")]
                               (when conn-atom
                                 (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
-                              (swap! state-atom assoc :connected? false :connection-error err)
+                              (swap! state-atom
+                                     (fn [st]
+                                       (:state (deploy/route-control-plane-envelope
+                                                (assoc st :connected? false :connection-error err)
+                                                (first live-envs)
+                                                (cond-> [{:id :validator-udp :available? true :send-ok? false}]
+                                                  (and (string? relay-url) (not (str/blank? relay-url)))
+                                                  (conj {:id :https-relay :available? true :send-ok? false}))))))
                               (if (= verb "send")
                                 (do
                                   (sync-conn-diagnostics! state-atom conn-atom)

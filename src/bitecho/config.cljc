@@ -19,7 +19,29 @@
 
 (def version
   "Current protocol and release milestone version."
-  "0.23.12")
+  "0.23.13")
+
+(def ratified-theta-star
+  "Selected Monte Carlo Tokenomics v2.1 Pareto-optimal parameter vector (`BIP-009` / `P-DEPLOY-9`)."
+  {:k-bps 5000
+   :treasury-trailing-epochs 168
+   :settlement-take-bps 50
+   :streamlet-share-pct 20
+   :min-node-stake 250000
+   :max-stake-multiplier 4.0
+   :min-signaling-burn 100
+   :bootstrap-sunset-epoch 26280
+   :bootstrap-drawdown-lambda 0.0001})
+
+(def ratified-theta-star-metrics
+  "Recorded Monte Carlo v2.1 Pareto frontier metrics for `ratified-theta-star` (`BIP-009` / `P-DEPLOY-9`)."
+  {:pareto-optimal? true
+   :candidate-id "theta-0"
+   :seed 1795112000
+   :gini-median 0.142
+   :insolvency-rate 0.0
+   :signaling-grief-cost-ratio 1.0
+   :supply-conserved? true})
 
 (def infra-cold-root-pubkey
   "Pinned Cold Offline Infra Root Ed25519 public key (HEX) for on-network artifact attestation."
@@ -109,6 +131,11 @@
    :settlement-take-bps   50
    :economy-enabled?      true
    :burn-floor            100
+   :k-bps                 5000
+   :streamlet-share-pct   20
+   :max-stake-multiplier  4.0
+   :bootstrap-drawdown-lambda 0.0001
+   :policy-theta          ratified-theta-star
    ;; Murmur — epidemic gossip fanout (G in the paper)
    :murmur-k              5
    ;; Maximum number of seen message IDs kept in the Murmur cache

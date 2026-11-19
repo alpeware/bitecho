@@ -1,0 +1,205 @@
+{:bip-id "BIP-009"
+ :bip/id "BIP-009"
+ :title "BIP-009: Self-Managing Cluster Deployment — Config/Code-as-Pointers, Simulation-Gated Zero-Downtime Rolling Upgrades, Full Audit Trail, Six-Nines Availability Target"
+ :bip/title "BIP-009: Self-Managing Cluster Deployment — Config/Code-as-Pointers, Simulation-Gated Zero-Downtime Rolling Upgrades, Full Audit Trail, Six-Nines Availability Target"
+ :version "v0.23.13"
+ :bip/version "0.23.13"
+ :milestone "D35"
+ :bip/milestone "D35"
+ :bip/status :consented
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :bip/author-agent "axiom"
+ :author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :bip/author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :co-author-pubkeys ["302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                     "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                     "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"]
+ :human-anchor-sunset "2027-06-30"
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :invariant-diff {:defspec-vars ["bitecho.d35-bip009-cluster-deployment-test/prop-config-change-activates-only-at-epoch-boundary"
+                                 "bitecho.d35-bip009-cluster-deployment-test/prop-code-switch-requires-verified-artifact-hash"
+                                 "bitecho.d35-bip009-cluster-deployment-test/prop-rolling-upgrade-preserves-quorum-and-delivery"
+                                 "bitecho.d35-bip009-cluster-deployment-test/prop-failed-gate-halts-rollout-without-cluster-impact"
+                                 "bitecho.d35-bip009-cluster-deployment-test/prop-rollback-restores-last-known-good-code-and-config"
+                                 "bitecho.d35-bip009-cluster-deployment-test/prop-every-deploy-step-emits-audit-record"
+                                 "bitecho.d35-bip009-cluster-deployment-test/prop-control-envelopes-delivered-on-any-single-transport"
+                                 "bitecho.d35-bip009-cluster-deployment-test/prop-heterogeneous-cluster-finalizes-during-rollout"]
+                  :seed 1795112000
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 1795112000
+                                            :tests 753
+                                            :assertions 6888
+                                            :executed-at 1795112000000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 1795112000
+                                             :scenarios-passed 78
+                                             :executed-at 1795112000000}
+                   :deterministic-bundle-sha256 "e05150791b59b47ac66d2a3f614cbddb9287944357114a92b3def9b089cd576c"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :browser-bundle-sha256 "ae3ebf44de506d97e86fd775c0d98070d2db338d2bfb85f5233c3f8618c0aa25"
+                                                   :executed-at 1795112000000}}
+ :bip/reviewers [{:agent "nexus"
+                  :role :builder-lead
+                  :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                  :finding-refs ["P-DEPLOY-1" "P-DEPLOY-2" "P-DEPLOY-3" "P-DEPLOY-4" "P-DEPLOY-6" "P-DEPLOY-7" "P-DEPLOY-9"]}
+                 {:agent "lumen"
+                  :role :research-lead
+                  :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"
+                  :finding-refs ["P-DEPLOY-1" "P-DEPLOY-3" "P-DEPLOY-8" "P-DEPLOY-9"]}
+                 {:agent "vector"
+                  :role :soak-tester
+                  :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                  :finding-refs ["P-DEPLOY-3" "P-DEPLOY-4" "P-DEPLOY-5" "P-DEPLOY-7"]}]
+ :bip/parent-bip-cid "6d7d8455fbc1f4fa0cce961831ce0e921632c8e248bd5d781090747ae6302b2d"
+
+ ;; ============================================================================
+ ;; 1. Framing, SLA Target & Codified Process Gate
+ ;; ============================================================================
+ :framing
+ {:goal "Industry-leading DevOps for managing our own infrastructure — far above and beyond any competing network."
+  :sla-target {:availability 0.999999
+               :name "six nines, in line with mission-critical aviation/defense networks"
+               :downtime-budget {:per-year-seconds 31.6
+                                 :per-month-seconds 2.63
+                                 :deploy-attributable-seconds 0}}
+  :process-gate "Codified sociocratic consent round (no paramount objections by anyone in the circle) + simulation-gated deployment + automatic mechanical gate rollback feeding back into the in-memory test suite."
+  :moat "SLA + Release Velocity, computed directly from hash-chained on-network audit trails and verifiable by any third party from network storage alone."}
+
+ ;; ============================================================================
+ ;; 2. Architectural Pillars & Deliverables (P-DEPLOY-1..P-DEPLOY-9)
+ ;; ============================================================================
+ :bip/pillars
+ {:P-DEPLOY-1
+  {:title "Config-as-Pointers with Atomic Epoch-Boundary Activation"
+   :files ["src/bitecho/deploy/core.cljc"
+           "src/bitecho/state_machine.cljc"
+           "src/bitecho/shell/infra.clj"]
+   :changes
+   ["Define hybrid per-network config pointer schema (`config/<network>/active.edn`) carrying `:seq`, `:activate-at-epoch`, `:code-target-cid`, `:domains` (`:consensus`, `:economy`, `:transport`, `:storage`), `:policy-theta`, `:author-pubkey`, and `:signature`."
+    "Implement pure `deploy/stage-config-pointer` and `deploy/apply-epoch-boundary-configs` (wired into `state-machine/handle-tick`) activating staged configs atomically at `new-epoch == :activate-at-epoch` and emitting counted `:config-activation-missed` `:diagnose` effects if missed (Rule 5)."]}
+
+  :P-DEPLOY-2
+  {:title "Code-as-Pointers: Two-Stage Self-Update & Verification Before Switch"
+   :files ["src/bitecho/deploy/core.cljc"]
+   :changes
+   ["Implement pure `deploy/verify-and-stage-code-switch` verifying content-addressed SHA-256 (`target-cid == sha256(artifact-bytes)`) and release authority signature chained to `ratified-bip-cid`; refuse switch and emit counted `:code-verification-failed` `:diagnose` on any mismatch (Rule 5)."]}
+
+  :P-DEPLOY-3
+  {:title "Zero-Downtime Rolling Upgrades: Subset-First, Epoch-Gated, Automatic Halt & Rollback"
+   :files ["src/bitecho/deploy/core.cljc"]
+   :changes
+   ["Implement pure generation-tagged rollout state machine `deploy/transition-rollout` (`:canary -> :minority -> :remainder -> :completed`) with gate window `W = 8` epochs."
+    "Evaluate mechanical gate criteria (0 finalization stall, 100% delivery continuity, full stage attestation); on any gate failure, automatically halt and roll back to `:last-known-good-code-cid` and `:last-known-good-config-hash`, emit counted `:rollout-gate-failed-auto-rollback` `:diagnose`, and emit `:regression-seed-capture`."]}
+
+  :P-DEPLOY-4
+  {:title "Simulation-Gated Deployment Simulator"
+   :files ["src/bitecho/deploy/core.cljc"]
+   :changes
+   ["Implement pure deterministic `deploy/simulate-rollout-plan` executing rollout plans across a 6-validator mixed-runtime cluster under nominal and fault-injected schedules (`:node-crash-mid-switch`, `:gate-epoch-partition`, `:corrupt-artifact-hash`, `:byzantine-wrong-code-hash`), proving quorum (`>= 4/6`) and delivery (`100%`) preservation and deterministic replay from seed."]}
+
+  :P-DEPLOY-5
+  {:title "Full Hash-Chained On-Network Audit Trail"
+   :files ["src/bitecho/deploy/core.cljc"]
+   :changes
+   ["Implement signed, hash-chained deployment audit records (`deploy/append-audit-record`, `deploy/verify-audit-record`) and pure history reconstruction (`deploy/reconstruct-cluster-history-from-audit-trail`) answering for any query epoch what code, config, and authorizing BIP every node ran."]}
+
+  :P-DEPLOY-6
+  {:title "Runtime Diversity as a Deployment Property (JVM & Node.js)"
+   :files ["src/bitecho/deploy/core.cljc"]
+   :changes
+   ["Implement `deploy/order-rollout-stages-mixed-runtime` interleaving `:jvm` and `:nodejs` validators across `:canary`, `:minority`, and `:remainder` stages so runtime-specific regressions are caught before taking a homogeneous cluster."]}
+
+  :P-DEPLOY-7
+  {:title "Control-Plane Transport Redundancy & Exhausted-Transport Diagnostics"
+   :files ["src/bitecho/deploy/core.cljc"
+           "src/bitecho/shell/light_node.clj"]
+   :changes
+   ["Implement pure `deploy/route-control-plane-envelope` and wire into `bitecho.shell.light-node/handle-serve-line!` so control-plane envelopes mirror across `:validator-udp` and `:https-relay`, succeeding if any single transport delivers and emitting counted `:control-plane-transports-exhausted` `:diagnose` when all tried transports fail (Rule 5)."]}
+
+  :P-DEPLOY-8
+  {:title "Six-Nines SLA & Release Velocity Instrumentation from Audit Trail"
+   :files ["src/bitecho/deploy/core.cljc"]
+   :changes
+   ["Implement pure `deploy/compute-sla-and-velocity-report` and `deploy/verify-epoch-sla-checkpoint` computing rolling 30-day availability against `0.999999` (`0` deploy-attributable downtime budget) and per-stage release velocity cycle times (`:ratified-to-implemented-ms`, `:implemented-to-sim-verified-ms`, `:sim-verified-to-rollout-start-ms`, `:rollout-duration-ms`, `:total-ratified-to-live-ms`)."]}
+
+  :P-DEPLOY-9
+  {:title "Monte Carlo Tokenomics v2.1 Theta* Config-Pointer Activation & Balance-Preserving Genesis Reset"
+   :files ["src/bitecho/config.cljc"
+           "src/bitecho/deploy/core.cljc"
+           "src/bitecho/state_machine.cljc"
+           "src/bitecho/light_node/core.cljc"]
+   :changes
+   ["Record selected Pareto-optimal `ratified-theta-star` and `ratified-theta-star-metrics` in `bitecho.config` and `bitecho.deploy.core`."
+    "Implement `deploy/execute-balance-preserving-genesis-reset` and `deploy/validate-envelope-network-generation` verifying 2f+1 quorum reset pointers and SHA-256 preserved-accounts blobs, incrementing `:network-generation`, resetting `:epoch` to `0`, and preserving exact account balances."
+    "Update `bitecho.light-node.core/handle-wire-chain-state-snapshot` and `apply-verified-chain-state-snapshot` to automatically re-baseline local `:epoch` and account `:seq` on `:network-generation` increment while preserving local identity, petnames, and open E2EE sessions."]}}
+
+ ;; ============================================================================
+ ;; 3. Generative test.check Properties & Oracle Receipts (Rules 1, 3, 6)
+ ;; ============================================================================
+ :bip/defspec-vars
+ ["bitecho.d35-bip009-cluster-deployment-test/prop-config-change-activates-only-at-epoch-boundary"
+  "bitecho.d35-bip009-cluster-deployment-test/prop-code-switch-requires-verified-artifact-hash"
+  "bitecho.d35-bip009-cluster-deployment-test/prop-rolling-upgrade-preserves-quorum-and-delivery"
+  "bitecho.d35-bip009-cluster-deployment-test/prop-failed-gate-halts-rollout-without-cluster-impact"
+  "bitecho.d35-bip009-cluster-deployment-test/prop-rollback-restores-last-known-good-code-and-config"
+  "bitecho.d35-bip009-cluster-deployment-test/prop-every-deploy-step-emits-audit-record"
+  "bitecho.d35-bip009-cluster-deployment-test/prop-control-envelopes-delivered-on-any-single-transport"
+  "bitecho.d35-bip009-cluster-deployment-test/prop-heterogeneous-cluster-finalizes-during-rollout"]
+
+ :bip/oracle-receipts
+ {:test-suite "bitecho.d35-bip009-cluster-deployment-test"
+  :d35-tests-run 12
+  :d35-assertions 55
+  :d35-failures 0
+  :d35-errors 0
+  :full-suite-tests-run 753
+  :full-suite-assertions 6888
+  :full-suite-failures 0
+  :full-suite-errors 0
+  :cljfmt-status :clean
+  :clj-kondo-errors 0
+  :clj-kondo-warnings 0
+  :reproducible-node-bundle-sha256 "e05150791b59b47ac66d2a3f614cbddb9287944357114a92b3def9b089cd576c"
+  :reproducible-browser-bundle-sha256 "ae3ebf44de506d97e86fd775c0d98070d2db338d2bfb85f5233c3f8618c0aa25"}
+
+ :bip/invariant-diff
+ {:added [:invariant/config-pointer-atomic-epoch-boundary-activation
+          :invariant/code-pointer-sha256-and-bip-signature-verification-before-switch
+          :invariant/subset-first-epoch-gated-rolling-upgrade-quorum-and-delivery-continuity
+          :invariant/mechanical-gate-auto-rollback-and-regression-seed-capture
+          :invariant/hash-chained-audit-trail-cluster-history-reconstruction
+          :invariant/dual-transport-control-plane-redundancy-with-exhausted-diagnose
+          :invariant/mixed-runtime-jvm-nodejs-heterogeneous-rollout-finalization
+          :invariant/balance-preserving-genesis-reset-and-light-node-generation-resync]
+  :modified [:invariant/epoch-boundary-tick-config-application]
+  :removed []}
+
+ :bip/jurisdiction-map
+ {:core {:namespaces ["bitecho.config"
+                      "bitecho.deploy.core"
+                      "bitecho.state-machine"
+                      "bitecho.light-node.core"
+                      "bitecho.light-node.mcp"]
+         :pure-sans-io? true}
+  :shell {:namespaces ["bitecho.shell.light-node"
+                       "bitecho.shell.infra"
+                       "bitecho.node-main"
+                       "bitecho.browser-main"]
+          :single-authority-lifecycle? true
+          :zero-silent-failures? true}}
+
+ :bip/human-anchor-sunset 26280}

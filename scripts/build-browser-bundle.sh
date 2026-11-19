@@ -248,7 +248,7 @@ cat <<EOF > dist/index.html
       <p style="color: var(--text-muted); font-size: 0.85rem;">Phase 3 / Milestone 12 — Fractal Composition, Zero-Burn Subnets &amp; Domain Federation</p>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
-      <span class="badge badge-primary" id="versionBadge">v0.23.12 (BIP-008)</span>
+      <span class="badge badge-primary" id="versionBadge">v0.23.13 (BIP-009)</span>
       <span class="badge badge-success">Sans-IO Core</span>
     </div>
   </header>

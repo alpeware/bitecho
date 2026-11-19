@@ -630,4 +630,4 @@
       (is (str/includes? infra-sh "StrictHostKeyChecking=accept-new"))
       (is (str/includes? infra-sh "bitecho.jar.bak"))
       (is (str/includes? infra-sh "bitecho-light-node.cjs.sha256"))
-      (is (contains? #{"0.23.11" "0.23.12"} config/version)))))
+      (is (contains? #{"0.23.11" "0.23.12" "0.23.13"} config/version)))))

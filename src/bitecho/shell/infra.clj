@@ -341,6 +341,9 @@
                                         {:pattern "blog/*"           :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "web/bip/*"        :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "bip/*"            :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "config/*"         :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "sla/*"            :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "deploy/*"         :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "web/app/*"        :principal {:type :allowlist :signers releases-signers}}
                                         {:pattern "web/*"            :principal {:type :allowlist}}
                                         {:pattern "bootstrap"        :principal {:type :allowlist}}

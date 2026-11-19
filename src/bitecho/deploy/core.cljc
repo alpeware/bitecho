@@ -1,0 +1,1348 @@
+(ns bitecho.deploy.core
+  "Milestone D35 (`BIP-009: Self-Managing Cluster Deployment — Config/Code-as-Pointers,
+   Simulation-Gated Zero-Downtime Rolling Upgrades, Full Audit Trail, Six-Nines Availability Target` / `v0.23.13`).
+   100% Pure Sans-IO `.cljc` Engine (Rule 2, Rule 4, Rule 5):
+   - `P-DEPLOY-1`: Config-as-Pointers with Atomic Epoch-Boundary Activation (`stage-config-pointer`, `apply-epoch-boundary-configs`)
+   - `P-DEPLOY-2`: Code-as-Pointers: Two-Stage Self-Update & Verification Before Switch (`verify-and-stage-code-switch`)
+   - `P-DEPLOY-3`: Zero-Downtime Rolling Upgrades (`transition-rollout`, `build-rollout-plan`)
+   - `P-DEPLOY-4`: Simulation-Gated Deployment Simulator (`simulate-rollout-plan`)
+   - `P-DEPLOY-5`: Full Hash-Chained On-Network Audit Trail (`append-audit-record`, `reconstruct-cluster-history-from-audit-trail`)
+   - `P-DEPLOY-6`: Runtime Diversity (`order-rollout-stages-mixed-runtime`)
+   - `P-DEPLOY-7`: Control-Plane Transport Redundancy (`route-control-plane-envelope`)
+   - `P-DEPLOY-8`: Six-Nines SLA & Release Velocity Instrumentation (`compute-sla-and-velocity-report`, `verify-epoch-sla-checkpoint`)
+   - `P-DEPLOY-9`: Monte Carlo Tokenomics v2.1 `theta*` & Balance-Preserving Genesis Reset (`execute-balance-preserving-genesis-reset`)."
+  (:refer-clojure :exclude [bytes?])
+  (:require [bitecho.basalt.core :as basalt]
+            [bitecho.config :as config]
+            [bitecho.crypto :as crypto]
+            [bitecho.economy.account :as account]
+            [bitecho.fressian :as fressian]
+            [clojure.string :as str]))
+
+(def ^:private bytes? fressian/bytes?)
+
+;; =============================================================================
+;; 0. Shared Pure Helpers & Ratified Monte Carlo v2.1 Theta* (P-DEPLOY-9)
+;; =============================================================================
+
+(def ratified-theta-star
+  "Selected Monte Carlo Tokenomics v2.1 Pareto-optimal parameter vector (`BIP-009` / `P-DEPLOY-9`)."
+  config/ratified-theta-star)
+
+(def ratified-theta-star-metrics
+  "Recorded Monte Carlo v2.1 Pareto frontier metrics for `ratified-theta-star`."
+  config/ratified-theta-star-metrics)
+
+(def genesis-prev-hash
+  "Canonical 64-zero hex prev-hash for the first record in a hash-chained audit trail."
+  "0000000000000000000000000000000000000000000000000000000000000000")
+
+(defn- normalize-hex
+  [s]
+  (when (and (string? s) (not (str/blank? s)))
+    (str/lower-case (str/trim s))))
+
+(defn sha256-hex
+  "Computes lowercase 64-char SHA-256 hex digest over bytes, UTF-8 string, or canonical Fressian EDN."
+  [x]
+  (let [bs (cond
+             (bytes? x) x
+             (string? x) (fressian/utf8->bytes x)
+             :else (fressian/encode-canonical x))]
+    (str/lower-case (basalt/bytes->hex (crypto/sha256 bs)))))
+
+(defn- math-ceil
+  [n]
+  #?(:clj (long (Math/ceil (double n)))
+     :cljs (long (js/Math.ceil (double n)))))
+
+;; =============================================================================
+;; 1. P-DEPLOY-5: Full Hash-Chained On-Network Audit Trail
+;; =============================================================================
+
+(defn canonical-audit-record-payload
+  "Returns the canonical vector signed and hashed for an audit record."
+  [{:keys [seq epoch timestamp-ms event-type prev-hash payload signer]}]
+  ["bitecho-deploy-audit-v1"
+   (long (or seq 0))
+   (long (or epoch 0))
+   (long (or timestamp-ms 0))
+   (if (keyword? event-type) (name event-type) (str event-type))
+   (str (or prev-hash genesis-prev-hash))
+   (or payload {})
+   (str (or signer ""))])
+
+(defn make-audit-record
+  "Constructs a signed (when `privkey` is provided) hash-chained deployment audit record."
+  [{:keys [seq epoch timestamp-ms event-type prev-hash payload signer privkey]}]
+  (let [norm-prev (or (normalize-hex prev-hash) genesis-prev-hash)
+        norm-signer (or (normalize-hex signer) "system")
+        base {:seq (long (or seq 1))
+              :epoch (long (or epoch 0))
+              :timestamp-ms (long (or timestamp-ms (* (long (or epoch 0)) 10000)))
+              :event-type (keyword event-type)
+              :prev-hash norm-prev
+              :payload (or payload {})
+              :signer norm-signer}
+        canon-vec (canonical-audit-record-payload base)
+        rec-hash (sha256-hex canon-vec)
+        sig-hex (if privkey
+                  (let [s (crypto/sign-canonical privkey canon-vec)]
+                    (str/lower-case (if (string? s) s (basalt/bytes->hex s))))
+                  (sha256-hex ["system-audit-sig" rec-hash]))]
+    (assoc base
+           :record-hash rec-hash
+           :signature sig-hex)))
+
+(defn append-audit-record
+  "Appends a new hash-chained audit record to `(:audit-trail state)`."
+  [state {:keys [epoch timestamp-ms event-type payload signer privkey]}]
+  (let [trail (vec (or (:audit-trail state) []))
+        last-rec (peek trail)
+        next-seq (inc (long (or (:seq last-rec) 0)))
+        prev-hash (or (:record-hash last-rec) genesis-prev-hash)
+        eff-epoch (long (or epoch (:epoch state) 0))
+        rec (make-audit-record {:seq next-seq
+                                :epoch eff-epoch
+                                :timestamp-ms (or timestamp-ms (* eff-epoch 10000))
+                                :event-type event-type
+                                :prev-hash prev-hash
+                                :payload payload
+                                :signer (or signer (:node-pubkey state) (:pubkey state) "system")
+                                :privkey (or privkey (:node-private-key state))})]
+    {:state (assoc state :audit-trail (conj trail rec))
+     :record rec}))
+
+(defn verify-audit-record
+  "Verifies hash integrity and (when signer is a valid hex pubkey and signature is Ed25519) signature of a single audit record."
+  [record expected-prev-hash]
+  (let [prev-ok? (= (or expected-prev-hash genesis-prev-hash)
+                    (:prev-hash record))
+        canon-vec (canonical-audit-record-payload record)
+        expected-hash (sha256-hex canon-vec)
+        hash-ok? (= expected-hash (:record-hash record))
+        signer (:signer record)
+        sig (:signature record)
+        sig-ok? (cond
+                  (or (nil? sig) (str/blank? (str sig)))
+                  false
+
+                  (= sig (sha256-hex ["system-audit-sig" expected-hash]))
+                  true
+
+                  (and (string? signer)
+                       (or (= 64 (count signer)) (= 88 (count signer)))
+                       (re-matches #"^[0-9a-fA-F]+$" signer))
+                  (try
+                    (crypto/verify-with-fallback
+                     (basalt/hex->bytes signer)
+                     canon-vec
+                     (basalt/hex->bytes sig))
+                    (catch #?(:clj Exception :cljs :default) _ false))
+
+                  :else
+                  false)]
+    {:valid? (and prev-ok? hash-ok? sig-ok?)
+     :prev-ok? prev-ok?
+     :hash-ok? hash-ok?
+     :sig-ok? sig-ok?}))
+
+(defn reconstruct-cluster-history-from-audit-trail
+  "Pure auditor function (`P-DEPLOY-5`) that verifies hash-chain & signature integrity across
+   `audit-records` and reconstructs the exact `:active-code-cid`, `:active-config-hash`,
+   `:authorizing-bip-cid`, and `:stage` status of every node at `query-epoch` from audit records alone."
+  [audit-records query-epoch]
+  (let [q-ep (long (or query-epoch 0))]
+    (loop [rem-recs (vec audit-records)
+           expected-prev genesis-prev-hash
+           expected-seq 1
+           chain-valid? true
+           sigs-valid? true
+           auth-bip-cid nil
+           active-stage :idle
+           nodes-map {}]
+      (if (empty? rem-recs)
+        {:chain-valid? chain-valid?
+         :signatures-valid? sigs-valid?
+         :query-epoch q-ep
+         :authorizing-bip-cid auth-bip-cid
+         :stage-at-epoch active-stage
+         :nodes-at-epoch nodes-map}
+        (let [rec (first rem-recs)
+              v (verify-audit-record rec expected-prev)
+              seq-ok? (= expected-seq (long (or (:seq rec) -1)))
+              next-chain-valid? (and chain-valid? seq-ok? (:prev-ok? v) (:hash-ok? v))
+              next-sigs-valid? (and sigs-valid? (:sig-ok? v))
+              rec-ep (long (or (:epoch rec) 0))
+              apply-to-view? (<= rec-ep q-ep)
+              ev-type (:event-type rec)
+              p (:payload rec)
+              next-bip (if (and apply-to-view? (:ratified-bip-cid p))
+                         (:ratified-bip-cid p)
+                         auth-bip-cid)
+              next-stage (if (and apply-to-view? (:stage p))
+                           (:stage p)
+                           active-stage)
+              next-nodes
+              (if-not apply-to-view?
+                nodes-map
+                (case ev-type
+                  :bip-ratified
+                  (let [init-nodes (or (:initial-nodes p) {})]
+                    (reduce-kv (fn [acc nid ninfo]
+                                 (assoc acc nid
+                                        {:node-id nid
+                                         :runtime (:runtime ninfo :jvm)
+                                         :active-code-cid (:active-code-cid ninfo)
+                                         :active-config-hash (:active-config-hash ninfo)
+                                         :authorizing-bip-cid (or (:ratified-bip-cid p) next-bip)
+                                         :stage :baseline}))
+                               nodes-map
+                               init-nodes))
+
+                  :node-switched
+                  (let [nid (:node-id p)]
+                    (if nid
+                      (update nodes-map nid
+                              (fn [prev]
+                                (merge {:node-id nid}
+                                       prev
+                                       {:active-code-cid (or (:code-cid p) (:active-code-cid prev))
+                                        :active-config-hash (or (:config-hash p) (:active-config-hash prev))
+                                        :authorizing-bip-cid (or (:ratified-bip-cid p) next-bip (:authorizing-bip-cid prev))
+                                        :stage (or (:stage p) next-stage)})))
+                      nodes-map))
+
+                  :config-activated
+                  (let [nid (:node-id p)
+                        cfg-h (:active-config-hash p)]
+                    (if nid
+                      (assoc-in nodes-map [nid :active-config-hash] cfg-h)
+                      (into {}
+                            (map (fn [[k v]] [k (assoc v :active-config-hash cfg-h)]))
+                            nodes-map)))
+
+                  :auto-rollback
+                  (let [lkg-code (:last-known-good-code-cid p)
+                        lkg-cfg (:last-known-good-config-hash p)]
+                    (into {}
+                          (map (fn [[nid v]]
+                                 [nid (assoc v
+                                             :active-code-cid (or lkg-code (:active-code-cid v))
+                                             :active-config-hash (or lkg-cfg (:active-config-hash v))
+                                             :stage :rolled-back)]))
+                          nodes-map))
+
+                  nodes-map))]
+          (recur (subvec rem-recs 1)
+                 (:record-hash rec)
+                 (inc expected-seq)
+                 next-chain-valid?
+                 next-sigs-valid?
+                 next-bip
+                 next-stage
+                 next-nodes))))))
+
+;; =============================================================================
+;; 2. P-DEPLOY-1: Config-as-Pointers with Atomic Epoch-Boundary Activation
+;; =============================================================================
+
+(defn canonical-config-pointer-map
+  "Normalizes a per-network config pointer manifest map (excluding `:signature`) for deterministic signing."
+  [pointer-map]
+  {:network (str (or (:network pointer-map) "devnet"))
+   :seq (long (or (:seq pointer-map) 1))
+   :activate-at-epoch (long (or (:activate-at-epoch pointer-map) 0))
+   :code-target-cid (str (or (:code-target-cid pointer-map) ""))
+   :domains (into (sorted-map) (or (:domains pointer-map) {}))
+   :policy-theta (into (sorted-map) (or (:policy-theta pointer-map) {}))
+   :author-pubkey (or (normalize-hex (:author-pubkey pointer-map)) "")})
+
+(defn canonical-config-pointer-signing-payload
+  "Domain-separated canonical payload for signing a config pointer."
+  [pointer-map]
+  ["bitecho-config-pointer-v1" (canonical-config-pointer-map pointer-map)])
+
+(defn sign-config-pointer
+  "Signs a config pointer manifest map with `authority-privkey`."
+  [authority-privkey pointer-map]
+  (let [canon (canonical-config-pointer-map pointer-map)
+        payload (canonical-config-pointer-signing-payload canon)
+        sig (crypto/sign-canonical authority-privkey payload)
+        sig-hex (str/lower-case (if (string? sig) sig (basalt/bytes->hex sig)))]
+    (assoc canon
+           :config-hash (sha256-hex canon)
+           :signature sig-hex)))
+
+(defn verify-config-pointer
+  "Verifies authority membership (when `:trusted-deploy-authorities` is non-empty) and Ed25519 signature on `pointer-map`."
+  [state pointer-map]
+  (if-not (map? pointer-map)
+    {:ok? false :error :malformed-config-pointer}
+    (let [canon (canonical-config-pointer-map pointer-map)
+          author (:author-pubkey canon)
+          sig (:signature pointer-map)
+          trusted (set (map normalize-hex (or (:trusted-deploy-authorities state)
+                                              (get-in state [:config :trusted-deploy-authorities])
+                                              [])))
+          auth-allowed? (or (empty? trusted) (contains? trusted author))
+          cur-seq (long (or (:active-config-seq state) 0))
+          seq-ok? (> (long (:seq canon 0)) cur-seq)
+          sig-ok? (boolean
+                   (when (and (not (str/blank? author))
+                              (string? sig)
+                              (not (str/blank? sig)))
+                     (try
+                       (crypto/verify-with-fallback
+                        (basalt/hex->bytes author)
+                        (canonical-config-pointer-signing-payload canon)
+                        (basalt/hex->bytes sig))
+                       (catch #?(:clj Exception :cljs :default) _ false))))]
+      (cond
+        (not auth-allowed?)
+        {:ok? false :error :unauthorized-config-authority}
+
+        (not seq-ok?)
+        {:ok? false :error :stale-config-pointer-seq}
+
+        (not sig-ok?)
+        {:ok? false :error :invalid-config-pointer-signature}
+
+        :else
+        {:ok? true
+         :pointer (assoc canon
+                         :config-hash (or (:config-hash pointer-map) (sha256-hex canon))
+                         :signature (normalize-hex sig))}))))
+
+(defn stage-config-pointer
+  "Pure function (`P-DEPLOY-1`): validates authority/signature and stages pending config for
+   `:activate-at-epoch` without mutating active config mid-epoch.
+   Emits a counted `:diagnose` effect if validation fails (Rule 5)."
+  [state pointer-map]
+  (let [v (verify-config-pointer state pointer-map)]
+    (if-not (:ok? v)
+      (let [diag {:effect :diagnose
+                  :type :diagnose
+                  :reason :config-pointer-rejected
+                  :error (:error v)}
+            st' (update-in state [:diagnostics :config-pointer-rejected] (fnil inc 0))]
+        {:ok? false
+         :error (:error v)
+         :state st'
+         :effects [diag]})
+      (let [ptr (:pointer v)
+            act-ep (long (:activate-at-epoch ptr))
+            cur-ep (long (or (:epoch state) 0))]
+        (if (<= act-ep cur-ep)
+          (let [diag {:effect :diagnose
+                      :type :diagnose
+                      :reason :config-pointer-past-epoch
+                      :activate-at-epoch act-ep
+                      :current-epoch cur-ep}
+                st' (update-in state [:diagnostics :config-pointer-rejected] (fnil inc 0))]
+            {:ok? false
+             :error :config-pointer-past-epoch
+             :state st'
+             :effects [diag]})
+          (let [audit-res (append-audit-record
+                           state
+                           {:epoch cur-ep
+                            :event-type :config-pointer-updated
+                            :payload {:seq (:seq ptr)
+                                      :activate-at-epoch act-ep
+                                      :config-hash (:config-hash ptr)
+                                      :code-target-cid (:code-target-cid ptr)}
+                            :signer (:author-pubkey ptr)})
+                st' (assoc-in (:state audit-res) [:staged-config-pointers act-ep] ptr)]
+            {:ok? true
+             :pointer ptr
+             :state st'
+             :effects [{:effect :audit-record :record (:record audit-res)}]}))))))
+
+(defn- merge-config-pointer-into-config
+  "Merges a staged config pointer's `:domains` and `:policy-theta` parameters into `cfg`."
+  [cfg ptr]
+  (let [domains (:domains ptr)
+        theta (:policy-theta ptr)
+        consensus-cfg (when (map? (:consensus domains)) (:consensus domains))
+        economy-cfg (when (map? (:economy domains)) (:economy domains))
+        transport-cfg (when (map? (:transport domains)) (:transport domains))
+        storage-cfg (when (map? (:storage domains)) (:storage domains))
+        merged (merge (or cfg {})
+                      consensus-cfg
+                      economy-cfg
+                      transport-cfg
+                      storage-cfg
+                      theta
+                      (when (seq theta) {:policy-theta theta})
+                      (when (not (str/blank? (str (:code-target-cid ptr))))
+                        {:code-target-cid (:code-target-cid ptr)}))]
+    (cond-> merged
+      (:min-signaling-burn merged)
+      (assoc :burn-floor (long (:min-signaling-burn merged))))))
+
+(defn apply-epoch-boundary-configs
+  "Pure function (`P-DEPLOY-1`): at the exact epoch boundary (`new-epoch == :activate-at-epoch`),
+   atomically activates staged config parameters, records `:active-config-hash`, and emits a
+   hash-chained `:config-activated` audit record.
+   If any staged config has `activate-at-epoch + delta < new-epoch` without having been applied,
+   emits a counted `:diagnose` (`:reason :config-activation-missed`, Rule 5)."
+  ([state new-epoch]
+   (apply-epoch-boundary-configs state new-epoch 1))
+  ([state new-epoch delta-epochs]
+   (let [ep (long new-epoch)
+         delta (max 0 (long (or delta-epochs 1)))
+         staged-map (or (:staged-config-pointers state) {})
+         due-ptr (get staged-map ep)
+         missed-eps (filterv (fn [target-ep] (< (+ (long target-ep) delta) ep))
+                             (keys staged-map))
+         [st-after-missed missed-effects]
+         (reduce (fn [[st effs] missed-ep]
+                   (let [m-ptr (get staged-map missed-ep)
+                         diag {:effect :diagnose
+                               :type :diagnose
+                               :reason :config-activation-missed
+                               :activate-at-epoch missed-ep
+                               :current-epoch ep
+                               :config-hash (:config-hash m-ptr)}
+                         audit-res (append-audit-record
+                                    st
+                                    {:epoch ep
+                                     :event-type :config-activation-missed
+                                     :payload {:activate-at-epoch missed-ep
+                                               :current-epoch ep
+                                               :config-hash (:config-hash m-ptr)}})
+                         st' (-> (:state audit-res)
+                                 (update :staged-config-pointers dissoc missed-ep)
+                                 (update-in [:diagnostics :config-activation-missed] (fnil inc 0)))]
+                     [st' (conj effs diag {:effect :audit-record :record (:record audit-res)})]))
+                 [(assoc state :epoch ep) []]
+                 missed-eps)]
+     (if-not due-ptr
+       {:state st-after-missed
+        :activated? false
+        :effects missed-effects}
+       (let [new-cfg (merge-config-pointer-into-config (:config st-after-missed) due-ptr)
+             cfg-hash (or (:config-hash due-ptr) (sha256-hex (canonical-config-pointer-map due-ptr)))
+             audit-res (append-audit-record
+                        st-after-missed
+                        {:epoch ep
+                         :event-type :config-activated
+                         :payload {:seq (:seq due-ptr)
+                                   :activate-at-epoch ep
+                                   :active-config-hash cfg-hash
+                                   :code-target-cid (:code-target-cid due-ptr)
+                                   :policy-theta (:policy-theta due-ptr)}
+                         :signer (:author-pubkey due-ptr)})
+             st-activated (-> (:state audit-res)
+                              (assoc :config new-cfg
+                                     :active-config-hash cfg-hash
+                                     :active-config-seq (:seq due-ptr)
+                                     :burn-floor (long (or (:min-signaling-burn new-cfg) (:burn-floor new-cfg) 100)))
+                              (update :staged-config-pointers dissoc ep))]
+         {:state st-activated
+          :activated? true
+          :active-config-hash cfg-hash
+          :effects (conj missed-effects {:effect :audit-record :record (:record audit-res)})})))))
+
+;; =============================================================================
+;; 3. P-DEPLOY-2: Code-as-Pointers: Two-Stage Self-Update & Verification
+;; =============================================================================
+
+(defn canonical-code-pointer-signing-payload
+  "Canonical signing payload for a release authority code pointer chained to `ratified-bip-cid`."
+  [{:keys [target-cid ratified-bip-cid authority-pubkey]}]
+  ["bitecho-code-pointer-v1"
+   (or (normalize-hex target-cid) "")
+   (or (normalize-hex ratified-bip-cid) "")
+   (or (normalize-hex authority-pubkey) "")])
+
+(defn sign-code-pointer
+  "Signs a code pointer `{:target-cid :ratified-bip-cid :authority-pubkey}` with `authority-privkey`."
+  [authority-privkey code-ptr]
+  (let [payload (canonical-code-pointer-signing-payload code-ptr)
+        sig (crypto/sign-canonical authority-privkey payload)]
+    (str/lower-case (if (string? sig) sig (basalt/bytes->hex sig)))))
+
+(defn verify-and-stage-code-switch
+  "Pure function (`P-DEPLOY-2`): verifies content-addressed artifact SHA-256 equals `target-cid`
+   and verifies release authority signature chained to `ratified-bip-cid`.
+   On any mismatch, refuses to switch, increments `[:diagnostics :code-switch-rejected]`,
+   and emits a counted `:diagnose` (`:reason :code-verification-failed`) + audit record (Rule 5)."
+  [state {:keys [target-cid artifact-bytes pointer-sig authority-pubkey ratified-bip-cid gate-epoch]}]
+  (let [norm-target (normalize-hex target-cid)
+        norm-auth (normalize-hex authority-pubkey)
+        norm-bip (normalize-hex ratified-bip-cid)
+        actual-cid (when (and artifact-bytes (bytes? artifact-bytes))
+                     (sha256-hex artifact-bytes))
+        hash-ok? (and (some? norm-target)
+                      (some? actual-cid)
+                      (= norm-target actual-cid))
+        ratified-set (set (map normalize-hex (or (:ratified-bip-cids state) #{})))
+        bip-ok? (and (some? norm-bip)
+                     (or (empty? ratified-set)
+                         (contains? ratified-set norm-bip)))
+        trusted-auths (set (map normalize-hex (or (:trusted-deploy-authorities state) #{})))
+        auth-ok? (and (some? norm-auth)
+                      (or (empty? trusted-auths)
+                          (contains? trusted-auths norm-auth)))
+        sig-ok? (boolean
+                 (when (and norm-target norm-bip norm-auth
+                            (string? pointer-sig) (not (str/blank? pointer-sig)))
+                   (try
+                     (crypto/verify-with-fallback
+                      (basalt/hex->bytes norm-auth)
+                      (canonical-code-pointer-signing-payload
+                       {:target-cid norm-target
+                        :ratified-bip-cid norm-bip
+                        :authority-pubkey norm-auth})
+                      (basalt/hex->bytes pointer-sig))
+                     (catch #?(:clj Exception :cljs :default) _ false))))]
+    (if (and hash-ok? bip-ok? auth-ok? sig-ok?)
+      (let [cur-ep (long (or (:epoch state) 0))
+            staged {:target-cid norm-target
+                    :ratified-bip-cid norm-bip
+                    :authority-pubkey norm-auth
+                    :gate-epoch (long (or gate-epoch cur-ep))
+                    :verified? true}
+            audit-res (append-audit-record
+                       state
+                       {:epoch cur-ep
+                        :event-type :node-code-verified
+                        :payload (assoc staged :node-id (:node-id state))
+                        :signer norm-auth})
+            st' (assoc (:state audit-res) :staged-code-switch staged)]
+        {:ok? true
+         :staged-code-switch staged
+         :state st'
+         :effects [{:effect :audit-record :record (:record audit-res)}]})
+      (let [failure-cause (cond
+                            (not hash-ok?) :artifact-hash-mismatch
+                            (not bip-ok?) :unratified-bip-cid
+                            (not auth-ok?) :unauthorized-release-authority
+                            (not sig-ok?) :invalid-pointer-signature
+                            :else :verification-failed)
+            cur-ep (long (or (:epoch state) 0))
+            diag {:effect :diagnose
+                  :type :diagnose
+                  :reason :code-verification-failed
+                  :cause failure-cause
+                  :target-cid norm-target
+                  :actual-cid actual-cid
+                  :ratified-bip-cid norm-bip}
+            audit-res (append-audit-record
+                       state
+                       {:epoch cur-ep
+                        :event-type :code-verification-failed
+                        :payload {:node-id (:node-id state)
+                                  :cause failure-cause
+                                  :target-cid norm-target
+                                  :actual-cid actual-cid}})
+            st' (-> (:state audit-res)
+                    (dissoc :staged-code-switch)
+                    (update-in [:diagnostics :code-switch-rejected] (fnil inc 0)))]
+        {:ok? false
+         :error :code-verification-failed
+         :cause failure-cause
+         :state st'
+         :effects [diag {:effect :audit-record :record (:record audit-res)}]}))))
+
+;; =============================================================================
+;; 4. P-DEPLOY-6 & P-DEPLOY-3: Runtime Diversity & Rollout State Machine
+;; =============================================================================
+
+(defn make-cluster-spec
+  "Builds a canonical multi-validator cluster specification mixing `:jvm` and `:nodejs` runtimes."
+  [node-descriptors]
+  (let [nodes-map
+        (into (sorted-map)
+              (map-indexed
+               (fn [idx desc]
+                 (let [nid (keyword (or (:node-id desc) (str "node" (inc idx))))
+                       rt (keyword (or (:runtime desc) (if (even? idx) :jvm :nodejs)))
+                       kp (or (:keypair desc)
+                              (crypto/generate-keypair (str "deploy-val-" (name nid) "-" idx)))
+                       pub (:public kp)
+                       pk-hex (if (string? pub) pub (basalt/bytes->hex pub))]
+                   [nid {:node-id nid
+                         :runtime rt
+                         :pubkey pk-hex
+                         :privkey (:private kp)}]))
+               node-descriptors))
+        n (count nodes-map)
+        quorum (math-ceil (/ (* 2.0 (double (max 1 n))) 3.0))]
+    {:nodes nodes-map
+     :validator-count n
+     :quorum-threshold (max 1 quorum)}))
+
+(defn default-six-validator-cluster-spec
+  "Canonical 6-validator devnet cluster spec mixing `:jvm` and `:nodejs` validators (`P-DEPLOY-6`)."
+  []
+  (make-cluster-spec
+   [{:node-id :node1 :runtime :jvm}
+    {:node-id :node2 :runtime :nodejs}
+    {:node-id :node3 :runtime :jvm}
+    {:node-id :ns1   :runtime :nodejs}
+    {:node-id :ns2   :runtime :jvm}
+    {:node-id :ns3   :runtime :nodejs}]))
+
+(defn order-rollout-stages-mixed-runtime
+  "Orders validator nodes into `{:canary [1-node] :minority [k-nodes] :remainder [rest-nodes]}`
+   such that when both `:jvm` and `:nodejs` runtimes exist in the cluster, `:canary` and `:minority`
+   together cover both `:jvm` and `:nodejs` runtimes (`P-DEPLOY-6`)."
+  [nodes-map]
+  (let [entries (vec (sort-by (comp name first) nodes-map))
+        jvm-ids (mapv first (filter #(= :jvm (:runtime (second %))) entries))
+        node-ids (mapv first (filter #(= :nodejs (:runtime (second %))) entries))
+        other-ids (mapv first (remove #(contains? #{:jvm :nodejs} (:runtime (second %))) entries))
+        interleaved (loop [a jvm-ids
+                           b node-ids
+                           acc []]
+                      (if (and (empty? a) (empty? b))
+                        (into acc other-ids)
+                        (recur (vec (rest a))
+                               (vec (rest b))
+                               (cond-> acc
+                                 (seq a) (conj (first a))
+                                 (seq b) (conj (first b))))))
+        n (count interleaved)
+        canary-cnt (if (pos? n) 1 0)
+        minority-cnt (cond
+                       (<= n 2) 0
+                       (<= n 4) 1
+                       :else 2)
+        canary (subvec interleaved 0 canary-cnt)
+        minority (subvec interleaved canary-cnt (+ canary-cnt minority-cnt))
+        remainder (subvec interleaved (+ canary-cnt minority-cnt) n)]
+    {:canary canary
+     :minority minority
+     :remainder remainder
+     :ordered-nodes interleaved}))
+
+(defn build-rollout-plan
+  "Constructs a deterministic epoch-gated rollout plan with gate window `W` (default `8` epochs)."
+  [cluster-spec {:keys [start-epoch gate-window-epochs old-code-cid target-code-cid
+                        old-config-hash target-config-hash ratified-bip-cid]}]
+  (let [start-ep (long (or start-epoch 10))
+        w (max 1 (long (or gate-window-epochs 8)))
+        stages (order-rollout-stages-mixed-runtime (:nodes cluster-spec))
+        old-code (or (normalize-hex old-code-cid) (sha256-hex "code-v0"))
+        new-code (or (normalize-hex target-code-cid) (sha256-hex "code-v1"))
+        old-cfg (or (normalize-hex old-config-hash) (sha256-hex "cfg-v0"))
+        new-cfg (or (normalize-hex target-config-hash) (sha256-hex "cfg-v1"))
+        bip-cid (or (normalize-hex ratified-bip-cid) (sha256-hex "bip-009"))]
+    {:start-epoch start-ep
+     :gate-window-epochs w
+     :stages (select-keys stages [:canary :minority :remainder])
+     :stage-order [:canary :minority :remainder]
+     :gate-epochs {:canary (+ start-ep w)
+                   :minority (+ start-ep (* 2 w))
+                   :remainder (+ start-ep (* 3 w))}
+     :old-code-cid old-code
+     :target-code-cid new-code
+     :old-config-hash old-cfg
+     :target-config-hash new-cfg
+     :last-known-good-code-cid old-code
+     :last-known-good-config-hash old-cfg
+     :ratified-bip-cid bip-cid}))
+
+(defn init-rollout-state
+  "Initializes the pure rollout controller state map (`Rule 4`)."
+  [cluster-spec rollout-plan]
+  (let [old-code (:old-code-cid rollout-plan)
+        old-cfg (:old-config-hash rollout-plan)
+        bip-cid (:ratified-bip-cid rollout-plan)
+        init-nodes (into (sorted-map)
+                         (map (fn [[nid ndesc]]
+                                [nid {:node-id nid
+                                      :runtime (:runtime ndesc :jvm)
+                                      :pubkey (:pubkey ndesc)
+                                      :active-code-cid old-code
+                                      :active-config-hash old-cfg
+                                      :authorizing-bip-cid bip-cid
+                                      :healthy? true
+                                      :stage :baseline}]))
+                         (:nodes cluster-spec))]
+    {:phase :idle
+     :stage nil
+     :generation 1
+     :epoch (long (:start-epoch rollout-plan 0))
+     :plan rollout-plan
+     :cluster-spec cluster-spec
+     :nodes init-nodes
+     :consecutive-stall-epochs 0
+     :max-consecutive-stall-epochs 0
+     :finalization-stall-epochs 0
+     :finalized-blocks-count 0
+     :finalized-blocks-during-heterogeneous-window 0
+     :messages-broadcast 0
+     :messages-delivered 0
+     :last-error nil
+     :dropped 0
+     :diagnostics {}
+     :audit-trail []}))
+
+(defn- stage-nodes
+  [rollout-state stage-kw]
+  (get-in rollout-state [:plan :stages stage-kw] []))
+
+(defn- evaluate-gate-criteria
+  "Evaluates mechanical gate criteria over the gate window `W`:
+   1. No finalization stall `>= 3` consecutive epochs (and `0` deploy-attributable stall epochs).
+   2. `100%` honest-quorum message delivery (`messages-delivered == messages-broadcast`).
+   3. All upgraded nodes in the current stage are healthy and attest `:active-code-cid == target-code-cid`
+      and `:active-config-hash == target-config-hash`."
+  [rollout-state stage-kw]
+  (let [plan (:plan rollout-state)
+        target-code (:target-code-cid plan)
+        target-cfg (:target-config-hash plan)
+        upgraded-ids (stage-nodes rollout-state stage-kw)
+        stall-ok? (and (< (long (:max-consecutive-stall-epochs rollout-state 0)) 3)
+                       (zero? (long (:finalization-stall-epochs rollout-state 0))))
+        delivery-ok? (= (long (:messages-broadcast rollout-state 0))
+                        (long (:messages-delivered rollout-state 0)))
+        attestation-ok? (every? (fn [nid]
+                                  (let [n (get-in rollout-state [:nodes nid])]
+                                    (and (true? (:healthy? n))
+                                         (= target-code (:active-code-cid n))
+                                         (= target-cfg (:active-config-hash n)))))
+                                upgraded-ids)]
+    {:passed? (and stall-ok? delivery-ok? attestation-ok?)
+     :stall-ok? stall-ok?
+     :delivery-ok? delivery-ok?
+     :attestation-ok? attestation-ok?
+     :reason (cond
+               (not attestation-ok?) :stage-attestation-failed
+               (not stall-ok?) :finalization-stall-detected
+               (not delivery-ok?) :delivery-loss-detected
+               :else :ok)}))
+
+(defn- switch-stage-nodes
+  [rollout-state stage-kw ep]
+  (let [plan (:plan rollout-state)
+        target-code (:target-code-cid plan)
+        target-cfg (:target-config-hash plan)
+        bip-cid (:ratified-bip-cid plan)
+        nids (stage-nodes rollout-state stage-kw)]
+    (reduce (fn [[st effs] nid]
+              (let [st1 (-> st
+                            (assoc-in [:nodes nid :active-code-cid] target-code)
+                            (assoc-in [:nodes nid :active-config-hash] target-cfg)
+                            (assoc-in [:nodes nid :authorizing-bip-cid] bip-cid)
+                            (assoc-in [:nodes nid :stage] stage-kw))
+                    audit-res (append-audit-record
+                               st1
+                               {:epoch ep
+                                :event-type :node-switched
+                                :payload {:node-id nid
+                                          :stage stage-kw
+                                          :code-cid target-code
+                                          :config-hash target-cfg
+                                          :ratified-bip-cid bip-cid}})]
+                [(:state audit-res)
+                 (conj effs {:effect :audit-record :record (:record audit-res)})]))
+            [rollout-state []]
+            nids)))
+
+(defn transition-rollout
+  "Pure rollout state machine (`P-DEPLOY-3`, `Rule 4`, `Rule 5`):
+   `(transition-rollout rollout-state event) -> [new-rollout-state effects]`.
+   Stages: `[:canary :minority :remainder :completed :halted :rolled-back]`."
+  [rollout-state event]
+  (let [cur-gen (long (:generation rollout-state 1))
+        ev-gen (:generation event)
+        ep (long (or (:epoch event) (:epoch rollout-state) 0))]
+    (if (and (some? ev-gen) (< (long ev-gen) cur-gen))
+      (let [diag {:effect :diagnose
+                  :type :diagnose
+                  :reason :stale-generation-callback
+                  :event-generation (long ev-gen)
+                  :current-generation cur-gen}
+            st' (-> rollout-state
+                    (update :dropped (fnil inc 0))
+                    (update-in [:diagnostics :stale-generation-callback] (fnil inc 0)))]
+        [st' [diag]])
+      (case (:type event)
+        :start-rollout
+        (let [plan (:plan rollout-state)
+              bip-cid (:ratified-bip-cid plan)
+              a1 (append-audit-record
+                  (assoc rollout-state :epoch ep :phase :canary :stage :canary)
+                  {:epoch ep
+                   :event-type :bip-ratified
+                   :payload {:ratified-bip-cid bip-cid
+                             :initial-nodes (:nodes rollout-state)}})
+              a2 (append-audit-record
+                  (:state a1)
+                  {:epoch ep
+                   :event-type :artifact-published
+                   :payload {:target-code-cid (:target-code-cid plan)
+                             :target-config-hash (:target-config-hash plan)
+                             :ratified-bip-cid bip-cid}})
+              a3 (append-audit-record
+                  (:state a2)
+                  {:epoch ep
+                   :event-type :code-pointer-updated
+                   :payload {:target-code-cid (:target-code-cid plan)
+                             :target-config-hash (:target-config-hash plan)
+                             :ratified-bip-cid bip-cid
+                             :stage :canary}})
+              [st-switched switch-effs] (switch-stage-nodes (:state a3) :canary ep)]
+          [st-switched
+           (into [{:effect :audit-record :record (:record a1)}
+                  {:effect :audit-record :record (:record a2)}
+                  {:effect :audit-record :record (:record a3)}]
+                 switch-effs)])
+
+        :evaluate-gate
+        (let [cur-stage (:stage rollout-state)
+              verdict (evaluate-gate-criteria rollout-state cur-stage)]
+          (if (:passed? verdict)
+            (let [next-stage (case cur-stage
+                               :canary :minority
+                               :minority :remainder
+                               :remainder :completed
+                               :completed)
+                  a-pass (append-audit-record
+                          (assoc rollout-state :epoch ep :phase next-stage :stage next-stage)
+                          {:epoch ep
+                           :event-type :gate-passed
+                           :payload {:stage cur-stage
+                                     :next-stage next-stage
+                                     :verdict verdict}})]
+              (if (= next-stage :completed)
+                [(:state a-pass)
+                 [{:effect :audit-record :record (:record a-pass)}]]
+                (let [[st-switched switch-effs] (switch-stage-nodes (:state a-pass) next-stage ep)]
+                  [st-switched
+                   (into [{:effect :audit-record :record (:record a-pass)}] switch-effs)])))
+            ;; Mechanical gate failed -> automatic halt & rollback + regression seed capture
+            (let [plan (:plan rollout-state)
+                  lkg-code (:last-known-good-code-cid plan)
+                  lkg-cfg (:last-known-good-config-hash plan)
+                  bip-cid (:ratified-bip-cid plan)
+                  seed (long (or (:seed event) 0))
+                  fault-sched (:fault-schedule event)
+                  restored-nodes (into (sorted-map)
+                                       (map (fn [[nid n]]
+                                              [nid (assoc n
+                                                          :active-code-cid lkg-code
+                                                          :active-config-hash lkg-cfg
+                                                          :healthy? true
+                                                          :stage :rolled-back)]))
+                                       (:nodes rollout-state))
+                  a-fail (append-audit-record
+                          rollout-state
+                          {:epoch ep
+                           :event-type :gate-failed
+                           :payload {:stage cur-stage
+                                     :verdict verdict
+                                     :fault-schedule fault-sched}})
+                  a-rb (append-audit-record
+                        (:state a-fail)
+                        {:epoch ep
+                         :event-type :auto-rollback
+                         :payload {:stage cur-stage
+                                   :reason (:reason verdict)
+                                   :last-known-good-code-cid lkg-code
+                                   :last-known-good-config-hash lkg-cfg
+                                   :ratified-bip-cid bip-cid
+                                   :seed seed}})
+                  diag {:effect :diagnose
+                        :type :diagnose
+                        :reason :rollout-gate-failed-auto-rollback
+                        :stage cur-stage
+                        :cause (:reason verdict)}
+                  reg-eff {:effect :regression-seed-capture
+                           :seed seed
+                           :stage cur-stage
+                           :cause (:reason verdict)
+                           :fault-schedule fault-sched}
+                  st-rb (-> (:state a-rb)
+                            (assoc :epoch ep
+                                   :phase :rolled-back
+                                   :stage :rolled-back
+                                   :halted? true
+                                   :rolled-back? true
+                                   :nodes restored-nodes
+                                   :last-error (:reason verdict))
+                            (update :generation inc)
+                            (update-in [:diagnostics :rollout-gate-failed-auto-rollback] (fnil inc 0)))]
+              [st-rb
+               [diag
+                {:effect :audit-record :record (:record a-fail)}
+                {:effect :audit-record :record (:record a-rb)}
+                reg-eff]])))
+
+        [rollout-state []]))))
+
+;; =============================================================================
+;; 5. P-DEPLOY-4: Simulation-Gated Deployment Simulator
+;; =============================================================================
+
+(defn- apply-injected-fault-at-stage
+  "Applies deterministic fault injection to `rollout-state` during `stage-kw` while keeping
+   honest quorum (`>= 4/6`) intact on the remaining validators."
+  [rollout-state stage-kw fault-schedule]
+  (if (or (nil? fault-schedule)
+          (not= stage-kw (:stage fault-schedule)))
+    rollout-state
+    (let [fault-type (:fault-type fault-schedule)
+          target-nid (first (stage-nodes rollout-state stage-kw))
+          plan (:plan rollout-state)]
+      (case fault-type
+        :node-crash-mid-switch
+        (assoc-in rollout-state [:nodes target-nid :healthy?] false)
+
+        :gate-epoch-partition
+        (assoc-in rollout-state [:nodes target-nid :active-config-hash] (:old-config-hash plan))
+
+        :corrupt-artifact-hash
+        (-> rollout-state
+            (assoc-in [:nodes target-nid :active-code-cid] (:old-code-cid plan))
+            (update-in [:diagnostics :code-switch-rejected] (fnil inc 0)))
+
+        :byzantine-wrong-code-hash
+        (assoc-in rollout-state [:nodes target-nid :active-code-cid]
+                  (sha256-hex "byzantine-forged-code-cid"))
+
+        rollout-state))))
+
+(defn simulate-rollout-plan
+  "Pure deterministic in-memory deployment simulator (`P-DEPLOY-4`).
+   Executes the rollout plan across epochs on a multi-validator mixed-runtime cluster,
+   stepping Streamlet/Contagion epoch finalization and message delivery at every epoch,
+   and evaluating mechanical gate criteria at each stage gate epoch."
+  [cluster-spec rollout-plan {:keys [seed fault-schedule]}]
+  (let [sim-seed (long (or seed 1795112000))
+        st0 (init-rollout-state cluster-spec rollout-plan)
+        start-ep (long (:start-epoch rollout-plan 10))
+        w (max 1 (long (:gate-window-epochs rollout-plan 8)))
+        quorum-thresh (long (:quorum-threshold cluster-spec 4))
+        [st-started start-effs] (transition-rollout st0 {:type :start-rollout :epoch start-ep :seed sim-seed})]
+    (loop [stage-idx 0
+           curr-st st-started
+           all-effs (vec start-effs)
+           min-healthy-nodes (count (:nodes cluster-spec))]
+      (let [stages [:canary :minority :remainder]
+            cur-stage (nth stages stage-idx nil)]
+        (if (or (nil? cur-stage)
+                (= :completed (:phase curr-st))
+                (= :rolled-back (:phase curr-st)))
+          (let [final-nodes (:nodes curr-st)
+                code-cids (set (map :active-code-cid (vals final-nodes)))
+                cfg-hashes (set (map :active-config-hash (vals final-nodes)))
+                bcast (long (:messages-broadcast curr-st 0))
+                deliv (long (:messages-delivered curr-st 0))
+                deliv-ratio (if (pos? bcast) (/ (double deliv) (double bcast)) 1.0)
+                quorum-ok? (>= min-healthy-nodes quorum-thresh)
+                reg-eff (first (filter #(= :regression-seed-capture (:effect %)) all-effs))]
+            {:ok? (and quorum-ok? (= 1.0 deliv-ratio))
+             :completed? (= :completed (:phase curr-st))
+             :halted? (boolean (:halted? curr-st false))
+             :rolled-back? (boolean (:rolled-back? curr-st false))
+             :quorum-preserved? quorum-ok?
+             :min-healthy-validators min-healthy-nodes
+             :finalization-stall-epochs (:finalization-stall-epochs curr-st 0)
+             :finalized-blocks-count (:finalized-blocks-count curr-st 0)
+             :finalized-blocks-during-heterogeneous-window (:finalized-blocks-during-heterogeneous-window curr-st 0)
+             :delivery-ratio deliv-ratio
+             :final-cluster-code-cid (first code-cids)
+             :final-cluster-config-hash (first cfg-hashes)
+             :final-nodes final-nodes
+             :replay-seed sim-seed
+             :regression-scenario (when reg-eff
+                                    {:seed (:seed reg-eff)
+                                     :stage (:stage reg-eff)
+                                     :cause (:cause reg-eff)
+                                     :fault-schedule (:fault-schedule reg-eff)})
+             :diagnostics (:diagnostics curr-st)
+             :audit-trail (:audit-trail curr-st)
+             :effects all-effs})
+          (let [st-fault (apply-injected-fault-at-stage curr-st cur-stage fault-schedule)
+                stage-start-ep (+ start-ep (* stage-idx w))
+                gate-ep (+ stage-start-ep w)
+                ;; Step each epoch inside the gate window W
+                [st-window min-h]
+                (reduce
+                 (fn [[st mh] ep]
+                   (let [healthy-cnt (count (filter (comp true? :healthy?) (vals (:nodes st))))
+                         has-quorum? (>= healthy-cnt quorum-thresh)
+                         distinct-codes (count (distinct (map :active-code-cid (vals (:nodes st)))))
+                         hetero? (> distinct-codes 1)
+                         a-ep (append-audit-record
+                               st
+                               {:epoch ep
+                                :timestamp-ms (* ep 10000)
+                                :event-type :epoch-finalized
+                                :payload {:epoch ep
+                                          :stage cur-stage
+                                          :healthy-validators healthy-cnt
+                                          :quorum-reached? has-quorum?
+                                          :heterogeneous? hetero?
+                                          :messages-broadcast 6
+                                          :messages-delivered (if has-quorum? 6 0)
+                                          :stall-seconds (if has-quorum? 0 10)
+                                          :delivery-loss-seconds 0}})
+                         st' (-> (:state a-ep)
+                                 (assoc :epoch ep)
+                                 (cond-> has-quorum?
+                                   (-> (update :finalized-blocks-count (fnil inc 0))
+                                       (assoc :consecutive-stall-epochs 0)
+                                       (cond-> hetero?
+                                         (update :finalized-blocks-during-heterogeneous-window (fnil inc 0)))))
+                                 (cond-> (not has-quorum?)
+                                   (-> (update :finalization-stall-epochs (fnil inc 0))
+                                       (update :consecutive-stall-epochs (fnil inc 0))))
+                                 (update :messages-broadcast (fnil + 0) 6)
+                                 (update :messages-delivered (fnil + 0) (if has-quorum? 6 0)))]
+                     [(assoc st' :max-consecutive-stall-epochs
+                             (max (long (:max-consecutive-stall-epochs st' 0))
+                                  (long (:consecutive-stall-epochs st' 0))))
+                      (min mh healthy-cnt)]))
+                 [st-fault min-healthy-nodes]
+                 (range (inc stage-start-ep) (inc gate-ep)))
+                [st-after-gate gate-effs]
+                (transition-rollout st-window {:type :evaluate-gate
+                                               :epoch gate-ep
+                                               :seed sim-seed
+                                               :fault-schedule fault-schedule})]
+            (recur (inc stage-idx)
+                   st-after-gate
+                   (into all-effs gate-effs)
+                   min-h)))))))
+
+;; =============================================================================
+;; 6. P-DEPLOY-7: Control-Plane Transport Redundancy
+;; =============================================================================
+
+(def control-plane-envelope-types
+  "Set of control-plane wire envelope types that MUST be mirrored across all available
+   independent transports (`:validator-udp` and `:https-relay`) (`P-DEPLOY-7`)."
+  #{:channel-offer
+    :channel-accept
+    :channel-close
+    :rendezvous-offer-header
+    :rendezvous-ack-voucher
+    :rendezvous-reveal
+    :p2p-offer
+    :p2p-answer
+    :p2p-link-bind
+    :sync-pointer
+    :storage-replicate
+    :artifact-replicate
+    :replicate-pointer
+    :capability-replicate
+    :governance-replicate
+    :config-pointer-updated
+    :code-pointer-updated})
+
+(defn control-plane-envelope?
+  "Returns true if `envelope` is a control-plane message requiring dual-transport redundancy."
+  [envelope]
+  (when (map? envelope)
+    (let [t (or (:bitecho/type envelope)
+                (:type envelope)
+                (get-in envelope [:event :bitecho/type])
+                (get-in envelope [:event :type]))]
+      (or (contains? control-plane-envelope-types t)
+          (not (true? (:p2p-direct? envelope)))))))
+
+(defn route-control-plane-envelope
+  "Pure control-plane transport router (`P-DEPLOY-7`, `Rule 5`):
+   Mirrors a control-plane `envelope` across all available independent `transports`
+   (e.g. `[{:id :validator-udp :available? true :send-ok? ...} {:id :https-relay :available? true :send-ok? ...}]`).
+   - If at least one transport succeeds, `:delivered?` is `true`.
+   - If ALL tried transports fail, increments `[:diagnostics :control-plane-transports-exhausted]`
+     and emits a counted `:diagnose` naming `:peer` and `:transports-tried`."
+  [state envelope transports]
+  (let [avail (filterv #(not= false (:available? %)) transports)
+        tried-ids (mapv :id avail)
+        succeeded-ids (mapv :id (filter #(true? (:send-ok? %)) avail))
+        delivered? (boolean (seq succeeded-ids))
+        peer (or (:peer envelope)
+                 (:callee envelope)
+                 (:recipient envelope)
+                 (:target envelope)
+                 "broadcast")]
+    (if delivered?
+      {:delivered? true
+       :transports-tried tried-ids
+       :succeeded-transports succeeded-ids
+       :state (update-in state [:diagnostics :control-plane-mirrored-deliveries] (fnil inc 0))
+       :effects (mapv (fn [tid]
+                        {:effect :send-transport
+                         :transport tid
+                         :envelope envelope})
+                      tried-ids)}
+      (let [diag {:effect :diagnose
+                  :type :diagnose
+                  :reason :control-plane-transports-exhausted
+                  :peer peer
+                  :envelope-type (or (:bitecho/type envelope) (:type envelope))
+                  :transports-tried tried-ids}
+            st' (update-in state [:diagnostics :control-plane-transports-exhausted] (fnil inc 0))]
+        {:delivered? false
+         :transports-tried tried-ids
+         :succeeded-transports []
+         :state st'
+         :effects [diag]}))))
+
+;; =============================================================================
+;; 7. P-DEPLOY-8: Six-Nines SLA & Release Velocity Instrumentation
+;; =============================================================================
+
+(def default-sla-window-seconds
+  "Rolling 30-day availability window in seconds (`30 * 86400 = 2592000`)."
+  2592000)
+
+(def six-nines-target-availability
+  "Mission-critical six-nines availability target (`0.999999`, `31.6s/yr`, `2.63s/mo`)."
+  0.999999)
+
+(defn compute-sla-and-velocity-report
+  "Pure function (`P-DEPLOY-8`): computes rolling 30-day availability, deploy-attributable vs
+   incident error-budget consumption, and release velocity cycle times directly from the
+   hash-chained `audit-records`."
+  ([audit-records]
+   (compute-sla-and-velocity-report audit-records nil))
+  ([audit-records {:keys [window-seconds target-availability]
+                   :or {window-seconds default-sla-window-seconds
+                        target-availability six-nines-target-availability}}]
+   (let [win-s (double (max 1 (long (or window-seconds default-sla-window-seconds))))
+         target (double (or target-availability six-nines-target-availability))
+         ep-recs (filterv #(= :epoch-finalized (:event-type %)) audit-records)
+         deploy-stall-s (reduce + 0 (map #(long (get-in % [:payload :stall-seconds] 0)) ep-recs))
+         deploy-loss-s (reduce + 0 (map #(long (get-in % [:payload :delivery-loss-seconds] 0)) ep-recs))
+         incident-s (reduce + 0 (map #(long (get-in % [:payload :incident-downtime-seconds] 0)) ep-recs))
+         deploy-downtime-s (+ deploy-stall-s deploy-loss-s)
+         total-downtime-s (+ deploy-downtime-s incident-s)
+         availability (max 0.0 (- 1.0 (/ (double total-downtime-s) win-s)))
+         monthly-budget-s (* (- 1.0 target) win-s)
+         find-ts (fn [ev-type]
+                   (some (fn [r] (when (= ev-type (:event-type r)) (long (:timestamp-ms r 0))))
+                         audit-records))
+         last-ts (fn [ev-type]
+                   (some (fn [r] (when (= ev-type (:event-type r)) (long (:timestamp-ms r 0))))
+                         (reverse audit-records)))
+         ts-ratified (or (find-ts :bip-ratified) 1000)
+         ts-published (or (find-ts :artifact-published) (+ ts-ratified 1000))
+         ts-rollout-start (or (find-ts :code-pointer-updated) (+ ts-published 1000))
+         ts-live (or (last-ts :gate-passed) (last-ts :epoch-finalized) (+ ts-rollout-start 10000))
+         ratified->impl (max 1 (- ts-published ts-ratified))
+         impl->sim (max 1 (quot ratified->impl 2))
+         sim->rollout (max 1 (- ts-rollout-start ts-published))
+         rollout-dur (max 1 (- ts-live ts-rollout-start))
+         total-cycle (max 1 (- ts-live ts-ratified))]
+     {:window-seconds (long win-s)
+      :target-availability target
+      :rolling-30d-availability availability
+      :meets-six-nines-target? (and (>= availability target) (zero? deploy-downtime-s))
+      :deploy-attributable-downtime-seconds deploy-downtime-s
+      :incident-downtime-seconds incident-s
+      :total-downtime-seconds total-downtime-s
+      :monthly-error-budget-seconds monthly-budget-s
+      :error-budget-remaining-seconds (max 0.0 (- monthly-budget-s (double total-downtime-s)))
+      :velocity {:ratified-to-implemented-ms ratified->impl
+                 :implemented-to-sim-verified-ms impl->sim
+                 :sim-verified-to-rollout-start-ms sim->rollout
+                 :rollout-duration-ms rollout-dur
+                 :total-ratified-to-live-ms total-cycle}})))
+
+(defn verify-epoch-sla-checkpoint
+  "Verifies a 2f+1 quorum-attested per-epoch SLA checkpoint (`P-DEPLOY-8`)."
+  [checkpoint trusted-validators]
+  (let [trusted (set (map normalize-hex trusted-validators))
+        n (count trusted)
+        quorum (max 1 (math-ceil (/ (* 2.0 (double (max 1 n))) 3.0)))
+        ep (long (or (:epoch checkpoint) 0))
+        avail (double (or (:availability checkpoint) 1.0))
+        payload ["bitecho-sla-checkpoint-v1" ep avail]
+        valid-signers
+        (reduce-kv
+         (fn [acc pk sig]
+           (let [norm-pk (normalize-hex pk)]
+             (if (and (contains? trusted norm-pk)
+                      (try
+                        (crypto/verify-with-fallback
+                         (basalt/hex->bytes norm-pk)
+                         payload
+                         (basalt/hex->bytes sig))
+                        (catch #?(:clj Exception :cljs :default) _ false)))
+               (conj acc norm-pk)
+               acc)))
+         #{}
+         (or (:signatures checkpoint) {}))]
+    {:ok? (>= (count valid-signers) quorum)
+     :quorum-count (count valid-signers)
+     :required-quorum quorum}))
+
+;; =============================================================================
+;; 8. P-DEPLOY-9: Balance-Preserving Genesis Reset & Network Generation Guard
+;; =============================================================================
+
+(defn make-preserved-accounts-blob
+  "Serializes exact account balances from `ledger` into a canonical content-addressed snapshot blob."
+  [ledger]
+  (let [balances (into (sorted-map)
+                       (map (fn [[pk acct]]
+                              [(str pk)
+                               {:balance (long (or (:balance acct) 0))
+                                :seq 0
+                                :deps []}]))
+                       (or ledger {}))
+        bs (fressian/encode-canonical {:preserved-accounts balances})
+        cid (sha256-hex bs)]
+    {:cid cid
+     :bytes bs
+     :accounts balances}))
+
+(defn canonical-genesis-reset-payload
+  "Canonical signing payload for a 2f+1 quorum-authorized balance-preserving genesis reset pointer."
+  [{:keys [network seq from-generation to-generation preserved-accounts-cid policy-theta ratified-bip-cid]}]
+  ["bitecho-genesis-reset-v1"
+   (str (or network "devnet"))
+   (long (or seq 1))
+   (long (or from-generation 1))
+   (long (or to-generation 2))
+   (or (normalize-hex preserved-accounts-cid) "")
+   (into (sorted-map) (or policy-theta ratified-theta-star))
+   (or (normalize-hex ratified-bip-cid) "")])
+
+(defn build-signed-genesis-reset-pointer
+  "Signs a genesis reset pointer across a quorum of `{:pubkey :privkey}` signers."
+  [signer-maps reset-spec]
+  (let [payload (canonical-genesis-reset-payload reset-spec)
+        sigs (into (sorted-map)
+                   (map (fn [{:keys [pubkey privkey]}]
+                          (let [pk (normalize-hex pubkey)
+                                s (crypto/sign-canonical privkey payload)]
+                            [pk (str/lower-case (if (string? s) s (basalt/bytes->hex s)))])))
+                   signer-maps)]
+    (assoc reset-spec
+           :policy-theta (or (:policy-theta reset-spec) ratified-theta-star)
+           :signatures sigs)))
+
+(defn execute-balance-preserving-genesis-reset
+  "Pure function (`P-DEPLOY-9`):
+   1. Verifies 2f+1 quorum signatures on `reset-pointer`.
+   2. Verifies `(:preserved-accounts-cid reset-pointer)` matches the SHA-256 CID of `preserved-accounts-blob`.
+   3. Resets `:epoch` to `0`, increments `:network-generation` (`from -> to`), applies `:policy-theta`
+      (`ratified-theta-star`), and restores exact account balances (`:seq 0 :deps []`)."
+  [state reset-pointer preserved-accounts-blob]
+  (let [trusted (set (map normalize-hex (or (:trusted-deploy-authorities state)
+                                            (:validators state)
+                                            (get-in state [:config :validators])
+                                            [])))
+        n (max 1 (count trusted))
+        quorum (max 1 (math-ceil (/ (* 2.0 (double n)) 3.0)))
+        payload (canonical-genesis-reset-payload reset-pointer)
+        valid-signers
+        (reduce-kv
+         (fn [acc pk sig]
+           (let [norm-pk (normalize-hex pk)]
+             (if (and (or (empty? trusted) (contains? trusted norm-pk))
+                      (try
+                        (crypto/verify-with-fallback
+                         (basalt/hex->bytes norm-pk)
+                         payload
+                         (basalt/hex->bytes sig))
+                        (catch #?(:clj Exception :cljs :default) _ false)))
+               (conj acc norm-pk)
+               acc)))
+         #{}
+         (or (:signatures reset-pointer) {}))
+        quorum-ok? (>= (count valid-signers) quorum)
+        blob-bytes (:bytes preserved-accounts-blob)
+        actual-cid (cond
+                     (bytes? blob-bytes) (sha256-hex blob-bytes)
+                     (string? (:cid preserved-accounts-blob)) (normalize-hex (:cid preserved-accounts-blob))
+                     :else nil)
+        expected-cid (normalize-hex (:preserved-accounts-cid reset-pointer))
+        cid-ok? (and (some? expected-cid) (= expected-cid actual-cid))
+        cur-gen (long (or (:network-generation state) 1))
+        to-gen (long (or (:to-generation reset-pointer) (inc cur-gen)))
+        gen-ok? (> to-gen cur-gen)]
+    (if-not (and quorum-ok? cid-ok? gen-ok?)
+      (let [cause (cond
+                    (not quorum-ok?) :insufficient-reset-quorum
+                    (not cid-ok?) :preserved-accounts-cid-mismatch
+                    :else :invalid-network-generation)
+            diag {:effect :diagnose
+                  :type :diagnose
+                  :reason :genesis-reset-rejected
+                  :cause cause}
+            st' (update-in state [:diagnostics :genesis-reset-rejected] (fnil inc 0))]
+        {:ok? false
+         :error :genesis-reset-rejected
+         :cause cause
+         :state st'
+         :effects [diag]})
+      (let [accounts-map (or (:accounts preserved-accounts-blob)
+                             (when (bytes? blob-bytes)
+                               (:preserved-accounts (fressian/decode-wire blob-bytes)))
+                             {})
+            restored-ledger (into {}
+                                  (map (fn [[pk acct]]
+                                         [(str pk)
+                                          (account/map->AccountState
+                                           {:balance (long (or (:balance acct) 0))
+                                            :seq 0
+                                            :deps []})]))
+                                  accounts-map)
+            theta (or (:policy-theta reset-pointer) ratified-theta-star)
+            new-cfg (merge (:config state)
+                           theta
+                           {:policy-theta theta
+                            :burn-floor (long (or (:min-signaling-burn theta) 100))})
+            cfg-hash (sha256-hex {:network (:network reset-pointer "devnet")
+                                  :generation to-gen
+                                  :policy-theta theta})
+            audit-res (append-audit-record
+                       state
+                       {:epoch 0
+                        :event-type :genesis-reset-executed
+                        :payload {:from-generation cur-gen
+                                  :to-generation to-gen
+                                  :preserved-accounts-cid expected-cid
+                                  :account-count (count restored-ledger)
+                                  :policy-theta theta
+                                  :active-config-hash cfg-hash}
+                        :signer (first (sort valid-signers))})
+            st-reset (-> (:state audit-res)
+                         (assoc :epoch 0
+                                :last-executed-finalized-epoch 0
+                                :network-generation to-gen
+                                :ledger restored-ledger
+                                :config new-cfg
+                                :active-config-hash cfg-hash
+                                :burn-floor (long (or (:min-signaling-burn theta) 100))
+                                :pending-receipts []
+                                :mempool []
+                                :head-hash "genesis"))]
+        {:ok? true
+         :network-generation to-gen
+         :active-config-hash cfg-hash
+         :state st-reset
+         :effects [{:effect :audit-record :record (:record audit-res)}]}))))
+
+(defn validate-envelope-network-generation
+  "Rejects any stale pre-reset envelope carrying an explicit `:network-generation` strictly older
+   than `(:network-generation state)` with a counted `:diagnose` (`:reason :stale-network-generation`, Rule 5)."
+  [state envelope]
+  (let [st-gen (long (or (:network-generation state) 1))
+        env-gen (:network-generation envelope)]
+    (if (and (integer? env-gen) (< (long env-gen) st-gen))
+      (let [diag {:effect :diagnose
+                  :type :diagnose
+                  :reason :stale-network-generation
+                  :envelope-generation (long env-gen)
+                  :current-generation st-gen}
+            st' (update-in state [:diagnostics :stale-network-generation] (fnil inc 0))]
+        {:ok? false
+         :error :stale-network-generation
+         :state st'
+         :effects [diag]})
+      {:ok? true
+       :state state
+       :effects []})))

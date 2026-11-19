@@ -1161,7 +1161,14 @@
                  (get snapshot "finalized-epoch")
                  (get snapshot "finalized_epoch")
                  0))
-       (long (or (:min-finalized-epoch opts) 0)))
+       (let [snap-gen (parse-long-safe (or (:network-generation snapshot)
+                                           (get snapshot "network-generation")
+                                           (get snapshot "network_generation"))
+                                       nil)
+             min-gen (long (or (:min-network-generation opts) 1))]
+         (if (and snap-gen (> snap-gen min-gen))
+           0
+           (long (or (:min-finalized-epoch opts) 0)))))
     {:ok? false :error "stale-finalized-epoch"}
 
     (let [sig (or (:signature snapshot) (get snapshot "signature"))]
@@ -1214,21 +1221,29 @@
                                              ref-r (assoc :refund-reason ref-r))))
                                        escrows-vec)]
           {:ok? true
-           :snapshot {:bitecho/type :chain-state-snapshot
-                      :type :chain-state-snapshot
-                      :validator-pubkey val-pub
-                      :pubkey (or (:pubkey snapshot) (get snapshot "pubkey"))
-                      :finalized-epoch (long (or (:finalized-epoch snapshot)
-                                                 (get snapshot "finalized-epoch")
-                                                 (get snapshot "finalized_epoch")
-                                                 0))
-                      :balance (long (or (:balance snapshot) (get snapshot "balance") 0))
-                      :spendable (long (or (:spendable snapshot) (get snapshot "spendable") 0))
-                      :seq (long (or (:seq snapshot) (get snapshot "seq") 0))
-                      :deps (vec (or (:deps snapshot) (get snapshot "deps") []))
-                      :escrows normalized-escrows
-                      :nonce (or (:nonce snapshot) (get snapshot "nonce") "")
-                      :signature sig}})
+           :snapshot (cond-> {:bitecho/type :chain-state-snapshot
+                              :type :chain-state-snapshot
+                              :validator-pubkey val-pub
+                              :pubkey (or (:pubkey snapshot) (get snapshot "pubkey"))
+                              :finalized-epoch (long (or (:finalized-epoch snapshot)
+                                                         (get snapshot "finalized-epoch")
+                                                         (get snapshot "finalized_epoch")
+                                                         0))
+                              :balance (long (or (:balance snapshot) (get snapshot "balance") 0))
+                              :spendable (long (or (:spendable snapshot) (get snapshot "spendable") 0))
+                              :seq (long (or (:seq snapshot) (get snapshot "seq") 0))
+                              :deps (vec (or (:deps snapshot) (get snapshot "deps") []))
+                              :escrows normalized-escrows
+                              :nonce (or (:nonce snapshot) (get snapshot "nonce") "")
+                              :signature sig}
+                       (some? (or (:network-generation snapshot)
+                                  (get snapshot "network-generation")
+                                  (get snapshot "network_generation")))
+                       (assoc :network-generation
+                              (parse-long-safe (or (:network-generation snapshot)
+                                                   (get snapshot "network-generation")
+                                                   (get snapshot "network_generation"))
+                                               1)))})
         {:ok? false :error "invalid-snapshot-signature"}))))
 
 (defn verify-chain-state-quorum
@@ -1299,16 +1314,25 @@
 
 (defn apply-verified-chain-state-snapshot
   "Applies a verified chain state snapshot to local light-node state.
-   Guards against stale finalized epochs (monotonicity), prunes expired
-   unconfirmed non-terminal escrows absent from snapshot, and clears stale
+   Guards against stale finalized epochs (monotonicity), unless `:network-generation`
+   has incremented (`P-DEPLOY-9` balance-preserving genesis reset), in which case
+   local `:epoch`, `:transfer-seq`, and `:account` are re-baselined to the new generation
+   while preserving identity, petnames, and open E2EE sessions.
+   Prunes expired unconfirmed non-terminal escrows absent from snapshot, and clears stale
    status-dependent escrow fields on merge."
   [state snapshot]
-  (let [curr-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
+  (let [curr-gen (long (or (:network-generation state) 1))
+        snap-gen (parse-long-safe (or (:network-generation snapshot)
+                                      (get snapshot "network-generation")
+                                      (get snapshot "network_generation"))
+                                  curr-gen)
+        gen-incremented? (> snap-gen curr-gen)
+        curr-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
         fin-epoch (parse-long-safe (or (:finalized-epoch snapshot)
                                        (get snapshot "finalized-epoch")
                                        (get snapshot "finalized_epoch"))
                                    0)]
-    (if (< fin-epoch curr-fin-ep)
+    (if (and (not gen-incremented?) (< fin-epoch curr-fin-ep))
       state
       (let [new-account {:balance (long (or (:balance snapshot) (get snapshot "balance") 0))
                          :spendable (long (or (:spendable snapshot) (get snapshot "spendable") 0))
@@ -1340,9 +1364,11 @@
                                    incoming-escrows)]
         (-> state
             (assoc :account new-account
+                   :network-generation snap-gen
                    :transfer-seq (:seq new-account)
                    :last-transfer-hash (last (:deps new-account))
-                   :epoch (if (> (long (or (:epoch state) 0)) (+ fin-epoch 1000))
+                   :epoch (if (or gen-incremented?
+                                  (> (long (or (:epoch state) 0)) (+ fin-epoch 1000)))
                             fin-epoch
                             (max (long (or (:epoch state) 0)) fin-epoch))
                    :epoch-initialized? true
@@ -7803,26 +7829,34 @@
    ONLY when verified BFT quorum is reached across trusted validators."
   [state msg]
   (let [trusted (set (keep (comp normalize-pubkey-hex :pubkey) (vals (get-in state [:bootstrap :nodes]))))
+        curr-gen (long (or (:network-generation state) 1))
         min-fin-ep (long (or (get-in state [:account :finalized-epoch]) 0))
         opts {:expected-pubkey (:pubkey state)
               :trusted-validators trusted
+              :min-network-generation curr-gen
               :min-finalized-epoch min-fin-ep}
         v-res (verify-chain-state-snapshot msg opts)]
     (if-not (:ok? v-res)
       {:state state :net-envelopes [] :stdout-events []}
       (let [snap (:snapshot v-res)
             val-pk (:validator-pubkey snap)
+            snap-gen (long (or (:network-generation snap) curr-gen))
             fin-ep (long (or (:finalized-epoch snap) 0))
             existing-snaps (:chain-state-snapshots state {})
-            ;; Prune stale snapshots older than (fin-ep - 2)
+            ;; Prune stale snapshots older than (fin-ep - 2) or from an older network generation
             fresh-snaps (into {} (filter (fn [[_ s]]
-                                           (>= (long (or (:finalized-epoch s) 0)) (- fin-ep 2)))
+                                           (let [s-gen (long (or (:network-generation s) curr-gen))]
+                                             (if (> snap-gen s-gen)
+                                               false
+                                               (>= (long (or (:finalized-epoch s) 0)) (- fin-ep 2)))))
                                          existing-snaps))
             buffered-snaps (assoc fresh-snaps val-pk snap)
             buffered-state (assoc state :chain-state-snapshots buffered-snaps)
             q-res (verify-chain-state-quorum (vals buffered-snaps) opts)]
         (if (:ok? q-res)
           (let [agreed-snap (:snapshot q-res)
+                agreed-gen (long (or (:network-generation agreed-snap) curr-gen))
+                gen-resynced? (> agreed-gen curr-gen)
                 st-applied (apply-verified-chain-state-snapshot buffered-state agreed-snap)
                 stdout-evt {"event" "chain-state-synced"
                             "pubkey" (:pubkey state)
@@ -7831,10 +7865,19 @@
                             "seq" (:seq agreed-snap)
                             "finalized_epoch" (:finalized-epoch agreed-snap)
                             "quorum_count" (:quorum-count q-res)
-                            "validator" (:validator-pubkey agreed-snap)}]
+                            "validator" (:validator-pubkey agreed-snap)}
+                gen-evt (when gen-resynced?
+                          {"event" "network-generation-resynced"
+                           "pubkey" (:pubkey state)
+                           "from_generation" curr-gen
+                           "to_generation" agreed-gen
+                           "finalized_epoch" (:finalized-epoch agreed-snap)
+                           "balance" (:balance agreed-snap)
+                           "seq" (:seq agreed-snap)})]
             {:state st-applied
              :net-envelopes []
-             :stdout-events [stdout-evt]})
+             :stdout-events (cond-> [stdout-evt]
+                              gen-evt (conj gen-evt))})
           {:state buffered-state
            :net-envelopes []
            :stdout-events []})))))

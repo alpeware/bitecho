@@ -7,6 +7,7 @@
             [bitecho.config :as config]
             [bitecho.contagion.core :as contagion]
             [bitecho.crypto :as crypto]
+            [bitecho.deploy.core :as deploy]
             [bitecho.economy.account :as account]
             [bitecho.economy.attestation :as attestation]
             [bitecho.economy.bundle :as bundle]
@@ -1132,7 +1133,9 @@
                           :global-echo-sample (:echo-sample sampling-res)
                           :global-ready-sample (:ready-sample sampling-res)
                           :global-delivery-sample (:delivery-sample sampling-res))
-        pruned-state (prune-expired-tick-state base-state new-epoch cfg)
+        cfg-act-res (deploy/apply-epoch-boundary-configs base-state new-epoch)
+        base-state' (:state cfg-act-res)
+        pruned-state (prune-expired-tick-state base-state' new-epoch (:config base-state'))
         transcript-commands (when (and (consensus-mode? pruned-state)
                                        (seq closing-messages)
                                        (or (:node-private-key pruned-state)
@@ -1152,7 +1155,7 @@
                                            :transcript (into {} half-tx)
                                            :frozen-log my-frozen-log}))
                                       peer-pubs)))
-        all-commands (into commands transcript-commands)]
+        all-commands (into (into commands transcript-commands) (:effects cfg-act-res))]
     (if (consensus-mode? pruned-state)
       (apply-streamlet-tick pruned-state all-commands closing-epoch)
       (let [tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)
@@ -3996,8 +3999,21 @@
                    :expected-network-uri net-uri
                    :actual-network-uri (or (:network-uri event) (get event "network-uri"))}]}
 
+      (and (integer? (:network-generation event))
+           (< (long (:network-generation event)) (long (or (:network-generation state) 1))))
+      (let [g-res (deploy/validate-envelope-network-generation state event)]
+        {:state (:state g-res)
+         :commands (:effects g-res)})
+
       :else
       (case (:type event)
+        :stage-config-pointer (let [r (deploy/stage-config-pointer state (:pointer event))]
+                                {:state (:state r) :commands (:effects r)})
+        :genesis-reset (let [r (deploy/execute-balance-preserving-genesis-reset
+                                state
+                                (:reset-pointer event)
+                                (:preserved-accounts-blob event))]
+                         {:state (:state r) :commands (:effects r)})
         :contagion-broadcast (handle-contagion-broadcast state event)
         :tick (handle-tick state event)
         :broadcast (handle-broadcast state event)
