@@ -386,7 +386,8 @@
     "builders-stewards" "mesh-validators" "anchor-agent-users"
     "invalid-lab-subnet-rejected" "bip-admission-rejected" "sybil-bounty-claim-rejected"
     "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"
-    "network-uri" "network-replay-rejected"})
+    "network-uri" "network-replay-rejected"
+    "raw-public-hex" "stale-browser-bundle"})
 
 (def ^:private allowed-persistence-keys-compact
   (into #{} (map #(str/replace % #"[-?]" "") allowed-persistence-keys)))
@@ -982,4 +983,69 @@
          :response (:response res)
          :net-envelopes (or (:net-envelopes res) [])
          :stdout-events (or (:stdout-events res) [])}))))
+
+(defn- parse-semver-tuple
+  [v]
+  (when (and (string? v) (not (str/blank? v)))
+    (let [clean (-> (str/trim v)
+                    (str/replace #"^v" "")
+                    (str/split #"[-+]")
+                    first)
+          parts (str/split clean #"\.")]
+      (when (seq parts)
+        (mapv #(try #?(:clj (Long/parseLong %) :cljs (js/parseInt % 10))
+                    (catch #?(:clj Exception :cljs :default) _ 0))
+              parts)))))
+
+(defn check-browser-bundle-freshness
+  "Pure helper (`BIP-010` / `P-WEB-1` item 4, Rule 5):
+   Compares `local-version` (and optional `:local-cid`) against `remote-version-or-config`
+   (a version string or map `{:version ... :browser-target-cid ...}`).
+   If the remote version is newer than `local-version` (or `:browser-target-cid` mismatches `:local-cid`),
+   increments `[:diagnostics :stale-browser-bundle]` and emits a counted `:diagnose`
+   (`:reason :stale-browser-bundle`)."
+  ([local-version remote-version-or-config]
+   (check-browser-bundle-freshness {:diagnostics {}} local-version remote-version-or-config))
+  ([state local-version remote-version-or-config]
+   (let [st (or state {:diagnostics {}})
+         remote-ver (if (map? remote-version-or-config)
+                      (or (:version remote-version-or-config)
+                          (:remote-version remote-version-or-config)
+                          (:browser-version remote-version-or-config))
+                      (str remote-version-or-config))
+         remote-cid (when (map? remote-version-or-config)
+                      (or (:browser-target-cid remote-version-or-config)
+                          (:target-cid remote-version-or-config)))
+         local-cid (when (map? st) (:local-bundle-cid st))
+         local-tuple (or (parse-semver-tuple (str local-version)) [0 0 0])
+         remote-tuple (or (parse-semver-tuple (str remote-ver)) local-tuple)
+         ver-stale? (neg? (compare local-tuple remote-tuple))
+         cid-stale? (boolean (and (string? remote-cid)
+                                  (not (str/blank? remote-cid))
+                                  (string? local-cid)
+                                  (not (str/blank? local-cid))
+                                  (not= (str/lower-case (str/trim local-cid))
+                                        (str/lower-case (str/trim remote-cid)))))
+         stale? (or ver-stale? cid-stale?)]
+     (if-not stale?
+       {:ok? true
+        :fresh? true
+        :local-version (str local-version)
+        :remote-version (str (or remote-ver local-version))
+        :state st
+        :effects []}
+       (let [diag (cond-> {:effect :diagnose
+                           :type :diagnose
+                           :reason :stale-browser-bundle
+                           :local-version (str local-version)
+                           :remote-version (str remote-ver)}
+                    cid-stale? (assoc :local-cid local-cid :remote-cid remote-cid))
+             st' (update-in st [:diagnostics :stale-browser-bundle] (fnil inc 0))]
+         {:ok? false
+          :fresh? false
+          :local-version (str local-version)
+          :remote-version (str remote-ver)
+          :state st'
+          :effects [diag]})))))
+
 

@@ -116,49 +116,56 @@
 
 (defn- apply-hardware-identity!
   "Applies a recovered hardware identity map to anchor-state-atom and active-node-atom,
+   normalizing to canonical 88-char SPKI :public-hex and 44-byte SPKI :public-key (BIP-010 P-WEB-1),
    and persists the sanitized public state to IndexedDB for refresh continuity (H-5, A-5)."
-  [recovered]
-  (when (and (map? recovered) (:public-hex recovered))
-    (when @anchor-state-atom
-      (swap! anchor-state-atom
-             (fn [st]
-               (cond-> (-> st
-                           (assoc-in [:identity :anchor-pubkey] (:public-hex recovered))
-                           (assoc-in [:identity :address] (:address recovered))
-                           (assoc :anchor-pubkey (:public-hex recovered))
-                           (assoc :anchor-address (:address recovered))
-                           (assoc :hot-pubkey (:public-hex recovered))
-                           (assoc :key-mode :yubikey-discoverable))
-                 (:private-key recovered)
-                 (assoc :privkey-bytes (:private-key recovered))))))
-    (when (and @active-node-atom (:private-key recovered) (:public-key recovered))
-      (let [na @active-node-atom
-            prev-pub (get-in @na [:light-state :pubkey])
-            new-pub (:public-hex recovered)
-            pub-changed? (not= prev-pub new-pub)]
-        (swap! na
-               (fn [node]
-                 (cond-> (-> node
-                             (assoc :keypair {:public-key (:public-key recovered)
-                                              :private-key (:private-key recovered)})
-                             (assoc-in [:light-state :pubkey] new-pub))
-                   pub-changed?
-                   (-> (assoc-in [:light-state :chain-state-snapshots] {})
-                       (assoc-in [:light-state :account] {:balance 0 :spendable 0 :seq 0 :deps []})))))
-        ;; If already connected to mesh DataChannels, re-register home-set and query chain state for unlocked identity
-        (let [channels (:active-channels @na)
-              open-dcs (keep (fn [[_id dc]] (when (and dc (= (.-readyState dc) "open")) dc)) channels)]
-          (when (seq open-dcs)
-            (let [reg-res (light-core/handle-command (:light-state @na)
-                                                     {"cmd" "register-home-set" "price" 10 "nodes" ["node1" "node2" "node3"]}
-                                                     (:private-key recovered))]
-              (swap! na assoc :light-state (:state reg-res))
-              (doseq [env (:net-envelopes reg-res)]
-                (send-to-all-channels! na env)))
-            (doseq [dc open-dcs]
-              (send-chain-state-query! na dc))))
-        (browser/persist-state! (browser/sanitize-state-for-persistence @na))))
-    (notify-ui-listeners!)))
+  [raw-recovered]
+  (let [recovered (webauthn/normalize-recovered-identity raw-recovered)]
+    (when (and (map? recovered) (:public-hex recovered))
+      (when @anchor-state-atom
+        (swap! anchor-state-atom
+               (fn [st]
+                 (cond-> (-> st
+                             (assoc-in [:identity :anchor-pubkey] (:public-hex recovered))
+                             (assoc-in [:identity :address] (:address recovered))
+                             (assoc :anchor-pubkey (:public-hex recovered))
+                             (assoc :anchor-address (:address recovered))
+                             (assoc :hot-pubkey (:public-hex recovered))
+                             (assoc :key-mode :yubikey-discoverable))
+                   (:private-key recovered)
+                   (assoc :privkey-bytes (:private-key recovered))))))
+      (when (and @active-node-atom (:public-key recovered))
+        (let [na @active-node-atom
+              prev-pub (webauthn/normalize-spki-pubkey-hex (get-in @na [:light-state :pubkey]))
+              new-pub (:public-hex recovered)
+              pub-changed? (and (some? prev-pub) (not= prev-pub new-pub))
+              existing-priv (get-in @na [:keypair :private-key])
+              eff-priv (or (:private-key recovered)
+                           (when (not pub-changed?) existing-priv))]
+          (when eff-priv
+            (swap! na
+                   (fn [node]
+                     (cond-> (-> node
+                                 (assoc :keypair {:public-key (:public-key recovered)
+                                                  :private-key eff-priv})
+                                 (assoc-in [:light-state :pubkey] new-pub))
+                       pub-changed?
+                       (-> (assoc-in [:light-state :chain-state-snapshots] {})
+                           (assoc-in [:light-state :account] {:balance 0 :spendable 0 :seq 0 :deps []})))))
+            ;; If already connected to mesh DataChannels, re-register home-set and query chain state for unlocked identity
+            (let [channels (:active-channels @na)
+                  open-dcs (keep (fn [[_id dc]] (when (and dc (= (.-readyState dc) "open")) dc)) channels)]
+              (when (seq open-dcs)
+                (let [reg-res (light-core/handle-command (:light-state @na)
+                                                         {"cmd" "register-home-set" "price" 10 "nodes" ["node1" "node2" "node3"]}
+                                                         eff-priv)]
+                  (swap! na assoc :light-state (:state reg-res))
+                  (doseq [env (:net-envelopes reg-res)]
+                    (send-to-all-channels! na env)))
+                (doseq [dc open-dcs]
+                  (send-chain-state-query! na dc))))
+            (browser/persist-state! (browser/sanitize-state-for-persistence @na)))))
+      (notify-ui-listeners!)
+      recovered)))
 
 (defn apply-restored-state!
   "Applies sanitized persisted state loaded from IndexedDB to node-atom and anchor-state-atom.
@@ -294,6 +301,9 @@
 
 (defn recover-from-yubikey
   "Recovers identity from WebAuthn assertion/userHandle without generating silent random identity.
+   Recognizes both top-level {:public-hex ...} and nested {:identity {:public-hex ...}} redacted shapes,
+   normalizes to canonical 88-char SPKI :public-hex, and never overwrites an already-unlocked
+   active-node-atom :private-key with nil (BIP-010 P-WEB-1).
    Fails closed with {:ok false :error 'recovery-failed'} if recovery input is missing or invalid."
   [seed-or-opts]
   (let [raw-bytes? (or (instance? js/Uint8Array seed-or-opts)
@@ -305,27 +315,28 @@
                    (map? seed-or-opts) seed-or-opts
                    (some? seed-or-opts) (js->clj seed-or-opts :keywordize-keys true)
                    :else nil)
-        existing-ident (or (when (map? opts-map) (:identity opts-map))
+        existing-ident (or (when (map? opts-map)
+                             (when (map? (:identity opts-map)) (:identity opts-map)))
                            (when (and (map? opts-map) (:public-hex opts-map)) opts-map))
         prf-out (or (when (and (some? seed-or-opts) (object? seed-or-opts))
-                      (or (unchecked-get seed-or-opts "prfOutput")
-                          (unchecked-get seed-or-opts "prf_output")
-                          (unchecked-get seed-or-opts "prf-output")
-                          (when-let [cer (or (unchecked-get seed-or-opts "clientExtensionResults")
-                                             (unchecked-get seed-or-opts "client_extension_results")
-                                             (unchecked-get seed-or-opts "extensions")
-                                             (when (fn? (.-getClientExtensionResults seed-or-opts))
-                                               (.getClientExtensionResults seed-or-opts)))]
-                            (when-let [prf (or (unchecked-get cer "prf") cer)]
-                              (or (unchecked-get prf "first")
-                                  (when-let [r (unchecked-get prf "results")]
-                                    (unchecked-get r "first")))))
-                          (when-let [prf (unchecked-get seed-or-opts "prf")]
-                            (or (unchecked-get prf "first")
-                                (when-let [r (unchecked-get prf "results")]
-                                  (unchecked-get r "first"))))
-                          (when-let [r (unchecked-get seed-or-opts "results")]
-                            (unchecked-get r "first"))))
+                      (or (gobj/get seed-or-opts "prfOutput")
+                          (gobj/get seed-or-opts "prf_output")
+                          (gobj/get seed-or-opts "prf-output")
+                          (when-let [cer (or (gobj/get seed-or-opts "clientExtensionResults")
+                                             (gobj/get seed-or-opts "client_extension_results")
+                                             (gobj/get seed-or-opts "extensions")
+                                             (when-let [f (gobj/get seed-or-opts "getClientExtensionResults")]
+                                               (when (fn? f) (.call f seed-or-opts))))]
+                            (when-let [prf (or (gobj/get cer "prf") cer)]
+                              (or (gobj/get prf "first")
+                                  (when-let [r (gobj/get prf "results")]
+                                    (gobj/get r "first")))))
+                          (when-let [prf (gobj/get seed-or-opts "prf")]
+                            (or (gobj/get prf "first")
+                                (when-let [r (gobj/get prf "results")]
+                                  (gobj/get r "first"))))
+                          (when-let [r (gobj/get seed-or-opts "results")]
+                            (gobj/get r "first"))))
                     (when (map? opts-map)
                       (or (:prf-output opts-map)
                           (:prfOutput opts-map)
@@ -337,11 +348,11 @@
                           (get-in opts-map [:client-extension-results :prf :results :first]))))
         user-handle (or (when raw-bytes? seed-or-opts)
                         (when (and (some? seed-or-opts) (object? seed-or-opts))
-                          (or (unchecked-get seed-or-opts "userHandle")
-                              (unchecked-get seed-or-opts "user_handle")
-                              (when-let [r (unchecked-get seed-or-opts "response")]
-                                (or (unchecked-get r "userHandle")
-                                    (unchecked-get r "user_handle")))))
+                          (or (gobj/get seed-or-opts "userHandle")
+                              (gobj/get seed-or-opts "user_handle")
+                              (when-let [r (gobj/get seed-or-opts "response")]
+                                (or (gobj/get r "userHandle")
+                                    (gobj/get r "user_handle")))))
                         (when existing-ident (or (:user-handle existing-ident) (:seed existing-ident)))
                         (when (map? opts-map)
                           (or (:user-handle opts-map)
@@ -355,25 +366,26 @@
                               (:seed_bytes opts-map)))
                         (when (string? seed-or-opts) seed-or-opts)
                         (when (sequential? seed-or-opts) seed-or-opts))
-        recovered (cond
-                    (some? user-handle)
-                    (webauthn/recover-seed-from-assertion
-                     (if (map? opts-map)
-                       (assoc opts-map :user-handle user-handle)
-                       {:user-handle user-handle}))
+        raw-recovered (cond
+                        (some? user-handle)
+                        (webauthn/recover-seed-from-assertion
+                         (if (map? opts-map)
+                           (assoc opts-map :user-handle user-handle)
+                           {:user-handle user-handle}))
 
-                    (some? prf-out)
-                    (webauthn/derive-identity-from-prf prf-out)
+                        (some? prf-out)
+                        (webauthn/derive-identity-from-prf prf-out)
 
-                    (and existing-ident (:public-hex existing-ident) (:address existing-ident))
-                    existing-ident
+                        (and existing-ident (:public-hex existing-ident))
+                        existing-ident
 
-                    :else nil)]
+                        :else nil)
+        recovered (when raw-recovered
+                    (webauthn/normalize-recovered-identity raw-recovered))]
     (if-not recovered
       (clj->js {:ok false :error "recovery-failed"})
-      (do
-        (apply-hardware-identity! recovered)
-        (clj->js (assoc (redact-for-js recovered) :ok true))))))
+      (let [applied (or (apply-hardware-identity! recovered) recovered)]
+        (clj->js (assoc (redact-for-js applied) :ok true))))))
 
 (defn generate-non-extractable-key
   "Generates and returns non-extractable WebCrypto key spec and metadata."
@@ -2203,7 +2215,14 @@
        "pollRelayEnvelopes" poll-relay-envelopes!
        "ackRelayEnvelopes" ack-relay-envelopes!
        "fetchRelayChainState" fetch-relay-chain-state!
-       "version" "0.23.13"})
+       "checkBundleFreshness" (fn [remote-ver]
+                                (let [na @active-node-atom
+                                      st (if na @na {:diagnostics {}})
+                                      res (browser/check-browser-bundle-freshness st "0.23.14" remote-ver)]
+                                  (when (and na (not (:fresh? res)))
+                                    (swap! na update-in [:conn :diagnostics :stale-browser-bundle] (fnil inc 0)))
+                                  (clj->js res)))
+       "version" "0.23.14"})
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api))

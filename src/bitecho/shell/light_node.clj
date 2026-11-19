@@ -3048,355 +3048,493 @@
     (catch Exception _
       "127.0.0.1")))
 
+(defonce ^:private single-instance-lock-guard (Object.))
+
+(defn- default-pid-alive?
+  [pid]
+  (try
+    (when (and pid (pos? (long pid)))
+      (let [ph (ProcessHandle/of (long pid))]
+        (and (.isPresent ph) (.isAlive ^ProcessHandle (.get ph)))))
+    (catch Exception _ false)))
+
+(defn- current-jvm-pid
+  ^long []
+  (try
+    (.pid (ProcessHandle/current))
+    (catch Exception _ 1)))
+
+(defn check-single-instance-lock
+  "Atomic single-instance serve/driver guard (`BIP-010` / `P-OPS-3`, Rule 5):
+   Probes `<state-dir>/serve.lock` and `<state-dir>/control.json` for an active PID.
+   - If held by a live PID (`(pid-alive-fn locked-pid)` is true and `locked-pid != current-pid`),
+     fails fast without overwriting `control.json`, returning a counted `:diagnose`
+     (`:reason :duplicate-serve-instance-rejected`).
+   - If the lock is from a dead PID, reclaims the stale lock, records `:reclaimed-stale-lock? true`,
+     and writes `{:pid current-pid :timestamp-ms ...}` into `<state-dir>/serve.lock`."
+  ([state-dir]
+   (check-single-instance-lock state-dir nil))
+  ([state-dir {:keys [current-pid pid-alive-fn timestamp-ms state]}]
+   (locking single-instance-lock-guard
+     (let [dir (io/file (or state-dir "."))
+           _ (when-not (.exists dir) (.mkdirs dir))
+           lock-file (io/file dir "serve.lock")
+           ctrl-file (io/file dir "control.json")
+           my-pid (long (or current-pid (current-jvm-pid)))
+           alive-fn (or pid-alive-fn default-pid-alive?)
+           now-ms (long (or timestamp-ms (System/currentTimeMillis)))
+           lock-info (when (.exists lock-file)
+                       (try (edn/read-string (slurp lock-file)) (catch Exception _ nil)))
+           ctrl-info (when (.exists ctrl-file)
+                       (try (json/read-str (slurp ctrl-file)) (catch Exception _ nil)))
+           existing-pid (or (when (map? lock-info) (:pid lock-info))
+                            (when (map? ctrl-info) (or (get ctrl-info "pid") (:pid ctrl-info))))
+           existing-pid-long (when (some? existing-pid)
+                               (try (Long/parseLong (str existing-pid)) (catch Exception _ nil)))
+           live-holder? (boolean (and existing-pid-long
+                                      (not= existing-pid-long my-pid)
+                                      (alive-fn existing-pid-long)))]
+       (if live-holder?
+         (let [diag {:effect :diagnose
+                     :type :diagnose
+                     :reason :duplicate-serve-instance-rejected
+                     :locked-pid existing-pid-long
+                     :attempted-pid my-pid
+                     :state-dir (.getAbsolutePath dir)}
+               st' (update-in (or state {:diagnostics {}})
+                              [:diagnostics :duplicate-serve-instance-rejected]
+                              (fnil inc 0))]
+           {:ok? false
+            :error "already-running"
+            :locked-pid existing-pid-long
+            :attempted-pid my-pid
+            :diagnose diag
+            :diagnostics (:diagnostics st')
+            :state st'
+            :effects [diag]})
+         (let [reclaimed? (boolean (and existing-pid-long (not= existing-pid-long my-pid)))
+               new-lock {:pid my-pid
+                         :timestamp-ms now-ms
+                         :reclaimed-stale-pid (when reclaimed? existing-pid-long)}
+               tmp-f (java.io.File/createTempFile "serve-lock-" ".tmp" dir)]
+           (try
+             (spit tmp-f (pr-str new-lock))
+             (try
+               (Files/move (.toPath tmp-f) (.toPath lock-file)
+                           (into-array java.nio.file.CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                                                 StandardCopyOption/REPLACE_EXISTING]))
+               (catch Exception _
+                 (Files/move (.toPath tmp-f) (.toPath lock-file)
+                             (into-array java.nio.file.CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+             (finally
+               (when (.exists tmp-f) (try (.delete tmp-f) (catch Exception _ nil)))))
+           (cond-> {:ok? true
+                    :locked-pid my-pid
+                    :lock-file (.getAbsolutePath lock-file)
+                    :reclaimed-stale-lock? reclaimed?
+                    :effects (if reclaimed?
+                               [{:effect :diagnose
+                                 :type :diagnose
+                                 :reason :stale-serve-lock-reclaimed
+                                 :stale-pid existing-pid-long
+                                 :new-pid my-pid}]
+                               [])}
+             reclaimed? (assoc :stale-pid existing-pid-long))))))))
+
+(defn acquire-serve-lock!
+  "Acquires the single-instance lock for `state-dir`."
+  ([state-dir]
+   (check-single-instance-lock state-dir nil))
+  ([state-dir opts]
+   (check-single-instance-lock state-dir opts)))
+
+(defn release-serve-lock!
+  "Releases `<state-dir>/serve.lock` if owned by `expected-pid` (or unconditionally when `expected-pid` is nil)."
+  ([state-dir]
+   (release-serve-lock! state-dir nil))
+  ([state-dir expected-pid]
+   (locking single-instance-lock-guard
+     (when state-dir
+       (let [lock-file (io/file state-dir "serve.lock")]
+         (when (.exists lock-file)
+           (let [info (try (edn/read-string (slurp lock-file)) (catch Exception _ nil))
+                 owner-pid (when (map? info) (:pid info))]
+             (when (or (nil? expected-pid)
+                       (nil? owner-pid)
+                       (= (long expected-pid) (long owner-pid)))
+               (try (.delete lock-file) (catch Exception _ false))))))))))
+
 (defn run-serve!
-  "Runs the light node in continuous JSONL serve mode reading STDIN (and optional --cmd-file) and writing STDOUT (and optional --events-out)."
+  "Runs the light node in continuous JSONL serve mode reading STDIN (and optional --cmd-file) and writing STDOUT (and optional --events-out).
+   Enforces the atomic single-instance serve lock (`BIP-010` / `P-OPS-3`, Rule 5)."
   [opts]
   (let [state-dir (:state-dir opts)
-        state-file (str (io/file state-dir "state.fressian"))
-        events-out (:events-out opts)
-        cmd-file (:cmd-file opts)
-        identity (load-or-create-light-identity! state-dir)
-        bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
-        loaded-state (load-light-state! state-file)
-        base-state (or (when loaded-state
-                         (cond-> loaded-state
-                           (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
-                           (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
-                           (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
-                           (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
-                           (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
-                           (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
-                           (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                           (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                           (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
-                       (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
-                                                                      :autonomous? (boolean (:autonomous? opts false))}
-                                                               (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
-                                                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
-                                                               (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                                                               (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                                                               (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
-        initial-state (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15)))
-                        (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
-                        (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
-                        (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
-        state-atom (atom initial-state)
-        conn-atom (atom (init-conn-state))
         out-writer (or (:out-writer opts)
                        (if (:embedded? opts)
                          (PrintWriter. (java.io.StringWriter.) true)
                          (PrintWriter. System/out true)))
-        event-out (fn [ev] (emit-json-line! out-writer ev events-out))
-        serve-cmd-lock (Object.)
-        conn-opts-atom (atom nil)
-        reconnect-fn (fn []
-                       (when conn-atom
-                         (apply-conn-event! conn-atom {:type :dial-started} @conn-opts-atom))
-                       (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
-                             cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
-                             home-set (if state-atom (:home-set @state-atom) [])
-                             opts-with-gen (assoc (or @conn-opts-atom {})
-                                                  :generation target-gen
-                                                  :validator-cursor cursor
-                                                  :home-set home-set)
-                             reconn (connect-validators! identity bootstrap opts-with-gen)]
-                         (if (:ok? reconn)
-                           (do
-                             (when conn-atom
-                               (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) @conn-opts-atom))
-                             (swap! state-atom assoc
-                                    :connected? true
-                                    :connection-error nil)
-                             (sync-conn-diagnostics! state-atom conn-atom)
-                             (let [recovery-envs (build-reconnect-recovery-envelopes @state-atom (:privkey-bytes identity))]
-                               (when (seq recovery-envs)
-                                 (send-all-envelopes! (:send-fn reconn) recovery-envs)))
-                             reconn)
-                           (let [err (or (:error reconn) "listener-disabled")]
-                             (when conn-atom
-                               (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} @conn-opts-atom))
-                             (swap! state-atom assoc
-                                    :connected? false
-                                    :connection-error err)
-                             (sync-conn-diagnostics! state-atom conn-atom)
-                             reconn))))
-        mdns-host (mdns/generate-mdns-hostname)
-        lan-ip (detect-lan-ipv4)
-        ingress-port (int (or (:ingress-tcp-port opts) 0))
-        default-cands (if (pos? ingress-port)
-                        [(str "udp://" mdns-host ":" ingress-port)
-                         (str "udp://" lan-ip ":" ingress-port)
-                         (str "tcp://" lan-ip ":" ingress-port)]
-                        [])
-        _ (swap! state-atom assoc
-                 :mdns-hostname mdns-host
-                 :lan-ip lan-ip
-                 :default-p2p-candidates default-cands)
-        mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {mdns-host lan-ip}}) (catch Exception _ nil))
-        mdns-atom (or mdns-svc (atom (mdns/init-mdns-table)))
-        p2p-peers-atom (atom {})
-        ingress-peers-atom (atom {})
-        conn-opts (assoc opts
-                         :state-atom state-atom
-                         :conn-atom conn-atom
-                         :event-out event-out
-                         :reconnect-fn reconnect-fn
-                         :state-file state-file
-                         :ingress-peers-atom ingress-peers-atom
-                         :p2p-peers-atom p2p-peers-atom
-                         :mdns-atom mdns-atom
-                         :mdns-svc mdns-svc
-                         :cmd-lock serve-cmd-lock
-                         :async-reconnect? true)
-        _ (reset! conn-opts-atom conn-opts)
-        ingress-listener (start-ingress-tcp-listener! identity conn-opts)
-        conn-res (reconnect-fn)
-        daemon-running? (atom true)
-        auto-sync-enabled? (boolean (:auto-sync? opts true))
-        sync-interval-ms (max 1000 (long (or (:sync-interval-ms opts) 15000)))
-        ctx {:state-atom state-atom
-             :conn-atom conn-atom
-             :out-writer out-writer
-             :events-out events-out
-             :state-file state-file
-             :identity identity
-             :bootstrap bootstrap
-             :ingress-peers-atom ingress-peers-atom
-             :p2p-peers-atom p2p-peers-atom
-             :mdns-atom mdns-atom
-             :conn-opts conn-opts
-             :cmd-lock serve-cmd-lock
-             :serve-cmd-lock serve-cmd-lock
-             :daemon-running? daemon-running?}
-        _ (when auto-sync-enabled?
-            (doto (Thread.
-                   ^Runnable
-                   (fn []
-                     (while @daemon-running?
-                       (run-auto-sync-tick! state-atom bootstrap identity state-file conn-opts)
-                       (try
-                         (Thread/sleep sync-interval-ms)
-                         (catch InterruptedException _
-                           (reset! daemon-running? false))))))
-              (.setDaemon true)
-              (.setName "bitecho-light-node-auto-sync")
-              (.start)))
-        _ (when (and cmd-file (not (str/blank? (str cmd-file))))
-            (let [cf (io/file cmd-file)
-                  _ (when-let [p (.getParentFile cf)] (.mkdirs p))
-                  _ (when-not (.exists cf) (spit cf ""))
-                  start-offset (.length cf)]
-              (doto (Thread.
+        events-out (:events-out opts)
+        lock-res (if (:skip-single-instance-lock? opts)
+                   {:ok? true :locked-pid (current-jvm-pid)}
+                   (acquire-serve-lock! state-dir opts))]
+    (if-not (:ok? lock-res)
+      (let [err-ev {"event" "duplicate-serve-rejected"
+                    "ok" false
+                    "error" "already-running"
+                    "locked_pid" (:locked-pid lock-res)
+                    "diagnose" "duplicate-serve-instance-rejected"}]
+        (emit-json-line! out-writer err-ev events-out)
+        lock-res)
+      (let [my-lock-pid (:locked-pid lock-res)
+            _ (when (:reclaimed-stale-lock? lock-res)
+                (emit-json-line! out-writer
+                                 {"event" "stale-serve-lock-reclaimed"
+                                  "stale_pid" (:stale-pid lock-res)
+                                  "pid" my-lock-pid}
+                                 events-out))
+            state-file (str (io/file state-dir "state.fressian"))
+            cmd-file (:cmd-file opts)
+            identity (load-or-create-light-identity! state-dir)
+            bootstrap (discovery/load-bootstrap-descriptor! (:bootstrap opts))
+            loaded-state (load-light-state! state-file)
+            base-state (or (when loaded-state
+                             (cond-> loaded-state
+                               (some? (:autonomous? opts)) (assoc :autonomous? (boolean (:autonomous? opts)))
+                               (seq (:nodes bootstrap)) (assoc :bootstrap bootstrap)
+                               (:directory-pubkey bootstrap) (assoc :trusted-directory-pubkey (:directory-pubkey bootstrap))
+                               (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                               (:fingerprint identity) (assoc :fingerprint (:fingerprint identity))
+                               (:ice-creds identity) (assoc :ice-creds (:ice-creds identity))
+                               (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                               (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                               (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap)))))
+                           (light-core/init-light-state identity (cond-> {:bootstrap bootstrap
+                                                                          :autonomous? (boolean (:autonomous? opts false))}
+                                                                   (:subnet-id opts) (assoc :subnet-id (:subnet-id opts))
+                                                                   (:trusted-dac-anchors opts) (assoc :trusted-dac-anchors (:trusted-dac-anchors opts))
+                                                                   (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                                                                   (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                                                                   (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))))
+            initial-state (cond-> (assoc base-state :max-epoch-skew (long (or (:max-epoch-skew opts) (:max-epoch-skew base-state) 15)))
+                            (contains? bootstrap :economy-enabled?) (assoc :economy-enabled? (boolean (:economy-enabled? bootstrap)))
+                            (:burn-floor bootstrap) (assoc :burn-floor (long (:burn-floor bootstrap)))
+                            (:min-signaling-burn bootstrap) (assoc :min-signaling-burn (long (:min-signaling-burn bootstrap))))
+            state-atom (atom initial-state)
+            conn-atom (atom (init-conn-state))
+            event-out (fn [ev] (emit-json-line! out-writer ev events-out))
+            serve-cmd-lock (Object.)
+            conn-opts-atom (atom nil)
+            reconnect-fn (fn []
+                           (when conn-atom
+                             (apply-conn-event! conn-atom {:type :dial-started} @conn-opts-atom))
+                           (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
+                                 cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
+                                 home-set (if state-atom (:home-set @state-atom) [])
+                                 opts-with-gen (assoc (or @conn-opts-atom {})
+                                                      :generation target-gen
+                                                      :validator-cursor cursor
+                                                      :home-set home-set)
+                                 reconn (connect-validators! identity bootstrap opts-with-gen)]
+                             (if (:ok? reconn)
+                               (do
+                                 (when conn-atom
+                                   (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) @conn-opts-atom))
+                                 (swap! state-atom assoc
+                                        :connected? true
+                                        :connection-error nil)
+                                 (sync-conn-diagnostics! state-atom conn-atom)
+                                 (let [recovery-envs (build-reconnect-recovery-envelopes @state-atom (:privkey-bytes identity))]
+                                   (when (seq recovery-envs)
+                                     (send-all-envelopes! (:send-fn reconn) recovery-envs)))
+                                 reconn)
+                               (let [err (or (:error reconn) "listener-disabled")]
+                                 (when conn-atom
+                                   (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} @conn-opts-atom))
+                                 (swap! state-atom assoc
+                                        :connected? false
+                                        :connection-error err)
+                                 (sync-conn-diagnostics! state-atom conn-atom)
+                                 reconn))))
+            mdns-host (mdns/generate-mdns-hostname)
+            lan-ip (detect-lan-ipv4)
+            ingress-port (int (or (:ingress-tcp-port opts) 0))
+            default-cands (if (pos? ingress-port)
+                            [(str "udp://" mdns-host ":" ingress-port)
+                             (str "udp://" lan-ip ":" ingress-port)
+                             (str "tcp://" lan-ip ":" ingress-port)]
+                            [])
+            _ (swap! state-atom assoc
+                     :mdns-hostname mdns-host
+                     :lan-ip lan-ip
+                     :default-p2p-candidates default-cands)
+            mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {mdns-host lan-ip}}) (catch Exception _ nil))
+            mdns-atom (or mdns-svc (atom (mdns/init-mdns-table)))
+            p2p-peers-atom (atom {})
+            ingress-peers-atom (atom {})
+            conn-opts (assoc opts
+                             :state-atom state-atom
+                             :conn-atom conn-atom
+                             :event-out event-out
+                             :reconnect-fn reconnect-fn
+                             :state-file state-file
+                             :ingress-peers-atom ingress-peers-atom
+                             :p2p-peers-atom p2p-peers-atom
+                             :mdns-atom mdns-atom
+                             :mdns-svc mdns-svc
+                             :cmd-lock serve-cmd-lock
+                             :async-reconnect? true)
+            _ (reset! conn-opts-atom conn-opts)
+            ingress-listener (start-ingress-tcp-listener! identity conn-opts)
+            conn-res (reconnect-fn)
+            daemon-running? (atom true)
+            auto-sync-enabled? (boolean (:auto-sync? opts true))
+            sync-interval-ms (max 1000 (long (or (:sync-interval-ms opts) 15000)))
+            ctx {:state-atom state-atom
+                 :conn-atom conn-atom
+                 :out-writer out-writer
+                 :events-out events-out
+                 :state-file state-file
+                 :identity identity
+                 :bootstrap bootstrap
+                 :ingress-peers-atom ingress-peers-atom
+                 :p2p-peers-atom p2p-peers-atom
+                 :mdns-atom mdns-atom
+                 :conn-opts conn-opts
+                 :cmd-lock serve-cmd-lock
+                 :serve-cmd-lock serve-cmd-lock
+                 :daemon-running? daemon-running?}
+            _ (when auto-sync-enabled?
+                (doto (Thread.
+                       ^Runnable
+                       (fn []
+                         (while @daemon-running?
+                           (run-auto-sync-tick! state-atom bootstrap identity state-file conn-opts)
+                           (try
+                             (Thread/sleep sync-interval-ms)
+                             (catch InterruptedException _
+                               (reset! daemon-running? false))))))
+                  (.setDaemon true)
+                  (.setName "bitecho-light-node-auto-sync")
+                  (.start)))
+            _ (when (and cmd-file (not (str/blank? (str cmd-file))))
+                (let [cf (io/file cmd-file)
+                      _ (when-let [p (.getParentFile cf)] (.mkdirs p))
+                      _ (when-not (.exists cf) (spit cf ""))
+                      start-offset (.length cf)]
+                  (doto (Thread.
+                         ^Runnable
+                         (fn []
+                           (loop [offset start-offset]
+                             (when @daemon-running?
+                               (let [{:keys [lines next-offset]} (try
+                                                                   (read-new-cmd-file-lines! cmd-file offset)
+                                                                   (catch Exception _
+                                                                     {:lines [] :next-offset offset}))]
+                                 (doseq [line lines]
+                                   (locking serve-cmd-lock
+                                     (binding [*out* *err*]
+                                       (handle-serve-line! line ctx))))
+                                 (try
+                                   (Thread/sleep 50)
+                                   (catch InterruptedException _
+                                     (reset! daemon-running? false)))
+                                 (recur next-offset))))))
+                    (.setDaemon true)
+                    (.setName "bitecho-light-node-cmd-file")
+                    (.start))))
+            effective-relay-url (when-not (:no-poll? opts)
+                                  (or (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                                        (:relay-url opts))
+                                      (:relay-url bootstrap)
+                                      (get-in bootstrap [:relay :url])
+                                      (when (= (:domain bootstrap) "bitecho.org")
+                                        "https://ns1.bitecho.org")))
+            _ (when (and (string? effective-relay-url) (not (str/blank? effective-relay-url)))
+                (doto (Thread.
+                       ^Runnable
+                       (fn []
+                         (loop [since-mseq (long (or (:relay-since-seq @state-atom) 0))
+                                since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))]
+                           (when @daemon-running?
+                             (let [eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
+                                   subnets (or (:subnets opts) eff-subnets)
+                                   poll-res (try
+                                              (poll-relay-envelopes! effective-relay-url
+                                                                     (:pubkey-hex identity)
+                                                                     (:privkey-bytes identity)
+                                                                     (cond-> {:since-seq since-mseq
+                                                                              :since-broadcast-seq since-bseq
+                                                                              :wait-ms 5000}
+                                                                       subnets (assoc :subnets subnets)))
+                                              (catch Exception _ nil))
+                                   msgs (or (get poll-res "messages") (get poll-res :messages) [])
+                                   bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
+                                   last-bseq (or (get poll-res "last_broadcast_seq")
+                                                 (get poll-res "last-broadcast-seq")
+                                                 (get poll-res :last_broadcast_seq))
+                                   all-items (concat msgs bcasts)
+                                   new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") since-mseq))
+                                   new-bseq (long (or last-bseq (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))]
+                               (when (or (not= new-mseq since-mseq) (not= new-bseq since-bseq))
+                                 (swap! state-atom assoc :relay-since-seq new-mseq :relay-since-broadcast-seq new-bseq))
+                               (doseq [item all-items]
+                                 (let [env-raw (or (get item "envelope_hex") (get item "envelope")
+                                                   (get item :envelope_hex) (get item :envelope))
+                                       wire-bytes (when env-raw (try (basalt/hex->bytes (str env-raw)) (catch Exception _ nil)))]
+                                   (when wire-bytes
+                                     (let [r-box (atom nil)
+                                           new-st (swap! state-atom
+                                                         (fn [st]
+                                                           (let [r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
+                                                             (reset! r-box r)
+                                                             (:state r))))
+                                           r @r-box]
+                                       (when state-file
+                                         (try (save-light-state! state-file new-st) (catch Exception _ nil)))
+                                       (when r
+                                         (doseq [ev (:stdout-events r)]
+                                           (event-out ev))
+                                         (when-let [dial-info (:p2p-dial r)]
+                                           (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
+                                         (when (seq (:net-envelopes r))
+                                           (send-routed-envelopes! (:net-envelopes r)
+                                                                   (:send-fn conn-res)
+                                                                   p2p-peers-atom
+                                                                   ingress-peers-atom
+                                                                   state-atom
+                                                                   (:privkey-bytes identity))
+                                           (when (not= :http-relay (:transport conn-res))
+                                             (doseq [env (remove :p2p-direct? (:net-envelopes r))]
+                                               (try
+                                                 (submit-relay-envelope! effective-relay-url env {:timeout-ms 5000})
+                                                 (catch Exception _ nil))))))))))
+                               (when (or (seq msgs) (seq bcasts) (> new-bseq since-bseq))
+                                 (try
+                                   (ack-relay-envelopes! effective-relay-url
+                                                         (:pubkey-hex identity)
+                                                         (:privkey-bytes identity)
+                                                         new-mseq
+                                                         {:ack-broadcast-seq new-bseq})
+                                   (catch Exception _ nil)))
+                               (recur new-mseq new-bseq))))))
+                  (.setDaemon true)
+                  (.setName "bitecho-light-node-relay-poll")
+                  (.start)))
+            ctrl-svc (try
+                       (start-control-server! state-dir ctx conn-opts)
+                       (catch Exception e
+                         (binding [*out* *err*]
+                           (println (str "ERROR: Could not start control server: " (.getMessage e))))
+                         (when-let [st (:state-atom ctx)]
+                           (swap! st update-in [:diagnostics :control-server-fatal] (fnil inc 0)))
+                         nil))
+            shutdown-hook (Thread. ^Runnable (fn []
+                                               (release-serve-lock! state-dir my-lock-pid)
+                                               (when ctrl-svc
+                                                 (try ((:stop! ctrl-svc)) (catch Exception _ nil)))))
+            _ (.addShutdownHook (Runtime/getRuntime) shutdown-hook)
+            _ (doto (Thread.
                      ^Runnable
                      (fn []
-                       (loop [offset start-offset]
-                         (when @daemon-running?
-                           (let [{:keys [lines next-offset]} (try
-                                                               (read-new-cmd-file-lines! cmd-file offset)
-                                                               (catch Exception _
-                                                                 {:lines [] :next-offset offset}))]
-                             (doseq [line lines]
-                               (locking serve-cmd-lock
-                                 (binding [*out* *err*]
-                                   (handle-serve-line! line ctx))))
-                             (try
-                               (Thread/sleep 50)
-                               (catch InterruptedException _
-                                 (reset! daemon-running? false)))
-                             (recur next-offset))))))
-                (.setDaemon true)
-                (.setName "bitecho-light-node-cmd-file")
-                (.start))))
-        effective-relay-url (when-not (:no-poll? opts)
-                              (or (when (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
-                                    (:relay-url opts))
-                                  (:relay-url bootstrap)
-                                  (get-in bootstrap [:relay :url])
-                                  (when (= (:domain bootstrap) "bitecho.org")
-                                    "https://ns1.bitecho.org")))
-        _ (when (and (string? effective-relay-url) (not (str/blank? effective-relay-url)))
-            (doto (Thread.
-                   ^Runnable
-                   (fn []
-                     (loop [since-mseq (long (or (:relay-since-seq @state-atom) 0))
-                            since-bseq (long (or (:relay-since-broadcast-seq @state-atom) 0))]
-                       (when @daemon-running?
-                         (let [eff-subnets (vec (sort (light-core/effective-subscribed-subnets @state-atom)))
-                               subnets (or (:subnets opts) eff-subnets)
-                               poll-res (try
-                                          (poll-relay-envelopes! effective-relay-url
-                                                                 (:pubkey-hex identity)
-                                                                 (:privkey-bytes identity)
-                                                                 (cond-> {:since-seq since-mseq
-                                                                          :since-broadcast-seq since-bseq
-                                                                          :wait-ms 5000}
-                                                                   subnets (assoc :subnets subnets)))
-                                          (catch Exception _ nil))
-                               msgs (or (get poll-res "messages") (get poll-res :messages) [])
-                               bcasts (or (get poll-res "broadcasts") (get poll-res :broadcasts) [])
-                               last-bseq (or (get poll-res "last_broadcast_seq")
-                                             (get poll-res "last-broadcast-seq")
-                                             (get poll-res :last_broadcast_seq))
-                               all-items (concat msgs bcasts)
-                               new-mseq (long (or (get (last msgs) "relay_seq") (get (last msgs) "relay-seq") since-mseq))
-                               new-bseq (long (or last-bseq (get (last bcasts) "broadcast_seq") (get (last bcasts) "broadcast-seq") since-bseq))]
-                           (when (or (not= new-mseq since-mseq) (not= new-bseq since-bseq))
-                             (swap! state-atom assoc :relay-since-seq new-mseq :relay-since-broadcast-seq new-bseq))
-                           (doseq [item all-items]
-                             (let [env-raw (or (get item "envelope_hex") (get item "envelope")
-                                               (get item :envelope_hex) (get item :envelope))
-                                   wire-bytes (when env-raw (try (basalt/hex->bytes (str env-raw)) (catch Exception _ nil)))]
-                               (when wire-bytes
-                                 (let [r-box (atom nil)
-                                       new-st (swap! state-atom
-                                                     (fn [st]
-                                                       (let [r (light-core/handle-wire-payload st wire-bytes (:privkey-bytes identity))]
-                                                         (reset! r-box r)
-                                                         (:state r))))
-                                       r @r-box]
-                                   (when state-file
-                                     (try (save-light-state! state-file new-st) (catch Exception _ nil)))
-                                   (when r
-                                     (doseq [ev (:stdout-events r)]
-                                       (event-out ev))
-                                     (when-let [dial-info (:p2p-dial r)]
-                                       (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) event-out dial-info))
-                                     (when (seq (:net-envelopes r))
-                                       (send-routed-envelopes! (:net-envelopes r)
-                                                               (:send-fn conn-res)
+                       (while @daemon-running?
+                         (try
+                           (let [now-ms (System/currentTimeMillis)
+                                 st @state-atom
+                                 sessions (:sessions st)]
+                         ;; F-5: 30s Outbox RTO Retransmit Loop across all open sessions
+                             (doseq [[sid _] sessions]
+                               (try
+                                 (let [rx-res (light-core/retransmit-unacked-outbox @state-atom sid now-ms 30000)]
+                                   (when (not= @state-atom (:state rx-res))
+                                     (reset! state-atom (:state rx-res))
+                                     (when (some? state-file)
+                                       (save-light-state! state-file @state-atom))
+                                     (when (seq (:net-envelopes rx-res))
+                                       (send-routed-envelopes! (:net-envelopes rx-res)
+                                                               (:send-fn @conn-atom)
                                                                p2p-peers-atom
                                                                ingress-peers-atom
                                                                state-atom
-                                                               (:privkey-bytes identity))
-                                       (when (not= :http-relay (:transport conn-res))
-                                         (doseq [env (remove :p2p-direct? (:net-envelopes r))]
-                                           (try
-                                             (submit-relay-envelope! effective-relay-url env {:timeout-ms 5000})
-                                             (catch Exception _ nil))))))))))
-                           (when (or (seq msgs) (seq bcasts) (> new-bseq since-bseq))
-                             (try
-                               (ack-relay-envelopes! effective-relay-url
-                                                     (:pubkey-hex identity)
-                                                     (:privkey-bytes identity)
-                                                     new-mseq
-                                                     {:ack-broadcast-seq new-bseq})
-                               (catch Exception _ nil)))
-                           (recur new-mseq new-bseq))))))
-              (.setDaemon true)
-              (.setName "bitecho-light-node-relay-poll")
-              (.start)))
-        ctrl-svc (try
-                   (start-control-server! state-dir ctx conn-opts)
-                   (catch Exception e
-                     (binding [*out* *err*]
-                       (println (str "ERROR: Could not start control server: " (.getMessage e))))
-                     (when-let [st (:state-atom ctx)]
-                       (swap! st update-in [:diagnostics :control-server-fatal] (fnil inc 0)))
-                     nil))
-        shutdown-hook (Thread. ^Runnable (fn []
-                                           (when ctrl-svc
-                                             (try ((:stop! ctrl-svc)) (catch Exception _ nil)))))
-        _ (.addShutdownHook (Runtime/getRuntime) shutdown-hook)
-        _ (doto (Thread.
-                 ^Runnable
-                 (fn []
-                   (while @daemon-running?
-                     (try
-                       (let [now-ms (System/currentTimeMillis)
-                             st @state-atom
-                             sessions (:sessions st)]
-                         ;; F-5: 30s Outbox RTO Retransmit Loop across all open sessions
-                         (doseq [[sid _] sessions]
-                           (try
-                             (let [rx-res (light-core/retransmit-unacked-outbox @state-atom sid now-ms 30000)]
-                               (when (not= @state-atom (:state rx-res))
-                                 (reset! state-atom (:state rx-res))
-                                 (when (some? state-file)
-                                   (save-light-state! state-file @state-atom))
-                                 (when (seq (:net-envelopes rx-res))
-                                   (send-routed-envelopes! (:net-envelopes rx-res)
-                                                           (:send-fn @conn-atom)
-                                                           p2p-peers-atom
-                                                           ingress-peers-atom
-                                                           state-atom
-                                                           (:privkey-bytes identity)))
-                                 (when (seq (:stdout-events rx-res))
-                                   (doseq [evt (:stdout-events rx-res)]
-                                     (emit-json-line! out-writer evt events-out)))))
-                             (catch Exception _ nil)))
+                                                               (:privkey-bytes identity)))
+                                     (when (seq (:stdout-events rx-res))
+                                       (doseq [evt (:stdout-events rx-res)]
+                                         (emit-json-line! out-writer evt events-out)))))
+                                 (catch Exception _ nil)))
                          ;; F-6: Gated Autonomous P2P Re-Offers with exponential backoff & tie-breaker protection
-                         (let [reconn-sids (for [[sid _] (:sessions @state-atom)
-                                                 :when (light-core/should-auto-reoffer? @state-atom sid now-ms (:autonomous? opts))]
-                                             sid)]
-                           (doseq [sid reconn-sids]
-                             (let [sess (get-in @state-atom [:sessions sid])
-                                   pref-cands (or (get-in sess [:p2p-meta :local-candidates])
-                                                  (get-in sess [:p2p-meta :preferred-candidates])
-                                                  (get-in sess [:p2p :local-candidates])
-                                                  (:default-p2p-candidates @state-atom))
-                                   pref-tr (or (get-in sess [:p2p-meta :preferred-transport]) "udp")
-                                   cmd {"cmd" "p2p-offer" "session_id" sid "candidates" pref-cands "transport" pref-tr}]
-                               (swap! state-atom light-core/record-reoffer-attempt sid now-ms)
-                               (when (some? state-file)
-                                 (save-light-state! state-file @state-atom))
-                               (locking serve-cmd-lock
-                                 (handle-serve-line! cmd ctx))))))
-                       (catch Exception _ nil))
-                     (try (Thread/sleep 5000) (catch InterruptedException _ (reset! daemon-running? false))))))
-            (.setDaemon true)
-            (.setName "bitecho-light-node-maintenance")
-            (.start))]
-    (if (:ok? conn-res)
-      (emit-json-line! out-writer {"event" "ready"
-                                   "connected" true
-                                   "transport" (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
-                                                 "http-relay"
-                                                 (name (or (:transport opts) :udp)))}
-                       events-out)
-      (emit-json-line! out-writer {"event" "connection-failed"
-                                   "connected" false
-                                   "error" (:error conn-res)}
-                       events-out))
-    (if (:embedded? opts)
-      {:state-atom state-atom
-       :conn-atom conn-atom
-       :control-server ctrl-svc
-       :port (:port ctrl-svc)
-       :token (:token ctrl-svc)
-       :daemon-running? daemon-running?
-       :stop! (fn []
-                (reset! daemon-running? false)
-                (when conn-atom
-                  (apply-conn-event! conn-atom {:type :shutdown} conn-opts))
-                (when ctrl-svc
-                  (try ((:stop! ctrl-svc)) (catch Exception _ nil)))
-                (when mdns-svc
-                  (try (mdns/stop-mdns-service! mdns-svc) (catch Exception _ nil)))
-                (when-let [stop-fn (:stop! ingress-listener)]
-                  (try (stop-fn) (catch Exception _ nil))))}
-      (try
-        (binding [*out* *err*]
-          (let [reader (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
-            (loop []
-              (if-let [line (.readLine reader)]
-                (do
-                  (when-not (str/blank? line)
-                    (locking serve-cmd-lock
-                      (handle-serve-line! line ctx)))
-                  (recur))
-                (when (or (:keep-alive-eof? opts) (and cmd-file (not (str/blank? (str cmd-file)))))
-                  (while @daemon-running?
-                    (try (Thread/sleep 1000) (catch InterruptedException _ (reset! daemon-running? false)))))))))
-        (finally
-          (reset! daemon-running? false)
-          (when conn-atom
-            (apply-conn-event! conn-atom {:type :shutdown} conn-opts))
-          (when ctrl-svc
-            (try ((:stop! ctrl-svc)) (catch Exception _ nil)))
-          (when mdns-svc
-            (try (mdns/stop-mdns-service! mdns-svc) (catch Exception _ nil)))
-          (when-let [stop-fn (:stop! ingress-listener)]
-            (try (stop-fn) (catch Exception _ nil))))))))
+                             (let [reconn-sids (for [[sid _] (:sessions @state-atom)
+                                                     :when (light-core/should-auto-reoffer? @state-atom sid now-ms (:autonomous? opts))]
+                                                 sid)]
+                               (doseq [sid reconn-sids]
+                                 (let [sess (get-in @state-atom [:sessions sid])
+                                       pref-cands (or (get-in sess [:p2p-meta :local-candidates])
+                                                      (get-in sess [:p2p-meta :preferred-candidates])
+                                                      (get-in sess [:p2p :local-candidates])
+                                                      (:default-p2p-candidates @state-atom))
+                                       pref-tr (or (get-in sess [:p2p-meta :preferred-transport]) "udp")
+                                       cmd {"cmd" "p2p-offer" "session_id" sid "candidates" pref-cands "transport" pref-tr}]
+                                   (swap! state-atom light-core/record-reoffer-attempt sid now-ms)
+                                   (when (some? state-file)
+                                     (save-light-state! state-file @state-atom))
+                                   (locking serve-cmd-lock
+                                     (handle-serve-line! cmd ctx))))))
+                           (catch Exception _ nil))
+                         (try (Thread/sleep 5000) (catch InterruptedException _ (reset! daemon-running? false))))))
+                (.setDaemon true)
+                (.setName "bitecho-light-node-maintenance")
+                (.start))]
+        (if (:ok? conn-res)
+          (emit-json-line! out-writer {"event" "ready"
+                                       "connected" true
+                                       "transport" (if (and (string? (:relay-url opts)) (not (str/blank? (:relay-url opts))))
+                                                     "http-relay"
+                                                     (name (or (:transport opts) :udp)))}
+                           events-out)
+          (emit-json-line! out-writer {"event" "connection-failed"
+                                       "connected" false
+                                       "error" (:error conn-res)}
+                           events-out))
+        (if (:embedded? opts)
+          {:state-atom state-atom
+           :conn-atom conn-atom
+           :control-server ctrl-svc
+           :port (:port ctrl-svc)
+           :token (:token ctrl-svc)
+           :daemon-running? daemon-running?
+           :stop! (fn []
+                    (reset! daemon-running? false)
+                    (release-serve-lock! state-dir my-lock-pid)
+                    (when conn-atom
+                      (apply-conn-event! conn-atom {:type :shutdown} conn-opts))
+                    (when ctrl-svc
+                      (try ((:stop! ctrl-svc)) (catch Exception _ nil)))
+                    (when mdns-svc
+                      (try (mdns/stop-mdns-service! mdns-svc) (catch Exception _ nil)))
+                    (when-let [stop-fn (:stop! ingress-listener)]
+                      (try (stop-fn) (catch Exception _ nil))))}
+          (try
+            (binding [*out* *err*]
+              (let [reader (BufferedReader. (InputStreamReader. System/in "UTF-8"))]
+                (loop []
+                  (if-let [line (.readLine reader)]
+                    (do
+                      (when-not (str/blank? line)
+                        (locking serve-cmd-lock
+                          (handle-serve-line! line ctx)))
+                      (recur))
+                    (when (or (:keep-alive-eof? opts) (and cmd-file (not (str/blank? (str cmd-file)))))
+                      (while @daemon-running?
+                        (try (Thread/sleep 1000) (catch InterruptedException _ (reset! daemon-running? false)))))))))
+            (finally
+              (reset! daemon-running? false)
+              (release-serve-lock! state-dir my-lock-pid)
+              (when conn-atom
+                (apply-conn-event! conn-atom {:type :shutdown} conn-opts))
+              (when ctrl-svc
+                (try ((:stop! ctrl-svc)) (catch Exception _ nil)))
+              (when mdns-svc
+                (try (mdns/stop-mdns-service! mdns-svc) (catch Exception _ nil)))
+              (when-let [stop-fn (:stop! ingress-listener)]
+                (try (stop-fn) (catch Exception _ nil))))))))))
 
 (defn- pid-alive? [pid]
   (try
@@ -3572,7 +3710,9 @@
             effective-relay-url (or (:relay-url opts)
                                     (:relay_url opts)
                                     (when-let [u (resolve-relay-url nil #(System/getenv %))] u)
-                                    (when-let [u (:relay-url bootstrap)] (resolve-relay-url u #(System/getenv %))))
+                                    (when-let [u (:relay-url bootstrap)] (resolve-relay-url u #(System/getenv %)))
+                                    (infer-bootstrap-relay-url bootstrap opts)
+                                    (when (= "bitecho.org" (:domain bootstrap)) "https://ns1.bitecho.org"))
             poll-verb? (and (not (:no-poll? opts))
                             effective-relay-url
                             (not= (:connect? opts) false)

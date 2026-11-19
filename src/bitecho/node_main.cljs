@@ -3925,7 +3925,8 @@
                                 (let [effective-relay-url (or (:relay-url opts)
                                                               (:relay_url opts)
                                                               (when-let [u (resolve-relay-url nil #(aget (.-env js/process) %))] u)
-                                                              (when-let [u (:relay-url bootstrap)] (resolve-relay-url u #(aget (.-env js/process) %))))
+                                                              (when-let [u (:relay-url bootstrap)] (resolve-relay-url u #(aget (.-env js/process) %)))
+                                                              (when (= "bitecho.org" (:domain bootstrap)) "https://ns1.bitecho.org"))
                                       poll-verb? (and (not (:no-poll? opts))
                                                       effective-relay-url
                                                       (not= (:connect? opts) false)

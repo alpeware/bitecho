@@ -250,13 +250,17 @@
 (defn canonical-config-pointer-map
   "Normalizes a per-network config pointer manifest map (excluding `:signature`) for deterministic signing."
   [pointer-map]
-  {:network (str (or (:network pointer-map) "devnet"))
-   :seq (long (or (:seq pointer-map) 1))
-   :activate-at-epoch (long (or (:activate-at-epoch pointer-map) 0))
-   :code-target-cid (str (or (:code-target-cid pointer-map) ""))
-   :domains (into (sorted-map) (or (:domains pointer-map) {}))
-   :policy-theta (into (sorted-map) (or (:policy-theta pointer-map) {}))
-   :author-pubkey (or (normalize-hex (:author-pubkey pointer-map)) "")})
+  (cond-> {:network (str (or (:network pointer-map) "devnet"))
+           :seq (long (or (:seq pointer-map) 1))
+           :activate-at-epoch (long (or (:activate-at-epoch pointer-map) 0))
+           :code-target-cid (str (or (:code-target-cid pointer-map) ""))
+           :domains (into (sorted-map) (or (:domains pointer-map) {}))
+           :policy-theta (into (sorted-map) (or (:policy-theta pointer-map) {}))
+           :author-pubkey (or (normalize-hex (:author-pubkey pointer-map)) "")}
+    (:node-runtimes pointer-map)
+    (assoc :node-runtimes (into (sorted-map) (:node-runtimes pointer-map)))
+    (:artifacts pointer-map)
+    (assoc :artifacts (into (sorted-map) (:artifacts pointer-map)))))
 
 (defn canonical-config-pointer-signing-payload
   "Domain-separated canonical payload for signing a config pointer."
@@ -1346,3 +1350,136 @@
       {:ok? true
        :state state
        :effects []})))
+
+;; =============================================================================
+;; 9. P-NODE-1 (BIP-010): Runtime-Dispatching Supervisor & Fail-Closed Preflight Gate
+;; =============================================================================
+
+(def min-required-runtime-major-versions
+  "Minimum required interpreter major versions per runtime target (`BIP-010` / `P-NODE-1`)."
+  {:nodejs 22
+   :jvm 21})
+
+(defn verify-runtime-binary-preflight
+  "Pure fail-closed runtime-binary preflight gate (`BIP-010` / `P-NODE-1`, Axiom seq 521, Rule 5):
+   Before staging or switching to a `:nodejs` or `:jvm` runtime artifact, verifies that the target
+   runtime interpreter is installed and meets the minimum major version (`:nodejs >= 22`, `:jvm >= 21`).
+   `available-runtimes` format: `{:jvm {:installed? true :major-version 25} :nodejs {:installed? true :major-version 22}}`.
+   When `available-runtimes` is nil, defaults to assuming the current runtime is available."
+  [target-runtime available-runtimes]
+  (let [rt (keyword (or target-runtime :jvm))
+        req-major (long (get min-required-runtime-major-versions rt 0))]
+    (if (nil? available-runtimes)
+      {:ok? true :target-runtime rt :required-major req-major}
+      (let [info (get available-runtimes rt)
+            installed? (boolean (:installed? info))
+            major (long (or (:major-version info) 0))]
+        (if (and installed? (>= major req-major))
+          {:ok? true
+           :target-runtime rt
+           :installed-major major
+           :required-major req-major}
+          {:ok? false
+           :error :runtime-binary-missing-or-incompatible
+           :target-runtime rt
+           :installed? installed?
+           :installed-major major
+           :required-major req-major})))))
+
+(defn build-runtime-dispatch-plan
+  "Pure runtime-dispatching supervisor planner (`BIP-010` / `P-NODE-1`, Rule 5):
+   Reads `:node-runtimes` and `:artifacts` (`:jvm` / `:nodejs`) from `config-pointer` for `node-id`,
+   verifies the fail-closed runtime-binary preflight gate (`verify-runtime-binary-preflight`) AND
+   verifies `sha256(artifact-bytes) == target-cid`.
+   On any preflight or hash failure, refuses the switch, reverts to `:last-known-good-runtime` and
+   `:last-known-good-cid`, increments `[:diagnostics :runtime-preflight-failed]` (or `:code-switch-rejected`),
+   and emits a counted `:diagnose` + audit record."
+  [config-pointer node-id {:keys [artifact-bytes available-runtimes
+                                  last-known-good-runtime last-known-good-cid state]}]
+  (let [st (or state {:diagnostics {} :audit-trail []})
+        nid (keyword node-id)
+        lkg-rt (keyword (or last-known-good-runtime :jvm))
+        lkg-cid (or (normalize-hex last-known-good-cid)
+                    (normalize-hex (:code-target-cid config-pointer))
+                    genesis-prev-hash)
+        target-rt (keyword (or (get-in config-pointer [:node-runtimes nid])
+                               (get-in config-pointer [:node-runtimes (name nid)])
+                               :jvm))
+        art-spec (or (get-in config-pointer [:artifacts target-rt])
+                     {:cid (:code-target-cid config-pointer)
+                      :path (if (= target-rt :nodejs)
+                              "dist/bitecho-full-node.cjs"
+                              "target/bitecho.jar")})
+        target-cid (normalize-hex (or (:cid art-spec) (:code-target-cid config-pointer)))
+        art-path (str (or (:path art-spec)
+                          (if (= target-rt :nodejs)
+                            "dist/bitecho-full-node.cjs"
+                            "target/bitecho.jar")))
+        preflight (verify-runtime-binary-preflight target-rt available-runtimes)]
+    (if-not (:ok? preflight)
+      (let [diag {:effect :diagnose
+                  :type :diagnose
+                  :reason :runtime-binary-missing-or-incompatible
+                  :node-id nid
+                  :target-runtime target-rt
+                  :required-major (:required-major preflight)
+                  :installed-major (:installed-major preflight)}
+            audit-res (append-audit-record
+                       st
+                       {:epoch (long (or (:activate-at-epoch config-pointer) 0))
+                        :event-type :runtime-preflight-failed
+                        :payload {:node-id nid
+                                  :target-runtime target-rt
+                                  :fallback-runtime lkg-rt
+                                  :required-major (:required-major preflight)
+                                  :installed-major (:installed-major preflight)}})
+            st' (update-in (:state audit-res) [:diagnostics :runtime-preflight-failed] (fnil inc 0))]
+        {:ok? false
+         :error :runtime-binary-missing-or-incompatible
+         :node-id nid
+         :active-runtime lkg-rt
+         :active-code-cid lkg-cid
+         :reverted-to-last-known-good? true
+         :state st'
+         :effects [diag {:effect :audit-record :record (:record audit-res)}]})
+      (let [actual-cid (when (and artifact-bytes (bytes? artifact-bytes))
+                         (sha256-hex artifact-bytes))
+            hash-ok? (or (nil? artifact-bytes)
+                         (and (some? target-cid) (= target-cid actual-cid)))]
+        (if-not hash-ok?
+          (let [diag {:effect :diagnose
+                      :type :diagnose
+                      :reason :code-verification-failed
+                      :cause :artifact-hash-mismatch
+                      :node-id nid
+                      :target-runtime target-rt
+                      :target-cid target-cid
+                      :actual-cid actual-cid}
+                st' (update-in st [:diagnostics :code-switch-rejected] (fnil inc 0))]
+            {:ok? false
+             :error :code-verification-failed
+             :cause :artifact-hash-mismatch
+             :node-id nid
+             :active-runtime lkg-rt
+             :active-code-cid lkg-cid
+             :reverted-to-last-known-good? true
+             :state st'
+             :effects [diag]})
+          (let [cmd (if (= target-rt :nodejs)
+                      ["node" art-path "infra-node" "--node-id" (name nid)]
+                      ["java" "-jar" art-path "infra-node" "--node-id" (name nid)])
+                env-content (str "BITECHO_ACTIVE_RUNTIME=" (name target-rt) "\n"
+                                 "BITECHO_ACTIVE_CODE_CID=" target-cid "\n"
+                                 "BITECHO_ACTIVE_ARTIFACT_PATH=" art-path "\n"
+                                 "BITECHO_LKG_RUNTIME=" (name lkg-rt) "\n"
+                                 "BITECHO_LKG_CODE_CID=" lkg-cid "\n")]
+            {:ok? true
+             :node-id nid
+             :active-runtime target-rt
+             :active-code-cid target-cid
+             :artifact-path art-path
+             :exec-command cmd
+             :active-runtime-env env-content
+             :state st
+             :effects []}))))))
+

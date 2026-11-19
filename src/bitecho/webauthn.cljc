@@ -7,7 +7,8 @@
             [bitecho.crypto :as crypto]
             [bitecho.fido :as fido]
             [bitecho.light-node.core :as light-core]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            #?(:cljs [goog.object :as gobj])))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Disclosures & Policy Constants
@@ -233,6 +234,22 @@
       :metadata {:origin-scoping origin-scoping-disclosure
                  :trust-boundary trust-boundary-disclosure}})))
 
+#?(:cljs
+   (do
+     (defn- js-prop
+       "Externs-safe property lookup on native WebAuthn / DOM objects under Closure :advanced."
+       [obj k]
+       (when (and (some? obj) (object? obj))
+         (gobj/get obj k)))
+
+     (defn- js-call-0
+       "Externs-safe 0-arg method invocation on native WebAuthn / DOM objects under Closure :advanced."
+       [obj method-name]
+       (when (and (some? obj) (object? obj))
+         (when-let [f (gobj/get obj method-name)]
+           (when (fn? f)
+             (.call f obj)))))))
+
 (defn recover-seed-from-assertion
   "Recovers the 32-byte seed from WebAuthn assertion response (userHandle as canonical default, with PRF extension fallback)
    and deterministically derives the Ed25519 identity keypair."
@@ -240,24 +257,47 @@
   (try
     (let [user-handle (or (when (map? assertion-or-response)
                             (or (get assertion-or-response :user-handle)
+                                (get assertion-or-response :userHandle)
                                 (get assertion-or-response "userHandle")
+                                (get assertion-or-response "user_handle")
                                 (get-in assertion-or-response [:response :user-handle])
+                                (get-in assertion-or-response [:response :userHandle])
                                 (get-in assertion-or-response [:response "userHandle"])
+                                (get-in assertion-or-response [:response "user_handle"])
+                                (get-in assertion-or-response ["response" "userHandle"])
+                                (get-in assertion-or-response ["response" "user_handle"])
+                                (get-in assertion-or-response ["response" :user-handle])
                                 (:user-id assertion-or-response)
                                 (get assertion-or-response "user_id")))
-                          #?(:cljs (when (and (some? assertion-or-response)
-                                              (some? (.-response assertion-or-response)))
-                                     (.-userHandle (.-response assertion-or-response)))))
+                          #?(:cljs (when (some? assertion-or-response)
+                                     (or (js-prop assertion-or-response "userHandle")
+                                         (js-prop assertion-or-response "user_handle")
+                                         (when-let [resp (js-prop assertion-or-response "response")]
+                                           (or (js-prop resp "userHandle")
+                                               (js-prop resp "user_handle")))))))
           prf-out (or (when (map? assertion-or-response)
                         (or (:prf-output assertion-or-response)
+                            (:prfOutput assertion-or-response)
+                            (get assertion-or-response "prfOutput")
+                            (get assertion-or-response "prf_output")
                             (get-in assertion-or-response [:extensions :prf :results :first])
-                            (get-in assertion-or-response [:client-extension-results :prf :results :first])))
-                      #?(:cljs (when (and (some? assertion-or-response)
-                                          (fn? (.-getClientExtensionResults assertion-or-response)))
-                                 (some-> (.getClientExtensionResults assertion-or-response)
-                                         (.-prf)
-                                         (.-results)
-                                         (.-first)))))
+                            (get-in assertion-or-response [:client-extension-results :prf :results :first])
+                            (get-in assertion-or-response [:clientExtensionResults :prf :results :first])
+                            (get-in assertion-or-response ["clientExtensionResults" "prf" "results" "first"])
+                            (get-in assertion-or-response ["extensions" "prf" "results" "first"])))
+                      #?(:cljs (when (some? assertion-or-response)
+                                 (let [cer (or (js-call-0 assertion-or-response "getClientExtensionResults")
+                                               (js-prop assertion-or-response "clientExtensionResults")
+                                               (js-prop assertion-or-response "client_extension_results")
+                                               (js-prop assertion-or-response "extensions"))
+                                       prf (or (when cer (js-prop cer "prf"))
+                                               (js-prop assertion-or-response "prf"))
+                                       results (or (when prf (js-prop prf "results"))
+                                                   (js-prop assertion-or-response "results"))]
+                                   (or (when results (js-prop results "first"))
+                                       (when prf (js-prop prf "first"))
+                                       (js-prop assertion-or-response "prfOutput")
+                                       (js-prop assertion-or-response "prf_output"))))))
           raw-seed (or user-handle prf-out)
           recovery-source (if (some? user-handle) :user-handle :prf)]
       (when-let [bs (to-byte-seq raw-seed)]
@@ -288,17 +328,31 @@
     (let [prf-raw (cond
                     (map? prf-or-assertion)
                     (or (:prf-output prf-or-assertion)
+                        (:prfOutput prf-or-assertion)
+                        (get prf-or-assertion "prfOutput")
+                        (get prf-or-assertion "prf_output")
                         (get-in prf-or-assertion [:extensions :prf :results :first])
                         (get-in prf-or-assertion [:client-extension-results :prf :results :first])
+                        (get-in prf-or-assertion [:clientExtensionResults :prf :results :first])
+                        (get-in prf-or-assertion ["clientExtensionResults" "prf" "results" "first"])
+                        (get-in prf-or-assertion ["extensions" "prf" "results" "first"])
                         (get prf-or-assertion :first)
                         (get-in prf-or-assertion [:results :first]))
 
                     #?@(:cljs
-                        [(and (some? prf-or-assertion) (fn? (.-getClientExtensionResults prf-or-assertion)))
-                         (some-> (.getClientExtensionResults prf-or-assertion)
-                                 (.-prf)
-                                 (.-results)
-                                 (.-first))])
+                        [(and (some? prf-or-assertion)
+                              (or (some? (js-call-0 prf-or-assertion "getClientExtensionResults"))
+                                  (some? (js-prop prf-or-assertion "clientExtensionResults"))
+                                  (some? (js-prop prf-or-assertion "prf"))
+                                  (some? (js-prop prf-or-assertion "results"))))
+                         (let [cer (or (js-call-0 prf-or-assertion "getClientExtensionResults")
+                                       (js-prop prf-or-assertion "clientExtensionResults"))
+                               prf (or (when cer (js-prop cer "prf"))
+                                       (js-prop prf-or-assertion "prf"))
+                               results (or (when prf (js-prop prf "results"))
+                                           (js-prop prf-or-assertion "results"))]
+                           (or (when results (js-prop results "first"))
+                               (when prf (js-prop prf "first"))))])
 
                     :else prf-or-assertion)]
       (when-let [bs (to-byte-seq prf-raw)]
@@ -370,7 +424,9 @@
          (-> (.create (.-credentials js/navigator)
                       (clj->js {:publicKey (dissoc reg-opts :metadata)}))
              (.then (fn [cred]
-                      (let [att-buf (some-> cred (.-response) (.-attestationObject))
+                      (let [resp (js-prop cred "response")
+                            att-buf (or (when resp (js-prop resp "attestationObject"))
+                                        (js-prop cred "attestationObject"))
                             att-bytes (when att-buf (js/Uint8Array. att-buf))
                             parsed-att (when att-bytes (parse-attestation-object att-bytes))
                             recovered (recover-seed-from-assertion {:user-handle (get-in reg-opts [:user :id])})]
@@ -473,6 +529,104 @@
                      :description (or (:description backup-opts) "Secondary Hardware YubiKey Backup")
                      :yubico-enrollment :parked}]
     (assoc primary-state :backup-key backup-info)))
+
+(defn normalize-spki-pubkey-hex
+  "Normalizes an Ed25519 public key (64-char raw hex, 88-char SPKI hex, 32-byte raw bytes,
+   or 44-byte SPKI bytes) into canonical lowercase 88-char SPKI hex (`302a300506032b6570032100` + 64-char raw hex)."
+  [pub]
+  (to-valid-spki-hex pub))
+
+(defn normalize-recovered-identity
+  "Normalizes a recovered hardware identity map (or nested `{:identity ...}` map) so:
+   - `:public-hex` is canonical 88-char SPKI hex (`302a300506032b6570032100` + 64-char raw hex)
+   - `:raw-public-hex` retains the 64-char raw Ed25519 public key hex
+   - `:public-key` is 44-byte SPKI bytes
+   - `:address` is the consistent `ech1...` Bech32m address."
+  [recovered]
+  (let [ident (if (and (map? recovered) (map? (:identity recovered)))
+                (:identity recovered)
+                recovered)]
+    (when (map? ident)
+      (let [raw-pub (or (:public-hex ident)
+                        (get ident "public-hex")
+                        (get ident "publicHex")
+                        (:public-key ident)
+                        (get-in ident [:keypair :public]))
+            spki-hex (to-valid-spki-hex raw-pub)]
+        (when (and (string? spki-hex) (= 88 (count spki-hex)))
+          (let [raw-64 (subs spki-hex 24)
+                spki-bytes (->byte-array spki-hex)
+                addr (or (when (and (string? (:address ident))
+                                    (str/starts-with? (:address ident) "ech1"))
+                           (:address ident))
+                         (bech32m/pubkey->bech32m spki-hex "ech"))
+                priv (or (:private-key ident)
+                         (get-in ident [:keypair :private]))]
+            (cond-> (assoc ident
+                           :public-hex spki-hex
+                           :raw-public-hex raw-64
+                           :public-key spki-bytes
+                           :address addr)
+              priv (assoc :private-key (to-pkcs8-der priv))
+              (:keypair ident)
+              (assoc :keypair {:public spki-bytes
+                               :private (when priv (to-pkcs8-der priv))
+                               :public-key spki-bytes
+                               :private-key (when priv (to-pkcs8-der priv))}))))))))
+
+(defn resolve-yubikey-recovery
+  "Pure single-recovery-path helper (`BIP-010` / `P-WEB-1`):
+   Resolves a YubiKey recovery request from:
+   - raw seed/user-handle bytes,
+   - PRF extension output,
+   - native / Closure-mangled WebAuthn assertion object or string-keyed map,
+   - top-level redacted credential `{:public-hex ... :address ...}`, or
+   - nested redacted credential `{:identity {:public-hex ... :address ...}}`.
+   Normalizes the recovered key to canonical 88-char SPKI `:public-hex` and 44-byte SPKI `:public-key`,
+   and when `current-node-state` already holds an unlocked `:private-key` for the same identity,
+   never overwrites `:private-key` with `nil`."
+  ([seed-or-opts]
+   (resolve-yubikey-recovery seed-or-opts nil))
+  ([seed-or-opts current-node-state]
+   (let [direct-rec (or (recover-seed-from-assertion seed-or-opts)
+                        (derive-identity-from-prf seed-or-opts))
+         existing-ident (when (map? seed-or-opts)
+                          (or (when (map? (:identity seed-or-opts)) (:identity seed-or-opts))
+                              (when (map? (get seed-or-opts "identity")) (get seed-or-opts "identity"))
+                              (when (or (:public-hex seed-or-opts)
+                                        (get seed-or-opts "public-hex")
+                                        (get seed-or-opts "publicHex"))
+                                seed-or-opts)))
+         cand (or (when direct-rec (normalize-recovered-identity direct-rec))
+                  (when existing-ident (normalize-recovered-identity existing-ident)))]
+     (if-not cand
+       {:ok? false :ok false :error "recovery-failed"}
+       (let [spki-hex (:public-hex cand)
+             existing-node-pub (when (map? current-node-state)
+                                 (or (to-valid-spki-hex (get-in current-node-state [:light-state :pubkey]))
+                                     (to-valid-spki-hex (get-in current-node-state [:keypair :public-key]))))
+             existing-node-priv (when (map? current-node-state)
+                                  (get-in current-node-state [:keypair :private-key]))
+             eff-priv (or (:private-key cand)
+                          (when (and existing-node-priv
+                                     (or (nil? existing-node-pub)
+                                         (= existing-node-pub spki-hex)))
+                            existing-node-priv))
+             eff-ident (cond-> cand
+                         eff-priv (assoc :private-key eff-priv))
+             next-node-state (when (map? current-node-state)
+                               (cond-> (-> current-node-state
+                                           (assoc-in [:light-state :pubkey] spki-hex)
+                                           (assoc-in [:keypair :public-key] (:public-key eff-ident)))
+                                 eff-priv
+                                 (assoc-in [:keypair :private-key] eff-priv)))]
+         {:ok? true
+          :ok true
+          :public-hex spki-hex
+          :raw-public-hex (:raw-public-hex eff-ident)
+          :address (:address eff-ident)
+          :identity eff-ident
+          :node-state next-node-state})))))
 
 (defn recover-from-backup-key
   "Recovers identity state using a verified backup key seed."

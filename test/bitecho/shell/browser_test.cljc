@@ -501,7 +501,8 @@
             "invalid-lab-subnet-rejected" "bip-admission-rejected" "sybil-bounty-claim-rejected"
             "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"
             "network-uri" "network-replay-rejected"
-            "subscribed-subnets" "offer-nonce"}
+            "subscribed-subnets" "offer-nonce"
+            "raw-public-hex" "stale-browser-bundle"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)

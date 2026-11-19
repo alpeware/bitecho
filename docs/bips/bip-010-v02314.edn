@@ -1,0 +1,195 @@
+{:bip-id "BIP-010"
+ :bip/id "BIP-010"
+ :title "BIP-010: Web-App YubiKey Recovery Fix, Single-Instance Serve Guard, Hardware-Key Faucet (A2 Service + A1 Spend-DAC), and Node.js Infra Node"
+ :bip/title "BIP-010: Web-App YubiKey Recovery Fix, Single-Instance Serve Guard, Hardware-Key Faucet (A2 Service + A1 Spend-DAC), and Node.js Infra Node"
+ :version "v0.23.14"
+ :bip/version "0.23.14"
+ :milestone "D36"
+ :bip/milestone "D36"
+ :bip/status :consented
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :bip/author-agent "axiom"
+ :author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :bip/author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :co-author-pubkeys ["302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                     "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                     "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"]
+ :human-anchor-sunset "2027-06-30"
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :invariant-diff {:defspec-vars ["bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-yubikey-recovery-redacted-and-advanced-mangled-roundtrip"
+                                 "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-recovered-hardware-pubkey-always-canonical-88-char-spki"
+                                 "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-single-instance-serve-lock-rejects-duplicate-live-pid"
+                                 "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-faucet-claim-requires-valid-pow-challenge-and-unique-credential"
+                                 "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-spend-dac-enforces-cap-expiry-revocation-and-holder-sig"
+                                 "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-a2-to-a1-spend-dac-migration-preserves-remaining-cap"]
+                  :seed 1795198400
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 1795198400
+                                            :tests 765
+                                            :assertions 6980
+                                            :executed-at 1795198400000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 1795198400
+                                             :scenarios-passed 84
+                                             :executed-at 1795198400000}
+                   :deterministic-bundle-sha256 "5a44657b51e32df66cd3c3cb1f0ea8431ed6c89df3ecd40894915f2729afcc88"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :browser-bundle-sha256 "d1d22fd39217e380ed5b8d68db5b458880ff4853aba1954824c58914637c9dd6"
+                                                   :full-node-bundle-sha256 "47de2e2f4dac1bdda6a2322403cc5c18b4f7c6b1349ffdcf8056a32d03e732db"
+                                                   :executed-at 1795198400000}}
+ :bip/reviewers [{:agent "nexus"
+                  :role :builder-lead
+                  :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                  :finding-refs ["P-WEB-1" "P-OPS-3" "P-FAUCET-1" "P-FAUCET-2" "P-NODE-1"]}
+                 {:agent "lumen"
+                  :role :research-lead
+                  :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"
+                  :finding-refs ["P-FAUCET-1" "P-FAUCET-2" "P-NODE-1"]}
+                 {:agent "vector"
+                  :role :soak-tester
+                  :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                  :finding-refs ["P-WEB-1" "P-OPS-3" "P-FAUCET-1" "P-NODE-1"]}]
+ :bip/parent-bip-cid "bfcf28f8da5d1fece02358c7017e5ce1bb13bab14b927eebc952e8b6eb95cec7"
+ :bip/draft-cid "72cadb0e4d120b2b6802a55e75b9bec0db5bd5fa6071a360f4c24010912bafc6"
+ :code-artifact {:parent-commit "3ca995123474d6108a1ca814ebee5140da739655"
+                 :patch-path "dist/bips/bip-010-v02314.patch"
+                 :patch-cid "dead0f69d9f7946d3fe963b8689c000c6055813b988a71c674c3c624b401c2a9"
+                 :patch-size-bytes 237180
+                 :verification-steps ["git checkout 3ca995123474d6108a1ca814ebee5140da739655"
+                                      "git apply bip-010-v02314.patch"
+                                      "./scripts/build-node-bundle.sh && ./scripts/build-browser-bundle.sh && ./scripts/build-full-node-bundle.sh"
+                                      "clojure -M:test -n bitecho.d36-bip010-yubikey-faucet-and-node-infra-test"]}
+ :bip/scenarios ["S-D36-1: Web-App YubiKey Recovery Round-Trip (Redacted & :advanced-Mangled)"
+                 "S-D36-2: Duplicate serve Instance Rejected Fail-Fast & Stale PID Lock Reclaimed"
+                 "S-D36-3: Spend-DAC Debit, Cap Enforcement, Expiry, Revocation, and Fee-From-Allowance (Zero Dust)"
+                 "S-D36-4: Hardware-Key Faucet Claim (Pre-Parse PoW/Challenge Gate, Attestation Root Verification, Dedup, Co-Execution)"
+                 "S-D36-5: A2 -> A1 Spend-DAC Migration Preserves Remaining Cap Without Re-Attestation"
+                 "S-D36-6: Node.js Infra Node Fressian Snapshot Continuity, Audit Parity, and Fail-Closed Runtime-Binary Preflight Gate"]
+ :vm-node-versions {:local-build-host "v22.22.0"
+                    :node1 "v22.14.0"
+                    :node2 "v22.14.0"
+                    :node3 "v22.14.0"
+                    :ns1 "v22.14.0"
+                    :ns2 "v22.14.0"
+                    :ns3 "v22.14.0"
+                    :min-required-nodejs-major 22
+                    :min-required-jvm-major 21
+                    :preflight-gate :fail-closed}
+
+ ;; ============================================================================
+ ;; 1. Deliverables (P-WEB-1, P-OPS-3, P-FAUCET-1, P-FAUCET-2, P-NODE-1)
+ ;; ============================================================================
+ :bip/pillars
+ {:P-WEB-1
+  {:title "Web App: YubiKey recovery-failed Fix & Bundle-Freshness Check"
+   :files ["src/bitecho/webauthn.cljc"
+           "src/bitecho/browser_main.cljs"
+           "src/bitecho/shell/browser.cljc"
+           "resources/public/index.html"
+           "scripts/build-browser-bundle.sh"]
+   :changes
+   ["Single recovery path in `recover-from-yubikey` (`webauthn/resolve-yubikey-recovery`) recognizing both top-level `{:public-hex ...}` and nested `{:identity {:public-hex ...}}` redacted shapes without overwriting an already-unlocked `:private-key` with `nil`."
+    "Externs-safe `goog.object/get` property accessors in `webauthn.cljc` and `browser_main.cljs` for all native WebAuthn DOM properties (`response`, `userHandle`, `attestationObject`, `clientExtensionResults`, `prf`, `results`, `first`)."
+    "Key-format normalization (`webauthn/normalize-recovered-identity`, `webauthn/normalize-spki-pubkey-hex`) normalizing recovered keys to canonical 88-char SPKI `:public-hex` (`302a300506032b6570032100` + 64-char raw hex) and 44-byte SPKI `:public-key`."
+    "Cache-busted `/app/bitecho-browser.js?v=0.23.14` script tag and pure `browser/check-browser-bundle-freshness` emitting counted `:stale-browser-bundle` `:diagnose` effects (Rule 5)."]}
+
+  :P-OPS-3
+  {:title "Rollout Remediation: Atomic Single-Instance Guard for serve/driver"
+   :files ["src/bitecho/shell/light_node.clj"
+           "scripts/light-node.sh"]
+   :changes
+   ["Implement `check-single-instance-lock`, `acquire-serve-lock!`, and `release-serve-lock!` in `bitecho.shell.light-node` using `<state-dir>/serve.lock` and `<state-dir>/control.json`."
+    "Fail fast with counted `:duplicate-serve-instance-rejected` `:diagnose` when the lock is held by a live PID, and reclaim stale locks from dead PIDs with `:stale-serve-lock-reclaimed`."]}
+
+  :P-FAUCET-1
+  {:title "Hardware-Key Faucet Service (A2: Sponsored Relay / Co-Execution)"
+   :files ["services/faucet/core.cljc"]
+   :changes
+   ["Create standalone pure `.cljc` Sans-IO faucet service engine in `services/faucet/core.cljc` (excluded from validator and light-node `dist/` bundles)."
+    "Enforce pre-parse anti-spam gate (16-bit Hashcash PoW + hardware-key challenge signature over `sha256('bitecho-faucet-claim-v1|' + claimant-pubkey + '|' + epoch-bucket)` before CBOR/x5c parsing), server-side FIDO2/WebAuthn attestation root verification (closing `F-BIP7-2`), `[aaguid credential-id]` deduplication (`faucet/claimed-keys.edn`), `1,000,000` ECH `:spend-dac` issuance, `25,000,000` ECH liquid cap with 20% refill alert, and signed audit artifacts for every decision."]}
+
+  :P-FAUCET-2
+  {:title "On-Chain :spend-dac Allowance State (A1: Economy-Layer Primitive)"
+   :files ["src/bitecho/economy/spend_dac.cljc"]
+   :changes
+   ["Define sibling `:spend-dac` record `{:dac-id, :type :spend-dac, :issuer, :holder, :cap, :expiry-epoch, :issued-epoch, :spent, :revoked?, :signature}` preserving the settled 2026-11-10 invariant that admission DACs never move money."
+    "Implement pure `issue-spend-dac`, `revoke-spend-dac`, `validate-and-apply-spend-dac-debit` (enforcing holder signature, cap, expiry, revocation, and fee-from-allowance with zero dust), `migrate-a2-allowance-to-a1`, and `default-faucet-attestation-roots` (`config/faucet/attestation-roots.edn`)."]}
+
+  :P-NODE-1
+  {:title "Node.js Infra Node: dist/bitecho-full-node.cjs & Fail-Closed Runtime-Dispatching Supervisor"
+   :files ["src/bitecho/full_node_main.cljs"
+           "src/bitecho/deploy/core.cljc"
+           "scripts/build-full-node-bundle.sh"]
+   :changes
+   ["Compile `bitecho.state-machine`, `bitecho.core.protocol.relay`, `bitecho.core.subnet`, `bitecho.core.storage`, `bitecho.governance.core`, `bitecho.deploy.core`, `bitecho.economy.spend-dac`, and `bitecho.fressian` into deterministic `dist/bitecho-full-node.cjs` (`:target :nodejs`, `:optimizations :advanced`)."
+    "Verify cross-runtime Fressian state snapshot continuity (`subnet-pointers.fressian`) and `P-DEPLOY-5` audit trail parity between JVM and Node.js infra nodes."
+    "Implement fail-closed runtime-binary preflight gate (`deploy/verify-runtime-binary-preflight`, `deploy/build-runtime-dispatch-plan`) requiring Node.js `>= 22` before switching to `:nodejs` and reverting to `:last-known-good-runtime` with counted `:runtime-binary-missing-or-incompatible` `:diagnose` if absent or incompatible."]}}
+
+ :bip/defspec-vars
+ ["bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-yubikey-recovery-redacted-and-advanced-mangled-roundtrip"
+  "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-recovered-hardware-pubkey-always-canonical-88-char-spki"
+  "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-single-instance-serve-lock-rejects-duplicate-live-pid"
+  "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-faucet-claim-requires-valid-pow-challenge-and-unique-credential"
+  "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-spend-dac-enforces-cap-expiry-revocation-and-holder-sig"
+  "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test/prop-a2-to-a1-spend-dac-migration-preserves-remaining-cap"]
+
+ :bip/oracle-receipts
+ {:test-suite "bitecho.d36-bip010-yubikey-faucet-and-node-infra-test"
+  :d36-tests-run 12
+  :d36-assertions 89
+  :d36-failures 0
+  :d36-errors 0
+  :full-suite-tests-run 765
+  :full-suite-assertions 6977
+  :full-suite-failures 0
+  :full-suite-errors 0
+  :cljfmt-status :clean
+  :clj-kondo-errors 0
+  :clj-kondo-warnings 0
+  :reproducible-node-bundle-sha256 "5a44657b51e32df66cd3c3cb1f0ea8431ed6c89df3ecd40894915f2729afcc88"
+  :reproducible-browser-bundle-sha256 "d1d22fd39217e380ed5b8d68db5b458880ff4853aba1954824c58914637c9dd6"
+  :reproducible-full-node-bundle-sha256 "47de2e2f4dac1bdda6a2322403cc5c18b4f7c6b1349ffdcf8056a32d03e732db"}
+
+ :bip/invariant-diff
+ {:added [:invariant/yubikey-single-recovery-path-and-externs-safe-webauthn-lookup
+          :invariant/recovered-hardware-pubkey-canonical-88-char-spki
+          :invariant/single-instance-serve-lock-rejects-live-duplicate-and-reclaims-stale
+          :invariant/faucet-pre-parse-pow-challenge-and-hardware-attestation-dedup
+          :invariant/spend-dac-enforces-cap-expiry-revocation-holder-sig-and-zero-dust-fee
+          :invariant/a2-to-a1-spend-dac-migration-preserves-remaining-cap-offline
+          :invariant/nodejs-infra-node-fressian-continuity-and-fail-closed-runtime-preflight]
+  :modified [:invariant/browser-bundle-freshness-diagnose]
+  :removed []}
+
+ :bip/jurisdiction-map
+ {:core {:namespaces ["bitecho.config"
+                      "bitecho.webauthn"
+                      "bitecho.economy.spend-dac"
+                      "faucet.core"
+                      "bitecho.deploy.core"
+                      "bitecho.state-machine"
+                      "bitecho.light-node.core"]
+         :pure-sans-io? true}
+  :shell {:namespaces ["bitecho.shell.browser"
+                       "bitecho.shell.light-node"
+                       "bitecho.browser-main"
+                       "bitecho.node-main"
+                       "bitecho.full-node-main"]
+          :single-authority-lifecycle? true
+          :zero-silent-failures? true}}
+
+ :bip/human-anchor-sunset 26280}
