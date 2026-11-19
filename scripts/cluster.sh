@@ -676,8 +676,8 @@ cmd_deploy() {
   echo "Directory Pubkey: ${DIRECTORY_PUB}"
   export DIRECTORY_PUB
 
-  # 3. Upload uberjar to all 6 VMs (node1..node3 + ns1..ns3) with .prev backup
-  echo "--> Step 3/7: Uploading uberjar to all 6 nodes via rsync (preserving .prev backup)..."
+  # 3. Upload uberjar and Node.js full-node bundle to all 6 VMs (node1..node3 + ns1..ns3) with .prev backup
+  echo "--> Step 3/7: Uploading uberjar and Node.js full-node bundle to all 6 nodes via rsync (preserving .prev backup)..."
   for node in "${NODES[@]}"; do
     local ip
     ip="$(get_ip "$node")"
@@ -685,6 +685,15 @@ cmd_deploy() {
     ssh_cmd "$node" "if [ -f /opt/bitecho/bitecho.jar ]; then cp -pf /opt/bitecho/bitecho.jar /opt/bitecho/bitecho.jar.prev; fi"
     rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
       "${ROOT_DIR}/target/bitecho.jar" "${SSH_USER}@${ip}:/opt/bitecho/bitecho.jar"
+    if [[ -f "${ROOT_DIR}/scripts/run-validator-node.sh" ]]; then
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
+        "${ROOT_DIR}/scripts/run-validator-node.sh" "${SSH_USER}@${ip}:/opt/bitecho/run-node.sh"
+      ssh_cmd "$node" "chmod +x /opt/bitecho/run-node.sh"
+    fi
+    if [[ -f "${ROOT_DIR}/dist/bitecho-full-node.cjs" ]]; then
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${SSH_KEY}" \
+        "${ROOT_DIR}/dist/bitecho-full-node.cjs" "${SSH_USER}@${ip}:/opt/bitecho/bitecho-full-node.cjs"
+    fi
   done
   local infra_ssh_key="${ROOT_DIR}/../clj-web/.ssh/clj_web_ed25519"
   for node in "${INFRA_NODES[@]}"; do
@@ -694,6 +703,15 @@ cmd_deploy() {
     ssh_cmd "$node" "mkdir -p /opt/bitecho-infra /etc/bitecho-infra && if [ -f /opt/bitecho-infra/bitecho.jar ]; then cp -pf /opt/bitecho-infra/bitecho.jar /opt/bitecho-infra/bitecho.jar.prev; cp -pf /opt/bitecho-infra/bitecho.jar /opt/bitecho-infra/bitecho.jar.bak; fi"
     rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${infra_ssh_key}" \
       "${ROOT_DIR}/target/bitecho.jar" "cljweb@${ip}:/opt/bitecho-infra/bitecho.jar"
+    if [[ -f "${ROOT_DIR}/scripts/run-infra-node.sh" ]]; then
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${infra_ssh_key}" \
+        "${ROOT_DIR}/scripts/run-infra-node.sh" "cljweb@${ip}:/opt/bitecho-infra/run-node.sh"
+      ssh_cmd "$node" "chmod +x /opt/bitecho-infra/run-node.sh"
+    fi
+    if [[ -f "${ROOT_DIR}/dist/bitecho-full-node.cjs" ]]; then
+      rsync -az -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -i ${infra_ssh_key}" \
+        "${ROOT_DIR}/dist/bitecho-full-node.cjs" "cljweb@${ip}:/opt/bitecho-infra/bitecho-full-node.cjs"
+    fi
   done
 
   # 4. Fetch persistent node identities
@@ -1056,10 +1074,18 @@ TXT_BOOTSTRAP_EOF
   for node in "${ordered_nodes[@]}"; do
     local ip
     ip="$(get_ip "$node")"
-    echo "Updating bitecho.service and restarting on ${node} (${ip})..."
-    ssh_cmd "$node" bash -s << 'SERVICE_UNIT'
+    local target_runtime="${VALIDATOR_RUNTIME:-jvm}"
+    echo "Updating bitecho.service (runtime=${target_runtime}) and restarting on ${node} (${ip})..."
+    ssh_cmd "$node" bash -s << SERVICE_UNIT
 set -euo pipefail
-cat << 'UNIT' | sudo tee /etc/systemd/system/bitecho.service > /dev/null
+if [ -f /opt/bitecho/run-node.sh ]; then
+  chmod +x /opt/bitecho/run-node.sh
+  printf 'RUNTIME=%s\n' "${target_runtime}" > /opt/bitecho/active-runtime.env
+  EXEC_CMD="/opt/bitecho/run-node.sh /etc/bitecho/config.edn"
+else
+  EXEC_CMD="/opt/jdk-25/bin/java -Xms128m -Xmx448m -XX:MaxMetaspaceSize=112m -XX:MaxDirectMemorySize=64m -XX:+UseCompactObjectHeaders -XX:+UseG1GC --enable-native-access=ALL-UNNAMED --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED --add-exports=java.base/sun.security.x509=ALL-UNNAMED -jar /opt/bitecho/bitecho.jar run /etc/bitecho/config.edn"
+fi
+cat << UNIT | sudo tee /etc/systemd/system/bitecho.service > /dev/null
 [Unit]
 Description=Bitecho Full Node & Streamlet Validator
 After=network.target
@@ -1070,13 +1096,7 @@ User=bitecho
 LimitNOFILE=65536
 Restart=always
 RestartSec=3
-ExecStart=/opt/jdk-25/bin/java \
-  -Xms128m -Xmx448m -XX:MaxMetaspaceSize=112m -XX:MaxDirectMemorySize=64m \
-  -XX:+UseCompactObjectHeaders -XX:+UseG1GC \
-  --enable-native-access=ALL-UNNAMED \
-  --add-exports=java.base/sun.security.tools.keytool=ALL-UNNAMED \
-  --add-exports=java.base/sun.security.x509=ALL-UNNAMED \
-  -jar /opt/bitecho/bitecho.jar run /etc/bitecho/config.edn
+ExecStart=\${EXEC_CMD}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=bitecho
@@ -1201,7 +1221,7 @@ cmd_status() {
         raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_STATUS' 2>/dev/null || echo "SSH_FAILED"
 set -o pipefail
 svc=$(if systemctl is-active --quiet bitecho.service 2>/dev/null || systemctl is-active --quiet bitecho-infra.service 2>/dev/null; then echo "active"; else echo "inactive"; fi)
-cpu=$(ps -o %cpu= -C java 2>/dev/null | awk '{s+=$1} END {if (NR>0) printf "%.1f%%", s; else print "0.0%"}' || echo "N/A")
+cpu=$(ps -o %cpu= -C java,node 2>/dev/null | awk '{s+=$1} END {if (NR>0) printf "%.1f%%", s; else print "0.0%"}' || echo "N/A")
 mem=$(free -m 2>/dev/null | awk '/Mem:/ {print $3 "/" $2 "M"}' || echo "N/A")
 disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}' || echo "N/A")
 dev=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
@@ -1345,7 +1365,7 @@ statusz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/statusz 2>/dev/null || c
 burnsz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/burnsz 2>/dev/null || curl -fsSL --max-time 3 http://127.0.0.1/burnsz 2>/dev/null || true)
 accountz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/accountz 2>/dev/null || curl -fsSL --max-time 3 http://127.0.0.1/accountz 2>/dev/null || true)
 connz=$(curl -fsSL --max-time 3 http://127.0.0.1:8080/connz 2>/dev/null || curl -fsSL --max-time 3 http://127.0.0.1/connz 2>/dev/null || true)
-rss=$(ps -o rss= -C java 2>/dev/null | awk '{printf "%.1fMB", $1/1024}' || echo "N/A")
+rss=$(ps -o rss= -C java,node 2>/dev/null | awk '{s+=$1} END {if (NR>0) printf "%.1fMB", s/1024; else print "N/A"}' || echo "N/A")
 echo "METRIC_DELIM"
 echo "$statusz"
 echo "METRIC_DELIM"

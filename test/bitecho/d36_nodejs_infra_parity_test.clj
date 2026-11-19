@@ -9,7 +9,9 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.data :as data]
             [bitecho.core.infra :as core-infra]
+            [bitecho.core.mesh :as core-mesh]
             [bitecho.core.protocol.dns :as dns-proto]
+            [bitecho.core.protocol.relay :as relay]
             [bitecho.core.protocol.smtp :as smtp-proto]
             [bitecho.crypto :as crypto]
             [bitecho.fressian :as fressian]
@@ -17,7 +19,9 @@
             [bitecho.shell.http :as http-shell]
             [bitecho.shell.infra :as jvm-infra]
             [bitecho.shell.light-node :as light-node]
+            [bitecho.streamlet.core :as streamlet]
             [clojure.data.json :as json]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
@@ -211,6 +215,63 @@
                  (some #(= :diagnose (:effect %)) (:effects rcpt-res)))
             (some #(str/starts-with? % "250") (:responses rcpt-res)))
           (true? (:ok? (data/verify-pointer norm-ptr)))))))
+
+(defspec ^{:doc "Pure validator Fressian snapshot round-trip (strip -> encode -> decode -> restore), authenticated agent envelope unwrapping, and validator chain-state snapshot signing preserve 100% invariant parity."}
+  prop-validator-fressian-snapshot-and-agent-envelope-parity 50
+  (prop/for-all
+   [seed (gen/choose 1 100000)
+    epoch (gen/choose 1 500)
+    balance (gen/choose 100 10000000)
+    burn-amt (gen/choose 10 500)]
+   (let [val-kp (crypto/generate-keypair (str "d36-val-" seed))
+         val-pk (kp->pk-hex val-kp)
+         val-sk (kp->sk val-kp)
+         agent-kp (crypto/generate-keypair (str "d36-agent-" seed))
+         agent-pk (kp->pk-hex agent-kp)
+         agent-sk (kp->sk agent-kp)
+         ident {:node-id :node1
+                :pubkey-hex val-pk
+                :privkey-hex (basalt/bytes->hex val-sk)
+                :keypair {:public (:public val-kp) :private val-sk}}
+         cfg {:node/id :node1
+              :network :devnet
+              :genesis-ledger {agent-pk {:balance balance :seq 3 :deps ["dep-1"]}}
+              :cluster {:validators [val-pk]
+                        :nodes {:node1 {:pubkey val-pk :ip "127.0.0.1" :port 5000}}}}
+         st0 (-> (core-mesh/build-initial-node-state cfg ident)
+                 (assoc :epoch epoch
+                        :last-executed-finalized-epoch epoch
+                        :notarized-blocks #{"b1" "b2"}
+                        :finalized-blocks #{"b1"}
+                        :blocks {"b1" (streamlet/map->Block {:epoch epoch :parent-hash "genesis" :txs [] :proposer val-pk :signature "sig"})}
+                        :rng (crypto/make-random seed)))
+         fressian-bytes (core-mesh/encode-snapshot-bytes st0)
+         restored (core-mesh/decode-snapshot-bytes fressian-bytes)
+         rebound (core-mesh/rebind-restored-state restored cfg ident)
+         ;; Test wrap-agent-event -> Fressian wire -> unwrap-authenticated-agent-event
+         raw-ev {:type :signaling-burn :sender agent-pk :burn burn-amt}
+         wrapped (core-mesh/wrap-agent-event raw-ev agent-pk agent-sk)
+         wire-ev (fressian/encode-wire wrapped)
+         unwrapped (core-mesh/unwrap-authenticated-agent-event wire-ev)
+         ;; Test build-validator-chain-state-snapshot -> verify-chain-state-snapshot-signature
+         nonce (str "nonce-" seed)
+         snap (core-mesh/build-validator-chain-state-snapshot rebound ident agent-pk nonce)]
+     (and (= epoch (:epoch rebound))
+          (= epoch (:last-executed-finalized-epoch rebound))
+          (nil? (:node-private-key restored))
+          (some? (:node-private-key rebound))
+          (instance? bitecho.economy.account.AccountState (get-in rebound [:ledger agent-pk]))
+          (instance? bitecho.streamlet.core.Block (get-in rebound [:blocks "b1"]))
+          (set? (:notarized-blocks rebound))
+          (set? (:finalized-blocks rebound))
+          (= :signaling-burn (:type unwrapped))
+          (= agent-pk (:sender unwrapped))
+          (= burn-amt (:burn unwrapped))
+          (map? snap)
+          (= val-pk (:validator-pubkey snap))
+          (= balance (:balance snap))
+          (= epoch (:finalized-epoch snap))
+          (true? (relay/verify-chain-state-snapshot-signature snap))))))
 
 ;; =============================================================================
 ;; 2. Live Node.js Infra-Node Full Parity E2E Test
@@ -543,20 +604,200 @@
               (try (.close echo-server) (catch Exception _ nil))
               (delete-dir-recursively! tmp-dir))))))))
 
+(deftest test-nodejs-validator-run-and-embedded-infra-validator-parity-e2e
+  (testing "Live `node dist/bitecho-full-node.cjs run <config.edn>` and `infra-node` with embedded `:validator` provide full JVM validator & Fressian state continuity parity"
+    (let [bundle-file (io/file "dist/bitecho-full-node.cjs")]
+      (is (.exists bundle-file) "dist/bitecho-full-node.cjs must exist")
+      (when (.exists bundle-file)
+        (let [tmp-dir (make-temp-dir "d36-node-val-e2e-")
+              state-dir (io/file tmp-dir "val-state")
+              infra-state-dir (io/file tmp-dir "infra-state")
+              cfg-file (io/file tmp-dir "val-config.edn")
+              infra-cfg-file (io/file tmp-dir "infra-val-config.edn")
+              val-kp (crypto/generate-keypair "e2e-val-node1")
+              val-pk (kp->pk-hex val-kp)
+              val-sk (kp->sk val-kp)
+              agent-kp (crypto/generate-keypair "e2e-val-agent")
+              agent-pk (kp->pk-hex agent-kp)
+              _ (.mkdirs (io/file state-dir "identity"))
+              _ (.mkdirs (io/file state-dir "state"))
+              _ (.mkdirs (io/file infra-state-dir "identity"))
+              ;; Pre-seed a JVM-written Fressian snapshot at <state-dir>/state/snapshot-node1.edn with epoch=42
+              snap-file (io/file state-dir "state" "snapshot-node1.edn")
+              ident-map {:pubkey-hex val-pk
+                         :privkey-hex (basalt/bytes->hex val-sk)}
+              _ (spit (io/file state-dir "identity" "node-identity.edn") (pr-str ident-map))
+              _ (spit (io/file infra-state-dir "identity" "node-identity.edn") (pr-str ident-map))
+              val-cfg {:node/id :node1
+                       :network :devnet
+                       :state-dir (.getAbsolutePath state-dir)
+                       :genesis-ledger {agent-pk {:balance 777000 :seq 2 :deps ["tx-prev"]}}
+                       :protocol {:tick-interval-ms 60000}
+                       :http {:enabled? true :host "127.0.0.1" :port 0}
+                       :transport :in-memory
+                       :cluster {:listen-agents? false
+                                 :validators [val-pk]
+                                 :nodes {:node1 {:ip "127.0.0.1"
+                                                 :port 5000
+                                                 :pubkey val-pk}}}}
+              init-st (-> (core-mesh/build-initial-node-state val-cfg {:node-id :node1
+                                                                       :pubkey-hex val-pk
+                                                                       :privkey-hex (basalt/bytes->hex val-sk)
+                                                                       :keypair {:public (:public val-kp) :private val-sk}})
+                          (assoc :epoch 42
+                                 :last-executed-finalized-epoch 41
+                                 :head-hash "block-42"
+                                 :notarized-blocks #{"block-41" "block-42"}
+                                 :finalized-blocks #{"block-41"}))
+              _ (Files/write (.toPath snap-file)
+                             ^bytes (core-mesh/encode-snapshot-bytes init-st)
+                             (into-array java.nio.file.OpenOption []))
+              _ (spit cfg-file (pr-str val-cfg))
+              pb (ProcessBuilder. ^java.util.List [(node-bin-path)
+                                                   (.getAbsolutePath bundle-file)
+                                                   "run"
+                                                   (.getAbsolutePath cfg-file)])
+              proc (.start pb)
+              ;; Also start infra-node with embedded :validator
+              infra-cfg {:node/id :ns1
+                         :domain "bitecho.org"
+                         :state-dir (.getAbsolutePath infra-state-dir)
+                         :dns {:enabled? false}
+                         :smtp {:enabled? false}
+                         :http {:enabled? true :bind-ip "127.0.0.1" :http-port 0 :https-port 0 :redirect-http-to-https? false}
+                         :cluster {:enabled? false
+                                   :nodes {:ns1 {:ip4 "127.0.0.1" :pubkey val-pk}}}
+                         :validator {:node/id :ns1
+                                     :network :devnet
+                                     :state-dir (.getAbsolutePath infra-state-dir)
+                                     :genesis-ledger {agent-pk {:balance 888000 :seq 5 :deps []}}
+                                     :protocol {:tick-interval-ms 60000}
+                                     :http {:enabled? true :host "127.0.0.1" :port 0}
+                                     :transport :in-memory
+                                     :cluster {:listen-agents? false
+                                               :validators [val-pk]
+                                               :nodes {:ns1 {:ip "127.0.0.1" :port 5000 :pubkey val-pk}}}}}
+              _ (spit infra-cfg-file (pr-str infra-cfg))
+              pb-infra (ProcessBuilder. ^java.util.List [(node-bin-path)
+                                                         (.getAbsolutePath bundle-file)
+                                                         "infra-node"
+                                                         (.getAbsolutePath infra-cfg-file)])
+              proc-infra (.start pb-infra)]
+          (try
+            (let [rdr (BufferedReader. (InputStreamReader. (.getInputStream proc) StandardCharsets/UTF_8))
+                  started-line (loop [attempts 0]
+                                 (when (< attempts 100)
+                                   (if-let [l (.readLine rdr)]
+                                     (if (str/includes? l "Bitecho node started:")
+                                       l
+                                       (recur (inc attempts)))
+                                     (do (Thread/sleep 50) (recur (inc attempts))))))
+                  http-port (when started-line
+                              (some-> (re-find #"http=:(\d+)" started-line) second Long/parseLong))
+                  rdr-infra (BufferedReader. (InputStreamReader. (.getInputStream proc-infra) StandardCharsets/UTF_8))
+                  infra-ready-line (loop [attempts 0]
+                                     (when (< attempts 100)
+                                       (if-let [l (.readLine rdr-infra)]
+                                         (if (str/includes? l "infra-node-ready")
+                                           l
+                                           (recur (inc attempts)))
+                                         (do (Thread/sleep 50) (recur (inc attempts))))))
+                  infra-ready (when infra-ready-line (json/read-str infra-ready-line))
+                  infra-http-port (get infra-ready "http_port")
+                  infra-diag-port (get infra-ready "diag_port")
+                  client (trust-all-http-client)]
+              (is (some? started-line) "Standalone validator must emit Bitecho node started line")
+              (is (pos? (long (or http-port 0))))
+              (is (pos? (long (or infra-http-port 0))))
+              (is (pos? (long (or infra-diag-port 0))))
+
+              ;; 1. Verify standalone validator /healthz, /statusz (loaded from JVM Fressian snapshot!), /connz, /burnsz, /accountz
+              (let [hz (.send client
+                              (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" http-port "/healthz")))
+                                  (.GET) (.build))
+                              (HttpResponse$BodyHandlers/ofString))
+                    stz (.send client
+                               (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" http-port "/statusz")))
+                                   (.GET) (.build))
+                               (HttpResponse$BodyHandlers/ofString))
+                    parsed-stz (core-mesh/parse-statusz-line (.body stz))
+                    cz (.send client
+                              (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" http-port "/connz")))
+                                  (.GET) (.build))
+                              (HttpResponse$BodyHandlers/ofString))
+                    bz (.send client
+                              (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" http-port "/burnsz")))
+                                  (.GET) (.build))
+                              (HttpResponse$BodyHandlers/ofString))
+                    az (.send client
+                              (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" http-port "/accountz?pubkey=" agent-pk "&nonce=test-n1")))
+                                  (.GET) (.build))
+                              (HttpResponse$BodyHandlers/ofString))
+                    az-map (edn/read-string (.body az))]
+                (is (= "ok\n" (.body hz)))
+                (is (= "validator" (:role parsed-stz)))
+                (is (= 42 (:epoch parsed-stz)) "Node.js validator must restore epoch=42 from JVM Fressian snapshot")
+                (is (= 41 (:finalized_epoch parsed-stz)))
+                (is (= "block-42" (:head parsed-stz)))
+                (is (map? (edn/read-string (.body cz))))
+                (is (map? (edn/read-string (.body bz))))
+                (is (= 777000 (:spendable az-map)))
+                (is (= 2 (get-in az-map [:account :seq])))
+                (is (true? (relay/verify-chain-state-snapshot-signature (:snapshot az-map)))))
+
+              ;; 2. Verify infra-node with embedded :validator returns signed snapshot on /relay/v1/chain-state AND validator /statusz on diag_port
+              (let [cs-resp (.send client
+                                   (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" infra-http-port "/relay/v1/chain-state?pubkey=" agent-pk "&nonce=relay-n2")))
+                                       (.GET) (.build))
+                                   (HttpResponse$BodyHandlers/ofString))
+                    cs-json (json/read-str (.body cs-resp))
+                    snaps (get cs-json "snapshots" [])
+                    diag-stz (.send client
+                                    (-> (HttpRequest/newBuilder (URI/create (str "http://127.0.0.1:" infra-diag-port "/statusz")))
+                                        (.GET) (.build))
+                                    (HttpResponse$BodyHandlers/ofString))
+                    parsed-diag (core-mesh/parse-statusz-line (.body diag-stz))]
+                (is (= 200 (.statusCode cs-resp)))
+                (is (true? (get cs-json "ok")))
+                (is (= 1 (count snaps)))
+                (is (true? (relay/verify-chain-state-snapshot-signature (first snaps))))
+                (is (= 888000 (get (first snaps) "balance")))
+                (is (= "validator" (:role parsed-diag)))))
+            (finally
+              (.destroy proc)
+              (.destroy proc-infra)
+              (.waitFor proc 3 TimeUnit/SECONDS)
+              (.waitFor proc-infra 3 TimeUnit/SECONDS)
+              (.destroyForcibly proc)
+              (.destroyForcibly proc-infra)
+              (delete-dir-recursively! tmp-dir))))))))
+
 ;; =============================================================================
 ;; 3. Rule 6 Ops Script & Runtime Preflight Gate Verification
 ;; =============================================================================
 
 (deftest test-ops-run-node-preflight-and-cluster-script-parity
-  (testing "Rule 6: scripts/infra_cluster.sh and scripts/run-infra-node.sh implement fail-closed active-runtime.env + Node >= 22 preflight gate"
+  (testing "Rule 6: scripts/infra_cluster.sh, scripts/cluster.sh, scripts/run-infra-node.sh, and scripts/run-validator-node.sh implement fail-closed active-runtime.env + Node >= 22 preflight gate"
     (let [run-script (io/file "scripts/run-infra-node.sh")
-          cluster-script (io/file "scripts/infra_cluster.sh")]
+          val-run-script (io/file "scripts/run-validator-node.sh")
+          cluster-script (io/file "scripts/infra_cluster.sh")
+          val-cluster-script (io/file "scripts/cluster.sh")]
       (is (.exists run-script) "scripts/run-infra-node.sh must exist")
+      (is (.exists val-run-script) "scripts/run-validator-node.sh must exist")
       (when (.exists run-script)
         (let [content (slurp run-script)]
           (is (str/includes? content "active-runtime.env"))
           (is (str/includes? content "bitecho-full-node.cjs"))
           (is (str/includes? content "22"))))
-      (let [cluster-content (slurp cluster-script)]
+      (when (.exists val-run-script)
+        (let [content (slurp val-run-script)]
+          (is (str/includes? content "active-runtime.env"))
+          (is (str/includes? content "bitecho-full-node.cjs"))
+          (is (str/includes? content "run"))
+          (is (str/includes? content "22"))))
+      (let [cluster-content (slurp cluster-script)
+            val-cluster-content (slurp val-cluster-script)]
         (is (str/includes? cluster-content "run-node.sh"))
-        (is (str/includes? cluster-content "active-runtime.env"))))))
+        (is (str/includes? cluster-content "active-runtime.env"))
+        (is (str/includes? val-cluster-content "run-node.sh"))
+        (is (str/includes? val-cluster-content "active-runtime.env"))))))
