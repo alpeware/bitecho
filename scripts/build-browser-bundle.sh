@@ -18,19 +18,20 @@ echo "Working directory: ${ROOT_DIR}"
 
 # 1. Clean and prepare dist directory
 mkdir -p dist
-rm -rf target/cljs-browser target/cljs-browse2 target/bundle-verify
+rm -rf target/cljs-browser target/cljs-browse2 target/cljs-browser-advanced target/bundle-verify
 mkdir -p target/bundle-verify
 
-# 2. Compile bitecho.browser-main into dist/bitecho-browser.js
-echo "Compiling bitecho.browser-main via ClojureScript (:optimizations :simple)..."
+# 2. Compile bitecho.browser-main into dist/bitecho-browser.js (:optimizations :advanced)
+echo "Compiling bitecho.browser-main via ClojureScript (:optimizations :advanced)..."
 clojure -M:build-browser -e '
 (require (quote [cljs.build.api :as b]))
 (b/build (b/inputs "src")
          {:main (quote bitecho.browser-main)
           :output-to "dist/bitecho-browser.js"
           :output-dir "target/cljs-browser/out"
+          :externs ["resources/closure-externs.js"]
           :parallel-build false
-          :optimizations :simple})'
+          :optimizations :advanced})'
 
 if [ ! -f "dist/bitecho-browser.js" ]; then
   echo "ERROR: dist/bitecho-browser.js was not generated!" >&2
@@ -69,6 +70,7 @@ with open(path, 'w', encoding='utf-8') as f:
 }
 
 normalize_bundle "dist/bitecho-browser.js"
+cp dist/bitecho-browser.js dist/bitecho-browser.min.js
 
 BUNDLE_SIZE=$(wc -c < "dist/bitecho-browser.js")
 echo "Generated dist/bitecho-browser.js (${BUNDLE_SIZE} bytes)"
@@ -246,7 +248,7 @@ cat <<EOF > dist/index.html
       <p style="color: var(--text-muted); font-size: 0.85rem;">Phase 3 / Milestone 12 — Fractal Composition, Zero-Burn Subnets &amp; Domain Federation</p>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
-      <span class="badge badge-primary" id="versionBadge">v0.23.11 (BIP-007)</span>
+      <span class="badge badge-primary" id="versionBadge">v0.23.12 (BIP-008)</span>
       <span class="badge badge-success">Sans-IO Core</span>
     </div>
   </header>
@@ -1207,8 +1209,9 @@ clojure -M:build-browser -e '
          {:main (quote bitecho.browser-main)
           :output-to "target/bundle-verify/bitecho-browser.js"
           :output-dir "target/cljs-browse2/out"
+          :externs ["resources/closure-externs.js"]
           :parallel-build false
-          :optimizations :simple})'
+          :optimizations :advanced})'
 
 normalize_bundle "target/bundle-verify/bitecho-browser.js"
 
@@ -1243,30 +1246,17 @@ if [ -d "${CLJ_WEB_PUBLIC}" ]; then
   echo "Synced bundle and SRI hash to ${CLJ_WEB_PUBLIC}/app/"
 fi
 
-# 7. Compile bitecho.browser-main into dist/bitecho-browser.min.js (:optimizations :advanced) & smoke test
-echo "Compiling bitecho.browser-main via ClojureScript (:optimizations :advanced)..."
-clojure -M:build-browser -e '
-(require (quote [cljs.build.api :as b]))
-(b/build (b/inputs "src")
-         {:main (quote bitecho.browser-main)
-          :output-to "dist/bitecho-browser.min.js"
-          :output-dir "target/cljs-browser-advanced/out"
-          :externs ["resources/closure-externs.js"]
-          :parallel-build false
-          :optimizations :advanced})'
+# 7. Smoke test the :advanced bundle
+MIN_BUNDLE_SIZE=$(wc -c < "dist/bitecho-browser.js")
+echo "Verified dist/bitecho-browser.js (:advanced, ${MIN_BUNDLE_SIZE} bytes)"
 
-if [ ! -f "dist/bitecho-browser.min.js" ]; then
-  echo "ERROR: dist/bitecho-browser.min.js was not generated!" >&2
-  exit 1
-fi
-
-MIN_BUNDLE_SIZE=$(wc -c < "dist/bitecho-browser.min.js")
-echo "Generated dist/bitecho-browser.min.js (${MIN_BUNDLE_SIZE} bytes)"
-
-echo "Running Node.js smoke assertions on :advanced bundle..."
+echo "Running Node.js + pure-Browser (no node:crypto) smoke assertions on :advanced bundle..."
 node -e "
+const _nodeFs = require('fs');
 globalThis.window = globalThis;
-require('./dist/bitecho-browser.min.js');
+// Delete require so the bundle executes the pure-browser WebCrypto / RFC 8032 Ed25519 path!
+delete globalThis.require;
+(1, eval)(_nodeFs.readFileSync('./dist/bitecho-browser.js', 'utf8'));
 
 async function test() {
   const B = globalThis.BitechoBrowser;
@@ -1281,7 +1271,11 @@ async function test() {
 
   const node = B.initNode();
   if (!node) throw new Error('initNode returned null');
-  console.log('initNode successful');
+  console.log('initNode successful (pure browser Ed25519 keygen)');
+
+  const dash = B.initAnchor();
+  if (!dash || (!dash.identity && !dash["anchor-pubkey"])) throw new Error('initAnchor failed: ' + JSON.stringify(dash));
+  console.log('initAnchor successful');
 
   const st = B.getStatus();
   if (!st || !st.pubkey) throw new Error('getStatus failed: ' + JSON.stringify(st));
@@ -1293,7 +1287,7 @@ async function test() {
 
   const putRes = await B.execCommand('storage-put --subnet nexus --slot note --data minified-payload --seq 1');
   if (!putRes || !putRes.ok) throw new Error('execCommand storage-put failed: ' + JSON.stringify(putRes));
-  console.log('execCommand storage-put verified');
+  console.log('execCommand storage-put verified (pure browser Ed25519 sign + verify)');
 
   const getRes = await B.ctl('storage-get --subnet nexus --slot note --min-seq 1');
   if (!getRes || !getRes.ok || getRes.data !== 'minified-payload') {
@@ -1309,7 +1303,7 @@ async function test() {
   if (!stopRes || !stopRes.ok) throw new Error('stopNode failed');
   console.log('stopNode verified');
 
-  console.log('ALL NODE.JS SMOKE ASSERTIONS PASSED ON :advanced BUNDLE!');
+  console.log('ALL PURE-BROWSER SMOKE ASSERTIONS PASSED ON :advanced BUNDLE!');
 }
 
 test().catch(err => {

@@ -138,15 +138,19 @@
 ;; 2. ACME v2 HTTP Client & Issuance Orchestrator (with Gap G7 Tombstone)
 ;; =============================================================================
 
+(def ^:private shared-acme-http-client-delay
+  (delay
+    (-> (HttpClient/newBuilder)
+        (.version HttpClient$Version/HTTP_1_1)
+        (.followRedirects HttpClient$Redirect/NORMAL)
+        (.connectTimeout (Duration/ofSeconds 15))
+        (.build))))
+
 (defn create-http-client
-  "Creates standard JDK 25 `HttpClient` for ACME directory/order requests."
-  ([] (create-http-client 15))
-  ([^long timeout-seconds]
-   (-> (HttpClient/newBuilder)
-       (.version HttpClient$Version/HTTP_1_1)
-       (.followRedirects HttpClient$Redirect/NORMAL)
-       (.connectTimeout (Duration/ofSeconds timeout-seconds))
-       (.build))))
+  "Returns the shared process-wide JDK 25 `HttpClient` for ACME directory/order requests (`P-SOAK-1` / `BUG-SOAK-01`)."
+  (^HttpClient [] (create-http-client 15))
+  (^HttpClient [^long _timeout-seconds]
+   @shared-acme-http-client-delay))
 
 (defn- fetch-directory
   [^HttpClient client ^String directory-url]

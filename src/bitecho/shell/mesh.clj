@@ -548,8 +548,11 @@
                                                 pk-bytes)))
          overrides (extract-top-level-overrides cfg cluster-cfg)
          explicit-network (or (:network cfg) (get-in cfg [:cluster :network]))
+         configured-validator-count (max (count nodes-cfg) (count validators))
          base-proto-cfg (case explicit-network
-                          :devnet config/devnet-config
+                          :devnet (if (>= configured-validator-count 6)
+                                    (config/devnet-6-config)
+                                    config/devnet-config)
                           :testnet config/testnet-config
                           :mainnet config/mainnet-config
                           config/default-config)
@@ -664,7 +667,18 @@
                                    (filterv #(not (contains? exec-receipt-ids (:receipt-id %)))
                                             (:pending-receipts loaded-state))
                                    (or (:pending-receipts loaded-state) []))
-        merged-config (cond-> (merge (or (:config loaded-state) {})
+        explicit-network (or (:network config) (get-in config [:cluster :network]))
+        configured-validator-count (max (count nodes-cfg) (count effective-validators))
+        upgrade-devnet-6? (and (= explicit-network :devnet)
+                               (>= configured-validator-count 6)
+                               (= 2 (:echo-sample-size (:config loaded-state))))
+        base-loaded-config (cond-> (or (:config loaded-state) {})
+                             upgrade-devnet-6?
+                             (merge (select-keys (config/devnet-6-config)
+                                                 [:murmur-k :echo-sample-size :echo-threshold
+                                                  :ready-sample-size :ready-threshold
+                                                  :delivery-sample-size :delivery-threshold])))
+        merged-config (cond-> (merge base-loaded-config
                                      (get config :protocol {})
                                      (get cluster-cfg :protocol {})
                                      overrides)
@@ -717,6 +731,39 @@
       (format "Peer %s missing or invalid :ice-pwd" pid)
 
       :else nil)))
+
+(defn validate-contagion-config
+  "Validates Contagion sample sizes and thresholds against the configured validator count (`P-CONTAG-3`).
+   Checks whether raw `:delivery-threshold` exceeds `N - 1` (active peer view excluding self)
+   and verifies that `(sm/effective-sample-threshold D D-hat (max 0 (dec N)))` clamps safely to `<= N - 1`.
+   Returns `{:valid? true :clamped? <bool> :validator-count N :active-peer-count V :configured-delivery-threshold D-hat :effective-delivery-threshold eff-D :diagnostics [...]}`."
+  ([proto-cfg]
+   (validate-contagion-config proto-cfg (or (:validators proto-cfg) (:nodes proto-cfg) [])))
+  ([proto-cfg validators-or-count]
+   (let [n (long (cond
+                   (number? validators-or-count) validators-or-count
+                   (coll? validators-or-count) (count validators-or-count)
+                   :else (or (:validator-count proto-cfg) 0)))
+         v (max 0 (dec n))
+         d-size (long (or (:delivery-sample-size proto-cfg) 10))
+         d-hat (long (or (:delivery-threshold proto-cfg) 8))
+         eff-d (sm/effective-sample-threshold d-size d-hat v)
+         clamped? (and (pos? v) (> d-hat v))
+         diags (if clamped?
+                 [{:effect :diagnose
+                   :reason :contagion-threshold-clamped-to-active-view
+                   :validator-count n
+                   :active-peer-count v
+                   :configured-delivery-threshold d-hat
+                   :effective-delivery-threshold eff-d}]
+                 [])]
+     {:valid? (or (zero? v) (<= eff-d v))
+      :clamped? clamped?
+      :validator-count n
+      :active-peer-count v
+      :configured-delivery-threshold d-hat
+      :effective-delivery-threshold eff-d
+      :diagnostics diags})))
 
 (defn validate-node-config
   "Validates a Bitecho node configuration map fail-closed:

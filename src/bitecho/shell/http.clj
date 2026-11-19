@@ -749,11 +749,16 @@
 
       :else
       (let [ae (first (get (:request/headers req) :header/accept-encoding))
-            want-gz? (and tier1?
+            max-gz-bytes (long (get-in config [:http :gzip-max-file-bytes] 16777216))
+            want-gz? (and (<= total-size max-gz-bytes)
                           ae
                           (str/includes? (str/lower-case ae) "gzip")
                           (compressible-content-type? ct))
-            gz-bs (when want-gz? (gzip-bytes raw-bs))]
+            src-bs (when want-gz?
+                     (or raw-bs
+                         (when (and disk-file (.exists disk-file))
+                           (Files/readAllBytes (.toPath disk-file)))))
+            gz-bs (when src-bs (gzip-bytes src-bs))]
         (if (and gz-bs (< (alength gz-bs) total-size))
           {:response/status 200
            :response/headers (merge auth-hdrs
@@ -1200,6 +1205,16 @@
               {:ok? false :error :unauthorized-replication})
             {:ok? false :error :unauthorized-replication}))))))
 
+(defn default-http-client
+  "Returns the shared process-wide JDK 25 `HttpClient` instance (`P-SOAK-1` / `BUG-SOAK-01`)."
+  ^HttpClient []
+  (light-node/default-http-client))
+
+(defn default-http11-client
+  "Returns the shared process-wide HTTP/1.1 `HttpClient` instance (`P-SOAK-1` / `BUG-SOAK-01`)."
+  ^HttpClient []
+  (light-node/default-http11-client))
+
 (defn- replicate-relay-request!
   "Replicates a raw relay request body in parallel across all cluster nodes (excluding self)."
   [config endpoint ^bytes body-bytes]
@@ -1209,9 +1224,7 @@
       (let [secret-bytes (resolve-relay-shared-secret config)
             auth-hmac (when (and secret-bytes (pos? (alength ^bytes secret-bytes)))
                         (compute-relay-auth-hmac secret-bytes endpoint body-bytes))
-            client (.. (HttpClient/newBuilder)
-                       (connectTimeout (Duration/ofMillis 1500))
-                       build)
+            client (default-http-client)
             eligible-peers (for [[nid pinfo] peers
                                  :let [ip (or (:ip4 pinfo) (:ip pinfo) (:host pinfo))
                                        port (or (:http-port pinfo)

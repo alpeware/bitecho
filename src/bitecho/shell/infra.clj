@@ -29,7 +29,7 @@
             [datachannel.api :as api])
   (:import [java.io File]
            [java.net URI]
-           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
+           [java.net.http HttpRequest HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
            [java.nio.file CopyOption Files OpenOption StandardCopyOption]
            [java.security SecureRandom]
@@ -257,6 +257,10 @@
   "Tier-1 Lumen Researcher Key (K_lumen) for web/SKILL.md, docs, and blog/* streams (BIP-004 §B.2)."
   "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de")
 
+(def k-vector-agent-pubkey
+  "Tier-1 Vector Agent Key (K_vector) for web/*, blog/*, bip/*, and bitecho.org/dev governance streams (BIP-008 P-SOAK-3 / BUG-SOAK-03)."
+  "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62")
+
 (def K_cold
   "Alias for `k-cold-root-pubkey` (BIP-004 §B.2)."
   k-cold-root-pubkey)
@@ -272,6 +276,18 @@
 (def K_lumen
   "Alias for `k-lumen-researcher-pubkey` (BIP-004 §B.2)."
   k-lumen-researcher-pubkey)
+
+(def K_vector
+  "Alias for `k-vector-agent-pubkey` (BIP-008 P-SOAK-3 / BUG-SOAK-03)."
+  k-vector-agent-pubkey)
+
+(def default-dev-signers
+  "Canonical set of core agent & root keys authorized for `bitecho.org/dev` and `bitecho.org/infra` docs/blog/BIP streams (`P-SOAK-3`)."
+  #{(str/lower-case (str/trim K_cold))
+    (str/lower-case (str/trim K_nexus))
+    (str/lower-case (str/trim K_axiom))
+    (str/lower-case (str/trim K_lumen))
+    (str/lower-case (str/trim K_vector))})
 
 (defn default-infra-policy
   "Constructs the canonical `\"bitecho.org/infra\"` Subnet policy map (UNIFICATION.md §6 Instance #3,
@@ -289,11 +305,12 @@
         k-nexus (str/lower-case (str/trim k-nexus-builder-pubkey))
         k-axiom (str/lower-case (str/trim k-axiom-steward-pubkey))
         k-lumen (str/lower-case (str/trim k-lumen-researcher-pubkey))
+        k-vector (str/lower-case (str/trim k-vector-agent-pubkey))
         cold-set (cond-> #{k-cold} cold-pk (conj cold-pk))
         dist-signers (into cold-set [k-nexus])
         releases-signers (into anchors dist-signers)
         pkg-signers (into dist-signers [k-axiom])
-        doc-blog-signers (into anchors (into pkg-signers [k-lumen]))
+        doc-blog-signers (into anchors (into pkg-signers [k-lumen k-vector]))
         thresh (long (or threshold (max 1 (min 2 (count anchors)))))
         gov (cond-> {:governance/type (if cold-pk :cold-key-or-quorum :quorum)
                      :threshold thresh}
@@ -324,6 +341,7 @@
                                         {:pattern "blog/*"           :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "web/bip/*"        :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "bip/*"            :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "web/app/*"        :principal {:type :allowlist :signers releases-signers}}
                                         {:pattern "web/*"            :principal {:type :allowlist}}
                                         {:pattern "bootstrap"        :principal {:type :allowlist}}
                                         {:pattern "dir/*"            :principal {:type :allowlist}}
@@ -465,9 +483,7 @@
         acc-port (:accountz-port node)]
     (or (when (and ip http-port target-pubkey)
           (try
-            (let [client (-> (HttpClient/newBuilder)
-                             (.connectTimeout (Duration/ofMillis 1200))
-                             (.build))
+            (let [client (light-node/default-http-client)
                   url (str "http://" ip ":" http-port "/relay/v1/chain-state?pubkey="
                            (java.net.URLEncoder/encode (str target-pubkey) StandardCharsets/UTF_8)
                            "&nonce=" (java.net.URLEncoder/encode (str (or nonce "")) StandardCharsets/UTF_8)
@@ -484,9 +500,7 @@
             (catch Exception _ nil)))
         (when (and ip acc-port target-pubkey)
           (try
-            (let [client (-> (HttpClient/newBuilder)
-                             (.connectTimeout (Duration/ofMillis 1000))
-                             (.build))
+            (let [client (light-node/default-http-client)
                   url (str "http://" ip ":" acc-port "/accountz?pubkey="
                            (java.net.URLEncoder/encode (str target-pubkey) StandardCharsets/UTF_8)
                            "&nonce=" (java.net.URLEncoder/encode (str (or nonce "")) StandardCharsets/UTF_8))
@@ -1472,7 +1486,7 @@
          auth-pub (:default-sender rt)
          auth-priv (:node-privkey rt)
          tls-secret (or (resolve-tls-secret opts) (:tls-secret rt))
-         max-asset-bytes (long (or (:max-asset-bytes opts) (* 2 1024 1024)))
+         max-asset-bytes (long (or (:max-asset-bytes opts) (* 8 1024 1024)))
          now-ms (System/currentTimeMillis)
          sid (:subnet-id @(:subnet-atom rt))
          tls-migrated? (atom false)

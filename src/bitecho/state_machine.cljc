@@ -605,6 +605,32 @@
       cand
       "genesis")))
 
+(defn effective-sample-threshold
+  "Clamps a configured sample threshold `configured-threshold` (for `configured-sample-size`)
+   to the active sample/view size `active-sample-count` (`|active-sample|`):
+   - When `active-sample-count >= configured-sample-size` (or `configured-sample-size <= 0`),
+     returns `(max 1 (long configured-threshold))`.
+   - When `1 <= active-sample-count < configured-sample-size`, returns
+     `(max 1 (min (long active-sample-count)
+                  (long (Math/ceil (* (/ (double configured-threshold) (double configured-sample-size))
+                                      (double active-sample-count))))))`.
+   - When `active-sample-count <= 0`, returns `(max 1 (long configured-threshold))`."
+  [configured-sample-size configured-threshold active-sample-count]
+  (let [s (long (or configured-sample-size 1))
+        t (max 1 (long (or configured-threshold 1)))
+        v (long (or active-sample-count 0))]
+    (cond
+      (or (<= s 0) (>= v s))
+      t
+
+      (<= v 0)
+      t
+
+      :else
+      (let [scaled #?(:clj (long (Math/ceil (* (/ (double t) (double s)) (double v))))
+                      :cljs (long (js/Math.ceil (* (/ (double t) (double s)) (double v)))))]
+        (max 1 (min v scaled))))))
+
 (defn- sample-peer-roles
   "Selects background peer samples for echo, ready, and delivery roles deterministically,
    returning updated sets and subscribe commands."
@@ -1056,7 +1082,20 @@
                        {:type :send-push-view
                         :targets push-targets
                         :view extracted-peers})
-        summary (contagion/generate-summary rng extracted-peers (:contagion-known-ids state))
+        summary-window (long (or (:contagion-summary-window-epochs cfg)
+                                 (:gossip-ttl-epochs cfg)
+                                 16))
+        summary-cutoff (- new-epoch summary-window)
+        msg-epochs (:message-epochs state)
+        trailing-known-ids (if (seq msg-epochs)
+                             (into #{}
+                                   (filter (fn [mid]
+                                             (let [ep (get msg-epochs mid)]
+                                               (or (nil? ep)
+                                                   (>= (long ep) summary-cutoff))))
+                                           (:contagion-known-ids state)))
+                             (:contagion-known-ids state))
+        summary (contagion/generate-summary rng extracted-peers trailing-known-ids)
         summary-command (when summary
                           {:type :send-summary
                            :target (:target summary)
@@ -1542,10 +1581,12 @@
         valid-frame? (sieve/validate-control-frame event :sieve-echo require-signed?)]
     (if-not valid-frame?
       {:state state :commands []}
-      (let [E-hat (:echo-threshold cfg)
+      (let [echo-sample (:global-echo-sample state)
+            E-hat (effective-sample-threshold (:echo-sample-size cfg 10)
+                                              (:echo-threshold cfg 7)
+                                              (count echo-sample))
             sender (:sender event)
             message-id (:message-id event)
-            echo-sample (:global-echo-sample state)
             received-echoes (get (:received-echoes state) message-id #{})
             sieve-delivered-set (:sieve-delivered-set state)]
         (if (and (contains? echo-sample sender)
@@ -2384,12 +2425,16 @@
         valid-frame? (sieve/validate-control-frame event :contagion-ready require-signed?)]
     (if-not valid-frame?
       {:state state :commands []}
-      (let [R-hat (:ready-threshold cfg)
-            D-hat (:delivery-threshold cfg)
+      (let [ready-sample (:global-ready-sample state)
+            delivery-sample (:global-delivery-sample state)
+            R-hat (effective-sample-threshold (:ready-sample-size cfg 10)
+                                              (:ready-threshold cfg 3)
+                                              (count ready-sample))
+            D-hat (effective-sample-threshold (:delivery-sample-size cfg 10)
+                                              (:delivery-threshold cfg 8)
+                                              (count delivery-sample))
             sender (:sender event)
             message-id (:message-id event)
-            ready-sample (:global-ready-sample state)
-            delivery-sample (:global-delivery-sample state)
             received-readies (get (:received-readies state) message-id #{})
             in-ready? (contains? ready-sample sender)
             in-delivery? (contains? delivery-sample sender)]

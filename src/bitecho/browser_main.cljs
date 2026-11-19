@@ -33,16 +33,20 @@
   "Default bootstrap devnet validator nodes for browser WebRTC connection."
   {:node1 {:node-id "node1" :ip "35.212.129.138" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node1.ingress.bitecho.org" :ingress-port 443 :pubkey "302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086" :fingerprint "95:09:40:3B:04:A0:B3:F5:88:26:51:CE:C9:A9:8E:0C:A1:15:92:8F:D5:7D:4A:11:A2:6C:3C:B0:0B:AB:0C:3B" :ice-ufrag "1ec0ae74" :ice-pwd "d928f1aac56a0d6e6fdda551"}
    :node2 {:node-id "node2" :ip "35.206.120.143" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node2.ingress.bitecho.org" :ingress-port 443 :pubkey "302a300506032b6570032100592ab794dea07da278ef3853e8cc2d2f6ac5e3417eac80d93ab01e1fc61653ba" :fingerprint "F8:73:94:91:1D:7B:CA:66:D9:67:9E:4B:72:B0:D0:8D:5F:5C:37:0F:FE:04:2E:ED:86:E6:8D:79:B8:07:43:78" :ice-ufrag "18388497" :ice-pwd "20540a60217702b8869d7bf5"}
-   :node3 {:node-id "node3" :ip "35.211.71.139" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "302a300506032b65700321007b7f58652a2c26b4180aeee45ff12f927a45d92e00fc3462c5d854f6203351f1" :fingerprint "38:2B:18:4B:23:E8:F4:32:D7:08:5A:2A:A4:45:4F:EE:12:D4:51:B1:9B:2D:66:7C:2E:E1:2A:3E:7C:B3:60:40" :ice-ufrag "4b1d8fc5" :ice-pwd "47e794a9ed5ef04cc0ebbe7f"}})
+   :node3 {:node-id "node3" :ip "35.211.71.139" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "node3.ingress.bitecho.org" :ingress-port 443 :pubkey "302a300506032b65700321007b7f58652a2c26b4180aeee45ff12f927a45d92e00fc3462c5d854f6203351f1" :fingerprint "38:2B:18:4B:23:E8:F4:32:D7:08:5A:2A:A4:45:4F:EE:12:D4:51:B1:9B:2D:66:7C:2E:E1:2A:3E:7C:B3:60:40" :ice-ufrag "4b1d8fc5" :ice-pwd "47e794a9ed5ef04cc0ebbe7f"}
+   :ns1 {:node-id "ns1" :ip "35.212.172.159" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns1.bitecho.org" :ingress-port 443 :pubkey "302a300506032b6570032100cd5be4b2c2f08ac78178db2e8f7d57ea3e01b09373a18a15c17f64294033ce3a" :fingerprint "3E:28:4A:2F:34:F4:4F:F2:18:3A:23:3C:9B:31:87:84:2C:C3:67:AF:B6:97:6A:32:1F:A5:0C:8B:96:EA:41:3B" :ice-ufrag "a1e0a80d" :ice-pwd "e9580acf2174e43d4d3535a6"}
+   :ns2 {:node-id "ns2" :ip "35.209.253.119" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns2.bitecho.org" :ingress-port 443 :pubkey "302a300506032b6570032100e4e5921c1b4bd6444da44493d2e63fcb916b91dad7ad32f10e92d850c8ba501c" :fingerprint "BC:4A:35:74:3F:36:D1:7A:6F:84:23:E4:6E:82:7E:19:C2:88:4D:38:A1:A5:58:8E:F6:57:1D:D9:C8:1C:2B:63" :ice-ufrag "eb999287" :ice-pwd "0b041a7ac128edba260627d0"}
+   :ns3 {:node-id "ns3" :ip "35.211.30.106" :port 5000 :agent-port 5010 :agent-tcp-port 5010 :ingress-host "ns3.bitecho.org" :ingress-port 443 :pubkey "302a300506032b6570032100c9cee982d272e9761035aea742378daebf06e20bf1edead46254c8c8b0c90013" :fingerprint "08:7D:65:5E:C1:4E:43:B8:6A:B8:2B:61:36:DE:55:24:C6:23:0F:37:F1:CB:54:51:CD:E2:CC:58:92:39:E6:D2" :ice-ufrag "10b7e089" :ice-pwd "095767ea310990ef2c76e691"}})
 
 (def default-bootstrap-descriptor
   "Signed devnet bootstrap descriptor verified against default-authority-pubkey."
   {:network :devnet
+   :network-uri "devnet.bitecho.org"
    :domain "bitecho.org"
    :authority-pubkey default-authority-pubkey
    :issued-epoch 0
    :expires-epoch 1000000000
-   :signature "fb6cbfaf65fde5e05eacda10b88dbb1bb0d5e3c955b7941e71b201769f1c25acd3df6fa5130a7316cf89260549de9888b3f35d352dbde62098820232a4b2f701"
+   :signature "0c7a1caa76a6def0a39b81d3dd7996aec71a06aa258364a04ef328ff5621eff67704d1e4a5daa7fee02d0646ea6f7171e2e6fdbbb5ebfb70d735a1a1ce1b7a0c"
    :treasury-pubkey "302a300506032b65700321007c2b695b77904a19a630b75ce53889a53963c0f85aa69e5276bb988a183b91b8"
    :custody-pubkey "302a300506032b6570032100e476d77ef34962d09baee0062b4c03be832a1ccc2d691623a8cb39e356793f2b"
    :directory-pubkey default-authority-pubkey
@@ -55,7 +59,7 @@
 
 (defonce ^:private ui-listeners-atom (atom []))
 
-(declare get-status)
+(declare get-status fetch-relay-chain-state!)
 
 (defn- notify-ui-listeners! []
   (when-let [na @active-node-atom]
@@ -175,6 +179,7 @@
                                (update-in [:light-state :sessions] prune-ghost-sessions)
                                (update :chat-history #(vec (or % [])))
                                (update-in [:light-state :inbox] #(vec (or % [])))
+                               (assoc-in [:light-state :bootstrap] default-bootstrap-descriptor)
                                (assoc-in [:light-state :max-epoch-skew]
                                          (or (get-in loaded [:light-state :max-epoch-skew]) 15)))]
           (swap! node-atom
@@ -599,8 +604,22 @@
            light-st (:light-state node)
            channels (:active-channels node)
            open-channels (into [] (keep (fn [[k dc]]
-                                          (when (and dc (= (.-readyState dc) "open")) (name k)))
+                                          (when (and dc (= (.-readyState dc) "open"))
+                                            (if (or (keyword? k) (symbol? k)) (name k) (str k))))
                                         channels))
+           tr-val (:transport conn)
+           tr-str (cond
+                    (:relay-url node) "http-relay"
+                    (or (keyword? tr-val) (symbol? tr-val) (string? tr-val)) (name tr-val)
+                    :else "webrtc")
+           phase-val (:phase conn)
+           phase-str (if (or (keyword? phase-val) (symbol? phase-val) (string? phase-val))
+                       (name phase-val)
+                       "idle")
+           diag-phase-val (:phase diag)
+           diag-phase-str (if (or (keyword? diag-phase-val) (symbol? diag-phase-val) (string? diag-phase-val))
+                            (name diag-phase-val)
+                            "idle")
            pubkey-hex (or (get-in light-st [:pubkey])
                           (when-let [kp (:keypair node)]
                             (when (:public-key kp)
@@ -613,8 +632,8 @@
                  :epoch (or (:epoch light-st) 0)
                  :balance (or (get-in light-st [:account :balance]) (:balance light-st) 0)
                  :spendable (or (get-in light-st [:account :spendable]) (:spendable light-st) 0)
-                 :transport (if (:relay-url node) "http-relay" (name (or (:transport conn) :webrtc)))
-                 :phase (name (or (:phase conn) :idle))
+                 :transport tr-str
+                 :phase phase-str
                  :generation (or (:generation conn) 0)
                  :visibilityState (or (:visibility-state conn) "visible")
                  :burnedEch (or (:burned-ech node) 0)
@@ -625,7 +644,7 @@
                  :broadcastInbox (redact-for-js (or (:broadcast-inbox light-st) []))
                  :chatHistory (or (:chat-history node) [])
                  :petnames (or (:petnames node) default-petnames)
-                 :diagnostics {:phase (name (or (:phase diag) :idle))
+                 :diagnostics {:phase diag-phase-str
                                :generation (or (:generation diag) 0)
                                :lastError (:last-error diag)
                                :dropped (or (:dropped diag) 0)
@@ -870,12 +889,21 @@
   ;; Register home set with devnet nodes when signing key is unlocked
   (when-let [privkey (:private-key (:keypair @node-atom))]
     (let [reg-res (light-core/handle-command (:light-state @node-atom)
-                                             {"cmd" "register-home-set" "price" 10 "nodes" ["node1" "node2" "node3"]}
+                                             {"cmd" "register-home-set" "price" 10 "nodes" ["node1" "node2" "node3" "ns1" "ns2" "ns3"]}
                                              privkey)]
       (swap! node-atom assoc :light-state (:state reg-res))
       (doseq [env (:net-envelopes reg-res)]
         (try (.send dc (fressian/encode-wire env)) (catch :default _ nil)))))
-  ;; Query chain state from validator so 2-of-3 BFT quorum syncs epoch and account
+  ;; Fast-path 4-of-6 HTTPS relay chain-state quorum sync (BIP-007)
+  (when (= nid "node1")
+    (try
+      (fetch-relay-chain-state! (or (when (and (exists? js/window) (.-location js/window) (.-origin (.-location js/window)))
+                                      (let [o (str (.-origin (.-location js/window)))]
+                                        (if (str/starts-with? o "http") o "https://ns1.bitecho.org")))
+                                    "https://ns1.bitecho.org")
+                                {:node-atom node-atom})
+      (catch :default _ nil)))
+  ;; Query chain state from validator so 4-of-6 BFT quorum syncs epoch and account
   (send-chain-state-query! node-atom dc)
   ;; Keepalive + epoch/balance sync every 5s (clear any previous interval for nid first)
   (when-let [old-timer (get @keepalive-timers-atom nid)]
@@ -900,6 +928,13 @@
      (clj->js {:ok false :error "untrusted-bootstrap-descriptor"})
      (let [node-atom (or @active-node-atom (init-node nil))
            _opts-map (when opts (if (map? opts) opts (js->clj opts :keywordize-keys true)))
+           _ (try
+               (fetch-relay-chain-state! (or (when (and (exists? js/window) (.-location js/window) (.-origin (.-location js/window)))
+                                               (let [o (str (.-origin (.-location js/window)))]
+                                                 (if (str/starts-with? o "http") o "https://ns1.bitecho.org")))
+                                             "https://ns1.bitecho.org")
+                                         {:node-atom node-atom})
+               (catch :default _ nil))
            _ (doseq [[_nid tid] @keepalive-timers-atom]
                (try (js/clearInterval tid) (catch :default _ nil)))
            _ (reset! keepalive-timers-atom {})
@@ -921,8 +956,8 @@
                     (on-validator-channel-open! node-atom "node1" (:channel open-info) conn-atom))
          :on-deliver-message (fn [env]
                                (handle-inbound-wire-envelope! node-atom env))})
-       ;; Auxiliary DataChannels to node2 and node3
-       (doseq [[nid ncfg] (select-keys default-bootstrap-nodes [:node2 :node3])]
+       ;; Auxiliary DataChannels to node2..ns3 for 4-of-6 BFT quorum
+       (doseq [[nid ncfg] (select-keys default-bootstrap-nodes [:node2 :node3 :ns1 :ns2 :ns3])]
          (let [nid-str (name nid)
                aux-sdp (browser/format-validator-sdp-answer ncfg)
                aux-conn-atom (atom (browser/initial-conn-state {:peer-id nid-str}))]
@@ -1850,9 +1885,12 @@
                                             :min-finalized-epoch (long (or (:min-finalized-epoch opts) 0))}
                                q-res (light-core/verify-chain-state-quorum signed-snaps verify-opts)]
                            (if (:ok? q-res)
-                             (do
+                             (let [snap (:snapshot q-res)
+                                   fin-ep (long (or (:finalized-epoch snap) 0))]
                                (swap! node-atom update :light-state
-                                      (fn [st] (light-core/apply-verified-chain-state-snapshot st (:snapshot q-res))))
+                                      (fn [st]
+                                        (-> (light-core/apply-verified-chain-state-snapshot st snap)
+                                            (assoc :epoch fin-ep :epoch-initialized? true))))
                                (notify-ui-listeners!)
                                (resolve (assoc resp :ok true :quorum-verified true :quorum-result q-res)))
                              (resolve {:ok false :error (:error q-res)})))
@@ -2165,7 +2203,7 @@
        "pollRelayEnvelopes" poll-relay-envelopes!
        "ackRelayEnvelopes" ack-relay-envelopes!
        "fetchRelayChainState" fetch-relay-chain-state!
-       "version" "0.23.11"})
+       "version" "0.23.12"})
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api))

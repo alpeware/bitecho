@@ -19,7 +19,7 @@
 
 (def version
   "Current protocol and release milestone version."
-  "0.23.11")
+  "0.23.12")
 
 (def infra-cold-root-pubkey
   "Pinned Cold Offline Infra Root Ed25519 public key (HEX) for on-network artifact attestation."
@@ -83,7 +83,9 @@
    (let [a (str (or s1 "global"))
          b (str (or s2 "global"))
          net-uri (str (or (resolve-network-uri active-network-uri) "devnet.bitecho.org"))
-         active-roots #{"global" net-uri}]
+         active-roots (cond-> #{"global" net-uri}
+                        (contains? #{"devnet.bitecho.org" "bitecho.org"} net-uri)
+                        (into ["devnet.bitecho.org" "bitecho.org"]))]
      (or (= a "*")
          (= b "*")
          (= a b)
@@ -115,6 +117,8 @@
    :basalt-max-view-size  20
    ;; Epochs before a gossip message expires from all caches
    :gossip-ttl-epochs     10
+   ;; Trailing epoch window for Contagion anti-entropy summaries (P-CONTAG-4)
+   :contagion-summary-window-epochs 16
    ;; Epochs before a frozen log message snapshot is evicted (7 days of 1-hour epochs)
    :frozen-log-retention-epochs 168
 

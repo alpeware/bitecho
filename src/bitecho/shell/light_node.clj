@@ -21,9 +21,9 @@
   (:import [com.sun.net.httpserver HttpHandler HttpServer]
            [java.io BufferedReader InputStreamReader PrintWriter RandomAccessFile]
            [java.lang ProcessHandle ProcessBuilder ProcessBuilder$Redirect]
-           [java.net InetSocketAddress URI]
-           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
-           [java.nio.channels FileChannel]
+           [java.net InetSocketAddress StandardSocketOptions URI]
+           [java.net.http HttpClient HttpClient$Redirect HttpClient$Version HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
+           [java.nio.channels DatagramChannel FileChannel]
            [java.nio.charset StandardCharsets]
            [java.nio.file Files StandardCopyOption StandardOpenOption]
            [java.nio.file.attribute PosixFilePermissions]
@@ -31,6 +31,76 @@
            [java.util.concurrent Executors ThreadFactory]))
 
 (declare dial-p2p-peer! send-routed-envelopes!)
+
+;; -----------------------------------------------------------------------------
+;; Shared Process-Wide HTTP Client & UDP Socket Buffer Helpers (P-SOAK-1, P-SOAK-4)
+;; -----------------------------------------------------------------------------
+
+(def ^:private shared-http-executor
+  (delay
+    (Executors/newCachedThreadPool
+     (reify ThreadFactory
+       (newThread [_ r]
+         (doto (Thread. ^Runnable r)
+           (.setName "bitecho-shared-http-client")
+           (.setDaemon true)))))))
+
+(def ^:private shared-http-client
+  (delay
+    (-> (HttpClient/newBuilder)
+        (.connectTimeout (Duration/ofMillis 5000))
+        (.followRedirects HttpClient$Redirect/NORMAL)
+        (.executor @shared-http-executor)
+        (.build))))
+
+(def ^:private shared-http11-client
+  (delay
+    (-> (HttpClient/newBuilder)
+        (.version HttpClient$Version/HTTP_1_1)
+        (.connectTimeout (Duration/ofMillis 5000))
+        (.followRedirects HttpClient$Redirect/NORMAL)
+        (.executor @shared-http-executor)
+        (.build))))
+
+(defn default-http-client
+  "Returns the process-wide shared `java.net.http.HttpClient` instance (`BUG-SOAK-01`)."
+  ^HttpClient []
+  @shared-http-client)
+
+(defn default-http11-client
+  "Returns the process-wide shared HTTP/1.1 `java.net.http.HttpClient` instance (`BUG-SOAK-01`)."
+  ^HttpClient []
+  @shared-http11-client)
+
+(def default-udp-rcvbuf-bytes
+  "Default 4 MB UDP socket receive buffer size (`DIAG-SOAK-03`)."
+  4194304)
+
+(defn configure-udp-receive-buffer!
+  "Configures `SO_RCVBUF` on a `DatagramChannel`, `DatagramSocket`, or `clj-datachannel` node map
+   to `buf-bytes` (default 4 MB / `4194304` bytes, `DIAG-SOAK-03`). Never throws."
+  ([target]
+   (configure-udp-receive-buffer! target default-udp-rcvbuf-bytes))
+  ([target ^long buf-bytes]
+   (let [sz (int (max 65536 buf-bytes))]
+     (try
+       (cond
+         (instance? DatagramChannel target)
+         (do (.setOption ^DatagramChannel target StandardSocketOptions/SO_RCVBUF (Integer/valueOf sz))
+             true)
+
+         (instance? java.net.DatagramSocket target)
+         (do (.setReceiveBufferSize ^java.net.DatagramSocket target sz)
+             true)
+
+         (and (map? target) (instance? clojure.lang.IDeref (:channel target)) @(:channel target))
+         (configure-udp-receive-buffer! @(:channel target) sz)
+
+         (and (map? target) (:channel target))
+         (configure-udp-receive-buffer! (:channel target) sz)
+
+         :else false)
+       (catch Throwable _ false)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Pure State Sanitization & Argument Parsing
@@ -443,9 +513,7 @@
   (if-let [fetcher (:accountz-fetcher opts)]
     (fetcher pubkey)
     (let [candidates (ordered-validator-candidates bootstrap nil 0)
-          client (-> (HttpClient/newBuilder)
-                     (.connectTimeout (Duration/ofMillis 1500))
-                     (.build))]
+          client (or (:http-client opts) (default-http-client))]
       (some (fn [cand]
               (let [ip (:ip cand)
                     http-port (or (:http-port cand) (:http_port cand) 8080)
@@ -475,10 +543,7 @@
   ([relay-url envelope]
    (submit-relay-envelope! relay-url envelope nil))
   ([relay-url envelope opts]
-   (let [client (or (:http-client opts)
-                    (-> (HttpClient/newBuilder)
-                        (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
-                        (.build)))
+   (let [client (or (:http-client opts) (default-http-client))
          url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/send")
          wire-hex (cond
                     (string? envelope) envelope
@@ -510,10 +575,7 @@
   ([relay-url pubkey privkey]
    (poll-relay-envelopes! relay-url pubkey privkey nil))
   ([relay-url pubkey privkey opts]
-   (let [client (or (:http-client opts)
-                    (-> (HttpClient/newBuilder)
-                        (.connectTimeout (Duration/ofMillis (long (+ (or (:timeout-ms opts) 0) 5000))))
-                        (.build)))
+   (let [client (or (:http-client opts) (default-http-client))
          base-url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/poll")
          pk-hex (if (bytes? pubkey) (basalt/bytes->hex pubkey) (str pubkey))
          now-ms (System/currentTimeMillis)
@@ -565,10 +627,7 @@
   ([relay-url pubkey privkey up-to-seq]
    (ack-relay-envelopes! relay-url pubkey privkey up-to-seq nil))
   ([relay-url pubkey privkey up-to-seq opts]
-   (let [client (or (:http-client opts)
-                    (-> (HttpClient/newBuilder)
-                        (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 5000))))
-                        (.build)))
+   (let [client (or (:http-client opts) (default-http-client))
          url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/ack")
          pk-hex (if (bytes? pubkey) (basalt/bytes->hex pubkey) (str pubkey))
          now-ms (System/currentTimeMillis)
@@ -616,10 +675,7 @@
   ([relay-url]
    (fetch-relay-chain-state! relay-url nil))
   ([relay-url opts]
-   (let [client (or (:http-client opts)
-                    (-> (HttpClient/newBuilder)
-                        (.connectTimeout (Duration/ofMillis (long (or (:timeout-ms opts) 12000))))
-                        (.build)))
+   (let [client (or (:http-client opts) (default-http-client))
          base-url (str (relay/normalize-relay-base-url relay-url) "/relay/v1/chain-state")
          q-parts (cond-> []
                    (:pubkey opts) (conj (str "pubkey=" (java.net.URLEncoder/encode (str (:pubkey opts)) StandardCharsets/UTF_8)))
@@ -700,7 +756,9 @@
     (try
       (if (or (= transport :tcp) (= transport :connect))
         (api/start-tcp! client-node remote-sdp callbacks)
-        (api/start! client-node remote-sdp callbacks))
+        (do
+          (api/start! client-node remote-sdp callbacks)
+          (configure-udp-receive-buffer! client-node)))
       (api/set-max-message-size! client-node)
       (let [timeout-ms (long (or (:timeout-ms opts) 4000))]
         (try
@@ -712,45 +770,54 @@
 
 (defn fetch-directory-descriptor!
   "Fetches and parses a directory descriptor for nickname under domain.
+   Supports qualified `<domain>/<nickname>` strings (`P-SOAK-2`).
    Supports injectable (:directory-fetcher opts) (fn [domain nickname] ...) for deterministic testing.
    Over HTTP/HTTPS, fetches https://<domain>/directory/<nickname>.json (falling back to https://<domain>/<nickname>),
    and parses via light-core/parse-directory-descriptor-text."
   ([domain nickname] (fetch-directory-descriptor! domain nickname nil))
   ([domain nickname opts]
-   (if-let [custom-fetcher (:directory-fetcher opts)]
-     (try
-       (let [res (custom-fetcher domain nickname)]
-         (cond
-           (map? res) res
-           (string? res) (light-core/parse-directory-descriptor-text res)
-           :else nil))
-       (catch Exception _ nil))
-     (let [dom (if (or (nil? domain) (str/blank? domain)) "bitecho.org" (str/trim domain))
-           net-uri (or (:network-uri opts) "bitecho.org")
-           url-v1 (str "https://" dom "/directory/v1/" net-uri "/" nickname)
-           url1 (str "https://" dom "/directory/" nickname ".json")
-           url2 (str "https://" dom "/" nickname)
-           local-f1 (io/file "devnet/directory" (str nickname ".json"))
-           client (HttpClient/newHttpClient)
-           fetch-url (fn [^String u]
-                       (try
-                         (let [req (-> (HttpRequest/newBuilder)
-                                       (.uri (URI/create u))
-                                       (.timeout (Duration/ofMillis 4000))
-                                       (.GET)
-                                       (.build))
-                               resp (.send client req (HttpResponse$BodyHandlers/ofString))]
-                           (when (= 200 (.statusCode resp))
-                             (.body resp)))
-                         (catch Exception _ nil)))]
-       (or (if-let [body-v1 (fetch-url url-v1)]
-             (light-core/parse-directory-descriptor-text body-v1)
-             (if-let [body1 (fetch-url url1)]
-               (light-core/parse-directory-descriptor-text body1)
-               (when-let [body2 (fetch-url url2)]
-                 (light-core/parse-directory-descriptor-text body2))))
-           (when (.exists local-f1)
-             (light-core/parse-directory-descriptor-text (slurp local-f1))))))))
+   (let [raw-nick (str/trim (str (or nickname "")))
+         slash-idx (.lastIndexOf raw-nick "/")
+         [eff-domain eff-nick] (if (pos? slash-idx)
+                                 [(subs raw-nick 0 slash-idx)
+                                  (subs raw-nick (inc slash-idx))]
+                                 [domain raw-nick])]
+     (if-let [custom-fetcher (:directory-fetcher opts)]
+       (try
+         (let [res (or (custom-fetcher eff-domain eff-nick)
+                       (when (not= raw-nick eff-nick)
+                         (custom-fetcher domain raw-nick)))]
+           (cond
+             (map? res) res
+             (string? res) (light-core/parse-directory-descriptor-text res)
+             :else nil))
+         (catch Exception _ nil))
+       (let [dom (if (or (nil? eff-domain) (str/blank? eff-domain)) "bitecho.org" (str/trim eff-domain))
+             net-uri (or (:network-uri opts) "bitecho.org")
+             url-v1 (str "https://" dom "/directory/v1/" net-uri "/" eff-nick)
+             url1 (str "https://" dom "/directory/" eff-nick ".json")
+             url2 (str "https://" dom "/" eff-nick)
+             local-f1 (io/file "devnet/directory" (str eff-nick ".json"))
+             client (or (:http-client opts) (default-http-client))
+             fetch-url (fn [^String u]
+                         (try
+                           (let [req (-> (HttpRequest/newBuilder)
+                                         (.uri (URI/create u))
+                                         (.timeout (Duration/ofMillis 4000))
+                                         (.GET)
+                                         (.build))
+                                 resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+                             (when (= 200 (.statusCode resp))
+                               (.body resp)))
+                           (catch Exception _ nil)))]
+         (or (if-let [body-v1 (fetch-url url-v1)]
+               (light-core/parse-directory-descriptor-text body-v1)
+               (if-let [body1 (fetch-url url1)]
+                 (light-core/parse-directory-descriptor-text body1)
+                 (when-let [body2 (fetch-url url2)]
+                   (light-core/parse-directory-descriptor-text body2))))
+             (when (.exists local-f1)
+               (light-core/parse-directory-descriptor-text (slurp local-f1)))))))))
 
 (defn fetch-inband-chain-state-quorum!
   "Fetches chain state snapshots from validators in parallel, cross-checking via verify-chain-state-quorum.
@@ -1445,6 +1512,7 @@
           (deliver connected? :connect-failed)))
       (do
         (api/start! client-node remote-sdp callbacks)
+        (configure-udp-receive-buffer! client-node)
         (api/set-max-message-size! client-node)))
     (Thread/interrupted)
     (let [timeout-ms (long (or (:timeout-ms opts) 8000))
@@ -2010,7 +2078,9 @@
                     (api/set-callbacks! client-node callbacks)
                     (if (or (= transport :tcp) (= transport :connect))
                       (api/start-tcp! client-node remote-sdp callbacks)
-                      (api/start! client-node remote-sdp callbacks))
+                      (do
+                        (api/start! client-node remote-sdp callbacks)
+                        (configure-udp-receive-buffer! client-node)))
                     (let [res (deref connected-prom 3000 :timeout)]
                       (if (= res true)
                         (let [my-gen (inc (long (or (get-in @p2p-peers-atom [peer-pk :generation]) 0)))]
@@ -2219,7 +2289,9 @@
                          :peer-ice-pwds peer-ice-pwds}
             listener (api/listen-tcp! listen-opts {:on-connection on-conn-fn})
             udp-listener (try
-                           (api/listen! listen-opts {:on-connection on-conn-fn})
+                           (let [ul (api/listen! listen-opts {:on-connection on-conn-fn})]
+                             (configure-udp-receive-buffer! ul)
+                             ul)
                            (catch Exception e
                              (when state-atom
                                (record-conn-diagnostic! state-atom :udp-listen-failed {:port port :error (or (.getMessage e) (str e))}))
@@ -2279,32 +2351,66 @@
       (str (get (cli/desugar-cli-cmd-map (assoc (or cmd-map {}) "cmd" v)) "cmd" v))
       v)))
 
+(defn- fetch-relay-pointer-seq
+  [raw-relay-url raw-path]
+  (when-let [base-url (artifact-endpoint-base-url raw-relay-url)]
+    (when (and (string? raw-path) (not (str/blank? raw-path)))
+      (let [clean-path (str/replace (str/trim raw-path) #"^/+" "")]
+        (try
+          (let [client (default-http-client)
+                enc-prefix (java.net.URLEncoder/encode clean-path StandardCharsets/UTF_8)
+                req (-> (HttpRequest/newBuilder)
+                        (.uri (URI/create (str base-url "/artifact/v1/list?prefix=" enc-prefix)))
+                        (.timeout (Duration/ofSeconds 5))
+                        (.GET)
+                        (.build))
+                r (.send client req (HttpResponse$BodyHandlers/ofString StandardCharsets/UTF_8))
+                body (when (= 200 (.statusCode r)) (json/read-str (.body r)))
+                ptrs (when (map? body) (or (get body "pointers") (:pointers body)))
+                matched (some (fn [p]
+                                (when (= clean-path (or (get p "path") (:path p)))
+                                  (or (get p "seq") (:seq p))))
+                              ptrs)]
+            (when (some? matched)
+              (Long/parseLong (str matched))))
+          (catch Exception _ nil))))))
+
 (defn- enrich-artifact-cmd-map
-  [verb cmd-map]
-  (let [eff-verb (effective-artifact-domain-verb verb cmd-map)]
-    (if (and (= eff-verb "artifact-put")
-             (nil? (get cmd-map "hex"))
-             (nil? (get cmd-map "data_hex"))
-             (nil? (get cmd-map "text"))
-             (nil? (get cmd-map "data"))
-             (string? (get cmd-map "file"))
-             (not (str/blank? (get cmd-map "file"))))
-      (let [f (io/file (get cmd-map "file"))]
-        (if (.exists f)
-          (let [bs (Files/readAllBytes (.toPath f))
-                h (basalt/bytes->hex bs)]
-            (assoc cmd-map "hex" h "data_hex" h))
-          cmd-map))
-      cmd-map)))
+  ([verb cmd-map]
+   (enrich-artifact-cmd-map verb cmd-map nil))
+  ([verb cmd-map default-relay-url]
+   (let [eff-verb (effective-artifact-domain-verb verb cmd-map)
+         m1 (if (and (= eff-verb "artifact-put")
+                     (nil? (get cmd-map "hex"))
+                     (nil? (get cmd-map "data_hex"))
+                     (nil? (get cmd-map "text"))
+                     (nil? (get cmd-map "data"))
+                     (string? (get cmd-map "file"))
+                     (not (str/blank? (get cmd-map "file"))))
+              (let [f (io/file (get cmd-map "file"))]
+                (if (.exists f)
+                  (let [bs (Files/readAllBytes (.toPath f))
+                        h (basalt/bytes->hex bs)]
+                    (assoc cmd-map "hex" h "data_hex" h))
+                  cmd-map))
+              cmd-map)
+         art-relay (or (get m1 "relay_url") (get m1 "relay-url") (:relay-url m1) default-relay-url)]
+     (if (and (contains? #{"artifact-put" "artifact-revoke"} eff-verb)
+              (nil? (get m1 "seq"))
+              (nil? (:seq m1))
+              (string? art-relay)
+              (not (str/blank? art-relay)))
+       (if-let [r-seq (fetch-relay-pointer-seq art-relay (or (get m1 "path") (:path m1)))]
+         (assoc m1 "min_remote_seq" r-seq)
+         m1)
+       m1))))
 
 (defn- post-artifact-to-relay!
   [raw-relay-url verb resp]
   (when-let [base-url (artifact-endpoint-base-url raw-relay-url)]
     (when (and (map? resp) (true? (or (get resp "ok") (:ok resp))))
       (try
-        (let [client (-> (HttpClient/newBuilder)
-                         (.connectTimeout (Duration/ofSeconds 5))
-                         (.build))
+        (let [client (default-http-client)
               post-json! (fn [subpath payload-str content-type timeout-ms]
                            (let [req (-> (HttpRequest/newBuilder)
                                          (.uri (URI/create (str base-url subpath)))
@@ -2358,7 +2464,12 @@
                   (string? cmd-or-line) (try (json/read-str cmd-or-line) (catch Exception _ nil))
                   :else nil)
         wait-ms (long (or (get cmd-map "wait_open_ms") (get cmd-map "wait-open-ms") (get cmd-map :wait-open-ms) (get cmd-map :wait_open_ms) 0))
-        relay-url (or (:relay-url conn-opts) (get-in conn-opts [:relay :url]))]
+        relay-url (or (:relay-url conn-opts)
+                      (get-in conn-opts [:relay :url])
+                      (infer-bootstrap-relay-url bootstrap conn-opts)
+                      (:relay-url bootstrap)
+                      (get-in bootstrap [:relay :url])
+                      (when (= "bitecho.org" (:domain bootstrap)) "https://ns1.bitecho.org"))]
     (if-not (and (map? cmd-map) (contains? cmd-map "cmd"))
       (let [err {"ok" false "error" (if (and (string? cmd-or-line) (str/blank? cmd-or-line)) "empty-line" "malformed-request")}]
         (emit! err)
@@ -2377,14 +2488,15 @@
           (let [effective-map (-> (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
                                            (not (contains? cmd-map "descriptor"))
                                            (not (contains? cmd-map :descriptor)))
-                                    (let [nick (or (get cmd-map "nickname") (:nickname cmd-map))
+                                    (let [nick (or (get cmd-map "nickname") (:nickname cmd-map)
+                                                   (get cmd-map "name") (:name cmd-map))
                                           dom (or (get cmd-map "domain") (:domain cmd-map) "bitecho.org")
                                           desc (when (and (string? nick) (not (str/blank? nick)))
                                                  (fetch-directory-descriptor! dom nick conn-opts))]
                                       (cond-> cmd-map
                                         desc (assoc "descriptor" desc)))
                                     cmd-map)
-                                  (as-> m (enrich-artifact-cmd-map verb m)))
+                                  (as-> m (enrich-artifact-cmd-map verb m relay-url)))
                 prev-state @state-atom
                 eff-domain-verb (effective-artifact-domain-verb verb effective-map)
                 res (light-core/handle-command @state-atom effective-map (:privkey-bytes identity))
@@ -2426,7 +2538,15 @@
                                   (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
                     live-envs (if (seq replay-envs)
                                 (into (vec replay-envs) (:net-envelopes res))
-                                (:net-envelopes res))]
+                                (:net-envelopes res))
+                    mirror-to-relay! (fn [envs]
+                                       (when (and (string? relay-url)
+                                                  (not (str/blank? relay-url))
+                                                  (not= :http-relay (:transport @conn-atom)))
+                                         (doseq [env (remove :p2p-direct? envs)]
+                                           (try
+                                             (submit-relay-envelope! relay-url env {:timeout-ms 5000})
+                                             (catch Exception _ nil)))))]
                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
                   (do
                     (when (and (not currently-live?)
@@ -2439,6 +2559,7 @@
                                             ingress-peers-atom
                                             state-atom
                                             (:privkey-bytes identity))
+                    (mirror-to-relay! live-envs)
                     (sync-conn-diagnostics! state-atom conn-atom)
                     (when state-file (save-light-state! state-file @state-atom))
                     (finish-resp! (:response res)))
@@ -2447,6 +2568,7 @@
                                          (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
                         sent-val? (when currently-live?
                                     (send-all-envelopes! (:send-fn @conn-atom) live-envs))
+                        _ (mirror-to-relay! live-envs)
                         sent? (or sent-val? sent-ingress?)]
                     (if sent?
                       (do
@@ -2588,9 +2710,7 @@
   "Sends a JSON command map or {\"argv\": [...]} payload to http://127.0.0.1:<port>/ctl."
   [port token payload-map timeout-ms]
   (let [body-json (json/write-str payload-map)
-        client (-> (HttpClient/newBuilder)
-                   (.connectTimeout (Duration/ofMillis 2000))
-                   (.build))
+        client (default-http11-client)
         req (-> (HttpRequest/newBuilder)
                 (.uri (URI/create (str "http://127.0.0.1:" port "/ctl")))
                 (.timeout (Duration/ofMillis (max 1000 (long (or timeout-ms 10000)))))
@@ -2791,14 +2911,16 @@
           (let [cmd-map (build-one-shot-cmd-map subverb subargs)
                 body-json (json/write-str cmd-map)
                 block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
-                timeout (if (= subverb "wait")
+                timeout (cond
+                          (= subverb "wait")
                           (if block?
                             (Duration/ofDays 365)
                             (Duration/ofMillis (+ 5000 (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000)))))
+                          (contains? #{"put" "artifact-put"} subverb)
+                          (Duration/ofSeconds 60)
+                          :else
                           (Duration/ofSeconds 10))
-                client (-> (HttpClient/newBuilder)
-                           (.connectTimeout (Duration/ofSeconds 3))
-                           (.build))
+                client (default-http11-client)
                 req (-> (HttpRequest/newBuilder)
                         (.uri (URI/create (str "http://127.0.0.1:" port "/ctl")))
                         (.timeout timeout)
@@ -3123,7 +3245,12 @@
                                                                p2p-peers-atom
                                                                ingress-peers-atom
                                                                state-atom
-                                                               (:privkey-bytes identity))))))))
+                                                               (:privkey-bytes identity))
+                                       (when (not= :http-relay (:transport conn-res))
+                                         (doseq [env (remove :p2p-direct? (:net-envelopes r))]
+                                           (try
+                                             (submit-relay-envelope! effective-relay-url env {:timeout-ms 5000})
+                                             (catch Exception _ nil))))))))))
                            (when (or (seq msgs) (seq bcasts) (> new-bseq since-bseq))
                              (try
                                (ack-relay-envelopes! effective-relay-url
@@ -3270,7 +3397,8 @@
               eff-cmd (if (and (:auto-sync? opts) (contains? #{"account" "escrows"} (get cmd-map "cmd")))
                         (assoc cmd-map "sync" true)
                         cmd-map)
-              timeout-ms (or (:timeout-ms opts) 15000)]
+              timeout-ms (or (:timeout-ms opts)
+                             (if (contains? #{"put" "artifact-put"} (get cmd-map "cmd")) 60000 15000))]
           (if (and port token)
             (let [res (try (post-control-request! port token eff-cmd timeout-ms) (catch Exception _ nil))]
               (cond
@@ -3396,14 +3524,15 @@
             cmd-map (-> (if (and (contains? #{"directory-lookup" "directory-verify"} verb)
                                  (not (contains? raw-cmd-map "descriptor"))
                                  (not (contains? raw-cmd-map :descriptor)))
-                          (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map))
+                          (let [nick (or (get raw-cmd-map "nickname") (:nickname raw-cmd-map)
+                                         (get raw-cmd-map "name") (:name raw-cmd-map))
                                 dom (or (get raw-cmd-map "domain") (:domain raw-cmd-map) "bitecho.org")
                                 desc (when (and (string? nick) (not (str/blank? nick)))
                                        (fetch-directory-descriptor! dom nick opts))]
                             (cond-> raw-cmd-map
                               desc (assoc "descriptor" desc)))
                           raw-cmd-map)
-                        (as-> m (enrich-artifact-cmd-map verb m)))
+                        (as-> m (enrich-artifact-cmd-map verb m (:relay-url opts))))
             shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal"
                                        "export-p2p-offer" "export-p2p-answer" "export-send"
                                        "import-envelope" "import-poll" "import"}
@@ -3488,9 +3617,7 @@
               token (get info "token")
               pid (get info "pid")]
           (when (and port token)
-            (let [client (-> (HttpClient/newBuilder)
-                             (.connectTimeout (Duration/ofMillis 1500))
-                             (.build))
+            (let [client (default-http11-client)
                   req (-> (HttpRequest/newBuilder)
                           (.uri (URI/create (str "http://127.0.0.1:" port "/ctl")))
                           (.header "Authorization" (str "Bearer " token))

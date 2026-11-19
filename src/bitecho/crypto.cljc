@@ -593,16 +593,16 @@
          (let [s (decodeLE sBytes)
                prefix (.slice h 32 64)
                pub (encodePoint (scalarMult s ed-B-PT))]
-           #js {:s s :prefix prefix :pub pub})))
+           {:s s :prefix prefix :pub pub})))
 
      (defn- ed-public-key [seed32]
-       (.-pub (expandSecret seed32)))
+       (:pub (expandSecret seed32)))
 
      (defn- ed-sign [seed32 msgBytes]
        (let [expanded (expandSecret seed32)
-             s (.-s expanded)
-             prefix (.-prefix expanded)
-             pub (.-pub expanded)
+             s (:s expanded)
+             prefix (:prefix expanded)
+             pub (:pub expanded)
              rInput (js/Uint8Array. (+ 32 (.-length msgBytes)))]
          (.set rInput prefix 0)
          (.set rInput msgBytes 32)

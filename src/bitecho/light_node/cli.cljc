@@ -204,7 +204,8 @@
    "--autonomous" "--auto-sync" "--auto-register-home-set" "--no-auto-register-home-set"
    "--wait-open-ms" "--block" "--until-event" "--help" "--mcp"
    "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
-   "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"])
+   "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"
+   "--nickname" "--name" "--domain"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -725,8 +726,16 @@
       "dac-revoke" {"cmd" "dac-revoke"}
 
       "directory-verify"
-      (let [nick (extract-flag-value clean-tokens "--nickname" nil)
-            dom (extract-flag-value clean-tokens "--domain" nil)
+      (let [raw-nick (or (extract-flag-value clean-tokens "--nickname" nil)
+                         (extract-flag-value clean-tokens "--name" nil))
+            raw-dom (extract-flag-value clean-tokens "--domain" nil)
+            slash-idx (when (string? raw-nick) (.lastIndexOf (str/trim raw-nick) "/"))
+            nick (if (and slash-idx (pos? slash-idx))
+                   (subs (str/trim raw-nick) (inc slash-idx))
+                   raw-nick)
+            dom (or raw-dom
+                    (when (and slash-idx (pos? slash-idx))
+                      (subs (str/trim raw-nick) 0 slash-idx)))
             pk (extract-flag-value clean-tokens "--directory-pubkey" nil)
             m {"cmd" "directory-verify"}]
         (cond-> m
@@ -735,8 +744,16 @@
           pk (assoc "directory_pubkey" pk)))
 
       "directory-register"
-      (let [nick (extract-flag-value clean-tokens "--nickname" nil)
-            dom (extract-flag-value clean-tokens "--domain" nil)
+      (let [raw-nick (or (extract-flag-value clean-tokens "--nickname" nil)
+                         (extract-flag-value clean-tokens "--name" nil))
+            raw-dom (extract-flag-value clean-tokens "--domain" nil)
+            slash-idx (when (string? raw-nick) (.lastIndexOf (str/trim raw-nick) "/"))
+            nick (if (and slash-idx (pos? slash-idx))
+                   (subs (str/trim raw-nick) (inc slash-idx))
+                   raw-nick)
+            dom (or raw-dom
+                    (when (and slash-idx (pos? slash-idx))
+                      (subs (str/trim raw-nick) 0 slash-idx)))
             mb (extract-flag-value clean-tokens "--mailbox" nil)
             prev-pk (extract-flag-value clean-tokens "--prev-pubkey" nil)
             prev-sk (extract-flag-value clean-tokens "--prev-privkey" nil)
@@ -749,8 +766,16 @@
           prev-sk (assoc "prev_privkey" prev-sk)))
 
       "directory-lookup"
-      (let [nick (extract-flag-value clean-tokens "--nickname" nil)
-            dom (extract-flag-value clean-tokens "--domain" nil)
+      (let [raw-nick (or (extract-flag-value clean-tokens "--nickname" nil)
+                         (extract-flag-value clean-tokens "--name" nil))
+            raw-dom (extract-flag-value clean-tokens "--domain" nil)
+            slash-idx (when (string? raw-nick) (.lastIndexOf (str/trim raw-nick) "/"))
+            nick (if (and slash-idx (pos? slash-idx))
+                   (subs (str/trim raw-nick) (inc slash-idx))
+                   raw-nick)
+            dom (or raw-dom
+                    (when (and slash-idx (pos? slash-idx))
+                      (subs (str/trim raw-nick) 0 slash-idx)))
             dir-pk (extract-flag-value clean-tokens "--directory-pubkey" nil)
             m {"cmd" "directory-lookup"}]
         (cond-> m
@@ -1346,7 +1371,8 @@
               (has-flag? clean-tokens "--petname")
               "petname-set"
 
-              (has-flag? clean-tokens "--nickname")
+              (or (has-flag? clean-tokens "--nickname")
+                  (has-flag? clean-tokens "--name"))
               "directory-register"
 
               (or (has-flag? clean-tokens "--child-subnet")
@@ -1379,11 +1405,13 @@
               (has-flag? clean-tokens "--petname")
               "petname-resolve"
 
-              (and (has-flag? clean-tokens "--nickname")
+              (and (or (has-flag? clean-tokens "--nickname")
+                       (has-flag? clean-tokens "--name"))
                    (has-flag? clean-tokens "--verify"))
               "directory-verify"
 
-              (has-flag? clean-tokens "--nickname")
+              (or (has-flag? clean-tokens "--nickname")
+                  (has-flag? clean-tokens "--name"))
               "directory-lookup"
 
               (or (has-flag? clean-tokens "--child-subnet")
@@ -1564,7 +1592,7 @@
                            (or (get m "slot") (get m "slot_id")) "storage-put"
                            (and (get m "petname") (get m "remove")) "petname-remove"
                            (get m "petname") "petname-set"
-                           (get m "nickname") "directory-register"
+                           (or (get m "nickname") (get m "name")) "directory-register"
                            (get m "parent_subnet") "anchor-subnet"
                            (or (get m "tombstone") (get m "revoke")) "artifact-revoke"
                            :else "artifact-put")
@@ -1573,8 +1601,8 @@
                            (get m "capability_id") "capability-resolve"
                            (or (get m "slot") (get m "slot_id")) "storage-get"
                            (get m "petname") "petname-resolve"
-                           (and (get m "nickname") (get m "verify")) "directory-verify"
-                           (get m "nickname") "directory-lookup"
+                           (and (or (get m "nickname") (get m "name")) (get m "verify")) "directory-verify"
+                           (or (get m "nickname") (get m "name")) "directory-lookup"
                            (get m "parent_subnet") "verify-subnet-anchor"
                            (or (get m "path") (get m "cid")) "artifact-get"
                            (or (get m "sync") (get m "balance")) "account"

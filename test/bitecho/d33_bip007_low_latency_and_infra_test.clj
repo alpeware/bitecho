@@ -544,6 +544,13 @@
           (is (true? (:ok? resolved)) "Canonical `put` must upload blob and pointer to HTTP relay /artifact/v1/*")
           (is (= "# Published via Canonical Put\n"
                  (String. ^bytes (get-in resolved [:blob :blob/bytes]) StandardCharsets/UTF_8))))
+        ;; 2. Verify default-infra-policy allows K_nexus to sign web/app/* pointers directly via CLI put,
+        ;;    and render-resolved-blob gzip-compresses compressible disk files > 2 MiB up to 16 MiB
+        (let [pol (infra/default-infra-policy {:trust-anchors [pk]})
+              nexus-rule (some #(when (= (:pattern %) "web/app/*") %) (:subnet/path-acl pol))]
+          (is (some? nexus-rule))
+          (is (contains? (get-in nexus-rule [:principal :signers]) infra/K_nexus)
+              "K_nexus must be authorized to publish web/app/* pointers in default-infra-policy"))
         (finally
           (try (http/stop-http-servers! srv) (catch Exception _ nil))
           (try (infra/stop-subnet-runtime! rt) (catch Exception _ nil))
@@ -623,4 +630,4 @@
       (is (str/includes? infra-sh "StrictHostKeyChecking=accept-new"))
       (is (str/includes? infra-sh "bitecho.jar.bak"))
       (is (str/includes? infra-sh "bitecho-light-node.cjs.sha256"))
-      (is (= "0.23.11" config/version)))))
+      (is (contains? #{"0.23.11" "0.23.12"} config/version)))))

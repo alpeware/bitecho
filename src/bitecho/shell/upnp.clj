@@ -10,9 +10,27 @@
             [clojure.xml :as xml])
   (:import [java.io ByteArrayInputStream]
            [java.net DatagramPacket DatagramSocket InetSocketAddress Socket SocketTimeoutException URI]
-           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
+           [java.net.http HttpClient HttpClient$Version HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers]
            [java.nio.charset StandardCharsets]
-           [java.time Duration]))
+           [java.time Duration]
+           [java.util.concurrent Executors ThreadFactory]))
+
+(def ^:private shared-upnp-http-client-delay
+  (delay
+    (let [tf (reify ThreadFactory
+               (newThread [_ r]
+                 (doto (Thread. r "bitecho-upnp-http-pool")
+                   (.setDaemon true))))]
+      (-> (HttpClient/newBuilder)
+          (.version HttpClient$Version/HTTP_1_1)
+          (.connectTimeout (Duration/ofMillis 3000))
+          (.executor (Executors/newCachedThreadPool tf))
+          (.build)))))
+
+(defn default-http-client
+  "Returns the shared process-wide UPnP HTTP/1.1 `HttpClient` (`P-SOAK-1` / `BUG-SOAK-01`)."
+  ^HttpClient []
+  @shared-upnp-http-client-delay)
 
 (def ^{:doc "Standard UPnP SSDP IPv4 multicast address."} default-ssdp-host "239.255.255.250")
 (def ^{:doc "Standard UPnP SSDP UDP port."} default-ssdp-port 1900)
@@ -219,9 +237,7 @@
        :effects [{:effect :diagnose :reason :upnp-invalid-gateway :action action}]}
       (try
         (let [body (build-soap-envelope service-type action arg-pairs)
-              client (-> (HttpClient/newBuilder)
-                         (.connectTimeout (Duration/ofMillis timeout-ms))
-                         (.build))
+              client (or (:http-client opts) (default-http-client))
               req (-> (HttpRequest/newBuilder (URI/create control-url))
                       (.timeout (Duration/ofMillis timeout-ms))
                       (.header "Content-Type" "text/xml; charset=\"utf-8\"")
@@ -274,9 +290,7 @@
              (.send sock pkt)))
          (let [deadline (+ (System/currentTimeMillis) timeout-ms)
                buf (byte-array 4096)
-               http-client (-> (HttpClient/newBuilder)
-                               (.connectTimeout (Duration/ofMillis timeout-ms))
-                               (.build))]
+               http-client (or (:http-client opts) (default-http-client))]
            (loop [seen-locs #{}]
              (let [rem (- deadline (System/currentTimeMillis))]
                (if (<= rem 0)

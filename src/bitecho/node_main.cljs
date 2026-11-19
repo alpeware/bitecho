@@ -2954,7 +2954,11 @@
         cmd-map (if (map? raw-cmd-map) (enrich-artifact-cmd-map verb raw-cmd-map) raw-cmd-map)
         line-str (if (map? cmd-map) (write-json-str cmd-map) (if (string? line) line (write-json-str line)))
         wait-ms (long (or (get cmd-map "wait_open_ms") (get cmd-map "wait-open-ms") (get cmd-map :wait-open-ms) (get cmd-map :wait_open_ms) 0))
-        relay-url (or (:relay-url conn-opts) (get-in conn-opts [:relay :url]))
+        relay-url (or (:relay-url conn-opts)
+                      (get-in conn-opts [:relay :url])
+                      (:relay-url bootstrap)
+                      (get-in bootstrap [:relay :url])
+                      (when (= "bitecho.org" (:domain bootstrap)) "https://ns1.bitecho.org"))
         sync-wanted? (or (and (= verb "sync-account")
                               (nil? (get cmd-map "balance"))
                               (nil? (get cmd-map "snapshots"))
@@ -3008,7 +3012,15 @@
                                   (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
                     live-envs (if (seq replay-envs)
                                 (into (vec replay-envs) (:net-envelopes res))
-                                (:net-envelopes res))]
+                                (:net-envelopes res))
+                    mirror-to-relay! (fn [envs]
+                                       (when (and (string? relay-url)
+                                                  (not (str/blank? relay-url))
+                                                  (not= :http-relay (:transport @conn-atom)))
+                                         (doseq [env (remove :p2p-direct? envs)]
+                                           (try
+                                             (submit-relay-envelope! relay-url env (fn [_] nil) {:timeout-ms 5000})
+                                             (catch :default _ nil)))))]
                 (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
                   (do
                     (send-routed-envelopes! live-envs
@@ -3017,6 +3029,7 @@
                                             ingress-peers-atom
                                             state-atom
                                             (:privkey-bytes identity))
+                    (mirror-to-relay! live-envs)
                     (sync-conn-diagnostics! state-atom conn-atom)
                     (save-light-state! state-file @state-atom)
                     (finish-resp! res))
@@ -3025,6 +3038,7 @@
                                          (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
                         sent-val? (when currently-live?
                                     (send-all-envelopes! (:send-fn @conn-atom) live-envs))
+                        _ (mirror-to-relay! live-envs)
                         sent? (or sent-val? sent-ingress?)]
                     (if sent?
                       (do
@@ -3265,10 +3279,14 @@
                 body-json (write-json-str cmd-map)
                 body-buf (.from (.-Buffer js/globalThis) body-json "utf8")
                 block? (boolean (or (get cmd-map "block") (get cmd-map :block) (get cmd-map "until_event") (get cmd-map "until-event")))
-                timeout-ms (if (= subverb "wait")
+                timeout-ms (cond
+                             (= subverb "wait")
                              (if block?
                                0
                                (+ 5000 (long (or (get cmd-map "timeout_ms") (get cmd-map "timeout-ms") 30000))))
+                             (contains? #{"put" "artifact-put"} subverb)
+                             60000
+                             :else
                              10000)
                 req-opts (cond-> #js {:hostname "127.0.0.1"
                                       :port (int port)
@@ -3645,7 +3663,12 @@
                                                                        p2p-peers-atom
                                                                        ingress-peers-atom
                                                                        state-atom
-                                                                       (:privkey-bytes identity)))))))
+                                                                       (:privkey-bytes identity))
+                                               (when (not= :http-relay (:transport conn-res))
+                                                 (doseq [env (remove :p2p-direct? (:net-envelopes r))]
+                                                   (try
+                                                     (submit-relay-envelope! effective-relay-url env (fn [_] nil) {:timeout-ms 5000})
+                                                     (catch :default _ nil)))))))))
                                      (when (or (seq msgs) (seq bcasts) (> @since-bseq old-bseq))
                                        (ack-relay-envelopes!
                                         effective-relay-url
@@ -3710,7 +3733,8 @@
             eff-cmd (if (and (:auto-sync? opts) (contains? #{"account" "escrows"} (get cmd-map "cmd")))
                       (assoc cmd-map "sync" true)
                       cmd-map)
-            timeout-ms (or (:timeout-ms opts) 15000)]
+            timeout-ms (or (:timeout-ms opts)
+                           (if (contains? #{"put" "artifact-put"} (get cmd-map "cmd")) 60000 15000))]
         (if-not (and port token)
           (if (and pid (pid-alive? pid))
             (cb {"ok" false

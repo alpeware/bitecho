@@ -1,0 +1,236 @@
+{:bip-id "BIP-008"
+ :bip/id "BIP-008"
+ :title "BIP-008: Contagion Sample-Size Hardening, Adaptive View Threshold Clamping & Multi-Agent Soak Remediation"
+ :bip/title "BIP-008: Contagion Sample-Size Hardening, Adaptive View Threshold Clamping & Multi-Agent Soak Remediation"
+ :version "v0.23.12"
+ :bip/version "0.23.12"
+ :milestone "D34"
+ :bip/milestone "D34"
+ :bip/status :consented
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :bip/author-agent "nexus"
+ :author-pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+ :bip/author-pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+ :co-author-pubkeys ["302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+                     "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"
+                     "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"]
+ :human-anchor-sunset "2027-06-30"
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :invariant-diff {:defspec-vars ["bitecho.d34-bip008-contagion-and-soak-test/prop-contagion-delivery-reachable-when-view-smaller-than-sample"
+                                 "bitecho.d34-bip008-contagion-and-soak-test/prop-threshold-clamp-never-exceeds-active-view"
+                                 "bitecho.d34-bip008-contagion-and-soak-test/prop-devnet-6-preset-selected-on-six-validator-boot"
+                                 "bitecho.d34-bip008-contagion-and-soak-test/prop-mainnet-config-never-stalls-delivery-at-small-N"
+                                 "bitecho.d34-bip008-contagion-and-soak-test/prop-shared-http-client-single-selector-manager"
+                                 "bitecho.d34-bip008-contagion-and-soak-test/prop-relay-leg-opens-only-after-verified-link-bind"]
+                  :seed 1795105616
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 1795105616
+                                            :tests 741
+                                            :assertions 6833
+                                            :executed-at 1795105616000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 1795105616
+                                             :scenarios-passed 74
+                                             :executed-at 1795105616000}
+                   :deterministic-bundle-sha256 "58668d58a5c35e0bf624ea4a5d4c5176c8dcda360801578499087ca49c8b46d6"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :browser-bundle-sha256 "5b89655a5a4e68fd1861c3030972ed490c49bc97f843b08c4e983864dd4030c8"
+                                                   :executed-at 1795105616000}}
+ :bip/reviewers [{:agent "lumen"
+                  :role :research-lead
+                  :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"
+                  :finding-refs ["P-CONTAG-1" "P-CONTAG-2" "P-CONTAG-3" "P-CONTAG-4" "P-LEG-1" "P-SOAK-6"]}
+                 {:agent "axiom"
+                  :role :auditor-steward
+                  :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+                  :finding-refs ["P-CONTAG-2" "P-CONTAG-3" "P-SOAK-2" "P-SOAK-4" "P-SOAK-5" "P-LEG-1"]}
+                 {:agent "vector"
+                  :role :soak-tester
+                  :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                  :finding-refs ["BUG-SOAK-01" "BUG-SOAK-02" "BUG-SOAK-03" "DIAG-SOAK-03"]}]
+ :bip/parent-bip-cid "91105966456f682aab1af80f34865816d6e7a76266697930e425333f14be6cff"
+
+ ;; ============================================================================
+ ;; 1. Problem Statement & Empirical Root Causes
+ ;; ============================================================================
+ :bip/problem-statement
+ {:root-causes
+  [{:id "RC-CONTAG-1"
+    :title "Live 6-validator Devnet still running N=3 Contagion sample parameters (E=2/2, R=2/1, D=2/2)"
+    :detail "Even though `config/devnet-6-config` (`E=5/4, R=5/2, D=5/4, murmur-k=5`) was defined in `src/bitecho/config.cljc`, `mesh/build-initial-node-state` selected `config/devnet-config` (`E=2/2`) whenever `:network` was `:devnet`, and `scripts/cluster.sh` omitted Contagion sample parameters from the rendered `:protocol` block."}
+   {:id "RC-CONTAG-2"
+    :title "Unclamped Contagion thresholds stall delivery when active Basalt view is smaller than configured sample size"
+    :detail "In `src/bitecho/state_machine.cljc`, `handle-receive-sieve-echo` and `handle-receive-contagion-ready` compared vote counts against raw `(:echo-threshold cfg)`, `(:ready-threshold cfg)`, and `(:delivery-threshold cfg)`. When `|active-sample| < threshold` (e.g. during cold boot, transient peer drop, or `mainnet-config` with `D-hat=17` on a cluster of `N <= 17`), Contagion delivery stalled permanently."}
+   {:id "RC-CONTAG-3"
+    :title "Unbounded `:contagion-known-ids` growth in `contagion/generate-summary` on every tick"
+    :detail "In `src/bitecho/state_machine.cljc`, `:tick` passed the entire historical `:contagion-known-ids` set to `contagion/generate-summary`, causing anti-entropy summary payloads to grow linearly with node uptime."}
+   {:id "RC-SOAK-1"
+    :title "BUG-SOAK-01: Per-request `HttpClient` instantiation across 15 shell call sites leaks SelectorManager threads and ephemeral sockets"
+    :detail "Creating a new `java.net.http.HttpClient` per request across `light_node.clj`, `http.clj`, `infra.clj`, `upnp.clj`, and `acme.clj` spawned a new `HttpClient-N-SelectorManager` thread and connection pool on every poll/submit/control call, exhausting ephemeral ports after ~30 minutes of continuous daemon soak."}
+   {:id "RC-SOAK-2"
+    :title "BUG-SOAK-02 & BUG-SOAK-03: Qualified `<domain>/<nickname>` directory lookup rejection and missing `artifact-put` relay auto-fallback / `K_vector` allowlist"
+    :detail "`directory-lookup` and `directory-verify` rejected qualified names like `bitecho.org/vector` via `valid-petname?`; `handle-serve-line!` did not fall back to bootstrap relay URL when `conn-opts` omitted `:relay-url`; and `default-infra-policy` omitted `K_vector` from `doc-blog-signers`."}
+   {:id "RC-SOAK-3"
+    :title "DIAG-SOAK-03, B7 & P-LEG-1: 208 KB UDP `SO_RCVBUF` burst drops, redundant canonical snapshot disk writes, and unverified `:p2p-link-bind` wire handling"
+    :detail "Default OS UDP receive buffers (212992 bytes) dropped bursts under 6-node + 4-agent traffic; `persistence/save-state-to-disk` re-encoded and rewrote unchanged snapshots on every save; and `light-core/handle-wire-payload` lacked a `:p2p-link-bind` handler to gate relay P2P leg opening on cryptographic signature verification."}]}
+
+ ;; ============================================================================
+ ;; 2. Architectural Pillars & Deliverables
+ ;; ============================================================================
+ :bip/pillars
+ {:P-CONTAG-1
+  {:title "Live 6-Validator Devnet on `devnet-6-config` (`E=5/4, R=5/2, D=5/4, murmur-k=5`) via Both Routes"
+   :files ["src/bitecho/shell/mesh.clj"
+           "scripts/cluster.sh"]
+   :changes
+   ["In `mesh/build-initial-node-state`: when `explicit-network` is `:devnet` and `(>= (max (count nodes-cfg) (count validators)) 6)`, automatically select `(config/devnet-6-config)` as `base-proto-cfg`."
+    "In `mesh/rebind-restored-state`: when restoring a `:devnet` snapshot on a `>= 6`-validator cluster whose persisted config still has legacy `:echo-sample-size 2`, automatically upgrade the base Contagion sample parameters to `devnet-6-config` before merging explicit `:protocol` overrides."
+    "In `scripts/cluster.sh`: render `:murmur-k 5 :echo-sample-size 5 :echo-threshold 4 :ready-sample-size 5 :ready-threshold 2 :delivery-sample-size 5 :delivery-threshold 4` in `:protocol`."]}
+
+  :P-CONTAG-2
+  {:title "Pure Adaptive Sample-Threshold Clamping (`effective-sample-threshold`)"
+   :files ["src/bitecho/state_machine.cljc"]
+   :changes
+   ["Add pure public `(effective-sample-threshold configured-sample-size configured-threshold active-sample-count)` clamping thresholds proportionally to `max(1, min(|active-sample|, ceil((T_hat / S) * |active-sample|)))` when `1 <= |active-sample| < S`, while preserving exact `T_hat` when `|active-sample| >= S` or `|active-sample| = 0`."
+    "Wire `effective-sample-threshold` into `handle-receive-sieve-echo` (`E-hat`) and `handle-receive-contagion-ready` (`R-hat` and `D-hat`)."]}
+
+  :P-CONTAG-3
+  {:title "Mainnet Small-N Contagion Stall Guard & Startup Diagnostic"
+   :files ["src/bitecho/shell/mesh.clj"
+           "src/bitecho/state_machine.cljc"]
+   :changes
+   ["Add pure `(mesh/validate-contagion-config proto-cfg validator-count)` emitting a structured `:contagion-threshold-clamped` diagnostic whenever raw `:delivery-threshold > N - 1`, while adaptive clamping ensures Contagion delivery remains reachable for any honest quorum."]}
+
+  :P-CONTAG-4
+  {:title "Bounded Trailing-Epoch Window for `contagion/generate-summary`"
+   :files ["src/bitecho/config.cljc"
+           "src/bitecho/contagion/core.cljc"
+           "src/bitecho/state_machine.cljc"]
+   :changes
+   ["Add `:contagion-summary-window-epochs 16` to `config/default-config`."
+    "Extend `contagion/generate-summary` with an optional 4th argument `max-ids-or-filter`."
+    "In `state-machine/handle-tick`, filter `:contagion-known-ids` to message IDs within the trailing `:contagion-summary-window-epochs` using `:message-epochs` (falling back to all `:contagion-known-ids` when `:message-epochs` is empty)."]}
+
+  :P-SOAK-1
+  {:title "BUG-SOAK-01: Shared Process-Wide `HttpClient` Across All 15 Shell Call Sites"
+   :files ["src/bitecho/shell/light_node.clj"
+           "src/bitecho/shell/http.clj"
+           "src/bitecho/shell/infra.clj"
+           "src/bitecho/shell/upnp.clj"
+           "src/bitecho/shell/acme.clj"]
+   :changes
+   ["Expose shared daemon-executor `default-http-client` and `default-http11-client` in `bitecho.shell.light-node` and `bitecho.shell.http` (plus shared `delay` clients in `upnp.clj` and `acme.clj`), replacing all 15 per-request `HttpClient/newBuilder` and `HttpClient/newHttpClient` sites while supporting optional `:http-client` in `opts` for test injection."]}
+
+  :P-SOAK-2
+  {:title "BUG-SOAK-02: Qualified `<domain>/<nickname>` Support in `directory-lookup`, `directory-verify`, and `directory-register`"
+   :files ["src/bitecho/light_node/cli.cljc"
+           "src/bitecho/light_node/core.cljc"
+           "src/bitecho/shell/light_node.clj"]
+   :changes
+   ["Accept both `--nickname` and `--name` in `cli.cljc` and `core.cljc`, splitting qualified `<domain>/<nickname>` strings (e.g. `bitecho.org/vector`) into `:domain` and `:nickname` across `build-cmd-map`, `exec-directory-lookup`, `exec-directory-verify`, `exec-directory-register`, and `fetch-directory-descriptor!`."]}
+
+  :P-SOAK-3
+  {:title "BUG-SOAK-03 & P-SOAK-6: Auto-Relay Fallback on `artifact-put` / `serve` Signaling, Cross-Root-Subnet Wildcard Outer Gossip & `K_vector` Allowlist"
+   :files ["src/bitecho/shell/light_node.clj"
+           "src/bitecho/node_main.cljs"
+           "src/bitecho/light_node/core.cljc"
+           "src/bitecho/config.cljc"
+           "src/bitecho/shell/infra.clj"]
+   :changes
+   ["In `handle-serve-line!` (`light_node.clj` and `node_main.cljs`), fall back `relay-url` to bootstrap relay URL (`infer-bootstrap-relay-url` / `https://ns1.bitecho.org` when bootstrap domain is `bitecho.org`) and mirror non-direct outbound envelopes from `handle-serve-line!` and `run-serve!` relay-poll responses to `relay-url`."
+    "In `exec-offer` and `exec-accept` (`light_node/core.cljc`), use wildcard `\"*\"` outer gossip `:subnet-id` for burn-bearing root-subnet signaling envelopes, and recognize `\"bitecho.org\"` and `\"devnet.bitecho.org\"` as equivalent root subnets in `config/equivalent-subnet-id?`."
+    "Add `k-vector-agent-pubkey` / `K_vector` (`302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62`) and `default-dev-signers` to `bitecho.shell.infra/default-infra-policy`."]}
+
+  :P-SOAK-4
+  {:title "DIAG-SOAK-03: 4 MB (`4194304`) `SO_RCVBUF` on Light-Node & DNS UDP Sockets"
+   :files ["src/bitecho/shell/light_node.clj"
+           "src/bitecho/shell/dns.clj"]
+   :changes
+   ["Add `(configure-udp-receive-buffer! target rcvbuf-bytes)` in `bitecho.shell.light-node` setting `StandardSocketOptions/SO_RCVBUF` to 4 MB (`4194304`) on UDP `DatagramChannel`s and `DatagramSocket`s across `query-validator-chain-state!`, `dial-single-node!`, `dial-p2p-peer!`, `start-ingress-tcp-listener!`, and `dns/start-dns-server!`."]}
+
+  :P-SOAK-5
+  {:title "B7: Dirty-Gated Non-Canonical Local Snapshot Persistence"
+   :files ["src/bitecho/shell/persistence.clj"]
+   :changes
+   ["Track last-saved stripped state and per-path metrics (`persistence-stats`: `:saved-count`, `:skipped-clean`) in `bitecho.shell.persistence/save-state-to-disk`, skipping redundant disk rewrites when stripped state is unchanged and encoding with non-canonical fast Fressian while `load-state-from-disk` decodes both canonical and standard Fressian."]}
+
+  :P-LEG-1
+  {:title "Verified `:p2p-link-bind` Wire Gate Before Opening Relay P2P Leg"
+   :files ["src/bitecho/light_node/core.cljc"]
+   :changes
+   ["Add `handle-wire-p2p-link-bind` to `light-core/handle-wire-payload`: verify Ed25519 signature over `bitecho-p2p-link-bind-v1|<sender>|<session-id>` and verify `<sender>` matches the open session's `:peer` before transitioning the session P2P state to `:open` (`:connected? true :zero-burn? true`); reject invalid/forged link-binds with counted `[:diagnostics :p2p-link-bind-rejected]` and diagnostic event (Rule 5)."]}}
+
+ ;; ============================================================================
+ ;; 3. Generative test.check Properties & Oracle Receipts (Rules 1, 3, 6)
+ ;; ============================================================================
+ :bip/defspec-vars
+ ["bitecho.d34-bip008-contagion-and-soak-test/prop-contagion-delivery-reachable-when-view-smaller-than-sample"
+  "bitecho.d34-bip008-contagion-and-soak-test/prop-threshold-clamp-never-exceeds-active-view"
+  "bitecho.d34-bip008-contagion-and-soak-test/prop-devnet-6-preset-selected-on-six-validator-boot"
+  "bitecho.d34-bip008-contagion-and-soak-test/prop-mainnet-config-never-stalls-delivery-at-small-N"
+  "bitecho.d34-bip008-contagion-and-soak-test/prop-shared-http-client-single-selector-manager"
+  "bitecho.d34-bip008-contagion-and-soak-test/prop-relay-leg-opens-only-after-verified-link-bind"]
+
+ :bip/oracle-receipts
+ {:test-suite "bitecho.d34-bip008-contagion-and-soak-test"
+  :d34-tests-run 12
+  :d34-assertions 43
+  :d34-failures 0
+  :d34-errors 0
+  :full-suite-tests-run 741
+  :full-suite-assertions 6833
+  :full-suite-failures 0
+  :full-suite-errors 0
+  :cljfmt-status :clean
+  :clj-kondo-errors 0
+  :clj-kondo-warnings 0
+  :reproducible-node-bundle-sha256 "58668d58a5c35e0bf624ea4a5d4c5176c8dcda360801578499087ca49c8b46d6"
+  :reproducible-browser-bundle-sha256 "5b89655a5a4e68fd1861c3030972ed490c49bc97f843b08c4e983864dd4030c8"}
+
+ :bip/invariant-diff
+ {:added [:invariant/adaptive-contagion-sample-threshold-clamp
+          :invariant/devnet-6-auto-preset-selection-and-snapshot-upgrade
+          :invariant/bounded-trailing-epoch-contagion-summary-window
+          :invariant/process-wide-shared-http-client-single-selector-manager
+          :invariant/qualified-domain-nickname-directory-resolution
+          :invariant/verified-p2p-link-bind-gate-with-counted-rejection-diagnostics
+          :invariant/dirty-gated-non-canonical-local-snapshot-persistence]
+  :modified [:invariant/contagion-quorum-threshold-evaluation]
+  :removed []}
+
+ :bip/jurisdiction-map
+ {:core {:namespaces ["bitecho.config"
+                      "bitecho.contagion.core"
+                      "bitecho.state-machine"
+                      "bitecho.light-node.cli"
+                      "bitecho.light-node.core"
+                      "bitecho.light-node.mcp"]
+         :pure-sans-io? true}
+  :shell {:namespaces ["bitecho.shell.mesh"
+                       "bitecho.shell.light-node"
+                       "bitecho.shell.http"
+                       "bitecho.shell.infra"
+                       "bitecho.shell.persistence"
+                       "bitecho.shell.dns"
+                       "bitecho.shell.upnp"
+                       "bitecho.shell.acme"
+                       "bitecho.node-main"
+                       "bitecho.browser-main"]
+          :single-authority-lifecycle? true
+          :zero-silent-failures? true}}
+
+ :bip/human-anchor-sunset 26280}

@@ -65,6 +65,9 @@
      (try
        (let [udp-channel (DatagramChannel/open)
              _ (.setOption udp-channel StandardSocketOptions/SO_REUSEADDR true)
+             _ (try
+                 (.setOption udp-channel StandardSocketOptions/SO_RCVBUF (Integer/valueOf (int 4194304)))
+                 (catch Throwable _ nil))
              _ (.bind udp-channel (InetSocketAddress. ^String bind-host bind-port))
              bound-udp-port (.getPort ^InetSocketAddress (.getLocalAddress udp-channel))
              tcp-socket (ServerSocket.)
