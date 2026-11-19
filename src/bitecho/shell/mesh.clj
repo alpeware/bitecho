@@ -1556,6 +1556,7 @@
 ;; ---------------------------------------------------------------------------
 
 (declare init-datachannel-peer!)
+(declare build-validator-chain-state-snapshot)
 
 (defn create-peer-datachannel-node
   "Constructs a DataChannel node map using persistent DTLS cert-data and deterministic ICE credentials,
@@ -1865,7 +1866,34 @@
                                  (if-not (map? msg)
                                    (apply-mesh-conn-event! peer-conns peer-hex
                                                            {:type :invalid-frame :generation next-gen :node node :peer pid :error "malformed-peer-frame"})
-                                   (when-not (= :keepalive (:type msg))
+                                   (case (:type msg)
+                                     :keepalive nil
+                                     :peer-chain-state-query
+                                     (try
+                                       (let [st (when-let [sa (:state-atom shell-node)] @sa)
+                                             tpk (:target-pubkey msg)
+                                             n (:nonce msg)
+                                             snap (when (and (map? st) (seq st) tpk)
+                                                    (build-validator-chain-state-snapshot st identity tpk n))
+                                             cid (or (:channel-id evt) (conn-channel-id updated) 0)]
+                                         (when (and (map? snap) (string? (:signature snap)))
+                                           (api/send! node
+                                                      (fressian/encode-wire {:type :peer-chain-state-response
+                                                                             :target-pubkey tpk
+                                                                             :nonce (or n "")
+                                                                             :snapshot snap})
+                                                      cid)))
+                                       (catch Exception _ nil))
+                                     :peer-chain-state-response
+                                     (try
+                                       (when-let [w-atom (:peer-snapshot-waiters ctx)]
+                                         (let [k [(:target-pubkey msg) (or (:nonce msg) "")]
+                                               snap (:snapshot msg)]
+                                           (when-let [waiter (and (map? snap) (get @w-atom k))]
+                                             (let [snaps (swap! (:snapshots-atom waiter) conj snap)]
+                                               (when (>= (count snaps) (long (or (:target-count waiter) 5)))
+                                                 (deliver (:done-promise waiter) true))))))
+                                       (catch Exception _ nil))
                                      (let [event (assoc msg
                                                         :sender peer-hex
                                                         :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
@@ -1961,6 +1989,42 @@
         (log-mesh-error "build-validator-chain-state-snapshot: missing sign-fn or val-priv"
                         (ex-info "Cannot sign snapshot" {:has-sign-fn? (boolean sign-fn) :has-priv? (boolean val-priv)}))
         nil))))
+
+(defn query-peer-validators-chain-state!
+  "Queries connected validator peers over the persistent in-band `peer-conns` mesh
+   for signed chain-state snapshots of `target-pubkey` with `nonce` (`P-NET-1`).
+   Returns vector of signed snapshots collected within `timeout-ms` (default 800ms)."
+  ([vnode target-pubkey nonce]
+   (query-peer-validators-chain-state! vnode target-pubkey nonce 800))
+  ([vnode target-pubkey nonce timeout-ms]
+   (let [pconns-atom (:peer-conns vnode)
+         w-atom (:peer-snapshot-waiters vnode)
+         open-conns (when (instance? clojure.lang.IDeref pconns-atom)
+                      (->> (vals @pconns-atom)
+                           (filter (fn [c] (and (= :open (:phase c)) (:node c))))
+                           vec))]
+     (if-not (and target-pubkey (instance? clojure.lang.IAtom w-atom) (seq open-conns))
+       []
+       (let [n-str (str (or nonce ""))
+             k [target-pubkey n-str]
+             snaps-atom (atom [])
+             done-prom (promise)
+             target-cnt (count open-conns)
+             payload (fressian/encode-wire {:type :peer-chain-state-query
+                                            :target-pubkey target-pubkey
+                                            :nonce n-str})]
+         (swap! w-atom assoc k {:snapshots-atom snaps-atom
+                                :done-promise done-prom
+                                :target-count target-cnt})
+         (try
+           (doseq [c open-conns]
+             (try
+               (api/send! (:node c) payload (or (conn-channel-id c) 0))
+               (catch Exception _ nil)))
+           (deref done-prom (long (or timeout-ms 800)) false)
+           @snaps-atom
+           (finally
+             (swap! w-atom dissoc k))))))))
 
 (defn make-agent-connection-handler
   "Returns a connection handler function for an incoming agent node.
@@ -2317,6 +2381,7 @@
          shell-node (start-node initial-state snapshot-file {:persist? (get opts :persist? true)})
          peer-conns (atom {})
          agent-conns (atom {})
+         peer-snapshot-waiters (atom {})
          cluster-cfg (get config :cluster {})
          nodes-cfg (get cluster-cfg :nodes {})
          sorted-ids (vec (sort-by name (keys nodes-cfg)))
@@ -2327,6 +2392,7 @@
               :shell-node shell-node
               :peer-conns peer-conns
               :agent-conns agent-conns
+              :peer-snapshot-waiters peer-snapshot-waiters
               :in-mem-bus in-memory-bus
               :node-idx node-idx
               :nodes-cfg nodes-cfg}]
@@ -2356,6 +2422,7 @@
                      :state-atom (:state-atom shell-node)
                      :peer-conns peer-conns
                      :agent-conns agent-conns
+                     :peer-snapshot-waiters peer-snapshot-waiters
                      :http-server http-server
                      :ticker-executor ticker
                      :agent-listener agent-listener

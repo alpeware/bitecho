@@ -531,15 +531,30 @@
                                          (and local-val-pk
                                               (= local-val-pk (light-core/normalize-pubkey-hex (:pubkey node))))))
                                vec)
-             http-snaps (->> remote-nodes
+             mesh-peer-snaps (when (and vnode target-pubkey)
+                               (try
+                                 (when-let [q-fn (requiring-resolve 'bitecho.shell.mesh/query-peer-validators-chain-state!)]
+                                   (->> (q-fn vnode target-pubkey nonce 800)
+                                        (keep normalize-http-chain-state-snapshot)
+                                        vec))
+                                 (catch Exception _ nil)))
+             mesh-pks (set (keep #(light-core/normalize-pubkey-hex (:validator-pubkey %)) mesh-peer-snaps))
+             http-target-nodes (filterv #(not (contains? mesh-pks (light-core/normalize-pubkey-hex (:pubkey %))))
+                                        remote-nodes)
+             http-snaps (->> http-target-nodes
                              (pmap #(query-peer-http-local-snapshot! % target-pubkey nonce))
                              (filterv some?))
              collected-snaps (cond-> []
                                local-snap (conj local-snap)
+                               (seq mesh-peer-snaps) (into mesh-peer-snaps)
                                (seq http-snaps) (into http-snaps))
              collected-pks (set (keep #(light-core/normalize-pubkey-hex (:validator-pubkey %)) collected-snaps))
-             remaining-nodes (filterv #(not (contains? collected-pks (light-core/normalize-pubkey-hex (:pubkey %))))
-                                      remote-nodes)
+             total-n (max 1 (count (:nodes bootstrap)))
+             quorum-target (long (Math/ceil (/ (* 2.0 total-n) 3.0)))
+             remaining-nodes (if (>= (count collected-pks) quorum-target)
+                               []
+                               (filterv #(not (contains? collected-pks (light-core/normalize-pubkey-hex (:pubkey %))))
+                                        remote-nodes))
              ident (or (:peer-identity rt)
                        (when (:state-dir rt)
                          (try
