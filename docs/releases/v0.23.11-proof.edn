@@ -294,11 +294,11 @@
    {:scenario "S24",
     :name "sea-build-script-and-skill-regrounding",
     :passed? true}]},
- :commit-sha "fbe72c136067cfe80b83ee6e63800763f9c0faa8",
+ :commit-sha "1fa7c5bfa7424583576a498de667ccb47b2c5aef",
  :version "v0.23.11",
  :browser-bundle-sha256
  "f876ea795e240af0553cfbd0d359e8ea12c2acdddccd45f6cfe239a77e255984",
- :tree-sha "4ebb7981bd06785719eef63c2f2749c90bd92259",
+ :tree-sha "cddc4fafdbd7aa25da19b91b2632dadfd1117259",
  :d28-remediation-scenarios
  {:all-passed? true,
   :count 5,
