@@ -2,6 +2,7 @@
   "Test runner for Bitecho"
   (:require [bitecho.anchor-webauthn-test]
             [bitecho.basalt.core-test]
+            [bitecho.browser-cli-and-webrtc-diagnostics-test]
             [bitecho.contagion.core-test]
             [bitecho.core.anchoring-test]
             [bitecho.core.data-test]

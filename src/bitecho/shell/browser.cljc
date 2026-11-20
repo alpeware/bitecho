@@ -20,6 +20,10 @@
 ;; Rule 4 & Rule 5 Single-Authority Connection Lifecycle State Machine
 ;; =============================================================================
 
+(def max-diagnostic-events
+  "Maximum number of diagnostic lifecycle events retained in bounded ring buffers."
+  64)
+
 (def initial-diagnostics
   "Initial zero-value diagnostics structure."
   {:phase :idle
@@ -31,8 +35,31 @@
    :background-throttled-events 0
    :ice-disconnects 0
    :ice-reconnects 0
+   :close-count 0
+   :dial-failures 0
    :last-ice-state nil
-   :last-connection-state nil})
+   :last-connection-state nil
+   :event-seq 0
+   :recent-events []})
+
+(defn- append-ring-event
+  "Appends an entry to a bounded vector ring buffer (retaining at most `max-events` entries)."
+  [events entry max-events]
+  (let [cap (max 1 (long (or max-events max-diagnostic-events)))
+        v (conj (vec (or events [])) entry)
+        n (count v)]
+    (if (> n cap)
+      (subvec v (- n cap) n)
+      v)))
+
+(defn- record-conn-diagnostic-event
+  "Records a compact diagnostic event into `[:diagnostics :recent-events]` with monotonic `:event-seq`."
+  [conn entry]
+  (let [next-seq (inc (long (or (get-in conn [:diagnostics :event-seq]) 0)))
+        tagged (assoc entry :seq next-seq)]
+    (-> conn
+        (assoc-in [:diagnostics :event-seq] next-seq)
+        (update-in [:diagnostics :recent-events] append-ring-event tagged max-diagnostic-events))))
 
 (defn- normalize-rtc-state
   [s]
@@ -46,13 +73,14 @@
 
 (defn classify-ice-transition
   "Pure helper classifying WebRTC ICE connection state transitions for Rule 5 diagnostics.
-   Returns `:ice-disconnected`, `:ice-failed`, `:ice-reconnected`, or `nil`."
+   Returns `:ice-disconnected`, `:ice-failed`, `:ice-closed`, `:ice-reconnected`, or `nil`."
   [prev-ice-state next-ice-state]
   (let [prev-s (normalize-rtc-state prev-ice-state)
         next-s (normalize-rtc-state next-ice-state)]
     (cond
       (= next-s "disconnected") :ice-disconnected
       (= next-s "failed") :ice-failed
+      (= next-s "closed") :ice-closed
       (and (contains? #{"connected" "completed"} next-s)
            (contains? #{"disconnected" "failed"} prev-s)) :ice-reconnected
       :else nil)))
@@ -64,7 +92,7 @@
    :generation 0
    :peer-id (:peer-id opts)
    :subnet-id (or (:subnet-id opts) "global")
-   :visibility-state "visible"
+   :visibility-state (or (:visibility-state opts) "visible")
    :channel nil
    :transport nil
    :diagnostics initial-diagnostics})
@@ -87,26 +115,46 @@
                     :dropped 0
                     :ignored-stale 0
                     :unsupported-format-dropped 0
-                    :background-throttled-events 0}}
+                    :background-throttled-events 0
+                    :ice-disconnects 0
+                    :ice-reconnects 0
+                    :close-count 0
+                    :dial-failures 0
+                    :last-ice-state nil
+                    :last-connection-state nil
+                    :event-seq 0
+                    :recent-events []}}
 
    Enforces:
    - Rule 4: Single authority, effects executed outside reducer.
    - Rule 5: Stale generations (gen < current) ignored with counted :diagnose effect.
-   - Zero silent failures: all drops, dial failures, and wire rejections emit :diagnose."
+   - Zero silent failures: all drops, dial failures, closes, ICE failures, and wire rejections emit :diagnose."
   [conn event]
   (let [event-gen (:generation event)
         curr-gen (:generation conn 0)
+        ts-ms (:timestamp-ms event)
+        peer-id (or (:peer-id event) (:peer-id conn))
         is-stale? (and (some? event-gen) (< (long event-gen) (long curr-gen)))]
     (if is-stale?
       ;; Rule 4 & 5: Stale callback ignored. Increment :ignored-stale, emit counted :diagnose.
-      (let [new-conn (-> conn
+      (let [diag-effect (cond-> {:type :diagnose
+                                 :kind :ignored-stale
+                                 :peer-id peer-id
+                                 :event event
+                                 :current-gen curr-gen
+                                 :event-gen event-gen}
+                          ts-ms (assoc :timestamp-ms ts-ms))
+            new-conn (-> conn
                          (update-in [:diagnostics :ignored-stale] (fnil inc 0))
-                         (assoc-in [:diagnostics :last-error] "stale-generation-event"))
-            diag-effect {:type :diagnose
-                         :kind :ignored-stale
-                         :event event
-                         :current-gen curr-gen
-                         :event-gen event-gen}]
+                         (assoc-in [:diagnostics :last-error] "stale-generation-event")
+                         (record-conn-diagnostic-event
+                          (cond-> {:kind :ignored-stale
+                                   :peer-id peer-id
+                                   :generation curr-gen
+                                   :event-gen event-gen
+                                   :phase (:phase conn)
+                                   :reason "stale-generation-event"}
+                            ts-ms (assoc :timestamp-ms ts-ms))))]
         [new-conn [diag-effect]])
 
       ;; Current or new generation
@@ -137,17 +185,29 @@
 
         :dial-failed
         (let [err (or (:error event) "dial-failed")
-              new-conn (assoc conn
-                              :phase :closed
-                              :channel nil
-                              :transport nil
-                              :diagnostics (assoc (:diagnostics conn)
-                                                  :phase :closed
-                                                  :last-error err))
-              diag-effect {:type :diagnose
-                           :kind :dial-failed
-                           :error err
-                           :generation curr-gen}]
+              new-conn (-> conn
+                           (assoc :phase :closed
+                                  :channel nil
+                                  :transport nil)
+                           (update :diagnostics
+                                   (fn [d]
+                                     (-> d
+                                         (assoc :phase :closed
+                                                :last-error err)
+                                         (update :dial-failures (fnil inc 0)))))
+                           (record-conn-diagnostic-event
+                            (cond-> {:kind :dial-failed
+                                     :peer-id peer-id
+                                     :generation curr-gen
+                                     :phase :closed
+                                     :reason err}
+                              ts-ms (assoc :timestamp-ms ts-ms))))
+              diag-effect (cond-> {:type :diagnose
+                                   :kind :dial-failed
+                                   :peer-id peer-id
+                                   :error err
+                                   :generation curr-gen}
+                            ts-ms (assoc :timestamp-ms ts-ms))]
           [new-conn [diag-effect]])
 
         :open
@@ -169,20 +229,32 @@
 
         :close
         (let [cause (or (:cause event) "closed")
-              new-conn (assoc conn
-                              :phase :closed
-                              :channel nil
-                              :transport nil
-                              :diagnostics (assoc (:diagnostics conn)
-                                                  :phase :closed
-                                                  :last-error cause))
+              new-conn (-> conn
+                           (assoc :phase :closed
+                                  :channel nil
+                                  :transport nil)
+                           (update :diagnostics
+                                   (fn [d]
+                                     (-> d
+                                         (assoc :phase :closed
+                                                :last-error cause)
+                                         (update :close-count (fnil inc 0)))))
+                           (record-conn-diagnostic-event
+                            (cond-> {:kind :closed
+                                     :peer-id peer-id
+                                     :generation curr-gen
+                                     :phase :closed
+                                     :reason cause}
+                              ts-ms (assoc :timestamp-ms ts-ms))))
               effects [{:type :close-transport
                         :transport (:transport conn)
                         :cause cause}
-                       {:type :diagnose
-                        :kind :closed
-                        :cause cause
-                        :generation curr-gen}]]
+                       (cond-> {:type :diagnose
+                                :kind :closed
+                                :peer-id peer-id
+                                :cause cause
+                                :generation curr-gen}
+                         ts-ms (assoc :timestamp-ms ts-ms))]]
           [new-conn effects])
 
         :send
@@ -191,12 +263,22 @@
             ;; Rule 5: Dropped send when connection is not open
             (let [new-conn (-> conn
                                (update-in [:diagnostics :dropped] (fnil inc 0))
-                               (assoc-in [:diagnostics :last-error] "connection-not-open"))
-                  diag-effect {:type :diagnose
-                               :kind :dropped
-                               :reason "connection-not-open"
-                               :envelope env
-                               :phase (:phase conn)}]
+                               (assoc-in [:diagnostics :last-error] "connection-not-open")
+                               (record-conn-diagnostic-event
+                                (cond-> {:kind :dropped
+                                         :peer-id peer-id
+                                         :generation curr-gen
+                                         :phase (:phase conn)
+                                         :reason "connection-not-open"}
+                                  ts-ms (assoc :timestamp-ms ts-ms))))
+                  diag-effect (cond-> {:type :diagnose
+                                       :kind :dropped
+                                       :peer-id peer-id
+                                       :reason "connection-not-open"
+                                       :envelope env
+                                       :phase (:phase conn)
+                                       :generation curr-gen}
+                                ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
             ;; Open: emit wire envelope
             [conn [{:type :emit
@@ -213,23 +295,41 @@
             ;; Dropped: message received while not open
             (let [new-conn (-> conn
                                (update-in [:diagnostics :dropped] (fnil inc 0))
-                               (assoc-in [:diagnostics :last-error] "message-received-when-not-open"))
-                  diag-effect {:type :diagnose
-                               :kind :dropped
-                               :reason "message-received-when-not-open"
-                               :generation curr-gen}]
+                               (assoc-in [:diagnostics :last-error] "message-received-when-not-open")
+                               (record-conn-diagnostic-event
+                                (cond-> {:kind :dropped
+                                         :peer-id peer-id
+                                         :generation curr-gen
+                                         :phase (:phase conn)
+                                         :reason "message-received-when-not-open"}
+                                  ts-ms (assoc :timestamp-ms ts-ms))))
+                  diag-effect (cond-> {:type :diagnose
+                                       :kind :dropped
+                                       :peer-id peer-id
+                                       :reason "message-received-when-not-open"
+                                       :generation curr-gen}
+                                ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
 
             (not fmt-supported?)
             ;; Rule 5: Unsupported wire format dropped with counted diagnostic
             (let [new-conn (-> conn
                                (update-in [:diagnostics :unsupported-format-dropped] (fnil inc 0))
-                               (assoc-in [:diagnostics :last-error] "unsupported-wire-format"))
-                  diag-effect {:type :diagnose
-                               :kind :unsupported-format
-                               :wire-format wire-fmt
-                               :reason "unsupported-wire-format"
-                               :generation curr-gen}]
+                               (assoc-in [:diagnostics :last-error] "unsupported-wire-format")
+                               (record-conn-diagnostic-event
+                                (cond-> {:kind :unsupported-format
+                                         :peer-id peer-id
+                                         :generation curr-gen
+                                         :phase (:phase conn)
+                                         :reason "unsupported-wire-format"}
+                                  ts-ms (assoc :timestamp-ms ts-ms))))
+                  diag-effect (cond-> {:type :diagnose
+                                       :kind :unsupported-format
+                                       :peer-id peer-id
+                                       :wire-format wire-fmt
+                                       :reason "unsupported-wire-format"
+                                       :generation curr-gen}
+                                ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
 
             :else
@@ -254,26 +354,48 @@
               kind (classify-ice-transition prev-ice norm-state)
               base-conn (assoc-in conn [:diagnostics :last-ice-state] norm-state)]
           (case kind
-            (:ice-disconnected :ice-failed)
+            (:ice-disconnected :ice-failed :ice-closed)
             (let [new-conn (-> base-conn
                                (update-in [:diagnostics :ice-disconnects] (fnil inc 0))
-                               (assoc-in [:diagnostics :last-error] (name kind)))
-                  diag-effect {:type :diagnose
-                               :kind kind
-                               :ice-state norm-state
-                               :prev-ice-state prev-ice
-                               :generation curr-gen}]
+                               (assoc-in [:diagnostics :last-error] (name kind))
+                               (record-conn-diagnostic-event
+                                (cond-> {:kind kind
+                                         :peer-id peer-id
+                                         :generation curr-gen
+                                         :phase (:phase base-conn)
+                                         :ice-state norm-state
+                                         :prev-ice-state prev-ice
+                                         :reason (name kind)}
+                                  ts-ms (assoc :timestamp-ms ts-ms))))
+                  diag-effect (cond-> {:type :diagnose
+                                       :kind kind
+                                       :peer-id peer-id
+                                       :ice-state norm-state
+                                       :prev-ice-state prev-ice
+                                       :generation curr-gen}
+                                ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
 
             :ice-reconnected
             (let [new-conn (-> base-conn
                                (update-in [:diagnostics :ice-reconnects] (fnil inc 0))
-                               (assoc-in [:diagnostics :last-error] nil))
-                  diag-effect {:type :diagnose
-                               :kind :ice-reconnected
-                               :ice-state norm-state
-                               :prev-ice-state prev-ice
-                               :generation curr-gen}]
+                               (assoc-in [:diagnostics :last-error] nil)
+                               (record-conn-diagnostic-event
+                                (cond-> {:kind :ice-reconnected
+                                         :peer-id peer-id
+                                         :generation curr-gen
+                                         :phase (:phase base-conn)
+                                         :ice-state norm-state
+                                         :prev-ice-state prev-ice
+                                         :reason "ice-reconnected"}
+                                  ts-ms (assoc :timestamp-ms ts-ms))))
+                  diag-effect (cond-> {:type :diagnose
+                                       :kind :ice-reconnected
+                                       :peer-id peer-id
+                                       :ice-state norm-state
+                                       :prev-ice-state prev-ice
+                                       :generation curr-gen}
+                                ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
 
             [base-conn []]))
@@ -282,25 +404,198 @@
         (let [prev-cs (get-in conn [:diagnostics :last-connection-state])
               norm-state (normalize-rtc-state (:connection-state event))
               base-conn (assoc-in conn [:diagnostics :last-connection-state] norm-state)]
-          (if (contains? #{"disconnected" "failed"} norm-state)
-            (let [kind (if (= norm-state "failed") :connection-failed :connection-disconnected)
-                  new-conn (assoc-in base-conn [:diagnostics :last-error] (name kind))
-                  diag-effect {:type :diagnose
-                               :kind kind
-                               :connection-state norm-state
-                               :prev-connection-state prev-cs
-                               :generation curr-gen}]
+          (if (contains? #{"disconnected" "failed" "closed"} norm-state)
+            (let [kind (case norm-state
+                         "failed" :connection-failed
+                         "closed" :connection-closed
+                         :connection-disconnected)
+                  new-conn (-> base-conn
+                               (assoc-in [:diagnostics :last-error] (name kind))
+                               (record-conn-diagnostic-event
+                                (cond-> {:kind kind
+                                         :peer-id peer-id
+                                         :generation curr-gen
+                                         :phase (:phase base-conn)
+                                         :connection-state norm-state
+                                         :prev-connection-state prev-cs
+                                         :reason (name kind)}
+                                  ts-ms (assoc :timestamp-ms ts-ms))))
+                  diag-effect (cond-> {:type :diagnose
+                                       :kind kind
+                                       :peer-id peer-id
+                                       :connection-state norm-state
+                                       :prev-connection-state prev-cs
+                                       :generation curr-gen}
+                                ts-ms (assoc :timestamp-ms ts-ms))]
               [new-conn [diag-effect]])
             [base-conn []]))
 
         ;; Fallback for unhandled events: count drop, emit diagnose
         (let [new-conn (-> conn
                            (update-in [:diagnostics :dropped] (fnil inc 0))
-                           (assoc-in [:diagnostics :last-error] "unknown-event"))
-              diag-effect {:type :diagnose
-                           :kind :unknown-event
-                           :event event}]
+                           (assoc-in [:diagnostics :last-error] "unknown-event")
+                           (record-conn-diagnostic-event
+                            (cond-> {:kind :unknown-event
+                                     :peer-id peer-id
+                                     :generation curr-gen
+                                     :phase (:phase conn)
+                                     :reason "unknown-event"}
+                              ts-ms (assoc :timestamp-ms ts-ms))))
+              diag-effect (cond-> {:type :diagnose
+                                   :kind :unknown-event
+                                   :peer-id peer-id
+                                   :event event
+                                   :generation curr-gen}
+                            ts-ms (assoc :timestamp-ms ts-ms))]
           [new-conn [diag-effect]])))))
+
+;; =============================================================================
+;; Single-Authority Multi-Peer Mesh Connection Registry (Rules 4 & 5)
+;; =============================================================================
+
+(defn initial-mesh-conns-state
+  "Initializes a single-authority multi-peer WebRTC connection registry.
+   Tracks EVERY validator/peer connection lifecycle (active AND closed/failed)
+   with a bounded diagnostic event ring buffer so peer losses are never silent."
+  [& [opts]]
+  {:peers {}
+   :visibility-state (or (:visibility-state opts) "visible")
+   :event-seq 0
+   :recent-events []
+   :max-events (max 1 (long (or (:max-events opts) max-diagnostic-events)))})
+
+(defn transition-mesh-peer
+  "Pure single-authority multi-peer reducer:
+   `(transition-mesh-peer mesh-conns peer-id event) -> [new-mesh-conns effects]`.
+   - Routes `event` through `transition-conn` for `peer-id`.
+   - NEVER `dissoc`s `peer-id` from `:peers` (preserving closed/failed diagnostics).
+   - Tags all emitted effects with `:peer-id` and appends `:diagnose` events into
+     the bounded mesh-wide `:recent-events` ring buffer."
+  [mesh-conns peer-id event]
+  (let [mesh0 (or mesh-conns (initial-mesh-conns-state))
+        pid (if (or (keyword? peer-id) (symbol? peer-id)) (name peer-id) (str peer-id))
+        vis (or (:visibility-state mesh0) "visible")
+        prev-conn (or (get-in mesh0 [:peers pid])
+                      (initial-conn-state {:peer-id pid :visibility-state vis}))
+        ev (assoc event :peer-id pid)
+        [next-conn raw-effects] (transition-conn prev-conn ev)
+        tagged-effects (mapv #(assoc % :peer-id pid) raw-effects)
+        diag-effects (filter #(= :diagnose (:type %)) tagged-effects)
+        max-ev (or (:max-events mesh0) max-diagnostic-events)
+        mesh1 (assoc-in mesh0 [:peers pid] next-conn)
+        mesh2 (reduce
+               (fn [m de]
+                 (let [next-seq (inc (long (or (:event-seq m) 0)))
+                       entry (cond-> {:seq next-seq
+                                      :peer-id pid
+                                      :kind (:kind de)
+                                      :generation (long (or (:generation de) (:generation next-conn) 0))
+                                      :phase (:phase next-conn)
+                                      :reason (or (:reason de) (:error de) (:cause de)
+                                                  (when (:kind de) (name (:kind de))))}
+                               (:ice-state de) (assoc :ice-state (:ice-state de))
+                               (:connection-state de) (assoc :connection-state (:connection-state de))
+                               (:event-gen de) (assoc :event-gen (:event-gen de))
+                               (:timestamp-ms de) (assoc :timestamp-ms (:timestamp-ms de)))]
+                   (-> m
+                       (assoc :event-seq next-seq)
+                       (update :recent-events append-ring-event entry max-ev))))
+               mesh1
+               diag-effects)]
+    [mesh2 tagged-effects]))
+
+(defn transition-mesh-visibility
+  "Propagates a document visibility change across all tracked peers in `mesh-conns`."
+  [mesh-conns vis-state]
+  (let [mesh0 (or mesh-conns (initial-mesh-conns-state))
+        norm-vis (if (= (str vis-state) "hidden") "hidden" "visible")
+        peer-ids (vec (keys (:peers mesh0)))]
+    (reduce
+     (fn [[m all-effs] pid]
+       (let [[m' effs] (transition-mesh-peer m pid {:type :visibility-change :state norm-vis})]
+         [m' (into all-effs effs)]))
+     [(assoc mesh0 :visibility-state norm-vis) []]
+     peer-ids)))
+
+(defn summarize-mesh-diagnostics
+  "Pure projection summarizing single-authority multi-peer connection diagnostics.
+   Surfaces aggregate counts, partitioned `:open-peers`/`:dialing-peers`/`:closed-peers`,
+   `:degraded?`, per-peer diagnostic maps (active AND closed/failed), and the bounded
+   `:recent-events` ring buffer."
+  [mesh-conns]
+  (let [mesh (or mesh-conns (initial-mesh-conns-state))
+        peers-map (or (:peers mesh) {})
+        sorted-pids (vec (sort (keys peers-map)))
+        peer-summaries
+        (into {}
+              (map (fn [pid]
+                     (let [c (get peers-map pid)
+                           d (:diagnostics c)]
+                       [pid {:peer-id pid
+                             :phase (or (:phase c) :idle)
+                             :generation (long (or (:generation c) 0))
+                             :last-error (:last-error d)
+                             :dropped (long (or (:dropped d) 0))
+                             :ignored-stale (long (or (:ignored-stale d) 0))
+                             :unsupported-format-dropped (long (or (:unsupported-format-dropped d) 0))
+                             :background-throttled-events (long (or (:background-throttled-events d) 0))
+                             :ice-disconnects (long (or (:ice-disconnects d) 0))
+                             :ice-reconnects (long (or (:ice-reconnects d) 0))
+                             :close-count (long (or (:close-count d) 0))
+                             :dial-failures (long (or (:dial-failures d) 0))
+                             :last-ice-state (:last-ice-state d)
+                             :last-connection-state (:last-connection-state d)
+                             :recent-events (vec (or (:recent-events d) []))}])))
+              sorted-pids)
+        open-peers (filterv #(= :open (get-in peer-summaries [% :phase])) sorted-pids)
+        dialing-peers (filterv #(= :dialing (get-in peer-summaries [% :phase])) sorted-pids)
+        closed-peers (filterv #(= :closed (get-in peer-summaries [% :phase])) sorted-pids)
+        sum-field (fn [k] (reduce + 0 (map #(long (or (get-in peer-summaries [% k]) 0)) sorted-pids)))
+        ice-disc (sum-field :ice-disconnects)
+        ice-reconn (sum-field :ice-reconnects)
+        close-cnt (sum-field :close-count)
+        dial-fail (sum-field :dial-failures)
+        recent-evs (vec (or (:recent-events mesh) []))
+        latest-err (or (some (fn [e]
+                               (when (and (:reason e) (not= :ice-reconnected (:kind e)))
+                                 (:reason e)))
+                             (rseq recent-evs))
+                       (some #(get-in peer-summaries [% :last-error]) sorted-pids))
+        agg-phase (cond
+                    (seq open-peers) :open
+                    (seq dialing-peers) :dialing
+                    (seq closed-peers) :closed
+                    :else :idle)
+        primary-peer (or (get peer-summaries "node1")
+                         (when (seq sorted-pids) (get peer-summaries (first sorted-pids))))
+        max-gen (if (seq sorted-pids)
+                  (apply max (map #(long (or (get-in peer-summaries [% :generation]) 0)) sorted-pids))
+                  0)
+        degraded? (boolean (or (seq closed-peers)
+                               (pos? dial-fail)
+                               (> ice-disc ice-reconn)
+                               (some #(some? (get-in peer-summaries [% :last-error])) sorted-pids)))]
+    {:phase agg-phase
+     :generation max-gen
+     :visibility-state (or (:visibility-state mesh) "visible")
+     :total-peers (count sorted-pids)
+     :open-peers open-peers
+     :dialing-peers dialing-peers
+     :closed-peers closed-peers
+     :degraded? degraded?
+     :last-error latest-err
+     :dropped (sum-field :dropped)
+     :ignored-stale (sum-field :ignored-stale)
+     :unsupported-format-dropped (sum-field :unsupported-format-dropped)
+     :background-throttled-events (sum-field :background-throttled-events)
+     :ice-disconnects ice-disc
+     :ice-reconnects ice-reconn
+     :close-count close-cnt
+     :dial-failures dial-fail
+     :last-ice-state (:last-ice-state primary-peer)
+     :last-connection-state (:last-connection-state primary-peer)
+     :peers peer-summaries
+     :recent-events recent-evs}))
 
 ;; =============================================================================
 ;; State Sanitization & Persistence (Rule 4)
@@ -803,19 +1098,34 @@
   "Establishes a generation-tagged RTCPeerConnection + RTCDataChannel in the browser
    (matching clj-datachannel/dev/example/index.html SDP offer/answer flow + STUN/ICE).
    All callbacks capture the dial generation so stale callbacks from superseded
-   connections are ignored and counted by transition-conn (Rules 4 & 5)."
-  [conn-atom {:keys [peer-id target-url] :as opts}]
-  (let [dial-effects (dispatch-conn-event! conn-atom
-                                           {:type :dial :peer-id peer-id :target-url (or target-url "rtc://validator")}
-                                           nil)
+   connections are ignored and counted by transition-conn (Rules 4 & 5).
+   When `:dispatch!` `(fn [event effect-handler] ...)` is provided in `opts`, all lifecycle
+   events route through that single-authority dispatcher instead of a standalone `conn-atom`."
+  [conn-atom {:keys [peer-id target-url dispatch!] :as opts}]
+  (let [dispatch-ev! (or dispatch!
+                         (fn [event effect-handler]
+                           (dispatch-conn-event! conn-atom event effect-handler)))
+        now-ms (fn [] #?(:cljs (.now js/Date) :clj (System/currentTimeMillis)))
+        dial-effects (dispatch-ev!
+                      {:type :dial
+                       :peer-id peer-id
+                       :target-url (or target-url "rtc://validator")
+                       :timestamp-ms (now-ms)}
+                      nil)
         gen (:generation (first dial-effects))]
     #?(:cljs
-       (let [{:keys [answer-sdp ice-servers channel-label on-deliver-message on-open on-diagnose]} opts]
+       (let [{:keys [answer-sdp ice-servers channel-label on-deliver-message on-open on-close on-diagnose]} opts
+             handle-diag (fn [eff]
+                           (when (and (= (:type eff) :diagnose) on-diagnose)
+                             (on-diagnose eff)))]
          (if-not (webrtc-available?)
            (do
-             (dispatch-conn-event! conn-atom
-                                   {:type :dial-failed :generation gen :error "webrtc-unavailable"}
-                                   on-diagnose)
+             (dispatch-ev!
+              {:type :dial-failed
+               :generation gen
+               :error "webrtc-unavailable"
+               :timestamp-ms (now-ms)}
+              handle-diag)
              {:ok? false :error "webrtc-unavailable" :generation gen})
            (try
              (let [rtc-cfg (clj->js {:iceServers (or ice-servers default-ice-servers)})
@@ -823,24 +1133,31 @@
                    dc (.createDataChannel pc (or channel-label "bitecho"))]
                (set! (.-oniceconnectionstatechange pc)
                      (fn [_]
-                       (dispatch-conn-event! conn-atom
-                                             {:type :ice-state-change
-                                              :generation gen
-                                              :ice-state (.-iceConnectionState pc)}
-                                             on-diagnose)))
+                       (dispatch-ev!
+                        {:type :ice-state-change
+                         :generation gen
+                         :ice-state (.-iceConnectionState pc)
+                         :timestamp-ms (now-ms)}
+                        handle-diag)))
                (set! (.-onconnectionstatechange pc)
                      (fn [_]
-                       (dispatch-conn-event! conn-atom
-                                             {:type :connection-state-change
-                                              :generation gen
-                                              :connection-state (.-connectionState pc)}
-                                             on-diagnose)))
+                       (dispatch-ev!
+                        {:type :connection-state-change
+                         :generation gen
+                         :connection-state (.-connectionState pc)
+                         :timestamp-ms (now-ms)}
+                        handle-diag)))
                (set! (.-binaryType dc) "arraybuffer")
                (set! (.-onopen dc)
                      (fn [ev]
-                       (dispatch-conn-event! conn-atom
-                                             {:type :open :generation gen :peer-id peer-id :channel dc :transport pc}
-                                             nil)
+                       (dispatch-ev!
+                        {:type :open
+                         :generation gen
+                         :peer-id peer-id
+                         :channel dc
+                         :transport pc
+                         :timestamp-ms (now-ms)}
+                        handle-diag)
                        (when on-open (on-open {:type :open :generation gen :channel dc :transport pc :event ev}))))
                (set! (.-onmessage dc)
                      (fn [ev]
@@ -851,44 +1168,70 @@
                                    (fressian/bytes? raw) (fressian/decode-wire raw)
                                    (map? raw) raw
                                    :else nil)]
-                         (dispatch-conn-event!
-                          conn-atom
-                          {:type :message :generation gen :envelope env}
+                         (dispatch-ev!
+                          {:type :message
+                           :generation gen
+                           :envelope env
+                           :timestamp-ms (now-ms)}
                           (fn [eff]
-                            (when (and (= (:type eff) :deliver-message) on-deliver-message)
-                              (on-deliver-message (:envelope eff))))))))
+                            (case (:type eff)
+                              :deliver-message (when on-deliver-message (on-deliver-message (:envelope eff)))
+                              :diagnose (when on-diagnose (on-diagnose eff))
+                              nil))))))
                (set! (.-onerror dc)
                      (fn [err]
-                       (dispatch-conn-event! conn-atom
-                                             {:type :dial-failed :generation gen :error (str "datachannel-error:" err)}
-                                             nil)))
+                       (let [err-msg (or (when (and err (.-error err)) (str (.-message (.-error err))))
+                                         (when (and err (.-message err)) (str (.-message err)))
+                                         (str err))]
+                         (dispatch-ev!
+                          {:type :dial-failed
+                           :generation gen
+                           :error (str "datachannel-error:" err-msg)
+                           :timestamp-ms (now-ms)}
+                          handle-diag))))
                (set! (.-onclose dc)
                      (fn [_]
-                       (dispatch-conn-event! conn-atom
-                                             {:type :close :generation gen :cause "datachannel-closed"}
-                                             (fn [eff]
-                                               (when (= (:type eff) :close-transport)
-                                                 (try (.close pc) (catch :default _ nil)))))))
+                       (dispatch-ev!
+                        {:type :close
+                         :generation gen
+                         :cause "datachannel-closed"
+                         :timestamp-ms (now-ms)}
+                        (fn [eff]
+                          (case (:type eff)
+                            :close-transport (try (.close pc) (catch :default _ nil))
+                            :diagnose (when on-diagnose (on-diagnose eff))
+                            nil)))
+                       (when on-close
+                         (on-close {:type :close :generation gen :peer-id peer-id :cause "datachannel-closed"}))))
                (when (string? answer-sdp)
                  (-> (.createOffer pc)
                      (.then (fn [offer] (.setLocalDescription pc offer)))
                      (.then (fn [_] (.setRemoteDescription pc (clj->js {:type "answer" :sdp answer-sdp}))))
                      (.catch (fn [err]
-                               (dispatch-conn-event! conn-atom
-                                                     {:type :dial-failed :generation gen :error (str "sdp-error:" err)}
-                                                     nil)))))
+                               (dispatch-ev!
+                                {:type :dial-failed
+                                 :generation gen
+                                 :error (str "sdp-error:" err)
+                                 :timestamp-ms (now-ms)}
+                                handle-diag)))))
                {:ok? true :generation gen :peer-connection pc :data-channel dc})
              (catch :default err
-               (dispatch-conn-event! conn-atom
-                                     {:type :dial-failed :generation gen :error (str err)}
-                                     nil)
+               (dispatch-ev!
+                {:type :dial-failed
+                 :generation gen
+                 :error (str err)
+                 :timestamp-ms (now-ms)}
+                handle-diag)
                {:ok? false :error (str err) :generation gen}))))
        :clj
        (do
          (let [_ opts]
-           (dispatch-conn-event! conn-atom
-                                 {:type :dial-failed :generation gen :error "webrtc-unavailable-on-jvm"}
-                                 nil)
+           (dispatch-ev!
+            {:type :dial-failed
+             :generation gen
+             :error "webrtc-unavailable-on-jvm"
+             :timestamp-ms (now-ms)}
+            nil)
            {:ok? false :error "webrtc-unavailable-on-jvm" :generation gen})))))
 
 ;; =============================================================================

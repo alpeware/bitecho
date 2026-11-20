@@ -1,8 +1,10 @@
 (ns bitecho.browser-main
   "Bitecho Browser Node static bundle entry point.
-   Exposes high-level browser API on js/globalThis.BitechoBrowser conforming to Rules 1-6."
+   Exposes high-level browser API on js/globalThis.BitechoBrowser and unified CLI parity API
+   on js/globalThis.BitechoLightNode conforming to Rules 1-6."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.bech32m :as bech32m]
+            [bitecho.browser-cli :as browser-cli]
             [bitecho.config :as config]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
@@ -183,7 +185,7 @@
         (let [saved-addr (bech32m/pubkey->bech32m saved-pub "ech")
               pub-bytes (basalt/hex->bytes saved-pub)
               clean-loaded (-> loaded
-                               (dissoc :conn :keypair :x25519 :active-channels)
+                               (dissoc :conn :mesh-conns :keypair :x25519 :active-channels)
                                (update :sessions prune-ghost-sessions)
                                (update-in [:light-state :sessions] prune-ghost-sessions)
                                (update :chat-history #(vec (or % [])))
@@ -564,12 +566,14 @@
          light-st (cond-> (assoc init-light :petnames default-petnames :max-epoch-skew 15)
                     relay-url (assoc :relay-url relay-url))
          conn-state (browser/initial-conn-state {:peer-id node-id :subnet-id subnet-id})
+         mesh-conns (browser/initial-mesh-conns-state)
          node-atom (atom {:peer-id node-id
                           :subnet-id subnet-id
                           :relay-url relay-url
                           :keypair keypair
                           :x25519 x25519
                           :conn conn-state
+                          :mesh-conns mesh-conns
                           :light-state light-st
                           :petnames default-petnames
                           :chat-history []
@@ -648,33 +652,109 @@
      (notify-ui-listeners!)
      node-atom)))
 
+(defn- kw-or-str->name
+  [v default-str]
+  (if (or (keyword? v) (symbol? v) (string? v))
+    (name v)
+    default-str))
+
+(defn- format-peer-diagnostics-js
+  [peer-map]
+  (into {}
+        (map (fn [[pid p]]
+               [pid {:peerId pid
+                     :phase (kw-or-str->name (:phase p) "idle")
+                     :generation (long (or (:generation p) 0))
+                     :lastError (:last-error p)
+                     :dropped (long (or (:dropped p) 0))
+                     :ignoredStale (long (or (:ignored-stale p) 0))
+                     :unsupportedFormatDropped (long (or (:unsupported-format-dropped p) 0))
+                     :backgroundThrottledEvents (long (or (:background-throttled-events p) 0))
+                     :iceDisconnects (long (or (:ice-disconnects p) 0))
+                     :iceReconnects (long (or (:ice-reconnects p) 0))
+                     :closeCount (long (or (:close-count p) 0))
+                     :dialFailures (long (or (:dial-failures p) 0))
+                     :lastIceState (:last-ice-state p)
+                     :lastConnectionState (:last-connection-state p)
+                     :recentEvents (mapv (fn [e]
+                                           (cond-> {:seq (:seq e)
+                                                    :kind (kw-or-str->name (:kind e) "unknown")
+                                                    :peerId (:peer-id e)
+                                                    :generation (long (or (:generation e) 0))
+                                                    :phase (kw-or-str->name (:phase e) "idle")
+                                                    :reason (:reason e)}
+                                             (:ice-state e) (assoc :iceState (:ice-state e))
+                                             (:connection-state e) (assoc :connectionState (:connection-state e))
+                                             (:event-gen e) (assoc :eventGen (:event-gen e))
+                                             (:timestamp-ms e) (assoc :timestampMs (:timestamp-ms e))))
+                                         (or (:recent-events p) []))}]))
+        (or peer-map {})))
+
+(defn- format-recent-events-js
+  [events]
+  (mapv (fn [e]
+          (cond-> {:seq (:seq e)
+                   :peerId (:peer-id e)
+                   :kind (kw-or-str->name (:kind e) "unknown")
+                   :generation (long (or (:generation e) 0))
+                   :phase (kw-or-str->name (:phase e) "idle")
+                   :reason (:reason e)}
+            (:ice-state e) (assoc :iceState (:ice-state e))
+            (:connection-state e) (assoc :connectionState (:connection-state e))
+            (:event-gen e) (assoc :eventGen (:event-gen e))
+            (:timestamp-ms e) (assoc :timestampMs (:timestamp-ms e))))
+        (or events [])))
+
 (defn get-status
-  "Returns Rule 4 status and diagnostics map as a JavaScript object."
+  "Returns Rule 4 & Rule 5 status and single-authority multi-peer diagnostics map as a JavaScript object."
   ([] (get-status @active-node-atom))
   ([node-atom]
    (when node-atom
      (let [node @node-atom
            conn (:conn node)
            diag (:diagnostics conn)
+           mesh-conns (:mesh-conns node)
+           has-mesh-peers? (pos? (count (:peers mesh-conns)))
+           mesh-summary (when has-mesh-peers?
+                          (browser/summarize-mesh-diagnostics mesh-conns))
            light-st (:light-state node)
            channels (:active-channels node)
            open-channels (into [] (keep (fn [[k dc]]
                                           (when (and dc (= (.-readyState dc) "open"))
                                             (if (or (keyword? k) (symbol? k)) (name k) (str k))))
                                         channels))
+           connected-nodes (if (seq open-channels)
+                             open-channels
+                             (or (:open-peers mesh-summary) []))
+           closed-nodes (or (:closed-peers mesh-summary) [])
+           dialing-nodes (or (:dialing-peers mesh-summary) [])
+           degraded? (boolean (:degraded? mesh-summary))
            tr-val (:transport conn)
            tr-str (cond
                     (:relay-url node) "http-relay"
                     (or (keyword? tr-val) (symbol? tr-val) (string? tr-val)) (name tr-val)
                     :else "webrtc")
-           phase-val (:phase conn)
-           phase-str (if (or (keyword? phase-val) (symbol? phase-val) (string? phase-val))
-                       (name phase-val)
-                       "idle")
-           diag-phase-val (:phase diag)
-           diag-phase-str (if (or (keyword? diag-phase-val) (symbol? diag-phase-val) (string? diag-phase-val))
-                            (name diag-phase-val)
-                            "idle")
+           phase-val (if has-mesh-peers? (:phase mesh-summary) (:phase conn))
+           phase-str (kw-or-str->name phase-val "idle")
+           diag-phase-str (kw-or-str->name (if has-mesh-peers? (:phase mesh-summary) (:phase diag)) "idle")
+           eff-gen (if has-mesh-peers? (long (or (:generation mesh-summary) 0)) (long (or (:generation conn) 0)))
+           eff-last-err (if has-mesh-peers? (:last-error mesh-summary) (:last-error diag))
+           eff-dropped (if has-mesh-peers? (:dropped mesh-summary) (or (:dropped diag) 0))
+           eff-stale (if has-mesh-peers? (:ignored-stale mesh-summary) (or (:ignored-stale diag) 0))
+           eff-unsup (if has-mesh-peers? (:unsupported-format-dropped mesh-summary) (or (:unsupported-format-dropped diag) 0))
+           eff-bg (if has-mesh-peers? (:background-throttled-events mesh-summary) (or (:background-throttled-events diag) 0))
+           eff-ice-disc (if has-mesh-peers? (:ice-disconnects mesh-summary) (or (:ice-disconnects diag) 0))
+           eff-ice-reconn (if has-mesh-peers? (:ice-reconnects mesh-summary) (or (:ice-reconnects diag) 0))
+           eff-close-cnt (if has-mesh-peers? (:close-count mesh-summary) (or (:close-count diag) 0))
+           eff-dial-fail (if has-mesh-peers? (:dial-failures mesh-summary) (or (:dial-failures diag) 0))
+           eff-last-ice (if has-mesh-peers? (:last-ice-state mesh-summary) (:last-ice-state diag))
+           eff-last-cs (if has-mesh-peers? (:last-connection-state mesh-summary) (:last-connection-state diag))
+           eff-recent (if has-mesh-peers?
+                        (format-recent-events-js (:recent-events mesh-summary))
+                        (format-recent-events-js (:recent-events diag)))
+           eff-peers (if has-mesh-peers?
+                       (format-peer-diagnostics-js (:peers mesh-summary))
+                       {})
            pubkey-hex (or (get-in light-st [:pubkey])
                           (when-let [kp (:keypair node)]
                             (when (:public-key kp)
@@ -689,27 +769,39 @@
                  :spendable (or (get-in light-st [:account :spendable]) (:spendable light-st) 0)
                  :transport tr-str
                  :phase phase-str
-                 :generation (or (:generation conn) 0)
-                 :visibilityState (or (:visibility-state conn) "visible")
+                 :generation eff-gen
+                 :visibilityState (or (:visibility-state mesh-summary) (:visibility-state conn) "visible")
                  :burnedEch (or (:burned-ech node) 0)
-                 :meshConnected (boolean (seq open-channels))
-                 :connectedNodes open-channels
+                 :meshConnected (boolean (seq connected-nodes))
+                 :connectedNodes connected-nodes
+                 :closedNodes closed-nodes
+                 :dialingNodes dialing-nodes
+                 :degraded degraded?
                  :sessions (redact-for-js (or (:sessions light-st) {}))
                  :pendingOffers (redact-for-js (or (:pending-offers light-st) {}))
                  :broadcastInbox (redact-for-js (or (:broadcast-inbox light-st) []))
                  :chatHistory (or (:chat-history node) [])
                  :petnames (or (:petnames node) default-petnames)
                  :diagnostics {:phase diag-phase-str
-                               :generation (or (:generation diag) 0)
-                               :lastError (:last-error diag)
-                               :dropped (or (:dropped diag) 0)
-                               :ignoredStale (or (:ignored-stale diag) 0)
-                               :unsupportedFormatDropped (or (:unsupported-format-dropped diag) 0)
-                               :backgroundThrottledEvents (or (:background-throttled-events diag) 0)
-                               :iceDisconnects (or (:ice-disconnects diag) 0)
-                               :iceReconnects (or (:ice-reconnects diag) 0)
-                               :lastIceState (:last-ice-state diag)
-                               :lastConnectionState (:last-connection-state diag)}})))))
+                               :generation eff-gen
+                               :lastError eff-last-err
+                               :dropped eff-dropped
+                               :ignoredStale eff-stale
+                               :unsupportedFormatDropped eff-unsup
+                               :backgroundThrottledEvents eff-bg
+                               :iceDisconnects eff-ice-disc
+                               :iceReconnects eff-ice-reconn
+                               :closeCount eff-close-cnt
+                               :dialFailures eff-dial-fail
+                               :lastIceState eff-last-ice
+                               :lastConnectionState eff-last-cs
+                               :totalPeers (long (or (:total-peers mesh-summary) 0))
+                               :openPeers connected-nodes
+                               :dialingPeers dialing-nodes
+                               :closedPeers closed-nodes
+                               :degraded degraded?
+                               :peers eff-peers
+                               :recentEvents eff-recent}})))))
 
 (defn build-p2p-link-bind-envelope
   "Builds and signs a :p2p-link-bind envelope proving peer pubkey and session identity."
@@ -738,16 +830,64 @@
            (and pub-bytes sig-bytes
                 (crypto/verify pub-bytes (fressian/utf8->bytes sig-str) sig-bytes))))))))
 
+(defn- dispatch-mesh-peer-event!
+  "Single-authority Rule 4/5 dispatcher updating `[:mesh-conns]` inside `node-atom` via pure
+   `browser/transition-mesh-peer`, syncing `[:conn]` to the primary/aggregate peer view,
+   executing effects outside `swap!`, and notifying UI listeners on lifecycle/diagnostic changes."
+  [node-atom peer-id event effect-handler-fn]
+  (when node-atom
+    (let [effects-box (atom nil)]
+      (swap! node-atom
+             (fn [curr]
+               (let [mesh0 (or (:mesh-conns curr) (browser/initial-mesh-conns-state))
+                     [mesh1 effs] (browser/transition-mesh-peer mesh0 peer-id event)
+                     primary-conn (or (get-in mesh1 [:peers "node1"])
+                                      (get-in mesh1 [:peers (str peer-id)])
+                                      (:conn curr))]
+                 (reset! effects-box effs)
+                 (cond-> (assoc curr :mesh-conns mesh1)
+                   primary-conn (assoc :conn primary-conn)))))
+      (let [effs @effects-box]
+        (when effect-handler-fn
+          (doseq [eff effs]
+            (effect-handler-fn eff)))
+        (when (or (contains? #{:open :close :dial-failed :ice-state-change :connection-state-change} (:type event))
+                  (some #(= :diagnose (:type %)) effs))
+          (notify-ui-listeners!))
+        effs))))
+
 (defn- send-to-all-channels!
   [node-atom env]
   (let [channels (:active-channels @node-atom)
         wire-bytes (fressian/encode-wire env)
         open-dcs (filter (fn [[_id dc]] (and dc (= (.-readyState dc) "open"))) channels)]
     (if (seq open-dcs)
-      (doseq [[_id dc] open-dcs]
-        (try (.send dc wire-bytes) (catch :default _ nil)))
-      (when-let [relay-url (:relay-url @node-atom)]
-        (submit-relay-envelope! relay-url env nil)))))
+      (doseq [[nid dc] open-dcs]
+        (try
+          (.send dc wire-bytes)
+          (catch :default err
+            (let [cur-gen (long (or (get-in @node-atom [:mesh-conns :peers nid :generation]) 0))]
+              (dispatch-mesh-peer-event!
+               node-atom
+               nid
+               {:type :dial-failed
+                :generation cur-gen
+                :error (str "send-failed:" err)
+                :timestamp-ms (.now js/Date)}
+               nil)))))
+      (if-let [relay-url (:relay-url @node-atom)]
+        (submit-relay-envelope! relay-url env nil)
+        ;; Rule 5: Never drop outbound envelopes silently when no channels or relay are open
+        (let [target-pid (if (contains? (get-in @node-atom [:mesh-conns :peers]) "node1") "node1" "mesh")
+              cur-gen (long (or (get-in @node-atom [:mesh-conns :peers target-pid :generation]) 0))]
+          (dispatch-mesh-peer-event!
+           node-atom
+           target-pid
+           {:type :send
+            :generation cur-gen
+            :envelope env
+            :timestamp-ms (.now js/Date)}
+           nil))))))
 
 (defn route-browser-envelope!
   "Routes an outgoing envelope directly to open P2P channel(s) or falls back to validator mesh."
@@ -941,10 +1081,8 @@
 
 (defn- on-validator-channel-open!
   "Handles validator DataChannel open: records channel, registers home set, queries chain state, and starts keepalive."
-  [node-atom nid dc conn-atom]
-  (swap! node-atom (fn [st]
-                     (cond-> (assoc-in st [:active-channels nid] dc)
-                       (= nid "node1") (assoc :conn @conn-atom))))
+  [node-atom nid dc gen]
+  (swap! node-atom assoc-in [:active-channels nid] dc)
   ;; Register home set with devnet nodes when signing key is unlocked
   (when-let [privkey (:private-key (:keypair @node-atom))]
     (let [reg-res (light-core/handle-command (:light-state @node-atom)
@@ -974,13 +1112,26 @@
                                        (when-let [tid (get @keepalive-timers-atom nid)]
                                          (try (js/clearInterval tid) (catch :default _ nil))
                                          (swap! keepalive-timers-atom dissoc nid))
+                                       ;; Rule 5: If browser DC closed without onclose transitioning peer, record it loudly
+                                       (let [peer-st (get-in @node-atom [:mesh-conns :peers nid])]
+                                         (when (and peer-st (= :open (:phase peer-st)))
+                                           (dispatch-mesh-peer-event!
+                                            node-atom
+                                            nid
+                                            {:type :close
+                                             :generation (long (or gen (:generation peer-st) 0))
+                                             :cause "keepalive-detected-closed"
+                                             :timestamp-ms (.now js/Date)}
+                                            nil)))
                                        (notify-ui-listeners!))))
                                  5000)]
     (swap! keepalive-timers-atom assoc nid timer-id))
   (notify-ui-listeners!))
 
 (defn connect-mesh
-  "Connects live browser light-node to Bitecho devnet mesh via WebRTC DataChannels."
+  "Connects live browser light-node to Bitecho devnet mesh via WebRTC DataChannels.
+   Routes all 6 validator connections through single-authority `[:mesh-conns]` inside `node-atom`
+   so every ICE disconnect, failure, error, or close is tracked with zero silent losses (Rules 4 & 5)."
   ([] (connect-mesh nil))
   ([opts]
    (if-not (:ok? (light-core/verify-bootstrap-descriptor default-authority-pubkey default-bootstrap-descriptor 0))
@@ -1002,40 +1153,40 @@
                  (try (.close old-dc) (catch :default _ nil))))
            _ (swap! node-atom assoc :active-channels {})
            node1 (get default-bootstrap-nodes :node1)
-           sdp1 (browser/format-validator-sdp-answer node1)
-           target-url (str "rtc://" (:ip node1) ":" (:agent-port node1))
-           conn-atom (atom (:conn @node-atom))]
-       (browser/connect-webrtc!
-        conn-atom
-        {:peer-id "node1"
-         :target-url target-url
-         :answer-sdp sdp1
-         :channel-label "bitecho"
-         :on-open (fn [open-info]
-                    (on-validator-channel-open! node-atom "node1" (:channel open-info) conn-atom))
-         :on-deliver-message (fn [env]
-                               (handle-inbound-wire-envelope! node-atom env))})
-       ;; Auxiliary DataChannels to node2..ns3 for 4-of-6 BFT quorum
-       (doseq [[nid ncfg] (select-keys default-bootstrap-nodes [:node2 :node3 :ns1 :ns2 :ns3])]
-         (let [nid-str (name nid)
-               aux-sdp (browser/format-validator-sdp-answer ncfg)
-               aux-conn-atom (atom (browser/initial-conn-state {:peer-id nid-str}))]
-           (browser/connect-webrtc!
-            aux-conn-atom
-            {:peer-id nid-str
-             :target-url (str "rtc://" (:ip ncfg) ":" (:agent-port ncfg))
-             :answer-sdp aux-sdp
-             :channel-label "bitecho"
-             :on-open (fn [aux-open]
-                        (on-validator-channel-open! node-atom nid-str (:channel aux-open) aux-conn-atom))
-             :on-deliver-message (fn [env]
-                                   (handle-inbound-wire-envelope! node-atom env))})))
+           dial-validator!
+           (fn [nid-str ncfg]
+             (let [sdp (browser/format-validator-sdp-answer ncfg)
+                   target-url (str "rtc://" (:ip ncfg) ":" (:agent-port ncfg))]
+               (browser/connect-webrtc!
+                nil
+                {:peer-id nid-str
+                 :target-url target-url
+                 :answer-sdp sdp
+                 :channel-label "bitecho"
+                 :dispatch! (fn [ev eff-handler]
+                              (dispatch-mesh-peer-event! node-atom nid-str ev eff-handler))
+                 :on-open (fn [open-info]
+                            (on-validator-channel-open! node-atom nid-str (:channel open-info) (:generation open-info)))
+                 :on-close (fn [_close-info]
+                             (when-let [tid (get @keepalive-timers-atom nid-str)]
+                               (try (js/clearInterval tid) (catch :default _ nil))
+                               (swap! keepalive-timers-atom dissoc nid-str))
+                             (notify-ui-listeners!))
+                 :on-diagnose (fn [_diag-eff]
+                                (notify-ui-listeners!))
+                 :on-deliver-message (fn [env]
+                                       (handle-inbound-wire-envelope! node-atom env))})))]
+       ;; Dial all 6 validators (node1..ns3) through single-authority mesh-conns for 4-of-6 BFT quorum
+       (doseq [nid [:node1 :node2 :node3 :ns1 :ns2 :ns3]]
+         (when-let [ncfg (get default-bootstrap-nodes nid)]
+           (dial-validator! (name nid) ncfg)))
        (notify-ui-listeners!)
        (clj->js {:ok true
                  :connected false
                  :dialing true
                  :status "connecting"
                  :targetNode "node1"
+                 :targetNodes ["node1" "node2" "node3" "ns1" "ns2" "ns3"]
                  :ip (:ip node1)
                  :port (:agent-port node1)})))))
 
@@ -1277,14 +1428,15 @@
         (js/Promise.resolve #js {:handle h :pubkey h})))))
 
 (defn handle-visibility-change!
-  "Dispatches visibility change ('visible' | 'hidden') into active node's connection state."
+  "Dispatches visibility change ('visible' | 'hidden') into active node's connection state and mesh-conns."
   ([vis-state] (handle-visibility-change! @active-node-atom vis-state))
   ([node-atom vis-state]
    (when node-atom
      (let [state-str (if (= (str vis-state) "hidden") "hidden" "visible")
            [new-conn effects] (browser/transition-conn (:conn @node-atom)
-                                                       {:type :visibility-change :state state-str})]
-       (swap! node-atom assoc :conn new-conn)
+                                                       {:type :visibility-change :state state-str})
+           [new-mesh _mesh-effs] (browser/transition-mesh-visibility (:mesh-conns @node-atom) state-str)]
+       (swap! node-atom assoc :conn new-conn :mesh-conns new-mesh)
        (clj->js {:visibilityState (:visibility-state new-conn)
                  :effects effects})))))
 
@@ -2366,12 +2518,187 @@
        "getAutoUpdaterStatus" (fn [] (clj->js (or @browser-updater-atom {})))
        "version" "0.23.17"})
 
+(defn- js-params->clj-map
+  "Safely converts a JS object (including null-prototype or cross-realm objects) or CLJ map
+   into a Clojure map for browser CLI verb dispatch."
+  [params]
+  (cond
+    (nil? params) {}
+    (map? params) params
+    (string? params) {"topic" params "verb" params}
+    (= "object" (js* "typeof ~{}" params))
+    (let [ks (js/Object.keys params)]
+      (reduce (fn [acc k]
+                (let [v (gobj/get params k)]
+                  (assoc acc k (if (and (some? v) (= "object" (js* "typeof ~{}" v)))
+                                 (if (js/Array.isArray v)
+                                   (vec (map #(if (and (some? %) (= "object" (js* "typeof ~{}" %)))
+                                                (js-params->clj-map %)
+                                                %)
+                                             (array-seq v)))
+                                   (js-params->clj-map v))
+                                 v))))
+              {}
+              (array-seq ks)))
+    :else {}))
+
+(defn exec-light-node-verb
+  "Executes a single CLI verb (kebab-case or camelCase) with optional JS/CLJ params object
+   against the active browser light node. Always returns a JS Promise resolving to a clean
+   plain JS object matching Node/JVM light-node JSON output semantics (Rules 2, 5, 6)."
+  ([verb] (exec-light-node-verb verb nil nil))
+  ([verb params] (exec-light-node-verb verb params nil))
+  ([verb params opts]
+   (js/Promise.
+    (fn [resolve _reject]
+      (let [norm-verb (browser-cli/js-method-name->verb (str (or verb "")))
+            params-clj (js-params->clj-map params)
+            opts-clj (cond
+                       (nil? opts) {}
+                       (map? opts) opts
+                       :else (let [c (js->clj opts :keywordize-keys true)]
+                               (if (map? c) c {})))
+            node-atom (or (:node-atom opts-clj) @active-node-atom)]
+        (cond
+          (= norm-verb "help")
+          (let [topic (or (when (string? params) params)
+                          (get params-clj "verb")
+                          (:verb params-clj)
+                          (get params-clj "topic")
+                          (:topic params-clj))]
+            (resolve (clj->js (browser-cli/build-browser-help topic))))
+
+          (contains? browser-cli/browser-unsupported-verbs norm-verb)
+          (let [norm (browser-cli/normalize-cli-invocation norm-verb params-clj)]
+            (when (and node-atom @node-atom)
+              (dispatch-mesh-peer-event!
+               node-atom
+               "cli"
+               {:type :unknown-event
+                :error "unsupported-in-browser"
+                :verb norm-verb
+                :timestamp-ms (.now js/Date)}
+               nil))
+            (resolve (clj->js (:response norm))))
+
+          (not (and node-atom @node-atom))
+          (resolve #js {:ok false :error "node-not-initialized" :verb norm-verb})
+
+          :else
+          (let [priv (or (get-in @node-atom [:keypair :private-key])
+                         (:privkey-bytes @anchor-state-atom))
+                exec-res (browser-cli/dispatch-browser-cli @node-atom norm-verb params-clj priv)
+                resp (:response exec-res)]
+            (when (:state exec-res)
+              (reset! node-atom (:state exec-res))
+              (when (seq (:net-envelopes exec-res))
+                (doseq [env (:net-envelopes exec-res)]
+                  (route-browser-envelope! node-atom env)))
+              (when-let [dial-info (:p2p-dial exec-res)]
+                (dial-browser-p2p-peer! node-atom dial-info))
+              (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
+              (notify-ui-listeners!))
+            (resolve (clj->js resp)))))))))
+
+(defn exec-light-node-cli
+  "Executes a CLI string (e.g. \"p2p-channel-state --session-id s1 --connected true\")
+   or argv array against the active browser light node, returning a JS Promise."
+  ([argv-or-str] (exec-light-node-cli argv-or-str nil))
+  ([argv-or-str opts]
+   (let [input-clj (cond
+                     (string? argv-or-str) argv-or-str
+                     (vector? argv-or-str) argv-or-str
+                     (sequential? argv-or-str) (vec argv-or-str)
+                     (map? argv-or-str) argv-or-str
+                     (nil? argv-or-str) "status"
+                     :else (js->clj argv-or-str))
+         parsed (cli/parse-cli-command input-clj)]
+     (cond
+       (and (:ok? parsed) (contains? browser-cli/browser-unsupported-verbs (:verb parsed)))
+       (exec-light-node-verb (:verb parsed) (:opts parsed) opts)
+
+       (and (:ok? parsed) (= "help" (:verb parsed)))
+       (exec-light-node-verb "help" (first (:args parsed)) opts)
+
+       :else
+       (ctl input-clj opts)))))
+
+(defn get-peers-status
+  "Returns a JS Promise resolving to the full validator mesh + P2P peer diagnostics object."
+  ([] (get-peers-status @active-node-atom))
+  ([node-atom]
+   (let [na (or node-atom @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {:ok false :error "node-not-initialized"})
+       (let [node @na
+             summary (browser/summarize-mesh-diagnostics (:mesh-conns node))
+             p2p-peers (into {}
+                             (map (fn [[pk entry]]
+                                    [pk {:peerId pk
+                                         :sessionId (:session-id entry)
+                                         :generation (long (or (:generation entry) 0))
+                                         :readyState (when-let [dc (:channel entry)]
+                                                       (.-readyState dc))}]))
+                             (or (:p2p-channels node) {}))]
+         (js/Promise.resolve
+          (clj->js {:ok true
+                    :totalPeers (:total-peers summary)
+                    :openPeers (:open-peers summary)
+                    :dialingPeers (:dialing-peers summary)
+                    :closedPeers (:closed-peers summary)
+                    :degraded (:degraded? summary)
+                    :lastError (:last-error summary)
+                    :iceDisconnects (:ice-disconnects summary)
+                    :iceReconnects (:ice-reconnects summary)
+                    :closeCount (:close-count summary)
+                    :dialFailures (:dial-failures summary)
+                    :peers (format-peer-diagnostics-js (:peers summary))
+                    :p2pPeers p2p-peers
+                    :recentEvents (format-recent-events-js (:recent-events summary))})))))))
+
+(defn build-light-node-api
+  "Constructs the unified `BitechoLightNode` browser console CLI object exposing EVERY
+   Node/JVM CLI verb from `browser-cli/browser-cli-verb-inventory` as a camelCase Promise-returning
+   method, plus `exec`, `cli`, `help`, `verbs`, `peers`, `reconnect`, and `autoUpdaterStatus`."
+  []
+  (let [obj #js {"exec" exec-light-node-verb
+                 "cli" exec-light-node-cli
+                 "verbs" (fn [] (js/Promise.resolve (clj->js browser-cli/browser-cli-verb-inventory)))
+                 "peers" (fn [] (get-peers-status @active-node-atom))
+                 "reconnect" (fn [& [opts]] (js/Promise.resolve (connect-mesh opts)))
+                 "autoUpdaterStatus" (fn [] (js/Promise.resolve (clj->js (or @browser-updater-atom {:status "not-started"}))))
+                 "initNode" init-node
+                 "stopNode" stop-node
+                 "getState" get-state
+                 "getStatus" get-status
+                 "version" "0.23.17"}]
+    ;; Attach every recognized CLI verb as a Closure :advanced-safe camelCase JS method
+    (doseq [[verb {:keys [js-method]}] browser-cli/browser-cli-verb-inventory]
+      (gobj/set obj js-method
+                (fn [& [params opts]]
+                  (exec-light-node-verb verb params opts))))
+    obj))
+
+(def light-node-api
+  "Global BitechoLightNode console CLI parity API object (Rule 6)."
+  (build-light-node-api))
+
+(gobj/set api "lightNode" light-node-api)
+(gobj/set api "exec" exec-light-node-verb)
+(gobj/set api "cli" exec-light-node-cli)
+(gobj/set api "verbs" (fn [] (js/Promise.resolve (clj->js browser-cli/browser-cli-verb-inventory))))
+(gobj/set api "peers" (fn [] (get-peers-status @active-node-atom)))
+(gobj/set api "reconnect" (fn [& [opts]] (js/Promise.resolve (connect-mesh opts))))
+
 (when (exists? js/goog)
-  (.exportSymbol js/goog "BitechoBrowser" api))
+  (.exportSymbol js/goog "BitechoBrowser" api)
+  (.exportSymbol js/goog "BitechoLightNode" light-node-api))
 (when (exists? js/globalThis)
-  (gobj/set js/globalThis "BitechoBrowser" api))
+  (gobj/set js/globalThis "BitechoBrowser" api)
+  (gobj/set js/globalThis "BitechoLightNode" light-node-api))
 (when (exists? js/window)
-  (gobj/set js/window "BitechoBrowser" api))
+  (gobj/set js/window "BitechoBrowser" api)
+  (gobj/set js/window "BitechoLightNode" light-node-api))
 
 ;; Wire document visibilitychange listener
 (when (and (exists? js/document) (some? (.-addEventListener js/document)))

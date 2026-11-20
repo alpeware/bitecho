@@ -1,0 +1,330 @@
+(ns bitecho.browser-cli-and-webrtc-diagnostics-test
+  "Strict TDD (Rule 1) generative, model-based, and inventory test suite for:
+   1. Single-authority multi-peer WebRTC lifecycle & zero-silent-loss diagnostics (Rules 4 & 5).
+   2. Browser Light Node Console CLI parity (`BitechoLightNode`) and automated verb inventory (Rule 6)."
+  (:require [bitecho.browser-cli :as browser-cli]
+            #?(:cljs [bitecho.browser-main :as browser-main])
+            [bitecho.crypto :as crypto]
+            [bitecho.fressian :as fressian]
+            [bitecho.light-node.cli :as cli]
+            [bitecho.light-node.core :as light-core]
+            [bitecho.shell.browser :as browser]
+            [clojure.set :as set]
+            #?(:clj [clojure.string :as str])
+            #?(:clj [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            #?(:clj [clojure.test.check.clojure-test :refer [defspec]]
+               :cljs [clojure.test.check.clojure-test :refer-macros [defspec]])
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]))
+
+;; =============================================================================
+;; 1. Generators for Multi-Peer WebRTC Lifecycle Model (Rule 1)
+;; =============================================================================
+
+(def ^:private validator-peer-ids
+  ["node1" "node2" "node3" "ns1" "ns2" "ns3"])
+
+(def ^:private gen-peer-id
+  (gen/elements validator-peer-ids))
+
+(def ^:private gen-ice-state
+  (gen/elements ["new" "checking" "connected" "completed" "disconnected" "failed" "closed"]))
+
+(def ^:private gen-conn-state
+  (gen/elements ["new" "connecting" "connected" "disconnected" "failed" "closed"]))
+
+(def ^:private gen-mesh-cmd
+  (gen/one-of
+   [(gen/hash-map :op (gen/return :dial)
+                  :peer-id gen-peer-id)
+    (gen/hash-map :op (gen/return :open)
+                  :peer-id gen-peer-id)
+    (gen/hash-map :op (gen/return :send)
+                  :peer-id gen-peer-id)
+    (gen/hash-map :op (gen/return :message-valid)
+                  :peer-id gen-peer-id)
+    (gen/hash-map :op (gen/return :message-invalid)
+                  :peer-id gen-peer-id)
+    (gen/hash-map :op (gen/return :ice-state-change)
+                  :peer-id gen-peer-id
+                  :ice-state gen-ice-state
+                  :stale? gen/boolean)
+    (gen/hash-map :op (gen/return :connection-state-change)
+                  :peer-id gen-peer-id
+                  :connection-state gen-conn-state
+                  :stale? gen/boolean)
+    (gen/hash-map :op (gen/return :close)
+                  :peer-id gen-peer-id
+                  :cause (gen/elements ["datachannel-closed" "peer-reset" "keepalive-detected-closed"])
+                  :stale? gen/boolean)
+    (gen/hash-map :op (gen/return :dial-failed)
+                  :peer-id gen-peer-id
+                  :error (gen/elements ["sdp-error" "datachannel-error" "ice-timeout"])
+                  :stale? gen/boolean)
+    (gen/hash-map :op (gen/return :visibility)
+                  :state (gen/elements ["visible" "hidden"]))]))
+
+;; =============================================================================
+;; 2. Rule 1 Generative Model-Based Property: Multi-Peer WebRTC Lifecycle
+;; =============================================================================
+
+(defspec ^{:doc "Rule 1/4/5 Model-Based Property: Multi-peer mesh connection reducer preserves
+                 every dialed peer's diagnostics (zero silent dissoc/loss), rejects stale
+                 generations with counted :diagnose effects, bounds :recent-events <= 64,
+                 and keeps aggregate summary counts strictly equal to per-peer sums."}
+  prop-mesh-conns-multi-peer-lifecycle-model 60
+  (prop/for-all [cmds (gen/vector gen-mesh-cmd 10 50)]
+                (let [init (browser/initial-mesh-conns-state {:max-events 64})
+                      result
+                      (reduce
+                       (fn [{:keys [mesh seen-peers ts valid?] :as acc} cmd]
+                         (if-not valid?
+                           acc
+                           (let [ts' (+ ts 100)]
+                             (if (= :visibility (:op cmd))
+                               (let [[mesh' _effs] (browser/transition-mesh-visibility mesh (:state cmd))
+                                     summary (browser/summarize-mesh-diagnostics mesh')]
+                                 (if (and (= (:state cmd) (:visibility-state mesh'))
+                                          (= seen-peers (set (keys (:peers mesh'))))
+                                          (= (count seen-peers) (:total-peers summary)))
+                                   (assoc acc :mesh mesh' :ts ts')
+                                   (assoc acc :valid? false :reason :visibility-invariant-failed)))
+                               (let [pid (:peer-id cmd)
+                                     prev-peer (get-in mesh [:peers pid])
+                                     curr-gen (long (or (:generation prev-peer) 0))
+                                     stale? (and (:stale? cmd) (pos? curr-gen))
+                                     ev-gen (if stale? (dec curr-gen) curr-gen)
+                                     event (case (:op cmd)
+                                             :dial {:type :dial :peer-id pid :target-url (str "rtc://" pid ":5010") :timestamp-ms ts'}
+                                             :open {:type :open :generation curr-gen :peer-id pid :channel :mock-dc :timestamp-ms ts'}
+                                             :send {:type :send :generation curr-gen :envelope {:type :ping :wire-format "fressian-v1"} :timestamp-ms ts'}
+                                             :message-valid {:type :message :generation curr-gen :envelope {:type :pong :wire-format "fressian-v1"} :timestamp-ms ts'}
+                                             :message-invalid {:type :message :generation curr-gen :envelope {:type :bad :wire-format "bad-fmt"} :timestamp-ms ts'}
+                                             :ice-state-change {:type :ice-state-change :generation ev-gen :ice-state (:ice-state cmd) :timestamp-ms ts'}
+                                             :connection-state-change {:type :connection-state-change :generation ev-gen :connection-state (:connection-state cmd) :timestamp-ms ts'}
+                                             :close {:type :close :generation ev-gen :cause (:cause cmd) :timestamp-ms ts'}
+                                             :dial-failed {:type :dial-failed :generation ev-gen :error (:error cmd) :timestamp-ms ts'})
+                                     [mesh' effs] (browser/transition-mesh-peer mesh pid event)
+                                     seen' (conj seen-peers pid)
+                                     peer' (get-in mesh' [:peers pid])
+                                     summary (browser/summarize-mesh-diagnostics mesh')
+                                     sum-of (fn [k] (reduce + 0 (map #(long (or (get-in % [:diagnostics k]) 0)) (vals (:peers mesh')))))
+                                     no-peer-lost? (= seen' (set (keys (:peers mesh'))))
+                                     gen-monotonic? (>= (long (:generation peer' 0)) curr-gen)
+                                     bounded-events? (<= (count (:recent-events mesh')) 64)
+                                     stale-ok? (if stale?
+                                                 (and (= (inc (long (or (get-in prev-peer [:diagnostics :ignored-stale]) 0)))
+                                                         (long (get-in peer' [:diagnostics :ignored-stale])))
+                                                      (some #(and (= :diagnose (:type %))
+                                                                  (= :ignored-stale (:kind %))
+                                                                  (= pid (:peer-id %)))
+                                                            effs))
+                                                 true)
+                                     sums-match? (and (= (:total-peers summary) (count seen'))
+                                                      (= (:dropped summary) (sum-of :dropped))
+                                                      (= (:ignored-stale summary) (sum-of :ignored-stale))
+                                                      (= (:ice-disconnects summary) (sum-of :ice-disconnects))
+                                                      (= (:ice-reconnects summary) (sum-of :ice-reconnects))
+                                                      (= (:close-count summary) (sum-of :close-count))
+                                                      (= (:dial-failures summary) (sum-of :dial-failures))
+                                                      (= (count (:peers summary)) (count seen')))]
+                                 (if (and no-peer-lost? gen-monotonic? bounded-events? stale-ok? sums-match?)
+                                   (assoc acc :mesh mesh' :seen-peers seen' :ts ts')
+                                   (assoc acc :valid? false :reason {:no-peer-lost? no-peer-lost?
+                                                                     :gen-monotonic? gen-monotonic?
+                                                                     :bounded-events? bounded-events?
+                                                                     :stale-ok? stale-ok?
+                                                                     :sums-match? sums-match?})))))))
+                       {:mesh init :seen-peers #{} :ts 1700000000000 :valid? true}
+                       cmds)]
+                  (:valid? result))))
+
+;; =============================================================================
+;; 3. Deterministic Regression: 4-of-6 Validator WebRTC Peer Loss (Rules 4 & 5)
+;; =============================================================================
+
+(deftest test-four-of-six-validator-peer-loss-zero-silent-failures
+  (testing "Losing 4 of 6 validator connections leaves full per-peer & ring-buffer trace in diagnostics"
+    (let [t0 1795200000000
+          ;; 1. Dial and open all 6 validators through single-authority mesh-conns
+          m-all-open
+          (reduce
+           (fn [m nid]
+             (let [[m1 eff1] (browser/transition-mesh-peer m nid {:type :dial :peer-id nid :target-url (str "rtc://" nid ":5010") :timestamp-ms t0})
+                   gen1 (:generation (first eff1))
+                   [m2 _] (browser/transition-mesh-peer m1 nid {:type :open :generation gen1 :peer-id nid :channel :mock-dc :timestamp-ms (+ t0 50)})
+                   [m3 _] (browser/transition-mesh-peer m2 nid {:type :ice-state-change :generation gen1 :ice-state "connected" :timestamp-ms (+ t0 60)})]
+               m3))
+           (browser/initial-mesh-conns-state)
+           validator-peer-ids)
+          s-healthy (browser/summarize-mesh-diagnostics m-all-open)]
+      (is (= 6 (:total-peers s-healthy)))
+      (is (= validator-peer-ids (:open-peers s-healthy)))
+      (is (empty? (:closed-peers s-healthy)))
+      (is (false? (:degraded? s-healthy)))
+      (is (= :open (:phase s-healthy)))
+
+      ;; 2. Lose 4 of 6 validators via distinct realistic failure modes while node1 & node2 survive
+      (let [g (fn [m nid] (get-in m [:peers nid :generation]))
+            ;; node3: ICE disconnected -> ICE failed -> datachannel close
+            [m1 _] (browser/transition-mesh-peer m-all-open "node3" {:type :ice-state-change :generation (g m-all-open "node3") :ice-state "disconnected" :timestamp-ms (+ t0 1000)})
+            [m2 _] (browser/transition-mesh-peer m1 "node3" {:type :ice-state-change :generation (g m1 "node3") :ice-state "failed" :timestamp-ms (+ t0 2000)})
+            [m3 _] (browser/transition-mesh-peer m2 "node3" {:type :close :generation (g m2 "node3") :cause "datachannel-closed" :timestamp-ms (+ t0 2100)})
+            ;; ns1: connectionState failed -> datachannel close
+            [m4 _] (browser/transition-mesh-peer m3 "ns1" {:type :connection-state-change :generation (g m3 "ns1") :connection-state "failed" :timestamp-ms (+ t0 3000)})
+            [m5 _] (browser/transition-mesh-peer m4 "ns1" {:type :close :generation (g m4 "ns1") :cause "datachannel-closed" :timestamp-ms (+ t0 3100)})
+            ;; ns2: ICE closed -> datachannel close
+            [m6 _] (browser/transition-mesh-peer m5 "ns2" {:type :ice-state-change :generation (g m5 "ns2") :ice-state "closed" :timestamp-ms (+ t0 4000)})
+            [m7 _] (browser/transition-mesh-peer m6 "ns2" {:type :close :generation (g m6 "ns2") :cause "keepalive-detected-closed" :timestamp-ms (+ t0 4100)})
+            ;; ns3: datachannel error (dial-failed)
+            [m8 _] (browser/transition-mesh-peer m7 "ns3" {:type :dial-failed :generation (g m7 "ns3") :error "datachannel-error:sctp-reset" :timestamp-ms (+ t0 5000)})
+            summary (browser/summarize-mesh-diagnostics m8)
+            event-peers (set (map :peer-id (:recent-events summary)))]
+        ;; Zero silent disappearance: all 6 peers are still tracked!
+        (is (= 6 (:total-peers summary)))
+        (is (= ["node1" "node2"] (:open-peers summary)))
+        (is (= ["node3" "ns1" "ns2" "ns3"] (:closed-peers summary)))
+        (is (true? (:degraded? summary)))
+        (is (= 3 (:ice-disconnects summary)))
+        (is (= 3 (:close-count summary)))
+        (is (= 1 (:dial-failures summary)))
+        (is (some? (:last-error summary)))
+        ;; Per-peer diagnostics preserve exact state of all 4 lost validators
+        (is (= :open (get-in summary [:peers "node1" :phase])))
+        (is (= :open (get-in summary [:peers "node2" :phase])))
+        (is (= :closed (get-in summary [:peers "node3" :phase])))
+        (is (= "failed" (get-in summary [:peers "node3" :last-ice-state])))
+        (is (= "datachannel-closed" (get-in summary [:peers "node3" :last-error])))
+        (is (= :closed (get-in summary [:peers "ns1" :phase])))
+        (is (= "failed" (get-in summary [:peers "ns1" :last-connection-state])))
+        (is (= :closed (get-in summary [:peers "ns2" :phase])))
+        (is (= "closed" (get-in summary [:peers "ns2" :last-ice-state])))
+        (is (= :closed (get-in summary [:peers "ns3" :phase])))
+        (is (= "datachannel-error:sctp-reset" (get-in summary [:peers "ns3" :last-error])))
+        ;; Recent events ring buffer contains trace for all 4 lost peers
+        (is (set/subset? #{"node3" "ns1" "ns2" "ns3"} event-peers))
+        ;; Rule 4: Persistence sanitization MUST strip :mesh-conns (runtime liveness)
+        (let [sanitized (browser/sanitize-state-for-persistence {:peer-id "browser-test" :mesh-conns m8})]
+          (is (nil? (:mesh-conns sanitized))))))))
+
+;; =============================================================================
+;; 4. Rule 1 & Rule 6 Generative Property: Browser CLI Parity & Normalization
+;; =============================================================================
+
+(def ^:private all-cli-verbs-vec
+  (vec (sort cli/all-recognized-cli-verbs-set)))
+
+(defspec ^{:doc "Rule 1/6 Property: Every recognized CLI verb has a reversible camelCase JS method
+                 name, normalizes cleanly via browser-cli/normalize-cli-invocation, and either
+                 maps to a supported browser command or returns an explicit counted
+                 :unsupported-in-browser diagnostic (never silently omitted)."}
+  prop-browser-cli-verb-normalization-and-parity 100
+  (prop/for-all [verb (gen/elements all-cli-verbs-vec)
+                 use-camel? gen/boolean]
+                (let [js-name (browser-cli/verb->js-method-name verb)
+                      back (browser-cli/js-method-name->verb js-name)
+                      invoked (if use-camel? js-name verb)
+                      norm (browser-cli/normalize-cli-invocation invoked {:sessionId "sess-1" :subnetId "global"})]
+                  (and (= verb back)
+                       (if (contains? browser-cli/browser-unsupported-verbs verb)
+                         (and (false? (:ok? norm))
+                              (= :unsupported-in-browser (:error norm))
+                              (= :diagnose (get-in norm [:diagnose :type]))
+                              (= verb (:verb norm)))
+                         (and (true? (:ok? norm))
+                              (= verb (:verb norm))
+                              (= "sess-1" (get-in norm [:cmd-map "session_id"]))
+                              (= "global" (get-in norm [:cmd-map "subnet_id"]))))))))
+
+;; =============================================================================
+;; 5. Rule 6 Automated CLI Verb-Parity Inventory Test
+;; =============================================================================
+
+(deftest test-browser-cli-verb-parity-inventory
+  (testing "100% of cli/all-recognized-cli-verbs-set is accounted for in browser-cli/browser-cli-verb-inventory"
+    (let [inv browser-cli/browser-cli-verb-inventory
+          inv-verbs (set (keys inv))
+          js-names (mapv :js-method (vals inv))]
+      (is (= cli/all-recognized-cli-verbs-set inv-verbs)
+          "Every Node/JVM CLI verb must be tracked in browser-cli-verb-inventory")
+      (is (= (count js-names) (count (distinct js-names)))
+          "Every CLI verb must map to a unique camelCase JS method name")
+      ;; Only genuinely OS-impossible verbs are marked unsupported-in-browser
+      (is (= #{"serve" "daemon" "mcp"} browser-cli/browser-unsupported-verbs))
+      (doseq [v browser-cli/browser-unsupported-verbs]
+        (is (= :unsupported-in-browser (get-in inv [v :support])))
+        (is (string? (get-in inv [v :reason]))))
+      (doseq [v (set/difference cli/all-recognized-cli-verbs-set browser-cli/browser-unsupported-verbs)]
+        (is (= :supported (get-in inv [v :support])) (str "Verb should be supported in browser: " v)))))
+
+  (testing "Pure browser-cli/dispatch-browser-cli executes core light-node verbs with camelCase params"
+    (let [kp (crypto/generate-keypair)
+          pub-hex (fressian/bytes->hex (:public-key kp))
+          priv (:private-key kp)
+          st0 {:peer-id "browser-cli-test"
+               :subnet-id "global"
+               :mesh-conns (browser/initial-mesh-conns-state)
+               :light-state (light-core/init-light-state {:pubkey-hex pub-hex} {:subnet-id "global"})}
+          ;; status
+          r-status (browser-cli/dispatch-browser-cli st0 "status" {} priv)
+          ;; help
+          r-help (browser-cli/dispatch-browser-cli st0 "help" {} priv)
+          ;; petname-set via camelCase verb + camelCase params
+          r-pn-set (browser-cli/dispatch-browser-cli st0 "petnameSet" {:petname "alice" :pubkey pub-hex :overwrite true} priv)
+          ;; petname-list on updated state
+          r-pn-list (browser-cli/dispatch-browser-cli (:state r-pn-set) "petname-list" {} priv)
+          ;; subscribe-subnets via camelCase
+          r-sub (browser-cli/dispatch-browser-cli (:state r-pn-list) "subscribeSubnets" {:subnets ["devnet" "ops"]} priv)
+          ;; unsupported OS daemon verb fails explicitly with counted diagnose
+          r-serve (browser-cli/dispatch-browser-cli st0 "serve" {} priv)
+          ;; unknown verb fails closed with counted diagnose
+          r-unknown (browser-cli/dispatch-browser-cli st0 "nonexistent-verb-xyz" {} priv)]
+      (is (true? (:ok? r-status)))
+      (is (true? (get-in r-status [:response "ok"])))
+      (is (true? (:ok? r-help)))
+      (is (vector? (get-in r-help [:response "verbs"])))
+      (is (true? (:ok? r-pn-set)))
+      (is (true? (:ok? r-pn-list)))
+      (is (= pub-hex (get-in r-pn-list [:response "petnames" "alice"])))
+      (is (true? (:ok? r-sub)))
+      (is (false? (:ok? r-serve)))
+      (is (= "unsupported-in-browser" (get-in r-serve [:response "error"])))
+      (is (some #(= :unsupported-in-browser (:kind %)) (:effects r-serve)))
+      (is (false? (:ok? r-unknown)))
+      (is (= "invalid-verb" (get-in r-unknown [:response "error"])))
+      (is (some #(= :invalid-verb (:kind %)) (:effects r-unknown)))))
+
+  #?(:clj
+     (testing "JVM source audit: browser_main.cljs wires BitechoLightNode and single-authority mesh-conns (no orphaned aux-conn-atom)"
+       (let [bm-src (slurp "src/bitecho/browser_main.cljs")
+             sh-src (slurp "src/bitecho/shell/browser.cljc")]
+         (is (str/includes? bm-src "BitechoLightNode"))
+         (is (str/includes? bm-src "summarize-mesh-diagnostics"))
+         (is (str/includes? bm-src "transition-mesh-peer"))
+         (is (not (str/includes? bm-src "aux-conn-atom"))
+             "Orphaned local aux-conn-atom must be removed in favor of single-authority :mesh-conns")
+         (is (str/includes? sh-src "transition-mesh-peer"))
+         (is (str/includes? sh-src "summarize-mesh-diagnostics")))))
+
+  #?(:cljs
+     (testing "CLJS runtime: BitechoLightNode exposes all CLI verbs + exec/cli/help/verbs/peers on globalThis"
+       (let [na (browser-main/init-node {:peer-id "cljs-parity-node"})
+             ln (aget js/globalThis "BitechoLightNode")
+             bb (aget js/globalThis "BitechoBrowser")
+             st (browser-main/get-status na)]
+         (is (some? na))
+         (is (some? st))
+         (is (some? ln) "BitechoLightNode must be exposed on globalThis")
+         (is (some? bb) "BitechoBrowser must remain exposed on globalThis")
+         (is (fn? (aget ln "exec")))
+         (is (fn? (aget ln "cli")))
+         (is (fn? (aget ln "help")))
+         (is (fn? (aget ln "verbs")))
+         (is (fn? (aget ln "peers")))
+         (is (fn? (aget ln "reconnect")))
+         (is (fn? (aget ln "autoUpdaterStatus")))
+         (doseq [[_verb {:keys [js-method]}] browser-cli/browser-cli-verb-inventory]
+           (is (fn? (aget ln js-method))
+               (str "Missing BitechoLightNode." js-method)))
+         (browser-main/stop-node na)))))

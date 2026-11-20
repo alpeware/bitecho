@@ -149,4 +149,36 @@ Light nodes support content-addressed artifact publishing, resolution, listing, 
 
 In `v0.23.11`, the light node unifies all 68 legacy verbs and 8 runner aliases into **12 canonical verbs** (`put`, `get`, `list`, `transfer`, `lock`, `spend`, `connect`, `send`, `inbox`, `wait`, `serve`, `ctl`) via `bitecho.light-node.cli/desugar-cli-cmd-map`, provides the zero-install `bitecho-mcp` JSON-RPC 2.0 server (`--mcp`), performs sub-25ms HTTPS relay-first `2f+1` chain-state quorum sync (`P-NET-1`), and supports zero-burn HTTPS relay P2P legs (`p2p-offer --to <peer> --endpoint https://ns1.bitecho.org/relay/v1`) with autonomous auto-answer (`P-NET-2`).
 
+---
+
+## 7. Browser Console CLI Parity (`BitechoLightNode`) & Multi-Peer WebRTC Diagnostics
+
+The browser light node (`dist/bitecho-browser.js`) exposes the full Node/JVM light-node CLI on **`window.BitechoLightNode`** (while preserving full backwards compatibility on `window.BitechoBrowser`, which also aliases `BitechoBrowser.lightNode`, `exec`, `cli`, `verbs`, `peers`, and `reconnect`).
+
+### Console Invocation Examples
+
+```javascript
+// Direct Promise-returning camelCase verbs (100% parity with Node/JVM CLI inventory)
+await BitechoLightNode.status()
+await BitechoLightNode.p2pChannelState({ sessionId: "...", connected: true })
+await BitechoLightNode.petnameSet({ petname: "alice", pubkey: "...", overwrite: true })
+await BitechoLightNode.subscribeSubnets({ subnets: ["devnet", "ops"] })
+
+// Generic verb or CLI string/argv dispatch
+await BitechoLightNode.exec("p2p-channel-state", { sessionId: "...", connected: true })
+await BitechoLightNode.cli("inbox --peek")
+
+// Discovery & diagnostics helpers
+await BitechoLightNode.help()
+await BitechoLightNode.verbs()
+await BitechoLightNode.peers()
+await BitechoLightNode.reconnect()
+await BitechoLightNode.autoUpdaterStatus()
+```
+
+- **Feature Parity by Construction**: `bitecho.browser-cli/browser-cli-verb-inventory` derives directly from `bitecho.light-node.cli/all-recognized-cli-verbs-set` and is verified by `bitecho.browser-cli-and-webrtc-diagnostics-test`.
+- **Explicit Unsupported-in-Browser Errors**: Genuinely OS-impossible verbs (`serve`, `daemon`, `mcp`) fail explicitly with `{ ok: false, error: "unsupported-in-browser", verb, reason }` and emit a counted `:diagnose` event (Rule 5).
+- **Single-Authority Multi-Peer WebRTC Diagnostics (Rules 4 & 5)**: All 6 validator WebRTC connections (`node1..node3`, `ns1..ns3`) transition through the single-authority `[:mesh-conns]` reducer (`bitecho.shell.browser/transition-mesh-peer`). Closed/failed/ICE-disconnected peers are never silently removed from diagnostics; `BitechoBrowser.getStatus().diagnostics` and `await BitechoLightNode.peers()` surface `totalPeers`, `openPeers`, `dialingPeers`, `closedPeers`, `degraded`, `closeCount`, `dialFailures`, `iceDisconnects`, `iceReconnects`, per-peer `peers` state maps (active and closed), and a bounded 64-entry `recentEvents` ring buffer.
+
+
 
