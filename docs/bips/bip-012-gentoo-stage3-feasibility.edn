@@ -1,0 +1,269 @@
+{:bip-id "BIP-012"
+ :bip/id "BIP-012"
+ :finding-ref "P-HOST-3"
+ :title "BIP-012 (P-HOST-3): Gentoo Stage3 In-Place Live Migration Feasibility Experiment on GCP e2-micro"
+ :status :verified-feasible
+ :executed-at "2026-11-20T01:16:25Z"
+ :directive-ref {:author "Simon"
+                 :relayed-by "axiom"
+                 :seq 544}
+ :environment {:gcp-account "alpeware@gmail.com"
+               :billing-account "00A760-ADD23B-93C934"
+               :project-id "bitecho-gentoo-lab"
+               :zone "us-central1-a"
+               :instance-name "bitecho-gentoo-lab"
+               :machine-type "e2-micro"
+               :ram-mib 969
+               :mem-total-kb 993228
+               :network-tier "STANDARD"
+               :internal-ipv4 "10.128.0.2"
+               :external-ipv4 "35.209.114.182"
+               :boot-disk {:size-gb 30
+                           :type "pd-standard"
+                           :partition-layout [{:device "/dev/sda1" :mount "/" :fs "ext4" :size-mib 30004 :partuuid "38a4d6fa-d9ea-4b67-a4a2-4adfc5612b72"}
+                                              {:device "/dev/sda14" :mount nil :type "bios-boot" :size-mib 3 :partuuid "dc50f3c5-e906-ca41-96d5-c4ef0428dd3f"}
+                                              {:device "/dev/sda15" :mount "/boot/efi" :fs "vfat" :size-mib 124 :partuuid "e33e9646-f416-40bf-a184-8301aaa1916d"}]}
+               :source-os {:distro "Debian GNU/Linux 12 (bookworm)"
+                           :kernel "6.1.0-56-cloud-amd64"
+                           :init "systemd"}
+               :target-os {:distro "Gentoo Linux 2.18 (Hardened OpenRC)"
+                           :stage3-tarball "stage3-amd64-hardened-openrc-20261115T170104Z.tar.xz"
+                           :stage3-size-bytes 276277944
+                           :kernel "6.1.0-56-cloud-amd64"
+                           :init "OpenRC"}}
+ :gate-1-ram-and-zram {:passed? true
+                       :ceiling-mib 969
+                       :zram-config {:device "/dev/zram0"
+                                     :algorithm "zstd"
+                                     :disksize-mib 969.9
+                                     :swap-total-kb 993224}
+                       :phases [{:phase :baseline-debian-no-zram
+                                 :samples 1
+                                 :peak-used-ram-mib 337
+                                 :min-mem-available-mib 632
+                                 :min-mem-available-kb 647168
+                                 :peak-swap-used-mib 0
+                                 :peak-zram-data-bytes 0
+                                 :peak-zram-compr-bytes 0
+                                 :peak-zram-total-bytes 0}
+                                {:phase :baseline-debian-with-zram
+                                 :samples 33
+                                 :peak-used-ram-mib 371
+                                 :min-mem-available-mib 598
+                                 :min-mem-available-kb 612984
+                                 :peak-swap-used-mib 0
+                                 :peak-zram-data-bytes 4096
+                                 :peak-zram-compr-bytes 59
+                                 :peak-zram-total-bytes 4096}
+                                {:phase :stage3-download-and-sha512
+                                 :samples 33
+                                 :peak-used-ram-mib 375
+                                 :min-mem-available-mib 594
+                                 :min-mem-available-kb 609796
+                                 :peak-swap-used-mib 10
+                                 :peak-zram-data-bytes 10219520
+                                 :peak-zram-compr-bytes 649577
+                                 :peak-zram-total-bytes 1040384}
+                                {:phase :stage3-unpack
+                                 :samples 270
+                                 :peak-used-ram-mib 416
+                                 :min-mem-available-mib 553
+                                 :min-mem-available-kb 567032
+                                 :peak-swap-used-mib 17
+                                 :peak-zram-data-bytes 18034688
+                                 :peak-zram-compr-bytes 3448510
+                                 :peak-zram-total-bytes 4014080}
+                                {:phase :runtime-install-node22-jdk25
+                                 :samples 91
+                                 :peak-used-ram-mib 464
+                                 :min-mem-available-mib 505
+                                 :min-mem-available-kb 518336
+                                 :peak-swap-used-mib 16
+                                 :peak-zram-data-bytes 16670720
+                                 :peak-zram-compr-bytes 3297527
+                                 :peak-zram-total-bytes 3903488}
+                                {:phase :chroot-prep-and-self-test
+                                 :samples 155
+                                 :peak-used-ram-mib 411
+                                 :min-mem-available-mib 558
+                                 :min-mem-available-kb 571908
+                                 :peak-swap-used-mib 18
+                                 :peak-zram-data-bytes 19247104
+                                 :peak-zram-compr-bytes 3387328
+                                 :peak-zram-total-bytes 3936256}
+                                {:phase :post-pivot-gentoo-openrc-idle
+                                 :samples 1
+                                 :peak-used-ram-mib 216
+                                 :min-mem-available-mib 753
+                                 :min-mem-available-kb 771468
+                                 :peak-swap-used-mib 0
+                                 :peak-zram-data-bytes 4096
+                                 :peak-zram-compr-bytes 59
+                                 :peak-zram-total-bytes 4096}
+                                {:phase :post-pivot-gentoo-openrc-with-bitecho-daemon
+                                 :samples 1
+                                 :peak-used-ram-mib 225
+                                 :min-mem-available-mib 744
+                                 :min-mem-available-kb 761352
+                                 :peak-swap-used-mib 0
+                                 :peak-zram-data-bytes 4096
+                                 :peak-zram-compr-bytes 59
+                                 :peak-zram-total-bytes 4096}]
+                       :overall-peak-used-ram-mib 464
+                       :overall-min-mem-available-mib 505
+                       :overall-min-mem-available-kb 518336
+                       :overall-peak-zram-data-bytes 19247104
+                       :overall-peak-zram-compr-bytes 3448510
+                       :overall-peak-zram-total-bytes 4014080}
+ :gate-2-disk-usage {:passed? true
+                     :total-root-mib 30004
+                     :checkpoints [{:checkpoint :baseline-debian
+                                    :used-mib 2086
+                                    :available-mib 26577
+                                    :use-percent 8}
+                                   {:checkpoint :after-zram-setup
+                                    :used-mib 2087
+                                    :available-mib 26577
+                                    :use-percent 8}
+                                   {:checkpoint :after-stage3-download
+                                    :used-mib 2350
+                                    :available-mib 26313
+                                    :use-percent 9}
+                                   {:checkpoint :after-stage3-unpack
+                                    :used-mib 3560
+                                    :available-mib 25104
+                                    :use-percent 13}
+                                   {:checkpoint :after-node22-jdk25-install
+                                    :used-mib 4071
+                                    :available-mib 24592
+                                    :use-percent 15}
+                                   {:checkpoint :after-kernel-modules-and-chroot-prep-peak
+                                    :used-mib 4206
+                                    :available-mib 24457
+                                    :use-percent 15}
+                                   {:checkpoint :after-stage3-tarball-removal-pre-pivot
+                                    :used-mib 3939
+                                    :available-mib 24724
+                                    :use-percent 14}
+                                   {:checkpoint :post-pivot-before-debian-old-cleanup
+                                    :used-mib 3956
+                                    :available-mib 24707
+                                    :use-percent 14}
+                                   {:checkpoint :post-pivot-after-debian-old-cleanup
+                                    :used-mib 1850
+                                    :available-mib 26813
+                                    :use-percent 7}]
+                     :peak-disk-used-mib 4206
+                     :min-disk-available-mib 24457
+                     :final-gentoo-disk-used-mib 1850
+                     :net-disk-reduction-vs-debian-mib 236}
+ :gate-3-wall-clock-timings {:passed? true
+                             :phases [{:phase :zram-install-and-enable
+                                       :start-epoch 1795134886
+                                       :end-epoch 1795134892
+                                       :duration-sec 6}
+                                      {:phase :stage3-download-and-sha512
+                                       :start-epoch 1795134960
+                                       :end-epoch 1795134978
+                                       :duration-sec 18}
+                                      {:phase :stage3-unpack
+                                       :start-epoch 1795134978
+                                       :end-epoch 1795135047
+                                       :duration-sec 69}
+                                      {:phase :node22-and-openjdk25-install
+                                       :start-epoch 1795135133
+                                       :end-epoch 1795135143
+                                       :duration-sec 10}
+                                      {:phase :chroot-prep-kernel-openrc-and-self-test
+                                       :start-epoch 1795135183
+                                       :end-epoch 1795135208
+                                       :duration-sec 25}
+                                      {:phase :pre-pivot-gcp-disk-snapshot
+                                       :start-epoch 1795135264
+                                       :end-epoch 1795135375
+                                       :duration-sec 111}
+                                      {:phase :gate4-deliberate-abort-and-gcp-snapshot-rollback
+                                       :start-epoch 1795135411
+                                       :end-epoch 1795135527
+                                       :duration-sec 116}
+                                      {:phase :atomic-renameat2-pivot-and-openrc-reboot
+                                       :start-epoch 1795136330
+                                       :end-epoch 1795136351
+                                       :duration-sec 21}
+                                      {:phase :post-pivot-debian-old-cleanup
+                                       :start-epoch 1795137337
+                                       :end-epoch 1795137353
+                                       :duration-sec 16}]
+                             :total-active-migration-path-sec 149
+                             :total-with-pre-pivot-snapshot-sec 260}
+ :gate-4-deliberate-abort-and-rollback {:passed? true
+                                        :snapshot-name "bitecho-gentoo-lab-pre-pivot"
+                                        :snapshot-storage-bytes 1505811520
+                                        :snapshot-creation-duration-sec 111
+                                        :abort-trigger "Deliberately aborted mid-pivot after moving /etc away in a non-root shell"
+                                        :rollback-steps [{:step :stop-instance :duration-sec 22}
+                                                         {:step :detach-corrupted-boot-disk :duration-sec 3}
+                                                         {:step :create-disk-from-pre-pivot-snapshot :duration-sec 48}
+                                                         {:step :attach-restored-boot-disk :duration-sec 3}
+                                                         {:step :start-instance-and-verify-ssh :duration-sec 40}]
+                                        :total-rollback-recovery-sec 116
+                                        :post-rollback-verified? true}
+ :gate-5-end-state-gentoo-openrc {:passed? true
+                                  :uname "Linux bitecho-gentoo-lab 6.1.0-56-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.1.192-2 (2026-11-16) x86_64 Intel(R) Xeon(R) CPU @ 2.20GHz GenuineIntel GNU/Linux"
+                                  :os-release {:name "Gentoo"
+                                               :id "gentoo"
+                                               :pretty-name "Gentoo Linux"
+                                               :version "2.18"}
+                                  :openrc-services {:boot ["hwclock" "modules" "fsck" "root" "hostname" "sysctl" "mtab" "swap" "localmount" "termencoding" "bootmisc" "keymaps" "save-keymaps" "save-termencoding" "zramswap" "seedrng" "procfs" "binfmt" "systemd-tmpfiles-setup" "loopback"]
+                                                    :default ["dhcpcd" "sshd" "bitecho-light-node" "netmount" "local"]
+                                                    :all-started? true}
+                                  :node-version "v22.23.5"
+                                  :openjdk-version "25.0.5.1+2-LTS (Temurin-25.0.5.1+2)"
+                                  :full-node-self-test {:epoch 11
+                                                        :fressian_roundtrip_ok true
+                                                        :active_config_hash "b93b72e8722a628971f74bba14f52a2a9b5dec3ff310faee6f86eac3162ce0dd"
+                                                        :spend_dac_ok true
+                                                        :ok true
+                                                        :runtime "nodejs"
+                                                        :audit_records 2
+                                                        :version "0.23.14"
+                                                        :node_version "v22.23.5"}
+                                  :light-node-openrc-status {:ok true
+                                                             :connected true
+                                                             :transport_healthy true
+                                                             :lan_ip "10.128.0.2"
+                                                             :epoch 34329
+                                                             :finalized_epoch 34329
+                                                             :pubkey "302a300506032b6570032100591d11e6f429dd09f711897c2140b157f2a6307a53d830c38a14c74964c5a976"
+                                                             :diagnostics {:phase "open"
+                                                                           :generation 1
+                                                                           :dropped 0
+                                                                           :ignored_stale 0
+                                                                           :failover_count 0
+                                                                           :consecutive_send_failures 0
+                                                                           :last_error nil
+                                                                           :validator_id "node1"}}}
+ :failure-classifications [{:id "F-1"
+                            :phase :chroot-prep
+                            :symptom "java: error while loading shared libraries: libjli.so: cannot open shared object file"
+                            :classification :procedure-bug
+                            :root-cause "Gentoo Hardened toolchain enables insecure-RUNPATH filtering unless /proc is mounted inside the chroot so the dynamic linker can resolve $ORIGIN/../lib via /proc/self/exe."
+                            :fix "Mount /proc, /sys, /dev, /run before running chroot verification; after real boot into Gentoo OpenRC, /proc is mounted by procfs service and java works natively."}
+                           {:id "F-2"
+                            :phase :pivot
+                            :symptom "sudo: you do not exist in the passwd database after swapping /etc"
+                            :classification :procedure-bug
+                            :root-cause "Executing multiple sudo commands sequentially in a non-root shell fails once /etc is swapped if the unprivileged user's UID or sudoers config changes between Debian and Gentoo."
+                            :fix "Execute the entire pivot atomically inside a single root process (sudo python3 -c ...)."}
+                           {:id "F-3"
+                            :phase :pivot
+                            :symptom "/bin/sh: /gentoo/usr/bin/mv: not found (or ld-linux-x86-64.so.2 missing) after mv /usr /debian.old/usr"
+                            :classification :procedure-bug
+                            :root-cause "Both Debian 12 and Gentoo stage3 use merged-/usr where /lib64 -> usr/lib64 and Debian's /usr/lib64/ld-linux-x86-64.so.2 is an absolute symlink to /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2. Moving /usr away first breaks the ELF interpreter path for any subsequent dynamically linked subprocess."
+                            :fix "Use the Linux renameat2(AT_FDCWD, \"/usr\", AT_FDCWD, \"/gentoo/usr\", RENAME_EXCHANGE) syscall (syscall 316, flags=2) inside a single root Python process so /usr and /gentoo/usr are exchanged atomically in the kernel VFS with zero window where /lib64/ld-linux-x86-64.so.2 is absent."}
+                           {:id "F-4"
+                            :phase :openrc-daemon
+                            :symptom "bitecho-light-node service marked [ crashed ] under OpenRC start-stop-daemon --background"
+                            :classification :procedure-bug
+                            :root-cause "bitecho-light-node.cjs serve attaches a readline interface to process.stdin and exits cleanly on stdin EOF; start-stop-daemon --background redirects stdin to /dev/null (immediate EOF), and /sbin/openrc-run uses POSIX /bin/sh where bash process substitution < <(...) is invalid."
+                            :fix "Use a POSIX /bin/sh wrapper (/usr/local/bin/bitecho-light-node-daemon) that pipes tail -f /dev/null into exec node /opt/bitecho/bitecho-light-node.cjs \"$@\", keeping stdin open."}]}
