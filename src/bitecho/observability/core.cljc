@@ -559,11 +559,20 @@
 
 (defn compute-six-nines-sla
   "Pure P-OBS-4 six-nines SLA accountant over published telemetry digests.
-   Separates `:deploy-downtime-ms` from `:service-downtime-ms` and reports both
+   Separates `:deploy-downtime-ms` from `:service-downtime-ms`, optionally filters
+   events to the rolling `[now-ms - window-ms, now-ms]` window, and reports both
    `:head-epoch-max` and `:finalized-epoch-max`."
-  [digests {:keys [window-ms]}]
+  [digests {:keys [window-ms now-ms]}]
   (let [win-ms (max 1 (long (or window-ms 86400000)))
-        all-events (mapcat #(or (:downtime-events %) []) digests)
+        now-ts (when (some? now-ms) (long now-ms))
+        win-start (when now-ts (- now-ts win-ms))
+        raw-events (mapcat #(or (:downtime-events %) []) digests)
+        all-events (if win-start
+                     (filter (fn [ev]
+                               (let [ended (or (:ended-ms ev) (:started-ms ev))]
+                                 (or (nil? ended) (>= (long ended) win-start))))
+                             raw-events)
+                     raw-events)
         deploy-ms (reduce + 0 (map #(long (or (:duration-ms %) 0))
                                    (filter #(contains? deploy-attributable-causes (keyword (:cause %)))
                                            all-events)))
@@ -574,18 +583,140 @@
         svc-avail (max 0.0 (- 1.0 (/ (double service-ms) (double win-ms))))
         tot-avail (max 0.0 (- 1.0 (/ (double (+ deploy-ms service-ms)) (double win-ms))))
         head-max (if (seq digests) (apply max (map #(long (or (:head-epoch %) 0)) digests)) 0)
-        fin-max (if (seq digests) (apply max (map #(long (or (:finalized-epoch %) 0)) digests)) 0)]
-    {:window-ms win-ms
-     :digest-count (count digests)
-     :deploy-downtime-ms deploy-ms
-     :service-downtime-ms service-ms
-     :total-downtime-ms (+ deploy-ms service-ms)
-     :service-availability svc-avail
-     :total-availability tot-avail
-     :six-nines-met? (>= svc-avail 0.999999)
-     :unexplained-restarts unexplained
-     :head-epoch-max head-max
-     :finalized-epoch-max fin-max}))
+        fin-max (if (seq digests) (apply max (map #(long (or (:finalized-epoch %) 0)) digests)) 0)
+        nodes-reporting (vec (sort (distinct (keep :node-id digests))))]
+    (cond-> {:schema "bitecho-sla-report-v1"
+             :window-ms win-ms
+             :digest-count (count digests)
+             :nodes-reporting nodes-reporting
+             :deploy-downtime-ms deploy-ms
+             :service-downtime-ms service-ms
+             :total-downtime-ms (+ deploy-ms service-ms)
+             :service-availability svc-avail
+             :total-availability tot-avail
+             :six-nines-met? (>= svc-avail 0.999999)
+             :unexplained-restarts unexplained
+             :head-epoch-max head-max
+             :finalized-epoch-max fin-max}
+      now-ts (assoc :computed-at-ms now-ts :window-start-ms win-start))))
+
+(defn- bounded-tail
+  [coll max-n]
+  (let [v (vec (or coll []))]
+    (if (> (count v) max-n)
+      (subvec v (- (count v) max-n))
+      v)))
+
+(defn record-startup-event
+  "Pure D39.5 telemetry lifecycle transition on node startup.
+   Classifies restarts as planned (`:clean-shutdown-cause` or `:planned-deploy`) when a
+   graceful shutdown marker was persisted prior to exit, or `:unplanned-crash` otherwise."
+  [prev-ledger {:keys [node-id now-ms]}]
+  (let [nid (str (or node-id (:node-id prev-ledger) "unknown"))
+        ts (max 0 (long (or now-ms 0)))]
+    (if-not (map? prev-ledger)
+      {:schema "bitecho-telemetry-lifecycle-v1"
+       :node-id nid
+       :restart-count 0
+       :restart-causes []
+       :downtime-events []
+       :last-heartbeat-ms ts
+       :clean-shutdown-ms nil
+       :clean-shutdown-cause nil
+       :active-stall-started-ms nil}
+      (let [clean-ms (:clean-shutdown-ms prev-ledger)
+            planned? (some? clean-ms)
+            cause (if planned?
+                    (keyword (or (:clean-shutdown-cause prev-ledger) :planned-deploy))
+                    :unplanned-crash)
+            started-ms (long (or (if planned? clean-ms (:last-heartbeat-ms prev-ledger)) ts))
+            dur-ms (max 0 (- ts started-ms))
+            ev {:node-id nid
+                :cause cause
+                :started-ms started-ms
+                :ended-ms ts
+                :duration-ms dur-ms}
+            prev-causes (or (:restart-causes prev-ledger) [])
+            prev-events (or (:downtime-events prev-ledger) [])]
+        {:schema "bitecho-telemetry-lifecycle-v1"
+         :node-id nid
+         :restart-count (inc (max 0 (long (or (:restart-count prev-ledger) 0))))
+         :restart-causes (bounded-tail (conj (vec prev-causes) cause) 16)
+         :downtime-events (bounded-tail (conj (vec prev-events) ev) 64)
+         :last-heartbeat-ms ts
+         :clean-shutdown-ms nil
+         :clean-shutdown-cause nil
+         :active-stall-started-ms nil}))))
+
+(defn record-shutdown-marker
+  "Pure D39.5 transition on graceful shutdown (`SIGTERM`/`SIGINT`), marking the exit
+   so the next startup classifies the restart as deploy-attributable rather than a crash."
+  [ledger {:keys [now-ms cause]}]
+  (let [ts (max 0 (long (or now-ms 0)))]
+    (assoc (or ledger {})
+           :clean-shutdown-ms ts
+           :clean-shutdown-cause (keyword (or cause :planned-deploy))
+           :last-heartbeat-ms ts)))
+
+(defn record-stall-sample
+  "Pure D39.5 heartbeat & consensus finalization-stall detector.
+   Opens a `:finalization-stall` interval when `head-epoch - finalized-epoch > max-healthy-lag`
+   (default 10) and closes it into `:downtime-events` once finalization catches up."
+  [ledger {:keys [node-id now-ms head-epoch finalized-epoch max-healthy-lag]}]
+  (let [base (or ledger (record-startup-event nil {:node-id node-id :now-ms now-ms}))
+        nid (str (or node-id (:node-id base) "unknown"))
+        ts (max 0 (long (or now-ms 0)))
+        head (long (or head-epoch 0))
+        fin (long (or finalized-epoch 0))
+        max-lag (max 1 (long (or max-healthy-lag 10)))
+        stalled? (and (pos? head) (pos? fin) (> (- head fin) max-lag))
+        active-start (:active-stall-started-ms base)]
+    (cond
+      (and stalled? (nil? active-start))
+      (assoc base :last-heartbeat-ms ts :active-stall-started-ms ts)
+
+      (and (not stalled?) (some? active-start))
+      (let [ev {:node-id nid
+                :cause :finalization-stall
+                :started-ms (long active-start)
+                :ended-ms ts
+                :duration-ms (max 0 (- ts (long active-start)))}]
+        (-> base
+            (assoc :last-heartbeat-ms ts :active-stall-started-ms nil)
+            (update :downtime-events #(bounded-tail (conj (vec (or % [])) ev) 64))))
+
+      :else
+      (assoc base :last-heartbeat-ms ts))))
+
+(defn effective-downtime-events
+  "Returns all recorded `:downtime-events` plus an in-progress `:finalization-stall`
+   event if a consensus stall is currently active at `now-ms`."
+  [ledger now-ms]
+  (let [events (vec (or (:downtime-events ledger) []))
+        active-start (:active-stall-started-ms ledger)]
+    (if (some? active-start)
+      (let [ts (max (long active-start) (long (or now-ms active-start)))]
+        (bounded-tail (conj events {:node-id (str (or (:node-id ledger) "unknown"))
+                                    :cause :finalization-stall
+                                    :started-ms (long active-start)
+                                    :ended-ms ts
+                                    :duration-ms (max 0 (- ts (long active-start)))
+                                    :ongoing? true})
+                      64))
+      events)))
+
+(defn prepare-sla-publication
+  "Pure D39.5 rolling SLA report builder (`sla/latest.edn`) over published node digests."
+  [digests opts]
+  (let [sla (compute-six-nines-sla digests opts)
+        edn-str (pr-str sla)
+        edn-bytes (fressian/utf8->bytes edn-str)]
+    {:subnet "bitecho.org/infra"
+     :path "sla/latest.edn"
+     :sla sla
+     :edn-str edn-str
+     :edn-bytes edn-bytes
+     :byte-size (fressian/count-bytes edn-bytes)}))
 
 (defn should-persist-validator-snapshot?
   "Pure throttle decision for synchronous Fressian validator snapshot persistence on single-threaded

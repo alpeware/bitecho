@@ -57,6 +57,7 @@
 (def ^:private obs-router-atom (atom (obs/init-sink-router {:node-id "full-node"})))
 (def ^:private defense-state-atom (atom (defense/init-defense-state)))
 (def ^:private poll-telemetry-atom (atom {:poll-count 0 :last-sample-ms 0 :last-heap-used 0}))
+(def ^:private validator-event-error-count (atom 0))
 
 (defn- sample-node-runtime-telemetry!
   "P-OBS-5 / F-SOAK-1 runtime telemetry hook: samples process RSS/heap, event-loop lag, and
@@ -1465,9 +1466,24 @@
                                                                    "messages" fresh-m
                                                                    "broadcasts" fresh-b
                                                                    "last_broadcast_seq" max-bseq})))))
-                              wake-fn (fn []
-                                        (swap! waiters-atom #(-> % (update norm-pk disj finish!) (update :broadcast disj finish!)))
-                                        (finish!))]
+                              wake-fn (let [self-ref (atom nil)]
+                                        (letfn [(do-wake []
+                                                  (let [f @self-ref]
+                                                    (swap! waiters-atom
+                                                           (fn [m]
+                                                             (let [m1 (if-let [s (get m norm-pk)]
+                                                                        (let [s' (disj s f)]
+                                                                          (if (empty? s') (dissoc m norm-pk) (assoc m norm-pk s')))
+                                                                        m)
+                                                                   m2 (if-let [s (get m1 :broadcast)]
+                                                                        (let [s' (disj s f)]
+                                                                          (if (empty? s') (dissoc m1 :broadcast) (assoc m1 :broadcast s')))
+                                                                        m1)]
+                                                               m2))))
+                                                  (try (.removeListener req "close" do-wake) (catch :default _ nil))
+                                                  (finish!))]
+                                          (reset! self-ref do-wake)
+                                          do-wake))]
                           (swap! waiters-atom #(-> % (update norm-pk (fnil conj #{}) wake-fn) (update :broadcast (fnil conj #{}) wake-fn)))
                           (reset! timer-id (js/setTimeout wake-fn wait-ms))
                           (.on req "close" wake-fn))
@@ -2351,6 +2367,7 @@
                            (-> s
                                (update :event-errors-count (fnil inc 0))
                                (assoc :last-event-error (or (.-message t) (str t))))))
+                  (swap! validator-event-error-count inc)
                   (log-diagnostic! {:effect :diagnose :reason :validator-event-error :event-type (:type ev) :detail (or (.-message t) (str t))}))
                 (let [{new-state :state commands :commands} res]
                   (reset! state-atom new-state)
@@ -2759,16 +2776,61 @@
     (catch :default e
       (on-done false (.-message e)))))
 
+(defn- telemetry-lifecycle-path
+  [state-dir nid]
+  (when state-dir
+    (.join node-path (str state-dir) (str "telemetry-lifecycle-" nid ".edn"))))
+
+(defn- load-telemetry-lifecycle-ledger!
+  [state-dir nid now-ms]
+  (let [p (telemetry-lifecycle-path state-dir nid)
+        prev (when (and p (.existsSync node-fs p))
+               (try
+                 (edn/read-string (.readFileSync node-fs p "utf8"))
+                 (catch :default _ nil)))
+        next-ledger (obs/record-startup-event prev {:node-id nid :now-ms now-ms})]
+    (when p
+      (try
+        (let [tmp (str p ".tmp")]
+          (-> (.writeFile (.-promises node-fs) tmp (pr-str next-ledger) "utf8")
+              (.then #(.rename (.-promises node-fs) tmp p))
+              (.catch (fn [_] nil))))
+        (catch :default _ nil)))
+    next-ledger))
+
+(defn- persist-telemetry-lifecycle-async!
+  [state-dir nid ledger]
+  (when-let [p (telemetry-lifecycle-path state-dir nid)]
+    (try
+      (let [tmp (str p ".tmp")]
+        (-> (.writeFile (.-promises node-fs) tmp (pr-str ledger) "utf8")
+            (.then #(.rename (.-promises node-fs) tmp p))
+            (.catch (fn [_] nil))))
+      (catch :default _ nil))))
+
+(defn- persist-telemetry-shutdown-marker!
+  [state-dir nid ledger-atom]
+  (let [now-ms (.now js/Date)
+        marked (swap! ledger-atom obs/record-shutdown-marker {:now-ms now-ms :cause :planned-deploy})]
+    (when-let [p (telemetry-lifecycle-path state-dir nid)]
+      (try
+        (let [tmp (str p ".tmp")]
+          (.writeFileSync node-fs tmp (pr-str marked) "utf8")
+          (.renameSync node-fs tmp p))
+        (catch :default _ nil)))))
+
 (defn- start-validator-telemetry-publisher!
-  "P-OBS-4 / D38.1: Periodically publishes signed privacy-preserving `telemetry/<node-id>/digest.edn`
-   blobs & pointers from standalone validator nodes (`node1..node3`) to the infra artifact plane."
-  [node-id identity state-atom peer-conns]
+  "P-OBS-4 / D38.1 / D39.5: Periodically publishes signed privacy-preserving
+   `telemetry/<node-id>/digest.edn` blobs & pointers from standalone validator nodes
+   (`node1..node3`) with real restart/stall downtime tracking and peer-conn diagnostics."
+  [node-id identity state-atom peer-conns state-dir]
   (let [started-ms (.now js/Date)
         nid (if (keyword? node-id) (name node-id) (str node-id))
         auth-pub (:pubkey-hex identity)
         auth-priv (:privkey-bytes identity)
         targets ["ns1.bitecho.org" "ns2.bitecho.org" "ns3.bitecho.org"]
         seq-atom (atom 0)
+        ledger-atom (atom (load-telemetry-lifecycle-ledger! state-dir nid started-ms))
         publish-once!
         (fn []
           (when (and auth-pub auth-priv)
@@ -2779,9 +2841,19 @@
                     head-ep (long (or (:epoch st) 0))
                     fin-ep (long (or (:last-executed-finalized-epoch st) 0))
                     peers-up (count (filter (fn [[_ v]] (= :open (:phase v))) @peer-conns))
+                    conn-diag (core-mesh/mesh-conn-diagnostics-summary (vals @peer-conns))
+                    ledger (swap! ledger-atom obs/record-stall-sample
+                                  {:node-id nid
+                                   :now-ms now-ms
+                                   :head-epoch head-ep
+                                   :finalized-epoch fin-ep})
+                    _ (persist-telemetry-lifecycle-async! state-dir nid ledger)
                     pub (obs/prepare-telemetry-publication
                          {:node-id nid
                           :uptime-ms (max 0 (- now-ms started-ms))
+                          :restart-count (:restart-count ledger)
+                          :restart-causes (:restart-causes ledger)
+                          :downtime-events (obs/effective-downtime-events ledger now-ms)
                           :head-epoch head-ep
                           :finalized-epoch fin-ep
                           :runtime-summary {:rss-bytes (.-rss mem)
@@ -2791,12 +2863,13 @@
                           :service-counters {:peers-connected peers-up
                                              :pending-receipts (count (:pending-receipts st))
                                              :failed-receipts (long (or (:failed-receipts-count st) 0))
+                                             :validator-event-errors (long @validator-event-error-count)
                                              :notarized-count (+ (count (:notarized-blocks st))
                                                                  (long (or (:pruned-notarized-count st) 0)))
                                              :finalized-count (+ (count (:finalized-blocks st))
                                                                  (long (or (:pruned-finalized-count st) 0)))}
-                          :defense-counters {:conn-dropped (long (or (:conn-dropped st) 0))
-                                             :conn-stale (long (or (:conn-stale st) 0))}})
+                          :defense-counters {:conn-dropped (long (or (:dropped conn-diag) 0))
+                                             :conn-stale (long (or (:ignored-stale conn-diag) 0))}})
                     blob (data/make-blob (:edn-bytes pub) "application/edn")
                     next-seq (swap! seq-atom (fn [prev] (max (inc (long prev)) (quot now-ms 1000))))
                     ptr (data/sign-pointer auth-priv
@@ -2835,7 +2908,8 @@
         iv (js/setInterval publish-once! 60000)]
     (fn []
       (js/clearTimeout t0)
-      (js/clearInterval iv))))
+      (js/clearInterval iv)
+      (persist-telemetry-shutdown-marker! state-dir nid ledger-atom))))
 
 (defn start-validator-mesh-node!
   "Starts a full Bitecho validator & mesh node on Node.js (`:5000..5005` DataChannel peer mesh,
@@ -2945,7 +3019,7 @@
                 (cb {:http-port bound-port}))))
          stop-telemetry! (when (and (not (:embedded? opts))
                                     (not (false? (:publish-telemetry? config))))
-                           (start-validator-telemetry-publisher! node-id identity state-atom peer-conns))
+                           (start-validator-telemetry-publisher! node-id identity state-atom peer-conns state-dir))
          stop! (fn []
                  (when stop-telemetry! (stop-telemetry!))
                  (js/clearTimeout init-timer)
@@ -3127,14 +3201,39 @@
 ;; 10. Full Infra-Node Orchestrator (`start-infra-node!`)
 ;; =============================================================================
 
+(defn- collect-published-telemetry-digests
+  "Reads all replicated `telemetry/*/digest.edn` blobs from the local infra subnet instance."
+  [inst]
+  (let [pointers (get-in inst [:data :pointers] {})
+        blobs (get-in inst [:data :blobs] {})]
+    (reduce-kv
+     (fn [acc [_ path] ptr]
+       (if (and (string? path)
+                (str/starts-with? path "telemetry/")
+                (str/ends-with? path "/digest.edn"))
+         (if-let [blob (get blobs (:pointer/target ptr))]
+           (let [bs (:blob/bytes blob)
+                 parsed (try
+                          (when bs
+                            (edn/read-string (fressian/bytes->utf8 bs)))
+                          (catch :default _ nil))]
+             (if (map? parsed) (conj acc parsed) acc))
+           acc)
+         acc))
+     []
+     pointers)))
+
 (defn- start-infra-telemetry-publisher!
-  "P-OBS-4 / D38.1: Periodically publishes signed privacy-preserving `telemetry/<node-id>/digest.edn`
-   blobs & pointers from infra nodes (`ns1..ns3`) directly into the local subnet instance
-   (which automatically replicates blobs & pointers across the infra cluster)."
-  [node-id rt]
+  "P-OBS-4 / D38.1 / D39.5: Periodically publishes signed privacy-preserving
+   `telemetry/<node-id>/digest.edn` AND rolling `sla/latest.edn` reports from infra nodes
+   (`ns1..ns3`) directly into the local subnet instance."
+  [node-id rt waiters-atom]
   (let [started-ms (.now js/Date)
         nid (if (keyword? node-id) (name node-id) (str node-id))
+        state-dir (:state-dir rt)
         seq-atom (atom 0)
+        sla-seq-atom (atom 0)
+        ledger-atom (atom (load-telemetry-lifecycle-ledger! state-dir nid started-ms))
         publish-once!
         (fn []
           (let [auth-pub (:default-sender rt)
@@ -3146,13 +3245,28 @@
                       sid (or (:subnet-id inst) "bitecho.org/infra")
                       vnode (:validator-node rt)
                       vst (when-let [sa (:state-atom vnode)] @sa)
+                      v-peer-conns (when-let [pc (:peer-conns vnode)] @pc)
+                      conn-diag (when v-peer-conns
+                                  (core-mesh/mesh-conn-diagnostics-summary (vals v-peer-conns)))
                       mem (.memoryUsage js/process)
                       head-ep (long (or (:epoch vst) (:epoch inst) 0))
                       fin-ep (long (or (:last-executed-finalized-epoch vst) (:epoch inst) 0))
                       rt-shell (when-let [sa (:shell-atom rt)] @sa)
+                      active-waiters (if waiters-atom
+                                       (reduce-kv (fn [acc _ s] (+ acc (count s))) 0 @waiters-atom)
+                                       0)
+                      ledger (swap! ledger-atom obs/record-stall-sample
+                                    {:node-id nid
+                                     :now-ms now-ms
+                                     :head-epoch head-ep
+                                     :finalized-epoch fin-ep})
+                      _ (persist-telemetry-lifecycle-async! state-dir nid ledger)
                       pub (obs/prepare-telemetry-publication
                            {:node-id nid
                             :uptime-ms (max 0 (- now-ms started-ms))
+                            :restart-count (:restart-count ledger)
+                            :restart-causes (:restart-causes ledger)
+                            :downtime-events (obs/effective-downtime-events ledger now-ms)
                             :head-epoch head-ep
                             :finalized-epoch fin-ep
                             :runtime-summary {:rss-bytes (.-rss mem)
@@ -3161,9 +3275,11 @@
                                               :runtime "nodejs"}
                             :service-counters {:pointer-count (count (get-in inst [:data :pointers] {}))
                                                :poll-count (long (or (:poll-count @poll-telemetry-atom) 0))
+                                               :active-waiters active-waiters
+                                               :validator-event-errors (long @validator-event-error-count)
                                                :failed-receipts (long (or (:failed-receipts-count vst) 0))}
-                            :defense-counters {:dropped (long (or (:dropped rt-shell) 0))
-                                               :ignored-stale (long (or (:ignored-stale rt-shell) 0))}})
+                            :defense-counters {:conn-dropped (long (or (:dropped conn-diag) (:dropped rt-shell) 0))
+                                               :conn-stale (long (or (:ignored-stale conn-diag) (:ignored-stale rt-shell) 0))}})
                       existing (get-in inst [:data :pointers [(str sid) (:path pub)]])
                       prev-on-chain (long (or (:pointer/seq existing) 0))
                       next-seq (swap! seq-atom (fn [prev] (max (inc (long prev)) (inc prev-on-chain) (quot now-ms 1000))))
@@ -3182,7 +3298,25 @@
                                           {:type :diagnose
                                            :reason :telemetry-digest-publish-rejected
                                            :error (:error res)
-                                           :path (:path pub)}))))
+                                           :path (:path pub)})))
+                  ;; Publish rolling 24h six-nines SLA rollup (`sla/latest.edn`)
+                  (let [fresh-inst @(:subnet-atom rt)
+                        digests (collect-published-telemetry-digests fresh-inst)]
+                    (when (seq digests)
+                      (let [sla-pub (obs/prepare-sla-publication digests {:window-ms 86400000 :now-ms now-ms})
+                            sla-existing (get-in fresh-inst [:data :pointers [(str sid) (:path sla-pub)]])
+                            prev-sla-seq (long (or (:pointer/seq sla-existing) 0))
+                            next-sla-seq (swap! sla-seq-atom (fn [prev] (max (inc (long prev)) (inc prev-sla-seq) (quot now-ms 1000))))
+                            sla-blob (data/make-blob (:edn-bytes sla-pub) "application/edn")
+                            sla-ptr (data/sign-pointer auth-priv
+                                                       {:pointer/authority auth-pub
+                                                        :pointer/subnet (str sid)
+                                                        :pointer/path (:path sla-pub)
+                                                        :pointer/seq next-sla-seq
+                                                        :pointer/target (:blob/cid sla-blob)
+                                                        :pointer/proof {:proof/type :self}})]
+                        (submit-subnet-event! rt {:type :put-blob :blob sla-blob :sender auth-pub :now-ms now-ms})
+                        (submit-subnet-event! rt {:type :publish-pointer :pointer sla-ptr :sender auth-pub :now-ms now-ms})))))
                 (catch :default e
                   (apply-shell-event! (:shell-atom rt)
                                       {:type :diagnose
@@ -3192,7 +3326,8 @@
         iv (js/setInterval publish-once! 60000)]
     (fn []
       (js/clearTimeout t0)
-      (js/clearInterval iv))))
+      (js/clearInterval iv)
+      (persist-telemetry-shutdown-marker! state-dir nid ledger-atom))))
 
 (defn- start-peer-heartbeat-loop!
   [config rt]
@@ -3397,9 +3532,9 @@
       (when-let [hb-timer (start-peer-heartbeat-loop! config rt)]
         (swap! stop-fns conj #(js/clearInterval hb-timer)))
 
-      ;; P-OBS-4 / D38.1: 60s signed observability digest publisher
+      ;; P-OBS-4 / D38.1 / D39.5: 60s signed observability digest & rolling SLA publisher
       (when-not (false? (:publish-telemetry? config))
-        (swap! stop-fns conj (start-infra-telemetry-publisher! node-id rt)))
+        (swap! stop-fns conj (start-infra-telemetry-publisher! node-id rt waiters-atom)))
 
       ;; 1. DNS (:53)
       (when dns-enabled?

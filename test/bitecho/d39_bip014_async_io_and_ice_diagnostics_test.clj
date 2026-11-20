@@ -6,6 +6,7 @@
    - P-ASYNC-4: Browser WebRTC ICE & connection-state diagnostics (shell/browser.cljc, browser_main.cljs)"
   (:require [bitecho.core.mesh :as core-mesh]
             [bitecho.economy.account :as account]
+            [bitecho.observability.core :as obs]
             [bitecho.shell.browser :as browser]
             [bitecho.shell.persistence :as persistence]
             [bitecho.snapshot.core :as snap]
@@ -573,3 +574,95 @@
         (is (set? (:delivered-set healed)))
         (is (set? (:expired-gossip-ids healed)))
         (is (set? (get-in healed [:epoch-to-messages 52160])))))))
+
+(defspec prop-telemetry-lifecycle-ledger-invariants
+  "Property: telemetry lifecycle ledger maintains bounded events/causes and non-negative durations across arbitrary restarts and stalls."
+  100
+  (prop/for-all [steps (gen/vector
+                        (gen/one-of
+                         [(gen/tuple (gen/return :heartbeat)
+                                     (gen/choose 1000 60000)
+                                     (gen/choose 100 200)
+                                     (gen/choose 0 30))
+                          (gen/tuple (gen/return :clean-restart)
+                                     (gen/choose 1000 30000))
+                          (gen/tuple (gen/return :crash-restart)
+                                     (gen/choose 1000 30000))])
+                        1 40)]
+                (let [t0 1700000000000
+                      init (obs/record-startup-event nil {:node-id "ns1" :now-ms t0})
+                      [final-ledger final-t]
+                      (reduce (fn [[ledger t] step]
+                                (case (first step)
+                                  :heartbeat
+                                  (let [[_ dt head lag] step
+                                        t' (+ t dt)
+                                        fin (max 0 (- head lag))]
+                                    [(obs/record-stall-sample ledger {:node-id "ns1"
+                                                                      :now-ms t'
+                                                                      :head-epoch head
+                                                                      :finalized-epoch fin
+                                                                      :max-healthy-lag 10})
+                                     t'])
+                                  :clean-restart
+                                  (let [[_ dt] step
+                                        t-stop (+ t 1000)
+                                        t-start (+ t-stop dt)
+                                        marked (obs/record-shutdown-marker ledger {:now-ms t-stop :cause :planned-deploy})]
+                                    [(obs/record-startup-event marked {:node-id "ns1" :now-ms t-start}) t-start])
+                                  :crash-restart
+                                  (let [[_ dt] step
+                                        t-start (+ t dt)]
+                                    [(obs/record-startup-event ledger {:node-id "ns1" :now-ms t-start}) t-start])))
+                              [init t0]
+                              steps)
+                      eff-events (obs/effective-downtime-events final-ledger final-t)]
+                  (and (<= (count (:downtime-events final-ledger)) 64)
+                       (<= (count (:restart-causes final-ledger)) 16)
+                       (every? #(>= (:duration-ms %) 0) eff-events)
+                       (every? #(keyword? (:cause %)) eff-events)
+                       (>= (:restart-count final-ledger) 0)))))
+
+(deftest s-d39-11-telemetry-lifecycle-sla-and-waiters-cleanup-test
+  (testing "S-D39-11: telemetry lifecycle ledger classifies planned vs crash restarts, detects stalls, and computes accurate 6-nines SLA"
+    (let [t0 1795200000000
+          ;; Initial boot -> 0 restarts
+          l0 (obs/record-startup-event nil {:node-id "ns1" :now-ms t0})
+          ;; Planned deploy restart (5s downtime)
+          l1 (obs/record-shutdown-marker l0 {:now-ms (+ t0 60000) :cause :planned-deploy})
+          l2 (obs/record-startup-event l1 {:node-id "ns1" :now-ms (+ t0 65000)})
+          ;; Unplanned OOM crash (no shutdown marker; 12s after last heartbeat)
+          l3 (obs/record-stall-sample l2 {:node-id "ns1" :now-ms (+ t0 120000) :head-epoch 52100 :finalized-epoch 52099})
+          l4 (obs/record-startup-event l3 {:node-id "ns1" :now-ms (+ t0 132000)})
+          ;; Consensus finalization stall (lag = 25 > 10 for 20s, then recovers)
+          l5 (obs/record-stall-sample l4 {:node-id "ns1" :now-ms (+ t0 200000) :head-epoch 52180 :finalized-epoch 52137})
+          ongoing (obs/effective-downtime-events l5 (+ t0 215000))
+          l6 (obs/record-stall-sample l5 {:node-id "ns1" :now-ms (+ t0 220000) :head-epoch 52192 :finalized-epoch 52191})
+          digest (obs/build-telemetry-digest {:node-id "ns1"
+                                              :uptime-ms 88000
+                                              :restart-count (:restart-count l6)
+                                              :restart-causes (:restart-causes l6)
+                                              :downtime-events (obs/effective-downtime-events l6 (+ t0 220000))
+                                              :head-epoch 52192
+                                              :finalized-epoch 52191})
+          sla-pub (obs/prepare-sla-publication [digest] {:window-ms 86400000 :now-ms (+ t0 220000)})
+          sla (:sla sla-pub)]
+      (is (= 0 (:restart-count l0)))
+      (is (= 2 (:restart-count l6)))
+      (is (= [:planned-deploy :unplanned-crash] (:restart-causes l6)))
+      ;; Ongoing stall is immediately surfaced before recovery
+      (is (= 3 (count ongoing)))
+      (is (= :finalization-stall (:cause (last ongoing))))
+      (is (= 15000 (:duration-ms (last ongoing))))
+      ;; Final SLA separates deploy (5s) from service (12s crash + 20s stall = 32s)
+      (is (= 5000 (:deploy-downtime-ms sla)))
+      (is (= 32000 (:service-downtime-ms sla)))
+      (is (false? (:six-nines-met? sla)))
+      (is (= "sla/latest.edn" (:path sla-pub)))
+      (is (= ["ns1"] (:nodes-reporting sla)))))
+  (testing "S-D39-11: full_node_main.cljs removes wake-fn (not finish!) from waiters-atom and uses mesh-conn-diagnostics-summary"
+    (let [src (slurp "src/bitecho/full_node_main.cljs")]
+      (is (not (str/includes? src "(update norm-pk disj finish!)"))
+          "waiters-atom MUST remove wake-fn, never finish!, to prevent unbounded HTTP/TLS socket OOM leak")
+      (is (str/includes? src "prepare-sla-publication")
+          "infra telemetry publisher must publish rolling sla/latest.edn"))))
