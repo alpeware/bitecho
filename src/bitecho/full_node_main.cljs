@@ -32,6 +32,7 @@
             [bitecho.host.core :as host]
             [bitecho.light-node.core :as light-core]
             [bitecho.observability.core :as obs]
+            [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
             [cljs.reader :as edn]
             [clojure.string :as str]
@@ -39,6 +40,7 @@
             [datachannel.dtls :as dtls]))
 
 (def ^:private node-fs (js/require "node:fs"))
+(def ^:private node-fsp (.-promises node-fs))
 (def ^:private node-path (js/require "node:path"))
 (def ^:private node-http (js/require "node:http"))
 (def ^:private node-https (js/require "node:https"))
@@ -50,7 +52,7 @@
 
 (def full-node-version
   "Current Node.js Full / Infra Node release version."
-  "0.23.16")
+  "0.23.17")
 
 (def ^:private obs-router-atom (atom (obs/init-sink-router {:node-id "full-node"})))
 (def ^:private defense-state-atom (atom (defense/init-defense-state)))
@@ -139,6 +141,8 @@
      @shell-atom)))
 
 (defn- atomic-write-file!
+  "Explicit boot/SIGTERM-only synchronous atomic write helper (BIP-014 exception).
+   All runtime hot paths MUST use `atomic-write-file-async!`."
   [dest-path data-buf-or-str mode]
   (let [parent (.dirname node-path dest-path)
         _ (when-not (.existsSync node-fs parent)
@@ -153,6 +157,27 @@
       (catch :default e
         (try (when (.existsSync node-fs tmp-path) (.unlinkSync node-fs tmp-path)) (catch :default _ nil))
         (throw e)))))
+
+(defn- atomic-write-file-async!
+  "Zero-Sync-IO async atomic write via `fs.promises`: mkdir -> writeFile -> chmod -> rename.
+   Returns a JS Promise resolving to `dest-path` (BIP-014 / P-ASYNC-2)."
+  [dest-path data-buf-or-str mode]
+  (let [parent (.dirname node-path dest-path)
+        rand-hex (.toString (.randomBytes node-crypto 6) "hex")
+        tmp-path (str dest-path ".tmp-" (.-pid js/process) "-" rand-hex)]
+    (-> (.mkdir node-fsp parent #js {:recursive true})
+        (.then (fn [_] (.writeFile node-fsp tmp-path data-buf-or-str)))
+        (.then (fn [_]
+                 (if mode
+                   (-> (.chmod node-fsp tmp-path mode)
+                       (.catch (fn [_] nil)))
+                   nil)))
+        (.then (fn [_] (.rename node-fsp tmp-path dest-path)))
+        (.then (fn [_] dest-path))
+        (.catch (fn [e]
+                  (-> (.unlink node-fsp tmp-path)
+                      (.catch (fn [_] nil))
+                      (.then (fn [_] (js/Promise.reject e)))))))))
 
 ;; =============================================================================
 ;; 2. AES-256-GCM TLS Secret & Decryption (Exact JVM Parity with shell/infra.clj)
@@ -227,6 +252,7 @@
       (.join node-path state-dir "blobs" (subs ncid 0 2) (str ncid ".meta.edn")))))
 
 (defn- write-disk-blob!
+  "Zero-Sync-IO async CAS blob persistence (`fs.promises`). Emits Rule 5 `:diagnose` on failure."
   [state-dir blob shell-atom]
   (let [ncid (core-infra/normalize-cid (:blob/cid blob))
         bs (:blob/bytes blob)
@@ -242,14 +268,58 @@
             {:ok? false :error :blob-cid-mismatch})
           (let [dest (blob-file-path state-dir ncid)
                 mdest (blob-meta-path state-dir ncid)
-                buf (u8->buf bs)]
-            (when-not (.existsSync node-fs dest)
-              (atomic-write-file! dest buf nil))
-            (when-not (.existsSync node-fs mdest)
-              (atomic-write-file! mdest (pr-str {:media-type mt :size (.-length buf)}) nil))
+                buf (u8->buf bs)
+                meta-str (pr-str {:media-type mt :size (.-length buf)})]
+            (-> (.access node-fsp dest)
+                (.catch (fn [_] (atomic-write-file-async! dest buf nil)))
+                (.then (fn [_]
+                         (-> (.access node-fsp mdest)
+                             (.catch (fn [_] (atomic-write-file-async! mdest meta-str nil))))))
+                (.catch (fn [e]
+                          (apply-shell-event! shell-atom
+                                              {:type :diagnose
+                                               :reason :blob-fs-async-write-failed
+                                               :cid ncid
+                                               :detail (or (.-message e) (str e))}))))
             {:ok? true :cid ncid :path dest}))))))
 
+(defn- read-disk-blob-async!
+  "Zero-Sync-IO async CAS blob read (`fs.promises`), invoking `(cb result-map)`."
+  [state-dir cid shell-atom cb]
+  (let [ncid (core-infra/normalize-cid cid)
+        fpath (blob-file-path state-dir ncid)
+        mpath (blob-meta-path state-dir ncid)]
+    (if-not fpath
+      (cb {:ok? false :error :blob-not-found})
+      (-> (.readFile node-fsp fpath)
+          (.then (fn [buf]
+                   (let [u8 (buf->u8 buf)
+                         actual (data/compute-cid u8)]
+                     (if (not= ncid actual)
+                       (do
+                         (apply-shell-event! shell-atom {:type :diagnose :reason :blob-fs-corrupt :expected ncid :actual actual})
+                         (cb {:ok? false :error :blob-cid-mismatch}))
+                       (-> (if mpath
+                             (-> (.readFile node-fsp mpath "utf8")
+                                 (.then (fn [s] (try (edn/read-string s) (catch :default _ nil))))
+                                 (.catch (fn [_] nil)))
+                             (js/Promise.resolve nil))
+                           (.then (fn [meta-map]
+                                    (cb {:ok? true
+                                         :path fpath
+                                         :blob {:blob/cid ncid
+                                                :blob/media-type (or (:media-type meta-map) "application/octet-stream")
+                                                :blob/bytes u8}}))))))))
+          (.catch (fn [e]
+                    (if (= "ENOENT" (.-code e))
+                      (cb {:ok? false :error :blob-not-found})
+                      (do
+                        (apply-shell-event! shell-atom {:type :diagnose :reason :blob-fs-io-error :cid ncid :detail (or (.-message e) (str e))})
+                        (cb {:ok? false :error :blob-io-error})))))))))
+
 (defn- read-disk-blob!
+  "Boot-only synchronous CAS blob reader (used during initial TLS cert load).
+   Runtime HTTP handlers use `read-disk-blob-async!`."
   [state-dir cid shell-atom]
   (let [ncid (core-infra/normalize-cid cid)
         fpath (blob-file-path state-dir ncid)
@@ -277,6 +347,7 @@
           {:ok? false :error :blob-io-error})))))
 
 (defn- save-pointers-snapshot!
+  "Zero-Sync-IO async pointer snapshot persistence via `atomic-write-file-async!`."
   [state-dir subnet-state shell-atom]
   (when state-dir
     (try
@@ -285,7 +356,12 @@
                      :policy (:policy subnet-state)
                      :pointers (get-in subnet-state [:data :pointers] {})}
             encoded (fressian/encode-canonical payload)]
-        (atomic-write-file! dest (u8->buf encoded) nil))
+        (-> (atomic-write-file-async! dest (u8->buf encoded) nil)
+            (.catch (fn [e]
+                      (apply-shell-event! shell-atom
+                                          {:type :diagnose
+                                           :reason :snapshot-save-failed
+                                           :detail (or (.-message e) (str e))})))))
       (catch :default e
         (apply-shell-event! shell-atom {:type :diagnose :reason :snapshot-save-failed :detail (.-message e)})))))
 
@@ -393,6 +469,43 @@
 ;; =============================================================================
 ;; 5. Unified Subnet Runtime Helpers
 ;; =============================================================================
+
+(defn- resolve-cid-blob-async!
+  "Zero-Sync-IO async CID blob resolver: hits in-memory cache synchronously, offloads disk reads to `read-disk-blob-async!`."
+  [rt cid now-ms cb]
+  (if (or (nil? cid) (str/blank? (str cid)))
+    (cb {:ok? false :error :not-found})
+    (let [ncid (core-infra/normalize-cid cid)
+          inst @(:subnet-atom rt)
+          sid (:subnet-id inst)
+          denied (into #{} (map core-infra/normalize-cid) (get-in inst [:policy :subnet/denied-cids] #{}))]
+      (if (contains? denied ncid)
+        (cb {:ok? false :denied? true :error :denied-cid :cid ncid})
+        (let [r-box (atom nil)
+              _ (swap! (:subnet-atom rt)
+                       (fn [cur]
+                         (let [r (data/get-blob (get-in cur [:data :blobs]) ncid {:subnet sid :now-ms now-ms})]
+                           (reset! r-box r)
+                           (assoc-in cur [:data :blobs] (:store r)))))
+              r1 @r-box]
+          (if (:hit? r1)
+            (cb {:ok? true
+                 :cid ncid
+                 :blob (:blob r1)
+                 :file-path (blob-file-path (:state-dir rt) ncid)})
+            (read-disk-blob-async!
+             (:state-dir rt) ncid (:shell-atom rt)
+             (fn [disk-res]
+               (if (:ok? disk-res)
+                 (do
+                   (swap! (:subnet-atom rt)
+                          (fn [cur]
+                            (assoc cur :data (:state (data/put-data-blob (:data cur) (:blob disk-res) now-ms)))))
+                   (cb {:ok? true
+                        :cid ncid
+                        :blob (:blob disk-res)
+                        :file-path (:path disk-res)}))
+                 (cb {:ok? false :error :missing-blob :cid ncid}))))))))))
 
 (defn- resolve-cid-blob!
   [rt cid now-ms]
@@ -751,52 +864,57 @@
                    :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
                    :smtp (when smtp-shell-atom (core-infra/shell-status-summary @smtp-shell-atom))}}))
 
-(defn- resolve-safe-content-root
-  [content-root req-path]
-  (when (and (string? content-root) (not (str/blank? content-root)))
-    (try
-      (let [subpath (core-infra/sanitize-web-subpath req-path)]
-        (if (nil? subpath)
-          {:ok? false :error :forbidden}
-          (if-not (.existsSync node-fs content-root)
-            {:ok? false :error :not-found}
-            (let [root-real (.realpathSync node-fs content-root)
-                  cand (.resolve node-path root-real (if (str/blank? subpath) "." subpath))]
-              (if (and (not= cand root-real)
-                       (not (str/starts-with? cand (str root-real (.-sep node-path)))))
-                {:ok? false :error :forbidden}
-                (if-not (.existsSync node-fs cand)
-                  {:ok? false :error :not-found}
-                  (let [real-p (.realpathSync node-fs cand)]
-                    (if (and (not= real-p root-real)
-                             (not (str/starts-with? real-p (str root-real (.-sep node-path)))))
-                      {:ok? false :error :forbidden}
-                      (let [st (.statSync node-fs real-p)
-                            target-f (cond
-                                       (.isFile st) real-p
-                                       (.isDirectory st)
-                                       (let [idx-html (.join node-path real-p "index.html")
-                                             idx-md (.join node-path real-p "index.md")]
-                                         (cond
-                                           (.existsSync node-fs idx-html) idx-html
-                                           (.existsSync node-fs idx-md) idx-md
-                                           :else nil))
-                                       :else nil)]
-                        (if-not target-f
-                          {:ok? false :error :not-found}
-                          (let [buf (.readFileSync node-fs target-f)
-                                cid (sha256-buf-hex buf)
-                                ct (core-infra/content-type-for-file (.basename node-path target-f))]
-                            {:ok? true
-                             :file-path target-f
-                             :blob {:blob/cid cid
-                                    :blob/media-type ct
-                                    :blob/bytes (buf->u8 buf)}})))))))))))
-      (catch :default _
-        {:ok? false :error :not-found}))))
+(defn- resolve-safe-content-root-async!
+  "Zero-Sync-IO async static content-root file resolver via `fs.promises`, invoking `(cb result-map)`."
+  [content-root req-path cb]
+  (if-not (and (string? content-root) (not (str/blank? content-root)))
+    (cb {:ok? false :error :not-found})
+    (let [subpath (core-infra/sanitize-web-subpath req-path)]
+      (if (nil? subpath)
+        (cb {:ok? false :error :forbidden})
+        (-> (.realpath node-fsp content-root)
+            (.then (fn [root-real]
+                     (let [cand (.resolve node-path root-real (if (str/blank? subpath) "." subpath))]
+                       (if (and (not= cand root-real)
+                                (not (str/starts-with? cand (str root-real (.-sep node-path)))))
+                         (js/Promise.resolve {:ok? false :error :forbidden})
+                         (-> (.realpath node-fsp cand)
+                             (.then (fn [real-p]
+                                      (if (and (not= real-p root-real)
+                                               (not (str/starts-with? real-p (str root-real (.-sep node-path)))))
+                                        (js/Promise.resolve {:ok? false :error :forbidden})
+                                        (-> (.stat node-fsp real-p)
+                                            (.then (fn [st]
+                                                     (cond
+                                                       (.isFile st) (js/Promise.resolve real-p)
+                                                       (.isDirectory st)
+                                                       (let [idx-html (.join node-path real-p "index.html")
+                                                             idx-md (.join node-path real-p "index.md")]
+                                                         (-> (.access node-fsp idx-html)
+                                                             (.then (fn [_] idx-html))
+                                                             (.catch (fn [_]
+                                                                       (-> (.access node-fsp idx-md)
+                                                                           (.then (fn [_] idx-md))
+                                                                           (.catch (fn [_] nil)))))))
+                                                       :else (js/Promise.resolve nil))))
+                                            (.then (fn [target-f]
+                                                     (if-not target-f
+                                                       (js/Promise.resolve {:ok? false :error :not-found})
+                                                       (-> (.readFile node-fsp target-f)
+                                                           (.then (fn [buf]
+                                                                    (let [cid (sha256-buf-hex buf)
+                                                                          ct (core-infra/content-type-for-file (.basename node-path target-f))]
+                                                                      {:ok? true
+                                                                       :file-path target-f
+                                                                       :blob {:blob/cid cid
+                                                                              :blob/media-type ct
+                                                                              :blob/bytes (buf->u8 buf)}}))))))))))))))))
+            (.then (fn [res] (cb res)))
+            (.catch (fn [_] (cb {:ok? false :error :not-found}))))))))
 
-(defn- resolve-web-blob!
-  [config rt req-path now-ms]
+(defn- resolve-web-blob-async!
+  "Zero-Sync-IO async web blob resolver: checks subnet pointers first, then falls back to `resolve-safe-content-root-async!`."
+  [config rt req-path now-ms cb]
   (if-let [subpath (core-infra/sanitize-web-subpath req-path)]
     (let [try-paths (cond
                       (str/blank? subpath) ["web/index.html" "web/index.md"]
@@ -812,11 +930,14 @@
                         (if (or (:ok? r) (:denied? r)) r (recur (rest ps))))
                       {:ok? false :error :not-found}))]
       (cond
-        (:ok? ptr-res) ptr-res
-        (:denied? ptr-res) ptr-res
-        :else (or (resolve-safe-content-root (get-in config [:http :content-root]) req-path)
-                  ptr-res)))
-    {:ok? false :error :forbidden}))
+        (:ok? ptr-res) (cb ptr-res)
+        (:denied? ptr-res) (cb ptr-res)
+        :else (resolve-safe-content-root-async!
+               (get-in config [:http :content-root])
+               req-path
+               (fn [disk-res]
+                 (cb (if (:ok? disk-res) disk-res ptr-res))))))
+    (cb {:ok? false :error :forbidden})))
 
 (defn- send-resolved-blob!
   [req res resolved method extra-headers limiter-atom]
@@ -875,18 +996,22 @@
                           ae
                           (str/includes? (str/lower-case ae) "gzip")
                           (core-infra/compressible-content-type? ct))
-            gz-buf (when want-gz? (try (.gzipSync node-zlib raw-buf) (catch :default _ nil)))
-            use-gz? (and gz-buf (< (.-length gz-buf) total-size))
-            out-buf (if use-gz? gz-buf raw-buf)
-            hdrs (cond-> (assoc auth-hdrs
-                                "Content-Type" ct
-                                "Accept-Ranges" "bytes"
-                                "Content-Length" (.-length out-buf))
-                   use-gz? (assoc "Content-Encoding" "gzip" "Vary" "Accept-Encoding"))]
-        (when (pos? (.-length out-buf))
-          (swap! limiter-atom #(-> (dns-proto/record-egress % (.-length out-buf) (current-month-key)) :state)))
-        (.writeHead res 200 (clj->js hdrs))
-        (if (= method "HEAD") (.end res) (.end res out-buf))))))
+            finish-send! (fn [out-buf use-gz?]
+                           (let [hdrs (cond-> (assoc auth-hdrs
+                                                     "Content-Type" ct
+                                                     "Accept-Ranges" "bytes"
+                                                     "Content-Length" (.-length out-buf))
+                                        use-gz? (assoc "Content-Encoding" "gzip" "Vary" "Accept-Encoding"))]
+                             (when (pos? (.-length out-buf))
+                               (swap! limiter-atom #(-> (dns-proto/record-egress % (.-length out-buf) (current-month-key)) :state)))
+                             (.writeHead res 200 (clj->js hdrs))
+                             (if (= method "HEAD") (.end res) (.end res out-buf))))]
+        (if want-gz?
+          (.gzip node-zlib raw-buf
+                 (fn [err gz-buf]
+                   (let [use-gz? (and (nil? err) gz-buf (< (.-length gz-buf) total-size))]
+                     (finish-send! (if use-gz? gz-buf raw-buf) use-gz?))))
+          (finish-send! raw-buf false))))))
 
 (defn- handle-dist-request!
   [req res config rt raw-path query-str method extra-headers limiter-atom]
@@ -927,18 +1052,27 @@
           (send-resolved-blob! req res direct-res method extra-headers limiter-atom)
 
           :else
-          (let [cr (get-in config [:http :content-root])
-                disk-target (when cr (resolve-safe-content-root cr (str "/dist/" target-name)))
-                disk-direct (when cr (resolve-safe-content-root cr (str "/dist/" rel-path)))]
-            (cond
-              (and sha-req? (:ok? disk-target))
-              (send-text! res 200 (str (get-in disk-target [:blob :blob/cid]) "  " (.basename node-path target-name) "\n") method)
-
-              (:ok? disk-direct)
-              (send-resolved-blob! req res disk-direct method extra-headers limiter-atom)
-
-              :else
-              (send-text! res 404 "Not Found\n" method))))))))
+          (let [cr (get-in config [:http :content-root])]
+            (if-not cr
+              (send-text! res 404 "Not Found\n" method)
+              (if sha-req?
+                (resolve-safe-content-root-async!
+                 cr (str "/dist/" target-name)
+                 (fn [disk-target]
+                   (if (:ok? disk-target)
+                     (send-text! res 200 (str (get-in disk-target [:blob :blob/cid]) "  " (.basename node-path target-name) "\n") method)
+                     (resolve-safe-content-root-async!
+                      cr (str "/dist/" rel-path)
+                      (fn [disk-direct]
+                        (if (:ok? disk-direct)
+                          (send-resolved-blob! req res disk-direct method extra-headers limiter-atom)
+                          (send-text! res 404 "Not Found\n" method)))))))
+                (resolve-safe-content-root-async!
+                 cr (str "/dist/" rel-path)
+                 (fn [disk-direct]
+                   (if (:ok? disk-direct)
+                     (send-resolved-blob! req res disk-direct method extra-headers limiter-atom)
+                     (send-text! res 404 "Not Found\n" method))))))))))))
 
 (defn- handle-artifact-endpoint!
   [req res rt clean-path query-str method]
@@ -984,17 +1118,19 @@
       (str/starts-with? clean-path "/artifact/v1/blob/")
       (if-not (contains? #{"GET" "HEAD"} method)
         (send-json! res 405 {:ok false :error "method-not-allowed"})
-        (let [cid (subs clean-path (count "/artifact/v1/blob/"))
-              r (resolve-cid-blob! rt cid now-ms)]
-          (if (:ok? r)
-            (let [b (:blob r)
-                  buf (u8->buf (:blob/bytes b))]
-              (.writeHead res 200 #js {"Content-Type" (or (:blob/media-type b) "application/octet-stream")
-                                       "Content-Length" (.-length buf)
-                                       "ETag" (str "\"" (:blob/cid b) "\"")
-                                       "X-Bitecho-Blob-Cid" (:blob/cid b)})
-              (if (= method "HEAD") (.end res) (.end res buf)))
-            (send-json! res 404 {:ok false :error "blob-not-found" :cid cid}))))
+        (let [cid (subs clean-path (count "/artifact/v1/blob/"))]
+          (resolve-cid-blob-async!
+           rt cid now-ms
+           (fn [r]
+             (if (:ok? r)
+               (let [b (:blob r)
+                     buf (u8->buf (:blob/bytes b))]
+                 (.writeHead res 200 #js {"Content-Type" (or (:blob/media-type b) "application/octet-stream")
+                                          "Content-Length" (.-length buf)
+                                          "ETag" (str "\"" (:blob/cid b) "\"")
+                                          "X-Bitecho-Blob-Cid" (:blob/cid b)})
+                 (if (= method "HEAD") (.end res) (.end res buf)))
+               (send-json! res 404 {:ok false :error "blob-not-found" :cid cid}))))))
 
       (= clean-path "/artifact/v1/pointer")
       (if (not= method "POST")
@@ -1619,18 +1755,20 @@
             (send-text! res 403 "Forbidden\n" method))
           (if (str/starts-with? subpath "dist/")
             (handle-dist-request! req res config rt raw-path query-str method extra-hdrs limiter-atom)
-            (let [resolved (resolve-web-blob! config rt raw-path now-ms)]
-              (cond
-                (= :forbidden (:error resolved))
-                (do
-                  (apply-shell-event! http-shell-atom {:type :drop :reason :http-forbidden-path :detail raw-path})
-                  (send-text! res 403 "Forbidden\n" method))
+            (resolve-web-blob-async!
+             config rt raw-path now-ms
+             (fn [resolved]
+               (cond
+                 (= :forbidden (:error resolved))
+                 (do
+                   (apply-shell-event! http-shell-atom {:type :drop :reason :http-forbidden-path :detail raw-path})
+                   (send-text! res 403 "Forbidden\n" method))
 
-                (:ok? resolved)
-                (send-resolved-blob! req res resolved method extra-hdrs limiter-atom)
+                 (:ok? resolved)
+                 (send-resolved-blob! req res resolved method extra-hdrs limiter-atom)
 
-                :else
-                (send-text! res 404 "Not Found\n" method)))))))))
+                 :else
+                 (send-text! res 404 "Not Found\n" method))))))))))
 
 (defn- find-header-end-idx
   [buf]
@@ -1730,10 +1868,10 @@
                                                  :date-str date-str
                                                  :raw-eml (:data-str deliver-eff)})
         mail-dir (.join node-path (:state-dir rt) "mail")
-        _ (try
-            (atomic-write-file! (.join node-path mail-dir (str now-ms "-" msg-id ".eml")) full-eml 0600)
-            (catch :default e
-              (apply-shell-event! (:shell-atom rt) {:type :diagnose :reason :smtp-disk-write-failed :detail (.-message e)})))
+        _ (-> (atomic-write-file-async! (.join node-path mail-dir (str now-ms "-" msg-id ".eml")) full-eml 0600)
+              (.catch (fn [e]
+                        (apply-shell-event! (:shell-atom rt)
+                                            {:type :diagnose :reason :smtp-disk-write-failed :detail (or (.-message e) (str e))}))))
         blob (data/make-blob (fressian/utf8->bytes full-eml) "message/rfc822")
         cid8 (subs (:blob/cid blob) 0 8)
         auth-pub (:default-sender rt)
@@ -1823,23 +1961,164 @@
 ;; =============================================================================
 
 (defonce ^:private last-saved-snapshots (atom {}))
+(defonce ^:private validator-writer-atoms (atom {}))
+
+(defn- get-validator-writer-atom
+  [state-dir node-id keep-epochs min-keep]
+  (let [k (str state-dir "::" (snap/sanitize-node-id node-id))]
+    (or (get @validator-writer-atoms k)
+        (let [a (atom (snap/init-writer-state {:node-id node-id
+                                               :keep-epochs (or keep-epochs snap/default-keep-epochs)
+                                               :min-keep (or min-keep snap/default-min-keep)}))]
+          (swap! validator-writer-atoms assoc k a)
+          (get @validator-writer-atoms k)))))
+
+(defn- prune-validator-snapshots-async!
+  [state-dir writer-atom eff]
+  (let [gen (:generation eff)
+        nid (:node-id eff)
+        cur-ep (:current-epoch eff)
+        keep-epochs (:keep-epochs eff)
+        min-keep (:min-keep eff)]
+    (-> (.readdir node-fsp state-dir)
+        (.then (fn [entries]
+                 (let [filenames (vec (array-seq entries))
+                       {:keys [delete]} (snap/plan-snapshot-retention
+                                         nid filenames cur-ep
+                                         {:keep-epochs keep-epochs :min-keep min-keep})]
+                   (js/Promise.all
+                    (clj->js
+                     (mapv (fn [fname]
+                             (-> (.unlink node-fsp (.join node-path state-dir fname))
+                                 (.catch (fn [_] nil))))
+                           delete)))
+                   (count delete))))
+        (.then (fn [del-count]
+                 (let [effs-box (atom [])]
+                   (swap! writer-atom
+                          (fn [wst]
+                            (let [[wst' effs] (snap/transition-writer
+                                               wst
+                                               {:type :prune-succeeded
+                                                :generation gen
+                                                :deleted-count del-count})]
+                              (reset! effs-box effs)
+                              wst')))
+                   (doseq [d @effs-box]
+                     (when (= :diagnose (:effect d))
+                       (log-diagnostic! d))))))
+        (.catch (fn [e]
+                  (let [effs-box (atom [])]
+                    (swap! writer-atom
+                           (fn [wst]
+                             (let [[wst' effs] (snap/transition-writer
+                                                wst
+                                                {:type :prune-failed
+                                                 :generation gen
+                                                 :error (or (.-message e) (str e))})]
+                               (reset! effs-box effs)
+                               wst')))
+                    (doseq [d @effs-box]
+                      (when (= :diagnose (:effect d))
+                        (log-diagnostic! d)))))))))
+
+(declare execute-validator-writer-effects!)
+
+(defn- execute-validator-writer-effects!
+  [state-dir path-key writer-atom effects]
+  (doseq [eff effects]
+    (case (:effect eff)
+      :diagnose
+      (log-diagnostic! eff)
+
+      :prune-snapshots
+      (prune-validator-snapshots-async! state-dir writer-atom eff)
+
+      :write-snapshot
+      (let [gen (:generation eff)
+            ep (:epoch eff)
+            fname (:filename eff)
+            dest-path (.join node-path state-dir fname)
+            st-to-save (:payload eff)]
+        ;; Yield via setImmediate so active UDP/STUN/ICE keepalives & DataChannel callbacks run first
+        (js/setImmediate
+         (fn []
+           (try
+             (let [safe-state (core-mesh/strip-unserializable-state st-to-save)
+                   encoded-u8 (fressian/write-standard-fressian (fressian/normalize-for-wire safe-state))
+                   buf (u8->buf encoded-u8)]
+               (-> (atomic-write-file-async! dest-path buf 0600)
+                   (.then (fn [_]
+                            (let [now-ms (.now js/Date)
+                                  next-effs (atom [])]
+                              (swap! last-saved-snapshots
+                                     (fn [m]
+                                       (-> m
+                                           (assoc-in [path-key :saved-at-ms] now-ms)
+                                           (assoc-in [path-key :finalized-epoch] ep)
+                                           (assoc-in [path-key :filename] fname)
+                                           (update-in [path-key :saved-count] (fnil inc 0)))))
+                              (swap! writer-atom
+                                     (fn [wst]
+                                       (let [[wst' effs] (snap/transition-writer
+                                                          wst
+                                                          {:type :write-succeeded
+                                                           :generation gen
+                                                           :epoch ep
+                                                           :filename fname})]
+                                         (reset! next-effs effs)
+                                         wst')))
+                              (execute-validator-writer-effects! state-dir path-key writer-atom @next-effs))))
+                   (.catch (fn [e]
+                             (let [next-effs (atom [])]
+                               (swap! writer-atom
+                                      (fn [wst]
+                                        (let [[wst' effs] (snap/transition-writer
+                                                           wst
+                                                           {:type :write-failed
+                                                            :generation gen
+                                                            :epoch ep
+                                                            :error (or (.-message e) (str e))})]
+                                          (reset! next-effs effs)
+                                          wst')))
+                               (execute-validator-writer-effects! state-dir path-key writer-atom @next-effs))))))
+             (catch :default e
+               (let [next-effs (atom [])]
+                 (swap! writer-atom
+                        (fn [wst]
+                          (let [[wst' effs] (snap/transition-writer
+                                             wst
+                                             {:type :write-failed
+                                              :generation gen
+                                              :epoch ep
+                                              :error (or (.-message e) (str e))})]
+                            (reset! next-effs effs)
+                            wst')))
+                 (execute-validator-writer-effects! state-dir path-key writer-atom @next-effs)))))))
+
+      nil)))
 
 (defn- save-validator-state-to-disk!
-  "Serializes validator state map using standard Fressian (`core-mesh/encode-snapshot-bytes`)
-   and atomically writes it to `filepath` with 0600 permissions.
-   Strictly throttles full 12MB Fressian disk writes on Node.js single-threaded event loop via
-   `obs/should-persist-validator-snapshot?` (at most once every 60s, or on `force?` shutdown),
-   preventing event-loop starvation during 10s ticks even when `finalized_epoch` advances."
+  "Persists validator state to immutable epoch-addressed Fressian snapshots
+   (`snapshot-<node>-epoch-<012d>.fressian`) via `bitecho.snapshot.core` coalescing async writer
+   (`fs.promises` + `setImmediate`, BIP-014 / P-ASYNC-2).
+   On runtime ticks (`force? false`), throttles via `obs/should-persist-validator-snapshot?` (60s)
+   and performs zero synchronous disk I/O.
+   On shutdown (`force? true`), performs an explicit synchronous final flush (BIP-014 exception)."
   ([filepath state]
-   (save-validator-state-to-disk! filepath state false))
+   (save-validator-state-to-disk! filepath state false nil))
   ([filepath state force?]
+   (save-validator-state-to-disk! filepath state force? nil))
+  ([filepath state force? {:keys [node-id keep-epochs min-keep]}]
    (when (and filepath (map? state))
      (try
        (let [path-key (str filepath)
+             state-dir (.dirname node-path path-key)
+             nid (or node-id (:node-id state) (:node/id state) "node")
              now-ms (.now js/Date)
              prev-entry (get @last-saved-snapshots path-key)
              last-saved-ms (long (or (:saved-at-ms prev-entry) 0))
-             curr-fin-ep (long (or (:last-executed-finalized-epoch state) 0))
+             curr-fin-ep (long (or (:last-executed-finalized-epoch state) (:epoch state) 0))
              should-save? (obs/should-persist-validator-snapshot?
                            {:force? force?
                             :last-saved-ms last-saved-ms
@@ -1849,32 +2128,65 @@
            (do
              (swap! last-saved-snapshots update-in [path-key :skipped-clean] (fnil inc 0))
              true)
-           (let [safe-state (core-mesh/strip-unserializable-state state)
-                 encoded-u8 (fressian/write-standard-fressian (fressian/normalize-for-wire safe-state))]
-             (atomic-write-file! path-key (u8->buf encoded-u8) 0600)
-             (swap! last-saved-snapshots
-                    (fn [m]
-                      (-> m
-                          (assoc-in [path-key :saved-at-ms] now-ms)
-                          (assoc-in [path-key :finalized-epoch] curr-fin-ep)
-                          (update-in [path-key :saved-count] (fnil inc 0)))))
-             true)))
+           (if force?
+             ;; Explicit boot/SIGTERM synchronous flush exception (BIP-014)
+             (let [fname (snap/snapshot-filename nid curr-fin-ep)
+                   dest-path (.join node-path state-dir fname)
+                   safe-state (core-mesh/strip-unserializable-state state)
+                   encoded-u8 (fressian/write-standard-fressian (fressian/normalize-for-wire safe-state))]
+               (atomic-write-file! dest-path (u8->buf encoded-u8) 0600)
+               (swap! last-saved-snapshots
+                      (fn [m]
+                        (-> m
+                            (assoc-in [path-key :saved-at-ms] now-ms)
+                            (assoc-in [path-key :finalized-epoch] curr-fin-ep)
+                            (assoc-in [path-key :filename] fname)
+                            (update-in [path-key :saved-count] (fnil inc 0)))))
+               true)
+             ;; Zero-Sync-IO runtime coalesced async write + retention pruning
+             (let [writer-atom (get-validator-writer-atom state-dir nid keep-epochs min-keep)
+                   effs-box (atom [])]
+               (swap! writer-atom
+                      (fn [wst]
+                        (let [[wst' effs] (snap/transition-writer
+                                           wst
+                                           {:type :request-write
+                                            :epoch curr-fin-ep
+                                            :payload state
+                                            :force? false
+                                            :node-id nid})]
+                          (reset! effs-box effs)
+                          wst')))
+               (execute-validator-writer-effects! state-dir path-key writer-atom @effs-box)
+               true))))
        (catch :default e
          (log-diagnostic! {:effect :diagnose :reason :validator-snapshot-save-failed :file filepath :detail (.-message e)})
          false)))))
 
 (defn- load-validator-state-from-disk
-  "Reads a Fressian-serialized validator snapshot from `filepath` and restores records, sets, and queues.
-   Rejects legacy Nippy ('NPY') payloads fail-closed (returns nil)."
-  [filepath]
-  (when (and filepath (.existsSync node-fs filepath))
-    (try
-      (let [buf (.readFileSync node-fs filepath)
-            u8 (buf->u8 buf)]
-        (core-mesh/decode-snapshot-bytes u8))
-      (catch :default e
-        (log-diagnostic! {:effect :diagnose :reason :validator-snapshot-load-failed :file filepath :detail (.-message e)})
-        nil))))
+  "Boot-time validator snapshot loader (explicit BIP-014 boot exception).
+   Scans the state directory via `bitecho.snapshot.core/select-latest-snapshot` to load the
+   highest-epoch immutable `snapshot-<node>-epoch-<012d>.fressian`, falling back seamlessly
+   to legacy `snapshot-<node>.edn` when present. Rejects legacy Nippy ('NPY') fail-closed."
+  ([filepath]
+   (load-validator-state-from-disk filepath nil))
+  ([filepath node-id]
+   (when filepath
+     (try
+       (let [state-dir (.dirname node-path (str filepath))
+             legacy-name (.basename node-path (str filepath))
+             selected-path (if (and node-id (.existsSync node-fs state-dir))
+                             (let [entries (vec (array-seq (.readdirSync node-fs state-dir)))
+                                   sel (snap/select-latest-snapshot node-id entries legacy-name)]
+                               (when sel (.join node-path state-dir sel)))
+                             (when (.existsSync node-fs filepath) filepath))]
+         (when (and selected-path (.existsSync node-fs selected-path))
+           (let [buf (.readFileSync node-fs selected-path)
+                 u8 (buf->u8 buf)]
+             (core-mesh/decode-snapshot-bytes u8))))
+       (catch :default e
+         (log-diagnostic! {:effect :diagnose :reason :validator-snapshot-load-failed :file filepath :detail (.-message e)})
+         nil)))))
 
 (defn- execute-mesh-conn-effects!
   [effects]
@@ -2053,7 +2365,11 @@
                       (swap! queue-atom conj cmd)))))
               (recur (inc steps)))))
         (when (and persist? snapshot-file tick?)
-          (save-validator-state-to-disk! snapshot-file @state-atom))))))
+          (save-validator-state-to-disk!
+           snapshot-file @state-atom false
+           {:node-id (:node-id ctx)
+            :keep-epochs (get-in ctx [:config :snapshot-keep-epochs])
+            :min-keep (get-in ctx [:config :snapshot-min-keep])}))))))
 
 (defn- create-peer-datachannel-node
   [local-port setup cert-data local-ice _local-fp turn-config]
@@ -2535,8 +2851,8 @@
          identity (or (:identity opts) (load-or-create-node-identity! state-dir node-id))
          transport (or (:transport opts) (:transport config) :datachannel)
          snapshot-file (or (:snapshot-file opts)
-                           (.join node-path state-dir "state" (str "snapshot-" (name node-id) ".edn")))
-         loaded-state (load-validator-state-from-disk snapshot-file)
+                           (.join node-path state-dir "state" (str "snapshot-" (snap/sanitize-node-id node-id) ".edn")))
+         loaded-state (load-validator-state-from-disk snapshot-file node-id)
          initial-state (if loaded-state
                          (core-mesh/rebind-restored-state loaded-state config identity)
                          (core-mesh/build-initial-node-state config identity))
@@ -2567,7 +2883,11 @@
                       {:saved-at-ms (.now js/Date)
                        :finalized-epoch (long (or (:last-executed-finalized-epoch initial-state) 0))
                        :saved-count 0})
-               (save-validator-state-to-disk! snapshot-file @state-atom true)))
+               (save-validator-state-to-disk!
+                snapshot-file @state-atom true
+                {:node-id node-id
+                 :keep-epochs (:snapshot-keep-epochs config)
+                 :min-keep (:snapshot-min-keep config)})))
          _ (when (= transport :datachannel)
              (doseq [[pid pcfg] nodes-cfg :when (not= pid node-id)]
                (try
@@ -2638,7 +2958,11 @@
                  (doseq [[k _] @agent-conns]
                    (apply-mesh-conn-event! agent-conns k {:type :shutdown}))
                  (when (and persist? snapshot-file)
-                   (save-validator-state-to-disk! snapshot-file @state-atom true)))]
+                   (save-validator-state-to-disk!
+                    snapshot-file @state-atom true
+                    {:node-id node-id
+                     :keep-epochs (:snapshot-keep-epochs config)
+                     :min-keep (:snapshot-min-keep config)})))]
      {:node-id node-id
       :identity identity
       :transport transport

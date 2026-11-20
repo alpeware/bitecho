@@ -703,7 +703,11 @@
                                :dropped (or (:dropped diag) 0)
                                :ignoredStale (or (:ignored-stale diag) 0)
                                :unsupportedFormatDropped (or (:unsupported-format-dropped diag) 0)
-                               :backgroundThrottledEvents (or (:background-throttled-events diag) 0)}})))))
+                               :backgroundThrottledEvents (or (:background-throttled-events diag) 0)
+                               :iceDisconnects (or (:ice-disconnects diag) 0)
+                               :iceReconnects (or (:ice-reconnects diag) 0)
+                               :lastIceState (:last-ice-state diag)
+                               :lastConnectionState (:last-connection-state diag)}})))))
 
 (defn build-p2p-link-bind-envelope
   "Builds and signs a :p2p-link-bind envelope proving peer pubkey and session identity."
@@ -2275,11 +2279,11 @@
        "checkBundleFreshness" (fn [remote-ver]
                                 (let [na @active-node-atom
                                       st (if na @na {:diagnostics {}})
-                                      res (browser/check-browser-bundle-freshness st "0.23.16" remote-ver)]
+                                      res (browser/check-browser-bundle-freshness st "0.23.17" remote-ver)]
                                   (when (and na (not (:fresh? res)))
                                     (swap! na update-in [:conn :diagnostics :stale-browser-bundle] (fnil inc 0)))
                                   (clj->js res)))
-       "version" "0.23.16"})
+       "version" "0.23.17"})
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api))

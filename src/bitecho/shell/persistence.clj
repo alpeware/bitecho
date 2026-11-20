@@ -3,8 +3,10 @@
    Ensures unserializable objects like core.async channels or PersistentQueues are safely handled."
   (:require [bitecho.core.mesh :as core-mesh]
             [bitecho.fressian :as fressian]
+            [bitecho.snapshot.core :as snap]
             [clojure.java.io :as io])
-  (:import [java.nio.file Files StandardCopyOption]
+  (:import [java.io File]
+           [java.nio.file Files StandardCopyOption]
            [java.nio.file.attribute PosixFilePermissions]))
 
 (def default-snapshot-filename
@@ -101,3 +103,73 @@
           (when-let [raw-state (or (try (fressian/decode raw-bytes) (catch Exception _ nil))
                                    (try (fressian/decode-wire raw-bytes) (catch Exception _ nil)))]
             (restore-unserializable-state raw-state)))))))
+
+(defn prune-epoch-snapshots!
+  "Prunes old immutable epoch snapshots in `state-dir` for `node-id` according to
+   `bitecho.snapshot.core/plan-snapshot-retention` (`keep-epochs` default 360, `min-keep >= 2`).
+   Never deletes foreign snapshots, `.tmp` files, or legacy `snapshot-<node>.edn`."
+  ([state-dir node-id current-epoch]
+   (prune-epoch-snapshots! state-dir node-id current-epoch nil))
+  ([state-dir node-id current-epoch opts]
+   (let [dir (io/file state-dir)]
+     (if-not (.isDirectory dir)
+       {:ok? true :kept 0 :deleted 0 :errors []}
+       (let [filenames (mapv #(.getName ^File %) (or (.listFiles dir) []))
+             {:keys [keep delete]} (snap/plan-snapshot-retention node-id filenames current-epoch opts)
+             errors (atom [])
+             deleted (atom 0)]
+         (doseq [fname delete]
+           (try
+             (let [f (io/file dir fname)]
+               (when (.exists f)
+                 (if (.delete f)
+                   (swap! deleted inc)
+                   (swap! errors conj {:file fname :error :delete-returned-false}))))
+             (catch Exception e
+               (swap! errors conj {:file fname :error (.getMessage e)}))))
+         {:ok? (empty? @errors)
+          :kept (count keep)
+          :deleted @deleted
+          :errors @errors})))))
+
+(defn save-epoch-snapshot!
+  "Saves `state` to an immutable epoch-addressed snapshot file
+   `snapshot-<sanitized>-epoch-<012d>.fressian` inside `state-dir` via atomic temp-file move,
+   and prunes expired epoch snapshots ONLY after the write succeeds (BIP-014 / P-ASYNC-3)."
+  ([state-dir node-id state]
+   (save-epoch-snapshot! state-dir node-id state nil))
+  ([state-dir node-id state opts]
+   (let [ep (long (or (:epoch opts)
+                      (:last-executed-finalized-epoch state)
+                      (:epoch state)
+                      0))
+         fname (snap/snapshot-filename node-id ep)
+         dir (io/file state-dir)
+         _ (.mkdirs dir)
+         dest (io/file dir fname)]
+     (try
+       (save-state-to-disk (.getAbsolutePath dest) state)
+       (let [prune-res (prune-epoch-snapshots! state-dir node-id ep opts)]
+         {:ok? true
+          :epoch ep
+          :filename fname
+          :path (.getAbsolutePath dest)
+          :prune prune-res})
+       (catch Exception e
+         {:ok? false
+          :epoch ep
+          :filename fname
+          :error (.getMessage e)})))))
+
+(defn load-latest-epoch-snapshot
+  "Selects and loads the highest-epoch immutable snapshot for `node-id` in `state-dir`
+   via `bitecho.snapshot.core/select-latest-snapshot`, falling back seamlessly to
+   `legacy-filename` (e.g. `snapshot-<node>.edn`) when present and no epoch snapshots exist."
+  ([state-dir node-id]
+   (load-latest-epoch-snapshot state-dir node-id (str "snapshot-" (snap/sanitize-node-id node-id) ".edn")))
+  ([state-dir node-id legacy-filename]
+   (let [dir (io/file state-dir)]
+     (when (.isDirectory dir)
+       (let [filenames (mapv #(.getName ^File %) (or (.listFiles dir) []))]
+         (when-let [selected (snap/select-latest-snapshot node-id filenames legacy-filename)]
+           (load-state-from-disk (.getAbsolutePath (io/file dir selected)))))))))

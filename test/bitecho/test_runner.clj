@@ -26,6 +26,7 @@
             [bitecho.d36-nodejs-infra-parity-test]
             [bitecho.d37-bip011-gentoo-host-and-unified-rollout-test]
             [bitecho.d38-bip013-observability-defense-and-autoupdate-test]
+            [bitecho.d39-bip014-async-io-and-ice-diagnostics-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

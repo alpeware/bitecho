@@ -11,6 +11,7 @@
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.light-node.mcp :as mcp]
+            [bitecho.snapshot.core :as snap]
             [cljs.reader :as edn]
             [clojure.string :as str]
             [datachannel.api :as api]
@@ -18,6 +19,7 @@
             [datachannel.mdns :as mdns]))
 
 (def ^:private node-fs (js/require "node:fs"))
+(def ^:private node-fsp (.-promises node-fs))
 (def ^:private node-path (js/require "node:path"))
 (def ^:private node-os (js/require "node:os"))
 (def ^:private node-http (js/require "node:http"))
@@ -1104,9 +1106,106 @@
         (when (.existsSync node-fs tmp-file)
           (try (.unlinkSync node-fs tmp-file) (catch :default _ nil)))))))
 
+(defonce ^:private light-state-writers-atom (atom {}))
+
+(defn- write-bytes-atomic-async!
+  "Zero-Sync-IO async atomic write via `fs.promises` with `0600` permissions (BIP-014 / P-ASYNC-2)."
+  [target-file u8-or-buf]
+  (let [target-str (str target-file)
+        dir (.dirname node-path target-str)
+        tmp-file (.join node-path dir (str ".tmp-" (.-pid js/process) "-" (js/Date.now) "-" (rand-int 1000000)))
+        buf (if (js/Buffer.isBuffer u8-or-buf)
+              u8-or-buf
+              (js/Buffer.from u8-or-buf))]
+    (-> (.mkdir node-fsp dir #js {:recursive true})
+        (.then (fn [_] (.writeFile node-fsp tmp-file buf #js {:mode 8r600})))
+        (.then (fn [_]
+                 (-> (.chmod node-fsp tmp-file 8r600)
+                     (.catch (fn [_] nil)))))
+        (.then (fn [_] (.rename node-fsp tmp-file target-str)))
+        (.then (fn [_] true))
+        (.catch (fn [e]
+                  (-> (.unlink node-fsp tmp-file)
+                      (.catch (fn [_] nil))
+                      (.then (fn [_] (js/Promise.reject e)))))))))
+
+(declare dispatch-light-writer-effects!)
+
+(defn- dispatch-light-writer-effects!
+  [path-key writer-atom effects]
+  (doseq [eff effects]
+    (when (= :write-snapshot (:effect eff))
+      (let [gen (:generation eff)
+            ep (:epoch eff)
+            st-to-save (:payload eff)]
+        (js/setImmediate
+         (fn []
+           (try
+             (let [encoded (light-core/encode-light-state st-to-save)]
+               (-> (write-bytes-atomic-async! path-key encoded)
+                   (.then (fn [_]
+                            (let [next-effs (atom [])]
+                              (swap! writer-atom
+                                     (fn [wst]
+                                       (let [[wst' effs] (snap/transition-writer
+                                                          wst
+                                                          {:type :write-succeeded :generation gen :epoch ep})]
+                                         (reset! next-effs effs)
+                                         wst')))
+                              (dispatch-light-writer-effects! path-key writer-atom @next-effs))))
+                   (.catch (fn [e]
+                             (let [next-effs (atom [])]
+                               (swap! writer-atom
+                                      (fn [wst]
+                                        (let [[wst' effs] (snap/transition-writer
+                                                           wst
+                                                           {:type :write-failed
+                                                            :generation gen
+                                                            :epoch ep
+                                                            :error (or (.-message e) (str e))})]
+                                          (reset! next-effs effs)
+                                          wst')))
+                               (dispatch-light-writer-effects! path-key writer-atom @next-effs))))))
+             (catch :default e
+               (let [next-effs (atom [])]
+                 (swap! writer-atom
+                        (fn [wst]
+                          (let [[wst' effs] (snap/transition-writer
+                                             wst
+                                             {:type :write-failed
+                                              :generation gen
+                                              :epoch ep
+                                              :error (or (.-message e) (str e))})]
+                            (reset! next-effs effs)
+                            wst')))
+                 (dispatch-light-writer-effects! path-key writer-atom @next-effs))))))))))
+
+(defn save-light-state-async!
+  "Coalesces and offloads runtime `state.fressian` persistence via `bitecho.snapshot.core/transition-writer`
+   and `fs.promises` so the Node.js event loop never blocks on disk I/O (BIP-014 / P-ASYNC-2)."
+  [state-file state]
+  (when (and (some? state-file) (not (str/blank? (str state-file))))
+    (let [path-key (str state-file)
+          writer-atom (or (get @light-state-writers-atom path-key)
+                          (let [a (atom (snap/init-writer-state {:node-id "light-node"}))]
+                            (swap! light-state-writers-atom assoc path-key a)
+                            (get @light-state-writers-atom path-key)))
+          ep (long (or (:epoch state) 0))
+          effs-box (atom [])]
+      (swap! writer-atom
+             (fn [wst]
+               (let [[wst' effs] (snap/transition-writer wst {:type :request-write
+                                                              :epoch ep
+                                                              :payload state})]
+                 (reset! effs-box effs)
+                 wst')))
+      (dispatch-light-writer-effects! path-key writer-atom @effs-box)
+      true)))
+
 (defn save-light-state!
   "Persists sanitized light-node state via cross-platform Fressian (`state.fressian`)
-   with atomic rename and `0600` permissions (`M2a-2`)."
+   with atomic rename and `0600` permissions (`M2a-2`).
+   Synchronous entry point reserved for one-shot CLI commands and graceful SIGTERM flush."
   [state-file state]
   (when (and (some? state-file) (not (str/blank? (str state-file))))
     (let [encoded (light-core/encode-light-state state)]
@@ -1602,7 +1701,7 @@
                              (reset! state-atom (:state res))
                              (when (and state-file (not= st (:state res)))
                                (try
-                                 (save-light-state! state-file (:state res))
+                                 (save-light-state-async! state-file (:state res))
                                  (catch :default e
                                    (when conn-atom
                                      (apply-conn-event! conn-atom
@@ -3561,7 +3660,7 @@
                                    (when (not= @state-atom (:state rx-res))
                                      (reset! state-atom (:state rx-res))
                                      (when (some? state-file)
-                                       (save-light-state! state-file @state-atom))
+                                       (save-light-state-async! state-file @state-atom))
                                      (when (seq (:net-envelopes rx-res))
                                        (send-routed-envelopes! (:net-envelopes rx-res)
                                                                (:send-fn @conn-atom)
@@ -3587,7 +3686,7 @@
                                        cmd {"cmd" "p2p-offer" "session_id" sid "candidates" pref-cands "transport" pref-tr}]
                                    (swap! state-atom light-core/record-reoffer-attempt sid now-ms)
                                    (when (some? state-file)
-                                     (save-light-state! state-file @state-atom))
+                                     (save-light-state-async! state-file @state-atom))
                                    (enqueue-line! (write-json-str cmd))))))
                            (catch :default _ nil)))]
                    (reset! maint-timer (js/setInterval maint-tick! 5000)))]

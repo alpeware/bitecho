@@ -645,7 +645,8 @@
                              :else #{}))
             intentional-drops #{:privkey-bytes :caller-x25519-priv :callee-x25519-priv :ephemeral-priv
                                 :tx-key :rx-key :shared-secret :session-keys :tx :rx :ice-pwd :pwd
-                                :session-id :channel :transport :last-error :metadata}
+                                :session-id :channel :transport :last-error :metadata
+                                :ice-disconnects :ice-reconnects :last-ice-state :last-connection-state}
             real-code-keys (disj (into #{} (concat (collect-keys base-light)
                                                    (collect-keys populated-light)
                                                    (collect-keys base-anchor)
@@ -653,7 +654,8 @@
                                                    (collect-keys (:escrows sm5))))
                                  :privkey-bytes :caller-x25519-priv :callee-x25519-priv :ephemeral-priv
                                  :tx-key :rx-key :shared-secret :session-keys :tx :rx :ice-pwd :pwd
-                                 :session-id :channel :transport :last-error :metadata)
+                                 :session-id :channel :transport :last-error :metadata
+                                 :ice-disconnects :ice-reconnects :last-ice-state :last-connection-state)
             loaded-light (atom nil)]
         (browser/persist-state! populated-light nil)
         (browser/load-persisted-state (fn [_err st] (reset! loaded-light st)))

@@ -1,0 +1,61 @@
+{:bip-id "BIP-014"
+ :bip/id "BIP-014"
+ :title "BIP-014: Zero-Sync-IO Boundary Shells Across All 3 Runtimes (Node.js, JVM, Browser), Immutable Epoch-Addressed Async Snapshots, and Browser WebRTC ICE Diagnostics"
+ :bip/title "BIP-014: Zero-Sync-IO Boundary Shells Across All 3 Runtimes (Node.js, JVM, Browser), Immutable Epoch-Addressed Async Snapshots, and Browser WebRTC ICE Diagnostics"
+ :version "v0.23.17"
+ :bip/version "0.23.17"
+ :milestone "D39"
+ :bip/milestone "D39"
+ :bip/status :consented
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :bip/author-agent "nexus"
+ :author-pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+ :bip/author-pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+ :co-author-pubkeys ["302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+                     "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                     "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"]
+ :human-anchor-sunset "2027-06-30"
+ :bip/parent-bip-cid "afc1c22e1f914fbea70c3844fe7fad7a972092d0173a9d2e583617bcffecff97"
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :note "Consented 2026-11-20 11:03 CST + mandate: maximize shared .cljc (bitecho.snapshot.core & all shareable logic) to avoid code duplication across Node.js/JVM/Browser"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8" :note "Consented with non-blocking flags F-1..F-3 (seq 547)"}
+                   {:agent "lumen" :role :research-lead :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de" :note "Consented on draft CID 2fd998ce... (broadcast seq 11 & direct P2P seq 4)"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"}]
+ :motivation "Live production telemetry and Simon's browser chrome://webrtc-internals trace proved that synchronous 12MB Fressian validator snapshot serialization + writeFileSync on Node.js stalls the single-threaded event loop for 5-8s on e2-micro, starving Chrome's 5s WebRTC ICE STUN consent freshness probes (connected -> disconnected -> connected). Simultaneously, browser connect-webrtc! never wired pc.oniceconnectionstatechange / pc.onconnectionstatechange, leaving transient ICE flaps invisible in diagnostics (Rule 5 gap). Per Simon's architectural direction, BIP-014 eliminates synchronous disk/compression I/O on critical paths across ALL THREE runtimes (Node.js, JVM, Browser) and BOTH node roles (full node and light node), moving validator state persistence to immutable epoch-addressed async snapshots with tunable retention."
+ :pillars
+ [{:id "P-ASYNC-1"
+   :name "Pure Sans-IO Immutable Epoch-Addressed Snapshot Core (src/bitecho/snapshot/core.cljc)"
+   :summary "Pure, deterministic snapshot naming (snapshot-<node>-epoch-<012d>.fressian), highest-epoch recovery selection with seamless legacy fallback (snapshot-<node>.edn), tunable retention planner (keep-epochs default 360 ~= 1h at 10s/epoch, min-keep >= 2 always preserved), and single-authority generation-tagged coalescing async writer reducer (Rule 4 & Rule 5: at most 1 in-flight write + 1 latest pending epoch, stale-gen ignored & counted, failed writes never prune prior snapshots)."}
+  {:id "P-ASYNC-2"
+   :name "Node.js Zero-Sync-IO Full Node & Light Node (full_node_main.cljs, node_main.cljs)"
+   :summary "Eliminate synchronous disk/compression I/O on all runtime critical paths (validator snapshots, blob GET/PUT, pointer snapshots, static content + gzip, telemetry digest GET/PUT, light-node state.fressian). Use fs.promises + async zlib + coalescing bitecho.snapshot.core writer, and offload/chunk heavy Fressian encoding so event-loop stall stays <= 50ms (eliminating Chrome 5s STUN consent-freshness drops). Boot-time config/identity load and SIGTERM final flush remain explicit exceptions."}
+  {:id "P-ASYNC-3"
+   :name "JVM Zero-Sync-IO Parity for Full Node & Light Node (shell/persistence.clj, shell/mesh.clj, shell/infra.clj, shell/light_node.clj)"
+   :summary "Upgrade JVM full node persistence to the identical immutable epoch-addressed snapshot format + retention pruning via bitecho.snapshot.core on its dedicated persistence worker. Move JVM infra blob GET/PUT, pointer snapshots, telemetry digests, and light-node state.fressian saves off Netty/WebRTC/event-loop threads onto bounded async I/O executors with Rule 5 counted diagnostics."}
+  {:id "P-ASYNC-4"
+   :name "Browser WebRTC ICE & Connection-State Diagnostics (shell/browser.cljc, browser_main.cljs)"
+   :summary "Wire pc.oniceconnectionstatechange and pc.onconnectionstatechange in connect-webrtc! to dispatch generation-tagged :ice-state-change and :connection-state-change events into transition-conn. Surface counted :ice-disconnects, :ice-reconnects, :last-ice-state, :last-connection-state, and counted :diagnose entries in getStatus().diagnostics (closing Rule 5 gap while preserving zero sync storage on browser hot paths)."}]
+ :invariant-diff
+ {:preserved ["Streamlet BFT safety & quorum finality (no consensus wire changes)"
+              "Rule 1 Strict TDD (clojure.test.check generative invariants + stale-gen/failure-injection model tests)"
+              "Rule 2 Pure Sans-IO core (bitecho.snapshot.core is 100% pure .cljc)"
+              "Rule 4 Single-authority generation-tagged lifecycle state"
+              "Rule 5 Zero silent failures (all write/prune/ICE-disconnect events counted)"]
+  :added ["Immutable epoch-addressed snapshots (snapshot-<node>-epoch-<012d>.fressian) with tunable retention N (current_epoch - N, min-keep >= 2)"
+          "Zero sync disk/gzip I/O on runtime critical paths across Node.js, JVM, and Browser (both full node & light node)"
+          "Browser ICE/connection-state diagnostics counted in transition-conn and surfaced in getStatus().diagnostics"]
+  :removed ["Synchronous validator snapshot writeFileSync/renameSync and synchronous blob/static/telemetry readFileSync/gzipSync on Node.js runtime hot paths"
+            "In-place mutable overwrite of snapshot-<node>.edn during runtime ticks"]
+  :rollback-path "Immutable epoch snapshots fall back cleanly to legacy snapshot-<node>.edn; reverting to v0.23.16 requires zero state wipe."}}

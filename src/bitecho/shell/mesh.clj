@@ -13,6 +13,7 @@
             [bitecho.rendezvous.core :as rendezvous]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.persistence :as persistence]
+            [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
             [clojure.core.async :as async]
             [clojure.edn :as edn]
@@ -2286,13 +2287,48 @@
       :else (async/put! events-in cmd))))
 
 (defn- start-persistence-worker!
-  "Spawns a dedicated thread draining persist-ch to snapshot files."
-  [persist-ch snapshot-filename]
-  (async/thread
-    (loop []
-      (when-let [state-to-save (async/<!! persist-ch)]
-        (persistence/save-state-to-disk snapshot-filename state-to-save)
-        (recur)))))
+  "Spawns a dedicated thread draining persist-ch to immutable epoch-addressed snapshots
+   via `bitecho.snapshot.core` (when `:node-id` and `:state-dir` are supplied) or
+   `persistence/save-state-to-disk` for explicit single-file test paths."
+  ([persist-ch snapshot-filename]
+   (start-persistence-worker! persist-ch snapshot-filename nil))
+  ([persist-ch snapshot-filename {:keys [node-id state-dir keep-epochs min-keep]}]
+   (let [writer-atom (atom (snap/init-writer-state {:node-id (or node-id "node")
+                                                    :keep-epochs keep-epochs
+                                                    :min-keep min-keep}))]
+     (async/thread
+       (loop []
+         (when-let [state-to-save (async/<!! persist-ch)]
+           (if (and node-id state-dir)
+             (let [ep (long (or (:last-executed-finalized-epoch state-to-save)
+                                (:epoch state-to-save)
+                                0))
+                   [st1 effs1] (snap/transition-writer @writer-atom
+                                                       {:type :request-write
+                                                        :epoch ep
+                                                        :payload state-to-save
+                                                        :node-id node-id})]
+               (reset! writer-atom st1)
+               (doseq [eff effs1]
+                 (when (= :write-snapshot (:effect eff))
+                   (let [res (persistence/save-epoch-snapshot!
+                              state-dir node-id (:payload eff)
+                              {:epoch (:epoch eff)
+                               :keep-epochs (or keep-epochs snap/default-keep-epochs)
+                               :min-keep (or min-keep snap/default-min-keep)})
+                         ev (if (:ok? res)
+                              {:type :write-succeeded
+                               :generation (:generation eff)
+                               :epoch (:epoch eff)
+                               :filename (:filename res)}
+                              {:type :write-failed
+                               :generation (:generation eff)
+                               :epoch (:epoch eff)
+                               :error (:error res)})
+                         [st2 _] (snap/transition-writer @writer-atom ev)]
+                     (reset! writer-atom st2)))))
+             (persistence/save-state-to-disk snapshot-filename state-to-save))
+           (recur)))))))
 
 (defn start-node
   "Starts a transparent go-loop wrapping the state machine.
@@ -2314,7 +2350,7 @@
          net-out (async/chan 8192)
          app-out (async/chan 8192)
          persist-ch (when persist? (async/chan (async/sliding-buffer 1)))
-         persist-done-ch (when persist? (start-persistence-worker! persist-ch snapshot-filename))
+         persist-done-ch (when persist? (start-persistence-worker! persist-ch snapshot-filename opts))
          stop-ch (async/chan)]
      (async/go-loop [state initial-state]
        (let [[val port] (async/alts! [events-in network-in stop-ch])]
@@ -2419,13 +2455,20 @@
          state-dir (or (:state-dir config) "data")
          identity (or (:identity opts) (identity/load-or-create-node-identity! state-dir node-id))
          transport (or (:transport opts) (:transport config) :datachannel)
-         snapshot-file (str (io/file state-dir "state" (str "snapshot-" (name node-id) ".edn")))
+         state-subdir (str (io/file state-dir "state"))
+         legacy-snap-name (str "snapshot-" (snap/sanitize-node-id node-id) ".edn")
+         snapshot-file (str (io/file state-subdir legacy-snap-name))
          loaded-state (or (when-let [f (:snapshot-file opts)] (persistence/load-state-from-disk f))
-                          (when (.exists (io/file snapshot-file)) (persistence/load-state-from-disk snapshot-file)))
+                          (persistence/load-latest-epoch-snapshot state-subdir node-id legacy-snap-name))
          initial-state (if loaded-state
                          (rebind-restored-state loaded-state config identity)
                          (build-initial-node-state config identity))
-         shell-node (start-node initial-state snapshot-file {:persist? (get opts :persist? true)})
+         shell-node (start-node initial-state snapshot-file
+                                {:persist? (get opts :persist? true)
+                                 :node-id node-id
+                                 :state-dir state-subdir
+                                 :keep-epochs (or (:snapshot-keep-epochs config) snap/default-keep-epochs)
+                                 :min-keep (or (:snapshot-min-keep config) snap/default-min-keep)})
          peer-conns (atom {})
          agent-conns (atom {})
          peer-snapshot-waiters (atom {})

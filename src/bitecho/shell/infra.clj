@@ -22,6 +22,7 @@
             [bitecho.shell.discovery :as discovery]
             [bitecho.shell.identity :as identity]
             [bitecho.shell.light-node :as light-node]
+            [bitecho.snapshot.core :as snap]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -34,7 +35,7 @@
            [java.nio.file CopyOption Files OpenOption StandardCopyOption]
            [java.security SecureRandom]
            [java.time Duration]
-           [java.util.concurrent Executors ScheduledExecutorService TimeUnit]
+           [java.util.concurrent ExecutorService Executors ScheduledExecutorService ThreadFactory TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicLong]
            [javax.crypto Cipher]
            [javax.crypto.spec GCMParameterSpec SecretKeySpec]))
@@ -716,6 +717,89 @@
         (apply-shell-event! (:shell-atom rt)
                             {:type :diagnose :reason :tls-hot-reload-failed :message (.getMessage e)})))))
 
+(defn- submit-async-disk-io!
+  "Offloads disk persistence work onto the runtime's bounded `:io-executor` so Netty/WebRTC
+   threads never block on disk I/O (BIP-014 / P-ASYNC-3). Emits counted `:diagnose` on failure."
+  [rt reason-kw f]
+  (if-let [^ExecutorService exec (:io-executor rt)]
+    (try
+      (.execute exec
+                ^Runnable (fn []
+                            (try
+                              (f)
+                              (catch Exception e
+                                (apply-shell-event! (:shell-atom rt)
+                                                    {:type :diagnose
+                                                     :reason reason-kw
+                                                     :message (.getMessage e)})))))
+      (catch Exception e
+        (apply-shell-event! (:shell-atom rt)
+                            {:type :diagnose
+                             :reason reason-kw
+                             :message (.getMessage e)})))
+    (try
+      (f)
+      (catch Exception e
+        (apply-shell-event! (:shell-atom rt)
+                            {:type :diagnose
+                             :reason reason-kw
+                             :message (.getMessage e)})))))
+
+(defn- schedule-async-pointers-save!
+  "Coalesces pointer snapshot disk writes through `bitecho.snapshot.core/transition-writer`
+   onto the runtime's bounded `:io-executor` (Rules 4 & 5, P-ASYNC-3)."
+  [rt]
+  (when-let [state-dir (:state-dir rt)]
+    (let [writer-atom (:pointer-writer-atom rt)
+          sub-snap @(:subnet-atom rt)
+          ep (long (or (current-runtime-epoch rt) 0))]
+      (if writer-atom
+        (let [effs-box (atom [])]
+          (swap! writer-atom
+                 (fn [wst]
+                   (let [[wst' effs] (snap/transition-writer wst {:type :request-write
+                                                                  :epoch ep
+                                                                  :payload sub-snap})]
+                     (reset! effs-box effs)
+                     wst')))
+          (doseq [eff @effs-box]
+            (case (:effect eff)
+              :diagnose
+              (apply-shell-event! (:shell-atom rt) (assoc eff :type :diagnose))
+
+              :write-snapshot
+              (submit-async-disk-io!
+               rt
+               :pointers-snapshot-write-failed
+               (fn []
+                 (let [gen (:generation eff)
+                       ok? (try
+                             (save-pointers-snapshot! state-dir (:payload eff))
+                             true
+                             (catch Exception e
+                               (apply-shell-event! (:shell-atom rt)
+                                                   {:type :diagnose
+                                                    :reason :pointers-snapshot-write-failed
+                                                    :message (.getMessage e)})
+                               false))
+                       next-effs-box (atom [])]
+                   (swap! writer-atom
+                          (fn [wst]
+                            (let [[wst' effs] (snap/transition-writer
+                                               wst
+                                               (if ok?
+                                                 {:type :write-succeeded :generation gen :epoch (:epoch eff)}
+                                                 {:type :write-failed :generation gen :epoch (:epoch eff) :error :io-error}))]
+                              (reset! next-effs-box effs)
+                              wst')))
+                   (doseq [neff @next-effs-box]
+                     (when (= :write-snapshot (:effect neff))
+                       (schedule-async-pointers-save! rt))))))
+
+              nil)))
+        (submit-async-disk-io! rt :pointers-snapshot-write-failed
+                               #(save-pointers-snapshot! state-dir sub-snap))))))
+
 (defn- execute-subnet-effects!
   "Executes all 7 `bitecho.core.subnet/reduce-subnet` effects outside the pure state transition (Rule 4 & Flag F1)."
   [rt effects event]
@@ -723,10 +807,14 @@
         send-fn (active-peer-sender rt)
         fetch-fn (active-blob-fetcher rt)]
     (when (and state-dir (= :put-blob (:type event)) (:blob event))
-      (let [w (blob-fs/write-blob! state-dir (:blob event))]
-        (when-not (:ok? w)
-          (doseq [d (:effects w)]
-            (apply-shell-event! shell-atom (assoc d :type :diagnose))))))
+      (submit-async-disk-io!
+       rt
+       :blob-fs-async-write-failed
+       (fn []
+         (let [w (blob-fs/write-blob! state-dir (:blob event))]
+           (when-not (:ok? w)
+             (doseq [d (:effects w)]
+               (apply-shell-event! shell-atom (assoc d :type :diagnose))))))))
 
     (doseq [eff effects]
       (case (:effect eff)
@@ -750,7 +838,14 @@
         :eager-push-blob
         (do
           (when state-dir
-            (blob-fs/write-blob! state-dir (:blob eff)))
+            (submit-async-disk-io!
+             rt
+             :blob-fs-async-write-failed
+             (fn []
+               (let [w (blob-fs/write-blob! state-dir (:blob eff))]
+                 (when-not (:ok? w)
+                   (doseq [d (:effects w)]
+                     (apply-shell-event! shell-atom (assoc d :type :diagnose))))))))
           (when (and (fn? send-fn) (not (:from-peer? event)))
             (try
               (send-fn (cond-> {:type :peer-put-blob
@@ -763,7 +858,7 @@
 
         :replicate-pointer
         (let [ptr (:pointer eff)]
-          (save-pointers-snapshot! state-dir @subnet-atom)
+          (schedule-async-pointers-save! rt)
           (maybe-hot-reload-tls! rt ptr)
           (when (and (fn? send-fn) (not (:from-peer? event)))
             (try
@@ -791,7 +886,7 @@
               (apply-shell-event! shell-atom {:type :diagnose :reason :heartbeat-send-failed :message (.getMessage e)}))))
 
         :policy-updated
-        (save-pointers-snapshot! state-dir @subnet-atom)
+        (schedule-async-pointers-save! rt)
 
         :anchor-to-parent
         (do
@@ -1077,6 +1172,13 @@
                 last-poll-atom (atom 0)
                 ticker (when (or (:heartbeat-ticker? opts) (some? validator-bootstrap) (some? val-node))
                          (Executors/newSingleThreadScheduledExecutor))
+                io-executor (Executors/newSingleThreadExecutor
+                             (reify ThreadFactory
+                               (newThread [_ r]
+                                 (doto (Thread. ^Runnable r)
+                                   (.setName "bitecho-infra-async-io")
+                                   (.setDaemon true)))))
+                pointer-writer-atom (atom (snap/init-writer-state {:node-id (or (:node-id opts) "infra-pointers")}))
                 rt {:shell-atom shell-atom
                     :subnet-atom subnet-atom
                     :epoch-atom (atom (:initial-epoch opts))
@@ -1095,7 +1197,9 @@
                     :on-leader-elected (:on-leader-elected opts)
                     :on-fetch-blob (:on-fetch-blob opts)
                     :on-fetch-blob-atom (atom nil)
-                    :ticker ticker}]
+                    :ticker ticker
+                    :io-executor io-executor
+                    :pointer-writer-atom pointer-writer-atom}]
             (if val-node
               (try
                 (let [st @(:state-atom val-node)
@@ -1138,17 +1242,22 @@
                                                              rt validator-bootstrap (:inband-snapshot-fetcher opts))))))
                                                     (catch Exception _ nil)))
                                       hb-ms hb-ms TimeUnit/MILLISECONDS)))
-            (apply-shell-event! shell-atom {:type :started :generation gen :resources {:ticker ticker}})
+            (apply-shell-event! shell-atom {:type :started :generation gen :resources {:ticker ticker :io-executor io-executor}})
             rt))))))
 
 (defn stop-subnet-runtime!
-  "Stops background heartbeat ticker (if active) and transitions runtime shell to `:stopped`."
+  "Stops background heartbeat ticker and drains async I/O executor cleanly, transitioning runtime shell to `:stopped`."
   [rt]
   (apply-shell-event! (:shell-atom rt)
                       {:type :stop}
-                      (fn [{:keys [ticker]}]
+                      (fn [{:keys [ticker io-executor]}]
                         (when ticker
-                          (try (.shutdownNow ^ScheduledExecutorService ticker) (catch Exception _ nil)))))
+                          (try (.shutdownNow ^ScheduledExecutorService ticker) (catch Exception _ nil)))
+                        (when io-executor
+                          (try
+                            (.shutdown ^ExecutorService io-executor)
+                            (.awaitTermination ^ExecutorService io-executor 2000 TimeUnit/MILLISECONDS)
+                            (catch Exception _ nil)))))
   rt)
 
 (defn runtime-status

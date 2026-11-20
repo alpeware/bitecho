@@ -758,8 +758,8 @@
       (is (some #(= :send-vote (:type %)) (:commands r2)))
       (is (str/includes? full-node-src ":accounts (into (sorted-map)")))))
 
-(defspec prop-snapshot-persist-throttle-invariant
-  "D38.1: Synchronous Fressian snapshot persistence strictly respects min-interval-ms unless force? or first save."
+(defspec ^{:doc "D38.1: Synchronous Fressian snapshot persistence strictly respects min-interval-ms unless force? or first save."}
+  prop-snapshot-persist-throttle-invariant
   50
   (prop/for-all [last-saved (gen/choose 0 200000)
                  delta (gen/choose 0 120000)
@@ -779,8 +779,8 @@
                     (< delta min-ms) (false? res)
                     :else (true? res)))))
 
-(defspec prop-prepare-telemetry-publication-privacy-and-size-invariant
-  "D38.1: Telemetry publication payloads strip raw IPs, stay <= 16 KiB, and target telemetry/<node-id>/digest.edn."
+(defspec ^{:doc "D38.1: Telemetry publication payloads strip raw IPs, stay <= 16 KiB, and target telemetry/<node-id>/digest.edn."}
+  prop-prepare-telemetry-publication-privacy-and-size-invariant
   40
   (prop/for-all [nid (gen/elements ["ns1" "ns2" "ns3" "node1" "node2" "node3" "lab/weird node"])
                  head-ep (gen/choose 0 100000)

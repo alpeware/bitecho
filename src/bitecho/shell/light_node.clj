@@ -13,6 +13,7 @@
             [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.discovery :as discovery]
             [bitecho.shell.identity :as identity]
+            [bitecho.snapshot.core :as snap]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -411,10 +412,22 @@
         (when (.exists tmp-file)
           (try (.delete tmp-file) (catch Exception _ nil)))))))
 
+(def ^:private light-state-async-executor
+  (delay
+    (Executors/newSingleThreadExecutor
+     (reify ThreadFactory
+       (newThread [_ r]
+         (doto (Thread. ^Runnable r)
+           (.setName "bitecho-light-state-async-io")
+           (.setDaemon true)))))))
+
+(defonce ^:private light-state-writers-atom (atom {}))
+
 (defn save-light-state!
   "Persists sanitized light-node state via cross-platform Fressian (`state.fressian`)
    with atomic move and 0600 permissions (`M2a-2`: writes strictly to `state-file` without
-   dual-writing Fressian bytes into legacy `state.nippy`)."
+   dual-writing Fressian bytes into legacy `state.nippy`).
+   Synchronous entry point reserved for one-shot CLI commands and graceful shutdown flushes."
   [state-file state]
   (when (and (some? state-file) (not (str/blank? (str state-file))))
     (locking light-state-save-lock
@@ -422,6 +435,54 @@
             encoded (light-core/encode-light-state state)]
         (write-state-bytes-atomic! f encoded)
         true))))
+
+(defn- dispatch-light-writer-effects!
+  [state-file writer-atom effects]
+  (doseq [eff effects]
+    (when (= :write-snapshot (:effect eff))
+      (let [gen (:generation eff)
+            ep (:epoch eff)
+            st-to-save (:payload eff)]
+        (.execute ^java.util.concurrent.ExecutorService @light-state-async-executor
+                  ^Runnable (fn []
+                              (let [ok? (try
+                                          (save-light-state! state-file st-to-save)
+                                          true
+                                          (catch Exception _ false))
+                                    next-effs (atom [])]
+                                (swap! writer-atom
+                                       (fn [wst]
+                                         (let [[wst' effs] (snap/transition-writer
+                                                            wst
+                                                            (if ok?
+                                                              {:type :write-succeeded :generation gen :epoch ep}
+                                                              {:type :write-failed :generation gen :epoch ep :error :io-error}))]
+                                           (reset! next-effs effs)
+                                           wst')))
+                                (dispatch-light-writer-effects! state-file writer-atom @next-effs))))))))
+
+(defn save-light-state-async!
+  "Coalesces and offloads runtime `state.fressian` writes onto a dedicated daemon I/O thread
+   using `bitecho.snapshot.core/transition-writer` so Netty/WebRTC/relay threads never block on disk I/O
+   (BIP-014 / P-ASYNC-3)."
+  [state-file state]
+  (when (and (some? state-file) (not (str/blank? (str state-file))))
+    (let [path-key (str state-file)
+          writer-atom (or (get @light-state-writers-atom path-key)
+                          (let [a (atom (snap/init-writer-state {:node-id "light-node"}))]
+                            (swap! light-state-writers-atom assoc path-key a)
+                            (get @light-state-writers-atom path-key)))
+          ep (long (or (:epoch state) 0))
+          effs-box (atom [])]
+      (swap! writer-atom
+             (fn [wst]
+               (let [[wst' effs] (snap/transition-writer wst {:type :request-write
+                                                              :epoch ep
+                                                              :payload state})]
+                 (reset! effs-box effs)
+                 wst')))
+      (dispatch-light-writer-effects! path-key writer-atom @effs-box)
+      true)))
 
 (declare execute-conn-effects! apply-conn-event!)
 
@@ -1378,7 +1439,7 @@
                                          (reset! state-atom (:state r))
                                          (when (and state-file (not= st (:state r)))
                                            (try
-                                             (save-light-state! state-file (:state r))
+                                             (save-light-state-async! state-file (:state r))
                                              (catch Exception e
                                                (when conn-atom
                                                  (apply-conn-event! conn-atom
@@ -3448,7 +3509,7 @@
                                    (when (not= @state-atom (:state rx-res))
                                      (reset! state-atom (:state rx-res))
                                      (when (some? state-file)
-                                       (save-light-state! state-file @state-atom))
+                                       (save-light-state-async! state-file @state-atom))
                                      (when (seq (:net-envelopes rx-res))
                                        (send-routed-envelopes! (:net-envelopes rx-res)
                                                                (:send-fn @conn-atom)
@@ -3474,7 +3535,7 @@
                                        cmd {"cmd" "p2p-offer" "session_id" sid "candidates" pref-cands "transport" pref-tr}]
                                    (swap! state-atom light-core/record-reoffer-attempt sid now-ms)
                                    (when (some? state-file)
-                                     (save-light-state! state-file @state-atom))
+                                     (save-light-state-async! state-file @state-atom))
                                    (locking serve-cmd-lock
                                      (handle-serve-line! cmd ctx))))))
                            (catch Exception _ nil))

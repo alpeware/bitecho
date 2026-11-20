@@ -28,7 +28,34 @@
    :dropped 0
    :ignored-stale 0
    :unsupported-format-dropped 0
-   :background-throttled-events 0})
+   :background-throttled-events 0
+   :ice-disconnects 0
+   :ice-reconnects 0
+   :last-ice-state nil
+   :last-connection-state nil})
+
+(defn- normalize-rtc-state
+  [s]
+  (cond
+    (keyword? s) (str/lower-case (name s))
+    (symbol? s) (str/lower-case (name s))
+    (string? s) (let [trimmed (str/trim s)]
+                  (when-not (str/blank? trimmed)
+                    (str/lower-case trimmed)))
+    :else nil))
+
+(defn classify-ice-transition
+  "Pure helper classifying WebRTC ICE connection state transitions for Rule 5 diagnostics.
+   Returns `:ice-disconnected`, `:ice-failed`, `:ice-reconnected`, or `nil`."
+  [prev-ice-state next-ice-state]
+  (let [prev-s (normalize-rtc-state prev-ice-state)
+        next-s (normalize-rtc-state next-ice-state)]
+    (cond
+      (= next-s "disconnected") :ice-disconnected
+      (= next-s "failed") :ice-failed
+      (and (contains? #{"connected" "completed"} next-s)
+           (contains? #{"disconnected" "failed"} prev-s)) :ice-reconnected
+      :else nil)))
 
 (defn initial-conn-state
   "Initializes a single-authority connection state map tagged with generation 0."
@@ -220,6 +247,51 @@
         (let [new-state (if (= (:state event) "hidden") "hidden" "visible")
               new-conn (assoc conn :visibility-state new-state)]
           [new-conn [{:type :visibility-changed :state new-state}]])
+
+        :ice-state-change
+        (let [prev-ice (get-in conn [:diagnostics :last-ice-state])
+              norm-state (normalize-rtc-state (:ice-state event))
+              kind (classify-ice-transition prev-ice norm-state)
+              base-conn (assoc-in conn [:diagnostics :last-ice-state] norm-state)]
+          (case kind
+            (:ice-disconnected :ice-failed)
+            (let [new-conn (-> base-conn
+                               (update-in [:diagnostics :ice-disconnects] (fnil inc 0))
+                               (assoc-in [:diagnostics :last-error] (name kind)))
+                  diag-effect {:type :diagnose
+                               :kind kind
+                               :ice-state norm-state
+                               :prev-ice-state prev-ice
+                               :generation curr-gen}]
+              [new-conn [diag-effect]])
+
+            :ice-reconnected
+            (let [new-conn (-> base-conn
+                               (update-in [:diagnostics :ice-reconnects] (fnil inc 0))
+                               (assoc-in [:diagnostics :last-error] nil))
+                  diag-effect {:type :diagnose
+                               :kind :ice-reconnected
+                               :ice-state norm-state
+                               :prev-ice-state prev-ice
+                               :generation curr-gen}]
+              [new-conn [diag-effect]])
+
+            [base-conn []]))
+
+        :connection-state-change
+        (let [prev-cs (get-in conn [:diagnostics :last-connection-state])
+              norm-state (normalize-rtc-state (:connection-state event))
+              base-conn (assoc-in conn [:diagnostics :last-connection-state] norm-state)]
+          (if (contains? #{"disconnected" "failed"} norm-state)
+            (let [kind (if (= norm-state "failed") :connection-failed :connection-disconnected)
+                  new-conn (assoc-in base-conn [:diagnostics :last-error] (name kind))
+                  diag-effect {:type :diagnose
+                               :kind kind
+                               :connection-state norm-state
+                               :prev-connection-state prev-cs
+                               :generation curr-gen}]
+              [new-conn [diag-effect]])
+            [base-conn []]))
 
         ;; Fallback for unhandled events: count drop, emit diagnose
         (let [new-conn (-> conn
@@ -738,17 +810,31 @@
                                            nil)
         gen (:generation (first dial-effects))]
     #?(:cljs
-       (let [{:keys [answer-sdp ice-servers channel-label on-deliver-message on-open]} opts]
+       (let [{:keys [answer-sdp ice-servers channel-label on-deliver-message on-open on-diagnose]} opts]
          (if-not (webrtc-available?)
            (do
              (dispatch-conn-event! conn-atom
                                    {:type :dial-failed :generation gen :error "webrtc-unavailable"}
-                                   nil)
+                                   on-diagnose)
              {:ok? false :error "webrtc-unavailable" :generation gen})
            (try
              (let [rtc-cfg (clj->js {:iceServers (or ice-servers default-ice-servers)})
                    pc (js/RTCPeerConnection. rtc-cfg)
                    dc (.createDataChannel pc (or channel-label "bitecho"))]
+               (set! (.-oniceconnectionstatechange pc)
+                     (fn [_]
+                       (dispatch-conn-event! conn-atom
+                                             {:type :ice-state-change
+                                              :generation gen
+                                              :ice-state (.-iceConnectionState pc)}
+                                             on-diagnose)))
+               (set! (.-onconnectionstatechange pc)
+                     (fn [_]
+                       (dispatch-conn-event! conn-atom
+                                             {:type :connection-state-change
+                                              :generation gen
+                                              :connection-state (.-connectionState pc)}
+                                             on-diagnose)))
                (set! (.-binaryType dc) "arraybuffer")
                (set! (.-onopen dc)
                      (fn [ev]
