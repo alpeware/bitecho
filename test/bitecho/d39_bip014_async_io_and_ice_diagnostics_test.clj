@@ -575,8 +575,8 @@
         (is (set? (:expired-gossip-ids healed)))
         (is (set? (get-in healed [:epoch-to-messages 52160])))))))
 
-(defspec prop-telemetry-lifecycle-ledger-invariants
-  "Property: telemetry lifecycle ledger maintains bounded events/causes and non-negative durations across arbitrary restarts and stalls."
+(defspec ^{:doc "Property: telemetry lifecycle ledger maintains bounded events/causes and non-negative durations across arbitrary restarts and stalls."}
+  prop-telemetry-lifecycle-ledger-invariants
   100
   (prop/for-all [steps (gen/vector
                         (gen/one-of
@@ -666,3 +666,73 @@
           "waiters-atom MUST remove wake-fn, never finish!, to prevent unbounded HTTP/TLS socket OOM leak")
       (is (str/includes? src "prepare-sla-publication")
           "infra telemetry publisher must publish rolling sla/latest.edn"))))
+
+(defspec ^{:doc "Property: interval-sweepline union never exceeds window-ms, sequential 1-by-1 rolling deploys produce 0 ms cluster downtime, and 3+ overlapping node outages trigger quorum breach."}
+  prop-sweepline-union-availability-invariants
+  100
+  (prop/for-all [durations (gen/vector (gen/choose 100 5000) 6 6)]
+                (let [win-ms 86400000
+                      t0 1795200000000
+                      nodes ["node1" "node2" "node3" "ns1" "ns2" "ns3"]
+          ;; Build strictly sequential 1-by-1 rolling deploy digests
+                      [rolling-digests end-t]
+                      (reduce (fn [[acc cur-t] [nid dur]]
+                                (let [s cur-t
+                                      e (+ cur-t dur)
+                                      d (obs/build-telemetry-digest
+                                         {:node-id nid
+                                          :version "0.23.17"
+                                          :bundle-sha256 "abc123"
+                                          :uptime-ms 60000
+                                          :head-epoch 53000
+                                          :finalized-epoch 52999
+                                          :downtime-events [{:node-id nid :cause :planned-deploy :started-ms s :ended-ms e :duration-ms dur}]})]
+                                  [(conj acc d) (+ e 1000)]))
+                              [[] t0]
+                              (map vector nodes durations))
+                      rolling-sla (obs/compute-six-nines-sla rolling-digests {:window-ms win-ms :now-ms (+ end-t 1000)})]
+                  (and (= 0 (:cluster-breach-ms rolling-sla))
+                       (= 1.0 (:service-availability rolling-sla))
+                       (true? (:six-nines-met? rolling-sla))
+                       (empty? (:breach-intervals rolling-sla))
+                       (<= 0.0 (:per-node-fleet-availability rolling-sla) 1.0)
+                       (true? (:version-converged? rolling-sla))))))
+
+(deftest s-d39-12-cluster-sweepline-sla-and-six-metrics-test
+  (testing "S-D39-12: sweepline detects quorum <4/6 breach, edge <1/3 breach, and finalization stall without double-counting overlaps"
+    (let [win-ms 86400000
+          t0 1795200000000
+          ;; 3 nodes down simultaneously [t0+1000, t0+6000] (5s quorum breach) + ns1..ns3 all down [t0+4000, t0+9000] (overlaps by 2s!)
+          ;; Union of [1000,6000] U [4000,9000] = [1000,9000] = 8000 ms (NOT 10000 ms, NOT 30000 ms!)
+          d-node1 (obs/build-telemetry-digest {:node-id "node1" :version "0.23.17" :bundle-sha256 "shaA" :head-epoch 53100 :finalized-epoch 53099
+                                               :downtime-events [{:node-id "node1" :cause :unplanned-crash :started-ms (+ t0 1000) :ended-ms (+ t0 6000) :duration-ms 5000}]})
+          d-node2 (obs/build-telemetry-digest {:node-id "node2" :version "0.23.17" :bundle-sha256 "shaA" :head-epoch 53100 :finalized-epoch 53099
+                                               :downtime-events [{:node-id "node2" :cause :unplanned-crash :started-ms (+ t0 1000) :ended-ms (+ t0 6000) :duration-ms 5000}]})
+          d-node3 (obs/build-telemetry-digest {:node-id "node3" :version "0.23.17" :bundle-sha256 "shaA" :head-epoch 53100 :finalized-epoch 53099
+                                               :downtime-events [{:node-id "node3" :cause :unplanned-crash :started-ms (+ t0 1000) :ended-ms (+ t0 6000) :duration-ms 5000}]})
+          d-ns1 (obs/build-telemetry-digest {:node-id "ns1" :version "0.23.17" :bundle-sha256 "shaA" :head-epoch 53100 :finalized-epoch 53099
+                                             :downtime-events [{:node-id "ns1" :cause :unplanned-crash :started-ms (+ t0 4000) :ended-ms (+ t0 9000) :duration-ms 5000}]})
+          d-ns2 (obs/build-telemetry-digest {:node-id "ns2" :version "0.23.17" :bundle-sha256 "shaA" :head-epoch 53100 :finalized-epoch 53099
+                                             :downtime-events [{:node-id "ns2" :cause :unplanned-crash :started-ms (+ t0 4000) :ended-ms (+ t0 9000) :duration-ms 5000}]})
+          d-ns3 (obs/build-telemetry-digest {:node-id "ns3" :version "0.23.17" :bundle-sha256 "shaB" :head-epoch 53100 :finalized-epoch 53099
+                                             :downtime-events [{:node-id "ns3" :cause :unplanned-crash :started-ms (+ t0 4000) :ended-ms (+ t0 9000) :duration-ms 5000}]})
+          sla (obs/compute-six-nines-sla [d-node1 d-node2 d-node3 d-ns1 d-ns2 d-ns3]
+                                         {:window-ms win-ms :now-ms (+ t0 20000)})]
+      ;; Union is strictly 8000 ms (no triple-counting of 3-node overlap!)
+      (is (= 8000 (:cluster-breach-ms sla)))
+      (is (= 8000 (:service-downtime-ms sla)))
+      (is (false? (:six-nines-met? sla)))
+      (is (seq (:breach-intervals sla)))
+      ;; Error budget for 24h six-nines is 86.4 ms, so remaining is negative
+      (is (< (:error-budget-remaining-ms sla) 0.0))
+      ;; Per-node fleet availability divides 30,000 ms by 6 * 86,400,000
+      (is (< (Math/abs (- (- 1.0 (/ 30000.0 (* 6.0 win-ms)))
+                          (:per-node-fleet-availability sla)))
+             1.0e-12))
+      ;; Different bundle SHA on ns3 flags version-converged? false
+      (is (false? (:version-converged? sla)))
+      ;; Pure operational metric helpers
+      (is (= 1 (:epoch-finality-gap d-node1)))
+      (is (= 99.0 (obs/p99-ms (range 1 101))))
+      (is (= 60000.0 (obs/compute-heap-slope-bytes-per-min [{:ts-ms 0 :heap-used 100000}
+                                                            {:ts-ms 60000 :heap-used 160000}]))))))

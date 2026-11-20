@@ -58,6 +58,66 @@
 (def ^:private defense-state-atom (atom (defense/init-defense-state)))
 (def ^:private poll-telemetry-atom (atom {:poll-count 0 :last-sample-ms 0 :last-heap-used 0}))
 (def ^:private validator-event-error-count (atom 0))
+(def ^:private runtime-metrics-atom
+  (atom {:loop-lag-samples []
+         :last-snapshot-encode-ms 0
+         :http-5xx-count 0
+         :heap-samples []
+         :loop-sampler-started? false}))
+(def ^:private running-bundle-sha256-atom (atom nil))
+
+(defn- running-bundle-sha256
+  "Computes and caches the SHA-256 hex digest of the currently executing Node.js bundle once."
+  []
+  (or @running-bundle-sha256-atom
+      (let [sha (try
+                  (let [fp (when (exists? js/__filename) js/__filename)]
+                    (when (and fp (.existsSync node-fs fp))
+                      (let [h (.createHash node-crypto "sha256")]
+                        (.update h (.readFileSync node-fs fp))
+                        (.digest h "hex"))))
+                  (catch :default _ nil))]
+        (reset! running-bundle-sha256-atom (or sha "unknown"))
+        @running-bundle-sha256-atom)))
+
+(defn- start-event-loop-lag-sampler!
+  "Starts a lightweight 1s event-loop lag probe (bounded to last 60 samples)."
+  []
+  (when-not (:loop-sampler-started? @runtime-metrics-atom)
+    (swap! runtime-metrics-atom assoc :loop-sampler-started? true)
+    (let [expected-atom (atom (+ (.now js/Date) 1000))
+          iv (js/setInterval
+              (fn []
+                (let [now (.now js/Date)
+                      lag (max 0 (- now @expected-atom))]
+                  (reset! expected-atom (+ now 1000))
+                  (swap! runtime-metrics-atom update :loop-lag-samples
+                         (fn [v]
+                           (let [v' (conj (vec (or v [])) lag)]
+                             (if (> (count v') 60) (subvec v' (- (count v') 60)) v'))))))
+              1000)]
+      (when (.-unref iv) (.unref iv)))))
+
+(defn- sample-v8-heap-headroom-pct
+  "Returns remaining V8 heap headroom as a percentage [0.0..100.0] of heap_size_limit."
+  []
+  (try
+    (let [v8 (js/require "v8")
+          stats (.getHeapStatistics v8)
+          used (double (.-used_heap_size stats))
+          limit (double (.-heap_size_limit stats))]
+      (if (pos? limit)
+        (/ (Math/round (* 1000.0 (max 0.0 (* 100.0 (- 1.0 (/ used limit)))))) 1000.0)
+        0.0))
+    (catch :default _ 0.0)))
+
+(defn- record-heap-sample!
+  [now-ms heap-used]
+  (let [updated (swap! runtime-metrics-atom update :heap-samples
+                       (fn [v]
+                         (let [v' (conj (vec (or v [])) {:ts-ms now-ms :heap-used heap-used})]
+                           (if (> (count v') 10) (subvec v' (- (count v') 10)) v'))))]
+    (obs/compute-heap-slope-bytes-per-min (:heap-samples updated))))
 
 (defn- sample-node-runtime-telemetry!
   "P-OBS-5 / F-SOAK-1 runtime telemetry hook: samples process RSS/heap, event-loop lag, and
@@ -818,6 +878,8 @@
 
 (defn- send-json!
   [res status obj]
+  (when (>= (long status) 500)
+    (swap! runtime-metrics-atom update :http-5xx-count (fnil inc 0)))
   (let [body (js/JSON.stringify (clj->js obj))
         buf (.from js/Buffer body "utf8")]
     (.writeHead res status #js {"Content-Type" "application/json; charset=utf-8"
@@ -826,6 +888,8 @@
 
 (defn- send-text!
   [res status text method]
+  (when (>= (long status) 500)
+    (swap! runtime-metrics-atom update :http-5xx-count (fnil inc 0)))
   (let [buf (.from js/Buffer (str text) "utf8")]
     (.writeHead res status #js {"Content-Type" "text/plain; charset=utf-8"
                                 "Content-Length" (.-length buf)})
@@ -2060,8 +2124,11 @@
         (js/setImmediate
          (fn []
            (try
-             (let [safe-state (core-mesh/strip-unserializable-state st-to-save)
+             (let [encode-t0 (.now js/Date)
+                   safe-state (core-mesh/strip-unserializable-state st-to-save)
                    encoded-u8 (fressian/write-standard-fressian safe-state)
+                   encode-ms (max 0 (- (.now js/Date) encode-t0))
+                   _ (swap! runtime-metrics-atom assoc :last-snapshot-encode-ms encode-ms)
                    buf (u8->buf encoded-u8)]
                (-> (atomic-write-file-async! dest-path buf 0600)
                    (.then (fn [_]
@@ -2820,10 +2887,12 @@
         (catch :default _ nil)))))
 
 (defn- start-validator-telemetry-publisher!
-  "P-OBS-4 / D38.1 / D39.5: Periodically publishes signed privacy-preserving
+  "P-OBS-4 / D38.1 / D39.5 / D39.6: Periodically publishes signed privacy-preserving
    `telemetry/<node-id>/digest.edn` blobs & pointers from standalone validator nodes
-   (`node1..node3`) with real restart/stall downtime tracking and peer-conn diagnostics."
+   (`node1..node3`) with real restart/stall downtime tracking, peer-conn diagnostics,
+   and all 6 priority operational metrics."
   [node-id identity state-atom peer-conns state-dir]
+  (start-event-loop-lag-sampler!)
   (let [started-ms (.now js/Date)
         nid (if (keyword? node-id) (name node-id) (str node-id))
         auth-pub (:pubkey-hex identity)
@@ -2831,6 +2900,7 @@
         targets ["ns1.bitecho.org" "ns2.bitecho.org" "ns3.bitecho.org"]
         seq-atom (atom 0)
         ledger-atom (atom (load-telemetry-lifecycle-ledger! state-dir nid started-ms))
+        prev-rates-atom (atom nil)
         publish-once!
         (fn []
           (when (and auth-pub auth-priv)
@@ -2838,10 +2908,22 @@
               (let [now-ms (.now js/Date)
                     st @state-atom
                     mem (.memoryUsage js/process)
+                    heap-used (.-heapUsed mem)
+                    heap-slope (record-heap-sample! now-ms heap-used)
+                    rtm @runtime-metrics-atom
+                    lag-samples (:loop-lag-samples rtm)
+                    lag-p99 (obs/p99-ms lag-samples)
+                    lag-max (if (seq lag-samples) (double (apply max lag-samples)) 0.0)
                     head-ep (long (or (:epoch st) 0))
                     fin-ep (long (or (:last-executed-finalized-epoch st) 0))
                     peers-up (count (filter (fn [[_ v]] (= :open (:phase v))) @peer-conns))
                     conn-diag (core-mesh/mesh-conn-diagnostics-summary @peer-conns nil)
+                    failed-now (long (or (:failed-receipts-count st) 0))
+                    verr-now (long @validator-event-error-count)
+                    prev-r @prev-rates-atom
+                    failed-delta (if prev-r (max 0 (- failed-now (:failed prev-r))) 0)
+                    verr-delta (if prev-r (max 0 (- verr-now (:verr prev-r))) 0)
+                    _ (reset! prev-rates-atom {:failed failed-now :verr verr-now})
                     ledger (swap! ledger-atom obs/record-stall-sample
                                   {:node-id nid
                                    :now-ms now-ms
@@ -2850,6 +2932,8 @@
                     _ (persist-telemetry-lifecycle-async! state-dir nid ledger)
                     pub (obs/prepare-telemetry-publication
                          {:node-id nid
+                          :version full-node-version
+                          :bundle-sha256 (running-bundle-sha256)
                           :uptime-ms (max 0 (- now-ms started-ms))
                           :restart-count (:restart-count ledger)
                           :restart-causes (:restart-causes ledger)
@@ -2857,13 +2941,20 @@
                           :head-epoch head-ep
                           :finalized-epoch fin-ep
                           :runtime-summary {:rss-bytes (.-rss mem)
-                                            :heap-used-bytes (.-heapUsed mem)
+                                            :heap-used-bytes heap-used
                                             :heap-total-bytes (.-heapTotal mem)
+                                            :heap-slope-bytes-per-min (Math/round heap-slope)
+                                            :v8-heap-headroom-pct (sample-v8-heap-headroom-pct)
+                                            :event-loop-lag-p99-ms lag-p99
+                                            :event-loop-lag-max-ms lag-max
+                                            :last-snapshot-encode-ms (long (or (:last-snapshot-encode-ms rtm) 0))
                                             :runtime "nodejs"}
                           :service-counters {:peers-connected peers-up
                                              :pending-receipts (count (:pending-receipts st))
-                                             :failed-receipts (long (or (:failed-receipts-count st) 0))
-                                             :validator-event-errors (long @validator-event-error-count)
+                                             :failed-receipts failed-now
+                                             :failed-receipts-last-60s failed-delta
+                                             :validator-event-errors verr-now
+                                             :validator-event-errors-last-60s verr-delta
                                              :notarized-count (+ (count (:notarized-blocks st))
                                                                  (long (or (:pruned-notarized-count st) 0)))
                                              :finalized-count (+ (count (:finalized-blocks st))
@@ -3224,16 +3315,18 @@
      pointers)))
 
 (defn- start-infra-telemetry-publisher!
-  "P-OBS-4 / D38.1 / D39.5: Periodically publishes signed privacy-preserving
+  "P-OBS-4 / D38.1 / D39.5 / D39.6: Periodically publishes signed privacy-preserving
    `telemetry/<node-id>/digest.edn` AND rolling `sla/latest.edn` reports from infra nodes
    (`ns1..ns3`) directly into the local subnet instance."
   [node-id rt waiters-atom]
+  (start-event-loop-lag-sampler!)
   (let [started-ms (.now js/Date)
         nid (if (keyword? node-id) (name node-id) (str node-id))
         state-dir (:state-dir rt)
         seq-atom (atom 0)
         sla-seq-atom (atom 0)
         ledger-atom (atom (load-telemetry-lifecycle-ledger! state-dir nid started-ms))
+        prev-rates-atom (atom nil)
         publish-once!
         (fn []
           (let [auth-pub (:default-sender rt)
@@ -3249,12 +3342,26 @@
                       conn-diag (when v-peer-conns
                                   (core-mesh/mesh-conn-diagnostics-summary v-peer-conns nil))
                       mem (.memoryUsage js/process)
+                      heap-used (.-heapUsed mem)
+                      heap-slope (record-heap-sample! now-ms heap-used)
+                      rtm @runtime-metrics-atom
+                      lag-samples (:loop-lag-samples rtm)
+                      lag-p99 (obs/p99-ms lag-samples)
+                      lag-max (if (seq lag-samples) (double (apply max lag-samples)) 0.0)
                       head-ep (long (or (:epoch vst) (:epoch inst) 0))
                       fin-ep (long (or (:last-executed-finalized-epoch vst) (:epoch inst) 0))
                       rt-shell (when-let [sa (:shell-atom rt)] @sa)
                       active-waiters (if waiters-atom
                                        (reduce-kv (fn [acc _ s] (+ acc (count s))) 0 @waiters-atom)
                                        0)
+                      failed-now (long (or (:failed-receipts-count vst) 0))
+                      verr-now (long @validator-event-error-count)
+                      http-5xx-now (long (or (:http-5xx-count rtm) 0))
+                      prev-r @prev-rates-atom
+                      failed-delta (if prev-r (max 0 (- failed-now (:failed prev-r))) 0)
+                      verr-delta (if prev-r (max 0 (- verr-now (:verr prev-r))) 0)
+                      http-5xx-delta (if prev-r (max 0 (- http-5xx-now (:http-5xx prev-r))) 0)
+                      _ (reset! prev-rates-atom {:failed failed-now :verr verr-now :http-5xx http-5xx-now})
                       ledger (swap! ledger-atom obs/record-stall-sample
                                     {:node-id nid
                                      :now-ms now-ms
@@ -3263,6 +3370,8 @@
                       _ (persist-telemetry-lifecycle-async! state-dir nid ledger)
                       pub (obs/prepare-telemetry-publication
                            {:node-id nid
+                            :version full-node-version
+                            :bundle-sha256 (running-bundle-sha256)
                             :uptime-ms (max 0 (- now-ms started-ms))
                             :restart-count (:restart-count ledger)
                             :restart-causes (:restart-causes ledger)
@@ -3270,14 +3379,22 @@
                             :head-epoch head-ep
                             :finalized-epoch fin-ep
                             :runtime-summary {:rss-bytes (.-rss mem)
-                                              :heap-used-bytes (.-heapUsed mem)
+                                              :heap-used-bytes heap-used
                                               :heap-total-bytes (.-heapTotal mem)
+                                              :heap-slope-bytes-per-min (Math/round heap-slope)
+                                              :v8-heap-headroom-pct (sample-v8-heap-headroom-pct)
+                                              :event-loop-lag-p99-ms lag-p99
+                                              :event-loop-lag-max-ms lag-max
+                                              :last-snapshot-encode-ms (long (or (:last-snapshot-encode-ms rtm) 0))
                                               :runtime "nodejs"}
                             :service-counters {:pointer-count (count (get-in inst [:data :pointers] {}))
                                                :poll-count (long (or (:poll-count @poll-telemetry-atom) 0))
                                                :active-waiters active-waiters
-                                               :validator-event-errors (long @validator-event-error-count)
-                                               :failed-receipts (long (or (:failed-receipts-count vst) 0))}
+                                               :http-5xx-last-60s http-5xx-delta
+                                               :validator-event-errors verr-now
+                                               :validator-event-errors-last-60s verr-delta
+                                               :failed-receipts failed-now
+                                               :failed-receipts-last-60s failed-delta}
                             :defense-counters {:conn-dropped (long (or (:dropped conn-diag) (:dropped rt-shell) 0))
                                                :conn-stale (long (or (:ignored-stale conn-diag) (:ignored-stale rt-shell) 0))}})
                       existing (get-in inst [:data :pointers [(str sid) (:path pub)]])

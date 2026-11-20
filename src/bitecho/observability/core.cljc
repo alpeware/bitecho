@@ -528,24 +528,31 @@
 
 (defn build-telemetry-digest
   "Builds a privacy-preserving P-OBS-4 published telemetry digest (<= 16 KiB).
-   Explicitly names BOTH `:head-epoch` and `:finalized-epoch` and strips any raw client IPs."
-  [{:keys [node-id uptime-ms restart-count restart-causes head-epoch finalized-epoch
-           attest-root service-counters defense-counters crash-context-cid downtime-events
-           runtime-summary]}]
-  (let [base {:schema "bitecho-telemetry-digest-v1"
-              :subnet "bitecho.org/observability"
-              :node-id (str (or node-id "unknown"))
-              :uptime-ms (max 0 (long (or uptime-ms 0)))
-              :restart-count (max 0 (long (or restart-count 0)))
-              :restart-causes (vec (take 16 (or restart-causes [])))
-              :head-epoch (long (or head-epoch 0))
-              :finalized-epoch (long (or finalized-epoch 0))
-              :attest-root (when attest-root (str attest-root))
-              :service-counters (strip-raw-ip-fields (or service-counters {}))
-              :defense-counters (strip-raw-ip-fields (or defense-counters {}))
-              :runtime-summary (strip-raw-ip-fields (or runtime-summary {}))
-              :crash-context-cid (when crash-context-cid (str crash-context-cid))
-              :downtime-events (vec (take 64 (strip-raw-ip-fields (or downtime-events []))))}]
+   Explicitly names BOTH `:head-epoch` and `:finalized-epoch`, computes `:epoch-finality-gap`,
+   includes `:version` / `:bundle-sha256`, and strips any raw client IPs."
+  [{:keys [node-id version bundle-sha256 uptime-ms restart-count restart-causes
+           head-epoch finalized-epoch attest-root service-counters defense-counters
+           crash-context-cid downtime-events runtime-summary]}]
+  (let [head (long (or head-epoch 0))
+        fin (long (or finalized-epoch 0))
+        gap (if (and (pos? head) (pos? fin)) (max 0 (- head fin)) 0)
+        base (cond-> {:schema "bitecho-telemetry-digest-v1"
+                      :subnet "bitecho.org/observability"
+                      :node-id (str (or node-id "unknown"))
+                      :uptime-ms (max 0 (long (or uptime-ms 0)))
+                      :restart-count (max 0 (long (or restart-count 0)))
+                      :restart-causes (vec (take 16 (or restart-causes [])))
+                      :head-epoch head
+                      :finalized-epoch fin
+                      :epoch-finality-gap gap
+                      :attest-root (when attest-root (str attest-root))
+                      :service-counters (strip-raw-ip-fields (or service-counters {}))
+                      :defense-counters (strip-raw-ip-fields (or defense-counters {}))
+                      :runtime-summary (strip-raw-ip-fields (or runtime-summary {}))
+                      :crash-context-cid (when crash-context-cid (str crash-context-cid))
+                      :downtime-events (vec (take 64 (strip-raw-ip-fields (or downtime-events []))))}
+               version (assoc :version (str version))
+               bundle-sha256 (assoc :bundle-sha256 (str bundle-sha256)))]
     (if (<= (estimate-record-bytes base) default-network-digest-max-bytes)
       base
       (assoc base
@@ -557,47 +564,231 @@
   "Restart/downtime causes attributable to planned deployments rather than service faults."
   #{:planned-deploy :unified-rollout :pointer-update :kexec-reboot :rolling-upgrade})
 
+(defn p99-ms
+  "Pure P99 percentile over a numeric sample collection (returns 0.0 when empty)."
+  [samples]
+  (let [v (vec (sort (keep #(when (number? %) (double %)) samples)))
+        n (count v)]
+    (if (zero? n)
+      0.0
+      (let [idx (min (dec n) (max 0 (dec (long (Math/ceil (* 0.99 (double n)))))))]
+        (nth v idx)))))
+
+(defn compute-heap-slope-bytes-per-min
+  "Pure linear heap slope (bytes/minute) between earliest and latest `{:ts-ms :heap-used}` samples."
+  [samples]
+  (let [valid (vec (sort-by :ts-ms (filter #(and (number? (:ts-ms %)) (number? (:heap-used %))) samples)))]
+    (if (< (count valid) 2)
+      0.0
+      (let [first-s (first valid)
+            last-s (peek valid)
+            dt-ms (- (double (:ts-ms last-s)) (double (:ts-ms first-s)))]
+        (if (<= dt-ms 0.0)
+          0.0
+          (* (/ (- (double (:heap-used last-s)) (double (:heap-used first-s))) dt-ms) 60000.0))))))
+
+(defn- clamp-interval
+  [ev win-start now-ts]
+  (let [s0 (long (or (:started-ms ev) (:start-ms ev) 0))
+        e0 (long (or (:ended-ms ev) (:end-ms ev) (+ s0 (long (or (:duration-ms ev) 0)))))
+        s (if win-start (max s0 win-start) s0)
+        e (if now-ts (min e0 now-ts) e0)]
+    (when (> e s)
+      {:node-id (str (or (:node-id ev) "unknown"))
+       :start-ms s
+       :end-ms e
+       :cause (keyword (or (:cause ev) :unknown))})))
+
+(defn- merge-intervals
+  "Pure sweepline union over `{:start-ms :end-ms :cause :slo}` intervals."
+  [intervals]
+  (let [sorted (sort-by (juxt :start-ms :end-ms) (filter #(> (:end-ms %) (:start-ms %)) intervals))]
+    (reduce (fn [acc iv]
+              (if (empty? acc)
+                [iv]
+                (let [prev (peek acc)]
+                  (if (<= (:start-ms iv) (:end-ms prev))
+                    (let [causes (into (set (or (:causes prev) [(:cause prev)]))
+                                       (or (:causes iv) [(:cause iv)]))
+                          slos (into (set (or (:slos prev) [(:slo prev)]))
+                                     (or (:slos iv) [(:slo iv)]))
+                          cause (if (every? deploy-attributable-causes causes) :planned-deploy :unplanned)]
+                      (conj (pop acc)
+                            {:start-ms (:start-ms prev)
+                             :end-ms (max (:end-ms prev) (:end-ms iv))
+                             :cause cause
+                             :causes causes
+                             :slo (if (= 1 (count slos)) (first slos) :multi)
+                             :slos slos}))
+                    (conj acc iv)))))
+            []
+            sorted)))
+
+(defn- overlap-threshold-intervals
+  "Sweepline emitting maximal intervals where >= `min-concurrent` distinct nodes are simultaneously down."
+  [node-intervals min-concurrent slo-tag]
+  (if (or (empty? node-intervals) (<= min-concurrent 0))
+    []
+    (let [points (sort-by (juxt :t :delta)
+                          (mapcat (fn [iv]
+                                    [{:t (:start-ms iv) :delta 1 :node (:node-id iv) :cause (:cause iv)}
+                                     {:t (:end-ms iv) :delta -1 :node (:node-id iv) :cause (:cause iv)}])
+                                  node-intervals))]
+      (loop [pts points
+             active-counts {}
+             active-causes {}
+             open-start nil
+             open-causes #{}
+             out []]
+        (if (empty? pts)
+          out
+          (let [t (:t (first pts))
+                [batch rest-pts] (split-with #(= t (:t %)) pts)
+                [next-counts next-causes]
+                (reduce (fn [[ac cs] {:keys [delta node cause]}]
+                          (let [prev-c (long (get ac node 0))
+                                new-c (+ prev-c delta)]
+                            (if (pos? new-c)
+                              [(assoc ac node new-c) (update cs node (fnil conj #{}) cause)]
+                              [(dissoc ac node) (dissoc cs node)])))
+                        [active-counts active-causes]
+                        batch)
+                now-down (count next-counts)
+                cur-causes (into #{} (mapcat identity) (vals next-causes))]
+            (cond
+              (and (nil? open-start) (>= now-down min-concurrent))
+              (recur rest-pts next-counts next-causes t cur-causes out)
+
+              (and (some? open-start) (< now-down min-concurrent))
+              (let [all-c (into open-causes cur-causes)
+                    c (if (and (seq all-c) (every? deploy-attributable-causes all-c)) :planned-deploy :unplanned)]
+                (recur rest-pts next-counts next-causes nil #{}
+                       (if (> t open-start)
+                         (conj out {:start-ms open-start :end-ms t :duration-ms (- t open-start) :cause c :slo slo-tag})
+                         out)))
+
+              (some? open-start)
+              (recur rest-pts next-counts next-causes open-start (into open-causes cur-causes) out)
+
+              :else
+              (recur rest-pts next-counts next-causes nil #{} out))))))))
+
 (defn compute-six-nines-sla
-  "Pure P-OBS-4 six-nines SLA accountant over published telemetry digests.
-   Separates `:deploy-downtime-ms` from `:service-downtime-ms`, optionally filters
-   events to the rolling `[now-ms - window-ms, now-ms]` window, and reports both
-   `:head-epoch-max` and `:finalized-epoch-max`."
-  [digests {:keys [window-ms now-ms]}]
+  "Pure P-OBS-4 / D39.6 six-nines SLA accountant over published telemetry digests.
+   Computes true cluster/service-level availability via interval-sweepline Union-of-Breach-Intervals
+   across three user-facing SLOs:
+   1. Consensus quorum breach (`< 4/6` validators healthy simultaneously, i.e. >= 3 overlapping down)
+   2. Consensus finalization stall (`:finalization-stall` intervals or live `head - finalized > 10`)
+   3. Edge ingress outage (`< 1/3` infra nodes `ns1..ns3` serving simultaneously, i.e. all 3 down)
+   Publishes auditable `:breach-intervals`, split `:consensus-availability` / `:edge-availability`,
+   fixed-denominator `:per-node-fleet-availability` (`N * window-ms`), `:error-budget-remaining-ms`,
+   and `:version-converged?`."
+  [digests {:keys [window-ms now-ms quorum-loss-threshold edge-outage-threshold]}]
   (let [win-ms (max 1 (long (or window-ms 86400000)))
         now-ts (when (some? now-ms) (long now-ms))
         win-start (when now-ts (- now-ts win-ms))
-        raw-events (mapcat #(or (:downtime-events %) []) digests)
+        raw-events (mapcat (fn [d]
+                             (let [nid (str (or (:node-id d) "unknown"))]
+                               (map #(assoc % :node-id (or (:node-id %) nid))
+                                    (or (:downtime-events d) []))))
+                           digests)
         all-events (if win-start
                      (filter (fn [ev]
                                (let [ended (or (:ended-ms ev) (:started-ms ev))]
                                  (or (nil? ended) (>= (long ended) win-start))))
                              raw-events)
                      raw-events)
+        ;; Per-node diagnostic totals (kept for fleet churn visibility)
         deploy-ms (reduce + 0 (map #(long (or (:duration-ms %) 0))
                                    (filter #(contains? deploy-attributable-causes (keyword (:cause %)))
                                            all-events)))
-        service-ms (reduce + 0 (map #(long (or (:duration-ms %) 0))
-                                    (remove #(contains? deploy-attributable-causes (keyword (:cause %)))
-                                            all-events)))
+        node-service-ms (reduce + 0 (map #(long (or (:duration-ms %) 0))
+                                         (remove #(contains? deploy-attributable-causes (keyword (:cause %)))
+                                                 all-events)))
         unexplained (count (filter #(or (nil? (:cause %)) (= :unknown (keyword (:cause %)))) all-events))
-        svc-avail (max 0.0 (- 1.0 (/ (double service-ms) (double win-ms))))
-        tot-avail (max 0.0 (- 1.0 (/ (double (+ deploy-ms service-ms)) (double win-ms))))
+        ;; Sweepline cluster breach intervals
+        clamped (keep #(clamp-interval % win-start now-ts) all-events)
+        stall-ivs (map #(assoc % :slo :finalization-stall :duration-ms (- (:end-ms %) (:start-ms %)))
+                       (filter #(= :finalization-stall (:cause %)) clamped))
+        node-down-ivs (remove #(= :finalization-stall (:cause %)) clamped)
+        edge-down-ivs (filter #(str/starts-with? (str (:node-id %)) "ns") node-down-ivs)
+        node-count (max 1 (count digests))
+        q-thresh (long (or quorum-loss-threshold (if (>= node-count 4) 3 1)))
+        e-thresh (long (or edge-outage-threshold 3))
+        quorum-breaches (overlap-threshold-intervals node-down-ivs q-thresh :quorum-loss)
+        edge-breaches (overlap-threshold-intervals edge-down-ivs e-thresh :edge-outage)
+        consensus-union (merge-intervals (concat quorum-breaches stall-ivs))
+        edge-union (merge-intervals edge-breaches)
+        cluster-union (merge-intervals (concat consensus-union edge-union))
+        sum-ms (fn [ivs] (reduce + 0 (map #(- (:end-ms %) (:start-ms %)) ivs)))
+        consensus-breach-ms (min win-ms (sum-ms consensus-union))
+        edge-breach-ms (min win-ms (sum-ms edge-union))
+        ;; Fallback to node-service-ms only when legacy events lack timestamps (duration-only fixtures)
+        has-timestamps? (some #(or (:started-ms %) (:start-ms %)) all-events)
+        service-breach-union (remove #(= :planned-deploy (:cause %)) cluster-union)
+        cluster-breach-ms (if (or has-timestamps? (empty? all-events))
+                            (min win-ms (sum-ms cluster-union))
+                            (min win-ms node-service-ms))
+        service-breach-ms (if (or has-timestamps? (empty? all-events))
+                            (min win-ms (sum-ms service-breach-union))
+                            (min win-ms node-service-ms))
+        svc-avail (max 0.0 (- 1.0 (/ (double service-breach-ms) (double win-ms))))
+        consensus-avail (max 0.0 (- 1.0 (/ (double consensus-breach-ms) (double win-ms))))
+        edge-avail (max 0.0 (- 1.0 (/ (double edge-breach-ms) (double win-ms))))
+        fleet-avail (max 0.0 (- 1.0 (/ (double (+ deploy-ms node-service-ms))
+                                       (double (* node-count win-ms)))))
+        tot-avail (max 0.0 (- 1.0 (/ (double (+ deploy-ms node-service-ms)) (double win-ms))))
+        budget-ms (* 0.000001 (double win-ms))
+        budget-rem-ms (- budget-ms (double service-breach-ms))
         head-max (if (seq digests) (apply max (map #(long (or (:head-epoch %) 0)) digests)) 0)
         fin-max (if (seq digests) (apply max (map #(long (or (:finalized-epoch %) 0)) digests)) 0)
-        nodes-reporting (vec (sort (distinct (keep :node-id digests))))]
+        max-fin-lag (if (seq digests)
+                      (apply max (map (fn [d]
+                                        (let [h (long (or (:head-epoch d) 0))
+                                              f (long (or (:finalized-epoch d) 0))]
+                                          (if (and (pos? h) (pos? f)) (max 0 (- h f)) 0)))
+                                      digests))
+                      0)
+        nodes-reporting (vec (sort (distinct (keep :node-id digests))))
+        versions (vec (sort-by (juxt #(str (:version %)) #(str (:bundle-sha256 %)))
+                               (distinct (keep (fn [d]
+                                                 (when (or (:version d) (:bundle-sha256 d))
+                                                   {:version (:version d) :bundle-sha256 (:bundle-sha256 d)}))
+                                               digests))))
+        version-converged? (<= (count versions) 1)
+        pub-intervals (mapv (fn [iv]
+                              {:start-ms (:start-ms iv)
+                               :end-ms (:end-ms iv)
+                               :duration-ms (- (:end-ms iv) (:start-ms iv))
+                               :cause (:cause iv)
+                               :slo (:slo iv)})
+                            (take 64 cluster-union))]
     (cond-> {:schema "bitecho-sla-report-v1"
              :window-ms win-ms
              :digest-count (count digests)
              :nodes-reporting nodes-reporting
+             :cluster-breach-ms cluster-breach-ms
+             :consensus-breach-ms consensus-breach-ms
+             :edge-breach-ms edge-breach-ms
              :deploy-downtime-ms deploy-ms
-             :service-downtime-ms service-ms
-             :total-downtime-ms (+ deploy-ms service-ms)
+             :node-service-downtime-ms node-service-ms
+             :service-downtime-ms service-breach-ms
+             :total-downtime-ms (+ deploy-ms node-service-ms)
              :service-availability svc-avail
+             :consensus-availability consensus-avail
+             :edge-availability edge-avail
+             :per-node-fleet-availability fleet-avail
              :total-availability tot-avail
+             :error-budget-ms budget-ms
+             :error-budget-remaining-ms budget-rem-ms
              :six-nines-met? (>= svc-avail 0.999999)
+             :breach-intervals pub-intervals
              :unexplained-restarts unexplained
              :head-epoch-max head-max
-             :finalized-epoch-max fin-max}
+             :finalized-epoch-max fin-max
+             :max-finalization-lag-epochs max-fin-lag
+             :version-converged? version-converged?
+             :versions-reporting versions}
       now-ts (assoc :computed-at-ms now-ts :window-start-ms win-start))))
 
 (defn- bounded-tail
