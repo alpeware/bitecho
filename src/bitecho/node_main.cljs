@@ -7,6 +7,7 @@
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
+            [bitecho.deploy.core :as deploy]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
@@ -541,6 +542,63 @@
            (run-get! nil)))
        (catch :default e
          (done! {:error (str e) :status 500}))))))
+
+(defn- http-get-bytes!
+  "Fetches raw bytes from `url-str` over HTTP/HTTPS (honoring `proxy-url` / `HTTPS_PROXY`),
+   invoking `(cb {:ok? bool :status int :bytes Uint8Array :headers map :error str})`."
+  [url-str proxy-url timeout-ms cb]
+  (let [settled? (atom false)
+        done! (fn [res]
+                (when (compare-and-set! settled? false true)
+                  (cb res)))]
+    (try
+      (let [https? (str/starts-with? (str/lower-case (str url-str)) "https://")
+            url-obj (js/URL. url-str)
+            target-host (.-hostname url-obj)
+            target-port (int (or (not-empty (str (.-port url-obj))) (if https? 443 80)))
+            eff-proxy (when (and https?
+                                 (not= target-host "127.0.0.1")
+                                 (not= target-host "localhost"))
+                        (or proxy-url (resolve-proxy-url nil)))
+            run-get! (fn [tls-sock]
+                       (try
+                         (let [client (if https? node-https node-http)
+                               opts-obj #js {:protocol (.-protocol url-obj)
+                                             :hostname target-host
+                                             :port target-port
+                                             :path (str (.-pathname url-obj) (.-search url-obj))
+                                             :method "GET"
+                                             :timeout (or timeout-ms 15000)}
+                               _ (when tls-sock
+                                   (set! (.-createConnection opts-obj) (fn [_ _] tls-sock)))
+                               req (.request client opts-obj
+                                             (fn [res]
+                                               (let [status-code (.-statusCode res)
+                                                     chunks #js []]
+                                                 (.on res "data" (fn [c] (.push chunks c)))
+                                                 (.on res "end" (fn []
+                                                                  (let [buf (js/Buffer.concat chunks)
+                                                                        u8 (js/Uint8Array. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf))]
+                                                                    (done! {:ok? (and (>= status-code 200) (< status-code 300))
+                                                                            :status status-code
+                                                                            :bytes u8
+                                                                            :headers (js->clj (.-headers res))}))))
+                                                 (.on res "error" (fn [err] (done! {:ok? false :status status-code :error (str err)}))))))]
+                           (.on req "timeout" (fn [] (.destroy req) (done! {:ok? false :status 408 :error "timeout"})))
+                           (.on req "error" (fn [err] (done! {:ok? false :status 500 :error (str err)})))
+                           (.end req))
+                         (catch :default e
+                           (done! {:ok? false :status 500 :error (str e)}))))]
+        (if eff-proxy
+          (open-https-proxy-tls-socket!
+           eff-proxy target-host target-port (or timeout-ms 15000)
+           (fn [tls-sock err]
+             (if tls-sock
+               (run-get! tls-sock)
+               (done! {:ok? false :status 502 :error (or err "proxy-connect-failed")}))))
+          (run-get! nil)))
+      (catch :default e
+        (done! {:ok? false :status 500 :error (str e)})))))
 
 (defn- http-post-json!
   "Posts `json-body-str` to `url-str` over HTTP/HTTPS with a timeout (tunneling via HTTPS_PROXY when present),
@@ -3505,6 +3563,154 @@
     (catch :default _
       "127.0.0.1")))
 
+(defn- start-light-node-auto-updater!
+  "P-UPD-1 / D40.1: Runs the generation-tagged `deploy/reduce-light-update-tick` polling loop
+   for Node.js light nodes (`serve` mode). Verifies pointer signature + monotonic version +
+   SHA-256 == CID, runs async pre-swap `--version` health check, atomically swaps bundle (with
+   `.lkg` rollback backup), emits structured JSONL events, and exits cleanly (`0`) for
+   supervisor/driver respawn."
+  [opts identity events-out stop-all! save-state-fn!]
+  (when-let [pointer-url (:auto-update-pointer opts)]
+    (let [bundle-path (when (exists? js/__filename) js/__filename)
+          current-cid (try
+                        (when (and bundle-path (.existsSync node-fs bundle-path))
+                          (let [h (.createHash node-crypto "sha256")]
+                            (.update h (.readFileSync node-fs bundle-path))
+                            (.digest h "hex")))
+                        (catch :default _ nil))
+          proxy-url (resolve-proxy-url (:proxy opts))
+          poll-ms (max 5000 (long (or (:auto-update-interval-ms opts) 60000)))
+          updater-atom (atom (deploy/init-light-updater-state
+                              {:node-id (or (:peer-id identity) "light-node")
+                               :artifact-role :light-node
+                               :current-version "0.23.17"
+                               :current-cid current-cid
+                               :pinned-version (:pin-version opts)
+                               :proxy-url proxy-url
+                               :poll-interval-ms poll-ms}))
+          staged-bytes-atom (atom nil)
+          staged-path-atom (atom nil)
+          dispatch! (fn dispatch! [ev]
+                      (let [effs-box (atom [])]
+                        (swap! updater-atom
+                               (fn [st]
+                                 (let [[st' effs] (deploy/reduce-light-update-tick st ev)]
+                                   (reset! effs-box effs)
+                                   st')))
+                        (doseq [eff @effs-box]
+                          (case (:effect eff)
+                            :fetch-pointer
+                            (let [gen (:generation eff)]
+                              (http-get-bytes!
+                               pointer-url (:proxy-url eff) 15000
+                               (fn [res]
+                                 (if (:ok? res)
+                                   (let [txt (fressian/bytes->utf8 (:bytes res))
+                                         ptr (try (edn/read-string txt) (catch :default _ nil))]
+                                     (if (map? ptr)
+                                       (dispatch! {:type :pointer-seen :pointer ptr :generation gen})
+                                       (emit-json-line! {"event" "auto-update-diagnose"
+                                                         "reason" "malformed-pointer-edn"
+                                                         "url" pointer-url}
+                                                        events-out)))
+                                   (emit-json-line! {"event" "auto-update-diagnose"
+                                                     "reason" "fetch-pointer-failed"
+                                                     "status" (:status res)
+                                                     "error" (:error res)}
+                                                    events-out)))))
+
+                            :fetch-bundle-blob
+                            (let [gen (:generation eff)
+                                  cid (:cid eff)
+                                  blob-url (deploy/build-blob-fetch-url pointer-url cid)]
+                              (http-get-bytes!
+                               blob-url (:proxy-url eff) 30000
+                               (fn [res]
+                                 (if (:ok? res)
+                                   (do
+                                     (reset! staged-bytes-atom (:bytes res))
+                                     (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
+                                   (emit-json-line! {"event" "auto-update-diagnose"
+                                                     "reason" "fetch-bundle-blob-failed"
+                                                     "cid" cid
+                                                     "status" (:status res)
+                                                     "error" (:error res)}
+                                                    events-out)))))
+
+                            :stage-light-bundle
+                            (when (and bundle-path @staged-bytes-atom)
+                              (let [dir (.dirname node-path bundle-path)
+                                    cid8 (subs (str (:cid eff)) 0 (min 8 (count (str (:cid eff)))))
+                                    tmp-p (.join node-path dir (str ".bitecho-update-" cid8 ".cjs.tmp"))
+                                    buf (.from js/Buffer (.-buffer @staged-bytes-atom)
+                                               (.-byteOffset @staged-bytes-atom)
+                                               (.-byteLength @staged-bytes-atom))]
+                                (reset! staged-path-atom tmp-p)
+                                (-> (.writeFile node-fsp tmp-p buf #js {:mode 0755})
+                                    (.catch (fn [e]
+                                              (emit-json-line! {"event" "auto-update-diagnose"
+                                                                "reason" "stage-write-failed"
+                                                                "detail" (.-message e)}
+                                                               events-out))))))
+
+                            :atomic-swap-and-restart-light-node
+                            (let [gen (:generation eff)
+                                  cid (:cid eff)
+                                  tmp-p @staged-path-atom]
+                              (when (and bundle-path tmp-p)
+                                (.execFile node-child-process
+                                           (.-execPath js/process)
+                                           #js [tmp-p "--help"]
+                                           #js {:timeout 10000}
+                                           (fn [err _stdout _stderr]
+                                             (if err
+                                               (dispatch! {:type :health-check-result :healthy? false :generation gen})
+                                               (let [lkg-p (str bundle-path ".lkg")]
+                                                 (-> (.copyFile node-fsp bundle-path lkg-p)
+                                                     (.catch (fn [_] nil))
+                                                     (.then (fn [_] (.rename node-fsp tmp-p bundle-path)))
+                                                     (.then (fn [_]
+                                                              (emit-json-line! {"event" "auto-update-applied"
+                                                                                "cid" cid
+                                                                                "restarting" true}
+                                                                               events-out)
+                                                              (when save-state-fn! (save-state-fn!))
+                                                              (when stop-all! (stop-all!))
+                                                              (.exit js/process 0)))
+                                                     (.catch (fn [e]
+                                                               (emit-json-line! {"event" "auto-update-diagnose"
+                                                                                 "reason" "atomic-swap-failed"
+                                                                                 "detail" (.-message e)}
+                                                                                events-out)
+                                                               (dispatch! {:type :health-check-result :healthy? false :generation gen}))))))))))
+
+                            :restore-lkg-light-bundle
+                            (do
+                              (when-let [tmp-p @staged-path-atom]
+                                (-> (.unlink node-fsp tmp-p) (.catch (fn [_] nil))))
+                              (emit-json-line! {"event" "auto-update-rolled-back"
+                                                "lkg_version" (:lkg-version eff)
+                                                "lkg_cid" (:lkg-cid eff)}
+                                               events-out))
+
+                            :diagnose
+                            (emit-json-line! {"event" "auto-update-diagnose"
+                                              "reason" (name (or (:reason eff) :unknown))
+                                              "cause" (when (:cause eff) (name (:cause eff)))}
+                                             events-out)
+
+                            :obs-record
+                            (emit-json-line! {"event" "auto-update-obs"
+                                              "transition" (name (or (get-in eff [:record :data :transition]) :unknown))}
+                                             events-out)
+
+                            nil))))
+          t0 (js/setTimeout #(dispatch! {:type :poll-tick}) 15000)
+          iv (js/setInterval #(dispatch! {:type :poll-tick}) poll-ms)]
+      (fn []
+        (js/clearTimeout t0)
+        (js/clearInterval iv)))))
+
 (defn run-serve!
   "Runs the Node.js light node in continuous JSONL `serve` mode reading STDIN (and optional `--cmd-file`)
    and writing STDOUT (and optional `--events-out`)."
@@ -3618,13 +3824,19 @@
                     :conn-opts conn-opts}
                ctrl-svc (try (start-control-server! state-dir ctx opts) (catch :default _ nil))
                maint-timer (atom nil)
+               stop-updater-atom (atom nil)
                stop-all! (fn []
+                           (when-let [su @stop-updater-atom] (try (su) (catch :default _ nil)))
                            (when @maint-timer (try (js/clearInterval @maint-timer) (catch :default _ nil)))
                            (when mdns-svc (try (mdns/stop-mdns-service! mdns-svc) (catch :default _ nil)))
                            (when-let [stop-fn (:stop! ingress-listener)]
                              (try (stop-fn) (catch :default _ nil)))
                            (when-let [stop-ctrl (:stop! ctrl-svc)]
                              (try (stop-ctrl) (catch :default _ nil))))
+               _ (when-let [su (start-light-node-auto-updater!
+                                opts identity events-out stop-all!
+                                #(save-light-state! state-file @state-atom))]
+                   (reset! stop-updater-atom su))
                _ (.on js/process "exit" (fn [_] (stop-all!)))
                _ (.on js/process "SIGINT" (fn [] (stop-all!) (.exit js/process 0)))
                _ (.on js/process "SIGTERM" (fn [] (stop-all!) (.exit js/process 0)))

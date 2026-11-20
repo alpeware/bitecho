@@ -1539,16 +1539,43 @@
   [v1 v2]
   (compare (parse-semver-tuple v1) (parse-semver-tuple v2)))
 
+(defn resolve-bundle-target-cid
+  "Selects the role-specific artifact CID (`:light-node-cid`, `:full-node-cid`, `:jvm-jar-cid`,
+   `:browser-cid`) from a signed pointer map, falling back to `:code-target-cid`."
+  [pointer-map artifact-role]
+  (when (map? pointer-map)
+    (let [role-key (case (keyword (or artifact-role :light-node))
+                     :light-node :light-node-cid
+                     :full-node :full-node-cid
+                     :jvm-jar :jvm-jar-cid
+                     :browser :browser-cid
+                     :code-target-cid)]
+      (or (normalize-hex (get pointer-map role-key))
+          (normalize-hex (:code-target-cid pointer-map))))))
+
+(defn build-blob-fetch-url
+  "Derives the HTTPS `/artifact/v1/blob/<cid>` fetch URL from a pointer URL and verified CID."
+  [pointer-url cid]
+  (let [norm-cid (normalize-hex cid)
+        raw-url (str/trim (str (or pointer-url "")))]
+    (when (and norm-cid (not (str/blank? raw-url)))
+      (let [origin (if-let [[_ scheme host] (re-find #"^(https?://[^/]+)" raw-url)]
+                     (str scheme host)
+                     "https://bitecho.org")]
+        (str origin "/artifact/v1/blob/" norm-cid)))))
+
 (defn init-light-updater-state
-  "Initializes single-authority generation-tagged P-UPD-1 light-node pointer auto-update state (`Rule 4`)."
-  [{:keys [node-id current-version current-cid trusted-deploy-authorities
+  "Initializes single-authority generation-tagged P-UPD-1 pointer auto-update state (`Rule 4`)
+   shared across Node.js, JVM, and Browser light & full nodes."
+  [{:keys [node-id artifact-role current-version current-cid trusted-deploy-authorities
            pinned-version proxy-url poll-interval-ms]}]
   {:node-id (str (or node-id "light-node"))
+   :artifact-role (keyword (or artifact-role :light-node))
    :phase :watching
    :generation 1
-   :current-version (str (or current-version "0.23.15"))
+   :current-version (str (or current-version "0.23.17"))
    :current-cid (normalize-hex current-cid)
-   :lkg-version (str (or current-version "0.23.15"))
+   :lkg-version (str (or current-version "0.23.17"))
    :lkg-cid (normalize-hex current-cid)
    :pinned-version (when (and (string? pinned-version) (not (str/blank? pinned-version)))
                      (str/trim pinned-version))
@@ -1611,7 +1638,7 @@
         :pointer-seen
         (let [ptr (:pointer event)
               target-ver (str (or (:target-version ptr) ""))
-              target-cid (normalize-hex (:code-target-cid ptr))]
+              target-cid (resolve-bundle-target-cid ptr (:artifact-role state))]
           (cond
             (some? (:pinned-version state))
             (let [[st1 obs-eff] (light-update-obs-record

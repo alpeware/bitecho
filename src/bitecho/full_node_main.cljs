@@ -44,6 +44,7 @@
 (def ^:private node-path (js/require "node:path"))
 (def ^:private node-http (js/require "node:http"))
 (def ^:private node-https (js/require "node:https"))
+(def ^:private node-child-process (js/require "node:child_process"))
 (def ^:private node-tls (js/require "node:tls"))
 (def ^:private node-net (js/require "node:net"))
 (def ^:private node-dgram (js/require "node:dgram"))
@@ -3002,6 +3003,153 @@
       (js/clearInterval iv)
       (persist-telemetry-shutdown-marker! state-dir nid ledger-atom))))
 
+(defn- fetch-url-bytes-async!
+  "Fetches raw bytes from an HTTP/HTTPS URL asynchronously for P-UPD-1 auto-updates."
+  [url-str timeout-ms cb]
+  (let [settled? (atom false)
+        done! (fn [res]
+                (when (compare-and-set! settled? false true)
+                  (cb res)))]
+    (try
+      (let [https? (str/starts-with? (str/lower-case (str url-str)) "https://")
+            url-obj (js/URL. url-str)
+            client (if https? node-https node-http)
+            req (.request client
+                          #js {:protocol (.-protocol url-obj)
+                               :hostname (.-hostname url-obj)
+                               :port (or (not-empty (str (.-port url-obj))) (if https? 443 80))
+                               :path (str (.-pathname url-obj) (.-search url-obj))
+                               :method "GET"
+                               :timeout (or timeout-ms 15000)}
+                          (fn [res]
+                            (let [status-code (.-statusCode res)
+                                  chunks #js []]
+                              (.on res "data" (fn [c] (.push chunks c)))
+                              (.on res "end" (fn []
+                                               (let [buf (js/Buffer.concat chunks)
+                                                     u8 (js/Uint8Array. (.-buffer buf) (.-byteOffset buf) (.-byteLength buf))]
+                                                 (done! {:ok? (and (>= status-code 200) (< status-code 300))
+                                                         :status status-code
+                                                         :bytes u8}))))
+                              (.on res "error" (fn [err] (done! {:ok? false :status status-code :error (str err)}))))))]
+        (.on req "timeout" (fn [] (.destroy req) (done! {:ok? false :status 408 :error "timeout"})))
+        (.on req "error" (fn [err] (done! {:ok? false :status 500 :error (str err)})))
+        (.end req))
+      (catch :default e
+        (done! {:ok? false :status 500 :error (str e)})))))
+
+(defn- start-full-node-auto-updater!
+  "P-UPD-1 / D40.1: Generation-tagged `deploy/reduce-light-update-tick` self-update loop
+   for Node.js full & infra nodes (`:artifact-role :full-node`).
+   Verifies pointer authority + monotonic version + SHA-256 == CID, runs pre-swap
+   `node <tmp> --self-test` gate, atomically swaps bundle with `.lkg` rollback backup,
+   and exits cleanly (`0`) so OpenRC `supervise-daemon` respawns on the new bundle."
+  [node-id config stop-fn!]
+  (when-let [pointer-url (:auto-update-pointer config)]
+    (let [nid (if (keyword? node-id) (name node-id) (str node-id))
+          bundle-path (when (exists? js/__filename) js/__filename)
+          poll-ms (max 5000 (long (or (:auto-update-interval-ms config) 60000)))
+          updater-atom (atom (deploy/init-light-updater-state
+                              {:node-id nid
+                               :artifact-role :full-node
+                               :current-version full-node-version
+                               :current-cid (running-bundle-sha256)
+                               :trusted-deploy-authorities (:trusted-deploy-authorities config)
+                               :pinned-version (:pin-version config)
+                               :poll-interval-ms poll-ms}))
+          staged-bytes-atom (atom nil)
+          staged-path-atom (atom nil)
+          fsp (.-promises node-fs)
+          dispatch! (fn dispatch! [ev]
+                      (let [effs-box (atom [])]
+                        (swap! updater-atom
+                               (fn [st]
+                                 (let [[st' effs] (deploy/reduce-light-update-tick st ev)]
+                                   (reset! effs-box effs)
+                                   st')))
+                        (doseq [eff @effs-box]
+                          (case (:effect eff)
+                            :fetch-pointer
+                            (let [gen (:generation eff)]
+                              (fetch-url-bytes-async!
+                               pointer-url 15000
+                               (fn [res]
+                                 (if (:ok? res)
+                                   (let [txt (fressian/bytes->utf8 (:bytes res))
+                                         ptr (try (edn/read-string txt) (catch :default _ nil))]
+                                     (if (map? ptr)
+                                       (dispatch! {:type :pointer-seen :pointer ptr :generation gen})
+                                       (log-diagnostic! {:effect :diagnose :reason :full-update-malformed-pointer :node-id nid})))
+                                   (log-diagnostic! {:effect :diagnose :reason :full-update-fetch-pointer-failed :node-id nid :error (:error res)})))))
+
+                            :fetch-bundle-blob
+                            (let [gen (:generation eff)
+                                  cid (:cid eff)
+                                  blob-url (deploy/build-blob-fetch-url pointer-url cid)]
+                              (fetch-url-bytes-async!
+                               blob-url 30000
+                               (fn [res]
+                                 (if (:ok? res)
+                                   (do
+                                     (reset! staged-bytes-atom (:bytes res))
+                                     (dispatch! {:type :blob-fetched :cid cid :bytes (:bytes res) :generation gen}))
+                                   (log-diagnostic! {:effect :diagnose :reason :full-update-fetch-blob-failed :node-id nid :cid cid :error (:error res)})))))
+
+                            :stage-light-bundle
+                            (when (and bundle-path @staged-bytes-atom)
+                              (let [dir (.dirname node-path bundle-path)
+                                    cid8 (subs (str (:cid eff)) 0 (min 8 (count (str (:cid eff)))))
+                                    tmp-p (.join node-path dir (str ".bitecho-full-update-" cid8 ".cjs.tmp"))
+                                    buf (u8->buf @staged-bytes-atom)]
+                                (reset! staged-path-atom tmp-p)
+                                (-> (.writeFile fsp tmp-p buf #js {:mode 0755})
+                                    (.catch (fn [e]
+                                              (log-diagnostic! {:effect :diagnose :reason :full-update-stage-failed :node-id nid :detail (.-message e)}))))))
+
+                            :atomic-swap-and-restart-light-node
+                            (let [gen (:generation eff)
+                                  cid (:cid eff)
+                                  tmp-p @staged-path-atom]
+                              (when (and bundle-path tmp-p)
+                                (.execFile node-child-process
+                                           (.-execPath js/process)
+                                           #js [tmp-p "--self-test"]
+                                           #js {:timeout 15000}
+                                           (fn [err stdout _stderr]
+                                             (let [ok? (and (nil? err)
+                                                            (try
+                                                              (true? (aget (js/JSON.parse (str stdout)) "ok"))
+                                                              (catch :default _ false)))]
+                                               (if-not ok?
+                                                 (dispatch! {:type :health-check-result :healthy? false :generation gen})
+                                                 (let [lkg-p (str bundle-path ".lkg")]
+                                                   (-> (.copyFile fsp bundle-path lkg-p)
+                                                       (.catch (fn [_] nil))
+                                                       (.then (fn [_] (.rename fsp tmp-p bundle-path)))
+                                                       (.then (fn [_]
+                                                                (log-diagnostic! {:effect :auto-update-applied :node-id nid :cid cid :restarting true})
+                                                                (when stop-fn! (try (stop-fn!) (catch :default _ nil)))
+                                                                (.exit js/process 0)))
+                                                       (.catch (fn [e]
+                                                                 (log-diagnostic! {:effect :diagnose :reason :full-update-swap-failed :node-id nid :detail (.-message e)})
+                                                                 (dispatch! {:type :health-check-result :healthy? false :generation gen})))))))))))
+
+                            :restore-lkg-light-bundle
+                            (do
+                              (when-let [tmp-p @staged-path-atom]
+                                (-> (.unlink fsp tmp-p) (.catch (fn [_] nil))))
+                              (log-diagnostic! {:effect :diagnose :reason :full-update-rolled-back :node-id nid :lkg-version (:lkg-version eff)}))
+
+                            :diagnose
+                            (log-diagnostic! (assoc eff :node-id nid))
+
+                            nil))))
+          t0 (js/setTimeout #(dispatch! {:type :poll-tick}) 20000)
+          iv (js/setInterval #(dispatch! {:type :poll-tick}) poll-ms)]
+      (fn []
+        (js/clearTimeout t0)
+        (js/clearInterval iv)))))
+
 (defn start-validator-mesh-node!
   "Starts a full Bitecho validator & mesh node on Node.js (`:5000..5005` DataChannel peer mesh,
    `:5010` UDP+TCP agent ingress, `127.0.0.1:8080` validator diagnostics, and Fressian snapshot persistence)."
@@ -3111,7 +3259,9 @@
          stop-telemetry! (when (and (not (:embedded? opts))
                                     (not (false? (:publish-telemetry? config))))
                            (start-validator-telemetry-publisher! node-id identity state-atom peer-conns state-dir))
+         stop-updater-atom (atom nil)
          stop! (fn []
+                 (when-let [su @stop-updater-atom] (try (su) (catch :default _ nil)))
                  (when stop-telemetry! (stop-telemetry!))
                  (js/clearTimeout init-timer)
                  (when-let [iv @interval-atom] (js/clearInterval iv))
@@ -3127,7 +3277,9 @@
                     snapshot-file @state-atom true
                     {:node-id node-id
                      :keep-epochs (:snapshot-keep-epochs config)
-                     :min-keep (:snapshot-min-keep config)})))]
+                     :min-keep (:snapshot-min-keep config)})))
+         _ (when (and (not (:embedded? opts)) (:auto-update-pointer config))
+             (reset! stop-updater-atom (start-full-node-auto-updater! node-id config stop!)))]
      {:node-id node-id
       :identity identity
       :transport transport
@@ -3658,6 +3810,13 @@
       ;; P-OBS-4 / D38.1 / D39.5: 60s signed observability digest & rolling SLA publisher
       (when-not (false? (:publish-telemetry? config))
         (swap! stop-fns conj (start-infra-telemetry-publisher! node-id rt waiters-atom)))
+
+      ;; P-UPD-1 / D40.1: Optional pointer-driven self-update loop for infra nodes
+      (when (:auto-update-pointer config)
+        (when-let [stop-upd (start-full-node-auto-updater!
+                             node-id config
+                             #(doseq [f @stop-fns] (try (f) (catch :default _ nil))))]
+          (swap! stop-fns conj stop-upd)))
 
       ;; 1. DNS (:53)
       (when dns-enabled?
