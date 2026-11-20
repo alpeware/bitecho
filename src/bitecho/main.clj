@@ -12,6 +12,7 @@
             [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
             [bitecho.shell.smtp :as smtp-shell]
+            [bitecho.shell.updater :as updater]
             [bitecho.shell.upnp :as upnp]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -200,6 +201,16 @@
      :upnp upnp-res
      :upnp-renewal upnp-renewal
      :acme acme-mgr
+     :updater-stop (when (:auto-update-pointer cfg)
+                     (updater/start-jvm-auto-updater!
+                      {:node-id (name node-id)
+                       :pointer-url (:auto-update-pointer cfg)
+                       :poll-interval-ms (:auto-update-interval-ms cfg)
+                       :pinned-version (:pin-version cfg)
+                       :trusted-deploy-authorities (:trusted-deploy-authorities cfg)
+                       :stop-node-fn! (fn []
+                                        (when val-node (mesh/stop-mesh-node! val-node))
+                                        (infra/stop-subnet-runtime! runtime))}))
      :stop! (fn []
               (when val-node (mesh/stop-mesh-node! val-node))
               (when acme-mgr (acme-shell/stop-acme-loop! acme-mgr))
@@ -222,6 +233,15 @@
       (System/exit 1))
     (let [cfg (edn/read-string (slurp f))
           node (mesh/start-mesh-node! cfg)
+          _ (when (:auto-update-pointer cfg)
+              (when-let [stop-upd (updater/start-jvm-auto-updater!
+                                   {:node-id (name (:node-id node))
+                                    :pointer-url (:auto-update-pointer cfg)
+                                    :poll-interval-ms (:auto-update-interval-ms cfg)
+                                    :pinned-version (:pin-version cfg)
+                                    :trusted-deploy-authorities (:trusted-deploy-authorities cfg)
+                                    :stop-node-fn! #(mesh/stop-mesh-node! node)})]
+                (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable stop-upd))))
           node-id (:node-id node)
           pubkey (get-in node [:identity :pubkey-hex])
           fp (get-in node [:identity :fingerprint])

@@ -13,6 +13,7 @@
             [bitecho.shell.agent-sim :as agent-sim]
             [bitecho.shell.discovery :as discovery]
             [bitecho.shell.identity :as identity]
+            [bitecho.shell.updater :as updater]
             [bitecho.snapshot.core :as snap]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -216,7 +217,8 @@
                                 "--callee" "--peer" "--receiver" "--recipient"
                                 "--amount" "--text" "--message" "--payload-hex"
                                 "--wait-open-ms" "--until-event"
-                                "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"}
+                                "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"
+                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -313,6 +315,9 @@
                                                  (str/split trusted-dac-anchors-raw #","))]
                                  (set (map #(or (light-core/normalize-pubkey-hex %) (str/trim (str %))) (remove str/blank? (map str raw-items))))))
          turn-server (extract-flag-value clean-args "--turn-server" nil)
+         pin-version (extract-flag-value clean-args "--pin-version" nil)
+         auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
+         auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
          turn-username (extract-flag-value clean-args "--turn-username" nil)
          turn-password (extract-flag-value clean-args "--turn-password" nil)
          turn-realm (extract-flag-value clean-args "--turn-realm" nil)
@@ -380,7 +385,10 @@
        (some? connect?) (assoc :connect? connect?)
        proxy-url (assoc :proxy proxy-url)
        relay-url (assoc :relay-url relay-url)
-       turn-config (assoc :turn-config turn-config)))))
+       turn-config (assoc :turn-config turn-config)
+       pin-version (assoc :pin-version pin-version)
+       auto-update-pointer (assoc :auto-update-pointer auto-update-pointer)
+       auto-update-interval-ms (assoc :auto-update-interval-ms auto-update-interval-ms)))))
 
 ;; -----------------------------------------------------------------------------
 ;; State Persistence & Identity Loading
@@ -3329,6 +3337,16 @@
                      :lan-ip lan-ip
                      :default-p2p-candidates default-cands)
             mdns-svc (try (mdns/start-mdns-service! {:initial-hosts {mdns-host lan-ip}}) (catch Exception _ nil))
+            stop-updater! (when (:auto-update-pointer opts)
+                            (updater/start-jvm-auto-updater!
+                             {:node-id (or (:peer-id identity) "jvm-light-node")
+                              :pointer-url (:auto-update-pointer opts)
+                              :poll-interval-ms (:auto-update-interval-ms opts)
+                              :pinned-version (:pin-version opts)
+                              :on-event (fn [ev] (event-out ev))
+                              :stop-node-fn! (fn [] (try (save-light-state! state-file @state-atom) (catch Exception _ nil)))}))
+            _ (when stop-updater!
+                (.addShutdownHook (Runtime/getRuntime) (Thread. ^Runnable stop-updater!)))
             mdns-atom (or mdns-svc (atom (mdns/init-mdns-table)))
             p2p-peers-atom (atom {})
             ingress-peers-atom (atom {})

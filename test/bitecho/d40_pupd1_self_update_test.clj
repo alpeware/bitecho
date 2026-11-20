@@ -8,6 +8,8 @@
             [bitecho.crypto :as crypto]
             [bitecho.deploy.core :as deploy]
             [bitecho.fressian :as fressian]
+            [bitecho.shell.light-node :as jvm-light]
+            [bitecho.shell.updater :as jvm-updater]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -109,3 +111,26 @@
           "node_main.cljs must wire pure deploy/reduce-light-update-tick in serve mode")
       (is (str/includes? full-src "deploy/reduce-light-update-tick")
           "full_node_main.cljs must wire pure deploy/reduce-light-update-tick for validator/infra nodes"))))
+
+(deftest s-d40-2-jvm-and-browser-pupd1-parity-test
+  (testing "S-D40-2: JVM light-node CLI parses --auto-update-pointer / --auto-update-interval-ms / --pin-version and JVM updater starts/stops cleanly"
+    (let [parsed (jvm-light/parse-light-node-args
+                  ["serve" "--auto-update-pointer" "https://bitecho.org/config/devnet/active.edn"
+                   "--auto-update-interval-ms" "30000" "--pin-version" "0.23.17"])]
+      (is (= "https://bitecho.org/config/devnet/active.edn" (:auto-update-pointer parsed)))
+      (is (= 30000 (:auto-update-interval-ms parsed)))
+      (is (= "0.23.17" (:pin-version parsed))))
+    (is (nil? (jvm-updater/start-jvm-auto-updater! {:pointer-url nil})))
+    (let [stop! (jvm-updater/start-jvm-auto-updater!
+                 {:node-id "test-jvm"
+                  :pointer-url "https://127.0.0.1:1/config/devnet/active.edn"
+                  :poll-interval-ms 600000
+                  :pinned-version "0.23.17"})]
+      (is (fn? stop!))
+      (stop!)))
+  (testing "S-D40-2: JVM main.clj and Browser browser_main.cljs wire P-UPD-1 self-update parity"
+    (let [jvm-main (slurp "src/bitecho/main.clj")
+          browser-src (slurp "src/bitecho/browser_main.cljs")]
+      (is (str/includes? jvm-main "updater/start-jvm-auto-updater!"))
+      (is (str/includes? browser-src "deploy/reduce-light-update-tick"))
+      (is (str/includes? browser-src "\"startAutoUpdater\"")))))

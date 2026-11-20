@@ -7,11 +7,13 @@
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.crypto.sealed :as sealed]
+            [bitecho.deploy.core :as deploy]
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.browser :as browser]
             [bitecho.webauthn :as webauthn]
+            [cljs.reader :as edn]
             [clojure.string :as str]
             [goog.object :as gobj]))
 
@@ -2216,6 +2218,83 @@
   [cmd-or-args & [opts]]
   (ctl cmd-or-args opts))
 
+(defonce
+  ^{:doc "Single-authority generation-tagged browser P-UPD-1 auto-updater state atom."}
+  browser-updater-atom
+  (atom nil))
+
+(defn start-browser-auto-updater!
+  "P-UPD-1 / D40.2: Starts a browser pointer-driven self-update watcher backed by pure
+   `deploy/reduce-light-update-tick` (`:artifact-role :browser`). Verifies pointer authority,
+   monotonic version, and SHA-256 == CID via async `js/fetch`, invoking `onUpdateReady` and
+   optionally reloading the window when `autoReload` is true."
+  [js-opts]
+  (let [opts (js->clj js-opts :keywordize-keys true)
+        pointer-url (:pointerUrl opts)
+        poll-ms (max 5000 (long (or (:pollIntervalMs opts) 60000)))
+        on-ready (when (and js-opts (fn? (.-onUpdateReady js-opts))) (.-onUpdateReady js-opts))
+        auto-reload? (boolean (:autoReload opts))
+        st0 (deploy/init-light-updater-state
+             {:node-id "browser"
+              :artifact-role :browser
+              :current-version "0.23.17"
+              :current-cid (:currentCid opts)
+              :pinned-version (:pinVersion opts)
+              :trusted-deploy-authorities (:trustedAuthorities opts)
+              :poll-interval-ms poll-ms})
+        _ (reset! browser-updater-atom st0)
+        dispatch!
+        (fn dispatch! [ev]
+          (let [effs-box (atom [])]
+            (swap! browser-updater-atom
+                   (fn [st]
+                     (let [[st' effs] (deploy/reduce-light-update-tick st ev)]
+                       (reset! effs-box effs)
+                       st')))
+            (doseq [eff @effs-box]
+              (case (:effect eff)
+                :fetch-pointer
+                (let [gen (:generation eff)]
+                  (when (and pointer-url (exists? js/fetch))
+                    (-> (js/fetch pointer-url #js {:cache "no-store"})
+                        (.then (fn [resp] (when (.-ok resp) (.text resp))))
+                        (.then (fn [txt]
+                                 (when txt
+                                   (let [ptr (try (edn/read-string txt) (catch :default _ nil))]
+                                     (when (map? ptr)
+                                       (dispatch! {:type :pointer-seen :pointer ptr :generation gen}))))))
+                        (.catch (fn [_] nil)))))
+
+                :fetch-bundle-blob
+                (let [gen (:generation eff)
+                      cid (:cid eff)
+                      blob-url (deploy/build-blob-fetch-url pointer-url cid)]
+                  (when (and blob-url (exists? js/fetch))
+                    (-> (js/fetch blob-url #js {:cache "no-store"})
+                        (.then (fn [resp] (when (.-ok resp) (.arrayBuffer resp))))
+                        (.then (fn [ab]
+                                 (when ab
+                                   (dispatch! {:type :blob-fetched
+                                               :cid cid
+                                               :bytes (js/Uint8Array. ab)
+                                               :generation gen}))))
+                        (.catch (fn [_] nil)))))
+
+                :atomic-swap-and-restart-light-node
+                (let [cid (:cid eff)
+                      pending (:pending-update @browser-updater-atom)]
+                  (when on-ready
+                    (try (on-ready (clj->js {:version (:target-version pending) :cid cid})) (catch :default _ nil)))
+                  (when (and auto-reload? (exists? js/window) (.-location js/window))
+                    (.reload (.-location js/window))))
+
+                nil))))
+        t0 (js/setTimeout #(dispatch! {:type :poll-tick}) 5000)
+        iv (js/setInterval #(dispatch! {:type :poll-tick}) poll-ms)]
+    (fn []
+      (js/clearTimeout t0)
+      (js/clearInterval iv))))
+
 (def api
   "Global BitechoBrowser API object with Closure :advanced-safe string property exports (Priority 4 & BIP-006 Part 2)."
   #js {"initNode" init-node
@@ -2283,6 +2362,8 @@
                                   (when (and na (not (:fresh? res)))
                                     (swap! na update-in [:conn :diagnostics :stale-browser-bundle] (fnil inc 0)))
                                   (clj->js res)))
+       "startAutoUpdater" start-browser-auto-updater!
+       "getAutoUpdaterStatus" (fn [] (clj->js (or @browser-updater-atom {})))
        "version" "0.23.17"})
 
 (when (exists? js/goog)
