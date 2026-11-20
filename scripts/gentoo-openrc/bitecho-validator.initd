@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# scripts/gentoo-openrc/bitecho-validator.initd
+# BIP-011 (P-HOST-1 / P-HOST-6): OpenRC supervise-daemon service for Bitecho Validator Node.
+# Uses supervise-daemon for PID locking and automatic crash/exit-75 respawn on pointer advances.
+
+name="bitecho-validator"
+description="Bitecho Validator Node (Unified Pointer-Watched Supervisor)"
+
+supervisor="supervise-daemon"
+command="/opt/bitecho/run-node.sh"
+command_args="${BITECHO_VALIDATOR_ARGS:-/etc/bitecho/config.edn}"
+command_user="${BITECHO_VALIDATOR_USER:-root}"
+pidfile="/run/${RC_SVCNAME}.pid"
+respawn_delay=2
+respawn_max=0
+output_log="/var/log/bitecho-validator.log"
+error_log="/var/log/bitecho-validator.err"
+
+depend() {
+    need net localmount
+    after dhcpcd zramswap
+}

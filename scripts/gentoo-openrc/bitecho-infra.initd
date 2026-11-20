@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# scripts/gentoo-openrc/bitecho-infra.initd
+# BIP-011 (P-HOST-1 / P-HOST-6): OpenRC supervise-daemon service for Bitecho Infra Node.
+# Uses supervise-daemon for PID locking and automatic crash/exit-75 respawn on pointer advances.
+
+name="bitecho-infra"
+description="Bitecho Infrastructure Node (Unified Pointer-Watched Supervisor)"
+
+supervisor="supervise-daemon"
+command="/opt/bitecho-infra/run-node.sh"
+command_args="${BITECHO_INFRA_ARGS:-}"
+command_user="${BITECHO_INFRA_USER:-root}"
+pidfile="/run/${RC_SVCNAME}.pid"
+respawn_delay=2
+respawn_max=0
+output_log="/var/log/bitecho-infra.log"
+error_log="/var/log/bitecho-infra.err"
+
+depend() {
+    need net localmount
+    after dhcpcd zramswap
+}

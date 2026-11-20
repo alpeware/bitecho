@@ -248,7 +248,7 @@ cat <<EOF > dist/index.html
       <p style="color: var(--text-muted); font-size: 0.85rem;">Phase 3 / Milestone 12 — Fractal Composition, Zero-Burn Subnets &amp; Domain Federation</p>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
-      <span class="badge badge-primary" id="versionBadge">v0.23.14 (BIP-010)</span>
+      <span class="badge badge-primary" id="versionBadge">v0.23.15 (BIP-011)</span>
       <span class="badge badge-success">Sans-IO Core</span>
     </div>
   </header>
@@ -513,7 +513,7 @@ cat <<EOF > dist/index.html
     <pre id="outputLog">Loading BitechoBrowser bundle...</pre>
   </div>
 
-  <script src="/app/bitecho-browser.js?v=0.23.14" integrity="${SRI_384}" crossorigin="anonymous"></script>
+  <script src="/app/bitecho-browser.js?v=0.23.15" integrity="${SRI_384}" crossorigin="anonymous"></script>
   <script>
     (function () {
       const log = document.getElementById("outputLog");
@@ -1064,13 +1064,23 @@ cat <<EOF > dist/index.html
       }
 
       async function handleRecoverYubiKey() {
-        writeLog("Prompting hardware authenticator (WebAuthn get)...");
+        writeLog("[P-WEB-1 diag] Recover handler entered; prompting hardware authenticator (WebAuthn get)...");
         try {
           const cred = await globalThis.BitechoBrowser.getDiscoverableCredential();
+          writeLog("[P-WEB-1 diag] Stage 1 getDiscoverableCredential resolved:", {
+            credType: cred === null ? "null" : typeof cred,
+            credKeys: (cred && typeof cred === "object") ? Object.keys(cred) : [],
+            diagnostics: (cred && cred.diagnostics) || null
+          });
           const rec = globalThis.BitechoBrowser.recoverFromYubiKey(cred);
           if (!rec || rec.ok === false) {
-            writeLog("YubiKey recovery failed: " + ((rec && rec.error) || "recovery-failed"));
+            const failReason = (rec && (rec["failure-reason"] || rec.error)) || "recovery-failed";
+            const failStage = (rec && rec["failure-stage"]) || "unknown";
+            writeLog("YubiKey recovery failed [" + failStage + "]: " + failReason, (rec && rec.diagnostics) || null);
             return;
+          }
+          if (rec.diagnostics) {
+            writeLog("[P-WEB-1 diag] Stage 2 recoverFromYubiKey diagnostics:", rec.diagnostics);
           }
           const dash = globalThis.BitechoBrowser.getAnchorDashboard();
           updateUI(dash);

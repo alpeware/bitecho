@@ -366,7 +366,20 @@
                               (:seed_bytes opts-map)))
                         (when (string? seed-or-opts) seed-or-opts)
                         (when (sequential? seed-or-opts) seed-or-opts))
+        stage1-diag (when (map? opts-map) (:diagnostics opts-map))
+        stage1-failed? (and (map? opts-map) (false? (:ok opts-map)))
+        input-shape (cond
+                      (nil? seed-or-opts) "nil"
+                      stage1-failed? "stage1-failed-result"
+                      raw-bytes? "raw-bytes"
+                      (some? user-handle) "assertion-or-user-handle"
+                      (some? prf-out) "prf-output"
+                      (and existing-ident (:public-hex existing-ident)) "redacted-identity-double-recovery"
+                      (map? opts-map) (str "map-keys:" (str/join "," (sort (map name (keys opts-map)))))
+                      :else "other")
         raw-recovered (cond
+                        stage1-failed? nil
+
                         (some? user-handle)
                         (webauthn/recover-seed-from-assertion
                          (if (map? opts-map)
@@ -381,11 +394,39 @@
 
                         :else nil)
         recovered (when raw-recovered
-                    (webauthn/normalize-recovered-identity raw-recovered))]
+                    (webauthn/normalize-recovered-identity raw-recovered))
+        rec-pk (when (map? recovered) (:public-hex recovered))
+        rec-pk-len (if (string? rec-pk) (count rec-pk) 0)
+        rec-pk-fmt (cond (= rec-pk-len 88) "88-char-spki-hex"
+                         (= rec-pk-len 64) "64-char-raw-hex"
+                         :else "none")
+        merged-diag (merge (or stage1-diag (webauthn/inspect-assertion-diagnostics seed-or-opts))
+                           {:second-call-ran true
+                            :second-call-input-shape input-shape
+                            :recovered-key-length rec-pk-len
+                            :recovered-key-format rec-pk-fmt})]
     (if-not recovered
-      (clj->js {:ok false :error "recovery-failed"})
+      (let [fail-stage (or (when stage1-failed? (:failure-stage opts-map))
+                           (if raw-recovered "normalize-recovered-identity" "recover-from-yubikey"))
+            fail-reason (or (when stage1-failed? (:failure-reason opts-map))
+                            (cond
+                              (nil? seed-or-opts) "nil-input-to-recover-from-yubikey"
+                              (and (nil? user-handle) (nil? prf-out) (nil? existing-ident))
+                              (str "no-user-handle-prf-or-public-hex-in-input (" input-shape ")")
+                              (nil? raw-recovered) (str "seed-derivation-returned-nil (" input-shape ")")
+                              :else (str "normalize-recovered-identity-returned-nil (raw-public-hex-len="
+                                         (count (str (:public-hex raw-recovered))) ")")))]
+        (clj->js {:ok false
+                  :error "recovery-failed"
+                  :failure-stage fail-stage
+                  :failure-reason fail-reason
+                  :diagnostics (assoc merged-diag
+                                      :failure-stage fail-stage
+                                      :failure-reason fail-reason)}))
       (let [applied (or (apply-hardware-identity! recovered) recovered)]
-        (clj->js (assoc (redact-for-js applied) :ok true))))))
+        (clj->js (assoc (redact-for-js applied)
+                        :ok true
+                        :diagnostics merged-diag))))))
 
 (defn generate-non-extractable-key
   "Generates and returns non-extractable WebCrypto key spec and metadata."
@@ -2218,11 +2259,11 @@
        "checkBundleFreshness" (fn [remote-ver]
                                 (let [na @active-node-atom
                                       st (if na @na {:diagnostics {}})
-                                      res (browser/check-browser-bundle-freshness st "0.23.14" remote-ver)]
+                                      res (browser/check-browser-bundle-freshness st "0.23.15" remote-ver)]
                                   (when (and na (not (:fresh? res)))
                                     (swap! na update-in [:conn :diagnostics :stale-browser-bundle] (fnil inc 0)))
                                   (clj->js res)))
-       "version" "0.23.14"})
+       "version" "0.23.15"})
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api))

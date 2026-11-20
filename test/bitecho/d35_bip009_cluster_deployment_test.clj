@@ -528,7 +528,7 @@
       (is (= {"bob" bob-pk} (:petnames ln-st1)))
       (is (= "open" (get-in ln-st1 [:sessions "sess-1" :state])))
       (is (some #(= "network-generation-resynced" (get % "event")) (:events ln-synced)))
-      (is (contains? #{"0.23.13" "0.23.14"} config/version))
+      (is (contains? #{"0.23.13" "0.23.14" "0.23.15"} config/version))
       (let [bip009-spec (edn/read-string (slurp "docs/bips/bip-009-v02313.edn"))
             gate-check (gov/verify-bip-admission-gates bip009-spec)]
         (is (true? (:ok? gate-check)))

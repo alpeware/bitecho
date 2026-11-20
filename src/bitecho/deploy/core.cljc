@@ -233,6 +233,30 @@
                                              :stage :rolled-back)]))
                           nodes-map))
 
+                  :unified-rollout-applied
+                  (let [nid (:node-id p)]
+                    (if nid
+                      (update nodes-map nid
+                              (fn [prev]
+                                (merge {:node-id nid}
+                                       prev
+                                       {:active-code-cid (or (:code-cid p) (:active-code-cid prev))
+                                        :system-merkle-root (or (:system-merkle-root p) (:system-merkle-root prev))
+                                        :stage (or (:stage p) next-stage)})))
+                      nodes-map))
+
+                  :unified-rollout-rolled-back
+                  (let [nid (:node-id p)]
+                    (if nid
+                      (update nodes-map nid
+                              (fn [prev]
+                                (merge {:node-id nid}
+                                       prev
+                                       {:active-code-cid (or (:last-known-good-code-cid p) (:active-code-cid prev))
+                                        :system-merkle-root (or (:last-known-good-merkle-root p) (:system-merkle-root prev))
+                                        :stage :rolled-back})))
+                      nodes-map))
+
                   nodes-map))]
           (recur (subvec rem-recs 1)
                  (:record-hash rec)
@@ -260,7 +284,11 @@
     (:node-runtimes pointer-map)
     (assoc :node-runtimes (into (sorted-map) (:node-runtimes pointer-map)))
     (:artifacts pointer-map)
-    (assoc :artifacts (into (sorted-map) (:artifacts pointer-map)))))
+    (assoc :artifacts (into (sorted-map) (:artifacts pointer-map)))
+    (:host-target pointer-map)
+    (assoc :host-target (into (sorted-map) (:host-target pointer-map)))
+    (:system-merkle-root pointer-map)
+    (assoc :system-merkle-root (or (normalize-hex (:system-merkle-root pointer-map)) ""))))
 
 (defn canonical-config-pointer-signing-payload
   "Domain-separated canonical payload for signing a config pointer."
@@ -380,7 +408,11 @@
                       theta
                       (when (seq theta) {:policy-theta theta})
                       (when (not (str/blank? (str (:code-target-cid ptr))))
-                        {:code-target-cid (:code-target-cid ptr)}))]
+                        {:code-target-cid (:code-target-cid ptr)})
+                      (when (map? (:host-target ptr))
+                        {:host-target (:host-target ptr)})
+                      (when (not (str/blank? (str (:system-merkle-root ptr))))
+                        {:system-merkle-root (:system-merkle-root ptr)}))]
     (cond-> merged
       (:min-signaling-burn merged)
       (assoc :burn-floor (long (:min-signaling-burn merged))))))

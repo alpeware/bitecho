@@ -250,6 +250,100 @@
            (when (fn? f)
              (.call f obj)))))))
 
+(defn- js-type-label [x]
+  (cond
+    (nil? x) "nil"
+    (map? x) "map"
+    (string? x) "string"
+    (sequential? x) "seq"
+    #?@(:cljs
+        [(instance? js/Uint8Array x) "Uint8Array"
+         (and (exists? js/ArrayBuffer) (instance? js/ArrayBuffer x)) "ArrayBuffer"
+         (and (exists? js/ArrayBuffer) (.isView js/ArrayBuffer x)) "ArrayBufferView"
+         (object? x) (or (when-let [ctor (gobj/get x "constructor")]
+                           (gobj/get ctor "name"))
+                         "Object")])
+    :else (str (type x))))
+
+(defn inspect-assertion-diagnostics
+  "Pure privacy-safe diagnostic inspector for WebAuthn assertions (P-WEB-1, Rule 5).
+   Emits only booleans, type labels, lengths, and formats — NEVER secret bytes or seeds."
+  [assertion-or-response]
+  (let [resp (cond
+               (map? assertion-or-response)
+               (or (:response assertion-or-response) (get assertion-or-response "response"))
+               #?@(:cljs [(and (some? assertion-or-response) (object? assertion-or-response))
+                          (js-prop assertion-or-response "response")])
+               :else nil)
+        cred-id (cond
+                  (map? assertion-or-response)
+                  (or (:id assertion-or-response) (get assertion-or-response "id")
+                      (:raw-id assertion-or-response) (get assertion-or-response "rawId"))
+                  #?@(:cljs [(and (some? assertion-or-response) (object? assertion-or-response))
+                             (or (js-prop assertion-or-response "id")
+                                 (js-prop assertion-or-response "rawId"))])
+                  :else nil)
+        cred-id-len (cond
+                      (string? cred-id) (count cred-id)
+                      (some? (to-byte-seq cred-id)) (count (to-byte-seq cred-id))
+                      :else 0)
+        user-handle (or (when (map? assertion-or-response)
+                          (or (get assertion-or-response :user-handle)
+                              (get assertion-or-response :userHandle)
+                              (get assertion-or-response "userHandle")
+                              (get assertion-or-response "user_handle")
+                              (get-in assertion-or-response [:response :user-handle])
+                              (get-in assertion-or-response [:response :userHandle])
+                              (get-in assertion-or-response [:response "userHandle"])
+                              (get-in assertion-or-response [:response "user_handle"])
+                              (get-in assertion-or-response ["response" "userHandle"])
+                              (get-in assertion-or-response ["response" "user_handle"])
+                              (get-in assertion-or-response ["response" :user-handle])
+                              (:user-id assertion-or-response)
+                              (get assertion-or-response "user_id")))
+                        #?(:cljs (when (some? assertion-or-response)
+                                   (or (js-prop assertion-or-response "userHandle")
+                                       (js-prop assertion-or-response "user_handle")
+                                       (when resp
+                                         (or (js-prop resp "userHandle")
+                                             (js-prop resp "user_handle")))))))
+        uh-bytes (when (some? user-handle) (to-byte-seq user-handle))
+        prf-out (or (when (map? assertion-or-response)
+                      (or (:prf-output assertion-or-response)
+                          (:prfOutput assertion-or-response)
+                          (get assertion-or-response "prfOutput")
+                          (get assertion-or-response "prf_output")
+                          (get-in assertion-or-response [:extensions :prf :results :first])
+                          (get-in assertion-or-response [:client-extension-results :prf :results :first])
+                          (get-in assertion-or-response [:clientExtensionResults :prf :results :first])
+                          (get-in assertion-or-response ["clientExtensionResults" "prf" "results" "first"])
+                          (get-in assertion-or-response ["extensions" "prf" "results" "first"])))
+                    #?(:cljs (when (some? assertion-or-response)
+                               (let [cer (or (js-call-0 assertion-or-response "getClientExtensionResults")
+                                             (js-prop assertion-or-response "clientExtensionResults")
+                                             (js-prop assertion-or-response "client_extension_results")
+                                             (js-prop assertion-or-response "extensions"))
+                                     prf (or (when cer (js-prop cer "prf"))
+                                             (js-prop assertion-or-response "prf"))
+                                     results (or (when prf (js-prop prf "results"))
+                                                 (js-prop assertion-or-response "results"))]
+                                 (or (when results (js-prop results "first"))
+                                     (when prf (js-prop prf "first"))
+                                     (js-prop assertion-or-response "prfOutput")
+                                     (js-prop assertion-or-response "prf_output"))))))
+        prf-bytes (when (some? prf-out) (to-byte-seq prf-out))]
+    {:assertion-received (some? assertion-or-response)
+     :assertion-type (js-type-label assertion-or-response)
+     :credential-id-present (some? cred-id)
+     :credential-id-length cred-id-len
+     :response-present (some? resp)
+     :response-type (js-type-label resp)
+     :user-handle-present (some? user-handle)
+     :user-handle-type (js-type-label user-handle)
+     :user-handle-byte-length (if uh-bytes (count uh-bytes) 0)
+     :prf-present (some? prf-out)
+     :prf-byte-length (if prf-bytes (count prf-bytes) 0)}))
+
 (defn recover-seed-from-assertion
   "Recovers the 32-byte seed from WebAuthn assertion response (userHandle as canonical default, with PRF extension fallback)
    and deterministically derives the Ed25519 identity keypair."
@@ -441,14 +535,48 @@
 #?(:cljs
    (defn get-discoverable-credential!
      "Executes navigator.credentials.get({publicKey: ...}) with allowCredentials: []
-      to recover the 32-byte seed from userHandle or PRF extension on a YubiKey."
+      to recover the 32-byte seed from userHandle or PRF extension on a YubiKey.
+      Emits privacy-safe staged diagnostics on both success and failure (P-WEB-1, Rule 5)."
      [opts cb]
      (let [req-opts (build-assertion-options opts)]
        (if (and (exists? js/navigator) (.-credentials js/navigator))
          (-> (.get (.-credentials js/navigator)
                    (clj->js {:publicKey (dissoc req-opts :metadata)}))
              (.then (fn [assertion]
-                      (cb nil (recover-seed-from-assertion assertion))))
+                      (let [diag (inspect-assertion-diagnostics assertion)
+                            rec-res (try
+                                      {:rec (recover-seed-from-assertion assertion)}
+                                      (catch :default e
+                                        {:rec nil :exception (or (.-message e) (str e))}))]
+                        (if-let [rec (:rec rec-res)]
+                          (let [pk-hex (:public-hex rec)
+                                pk-len (if (string? pk-hex) (count pk-hex) 0)
+                                pk-fmt (cond (= pk-len 88) "88-char-spki-hex"
+                                             (= pk-len 64) "64-char-raw-hex"
+                                             :else (str "other-" pk-len))]
+                            (cb nil (assoc rec :diagnostics
+                                           (assoc diag
+                                                  :stage1-ok true
+                                                  :recovered-key-length pk-len
+                                                  :recovered-key-format pk-fmt))))
+                          (let [reason (cond
+                                         (:exception rec-res) (str "recover-exception: " (:exception rec-res))
+                                         (not (:assertion-received diag)) "assertion-was-nil"
+                                         (and (not (:user-handle-present diag)) (not (:prf-present diag)))
+                                         "no-user-handle-and-no-prf-in-assertion"
+                                         (and (:user-handle-present diag) (zero? (:user-handle-byte-length diag)))
+                                         (str "user-handle-unreadable-or-empty-bytes (type=" (:user-handle-type diag) ")")
+                                         :else "recover-seed-from-assertion-returned-nil")]
+                            (cb nil {:ok false
+                                     :error "recovery-failed"
+                                     :failure-stage "get-discoverable-credential"
+                                     :failure-reason reason
+                                     :diagnostics (assoc diag
+                                                         :stage1-ok false
+                                                         :recovered-key-length 0
+                                                         :recovered-key-format "none"
+                                                         :failure-stage "get-discoverable-credential"
+                                                         :failure-reason reason)}))))))
              (.catch (fn [err]
                        (cb {:error (str err)} nil))))
          (cb {:error "webauthn-navigator-credentials-unavailable" :assertion-options req-opts} nil)))))

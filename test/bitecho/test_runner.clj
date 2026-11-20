@@ -24,6 +24,7 @@
             [bitecho.d35-bip009-cluster-deployment-test]
             [bitecho.d36-bip010-yubikey-faucet-and-node-infra-test]
             [bitecho.d36-nodejs-infra-parity-test]
+            [bitecho.d37-bip011-gentoo-host-and-unified-rollout-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]

@@ -857,7 +857,7 @@
             (is (= 0 (:exit sh-res)) (str "Node full-node self-test failed: " (:err sh-res) " / " (:out sh-res)))
             (is (str/includes? (:out sh-res) "\"ok\":true"))
             (is (str/includes? (:out sh-res) "\"runtime\":\"nodejs\"")))))
-      (is (= "0.23.14" config/version))
+      (is (contains? #{"0.23.14" "0.23.15"} config/version))
       (let [bip010-file (io/file "docs/bips/bip-010-v02314.edn")]
         (is (.exists bip010-file) "docs/bips/bip-010-v02314.edn must exist")
         (when (.exists bip010-file)

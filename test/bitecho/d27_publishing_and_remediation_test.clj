@@ -434,7 +434,7 @@
 
 (deftest test-d27-version-and-cold-root-pins
   (testing "config/version is at least 0.23.5 (0.23.6 in D28, 0.23.7 in D29, 0.23.8 in D30, 0.23.9 in D31, 0.23.10 in D32, 0.23.11 in D33, 0.23.12 in D34, 0.23.13 in D35, 0.23.14 in D36)"
-    (is (contains? #{"0.23.5" "0.23.6" "0.23.7" "0.23.8" "0.23.9" "0.23.10" "0.23.11" "0.23.12" "0.23.13" "0.23.14"} config/version)))
+    (is (contains? #{"0.23.5" "0.23.6" "0.23.7" "0.23.8" "0.23.9" "0.23.10" "0.23.11" "0.23.12" "0.23.13" "0.23.14" "0.23.15"} config/version)))
 
   (testing "config/infra-cold-root-pubkey is pinned"
     (is (= "302a300506032b6570032100d88b92f094f65be1d32c8c1fb6c85f7913458a99ebdc142009ab2f18fd1bf641"

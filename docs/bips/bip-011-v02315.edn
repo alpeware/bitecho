@@ -1,0 +1,109 @@
+{:bip-id "BIP-011"
+ :bip/id "BIP-011"
+ :title "BIP-011: Gentoo Host-Layer Migration — Minimal Hardened OpenRC Image, On-Network Binhost, Unified Pointer-Driven Rolling Upgrades (Host Binpackages + Full Node), and Merkle Root-Hash Attestation"
+ :bip/title "BIP-011: Gentoo Host-Layer Migration — Minimal Hardened OpenRC Image, On-Network Binhost, Unified Pointer-Driven Rolling Upgrades (Host Binpackages + Full Node), and Merkle Root-Hash Attestation"
+ :version "v0.23.15"
+ :bip/version "0.23.15"
+ :milestone "D37"
+ :bip/milestone "D37"
+ :bip/status :consented
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :bip/author-agent "axiom"
+ :author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :bip/author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :co-author-pubkeys ["302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                     "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                     "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"]
+ :human-anchor-sunset "2027-06-30"
+ :bip/parent-bip-cid "076da55e8459b50897e9189d5f05fe07e051e46ac686ac8e200e915fb13b00f3"
+ :bip/draft-cid "275e94f401aa3c0a3a3b46efa342753dcb14b3f76ee8a2fc4e2f7a56d80e5197"
+ :bip/feasibility-report-cid "5a045dcb8ff8f94b2cd0b40faff2dd63d3bbf171c62db02b3f01b77e06b40e15"
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :note "Go decision on BIP-012 stage3 live migration + unified P-HOST-6 pointer move (2026-11-19 19:32 CST)"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"}
+                   {:agent "lumen" :role :research-lead :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"}]
+ :invariant-diff {:defspec-vars ["bitecho.d37-bip011-gentoo-host-and-unified-rollout-test/prop-system-merkle-root-deterministic-and-layer-proofs-verify"
+                                 "bitecho.d37-bip011-gentoo-host-and-unified-rollout-test/prop-single-package-change-localizes-to-exact-subtree"
+                                 "bitecho.d37-bip011-gentoo-host-and-unified-rollout-test/prop-binpkg-signature-verification-fail-closed-on-tamper-or-unsigned"
+                                 "bitecho.d37-bip011-gentoo-host-and-unified-rollout-test/prop-unified-rollout-state-machine-atomic-rollback-and-stale-gen-guard"]
+                  :seed 1795210000
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 1795210000
+                                            :tests 792
+                                            :assertions 7309
+                                            :executed-at 1795210000000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 1795210000
+                                             :scenarios-passed 91
+                                             :executed-at 1795210000000}
+                   :deterministic-bundle-sha256 "86d5e6f5f272ee289e568e3cceed1770765ac08ee050bc31eb7b628a305f66ff"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :browser-bundle-sha256 "2a082634bcaf3be276df7c728c2953df945f04d8060131c115112ecf6f144753"
+                                                   :full-node-bundle-sha256 "3543f839b86b3f42b93e9588701b16a80b66414f949b5ea2d2241d920b9849c7"
+                                                   :executed-at 1795210000000}}
+ :bip/oracle-receipts {:test-suite "bitecho.d37-bip011-gentoo-host-and-unified-rollout-test"
+                       :d37-tests-run 12
+                       :d37-assertions 112
+                       :d37-failures 0
+                       :d37-errors 0
+                       :full-suite-tests-run 792
+                       :full-suite-assertions 7309
+                       :full-suite-failures 0
+                       :full-suite-errors 0
+                       :cljfmt-status :clean
+                       :clj-kondo-errors 0
+                       :clj-kondo-warnings 0
+                       :reproducible-node-bundle-sha256 "86d5e6f5f272ee289e568e3cceed1770765ac08ee050bc31eb7b628a305f66ff"
+                       :reproducible-browser-bundle-sha256 "2a082634bcaf3be276df7c728c2953df945f04d8060131c115112ecf6f144753"
+                       :reproducible-full-node-bundle-sha256 "3543f839b86b3f42b93e9588701b16a80b66414f949b5ea2d2241d920b9849c7"}
+ :code-artifact {:parent-commit "bdd858c"
+                 :patch-path "dist/bips/bip-011-v02315.patch"
+                 :patch-cid "82d57bdd955781bdbe38faa3efadd0e4f3cbbe413ee280d5a18cdf6ab5dee7b1"
+                 :patch-size-bytes 153440
+                 :verification-steps ["git checkout bdd858c"
+                                      "git apply bip-011-v02315.patch"
+                                      "./scripts/build-full-node-bundle.sh && ./scripts/build-node-light-node.sh && ./scripts/build-browser-bundle.sh"
+                                      "clojure -M:test -n bitecho.d37-bip011-gentoo-host-and-unified-rollout-test"]}
+ :bip/scenarios ["S-D37-1: Reproducible image (identical OS and runtime subtree hashes across independent builds)"
+                 "S-D37-2: Pointer-driven host update (:host-target binpkg verification, tamper/unsigned refusal, P-DEPLOY-5 audit records)"
+                 "S-D37-3: Host rollback (@rootfs snapshot restore with @bitecho-state and node identity untouched)"
+                 "S-D37-4: Transition continuity (P-HOST-3 live migration preserves pubkey/balance/epoch/IPs/bootstrap/home-sets; pivot abort rolls back to Debian)"
+                 "S-D37-5: Root-hash attestation (external verifier recomputes Merkle root, verifies per-layer proof, localizes single-package divergence to :os-subtree)"
+                 "S-D37-6: kexec kernel update (completes inside downtime budget; fallback to cold reboot; 2 consecutive failures trip stage gate)"
+                 "S-D37-7: Unified pointer move (single pointer advance rolls binpkg + full-node host-then-node; tampered artifact or second-layer failure trips combined mechanical rollback)"]
+ :bip/pillars
+ {:P-HOST-1 {:title "Minimal hardened Gentoo image definition + deterministic build pipeline"
+             :files ["src/bitecho/host/core.cljc"]}
+  :P-HOST-2 {:title "On-network binhost + :host-target pointer"
+             :files ["src/bitecho/host/core.cljc" "src/bitecho/deploy/core.cljc"]}
+  :P-HOST-3 {:title "Provisioning transition: stage3 live migration in place (provider-generic)"
+             :files ["scripts/gentoo-stage3-live-migrate.sh" "docs/runbooks/gentoo-stage3-live-migration.md"]}
+  :P-HOST-4 {:title "Rollback stack for the host layer (@rootfs snapshot + kexec)"
+             :files ["src/bitecho/host/core.cljc"]}
+  :P-HOST-5 {:title "3-subtree Merkle root-hash attestation of the running system"
+             :files ["src/bitecho/host/core.cljc" "src/bitecho/full_node_main.cljs"]}
+  :P-HOST-6 {:title "Unified dynamic rolling upgrade (ONE storage-pointer move rolls Gentoo binpackages + full node)"
+             :files ["src/bitecho/host/core.cljc"
+                     "src/bitecho/deploy/core.cljc"
+                     "src/bitecho/full_node_main.cljs"
+                     "scripts/gentoo-openrc/bitecho-infra.initd"
+                     "scripts/gentoo-openrc/bitecho-validator.initd"
+                     "scripts/run-infra-node.sh"
+                     "scripts/run-validator-node.sh"]}}
+ :bip/human-anchor-sunset 26280}

@@ -28,6 +28,7 @@
             [bitecho.economy.spend-dac :as spend-dac]
             [bitecho.fressian :as fressian]
             [bitecho.governance.core :as gov]
+            [bitecho.host.core :as host]
             [bitecho.light-node.core :as light-core]
             [bitecho.state-machine :as sm]
             [cljs.reader :as edn]
@@ -47,7 +48,7 @@
 
 (def full-node-version
   "Current Node.js Full / Infra Node release version."
-  "0.23.14")
+  "0.23.15")
 
 (declare fetch-validator-chain-state-snapshots! forward-gossip-to-agents! start-validator-mesh-node! step-validator-event!)
 
@@ -3028,6 +3029,15 @@
         relay-st (relay/init-relay-state)
         gov-st (gov/init-governance-state)
         sym-key (storage/derive-storage-key auth-sk "infra-test")
+        host-manifest (host/build-system-merkle-manifest
+                       {:arch "amd64"
+                        :stage3-cid (deploy/sha256-hex "stage3-amd64-hardened-openrc")
+                        :profile-cid (deploy/sha256-hex "default/linux/amd64/23.0/no-multilib/hardened")
+                        :os-packages [{:atom "sys-apps/openrc" :version "0.55.1" :cid (deploy/sha256-hex "openrc-0.55.1")}]
+                        :runtimes [{:name "nodejs" :version (.-version js/process) :cid (deploy/sha256-hex (.-version js/process))}]
+                        :app-artifacts [{:artifact "bitecho-full-node.cjs" :version full-node-version :cid (deploy/sha256-hex full-node-version)}]})
+        host-proof (host/generate-layer-proof host-manifest :os-subtree)
+        host-proof-ok? (true? (:valid? (host/verify-layer-proof host-proof (:system-merkle-root host-manifest))))
         ok? (and (= 11 (:epoch ticked))
                  (= 125 (get-in ticked [:config :min-signaling-burn]))
                  (true? (:chain-valid? audit-check))
@@ -3041,6 +3051,7 @@
                  (map? gov-st)
                  (= 32 (fressian/count-bytes sym-key))
                  (true? (light-core/valid-pubkey-hex? auth-pk))
+                 host-proof-ok?
                  (some? acme-proto/base64url-encode))]
     {:ok ok?
      :runtime "nodejs"
@@ -3048,6 +3059,7 @@
      :version full-node-version
      :epoch (:epoch ticked)
      :active_config_hash (:active-config-hash ticked)
+     :system_merkle_root (:system-merkle-root host-manifest)
      :audit_records (count (:audit-trail ticked))
      :fressian_roundtrip_ok (= "bitecho.org/infra" (:subnet-id snap-decoded))
      :spend_dac_ok (true? (:ok? spend-res))}))
@@ -3149,6 +3161,48 @@
       dns-port (assoc-in [:dns :port] (js/parseInt dns-port 10))
       smtp-port (assoc-in [:smtp :port] (js/parseInt smtp-port 10)))))
 
+(defn- cmd-check-pointer!
+  "Verifies a signed `config/<network>/active.edn` pointer file (and optional `:host-target` schema)
+   per BIP-011 `P-HOST-2` / `P-HOST-6`."
+  [pointer-file]
+  (let [ptr (read-config-file-or-exit! pointer-file)
+        v (deploy/verify-config-pointer {:active-config-seq 0} ptr)
+        ht (:host-target ptr)
+        ht-v (if ht (host/validate-host-target ht) {:ok? true :errors []})
+        ok? (and (:ok? v) (:ok? ht-v))]
+    (println (js/JSON.stringify
+              (clj->js {:ok ok?
+                        :version full-node-version
+                        :pointer_seq (:seq ptr)
+                        :code_target_cid (:code-target-cid ptr)
+                        :host_target_valid (:ok? ht-v)
+                        :system_merkle_root (or (:system-merkle-root ptr) (:system-merkle-root ht))
+                        :error (or (:error v) (first (:errors ht-v)))})))
+    (when-not ok?
+      (.exit js/process 1))))
+
+(defn- cmd-attest-root!
+  "Recomputes the P-HOST-5 3-subtree system Merkle root from a manifest EDN file (or emits a
+   local runtime attestation manifest when no path is provided)."
+  [manifest-file]
+  (let [manifest (if (and manifest-file (.existsSync node-fs manifest-file))
+                   (edn/read-string (.readFileSync node-fs manifest-file "utf8"))
+                   (host/build-system-merkle-manifest
+                    {:arch (case (.-arch js/process)
+                             "x64" "amd64"
+                             "arm64" "arm64"
+                             (str (.-arch js/process)))
+                     :os-packages [{:atom "sys-apps/openrc" :version "openrc" :cid (deploy/sha256-hex "openrc")}]
+                     :runtimes [{:name "nodejs" :version (.-version js/process) :cid (deploy/sha256-hex (.-version js/process))}]
+                     :app-artifacts [{:artifact "bitecho-full-node.cjs" :version full-node-version :cid (deploy/sha256-hex full-node-version)}]}))
+        recomputed (host/compute-system-merkle-root manifest)]
+    (println (js/JSON.stringify
+              (clj->js {:ok true
+                        :version full-node-version
+                        :arch (:arch manifest)
+                        :system_merkle_root (:system-merkle-root recomputed)
+                        :subtree_roots (:subtree-roots recomputed)})))))
+
 (defn -main
   "CLI entry point for the Node.js full validator & infrastructure node."
   [& args]
@@ -3161,6 +3215,16 @@
         (when-not (:ok res)
           (.exit js/process 1)))
 
+      (some #{"--check-pointer"} argv)
+      (let [idx (.indexOf argv "--check-pointer")
+            ptr-file (when (< (inc idx) (count argv)) (nth argv (inc idx)))]
+        (cmd-check-pointer! ptr-file))
+
+      (some #{"--attest-root"} argv)
+      (let [idx (.indexOf argv "--attest-root")
+            m-file (when (< (inc idx) (count argv)) (nth argv (inc idx)))]
+        (cmd-attest-root! m-file))
+
       (some #{"--version" "-v"} argv)
       (println (js/JSON.stringify #js {:ok true :runtime "nodejs" :version full-node-version}))
 
@@ -3170,7 +3234,7 @@
                      :help true
                      :runtime "nodejs"
                      :version full-node-version
-                     :commands #js ["run" "infra-node" "print-identity" "print-fingerprint" "validate-config" "gen-keypair" "--self-test" "--version" "--help"]}))
+                     :commands #js ["run" "infra-node" "print-identity" "print-fingerprint" "validate-config" "gen-keypair" "--check-pointer" "--attest-root" "--self-test" "--version" "--help"]}))
 
       (= first-arg "run")
       (cmd-run! (second argv))

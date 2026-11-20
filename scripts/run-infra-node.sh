@@ -13,12 +13,29 @@ CONFIG_FILE="${BITECHO_INFRA_CONFIG:-/etc/bitecho-infra/config.edn}"
 NODE_BUNDLE="${BITECHO_NODE_BUNDLE:-/opt/bitecho-infra/bitecho-full-node.cjs}"
 JVM_JAR="${BITECHO_JVM_JAR:-/opt/bitecho-infra/bitecho.jar}"
 JAVA_BIN="${BITECHO_JAVA_BIN:-/opt/jdk-25/bin/java}"
+NETWORK="${BITECHO_NETWORK:-devnet}"
+POINTER_PATH="${BITECHO_POINTER_PATH:-/var/lib/clj-web/config/${NETWORK}/active.edn}"
+LKG_BUNDLE="${NODE_BUNDLE}.lkg"
 RUNTIME="jvm"
 
 if [[ -f "${RUNTIME_ENV}" ]]; then
   # shellcheck disable=SC1090
   source "${RUNTIME_ENV}"
 fi
+
+check_unified_pointer() {
+  local nbin="$1"
+  if [[ -f "${POINTER_PATH}" && -n "${nbin}" && -x "${nbin}" && -s "${NODE_BUNDLE}" ]]; then
+    if ! "${nbin}" "${NODE_BUNDLE}" --check-pointer "${POINTER_PATH}" >/dev/null 2>&1; then
+      echo "{\"event\":\"unified-pointer-verification-failed\",\"pointer\":\"${POINTER_PATH}\",\"action\":\"retain-lkg\"}" >&2
+      if [[ -s "${LKG_BUNDLE}" ]]; then
+        cp -f "${LKG_BUNDLE}" "${NODE_BUNDLE}"
+      fi
+      return 1
+    fi
+  fi
+  return 0
+}
 
 resolve_node_bin() {
   if [[ -n "${NODE_BIN:-}" && -x "${NODE_BIN}" ]]; then
@@ -57,6 +74,8 @@ check_node_preflight() {
 if [[ "${RUNTIME}" == "nodejs" ]]; then
   RESOLVED_NODE="$(resolve_node_bin)"
   if check_node_preflight "${RESOLVED_NODE}"; then
+    check_unified_pointer "${RESOLVED_NODE}" || true
+    # Exit 75 triggers OpenRC supervise-daemon respawn after unified pointer advance (P-HOST-6)
     exec "${RESOLVED_NODE}" "${NODE_BUNDLE}" infra-node "${CONFIG_FILE}"
   else
     echo '{"event":"runtime-fallback","from":"nodejs","to":"jvm"}' >&2
