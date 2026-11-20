@@ -236,16 +236,25 @@
 
 #?(:cljs
    (do
+     (defn- native-js-obj?
+       "True for any non-nil JS object (including native DOM/WebAuthn class instances
+        like PublicKeyCredential and AuthenticatorAssertionResponse where cljs.core/object?
+        returns false because their constructor !== js/Object)."
+       [obj]
+       (and (some? obj)
+            (= "object" (js* "typeof ~{}" obj))
+            (not (map? obj))))
+
      (defn- js-prop
        "Externs-safe property lookup on native WebAuthn / DOM objects under Closure :advanced."
        [obj k]
-       (when (and (some? obj) (object? obj))
+       (when (native-js-obj? obj)
          (gobj/get obj k)))
 
      (defn- js-call-0
        "Externs-safe 0-arg method invocation on native WebAuthn / DOM objects under Closure :advanced."
        [obj method-name]
-       (when (and (some? obj) (object? obj))
+       (when (native-js-obj? obj)
          (when-let [f (gobj/get obj method-name)]
            (when (fn? f)
              (.call f obj)))))))
@@ -260,9 +269,9 @@
         [(instance? js/Uint8Array x) "Uint8Array"
          (and (exists? js/ArrayBuffer) (instance? js/ArrayBuffer x)) "ArrayBuffer"
          (and (exists? js/ArrayBuffer) (.isView js/ArrayBuffer x)) "ArrayBufferView"
-         (object? x) (or (when-let [ctor (gobj/get x "constructor")]
-                           (gobj/get ctor "name"))
-                         "Object")])
+         (native-js-obj? x) (or (when-let [ctor (gobj/get x "constructor")]
+                                  (gobj/get ctor "name"))
+                                "Object")])
     :else (str (type x))))
 
 (defn inspect-assertion-diagnostics
@@ -272,14 +281,14 @@
   (let [resp (cond
                (map? assertion-or-response)
                (or (:response assertion-or-response) (get assertion-or-response "response"))
-               #?@(:cljs [(and (some? assertion-or-response) (object? assertion-or-response))
+               #?@(:cljs [(native-js-obj? assertion-or-response)
                           (js-prop assertion-or-response "response")])
                :else nil)
         cred-id (cond
                   (map? assertion-or-response)
                   (or (:id assertion-or-response) (get assertion-or-response "id")
                       (:raw-id assertion-or-response) (get assertion-or-response "rawId"))
-                  #?@(:cljs [(and (some? assertion-or-response) (object? assertion-or-response))
+                  #?@(:cljs [(native-js-obj? assertion-or-response)
                              (or (js-prop assertion-or-response "id")
                                  (js-prop assertion-or-response "rawId"))])
                   :else nil)

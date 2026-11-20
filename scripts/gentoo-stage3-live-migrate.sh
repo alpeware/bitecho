@@ -145,14 +145,18 @@ prepare_chroot_and_selftest() {
   cp -a /root/.ssh/authorized_keys "${STAGE3_DIR}/root/.ssh/" 2>/dev/null || true
 
   # Mount virtual filesystems inside chroot (fixes BIP-012 F-1: /proc/self/exe for $ORIGIN RUNPATH)
+  # Use --make-rslave so unmounting /gentoo/{sys,dev} never propagates to the host's /sys/fs/cgroup.
   mount --types proc /proc "${STAGE3_DIR}/proc"
   mount --rbind /sys "${STAGE3_DIR}/sys"
+  mount --make-rslave "${STAGE3_DIR}/sys"
   mount --rbind /dev "${STAGE3_DIR}/dev"
+  mount --make-rslave "${STAGE3_DIR}/dev"
   mount --bind /run "${STAGE3_DIR}/run"
+  mount --make-slave "${STAGE3_DIR}/run"
 
   chroot "${STAGE3_DIR}" /bin/sh -c 'env-update && rc-update add dhcpcd default && rc-update add sshd default'
 
-  umount -l "${STAGE3_DIR}/run" "${STAGE3_DIR}/dev" "${STAGE3_DIR}/sys" "${STAGE3_DIR}/proc"
+  umount -R -l "${STAGE3_DIR}/run" "${STAGE3_DIR}/dev" "${STAGE3_DIR}/sys" "${STAGE3_DIR}/proc"
 }
 
 execute_atomic_renameat2_pivot() {

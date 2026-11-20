@@ -318,7 +318,7 @@
         existing-ident (or (when (map? opts-map)
                              (when (map? (:identity opts-map)) (:identity opts-map)))
                            (when (and (map? opts-map) (:public-hex opts-map)) opts-map))
-        prf-out (or (when (and (some? seed-or-opts) (object? seed-or-opts))
+        prf-out (or (when (and (some? seed-or-opts) (= "object" (js* "typeof ~{}" seed-or-opts)) (not (map? seed-or-opts)))
                       (or (gobj/get seed-or-opts "prfOutput")
                           (gobj/get seed-or-opts "prf_output")
                           (gobj/get seed-or-opts "prf-output")
@@ -347,7 +347,7 @@
                           (get-in opts-map [:clientExtensionResults :prf :results :first])
                           (get-in opts-map [:client-extension-results :prf :results :first]))))
         user-handle (or (when raw-bytes? seed-or-opts)
-                        (when (and (some? seed-or-opts) (object? seed-or-opts))
+                        (when (and (some? seed-or-opts) (= "object" (js* "typeof ~{}" seed-or-opts)) (not (map? seed-or-opts)))
                           (or (gobj/get seed-or-opts "userHandle")
                               (gobj/get seed-or-opts "user_handle")
                               (when-let [r (gobj/get seed-or-opts "response")]
@@ -1783,7 +1783,15 @@
              (reject (js/Error. (or (:error err) "credential-creation-failed")))
              (do
                (apply-hardware-identity! res)
-               (resolve (clj->js (redact-for-js res))))))))))))
+               (let [safe (redact-for-js res)
+                       ;; Preserve privacy-safe Stage 1 diagnostic fields that are outside the
+                       ;; IndexedDB persistence allowlist (BIP-010 P-WEB-1, Rule 5).
+                     with-diag (cond-> safe
+                                 (:error res) (assoc :error (:error res))
+                                 (:failure-stage res) (assoc :failure-stage (:failure-stage res))
+                                 (:failure-reason res) (assoc :failure-reason (:failure-reason res))
+                                 (:diagnostics res) (assoc :diagnostics (:diagnostics res)))]
+                 (resolve (clj->js with-diag))))))))))))
 
 (defn get-discoverable-credential
   "Invokes WebAuthn navigator.credentials.get to recover discoverable credential seed. Returns a Promise."
@@ -1800,7 +1808,15 @@
              (reject (js/Error. (or (:error err) "credential-get-failed")))
              (do
                (apply-hardware-identity! res)
-               (resolve (clj->js (redact-for-js res))))))))))))
+               (let [safe (redact-for-js res)
+                       ;; Preserve privacy-safe Stage 1 diagnostic fields that are outside the
+                       ;; IndexedDB persistence allowlist (BIP-010 P-WEB-1, Rule 5).
+                     with-diag (cond-> safe
+                                 (:error res) (assoc :error (:error res))
+                                 (:failure-stage res) (assoc :failure-stage (:failure-stage res))
+                                 (:failure-reason res) (assoc :failure-reason (:failure-reason res))
+                                 (:diagnostics res) (assoc :diagnostics (:diagnostics res)))]
+                 (resolve (clj->js with-diag))))))))))))
 
 ;; =============================================================================
 ;; HTTP Gateway Relay Client Helpers (/relay/v1/*)
