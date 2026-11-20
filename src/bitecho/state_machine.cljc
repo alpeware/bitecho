@@ -787,6 +787,15 @@
       (or (pos? treasury-cutoff) (contains? state :last-pruned-mint-epoch))
       (assoc :last-pruned-mint-epoch next-last-pruned))))
 
+(defn- ensure-set
+  "Coerces nil/sequential values to a Clojure set so `clojure.set/difference` and `disj`
+   never throw `ISet.-disjoin` on nil or list-corrupted collections."
+  [x]
+  (cond
+    (set? x) x
+    (nil? x) #{}
+    :else (set x)))
+
 (defn- prune-expired-tick-state
   "Prunes state message and role entries for epochs older than the TTL cutoff,
    and bounds frozen epoch message and role snapshots to frozen-log-retention-epochs."
@@ -797,7 +806,7 @@
         frozen-cutoff (- new-epoch frozen-retention)
         epoch-to-messages (or (:epoch-to-messages state) {})
         expired-epochs (filterv #(< % cutoff-epoch) (keys epoch-to-messages))
-        expired-from-epoch-map (reduce (fn [acc ep] (set/union acc (get epoch-to-messages ep #{})))
+        expired-from-epoch-map (reduce (fn [acc ep] (set/union acc (ensure-set (get epoch-to-messages ep))))
                                        #{} expired-epochs)
         expired-from-msg-epochs (reduce-kv (fn [acc mid ep]
                                              (if (and (integer? ep) (< (long ep) cutoff-epoch))
@@ -810,15 +819,15 @@
         pruned-epoch-to-roles (reduce dissoc (or (:epoch-to-message-roles state) {}) expired-epochs)
         pruned-epochs (reduce dissoc (or (:message-epochs state) {}) expired-ids)
         pruned-messages (reduce dissoc (:messages state) expired-ids)
-        pruned-known-ids (set/difference (:contagion-known-ids state) expired-ids)
+        pruned-known-ids (set/difference (ensure-set (:contagion-known-ids state)) expired-ids)
         pruned-received-echoes (reduce dissoc (or (:received-echoes state) {}) expired-ids)
         pruned-received-readies (reduce dissoc (or (:received-readies state) {}) expired-ids)
         pruned-echo-vote-counts (reduce dissoc (or (:echo-vote-counts state) {}) expired-ids)
         pruned-ready-vote-counts (reduce dissoc (or (:ready-vote-counts state) {}) expired-ids)
         pruned-delivery-vote-counts (reduce dissoc (or (:delivery-vote-counts state) {}) expired-ids)
-        pruned-sieve-delivered-set (set/difference (:sieve-delivered-set state) expired-ids)
-        pruned-local-ready-set (set/difference (:local-ready-set state) expired-ids)
-        pruned-delivered-set (set/difference (:delivered-set state) expired-ids)
+        pruned-sieve-delivered-set (set/difference (ensure-set (:sieve-delivered-set state)) expired-ids)
+        pruned-local-ready-set (set/difference (ensure-set (:local-ready-set state)) expired-ids)
+        pruned-delivered-set (set/difference (ensure-set (:delivered-set state)) expired-ids)
         expired-frozen-epochs (filterv #(< % frozen-cutoff) (keys (or (:frozen-epoch-messages state) {})))
         pruned-frozen-messages (reduce dissoc (or (:frozen-epoch-messages state) {}) expired-frozen-epochs)
         pruned-frozen-roles (reduce dissoc (or (:frozen-epoch-message-roles state) {}) expired-frozen-epochs)
@@ -919,7 +928,7 @@
         [pruned-expired-gossip pruned-expired-gossip-ord]
         (reduce (fn [[s ord] mid]
                   (fifo-track s ord mid max-tracked))
-                [(or (:expired-gossip-ids state) #{})
+                [(ensure-set (:expired-gossip-ids state))
                  (or (:expired-gossip-order state) [])]
                 (sort expired-ids))
         pruned-pending-receipts (if (seq (:pending-receipts state))
@@ -927,7 +936,7 @@
                                            (:pending-receipts state))
                                   (or (:pending-receipts state) []))
         pruned-murmur-cache (if (and (:murmur-cache state) (seq expired-ids))
-                              {:set (set/difference (or (get-in state [:murmur-cache :set]) #{}) expired-ids)
+                              {:set (set/difference (ensure-set (get-in state [:murmur-cache :set])) expired-ids)
                                :queue (into empty-queue
                                             (remove #(contains? expired-ids %)
                                                     (or (get-in state [:murmur-cache :queue]) [])))}
@@ -1103,8 +1112,8 @@
                            :summary (:summary summary)})
         sampling-res (sample-peer-roles state cfg epoch-entropy new-epoch extracted-peers)
         echo-subs (:echo-subscribers state)
-        pending-echo-ids (set/difference (:contagion-known-ids state)
-                                         (:sieve-delivered-set state))
+        pending-echo-ids (set/difference (ensure-set (:contagion-known-ids state))
+                                         (ensure-set (:sieve-delivered-set state)))
         echo-ae-commands (when (seq echo-subs)
                            (mapv (fn [mid]
                                    (attach-control-frame-signature
@@ -1569,7 +1578,7 @@
                   :message-id message-id}
                  :contagion-ready
                  message-id))]
-      {:state (update state :local-ready-set conj message-id)
+      {:state (update state :local-ready-set (fnil conj #{}) message-id)
        :commands (filterv some? [cmd])})
     {:state state :commands []}))
 
@@ -1604,7 +1613,7 @@
                                     (assoc-in [:epoch-to-message-roles current-epoch message-id] :echo))]
             (if (and (>= new-count E-hat)
                      (not (contains? sieve-delivered-set message-id)))
-              (let [state-sieve-delivered (update state-with-echo :sieve-delivered-set conj message-id)]
+              (let [state-sieve-delivered (update state-with-echo :sieve-delivered-set (fnil conj #{}) message-id)]
                 (transition-to-ready state-sieve-delivered message-id))
               {:state state-with-echo :commands []}))
           {:state state :commands []})))))
@@ -2413,7 +2422,7 @@
   [state message-id delivery-votes D-hat]
   (if (and (>= delivery-votes D-hat)
            (not (contains? (:delivered-set state) message-id)))
-    (let [state-delivered (update state :delivered-set conj message-id)
+    (let [state-delivered (update state :delivered-set (fnil conj #{}) message-id)
           message (get (:messages state) message-id)]
       (if message
         (handle-event state-delivered

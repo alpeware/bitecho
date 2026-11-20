@@ -522,3 +522,54 @@
       (is (= 50734898 (:balance (get-in restored [:ledger "k1"]))))
       (is (= 13 (:seq (get-in restored [:ledger "k1"]))))
       (is (= 51954 (:epoch (get-in restored [:blocks "b1"])))))))
+
+(deftest s-d39-10-ephemeral-sets-reinitialized-and-list-healed-on-restore-and-tick-test
+  (testing "S-D39-10: strip+restore re-initializes ephemeral Bracha/Sieve sets/maps and heals list-corrupted sets across :tick"
+    (let [state0 {:epoch 52180
+                  :config {:gossip-ttl-epochs 10
+                           :frozen-log-retention-epochs 168
+                           :max-tracked-receipts 10000
+                           :max-escrow-horizon 168}
+                  :sieve-delivered-set #{"m1"}
+                  :local-ready-set #{"m1"}
+                  :delivered-set #{"m1"}
+                  :received-readies {"m1" #{"p1"}}
+                  :received-echoes {"m1" #{"p1"}}
+                  :echo-vote-counts {"m1" 1}
+                  :ready-vote-counts {"m1" 1}
+                  :delivery-vote-counts {"m1" 1}
+                  :expired-gossip-ids #{"old-1"}
+                  :expired-gossip-order ["old-1"]
+                  :epoch-to-messages {52160 #{"deaf6ded"}}
+                  :message-epochs {"deaf6ded" 52160}
+                  :contagion-known-ids #{"deaf6ded"}
+                  :murmur-cache {:set #{"deaf6ded"} :queue ["deaf6ded"]}}
+          stripped (core-mesh/strip-unserializable-state state0)
+          restored (core-mesh/restore-unserializable-state stripped)]
+      ;; All ephemeral sets/maps stripped on save MUST be re-initialized as empty sets/maps (never nil!)
+      (is (set? (:sieve-delivered-set restored)))
+      (is (set? (:local-ready-set restored)))
+      (is (set? (:delivered-set restored)))
+      (is (set? (:expired-gossip-ids restored)))
+      (is (map? (:received-readies restored)))
+      (is (map? (:received-echoes restored)))
+      (is (map? (:echo-vote-counts restored)))
+      (is (map? (:ready-vote-counts restored)))
+      (is (map? (:delivery-vote-counts restored)))
+      ;; Conj onto restored ephemeral sets MUST produce sets, never lists
+      (is (set? (conj (:sieve-delivered-set restored) "deaf6ded")))
+      (is (set? (conj (:local-ready-set restored) "deaf6ded")))
+      (is (set? (conj (:delivered-set restored) "deaf6ded")))
+      ;; Even if a corrupted snapshot had lists in set-typed keys, restore heals them to sets
+      (let [corrupted (assoc restored
+                             :sieve-delivered-set (list "deaf6ded")
+                             :local-ready-set (list "deaf6ded")
+                             :delivered-set (list "deaf6ded")
+                             :expired-gossip-ids (list "old-1")
+                             :epoch-to-messages {52160 (list "deaf6ded")})
+            healed (core-mesh/restore-unserializable-state corrupted)]
+        (is (set? (:sieve-delivered-set healed)))
+        (is (set? (:local-ready-set healed)))
+        (is (set? (:delivered-set healed)))
+        (is (set? (:expired-gossip-ids healed)))
+        (is (set? (get-in healed [:epoch-to-messages 52160])))))))

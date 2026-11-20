@@ -230,6 +230,7 @@
    :sieve-delivered-set
    :local-ready-set
    :delivered-set
+   :expired-gossip-ids
    :settled-transcript-pairs
    :settled-voucher-tuples])
 
@@ -287,7 +288,47 @@
               (assoc :known-receipt-ids (set (:known-receipt-order s)))
 
               (and (not (contains? s :executed-receipt-ids)) (coll? (:executed-receipt-order s)))
-              (assoc :executed-receipt-ids (set (:executed-receipt-order s))))
+              (assoc :executed-receipt-ids (set (:executed-receipt-order s)))
+
+              ;; Re-initialize ephemeral Bracha/Sieve sets & maps stripped by `strip-unserializable-state`
+              ;; so `(update state :sieve-delivered-set conj id)` never produces a list `(id)` from `nil`.
+              (not (set? (:local-ready-set s)))
+              (assoc :local-ready-set (if (coll? (:local-ready-set s)) (set (:local-ready-set s)) #{}))
+
+              (not (set? (:sieve-delivered-set s)))
+              (assoc :sieve-delivered-set (if (coll? (:sieve-delivered-set s)) (set (:sieve-delivered-set s)) #{}))
+
+              (not (set? (:delivered-set s)))
+              (assoc :delivered-set (if (coll? (:delivered-set s)) (set (:delivered-set s)) #{}))
+
+              (not (map? (:received-readies s)))
+              (assoc :received-readies {})
+
+              (not (map? (:received-echoes s)))
+              (assoc :received-echoes {})
+
+              (not (map? (:echo-vote-counts s)))
+              (assoc :echo-vote-counts {})
+
+              (not (map? (:ready-vote-counts s)))
+              (assoc :ready-vote-counts {})
+
+              (not (map? (:delivery-vote-counts s)))
+              (assoc :delivery-vote-counts {})
+
+              (map? (:epoch-to-messages s))
+              (update :epoch-to-messages
+                      #(reduce-kv (fn [acc ep mids]
+                                    (assoc acc ep (cond (set? mids) mids (coll? mids) (set mids) :else #{})))
+                                  {}
+                                  %))
+
+              (map? (:frozen-epoch-messages s))
+              (update :frozen-epoch-messages
+                      #(reduce-kv (fn [acc ep mids]
+                                    (assoc acc ep (cond (set? mids) mids (coll? mids) (set mids) :else #{})))
+                                  {}
+                                  %)))
           empty-q #?(:clj clojure.lang.PersistentQueue/EMPTY :cljs #queue [])]
       (cond-> s
         (get-in s [:murmur-cache :queue])
