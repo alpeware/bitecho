@@ -5,6 +5,7 @@
    - P-ASYNC-3: JVM Zero-Sync-IO parity (persistence, mesh, infra, light-node)
    - P-ASYNC-4: Browser WebRTC ICE & connection-state diagnostics (shell/browser.cljc, browser_main.cljs)"
   (:require [bitecho.core.mesh :as core-mesh]
+            [bitecho.economy.account :as account]
             [bitecho.shell.browser :as browser]
             [bitecho.shell.persistence :as persistence]
             [bitecho.snapshot.core :as snap]
@@ -503,3 +504,21 @@
       (is (not (contains? kept-ids "stale-edge")))
       (is (contains? kept-ids "fresh-1"))
       (is (contains? kept-ids "no-epoch")))))
+
+(deftest s-d39-9-record-serialization-and-tagged-record-recovery-test
+  (testing "S-D39-9: strip-unserializable-state converts defrecords in :ledger/:blocks to plain maps without deep-walking bulk strings, and restore-unserializable-state unwraps legacy TaggedObject record maps losslessly"
+    (let [acct (account/map->AccountState {:balance 50734898 :seq 13 :deps ["d1"]})
+          blk (streamlet/->Block 51954 "parent" [] "pub")
+          stripped (core-mesh/strip-unserializable-state {:ledger {"k1" acct} :blocks {"b1" blk}})
+          ;; Simulate a TaggedObject record map from an unnormalized Fressian snapshot
+          tagged-state {:ledger {"k1" {:tag "record" :value ["AccountState" {:balance 50734898 :seq 13 :deps ["d1"]}]}}
+                        :blocks {"b1" {:tag "record" :value ["Block" {:epoch 51954 :parent-hash "parent" :payload [] :proposer "pub"}]}}}
+          restored (core-mesh/restore-unserializable-state tagged-state)]
+      (is (not (record? (get-in stripped [:ledger "k1"]))))
+      (is (= 50734898 (get-in stripped [:ledger "k1" :balance])))
+      (is (not (record? (get-in stripped [:blocks "b1"]))))
+      (is (= 51954 (get-in stripped [:blocks "b1" :epoch])))
+      ;; TaggedObject record maps unwrap losslessly back to real AccountState/Block records
+      (is (= 50734898 (:balance (get-in restored [:ledger "k1"]))))
+      (is (= 13 (:seq (get-in restored [:ledger "k1"]))))
+      (is (= 51954 (:epoch (get-in restored [:blocks "b1"])))))))

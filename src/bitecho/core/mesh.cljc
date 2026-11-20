@@ -145,12 +145,54 @@
                m
                m)))
 
+(defn- record->plain-map
+  [x]
+  (if (record? x) (into {} x) x))
+
+(defn- normalize-record-bearing-keys
+  "Converts domain defrecords in the small record-bearing snapshot collections to plain maps
+   in O(records) (~200 entries) so `fressian/write-standard-fressian` writes plain maps directly
+   without needing a full 12MB `normalize-for-wire` deep-walk."
+  [m]
+  (cond-> m
+    (map? (:ledger m))
+    (update :ledger #(reduce-kv (fn [acc k v] (assoc acc k (record->plain-map v))) {} %))
+
+    (map? (:genesis-ledger m))
+    (update :genesis-ledger #(reduce-kv (fn [acc k v] (assoc acc k (record->plain-map v))) {} %))
+
+    (map? (:blocks m))
+    (update :blocks #(reduce-kv (fn [acc k v] (assoc acc k (record->plain-map v))) {} %))
+
+    (map? (:block-vote-proofs m))
+    (update :block-vote-proofs
+            #(reduce-kv (fn [acc bh vm]
+                          (assoc acc bh
+                                 (if (map? vm)
+                                   (reduce-kv (fn [a vk vv] (assoc a vk (record->plain-map vv))) {} vm)
+                                   vm)))
+                        {}
+                        %))
+
+    (sequential? (:basalt-view m))
+    (update :basalt-view
+            #(mapv (fn [slot]
+                     (cond
+                       (record? slot) (into {} slot)
+                       (and (map? slot) (record? (:peer slot))) (update slot :peer (fn [p] (into {} p)))
+                       :else slot))
+                   %))
+
+    (set? (:basalt-view m))
+    (update :basalt-view #(into #{} (map record->plain-map) %))))
+
 (defn strip-unserializable-state
   "Transforms the pure state map into a compact, serializable format without deep-walking
    10,000+ pure receipt/block entries (`D39` V8 hot-path fix).
    Strips private key material, nested PRNG/channel instances, duplicate derived sets
    (`:known-receipt-ids`, `:executed-receipt-ids` — reconstructed from `*-order` on load),
-   ephemeral Bracha/Sieve gossip caches, and converts `:murmur-cache :queue` into a vector."
+   ephemeral Bracha/Sieve gossip caches, converts domain defrecords to plain maps,
+   and converts `:murmur-cache :queue` into a vector."
   [state]
   (if-not (map? state)
     state
@@ -163,7 +205,9 @@
                      ephemeral-snapshot-keys)
               (cond-> (map? (:config queue-handled))
                 (update :config dissoc :keypair :keys :node-private-key :treasury-privkey :custody-privkey)))]
-      (scrub-top-level-unserializable secrets-and-ephemeral-stripped))))
+      (-> secrets-and-ephemeral-stripped
+          scrub-top-level-unserializable
+          normalize-record-bearing-keys))))
 
 (def set-typed-state-keys
   "Root state keys that must be reconstituted as Clojure sets after Fressian deserialization."
@@ -189,27 +233,39 @@
    :settled-transcript-pairs
    :settled-voucher-tuples])
 
+(defn- unwrap-tagged-record
+  "Unwraps Fressian TaggedObject `\"record\"` maps `{:tag \"record\" :value [ctor fields-map]}`
+   back into their underlying fields map for lossless recovery."
+  [v]
+  (if (and (map? v) (= "record" (:tag v)) (sequential? (:value v)) (map? (second (:value v))))
+    (recur (second (:value v)))
+    v))
+
 (defn- restore-basalt-view
   [bv]
   (cond
     (set? bv)
     (into #{}
-          (map (fn [item]
-                 (if (and (map? item) (not (record? item)) (or (contains? item :ip) (contains? item :id)) (contains? item :pubkey))
-                   (basalt/map->Peer item)
-                   item))
+          (map (fn [raw-item]
+                 (let [item (unwrap-tagged-record raw-item)]
+                   (if (and (map? item) (not (record? item)) (or (contains? item :ip) (contains? item :id)) (contains? item :pubkey))
+                     (basalt/map->Peer item)
+                     item)))
                bv))
 
     (sequential? bv)
-    (mapv (fn [slot]
-            (cond
-              (and (map? slot) (map? (:peer slot)))
-              (update slot :peer #(if (record? %) % (basalt/map->Peer %)))
+    (mapv (fn [raw-slot]
+            (let [slot (unwrap-tagged-record raw-slot)]
+              (cond
+                (and (map? slot) (map? (:peer slot)))
+                (update slot :peer (fn [p]
+                                     (let [p' (unwrap-tagged-record p)]
+                                       (if (record? p') p' (basalt/map->Peer p')))))
 
-              (and (map? slot) (not (record? slot)) (or (contains? slot :ip) (contains? slot :id)) (contains? slot :pubkey))
-              (basalt/map->Peer slot)
+                (and (map? slot) (not (record? slot)) (or (contains? slot :ip) (contains? slot :id)) (contains? slot :pubkey))
+                (basalt/map->Peer slot)
 
-              :else slot))
+                :else slot)))
           bv)
 
     :else bv))
@@ -246,23 +302,25 @@
         (map? (:ledger s))
         (update :ledger
                 #(into {}
-                       (map (fn [[k v]]
-                              [k (if (map? v)
-                                   (account/map->AccountState
-                                    (cond-> v
-                                      (contains? v :deps) (update :deps vec)))
-                                   v)])
+                       (map (fn [[k raw-v]]
+                              (let [v (unwrap-tagged-record raw-v)]
+                                [k (if (map? v)
+                                     (account/map->AccountState
+                                      (cond-> v
+                                        (contains? v :deps) (update :deps vec)))
+                                     v)]))
                             %)))
 
         (map? (:blocks s))
         (update :blocks
                 #(into {}
-                       (map (fn [[k v]]
-                              [k (if (map? v)
-                                   (streamlet/map->Block
-                                    (cond-> v
-                                      (contains? v :txs) (update :txs vec)))
-                                   v)])
+                       (map (fn [[k raw-v]]
+                              (let [v (unwrap-tagged-record raw-v)]
+                                [k (if (map? v)
+                                     (streamlet/map->Block
+                                      (cond-> v
+                                        (contains? v :txs) (update :txs vec)))
+                                     v)]))
                             %)))
 
         (map? (:block-votes s))
@@ -278,10 +336,11 @@
                        (map (fn [[bhash voter-map]]
                               [bhash (if (map? voter-map)
                                        (into {}
-                                             (map (fn [[voter v]]
-                                                    [voter (if (map? v)
-                                                             (streamlet/map->Vote v)
-                                                             v)])
+                                             (map (fn [[voter raw-v]]
+                                                    (let [v (unwrap-tagged-record raw-v)]
+                                                      [voter (if (map? v)
+                                                               (streamlet/map->Vote v)
+                                                               v)]))
                                                   voter-map))
                                        voter-map)])
                             %)))
