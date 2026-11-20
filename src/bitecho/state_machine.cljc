@@ -2378,11 +2378,18 @@
                                       (fn [m]
                                         (into {} (filter (fn [[ep _]] (>= (long ep) (- closing-ep 65))) m))))
              exec-rids (or (:executed-receipt-ids st-pruned-epochs) #{})
+             keep-pending-receipt? (fn [r]
+                                     (let [rid (:receipt-id r)
+                                           r-ep (:epoch r)
+                                           stale? (and (integer? r-ep)
+                                                       (> (- (long closing-ep) (long r-ep)) max-receipt-age-epochs))]
+                                       (and (not (contains? exec-rids rid))
+                                            (not stale?))))
              st-clean (assoc st-pruned-epochs
-                             :pending-receipts (filterv #(not (contains? exec-rids (:receipt-id %)))
+                             :pending-receipts (filterv keep-pending-receipt?
                                                         (or (:pending-receipts st-pruned-epochs) []))
                              :mempool (filterv #(if (and (map? %) (:receipt-id %))
-                                                  (not (contains? exec-rids (:receipt-id %)))
+                                                  (keep-pending-receipt? %)
                                                   true)
                                                (or (:mempool st-pruned-epochs) [])))
              st-advanced (if (> b-epoch last-exec)

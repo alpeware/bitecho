@@ -485,3 +485,21 @@
       (is (<= strip-ms 50.0) (str "strip-unserializable-state blew 50ms budget: " strip-ms "ms"))
       (is (pos? (count kept)))
       (is (<= trunc-ms 50.0) (str "truncate-ancestors-to-wire-budget blew 50ms budget: " trunc-ms "ms")))))
+
+(deftest s-d39-8-stale-pending-receipt-eviction-test
+  (testing "S-D39-8: rebind-restored-state evicts expired/stale pending-receipts older than 64 epochs while preserving fresh receipts"
+    (let [loaded {:epoch 51920
+                  :last-executed-finalized-epoch 51918
+                  :executed-receipt-ids #{"exec-1"}
+                  :pending-receipts [{:receipt-id "exec-1" :epoch 51915}
+                                     {:receipt-id "stale-old" :epoch 34329}
+                                     {:receipt-id "stale-edge" :epoch 51800}
+                                     {:receipt-id "fresh-1" :epoch 51910}
+                                     {:receipt-id "no-epoch" :type :burn}]}
+          rebound (core-mesh/rebind-restored-state loaded {:node/id :node1} {:pubkey-hex "aa" :privkey-bytes (byte-array 32)})
+          kept-ids (set (map :receipt-id (:pending-receipts rebound)))]
+      (is (not (contains? kept-ids "exec-1")))
+      (is (not (contains? kept-ids "stale-old")))
+      (is (not (contains? kept-ids "stale-edge")))
+      (is (contains? kept-ids "fresh-1"))
+      (is (contains? kept-ids "no-epoch")))))

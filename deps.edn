@@ -3,7 +3,7 @@
         org.clojure/core.async {:mvn/version "1.9.829-alpha2"}
         org.clojure/data.json {:mvn/version "2.5.1"}
         alpeware/clj-fressian {:git/url "https://bitecho.org/git/clj-fressian.git"
-                               :git/sha "4c56c12c8f94efed4324c8f0a4ed340337bdbc54"}
+                               :git/sha "64caf46ed1e6957b9d3e7488f7acedeaa93c9878"}
         alpeware/clj-datachannel {:local/root "../clj-datachannel"}
         org.babashka/sci {:mvn/version "0.8.41"}}
  :aliases {:run {:jvm-opts ["--enable-native-access=ALL-UNNAMED"

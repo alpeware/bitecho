@@ -970,8 +970,16 @@
                                   (cond-> peer-entries
                                     pubkey-bytes (conj [pubkey-hex pubkey-bytes])))
         exec-receipt-ids (or (:executed-receipt-ids loaded-state) #{})
+        curr-ep (long (max (or (:epoch loaded-state) 0)
+                           (or (:last-executed-finalized-epoch loaded-state) 0)))
         cleaned-pending-receipts (if (seq (:pending-receipts loaded-state))
-                                   (filterv #(not (contains? exec-receipt-ids (:receipt-id %)))
+                                   (filterv (fn [r]
+                                              (let [r-ep (:epoch r)
+                                                    stale? (and (integer? r-ep)
+                                                                (pos? curr-ep)
+                                                                (> (- curr-ep (long r-ep)) 64))]
+                                                (and (not (contains? exec-receipt-ids (:receipt-id r)))
+                                                     (not stale?))))
                                             (:pending-receipts loaded-state))
                                    (or (:pending-receipts loaded-state) []))
         explicit-network (or (:network config) (get-in config [:cluster :network]))
