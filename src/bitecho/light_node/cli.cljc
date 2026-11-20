@@ -205,7 +205,8 @@
    "--wait-open-ms" "--block" "--until-event" "--help" "--mcp"
    "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
    "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"
-   "--nickname" "--name" "--domain"])
+   "--nickname" "--name" "--domain"
+   "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)

@@ -1662,7 +1662,13 @@
                   [st2 [diag obs-eff]])
                 (let [cmp (if (str/blank? target-ver)
                             (if (and target-cid (not= target-cid (:current-cid state))) 1 0)
-                            (compare-semver target-ver (:current-version state)))]
+                            (let [v-cmp (compare-semver target-ver (:current-version state))]
+                              (if (and (zero? v-cmp)
+                                       target-cid
+                                       (:current-cid state)
+                                       (not= target-cid (:current-cid state)))
+                                1
+                                v-cmp)))]
                   (if (<= cmp 0)
                     (let [diag {:effect :diagnose
                                 :type :diagnose
