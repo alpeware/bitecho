@@ -6,6 +6,7 @@
    plus all 9 deterministic proof scenarios (`S-D38-1` through `S-D38-9`) and Rule 6 co-commit audit."
   (:require [bitecho.basalt.core :as basalt]
             [bitecho.config :as config]
+            [bitecho.core.infra :as core-infra]
             [bitecho.crypto :as crypto]
             [bitecho.defense.core :as defense]
             [bitecho.deploy.core :as deploy]
@@ -756,3 +757,66 @@
       (is (some #(= :quorum-epoch-catchup (:reason %)) (:commands r2)))
       (is (some #(= :send-vote (:type %)) (:commands r2)))
       (is (str/includes? full-node-src ":accounts (into (sorted-map)")))))
+
+(defspec prop-snapshot-persist-throttle-invariant
+  "D38.1: Synchronous Fressian snapshot persistence strictly respects min-interval-ms unless force? or first save."
+  50
+  (prop/for-all [last-saved (gen/choose 0 200000)
+                 delta (gen/choose 0 120000)
+                 force? gen/boolean
+                 fin-adv? gen/boolean]
+                (let [min-ms 60000
+                      now-ms (+ last-saved delta)
+                      res (obs/should-persist-validator-snapshot?
+                           {:force? force?
+                            :last-saved-ms last-saved
+                            :now-ms now-ms
+                            :min-interval-ms min-ms
+                            :fin-advanced? fin-adv?})]
+                  (cond
+                    force? (true? res)
+                    (<= last-saved 0) (true? res)
+                    (< delta min-ms) (false? res)
+                    :else (true? res)))))
+
+(defspec prop-prepare-telemetry-publication-privacy-and-size-invariant
+  "D38.1: Telemetry publication payloads strip raw IPs, stay <= 16 KiB, and target telemetry/<node-id>/digest.edn."
+  40
+  (prop/for-all [nid (gen/elements ["ns1" "ns2" "ns3" "node1" "node2" "node3" "lab/weird node"])
+                 head-ep (gen/choose 0 100000)
+                 fin-ep (gen/choose 0 100000)
+                 uptime-ms (gen/choose 0 100000000)
+                 raw-ip (gen/elements ["198.51.100.42" "203.0.113.7" "10.0.0.1"])]
+                (let [pub (obs/prepare-telemetry-publication
+                           {:node-id nid
+                            :uptime-ms uptime-ms
+                            :head-epoch head-ep
+                            :finalized-epoch fin-ep
+                            :runtime-summary {:rss-bytes 250000000 :heap-used-bytes 180000000 :client-ip raw-ip}
+                            :service-counters {:poll-count 42 :remote-addr raw-ip}
+                            :defense-counters {:dropped 0 :source-ip raw-ip}})
+                      edn-str (:edn-str pub)]
+                  (and (str/starts-with? (:path pub) "telemetry/")
+                       (str/ends-with? (:path pub) "/digest.edn")
+                       (= "bitecho.org/observability" (:subnet pub))
+                       (<= (:byte-size pub) obs/default-network-digest-max-bytes)
+                       (= head-ep (get-in pub [:digest :head-epoch]))
+                       (= fin-ep (get-in pub [:digest :finalized-epoch]))
+                       (not (str/includes? edn-str raw-ip))))))
+
+(deftest s-d38-12-telemetry-publication-and-snapshot-throttle-test
+  (testing "S-D38-12 (D38.1): telemetry/* ACL includes infra anchors + node1..node3 validators, upgrades cleanly, and full_node_main wires both snapshot throttle & telemetry publisher"
+    (let [anchor-pk "302a300506032b6570032100cd5be4b2c2f08ac78178db2e8f7d57ea3e01b09373a18a15c17f64294033ce3a"
+          def-pol (core-infra/default-infra-policy {:trust-anchors #{anchor-pk}})
+          old-pol (update def-pol :subnet/path-acl #(vec (remove (fn [r] (= "telemetry/*" (:pattern r))) %)))
+          merged (core-infra/merge-upgraded-policy def-pol old-pol)
+          tel-rule (first (filter #(= "telemetry/*" (:pattern %)) (:subnet/path-acl merged)))
+          signers (get-in tel-rule [:principal :signers])
+          full-node-src (slurp "src/bitecho/full_node_main.cljs")]
+      (is (some? tel-rule))
+      (is (contains? signers anchor-pk))
+      (is (contains? signers core-infra/k-node1-validator-pubkey))
+      (is (contains? signers core-infra/k-node2-validator-pubkey))
+      (is (contains? signers core-infra/k-node3-validator-pubkey))
+      (is (str/includes? full-node-src "obs/should-persist-validator-snapshot?"))
+      (is (str/includes? full-node-src "obs/prepare-telemetry-publication")))))

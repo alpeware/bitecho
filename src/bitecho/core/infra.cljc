@@ -161,6 +161,18 @@
   "Tier-1 Vector Agent Key (K_vector) for web/*, blog/*, bip/*, and bitecho.org/dev governance streams."
   "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62")
 
+(def k-node1-validator-pubkey
+  "Devnet validator node1 Ed25519 pubkey authorized for telemetry/node1/* observability digests."
+  "302a300506032b6570032100d869c1cc916523907f9c4a44b6c9963daf430a08d9d15567b017b6599f87e086")
+
+(def k-node2-validator-pubkey
+  "Devnet validator node2 Ed25519 pubkey authorized for telemetry/node2/* observability digests."
+  "302a300506032b6570032100592ab794dea07da278ef3853e8cc2d2f6ac5e3417eac80d93ab01e1fc61653ba")
+
+(def k-node3-validator-pubkey
+  "Devnet validator node3 Ed25519 pubkey authorized for telemetry/node3/* observability digests."
+  "302a300506032b65700321007b7f58652a2c26b4180aeee45ff12f927a45d92e00fc3462c5d854f6203351f1")
+
 (defn default-infra-policy
   "Constructs the canonical `\"bitecho.org/infra\"` Subnet policy map."
   [{:keys [subnet-id trust-anchors cold-pubkey domain-pubkey threshold acme-thumbprint denied-cids]}]
@@ -180,6 +192,10 @@
         releases-signers (into anchors dist-signers)
         pkg-signers (into dist-signers [k-axiom])
         doc-blog-signers (into anchors (into pkg-signers [k-lumen k-vector]))
+        telemetry-signers (into doc-blog-signers
+                                [(str/lower-case (str/trim k-node1-validator-pubkey))
+                                 (str/lower-case (str/trim k-node2-validator-pubkey))
+                                 (str/lower-case (str/trim k-node3-validator-pubkey))])
         thresh (long (or threshold (max 1 (min 2 (count anchors)))))
         gov (cond-> {:governance/type (if cold-pk :cold-key-or-quorum :quorum)
                      :threshold thresh}
@@ -214,6 +230,7 @@
                                         {:pattern "sla/*"            :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "deploy/*"         :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "research/*"       :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "telemetry/*"      :principal {:type :allowlist :signers telemetry-signers}}
                                         {:pattern "web/app/*"        :principal {:type :allowlist :signers releases-signers}}
                                         {:pattern "web/*"            :principal {:type :allowlist}}
                                         {:pattern "bootstrap"        :principal {:type :allowlist}}

@@ -586,3 +586,32 @@
      :unexplained-restarts unexplained
      :head-epoch-max head-max
      :finalized-epoch-max fin-max}))
+
+(defn should-persist-validator-snapshot?
+  "Pure throttle decision for synchronous Fressian validator snapshot persistence on single-threaded
+   shells (`D38.1`). Always returns true when `force?` is true (graceful shutdown) or on first save
+   (`last-saved-ms <= 0`). Otherwise strictly enforces `min-interval-ms` (default 60s) even when
+   `finalized-epoch` advances every 10s tick, preventing 12MB synchronous serialization storms."
+  [{:keys [force? last-saved-ms now-ms min-interval-ms]}]
+  (let [last-ms (long (or last-saved-ms 0))
+        curr-ms (long (or now-ms 0))
+        min-ms (max 1000 (long (or min-interval-ms 60000)))]
+    (or (boolean force?)
+        (<= last-ms 0)
+        (>= (- curr-ms last-ms) min-ms))))
+
+(defn prepare-telemetry-publication
+  "Pure P-OBS-4 publication builder: constructs a privacy-preserving `bitecho-telemetry-digest-v1`
+   EDN payload (<= 16 KiB, zero raw IPs) along with its canonical `telemetry/<node-id>/digest.edn`
+   path and UTF-8 bytes ready for Blob+Pointer publication."
+  [opts]
+  (let [digest (build-telemetry-digest opts)
+        paths (observability-paths (:node-id digest))
+        edn-str (pr-str digest)
+        edn-bytes (fressian/utf8->bytes edn-str)]
+    {:subnet (:subnet paths)
+     :path (:digest-path paths)
+     :digest digest
+     :edn-str edn-str
+     :edn-bytes edn-bytes
+     :byte-size (fressian/count-bytes edn-bytes)}))

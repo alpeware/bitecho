@@ -1827,9 +1827,9 @@
 (defn- save-validator-state-to-disk!
   "Serializes validator state map using standard Fressian (`core-mesh/encode-snapshot-bytes`)
    and atomically writes it to `filepath` with 0600 permissions.
-   Throttles full 11MB Fressian disk writes on Node.js single-threaded event loop to at most
-   once every 60 seconds (or when `:last-executed-finalized-epoch` advances or `force?` is true),
-   preventing event-loop starvation during 10s ticks."
+   Strictly throttles full 12MB Fressian disk writes on Node.js single-threaded event loop via
+   `obs/should-persist-validator-snapshot?` (at most once every 60s, or on `force?` shutdown),
+   preventing event-loop starvation during 10s ticks even when `finalized_epoch` advances."
   ([filepath state]
    (save-validator-state-to-disk! filepath state false))
   ([filepath state force?]
@@ -1839,14 +1839,13 @@
              now-ms (.now js/Date)
              prev-entry (get @last-saved-snapshots path-key)
              last-saved-ms (long (or (:saved-at-ms prev-entry) 0))
-             prev-fin-ep (long (or (:finalized-epoch prev-entry) -1))
              curr-fin-ep (long (or (:last-executed-finalized-epoch state) 0))
-             fin-advanced? (> curr-fin-ep prev-fin-ep)
-             elapsed-ms (- now-ms last-saved-ms)]
-         (if (and (not force?)
-                  (not fin-advanced?)
-                  (pos? last-saved-ms)
-                  (< elapsed-ms 60000))
+             should-save? (obs/should-persist-validator-snapshot?
+                           {:force? force?
+                            :last-saved-ms last-saved-ms
+                            :now-ms now-ms
+                            :min-interval-ms 60000})]
+         (if-not should-save?
            (do
              (swap! last-saved-snapshots update-in [path-key :skipped-clean] (fnil inc 0))
              true)
@@ -2421,6 +2420,107 @@
                      (on-ready srv bound-port)))))
       srv)))
 
+(defn- post-https-artifact!
+  "Best-effort HTTPS POST to an infra node `/artifact/v1/*` endpoint with bounded timeout and
+   counted `:diagnose` on failure (`Rule 5`)."
+  [hostname path content-type body-buf on-done]
+  (try
+    (let [req (.request node-https
+                        #js {:hostname hostname
+                             :port 443
+                             :path path
+                             :method "POST"
+                             :timeout 5000
+                             :headers #js {"Content-Type" content-type
+                                           "Content-Length" (.-length body-buf)}}
+                        (fn [res]
+                          (.resume res)
+                          (let [sc (.-statusCode res)]
+                            (on-done (and (>= sc 200) (< sc 300)) sc))))]
+      (.on req "error" (fn [e] (on-done false (.-message e))))
+      (.on req "timeout" (fn [] (.destroy req)))
+      (.end req body-buf))
+    (catch :default e
+      (on-done false (.-message e)))))
+
+(defn- start-validator-telemetry-publisher!
+  "P-OBS-4 / D38.1: Periodically publishes signed privacy-preserving `telemetry/<node-id>/digest.edn`
+   blobs & pointers from standalone validator nodes (`node1..node3`) to the infra artifact plane."
+  [node-id identity state-atom peer-conns]
+  (let [started-ms (.now js/Date)
+        nid (if (keyword? node-id) (name node-id) (str node-id))
+        auth-pub (:pubkey-hex identity)
+        auth-priv (:privkey-bytes identity)
+        targets ["ns1.bitecho.org" "ns2.bitecho.org" "ns3.bitecho.org"]
+        seq-atom (atom 0)
+        publish-once!
+        (fn []
+          (when (and auth-pub auth-priv)
+            (try
+              (let [now-ms (.now js/Date)
+                    st @state-atom
+                    mem (.memoryUsage js/process)
+                    head-ep (long (or (:epoch st) 0))
+                    fin-ep (long (or (:last-executed-finalized-epoch st) 0))
+                    peers-up (count (filter (fn [[_ v]] (= :open (:phase v))) @peer-conns))
+                    pub (obs/prepare-telemetry-publication
+                         {:node-id nid
+                          :uptime-ms (max 0 (- now-ms started-ms))
+                          :head-epoch head-ep
+                          :finalized-epoch fin-ep
+                          :runtime-summary {:rss-bytes (.-rss mem)
+                                            :heap-used-bytes (.-heapUsed mem)
+                                            :heap-total-bytes (.-heapTotal mem)
+                                            :runtime "nodejs"}
+                          :service-counters {:peers-connected peers-up
+                                             :pending-receipts (count (:pending-receipts st))
+                                             :failed-receipts (long (or (:failed-receipts-count st) 0))
+                                             :notarized-count (+ (count (:notarized-blocks st))
+                                                                 (long (or (:pruned-notarized-count st) 0)))
+                                             :finalized-count (+ (count (:finalized-blocks st))
+                                                                 (long (or (:pruned-finalized-count st) 0)))}
+                          :defense-counters {:conn-dropped (long (or (:conn-dropped st) 0))
+                                             :conn-stale (long (or (:conn-stale st) 0))}})
+                    blob (data/make-blob (:edn-bytes pub) "application/edn")
+                    next-seq (swap! seq-atom (fn [prev] (max (inc (long prev)) (quot now-ms 1000))))
+                    ptr (data/sign-pointer auth-priv
+                                           {:pointer/authority auth-pub
+                                            :pointer/subnet "bitecho.org/infra"
+                                            :pointer/path (:path pub)
+                                            :pointer/seq next-seq
+                                            :pointer/target (:blob/cid blob)
+                                            :pointer/proof {:proof/type :self}})
+                    blob-buf (u8->buf (:blob/bytes blob))
+                    ptr-buf (.from js/Buffer (pr-str ptr) "utf8")
+                    try-host! (fn try-host! [idx]
+                                (if (>= idx (count targets))
+                                  (log-diagnostic! {:effect :diagnose
+                                                    :reason :telemetry-digest-publish-failed
+                                                    :node-id nid
+                                                    :path (:path pub)})
+                                  (let [h (nth targets idx)]
+                                    (post-https-artifact!
+                                     h "/artifact/v1/blob" "application/edn" blob-buf
+                                     (fn [ok1 _]
+                                       (if-not ok1
+                                         (try-host! (inc idx))
+                                         (post-https-artifact!
+                                          h "/artifact/v1/pointer" "application/edn" ptr-buf
+                                          (fn [ok2 _]
+                                            (when-not ok2
+                                              (try-host! (inc idx)))))))))))]
+                (try-host! 0))
+              (catch :default e
+                (log-diagnostic! {:effect :diagnose
+                                  :reason :telemetry-digest-build-failed
+                                  :node-id nid
+                                  :detail (.-message e)})))))
+        t0 (js/setTimeout publish-once! 15000)
+        iv (js/setInterval publish-once! 60000)]
+    (fn []
+      (js/clearTimeout t0)
+      (js/clearInterval iv))))
+
 (defn start-validator-mesh-node!
   "Starts a full Bitecho validator & mesh node on Node.js (`:5000..5005` DataChannel peer mesh,
    `:5010` UDP+TCP agent ingress, `127.0.0.1:8080` validator diagnostics, and Fressian snapshot persistence)."
@@ -2523,7 +2623,11 @@
               (reset! http-srv-atom srv)
               (when-let [cb (:on-ready opts)]
                 (cb {:http-port bound-port}))))
+         stop-telemetry! (when (and (not (:embedded? opts))
+                                    (not (false? (:publish-telemetry? config))))
+                           (start-validator-telemetry-publisher! node-id identity state-atom peer-conns))
          stop! (fn []
+                 (when stop-telemetry! (stop-telemetry!))
                  (js/clearTimeout init-timer)
                  (when-let [iv @interval-atom] (js/clearInterval iv))
                  (when-let [srv @http-srv-atom] (try (.close srv) (catch :default _ nil)))
@@ -2699,6 +2803,73 @@
 ;; 10. Full Infra-Node Orchestrator (`start-infra-node!`)
 ;; =============================================================================
 
+(defn- start-infra-telemetry-publisher!
+  "P-OBS-4 / D38.1: Periodically publishes signed privacy-preserving `telemetry/<node-id>/digest.edn`
+   blobs & pointers from infra nodes (`ns1..ns3`) directly into the local subnet instance
+   (which automatically replicates blobs & pointers across the infra cluster)."
+  [node-id rt]
+  (let [started-ms (.now js/Date)
+        nid (if (keyword? node-id) (name node-id) (str node-id))
+        seq-atom (atom 0)
+        publish-once!
+        (fn []
+          (let [auth-pub (:default-sender rt)
+                auth-priv (:node-privkey rt)]
+            (when (and auth-pub auth-priv)
+              (try
+                (let [now-ms (.now js/Date)
+                      inst @(:subnet-atom rt)
+                      sid (or (:subnet-id inst) "bitecho.org/infra")
+                      vnode (:validator-node rt)
+                      vst (when-let [sa (:state-atom vnode)] @sa)
+                      mem (.memoryUsage js/process)
+                      head-ep (long (or (:epoch vst) (:epoch inst) 0))
+                      fin-ep (long (or (:last-executed-finalized-epoch vst) (:epoch inst) 0))
+                      rt-shell (when-let [sa (:shell-atom rt)] @sa)
+                      pub (obs/prepare-telemetry-publication
+                           {:node-id nid
+                            :uptime-ms (max 0 (- now-ms started-ms))
+                            :head-epoch head-ep
+                            :finalized-epoch fin-ep
+                            :runtime-summary {:rss-bytes (.-rss mem)
+                                              :heap-used-bytes (.-heapUsed mem)
+                                              :heap-total-bytes (.-heapTotal mem)
+                                              :runtime "nodejs"}
+                            :service-counters {:pointer-count (count (get-in inst [:data :pointers] {}))
+                                               :poll-count (long (or (:poll-count @poll-telemetry-atom) 0))
+                                               :failed-receipts (long (or (:failed-receipts-count vst) 0))}
+                            :defense-counters {:dropped (long (or (:dropped rt-shell) 0))
+                                               :ignored-stale (long (or (:ignored-stale rt-shell) 0))}})
+                      existing (get-in inst [:data :pointers [(str sid) (:path pub)]])
+                      prev-on-chain (long (or (:pointer/seq existing) 0))
+                      next-seq (swap! seq-atom (fn [prev] (max (inc (long prev)) (inc prev-on-chain) (quot now-ms 1000))))
+                      blob (data/make-blob (:edn-bytes pub) "application/edn")
+                      ptr (data/sign-pointer auth-priv
+                                             {:pointer/authority auth-pub
+                                              :pointer/subnet (str sid)
+                                              :pointer/path (:path pub)
+                                              :pointer/seq next-seq
+                                              :pointer/target (:blob/cid blob)
+                                              :pointer/proof {:proof/type :self}})]
+                  (submit-subnet-event! rt {:type :put-blob :blob blob :sender auth-pub :now-ms now-ms})
+                  (let [res (submit-subnet-event! rt {:type :publish-pointer :pointer ptr :sender auth-pub :now-ms now-ms})]
+                    (when-not (:applied? res)
+                      (apply-shell-event! (:shell-atom rt)
+                                          {:type :diagnose
+                                           :reason :telemetry-digest-publish-rejected
+                                           :error (:error res)
+                                           :path (:path pub)}))))
+                (catch :default e
+                  (apply-shell-event! (:shell-atom rt)
+                                      {:type :diagnose
+                                       :reason :telemetry-digest-build-failed
+                                       :detail (.-message e)}))))))
+        t0 (js/setTimeout publish-once! 10000)
+        iv (js/setInterval publish-once! 60000)]
+    (fn []
+      (js/clearTimeout t0)
+      (js/clearInterval iv))))
+
 (defn- start-peer-heartbeat-loop!
   [config rt]
   (when (get-in config [:cluster :enabled?] false)
@@ -2851,6 +3022,7 @@
             vnode (start-validator-mesh-node!
                    val-cfg
                    {:identity ident
+                    :embedded? true
                     :on-ready (fn [{:keys [http-port]}]
                                 (when diag-enabled?
                                   (swap! ports-atom assoc :diag-port (or http-port 0))
@@ -2900,6 +3072,10 @@
       ;; Heartbeat loop
       (when-let [hb-timer (start-peer-heartbeat-loop! config rt)]
         (swap! stop-fns conj #(js/clearInterval hb-timer)))
+
+      ;; P-OBS-4 / D38.1: 60s signed observability digest publisher
+      (when-not (false? (:publish-telemetry? config))
+        (swap! stop-fns conj (start-infra-telemetry-publisher! node-id rt)))
 
       ;; 1. DNS (:53)
       (when dns-enabled?
