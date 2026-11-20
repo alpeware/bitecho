@@ -3212,7 +3212,7 @@
                 (str/starts-with? path "telemetry/")
                 (str/ends-with? path "/digest.edn"))
          (if-let [blob (get blobs (:pointer/target ptr))]
-           (let [bs (:blob/bytes blob)
+           (let [bs (or (:bytes blob) (:blob/bytes blob))
                  parsed (try
                           (when bs
                             (edn/read-string (fressian/bytes->utf8 bs)))
@@ -3316,7 +3316,13 @@
                                                         :pointer/target (:blob/cid sla-blob)
                                                         :pointer/proof {:proof/type :self}})]
                         (submit-subnet-event! rt {:type :put-blob :blob sla-blob :sender auth-pub :now-ms now-ms})
-                        (submit-subnet-event! rt {:type :publish-pointer :pointer sla-ptr :sender auth-pub :now-ms now-ms})))))
+                        (let [sla-res (submit-subnet-event! rt {:type :publish-pointer :pointer sla-ptr :sender auth-pub :now-ms now-ms})]
+                          (when-not (:applied? sla-res)
+                            (apply-shell-event! (:shell-atom rt)
+                                                {:type :diagnose
+                                                 :reason :sla-report-publish-rejected
+                                                 :error (:error sla-res)
+                                                 :path (:path sla-pub)})))))))
                 (catch :default e
                   (apply-shell-event! (:shell-atom rt)
                                       {:type :diagnose
