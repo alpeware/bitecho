@@ -711,15 +711,18 @@
   "Truncates a newest-first vector of notarized ancestor entries to the longest contiguous prefix
    whose encoded :send-propose wire representation does not exceed max-wire-bytes."
   [base-propose-cmd ancestors max-wire-bytes]
-  (let [budget (long (or max-wire-bytes default-max-propose-wire-bytes))]
+  (let [budget (long (or max-wire-bytes default-max-propose-wire-bytes))
+        base-bytes (fressian/count-bytes (fressian/encode-wire base-propose-cmd))]
     (loop [remaining ancestors
-           kept []]
+           kept []
+           acc-bytes base-bytes]
       (if (empty? remaining)
         kept
-        (let [candidate (conj kept (first remaining))
-              encoded (fressian/encode-wire (assoc base-propose-cmd :ancestors candidate))]
-          (if (<= (fressian/count-bytes encoded) budget)
-            (recur (rest remaining) candidate)
+        (let [anc (first remaining)
+              anc-bytes (+ 8 (fressian/count-bytes (fressian/encode-wire anc)))
+              next-bytes (+ acc-bytes anc-bytes)]
+          (if (<= next-bytes budget)
+            (recur (rest remaining) (conj kept anc) next-bytes)
             kept))))))
 
 (defn- handle-tick-event

@@ -2045,7 +2045,7 @@
          (fn []
            (try
              (let [safe-state (core-mesh/strip-unserializable-state st-to-save)
-                   encoded-u8 (fressian/write-standard-fressian (fressian/normalize-for-wire safe-state))
+                   encoded-u8 (fressian/write-standard-fressian safe-state)
                    buf (u8->buf encoded-u8)]
                (-> (atomic-write-file-async! dest-path buf 0600)
                    (.then (fn [_]
@@ -2133,7 +2133,7 @@
              (let [fname (snap/snapshot-filename nid curr-fin-ep)
                    dest-path (.join node-path state-dir fname)
                    safe-state (core-mesh/strip-unserializable-state state)
-                   encoded-u8 (fressian/write-standard-fressian (fressian/normalize-for-wire safe-state))]
+                   encoded-u8 (fressian/write-standard-fressian safe-state)]
                (atomic-write-file! dest-path (u8->buf encoded-u8) 0600)
                (swap! last-saved-snapshots
                       (fn [m]

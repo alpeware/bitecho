@@ -23,8 +23,7 @@
             [bitecho.streamlet.core :as streamlet]
             #?(:clj [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
-            [clojure.string :as str]
-            [clojure.walk :as walk]))
+            [clojure.string :as str]))
 
 (def ^:private bytes? fressian/bytes?)
 
@@ -89,27 +88,82 @@
 ;; 2. Snapshot Serialization Sanitization & Reconstitution (Rule 2)
 ;; =============================================================================
 
+(def ^:private ephemeral-snapshot-keys
+  "Derived duplicate sets (reconstructed from `*-order` on load) and ephemeral Bracha/Sieve
+   gossip delivery caches that never need to be serialized into validator snapshots."
+  [:known-receipt-ids
+   :executed-receipt-ids
+   :received-readies
+   :received-echoes
+   :echo-vote-counts
+   :ready-vote-counts
+   :delivery-vote-counts
+   :local-ready-set
+   :sieve-delivered-set
+   :delivered-set])
+
+(defn- unserializable-val?
+  [x]
+  (or (satisfies? crypto/IRandom x)
+      #?@(:clj
+          [(instance? java.util.Random x)
+           (and (some? x) (= "clojure.core.async.impl.channels.ManyToManyChannel" (.getName (class x))))])))
+
+(def ^:private bulk-pure-snapshot-keys
+  "Large pure-data validator state collections that never contain PRNGs or channels;
+   skipping recursive walk over these keys avoids O(100k)-node deep copies on every snapshot."
+  #{:blocks :pending-receipts :known-receipt-order :executed-receipt-order
+    :ledger :genesis-ledger :block-vote-proofs :block-votes :future-votes
+    :future-blocks :epoch-voters :expired-gossip-ids :expired-gossip-order
+    :epoch-to-message-roles :notarized-blocks :finalized-blocks
+    :executed-finalized-blocks :executed-finalized-blocks-order :block-depths
+    :mempool :home-sets :basalt-view :voted-epochs :epoch-unclaimed-mint
+    :epoch-mint-dust :frozen-epoch-message-roles :frozen-epoch-messages})
+
+(defn- scrub-unserializable-val
+  [x]
+  (cond
+    (unserializable-val? x) nil
+    (map? x) (reduce-kv (fn [acc k v]
+                          (let [v' (scrub-unserializable-val v)]
+                            (if (identical? v v') acc (assoc acc k v'))))
+                        x
+                        x)
+    (vector? x) (mapv scrub-unserializable-val x)
+    (set? x) (into #{} (map scrub-unserializable-val) x)
+    :else x))
+
+(defn- scrub-top-level-unserializable
+  [m]
+  (if-not (map? m)
+    m
+    (reduce-kv (fn [acc k v]
+                 (if (contains? bulk-pure-snapshot-keys k)
+                   acc
+                   (let [v' (scrub-unserializable-val v)]
+                     (if (identical? v v') acc (assoc acc k v')))))
+               m
+               m)))
+
 (defn strip-unserializable-state
-  "Transforms the pure state map into a serializable format.
-   Strips raw Random / PRNG instances, core.async channels,
-   private key material, and converts the :murmur-cache :queue into a standard vector."
+  "Transforms the pure state map into a compact, serializable format without deep-walking
+   10,000+ pure receipt/block entries (`D39` V8 hot-path fix).
+   Strips private key material, nested PRNG/channel instances, duplicate derived sets
+   (`:known-receipt-ids`, `:executed-receipt-ids` — reconstructed from `*-order` on load),
+   ephemeral Bracha/Sieve gossip caches, and converts `:murmur-cache :queue` into a vector."
   [state]
-  (let [queue-handled (if (get-in state [:murmur-cache :queue])
-                        (update-in state [:murmur-cache :queue] vec)
-                        state)
-        secrets-stripped (-> queue-handled
-                             (dissoc :keypair :keys :node-private-key :treasury-privkey :custody-privkey)
-                             (cond-> (map? (:config queue-handled))
-                               (update :config dissoc :keypair :keys :node-private-key :treasury-privkey :custody-privkey)))]
-    (walk/postwalk
-     (fn [x]
-       (cond
-         (satisfies? crypto/IRandom x) nil
-         #?@(:clj
-             [(instance? java.util.Random x) nil
-              (and (class x) (= "clojure.core.async.impl.channels.ManyToManyChannel" (.getName (class x)))) nil])
-         :else x))
-     secrets-stripped)))
+  (if-not (map? state)
+    state
+    (let [queue-handled (if (get-in state [:murmur-cache :queue])
+                          (update-in state [:murmur-cache :queue] vec)
+                          state)
+          secrets-and-ephemeral-stripped
+          (-> (apply dissoc queue-handled
+                     :keypair :keys :node-private-key :treasury-privkey :custody-privkey
+                     ephemeral-snapshot-keys)
+              (cond-> (map? (:config queue-handled))
+                (update :config dissoc :keypair :keys :node-private-key :treasury-privkey :custody-privkey)))]
+      (scrub-top-level-unserializable secrets-and-ephemeral-stripped))))
 
 (def set-typed-state-keys
   "Root state keys that must be reconstituted as Clojure sets after Fressian deserialization."
@@ -172,6 +226,12 @@
                         acc))
                     state
                     set-typed-state-keys)
+          s (cond-> s
+              (and (not (contains? s :known-receipt-ids)) (coll? (:known-receipt-order s)))
+              (assoc :known-receipt-ids (set (:known-receipt-order s)))
+
+              (and (not (contains? s :executed-receipt-ids)) (coll? (:executed-receipt-order s)))
+              (assoc :executed-receipt-ids (set (:executed-receipt-order s))))
           empty-q #?(:clj clojure.lang.PersistentQueue/EMPTY :cljs #queue [])]
       (cond-> s
         (get-in s [:murmur-cache :queue])

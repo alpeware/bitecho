@@ -4,9 +4,11 @@
    - P-ASYNC-2: Node.js Zero-Sync-IO full node & light node hot-path audit
    - P-ASYNC-3: JVM Zero-Sync-IO parity (persistence, mesh, infra, light-node)
    - P-ASYNC-4: Browser WebRTC ICE & connection-state diagnostics (shell/browser.cljc, browser_main.cljs)"
-  (:require [bitecho.shell.browser :as browser]
+  (:require [bitecho.core.mesh :as core-mesh]
+            [bitecho.shell.browser :as browser]
             [bitecho.shell.persistence :as persistence]
             [bitecho.snapshot.core :as snap]
+            [bitecho.streamlet.core :as streamlet]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.set :as set]
@@ -434,3 +436,52 @@
       ;; 4. BIP-014 parent CID must be full 64-char sha256 hex of BIP-013
       (is (= 64 (count (str (:bip/parent-bip-cid bip014)))))
       (is (boolean (re-matches #"[0-9a-f]{64}" (str (:bip/parent-bip-cid bip014))))))))
+
+(deftest s-d39-7-hot-path-cost-budget-and-snapshot-sanitization-test
+  (testing "S-D39-7 (V8 Trace Hot-Path Fix + Cost-Budget Sim Gate): strip-unserializable-state drops duplicate/ephemeral caches in < 50ms, restores losslessly, and truncate-ancestors-to-wire-budget runs in O(N) < 50ms"
+    (let [ids (mapv #(str "rcpt-" %) (range 10000))
+          big-state {:epoch 51800
+                     :last-executed-finalized-epoch 51799
+                     :keypair {:private "secret" :public "pub"}
+                     :config {:node-private-key "secret2" :port 5000}
+                     :ledger {"acct1" {:balance 1000 :seq 1 :deps []}}
+                     :known-receipt-order ids
+                     :known-receipt-ids (set ids)
+                     :executed-receipt-order ids
+                     :executed-receipt-ids (set ids)
+                     :received-readies (into {} (map (fn [i] [(str "m" i) #{"v1"}]) (range 2000)))
+                     :received-echoes (into {} (map (fn [i] [(str "m" i) #{"v1"}]) (range 2000)))
+                     :echo-vote-counts {"m0" 2}
+                     :ready-vote-counts {"m0" 2}
+                     :delivery-vote-counts {"m0" 2}
+                     :local-ready-set #{"m0"}
+                     :sieve-delivered-set #{"m0"}
+                     :delivered-set #{"m0"}}
+          t0 (System/nanoTime)
+          stripped (core-mesh/strip-unserializable-state big-state)
+          strip-ms (/ (- (System/nanoTime) t0) 1e6)
+          restored (core-mesh/restore-unserializable-state stripped)
+          ancestors (mapv (fn [i]
+                            {:block (streamlet/->Block (+ 51780 i) "parent" [] "pub")
+                             :votes []})
+                          (range 16))
+          base-cmd {:type :send-propose :targets [] :block (streamlet/->Block 51800 "parent" [] "pub") :ancestors []}
+          t1 (System/nanoTime)
+          kept (#'streamlet/truncate-ancestors-to-wire-budget base-cmd ancestors 32768)
+          trunc-ms (/ (- (System/nanoTime) t1) 1e6)]
+      ;; Secrets stripped
+      (is (not (contains? stripped :keypair)))
+      (is (not (contains? (:config stripped) :node-private-key)))
+      ;; Duplicate derived sets & ephemeral gossip caches stripped from persisted snapshot
+      (is (not (contains? stripped :known-receipt-ids)))
+      (is (not (contains? stripped :executed-receipt-ids)))
+      (is (not (contains? stripped :received-readies)))
+      (is (not (contains? stripped :received-echoes)))
+      ;; Losslessly reconstructed on restore
+      (is (= 10000 (count (:known-receipt-ids restored))))
+      (is (= 10000 (count (:executed-receipt-ids restored))))
+      (is (contains? (:known-receipt-ids restored) "rcpt-9999"))
+      ;; Strict per-step cost-budget gate (<= 50 ms)
+      (is (<= strip-ms 50.0) (str "strip-unserializable-state blew 50ms budget: " strip-ms "ms"))
+      (is (pos? (count kept)))
+      (is (<= trunc-ms 50.0) (str "truncate-ancestors-to-wire-budget blew 50ms budget: " trunc-ms "ms")))))
