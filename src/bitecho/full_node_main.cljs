@@ -3205,7 +3205,7 @@
   "Reads all replicated `telemetry/*/digest.edn` blobs from the local infra subnet instance."
   [inst]
   (let [pointers (get-in inst [:data :pointers] {})
-        blobs (get-in inst [:data :blobs] {})]
+        blobs (get-in inst [:data :blobs :entries] {})]
     (reduce-kv
      (fn [acc [_ path] ptr]
        (if (and (string? path)
