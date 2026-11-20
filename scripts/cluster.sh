@@ -1220,7 +1220,7 @@ cmd_status() {
         local raw_metrics
         raw_metrics="$(ssh_cmd "$node" bash -s << 'REMOTE_STATUS' 2>/dev/null || echo "SSH_FAILED"
 set -o pipefail
-svc=$(if systemctl is-active --quiet bitecho.service 2>/dev/null || systemctl is-active --quiet bitecho-infra.service 2>/dev/null; then echo "active"; else echo "inactive"; fi)
+svc=$(if rc-service bitecho-validator status >/dev/null 2>&1 || rc-service bitecho-infra status >/dev/null 2>&1 || systemctl is-active --quiet bitecho.service 2>/dev/null || systemctl is-active --quiet bitecho-infra.service 2>/dev/null; then echo "active"; else echo "inactive"; fi)
 cpu=$(ps -o %cpu= -C java,node 2>/dev/null | awk '{s+=$1} END {if (NR>0) printf "%.1f%%", s; else print "0.0%"}' || echo "N/A")
 mem=$(free -m 2>/dev/null | awk '/Mem:/ {print $3 "/" $2 "M"}' || echo "N/A")
 disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}' || echo "N/A")
