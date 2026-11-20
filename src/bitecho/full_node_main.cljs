@@ -1603,30 +1603,43 @@
 
 (defn- save-validator-state-to-disk!
   "Serializes validator state map using standard Fressian (`core-mesh/encode-snapshot-bytes`)
-   and atomically writes it to `filepath` with 0600 permissions, skipping redundant writes when clean."
-  [filepath state]
-  (when (and filepath (map? state))
-    (try
-      (let [path-key (str filepath)
-            safe-state (core-mesh/strip-unserializable-state state)
-            prev-state (get-in @last-saved-snapshots [path-key :state])]
-        (if (and (.existsSync node-fs path-key)
-                 (some? prev-state)
-                 (= safe-state prev-state))
-          (do
-            (swap! last-saved-snapshots update-in [path-key :skipped-clean] (fnil inc 0))
-            true)
-          (let [encoded-u8 (fressian/write-standard-fressian (fressian/normalize-for-wire safe-state))]
-            (atomic-write-file! path-key (u8->buf encoded-u8) 0600)
-            (swap! last-saved-snapshots
-                   (fn [m]
-                     (-> m
-                         (assoc-in [path-key :state] safe-state)
-                         (update-in [path-key :saved-count] (fnil inc 0)))))
-            true)))
-      (catch :default e
-        (log-diagnostic! {:effect :diagnose :reason :validator-snapshot-save-failed :file filepath :detail (.-message e)})
-        false))))
+   and atomically writes it to `filepath` with 0600 permissions.
+   Throttles full 11MB Fressian disk writes on Node.js single-threaded event loop to at most
+   once every 60 seconds (or when `:last-executed-finalized-epoch` advances or `force?` is true),
+   preventing event-loop starvation during 10s ticks."
+  ([filepath state]
+   (save-validator-state-to-disk! filepath state false))
+  ([filepath state force?]
+   (when (and filepath (map? state))
+     (try
+       (let [path-key (str filepath)
+             now-ms (.now js/Date)
+             prev-entry (get @last-saved-snapshots path-key)
+             last-saved-ms (long (or (:saved-at-ms prev-entry) 0))
+             prev-fin-ep (long (or (:finalized-epoch prev-entry) -1))
+             curr-fin-ep (long (or (:last-executed-finalized-epoch state) 0))
+             fin-advanced? (> curr-fin-ep prev-fin-ep)
+             elapsed-ms (- now-ms last-saved-ms)]
+         (if (and (not force?)
+                  (not fin-advanced?)
+                  (pos? last-saved-ms)
+                  (< elapsed-ms 60000))
+           (do
+             (swap! last-saved-snapshots update-in [path-key :skipped-clean] (fnil inc 0))
+             true)
+           (let [safe-state (core-mesh/strip-unserializable-state state)
+                 encoded-u8 (fressian/write-standard-fressian (fressian/normalize-for-wire safe-state))]
+             (atomic-write-file! path-key (u8->buf encoded-u8) 0600)
+             (swap! last-saved-snapshots
+                    (fn [m]
+                      (-> m
+                          (assoc-in [path-key :saved-at-ms] now-ms)
+                          (assoc-in [path-key :finalized-epoch] curr-fin-ep)
+                          (update-in [path-key :saved-count] (fnil inc 0)))))
+             true)))
+       (catch :default e
+         (log-diagnostic! {:effect :diagnose :reason :validator-snapshot-save-failed :file filepath :detail (.-message e)})
+         false)))))
 
 (defn- load-validator-state-from-disk
   "Reads a Fressian-serialized validator snapshot from `filepath` and restores records, sets, and queues.
@@ -1812,30 +1825,17 @@
           (save-validator-state-to-disk! snapshot-file @state-atom))))))
 
 (defn- create-peer-datachannel-node
-  [local-port setup cert-data local-ice local-fp turn-config]
-  (let [opts (cond-> {:port local-port :setup setup}
-               turn-config (assoc :turn-config turn-config)
-               (and turn-config (some? (:use-turn-relay? turn-config)))
-               (assoc :use-turn-relay? (boolean (:use-turn-relay? turn-config)))
-               (and turn-config (nil? (:use-turn-relay? turn-config)) (true? (:force-relay? turn-config)))
-               (assoc :use-turn-relay? true))
-        local-sdp-params {:port local-port
-                          :ice-ufrag (:ufrag local-ice)
-                          :ice-pwd (:pwd local-ice)
-                          :fingerprint local-fp
-                          :setup setup}]
-    {:opts opts
-     :cert-data cert-data
-     :ice-creds local-ice
-     :local-sdp-params local-sdp-params
-     :running (atom false)
-     :state-atom (atom nil)
-     :channel (atom nil)
-     :selector (atom nil)
-     :loop-future (atom nil)
-     :remote-addr (atom nil)
-     :shared-channel? false
-     :callbacks (atom nil)}))
+  [local-port setup cert-data local-ice _local-fp turn-config]
+  (api/create-node
+   (cond-> {:port local-port
+            :setup setup
+            :cert-data cert-data
+            :ice-creds local-ice}
+     turn-config (assoc :turn-config turn-config)
+     (and turn-config (some? (:use-turn-relay? turn-config)))
+     (assoc :use-turn-relay? (boolean (:use-turn-relay? turn-config)))
+     (and turn-config (nil? (:use-turn-relay? turn-config)) (true? (:force-relay? turn-config)))
+     (assoc :use-turn-relay? true))))
 
 (defn- init-datachannel-peer!
   [ctx pid peer-cfg]
@@ -2230,7 +2230,12 @@
               :node-idx node-idx
               :nodes-cfg nodes-cfg}
          _ (when persist?
-             (save-validator-state-to-disk! snapshot-file @state-atom))
+             (if loaded-state
+               (swap! last-saved-snapshots assoc (str snapshot-file)
+                      {:saved-at-ms (.now js/Date)
+                       :finalized-epoch (long (or (:last-executed-finalized-epoch initial-state) 0))
+                       :saved-count 0})
+               (save-validator-state-to-disk! snapshot-file @state-atom true)))
          _ (when (= transport :datachannel)
              (doseq [[pid pcfg] nodes-cfg :when (not= pid node-id)]
                (try
@@ -2297,7 +2302,7 @@
                  (doseq [[k _] @agent-conns]
                    (apply-mesh-conn-event! agent-conns k {:type :shutdown}))
                  (when (and persist? snapshot-file)
-                   (save-validator-state-to-disk! snapshot-file @state-atom)))]
+                   (save-validator-state-to-disk! snapshot-file @state-atom true)))]
      {:node-id node-id
       :identity identity
       :transport transport
