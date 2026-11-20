@@ -735,4 +735,24 @@
       (is (= 1 (:epoch-finality-gap d-node1)))
       (is (= 99.0 (obs/p99-ms (range 1 101))))
       (is (= 60000.0 (obs/compute-heap-slope-bytes-per-min [{:ts-ms 0 :heap-used 100000}
-                                                            {:ts-ms 60000 :heap-used 160000}]))))))
+                                                            {:ts-ms 60000 :heap-used 160000}])))))
+  (testing "S-D39-12: single-node :finalization-stall stays per-node diagnostic while >=3 simultaneous stalls breach cluster SLA"
+    (let [win-ms 86400000
+          t0 1795210600000
+          ok-node (fn [nid] (obs/build-telemetry-digest {:node-id nid :head-epoch 54000 :finalized-epoch 53999}))
+          stalled-node (fn [nid]
+                         (obs/build-telemetry-digest
+                          {:node-id nid :head-epoch 54000 :finalized-epoch 53999
+                           :downtime-events [{:node-id nid :cause :finalization-stall
+                                              :started-ms (+ t0 1000) :ended-ms (+ t0 61000) :duration-ms 60000}]}))
+          sla-1 (obs/compute-six-nines-sla [(ok-node "node1") (ok-node "node2") (ok-node "node3")
+                                            (ok-node "ns1") (ok-node "ns2") (stalled-node "ns3")]
+                                           {:window-ms win-ms :now-ms (+ t0 120000)})
+          sla-3 (obs/compute-six-nines-sla [(ok-node "node1") (ok-node "node2") (ok-node "node3")
+                                            (stalled-node "ns1") (stalled-node "ns2") (stalled-node "ns3")]
+                                           {:window-ms win-ms :now-ms (+ t0 120000)})]
+      (is (= 0 (:cluster-breach-ms sla-1)))
+      (is (= 60000 (:node-service-downtime-ms sla-1)))
+      (is (true? (:six-nines-met? sla-1)))
+      (is (= 60000 (:cluster-breach-ms sla-3)))
+      (is (false? (:six-nines-met? sla-3))))))
