@@ -17,6 +17,7 @@
             [bitecho.core.mesh :as core-mesh]
             [bitecho.core.protocol.acme :as acme-proto]
             [bitecho.core.protocol.dns :as dns-proto]
+            [bitecho.core.protocol.faucet :as faucet]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.core.protocol.smtp :as smtp-proto]
             [bitecho.core.storage :as storage]
@@ -48,7 +49,7 @@
   "Current Node.js Full / Infra Node release version."
   "0.23.14")
 
-(declare fetch-validator-chain-state-snapshots! start-validator-mesh-node!)
+(declare fetch-validator-chain-state-snapshots! forward-gossip-to-agents! start-validator-mesh-node! step-validator-event!)
 
 ;; =============================================================================
 ;; 1. Byte / Buffer / Crypto / Diagnostic Helpers
@@ -1076,6 +1077,72 @@
     (doseq [wake-fn to-wake]
       (try (wake-fn) (catch :default _ nil)))))
 
+(defn- maybe-ingest-artifact-envelope!
+  [rt raw-env now-ms]
+  (when rt
+    (try
+      (let [env-val (if (and (string? raw-env) (re-matches #"[0-9a-fA-F]+" (str/trim raw-env)))
+                      (try (basalt/hex->bytes (str/trim raw-env)) (catch :default _ raw-env))
+                      raw-env)
+            unwrapped (or (try (light-core/unwrap-wire-message env-val) (catch :default _ nil))
+                          (when (fressian/bytes? env-val) (try (fressian/decode-wire env-val) (catch :default _ nil)))
+                          (when (map? env-val) env-val))]
+        (when (map? unwrapped)
+          (let [mtype (keyword (or (:bitecho/type unwrapped) (:type unwrapped) (get unwrapped "type")))]
+            (when (contains? #{:sync-pointer :artifact-replicate :replicate-pointer} mtype)
+              (let [ptr (core-infra/normalize-artifact-pointer (or (:pointer unwrapped) (get unwrapped "pointer") unwrapped))
+                    blob-res (core-infra/normalize-artifact-blob (or (:blob unwrapped) (get unwrapped "blob")))
+                    sender (or (:pointer/authority ptr)
+                               (:sender unwrapped)
+                               (get unwrapped "sender")
+                               (:default-sender rt))]
+                (when (and blob-res (:ok? blob-res))
+                  (submit-subnet-event! rt {:type :put-blob
+                                            :blob (:blob blob-res)
+                                            :sender sender
+                                            :now-ms now-ms}))
+                (when ptr
+                  (submit-subnet-event! rt {:type :publish-pointer
+                                            :pointer ptr
+                                            :sender (or (:pointer/authority ptr) sender)
+                                            :now-ms now-ms})))))))
+      (catch :default _ nil))))
+
+(defn- forward-relay-to-validator-mesh!
+  [rt eff]
+  (when-let [vnode (:validator-node rt)]
+    (try
+      (let [raw-env (:envelope eff)
+            env (if (fressian/bytes? raw-env)
+                  (try (fressian/decode-wire raw-env) (catch :default _ raw-env))
+                  raw-env)
+            ev-type (when (map? env) (or (get-in env [:event :type]) (:type env)))
+            gossip-msg (when (map? env)
+                         (if (= :receive-gossip ev-type)
+                           (or (get-in env [:event :message]) (:message env))
+                           (or (:message env) (get-in env [:event :message]))))
+            sub-id (or (when (map? env) (:subnet-id env))
+                       (when (map? env) (get-in env [:event :subnet-id]))
+                       "global")]
+        (when gossip-msg
+          (let [sender-pk (or (when (map? env) (:agent-pubkey env))
+                              (:default-sender rt)
+                              (get-in vnode [:identity :pubkey-hex]))
+                gossip-ev {:type :receive-gossip
+                           :subnet-id sub-id
+                           :message gossip-msg
+                           :sender sender-pk
+                           :rng (crypto/make-random)}]
+            (step-validator-event! vnode gossip-ev false)
+            (when-let [acs (:agent-conns vnode)]
+              (forward-gossip-to-agents!
+               acs
+               (fressian/encode-wire {:type :receive-gossip
+                                      :subnet-id sub-id
+                                      :message gossip-msg})
+               nil)))))
+      (catch :default _ nil))))
+
 (defn- handle-relay-endpoint!
   [req res rt relay-atom waiters-atom clean-path query-str method]
   (cond
@@ -1113,10 +1180,15 @@
                    r @res-box]
                (if (:ok? r)
                  (do
+                   (maybe-ingest-artifact-envelope! rt env now-ms)
                    (when-not (:replicated? rep-auth)
+                     (doseq [eff (:effects r)]
+                       (when (= :forward-to-validators (:effect eff))
+                         (forward-relay-to-validator-mesh! rt eff)))
                      (replicate-relay-to-peers! rt "/relay/v1/send" body-buf))
                    (wake-relay-waiters! waiters-atom
-                                        (get-in r [:response "recipient"])
+                                        (or (get-in r [:response "recipient"])
+                                            (some #(when (= :forward-to-validators (:effect %)) (:recipient %)) (:effects r)))
                                         (boolean (get-in r [:response "broadcast"])))
                    (send-json! res 200 (:response r)))
                  (let [status (case (:error r) :payload-too-large 413 :invalid-signature 403 400)]
@@ -1142,12 +1214,18 @@
                                          (get body-json "ts") (get-header req "x-bitecho-timestamp-ms")) 0)
                     nonce (or (get body-json "nonce") (get-header req "x-bitecho-nonce"))
                     sig (or (get body-json "signature") (get body-json "sig") (get-header req "x-bitecho-signature"))
-                    wait-ms (min 30000 (max 0 (parse-int (or (get body-json "wait_ms") (get qparams "wait_ms")) 0)))
+                    raw-wait (or (get body-json "wait_ms") (get body-json "wait-ms")
+                                 (get body-json "timeout_ms") (get body-json "timeout-ms")
+                                 (get qparams "wait_ms") (get qparams "wait-ms")
+                                 (get qparams "timeout_ms") (get qparams "timeout-ms")
+                                 (get-header req "x-bitecho-wait-ms"))
+                    wait-ms (min 25000 (max 0 (parse-int raw-wait 0)))
                     raw-subs (or (get body-json "subnets") (get qparams "subnets") (get-header req "x-bitecho-subnets"))
                     subs (cond
-                           (coll? raw-subs) (vec raw-subs)
-                           (and (string? raw-subs) (not (str/blank? raw-subs))) (vec (remove str/blank? (str/split raw-subs #",")))
+                           (coll? raw-subs) (mapv (comp str/trim str) raw-subs)
+                           (and (string? raw-subs) (not (str/blank? raw-subs))) (vec (remove str/blank? (map str/trim (str/split raw-subs #","))))
                            :else nil)
+                    sub-filter-set (when (seq subs) (set subs))
                     now-ms (.now js/Date)
                     poll-ev (cond-> {:type :relay-poll
                                      :pubkey pubkey
@@ -1178,14 +1256,32 @@
                                         (when @timer-id (js/clearTimeout @timer-id))
                                         (let [st @relay-atom
                                               cutoff (- (.now js/Date) (long (get st :ttl-ms 86400000)))
-                                              fresh-m (filterv #(and (> (long (:relay-seq %)) since-seq)
+                                              max-inbox-seq (long (get-in st [:inbox-seqs norm-pk] 0))
+                                              max-bcast-seq (long (get st :next-broadcast-seq 0))
+                                              eff-since-seq (if (> since-seq max-inbox-seq) 0 since-seq)
+                                              eff-since-bseq (if (> since-bseq max-bcast-seq) 0 since-bseq)
+                                              fresh-m (filterv #(and (> (long (:relay-seq %)) eff-since-seq)
                                                                      (>= (long (:received-at % 0)) cutoff))
                                                                (get-in st [:inboxes norm-pk] []))
-                                              fresh-b (filterv #(and (> (long (:broadcast-seq %)) since-bseq)
-                                                                     (>= (long (:received-at % 0)) cutoff))
-                                                               (get st :broadcasts []))]
+                                              all-b (filterv #(and (> (long (:broadcast-seq %)) eff-since-bseq)
+                                                                   (>= (long (:received-at % 0)) cutoff))
+                                                             (get st :broadcasts []))
+                                              max-bseq (if (seq all-b)
+                                                         (apply max (map :broadcast-seq all-b))
+                                                         eff-since-bseq)
+                                              fresh-b (if sub-filter-set
+                                                        (filterv (fn [e]
+                                                                   (let [esub (str (or (:subnet-id e) (:subnet_id e) (get e "subnet_id") "global"))]
+                                                                     (or (contains? sub-filter-set esub)
+                                                                         (contains? sub-filter-set "*"))))
+                                                                 all-b)
+                                                        all-b)]
                                           (when-not (.-writableEnded res)
-                                            (send-json! res 200 {"ok" true "pubkey" norm-pk "messages" fresh-m "broadcasts" fresh-b})))))
+                                            (send-json! res 200 {"ok" true
+                                                                 "pubkey" norm-pk
+                                                                 "messages" fresh-m
+                                                                 "broadcasts" fresh-b
+                                                                 "last_broadcast_seq" max-bseq})))))
                             wake-fn (fn []
                                       (swap! waiters-atom #(-> % (update norm-pk disj finish!) (update :broadcast disj finish!)))
                                       (finish!))]
@@ -1332,8 +1428,85 @@
           (if (= method "HEAD") (.end res) (.end res buf)))
         (send-json! res 404 {:ok false :error "nickname-not-found" :nickname nick :network_uri net-uri})))))
 
+(defn- handle-faucet-endpoint!
+  [req res rt faucet-atom clean-path query-str method]
+  (let [now-ms (.now js/Date)
+        config (:config rt)]
+    (cond
+      (= clean-path "/faucet/v1/challenge")
+      (let [qparams (core-infra/parse-query-params query-str)
+            issue! (fn [body-buf _]
+                     (let [body-json (when (and body-buf (pos? (.-length body-buf)))
+                                       (try (js->clj (js/JSON.parse (.toString body-buf "utf8"))) (catch :default _ nil)))
+                           net-uri (or (get body-json "network_uri")
+                                       (get qparams "network_uri")
+                                       (:network-uri config)
+                                       "devnet.bitecho.org")
+                           res-box (atom nil)
+                           _ (swap! faucet-atom
+                                    (fn [st]
+                                      (let [r (faucet/issue-faucet-challenge st {:network-uri net-uri} now-ms)]
+                                        (reset! res-box r)
+                                        (:state r))))
+                           ch (:challenge @res-box)]
+                       (send-json! res 200 {:ok true :challenge ch})))]
+        (if (= method "POST")
+          (read-req-body-bounded! req 16384 issue!)
+          (issue! nil false)))
+
+      (= clean-path "/faucet/v1/claim")
+      (if (not= method "POST")
+        (send-json! res 405 {:ok false :error "method-not-allowed"})
+        (read-req-body-bounded!
+         req 65536
+         (fn [body-buf exceeded?]
+           (if exceeded?
+             (send-json! res 413 {:ok false :error "payload-too-large"})
+             (let [body-json (when (and body-buf (pos? (.-length body-buf)))
+                               (try (js->clj (js/JSON.parse (.toString body-buf "utf8"))) (catch :default _ nil)))
+                   nonce (get body-json "nonce")
+                   cred-hash (or (get body-json "credential_id_hash") (get body-json "credential_hash"))
+                   claimant-pk (or (get body-json "claimant_pubkey") (get body-json "pubkey"))
+                   claim-net (or (get body-json "network_uri") (:network-uri config) "devnet.bitecho.org")
+                   auth-ver (get body-json "authenticator_verified?" (get body-json "authenticator_verified" true))
+                   claim-req {:nonce nonce
+                              :credential-id-hash cred-hash
+                              :claimant-pubkey claimant-pk
+                              :network-uri claim-net
+                              :authenticator-verified? auth-ver}
+                   res-box (atom nil)
+                   _ (swap! faucet-atom
+                            (fn [st]
+                              (let [r (faucet/reduce-faucet-claim st claim-req now-ms)]
+                                (reset! res-box r)
+                                (:state r))))
+                   claim-res @res-box]
+               (if-not (:ok? claim-res)
+                 (send-json! res 400 {:ok false
+                                      :error (name (or (:error claim-res) :faucet-claim-rejected))
+                                      :reason (:reason claim-res)})
+                 (do
+                   (when (and (:receipt-blob claim-res) (:receipt-pointer claim-res))
+                     (submit-subnet-event! rt {:type :put-blob
+                                               :blob (:receipt-blob claim-res)
+                                               :sender (:default-sender rt)
+                                               :now-ms now-ms})
+                     (submit-subnet-event! rt {:type :publish-pointer
+                                               :pointer (:receipt-pointer claim-res)
+                                               :sender (:default-sender rt)
+                                               :now-ms now-ms}))
+                   (send-json! res 200 (cond-> {:ok true
+                                                :transfer_intent (:transfer-intent claim-res)
+                                                :receipt_path (:receipt-path claim-res)
+                                                :receipt_cid (:receipt-cid claim-res)}
+                                         (:signed-transfer claim-res)
+                                         (assoc :signed_transfer (:signed-transfer claim-res)))))))))))
+
+      :else
+      (send-json! res 404 {:ok false :error "not-found" :path clean-path}))))
+
 (defn- handle-web-or-api-request!
-  [req res {:keys [config rt relay-atom waiters-atom limiter-atom http-shell-atom dns-shell-atom smtp-shell-atom https? bound-https-port]}]
+  [req res {:keys [config rt relay-atom waiters-atom faucet-atom limiter-atom http-shell-atom dns-shell-atom smtp-shell-atom https? bound-https-port]}]
   (let [raw-url (or (.-url req) "/")
         [raw-path query-str] (str/split raw-url #"\?" 2)
         clean-path (let [p (str/replace raw-path #"/+$" "")] (if (str/blank? p) "/" p))
@@ -1356,6 +1529,9 @@
 
       (str/starts-with? raw-path "/directory/v1/")
       (handle-directory-endpoint! res rt clean-path method)
+
+      (and faucet-atom (str/starts-with? raw-path "/faucet/v1/"))
+      (handle-faucet-endpoint! req res rt faucet-atom clean-path query-str method)
 
       (and (contains? #{"GET" "HEAD"} method) (= clean-path "/healthz"))
       (send-json! res 200 {:ok true
@@ -1720,15 +1896,24 @@
           (let [sent-ids (core-mesh/conn-sent-msg-ids conn)]
             (when-not (and msg-id (contains? sent-ids msg-id))
               (when-let [cid (or (core-mesh/conn-channel-id conn) 0)]
-                (when-let [node (:node conn)]
+                (if-let [on-msg (:on-message conn)]
                   (try
-                    (api/send! node wire-bytes cid)
+                    (on-msg wire-bytes)
                     (when msg-id
                       (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id}))
                     (catch :default e
                       (apply-mesh-conn-event! agent-conns pk
                                               {:type :send-failed :error (or (.-message e) "send-failed")})
-                      nil))))))))
+                      nil))
+                  (when-let [node (:node conn)]
+                    (try
+                      (api/send! node wire-bytes cid)
+                      (when msg-id
+                        (apply-mesh-conn-event! agent-conns pk {:type :record-sent-msg :msg-id msg-id}))
+                      (catch :default e
+                        (apply-mesh-conn-event! agent-conns pk
+                                                {:type :send-failed :error (or (.-message e) "send-failed")})
+                        nil)))))))))
       (doseq [[pk _] @agent-conns
               :when (not= pk exclude-sender)]
         (apply-mesh-conn-event! agent-conns pk
@@ -2567,6 +2752,7 @@
         _ (apply-shell-event! rt-shell-atom {:type :started :generation rt-gen :resources {:state-dir state-dir}})
         relay-atom (atom (relay/init-relay-state (get-in config [:http :relay])))
         waiters-atom (atom {})
+        faucet-atom (atom (faucet/init-faucet-state (or (:faucet config) {})))
         limiter-atom (atom (dns-proto/init-limiter {:capacity 100.0
                                                     :refill-per-sec 20.0
                                                     :monthly-egress-limit-bytes (get-in config [:http :monthly-egress-limit-bytes] 900000000)}))
@@ -2607,7 +2793,7 @@
                            (if smtp-enabled? 1 0)
                            (if diag-enabled? 1 0))]
     (reset! pending-atom (max 1 total-listeners))
-    ;; Co-located Validator Mesh Engine (when :validator is configured)
+    ;; Co-located Validator Mesh Engine (when :validator is configured) + bi-directional Relay<->Validator bridge
     (when has-embedded-val?
       (let [val-cfg (assoc raw-val-cfg
                            :node/id (or (:node/id raw-val-cfg) (:node-id raw-val-cfg) node-id)
@@ -2621,7 +2807,46 @@
                     :on-ready (fn [{:keys [http-port]}]
                                 (when diag-enabled?
                                   (swap! ports-atom assoc :diag-port (or http-port 0))
-                                  (maybe-emit-ready!)))})]
+                                  (maybe-emit-ready!)))})
+            on-bridge-msg (fn [payload]
+                            (try
+                              (let [now-ms (.now js/Date)
+                                    cur-rt @rt-atom]
+                                (maybe-ingest-artifact-envelope! cur-rt payload now-ms)
+                                (let [res-box (atom nil)
+                                      _ (swap! relay-atom
+                                               (fn [st]
+                                                 (let [r (relay/reduce-relay st {:type :relay-submit
+                                                                                 :envelope payload
+                                                                                 :from-validator? true
+                                                                                 :now-ms now-ms})]
+                                                   (reset! res-box r)
+                                                   (:state r))))
+                                      res @res-box]
+                                  (when (:ok? res)
+                                    (let [recip (or (get-in res [:response "recipient"])
+                                                    (get-in res [:response "pubkey"]))
+                                          broadcast? (boolean (get-in res [:response "broadcast"]))]
+                                      (when (and recip (not broadcast?))
+                                        (try
+                                          (let [payload-bytes (if (fressian/bytes? payload) payload (fressian/encode-wire payload))
+                                                wire-hex (basalt/bytes->hex payload-bytes)
+                                                body-buf (.from js/Buffer (js/JSON.stringify #js {:envelope_hex wire-hex}) "utf8")]
+                                            (replicate-relay-to-peers! cur-rt "/relay/v1/send" body-buf))
+                                          (catch :default _ nil)))
+                                      (when (or recip broadcast?)
+                                        (wake-relay-waiters! waiters-atom recip broadcast?))))))
+                              (catch :default _ nil)))
+            bridge-key (keyword (str "colocated-bridge-" (name node-id)))]
+        (when-let [acs (:agent-conns vnode)]
+          (swap! acs assoc bridge-key {:channel-id 0
+                                       :phase :open
+                                       :ok? true
+                                       :on-message on-bridge-msg
+                                       :node nil
+                                       :generation 1
+                                       :sent-msg-ids #{}
+                                       :sent-msg-order []}))
         (swap! rt-atom assoc :validator-node vnode)
         (swap! stop-fns conj (:stop! vnode))))
     (let [rt @rt-atom]
@@ -2660,6 +2885,7 @@
                            (handle-web-or-api-request!
                             req res
                             {:config config :rt rt :relay-atom relay-atom :waiters-atom waiters-atom
+                             :faucet-atom faucet-atom
                              :limiter-atom limiter-atom :http-shell-atom http-shell-atom
                              :dns-shell-atom (:shell-atom @dns-handle-atom)
                              :smtp-shell-atom (:shell-atom @smtp-handle-atom)
@@ -2694,6 +2920,7 @@
                           (handle-web-or-api-request!
                            req res
                            {:config config :rt rt :relay-atom relay-atom :waiters-atom waiters-atom
+                            :faucet-atom faucet-atom
                             :limiter-atom limiter-atom :http-shell-atom http-shell-atom
                             :dns-shell-atom (:shell-atom @dns-handle-atom)
                             :smtp-shell-atom (:shell-atom @smtp-handle-atom)
