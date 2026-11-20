@@ -2841,7 +2841,7 @@
                     head-ep (long (or (:epoch st) 0))
                     fin-ep (long (or (:last-executed-finalized-epoch st) 0))
                     peers-up (count (filter (fn [[_ v]] (= :open (:phase v))) @peer-conns))
-                    conn-diag (core-mesh/mesh-conn-diagnostics-summary (vals @peer-conns))
+                    conn-diag (core-mesh/mesh-conn-diagnostics-summary @peer-conns nil)
                     ledger (swap! ledger-atom obs/record-stall-sample
                                   {:node-id nid
                                    :now-ms now-ms
@@ -3247,7 +3247,7 @@
                       vst (when-let [sa (:state-atom vnode)] @sa)
                       v-peer-conns (when-let [pc (:peer-conns vnode)] @pc)
                       conn-diag (when v-peer-conns
-                                  (core-mesh/mesh-conn-diagnostics-summary (vals v-peer-conns)))
+                                  (core-mesh/mesh-conn-diagnostics-summary v-peer-conns nil))
                       mem (.memoryUsage js/process)
                       head-ep (long (or (:epoch vst) (:epoch inst) 0))
                       fin-ep (long (or (:last-executed-finalized-epoch vst) (:epoch inst) 0))
