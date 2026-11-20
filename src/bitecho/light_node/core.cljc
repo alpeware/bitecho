@@ -69,6 +69,25 @@
   [payload-bytes]
   (fressian/decode-wire payload-bytes))
 
+(defn invalidate-stale-p2p-sessions
+  "Pure helper (`F-BCAST-1` / `BIP-013`): clears transient runtime P2P liveness flags
+   (`:connected?`, `:channel-open?`, `:direct-route?`) from all sessions' `:p2p` and `:p2p-meta`
+   maps on daemon restart so stale pre-restart P2P metadata can never divert routing."
+  [state]
+  (if-not (map? state)
+    state
+    (let [clean-sessions
+          (into {}
+                (for [[sid s] (:sessions state)]
+                  (let [p2p-seqs (select-keys (:p2p s) [:local-signal-seq :remote-offer-seq :remote-answer-seq])
+                        p2p-meta (when (map? (:p2p-meta s))
+                                   (dissoc (:p2p-meta s) :connected? :channel-open? :direct-route?))
+                        s1 (cond-> (dissoc s :p2p)
+                             (seq p2p-seqs) (assoc :p2p p2p-seqs)
+                             (some? p2p-meta) (assoc :p2p-meta p2p-meta))]
+                    [sid s1])))]
+      (assoc state :sessions clean-sessions))))
+
 (defn strip-sensitive-keys
   "Pure helper to remove single-use ECDH `:ephemeral-priv` keys from session state prior to persistence,
    and dissoc transient runtime connection liveness keys (`:connected?`, `:connection-error`, `:conn-diagnostics`, `:p2p`)
@@ -78,14 +97,12 @@
    so stateless one-shot CLI invocations (`send`, `inbox`, `close`) can encrypt and decrypt ongoing session
    messages across process invocations without re-running the X25519 handshake."
   [state]
-  (let [clean-sessions (into {} (for [[sid s] (:sessions state)]
-                                  (let [p2p-seqs (select-keys (:p2p s) [:local-signal-seq :remote-offer-seq :remote-answer-seq])
-                                        cleaned (cond-> (dissoc s :ephemeral-priv :ratchet :pq-secret-key :handshake-state)
+  (let [invalidated (invalidate-stale-p2p-sessions state)
+        clean-sessions (into {} (for [[sid s] (:sessions invalidated)]
+                                  (let [cleaned (cond-> (dissoc s :ephemeral-priv :ratchet :pq-secret-key :handshake-state)
                                                   (not= "offered" (:state s)) (dissoc :offer-nonce))]
-                                    [sid (if (seq p2p-seqs)
-                                           (assoc cleaned :p2p p2p-seqs)
-                                           (dissoc cleaned :p2p))])))]
-    (-> state
+                                    [sid cleaned])))]
+    (-> invalidated
         (assoc :sessions clean-sessions)
         (dissoc :connected? :connection-error :conn-diagnostics))))
 
@@ -3135,7 +3152,14 @@
                           dac (assoc :dac dac))
                 outer-sub (if (pos? burn-amt) "*" sub-id)
                 raw-env (build-gossip-envelope sender privkey-bytes (freeze-payload payload) burn-amt outer-sub)
-                env (assoc raw-env :p2p-direct? true :p2p-broadcast? true)
+                ;; F-BCAST-1 (BIP-013): Broadcast NEVER sets :p2p-direct? true so stale P2P session metadata
+                ;; cannot divert mesh broadcast or cause relay mirroring to skip it.
+                env (assoc (dissoc raw-env :p2p-direct? :p2p-peer :p2p-session-id)
+                           :p2p-broadcast? true
+                           :mesh-broadcast? true)
+                peers-targeted (max 1 (count (or (:home-set st-after-burn)
+                                                 (:bootstrap-peers st-after-burn)
+                                                 [])))
                 dedup-key [sender next-seq msg-id]
                 b-entry {:from sender
                          :seq next-seq
@@ -3161,7 +3185,13 @@
                         "msg_id" msg-id
                         "burn" burn-amt
                         "zero_burn" (zero? burn-amt)
-                        "p2p" true}
+                        "p2p" false
+                        "mesh_submitted" true
+                        "peers_targeted" peers-targeted
+                        "fanout" {"route" "mesh"
+                                  "mesh_submitted" true
+                                  "p2p_direct" false
+                                  "peers_targeted" peers-targeted}}
              :net-envelopes [env]
              :stdout-events []}))))))
 
@@ -5293,56 +5323,88 @@
                     eff-priv (or privkey-bytes (:private fallback-kp))
                     eff-pub (if privkey-bytes my-pub (basalt/bytes->hex (:public fallback-kp)))
                     ts (now-utc-ms)
-                    unsigned-ptr {:pointer/subnet subnet
-                                  :pointer/path path
-                                  :pointer/authority eff-pub
-                                  :pointer/seq seq-num
-                                  :pointer/leader-term 1
-                                  :pointer/target cid
-                                  :pointer/proof {:proof/type :self}
-                                  :pointer/timestamp ts}
-                    ptr (assoc (data/sign-pointer eff-priv unsigned-ptr) :pointer/timestamp ts)
-                    rep-payload {:protocol-version current-wire-version
-                                 :wire-format current-wire-format
-                                 :bitecho/type :artifact-replicate
-                                 :type :artifact-replicate
-                                 :subnet-id subnet
-                                 :path path
-                                 :cid cid
-                                 :seq seq-num
-                                 :blob blob
-                                 :pointer ptr
-                                 :sender eff-pub
-                                 :epoch (long (or (:epoch st-after-burn) 0))
-                                 :timestamp ts}
-                    outer-sub (if (pos? burn-amt) "*" subnet)
-                    rep-envelope (when eff-priv
-                                   (let [gossip-env (build-gossip-envelope
-                                                     eff-pub
-                                                     eff-priv
-                                                     (freeze-payload rep-payload)
-                                                     burn-amt
-                                                     outer-sub)]
-                                     (merge rep-payload gossip-env {:p2p-broadcast? true})))]
-                {:state (-> st-after-burn
-                            (assoc-in [:blobs cid] blob)
-                            (assoc-in [:pointers [subnet path]] ptr)
-                            (assoc-in [:artifact-blobs cid] blob)
-                            (assoc-in [:artifact-pointers [subnet path]] ptr)
-                            (update :artifact-tombstones dissoc [subnet path])
-                            (assoc-in [:artifact-min-seqs [subnet path]] seq-num))
-                 :response {"ok" true
-                            "subnet_id" subnet
-                            "path" path
-                            "cid" cid
-                            "seq" seq-num
-                            "authority" eff-pub
-                            "size_bytes" (fressian/count-bytes bs)
-                            "burn" burn-amt
-                            "blob" blob
-                            "pointer" ptr}
-                 :net-envelopes (if rep-envelope [rep-envelope] [])
-                 :stdout-events []}))))))))
+                    raw-replicas (or (get effective-map "replicas") (:replicas effective-map) (:artifact-replicas st-after-burn))
+                    replicas (when (sequential? raw-replicas) (vec (map str raw-replicas)))
+                    raw-confirmed (or (get effective-map "confirmed_replicas") (:confirmed-replicas effective-map))
+                    confirmed-replicas (when (sequential? raw-confirmed) (vec (map str raw-confirmed)))
+                    req-quorum (parse-long-safe (or (get effective-map "replica_quorum") (:replica-quorum effective-map)) nil)
+                    quorum-unmet? (and (some? req-quorum)
+                                       (some? confirmed-replicas)
+                                       (< (count confirmed-replicas) (long req-quorum)))]
+                (if quorum-unmet?
+                  (let [missing-reps (vec (remove (set confirmed-replicas) (or replicas [])))
+                        diag {"reason" "artifact-replica-quorum-unmet"
+                              "required_quorum" (long req-quorum)
+                              "confirmed_replicas" confirmed-replicas
+                              "missing_replicas" missing-reps}]
+                    {:state (update-in state [:diagnostics :artifact-replica-quorum-unmet] (fnil inc 0))
+                     :response {"ok" false
+                                "error" "artifact-replica-quorum-unmet"
+                                "subnet_id" subnet
+                                "path" path
+                                "cid" cid
+                                "required_quorum" (long req-quorum)
+                                "confirmed_replicas" confirmed-replicas
+                                "missing_replicas" missing-reps
+                                "diagnose" diag}
+                     :net-envelopes []
+                     :stdout-events []})
+                  (let [unsigned-ptr (cond-> {:pointer/subnet subnet
+                                              :pointer/path path
+                                              :pointer/authority eff-pub
+                                              :pointer/seq seq-num
+                                              :pointer/leader-term 1
+                                              :pointer/target cid
+                                              :pointer/proof {:proof/type :self}
+                                              :pointer/timestamp ts}
+                                       (seq replicas) (assoc :pointer/replicas replicas))
+                        ptr (cond-> (assoc (data/sign-pointer eff-priv unsigned-ptr) :pointer/timestamp ts)
+                              (seq replicas) (assoc :pointer/replicas replicas))
+                        rep-payload {:protocol-version current-wire-version
+                                     :wire-format current-wire-format
+                                     :bitecho/type :artifact-replicate
+                                     :type :artifact-replicate
+                                     :subnet-id subnet
+                                     :path path
+                                     :cid cid
+                                     :seq seq-num
+                                     :blob blob
+                                     :pointer ptr
+                                     :replicas replicas
+                                     :sender eff-pub
+                                     :epoch (long (or (:epoch st-after-burn) 0))
+                                     :timestamp ts}
+                        outer-sub (if (pos? burn-amt) "*" subnet)
+                        rep-envelope (when eff-priv
+                                       (let [gossip-env (build-gossip-envelope
+                                                         eff-pub
+                                                         eff-priv
+                                                         (freeze-payload rep-payload)
+                                                         burn-amt
+                                                         outer-sub)]
+                                         (merge rep-payload gossip-env {:p2p-broadcast? true})))]
+                    {:state (-> st-after-burn
+                                (assoc-in [:blobs cid] blob)
+                                (assoc-in [:pointers [subnet path]] ptr)
+                                (assoc-in [:artifact-blobs cid] blob)
+                                (assoc-in [:artifact-pointers [subnet path]] ptr)
+                                (update :artifact-tombstones dissoc [subnet path])
+                                (assoc-in [:artifact-min-seqs [subnet path]] seq-num))
+                     :response (cond-> {"ok" true
+                                        "subnet_id" subnet
+                                        "path" path
+                                        "cid" cid
+                                        "seq" seq-num
+                                        "authority" eff-pub
+                                        "size_bytes" (fressian/count-bytes bs)
+                                        "burn" burn-amt
+                                        "blob" blob
+                                        "pointer" ptr}
+                                 (seq replicas) (assoc "replicas" replicas)
+                                 (some? req-quorum) (assoc "replica_quorum" (long req-quorum)
+                                                           "quorum_confirmed" true))
+                     :net-envelopes (if rep-envelope [rep-envelope] [])
+                     :stdout-events []}))))))))))
 
 (defn- exec-artifact-revoke
   [state effective-map privkey-bytes sub-id]
@@ -5491,8 +5553,21 @@
             ptr (or (get-in state [:artifact-pointers [subnet path]])
                     (some (fn [[[_ p] candidate-ptr]] (when (= p path) candidate-ptr)) (:artifact-pointers state)))
             cid (or (when ptr (:pointer/target ptr)) explicit-cid)
-            blob (when cid (or (get-in state [:artifact-blobs cid])
-                               (get-in state [:blobs cid])))]
+            local-blob (when cid (or (get-in state [:artifact-blobs cid])
+                                     (get-in state [:blobs cid])))
+            replicas (let [r (or (get effective-map "replicas")
+                                 (:replicas effective-map)
+                                 (when ptr (:pointer/replicas ptr))
+                                 (:artifact-replicas state))]
+                       (when (sequential? r) (vec (map str r))))
+            replica-hit (when (and (nil? local-blob) cid (seq replicas))
+                          (some (fn [rep]
+                                  (when-let [rb (get-in state [:replica-blobs rep cid])]
+                                    (when (data/verify-blob rb)
+                                      {:replica rep :blob rb})))
+                                replicas))
+            blob (or local-blob (:blob replica-hit))
+            served-by (:replica replica-hit)]
         (cond
           (and tomb (nil? ptr))
           {:state (update-in state [:diagnostics :artifact-get-tombstoned] (fnil inc 0))
@@ -5506,31 +5581,43 @@
            :stdout-events []}
 
           (not (and ptr blob (data/verify-blob blob) (:ok? (data/verify-pointer ptr))))
-          {:state (update-in state [:diagnostics :artifact-get-missing] (fnil inc 0))
-           :response {"ok" false
-                      "error" "missing-artifact"
+          (let [missing-reps (vec (or replicas []))
+                diag {"reason" "artifact-missing-on-replicas"
                       "subnet_id" subnet
-                      "path" path}
-           :net-envelopes []
-           :stdout-events []}
+                      "path" path
+                      "cid" cid
+                      "missing_replicas" missing-reps}]
+            {:state (-> state
+                        (update-in [:diagnostics :artifact-get-missing] (fnil inc 0))
+                        (update-in [:diagnostics :artifact-missing-on-replicas] (fnil inc 0)))
+             :response (cond-> {"ok" false
+                                "error" "missing-artifact"
+                                "subnet_id" subnet
+                                "path" path
+                                "missing_replicas" missing-reps
+                                "diagnose" diag}
+                         cid (assoc "cid" cid))
+             :net-envelopes []
+             :stdout-events []})
 
           :else
           (let [bs (:blob/bytes blob)
                 hex (basalt/bytes->hex bs)
                 text (try (fressian/bytes->utf8 bs) (catch #?(:clj Exception :cljs :default) _ nil))]
             {:state state
-             :response {"ok" true
-                        "subnet_id" (:pointer/subnet ptr subnet)
-                        "path" path
-                        "cid" cid
-                        "seq" (:pointer/seq ptr)
-                        "authority" (:pointer/authority ptr)
-                        "size_bytes" (fressian/count-bytes bs)
-                        "hex" hex
-                        "data_hex" hex
-                        "text" text
-                        "data" text
-                        "pointer" ptr}
+             :response (cond-> {"ok" true
+                                "subnet_id" (:pointer/subnet ptr subnet)
+                                "path" path
+                                "cid" cid
+                                "seq" (:pointer/seq ptr)
+                                "authority" (:pointer/authority ptr)
+                                "size_bytes" (fressian/count-bytes bs)
+                                "hex" hex
+                                "data_hex" hex
+                                "text" text
+                                "data" text
+                                "pointer" ptr}
+                         served-by (assoc "served_by_replica" served-by))
              :net-envelopes []
              :stdout-events []}))))))
 

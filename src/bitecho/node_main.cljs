@@ -907,7 +907,8 @@
                                 "--callee" "--peer" "--receiver" "--recipient"
                                 "--amount" "--text" "--message" "--payload-hex"
                                 "--wait-open-ms" "--until-event"
-                                "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"}
+                                "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix"
+                                "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"}
         runner-valued-flags #{"--state-dir" "--control-port" "--bootstrap"}]
     (loop [rem (vec tokens)]
       (if (empty? rem)
@@ -991,6 +992,9 @@
          ingress-tcp-port (extract-long-flag clean-args "--ingress-tcp-port" nil)
          proxy-cli (extract-flag-value clean-args "--proxy" nil)
          proxy-url (resolve-proxy-url proxy-cli getenv-fn)
+         pin-version (extract-flag-value clean-args "--pin-version" nil)
+         auto-update-pointer (extract-flag-value clean-args "--auto-update-pointer" nil)
+         auto-update-interval-ms (extract-long-flag clean-args "--auto-update-interval-ms" nil)
          relay-cli (extract-flag-value clean-args "--relay-url" nil)
          relay-url (resolve-relay-url relay-cli getenv-fn)
          subnet-id (extract-flag-value clean-args "--subnet-id" nil)
@@ -1068,6 +1072,9 @@
        (some? sync?) (assoc :sync? sync?)
        (some? connect?) (assoc :connect? connect?)
        proxy-url (assoc :proxy proxy-url)
+       pin-version (assoc :pin-version pin-version)
+       auto-update-pointer (assoc :auto-update-pointer auto-update-pointer)
+       auto-update-interval-ms (assoc :auto-update-interval-ms auto-update-interval-ms)
        relay-url (assoc :relay-url relay-url)
        turn-config (assoc :turn-config turn-config)))))
 

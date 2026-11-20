@@ -323,6 +323,28 @@
   (let [left (data/merkle-branch-hash os-root runtime-root)]
     (data/merkle-branch-hash left app-root)))
 
+(defn validate-attestation-manifest
+  "Fail-closed P-HOST-5 / F-SADV1-1 attestation manifest validator:
+   Requires `(map? manifest)`, `(map? (:layers manifest))`, and non-empty sequential
+   `:os-subtree`, `:runtime-subtree`, and `:app-subtree`.
+   Returns `{:ok? true :manifest manifest}` or `{:ok? false :error \"invalid-manifest-missing-layers\" :missing-layers [...]}`."
+  [manifest]
+  (if-not (and (map? manifest) (map? (:layers manifest)))
+    {:ok? false
+     :error "invalid-manifest-missing-layers"
+     :missing-layers [:layers]}
+    (let [layers (:layers manifest)
+          missing (filterv (fn [k]
+                             (let [v (get layers k)]
+                               (not (and (sequential? v) (seq v)))))
+                           merkle-layer-order)]
+      (if (seq missing)
+        {:ok? false
+         :error "invalid-manifest-missing-layers"
+         :missing-layers missing}
+        {:ok? true
+         :manifest manifest}))))
+
 (defn compute-system-merkle-root
   "Pure external-verifier recomputation (`P-HOST-5`): given a manifest containing `:layers`
    (`:os-subtree`, `:runtime-subtree`, `:app-subtree`), recomputes `:subtree-roots` and

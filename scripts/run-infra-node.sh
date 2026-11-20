@@ -75,8 +75,10 @@ if [[ "${RUNTIME}" == "nodejs" ]]; then
   RESOLVED_NODE="$(resolve_node_bin)"
   if check_node_preflight "${RESOLVED_NODE}"; then
     check_unified_pointer "${RESOLVED_NODE}" || true
+    # P-OBS-5 (BIP-013 / F-SOAK-1 interim mitigation): cap V8 old-space heap to 384 MiB
+    NODE_MAX_OLD_SPACE_MB="${BITECHO_NODE_MAX_OLD_SPACE_MB:-384}"
     # Exit 75 triggers OpenRC supervise-daemon respawn after unified pointer advance (P-HOST-6)
-    exec "${RESOLVED_NODE}" "${NODE_BUNDLE}" infra-node "${CONFIG_FILE}"
+    exec "${RESOLVED_NODE}" "--max-old-space-size=${NODE_MAX_OLD_SPACE_MB}" "${NODE_BUNDLE}" infra-node "${CONFIG_FILE}"
   else
     echo '{"event":"runtime-fallback","from":"nodejs","to":"jvm"}' >&2
     RUNTIME="jvm"

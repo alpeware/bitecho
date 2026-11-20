@@ -1123,8 +1123,9 @@
                              :head-hash "genesis"}
                       event {:type :receive-propose :block b :sender leader-hex}
                       res (core/handle-streamlet-event state event)]
-                  (and (= state (:state res))
-                       (= [] (:commands res))))))
+                  (and (= curr-epoch (:epoch (:state res)))
+                       (empty? (:blocks (:state res)))
+                       (some #(= :proposal-exceeds-catchup-delta (:reason %)) (:commands res))))))
 
 (defspec ^{:doc "Property: Streamlet reducer drops votes exceeding max-epoch-catchup-delta fail-closed"}
   prop-rejects-excessive-epoch-vote 50
@@ -1147,8 +1148,9 @@
                              :head-hash "genesis"}
                       event {:type :receive-vote :vote vote :sender voter-hex}
                       res (core/handle-streamlet-event state event)]
-                  (and (= state (:state res))
-                       (= [] (:commands res))))))
+                  (and (= curr-epoch (:epoch (:state res)))
+                       (empty? (:future-votes (:state res)))
+                       (some #(= :vote-exceeds-catchup-delta (:reason %)) (:commands res))))))
 
 (deftest test-accumulate-vote-proofs
   (testing "accumulate-vote records both voter-hex in :block-votes and vote record in :block-vote-proofs"

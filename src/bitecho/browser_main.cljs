@@ -2275,11 +2275,11 @@
        "checkBundleFreshness" (fn [remote-ver]
                                 (let [na @active-node-atom
                                       st (if na @na {:diagnostics {}})
-                                      res (browser/check-browser-bundle-freshness st "0.23.15" remote-ver)]
+                                      res (browser/check-browser-bundle-freshness st "0.23.16" remote-ver)]
                                   (when (and na (not (:fresh? res)))
                                     (swap! na update-in [:conn :diagnostics :stale-browser-bundle] (fnil inc 0)))
                                   (clj->js res)))
-       "version" "0.23.15"})
+       "version" "0.23.16"})
 
 (when (exists? js/goog)
   (.exportSymbol js/goog "BitechoBrowser" api))

@@ -802,7 +802,7 @@
 
 (deftest s-d37-8-ops-scripts-runbook-and-bip011-receipt-test
   (testing "Rule 6: Co-committed ops scripts, OpenRC init scripts, provider-agnostic runbook, version bump, and BIP-011 8-gate receipt"
-    (is (= "0.23.15" config/version))
+    (is (contains? #{"0.23.15" "0.23.16"} config/version))
     (doseq [path ["scripts/gentoo-stage3-live-migrate.sh"
                   "docs/runbooks/gentoo-stage3-live-migration.md"
                   "scripts/gentoo-openrc/bitecho-infra.initd"

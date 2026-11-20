@@ -23,6 +23,7 @@
             [bitecho.core.storage :as storage]
             [bitecho.core.subnet :as subnet]
             [bitecho.crypto :as crypto]
+            [bitecho.defense.core :as defense]
             [bitecho.deploy.core :as deploy]
             [bitecho.economy.account :as account]
             [bitecho.economy.spend-dac :as spend-dac]
@@ -30,6 +31,7 @@
             [bitecho.governance.core :as gov]
             [bitecho.host.core :as host]
             [bitecho.light-node.core :as light-core]
+            [bitecho.observability.core :as obs]
             [bitecho.state-machine :as sm]
             [cljs.reader :as edn]
             [clojure.string :as str]
@@ -48,7 +50,38 @@
 
 (def full-node-version
   "Current Node.js Full / Infra Node release version."
-  "0.23.15")
+  "0.23.16")
+
+(def ^:private obs-router-atom (atom (obs/init-sink-router {:node-id "full-node"})))
+(def ^:private defense-state-atom (atom (defense/init-defense-state)))
+(def ^:private poll-telemetry-atom (atom {:poll-count 0 :last-sample-ms 0 :last-heap-used 0}))
+
+(defn- sample-node-runtime-telemetry!
+  "P-OBS-5 / F-SOAK-1 runtime telemetry hook: samples process RSS/heap, event-loop lag, and
+   poll-route counts into the P-OBS-2 sink router without blocking the request path."
+  [node-id active-waiters]
+  (try
+    (let [now-ms (.now js/Date)
+          last-ms (:last-sample-ms @poll-telemetry-atom 0)]
+      (when (>= (- now-ms last-ms) 15000)
+        (let [mem (.memoryUsage js/process)
+              rt-rec (obs/collect-nodejs-runtime
+                      {:node-id node-id
+                       :rss-bytes (.-rss mem)
+                       :heap-used-bytes (.-heapUsed mem)
+                       :heap-total-bytes (.-heapTotal mem)
+                       :external-bytes (.-external mem)
+                       :event-loop-lag-ms 0.0})
+              relay-rec (obs/collect-relay-metric
+                         {:node-id node-id
+                          :poll-queue-depth (long (:poll-count @poll-telemetry-atom 0))
+                          :active-waiters (long (or active-waiters 0))
+                          :dropped (long (:dropped @obs-router-atom 0))})]
+          (swap! poll-telemetry-atom assoc :last-sample-ms now-ms :last-heap-used (.-heapUsed mem))
+          (swap! obs-router-atom
+                 (fn [r]
+                   (first (obs/route-records r [rt-rec relay-rec] {:disk {:ok? true} :network {:ok? true}})))))))
+    (catch :default _ nil)))
 
 (declare fetch-validator-chain-state-snapshots! forward-gossip-to-agents! start-validator-mesh-node! step-validator-event!)
 
@@ -1196,100 +1229,113 @@
                    (send-json! res status (:response r))))))))))
 
     (and (contains? #{"GET" "POST"} method) (= clean-path "/relay/v1/poll"))
-    (let [process-poll!
+    (let [_ (swap! poll-telemetry-atom update :poll-count (fnil inc 0))
+          _ (sample-node-runtime-telemetry! (or (:node-id rt) "infra") (count @waiters-atom))
+          remote-ip (or (some-> req .-socket .-remoteAddress) "unknown")
+          [def-st def-dec _] (defense/evaluate-request
+                              @defense-state-atom
+                              {:source-id remote-ip
+                               :traffic-class :unauthenticated-ingress
+                               :authenticated? false
+                               :route "/relay/v1/poll"
+                               :now-ms (.now js/Date)})
+          _ (reset! defense-state-atom def-st)
+          process-poll!
           (fn [body-buf exceeded?]
-            (if exceeded?
-              (send-json! res 413 {:ok false :error "payload-too-large"})
-              (let [body-json (when (and body-buf (pos? (.-length body-buf)))
-                                (try (js->clj (js/JSON.parse (.toString body-buf "utf8"))) (catch :default _ nil)))
-                    qparams (core-infra/parse-query-params query-str)
-                    pubkey (or (get body-json "pubkey") (get qparams "pubkey") (get-header req "x-bitecho-pubkey"))
-                    parse-int (fn [v d] (let [n (js/parseInt (str (or v d)) 10)] (long (if (js/isNaN n) d n))))
-                    since-seq (parse-int (or (get body-json "since_seq") (get body-json "since-seq")
-                                             (get qparams "since_seq") (get qparams "since-seq")
-                                             (get-header req "x-bitecho-since-seq")) 0)
-                    since-bseq (parse-int (or (get body-json "since_broadcast_seq") (get body-json "since-broadcast-seq")
-                                              (get qparams "since_broadcast_seq") (get qparams "since-broadcast-seq")
-                                              (get-header req "x-bitecho-since-broadcast-seq")) 0)
-                    ts-ms (parse-int (or (get body-json "timestamp_ms") (get body-json "timestamp-ms")
-                                         (get body-json "ts") (get-header req "x-bitecho-timestamp-ms")) 0)
-                    nonce (or (get body-json "nonce") (get-header req "x-bitecho-nonce"))
-                    sig (or (get body-json "signature") (get body-json "sig") (get-header req "x-bitecho-signature"))
-                    raw-wait (or (get body-json "wait_ms") (get body-json "wait-ms")
-                                 (get body-json "timeout_ms") (get body-json "timeout-ms")
-                                 (get qparams "wait_ms") (get qparams "wait-ms")
-                                 (get qparams "timeout_ms") (get qparams "timeout-ms")
-                                 (get-header req "x-bitecho-wait-ms"))
-                    wait-ms (min 25000 (max 0 (parse-int raw-wait 0)))
-                    raw-subs (or (get body-json "subnets") (get qparams "subnets") (get-header req "x-bitecho-subnets"))
-                    subs (cond
-                           (coll? raw-subs) (mapv (comp str/trim str) raw-subs)
-                           (and (string? raw-subs) (not (str/blank? raw-subs))) (vec (remove str/blank? (map str/trim (str/split raw-subs #","))))
-                           :else nil)
-                    sub-filter-set (when (seq subs) (set subs))
-                    now-ms (.now js/Date)
-                    poll-ev (cond-> {:type :relay-poll
-                                     :pubkey pubkey
-                                     :since-seq since-seq
-                                     :since-broadcast-seq since-bseq
-                                     :timestamp-ms ts-ms
-                                     :nonce nonce
-                                     :signature sig
-                                     :now-ms now-ms}
-                              (seq subs) (assoc :subnets subs))
-                    r-box (atom nil)
-                    _ (swap! relay-atom
-                             (fn [st]
-                               (let [r (relay/reduce-relay st poll-ev)]
-                                 (reset! r-box r)
-                                 (:state r))))
-                    r @r-box]
-                (if-not (:ok? r)
-                  (send-json! res 403 (:response r))
-                  (let [msgs (get-in r [:response "messages"] [])
-                        bcasts (get-in r [:response "broadcasts"] [])
-                        norm-pk (get-in r [:response "pubkey"])]
-                    (if (and (pos? wait-ms) (empty? msgs) (empty? bcasts) norm-pk)
-                      (let [finished? (atom false)
-                            timer-id (atom nil)
-                            finish! (fn []
-                                      (when (compare-and-set! finished? false true)
-                                        (when @timer-id (js/clearTimeout @timer-id))
-                                        (let [st @relay-atom
-                                              cutoff (- (.now js/Date) (long (get st :ttl-ms 86400000)))
-                                              max-inbox-seq (long (get-in st [:inbox-seqs norm-pk] 0))
-                                              max-bcast-seq (long (get st :next-broadcast-seq 0))
-                                              eff-since-seq (if (> since-seq max-inbox-seq) 0 since-seq)
-                                              eff-since-bseq (if (> since-bseq max-bcast-seq) 0 since-bseq)
-                                              fresh-m (filterv #(and (> (long (:relay-seq %)) eff-since-seq)
+            (if (contains? #{:ban :drop} (:action def-dec))
+              (send-json! res 429 {:ok false :error "rate-limited" :action (name (:action def-dec))})
+              (if exceeded?
+                (send-json! res 413 {:ok false :error "payload-too-large"})
+                (let [body-json (when (and body-buf (pos? (.-length body-buf)))
+                                  (try (js->clj (js/JSON.parse (.toString body-buf "utf8"))) (catch :default _ nil)))
+                      qparams (core-infra/parse-query-params query-str)
+                      pubkey (or (get body-json "pubkey") (get qparams "pubkey") (get-header req "x-bitecho-pubkey"))
+                      parse-int (fn [v d] (let [n (js/parseInt (str (or v d)) 10)] (long (if (js/isNaN n) d n))))
+                      since-seq (parse-int (or (get body-json "since_seq") (get body-json "since-seq")
+                                               (get qparams "since_seq") (get qparams "since-seq")
+                                               (get-header req "x-bitecho-since-seq")) 0)
+                      since-bseq (parse-int (or (get body-json "since_broadcast_seq") (get body-json "since-broadcast-seq")
+                                                (get qparams "since_broadcast_seq") (get qparams "since-broadcast-seq")
+                                                (get-header req "x-bitecho-since-broadcast-seq")) 0)
+                      ts-ms (parse-int (or (get body-json "timestamp_ms") (get body-json "timestamp-ms")
+                                           (get body-json "ts") (get-header req "x-bitecho-timestamp-ms")) 0)
+                      nonce (or (get body-json "nonce") (get-header req "x-bitecho-nonce"))
+                      sig (or (get body-json "signature") (get body-json "sig") (get-header req "x-bitecho-signature"))
+                      raw-wait (or (get body-json "wait_ms") (get body-json "wait-ms")
+                                   (get body-json "timeout_ms") (get body-json "timeout-ms")
+                                   (get qparams "wait_ms") (get qparams "wait-ms")
+                                   (get qparams "timeout_ms") (get qparams "timeout-ms")
+                                   (get-header req "x-bitecho-wait-ms"))
+                      wait-ms (min 25000 (max 0 (parse-int raw-wait 0)))
+                      raw-subs (or (get body-json "subnets") (get qparams "subnets") (get-header req "x-bitecho-subnets"))
+                      subs (cond
+                             (coll? raw-subs) (mapv (comp str/trim str) raw-subs)
+                             (and (string? raw-subs) (not (str/blank? raw-subs))) (vec (remove str/blank? (map str/trim (str/split raw-subs #","))))
+                             :else nil)
+                      sub-filter-set (when (seq subs) (set subs))
+                      now-ms (.now js/Date)
+                      poll-ev (cond-> {:type :relay-poll
+                                       :pubkey pubkey
+                                       :since-seq since-seq
+                                       :since-broadcast-seq since-bseq
+                                       :timestamp-ms ts-ms
+                                       :nonce nonce
+                                       :signature sig
+                                       :now-ms now-ms}
+                                (seq subs) (assoc :subnets subs))
+                      r-box (atom nil)
+                      _ (swap! relay-atom
+                               (fn [st]
+                                 (let [r (relay/reduce-relay st poll-ev)]
+                                   (reset! r-box r)
+                                   (:state r))))
+                      r @r-box]
+                  (if-not (:ok? r)
+                    (send-json! res 403 (:response r))
+                    (let [msgs (get-in r [:response "messages"] [])
+                          bcasts (get-in r [:response "broadcasts"] [])
+                          norm-pk (get-in r [:response "pubkey"])]
+                      (if (and (pos? wait-ms) (empty? msgs) (empty? bcasts) norm-pk)
+                        (let [finished? (atom false)
+                              timer-id (atom nil)
+                              finish! (fn []
+                                        (when (compare-and-set! finished? false true)
+                                          (when @timer-id (js/clearTimeout @timer-id))
+                                          (let [st @relay-atom
+                                                cutoff (- (.now js/Date) (long (get st :ttl-ms 86400000)))
+                                                max-inbox-seq (long (get-in st [:inbox-seqs norm-pk] 0))
+                                                max-bcast-seq (long (get st :next-broadcast-seq 0))
+                                                eff-since-seq (if (> since-seq max-inbox-seq) 0 since-seq)
+                                                eff-since-bseq (if (> since-bseq max-bcast-seq) 0 since-bseq)
+                                                fresh-m (filterv #(and (> (long (:relay-seq %)) eff-since-seq)
+                                                                       (>= (long (:received-at % 0)) cutoff))
+                                                                 (get-in st [:inboxes norm-pk] []))
+                                                all-b (filterv #(and (> (long (:broadcast-seq %)) eff-since-bseq)
                                                                      (>= (long (:received-at % 0)) cutoff))
-                                                               (get-in st [:inboxes norm-pk] []))
-                                              all-b (filterv #(and (> (long (:broadcast-seq %)) eff-since-bseq)
-                                                                   (>= (long (:received-at % 0)) cutoff))
-                                                             (get st :broadcasts []))
-                                              max-bseq (if (seq all-b)
-                                                         (apply max (map :broadcast-seq all-b))
-                                                         eff-since-bseq)
-                                              fresh-b (if sub-filter-set
-                                                        (filterv (fn [e]
-                                                                   (let [esub (str (or (:subnet-id e) (:subnet_id e) (get e "subnet_id") "global"))]
-                                                                     (or (contains? sub-filter-set esub)
-                                                                         (contains? sub-filter-set "*"))))
-                                                                 all-b)
-                                                        all-b)]
-                                          (when-not (.-writableEnded res)
-                                            (send-json! res 200 {"ok" true
-                                                                 "pubkey" norm-pk
-                                                                 "messages" fresh-m
-                                                                 "broadcasts" fresh-b
-                                                                 "last_broadcast_seq" max-bseq})))))
-                            wake-fn (fn []
-                                      (swap! waiters-atom #(-> % (update norm-pk disj finish!) (update :broadcast disj finish!)))
-                                      (finish!))]
-                        (swap! waiters-atom #(-> % (update norm-pk (fnil conj #{}) wake-fn) (update :broadcast (fnil conj #{}) wake-fn)))
-                        (reset! timer-id (js/setTimeout wake-fn wait-ms))
-                        (.on req "close" wake-fn))
-                      (send-json! res 200 (:response r))))))))]
+                                                               (get st :broadcasts []))
+                                                max-bseq (if (seq all-b)
+                                                           (apply max (map :broadcast-seq all-b))
+                                                           eff-since-bseq)
+                                                fresh-b (if sub-filter-set
+                                                          (filterv (fn [e]
+                                                                     (let [esub (str (or (:subnet-id e) (:subnet_id e) (get e "subnet_id") "global"))]
+                                                                       (or (contains? sub-filter-set esub)
+                                                                           (contains? sub-filter-set "*"))))
+                                                                   all-b)
+                                                          all-b)]
+                                            (when-not (.-writableEnded res)
+                                              (send-json! res 200 {"ok" true
+                                                                   "pubkey" norm-pk
+                                                                   "messages" fresh-m
+                                                                   "broadcasts" fresh-b
+                                                                   "last_broadcast_seq" max-bseq})))))
+                              wake-fn (fn []
+                                        (swap! waiters-atom #(-> % (update norm-pk disj finish!) (update :broadcast disj finish!)))
+                                        (finish!))]
+                          (swap! waiters-atom #(-> % (update norm-pk (fnil conj #{}) wake-fn) (update :broadcast (fnil conj #{}) wake-fn)))
+                          (reset! timer-id (js/setTimeout wake-fn wait-ms))
+                          (.on req "close" wake-fn))
+                        (send-json! res 200 (:response r)))))))))]
       (if (= method "POST")
         (read-req-body-bounded! req 65536 process-poll!)
         (process-poll! nil false)))
@@ -2348,21 +2394,21 @@
                            resp (cond
                                   pubkey
                                   (cond-> {:pubkey pubkey
-                                           :account (when-let [a (get (:ledger st) pubkey)] (into {} a))
+                                           :account (when-let [a (get (:ledger st) pubkey)] (into (sorted-map) a))
                                            :spendable (sm/spendable-balance st pubkey)
                                            :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
                                     snap (assoc :snapshot snap))
 
                                   include-escrows?
-                                  {:accounts (into {} (map (fn [[k v]] [k (into {} v)]) (:ledger st)))
-                                   :escrows (into {} (map (fn [[k v]] [k (into {} v)]) (:escrows st)))
+                                  {:accounts (into (sorted-map) (map (fn [[k v]] [k (into (sorted-map) v)]) (:ledger st)))
+                                   :escrows (into (sorted-map) (map (fn [[k v]] [k (into (sorted-map) v)]) (:escrows st)))
                                    :failed-receipts-count (long (or (:failed-receipts-count st) 0))
                                    :pending-receipts-count (long (count (or (:pending-receipts st) [])))
                                    :epoch (long (or (:epoch st) 0))
                                    :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))}
 
                                   :else
-                                  {:accounts (into {} (map (fn [[k v]] [k (into {} v)]) (:ledger st)))
+                                  {:accounts (into (sorted-map) (map (fn [[k v]] [k (into (sorted-map) v)]) (:ledger st)))
                                    :finalized-epoch (long (or (:last-executed-finalized-epoch st) 0))})]
                        (send-text! res 200 (str (pr-str resp) "\n") method))
 
@@ -3183,10 +3229,14 @@
 
 (defn- cmd-attest-root!
   "Recomputes the P-HOST-5 3-subtree system Merkle root from a manifest EDN file (or emits a
-   local runtime attestation manifest when no path is provided)."
+   local runtime attestation manifest when no path is provided).
+   F-SADV1-1 (BIP-013): fails closed with `invalid-manifest-missing-layers` (exit 1) when
+   `:layers` is missing/non-map or any of `:os-subtree`/`:runtime-subtree`/`:app-subtree` is empty."
   [manifest-file]
   (let [manifest (if (and manifest-file (.existsSync node-fs manifest-file))
-                   (edn/read-string (.readFileSync node-fs manifest-file "utf8"))
+                   (try
+                     (edn/read-string (.readFileSync node-fs manifest-file "utf8"))
+                     (catch :default _ nil))
                    (host/build-system-merkle-manifest
                     {:arch (case (.-arch js/process)
                              "x64" "amd64"
@@ -3195,13 +3245,22 @@
                      :os-packages [{:atom "sys-apps/openrc" :version "openrc" :cid (deploy/sha256-hex "openrc")}]
                      :runtimes [{:name "nodejs" :version (.-version js/process) :cid (deploy/sha256-hex (.-version js/process))}]
                      :app-artifacts [{:artifact "bitecho-full-node.cjs" :version full-node-version :cid (deploy/sha256-hex full-node-version)}]}))
-        recomputed (host/compute-system-merkle-root manifest)]
-    (println (js/JSON.stringify
-              (clj->js {:ok true
-                        :version full-node-version
-                        :arch (:arch manifest)
-                        :system_merkle_root (:system-merkle-root recomputed)
-                        :subtree_roots (:subtree-roots recomputed)})))))
+        validation (host/validate-attestation-manifest manifest)]
+    (if-not (:ok? validation)
+      (do
+        (println (js/JSON.stringify
+                  (clj->js {:ok false
+                            :version full-node-version
+                            :error (:error validation)
+                            :missing_layers (mapv name (:missing-layers validation))})))
+        (.exit js/process 1))
+      (let [recomputed (host/compute-system-merkle-root manifest)]
+        (println (js/JSON.stringify
+                  (clj->js {:ok true
+                            :version full-node-version
+                            :arch (:arch manifest)
+                            :system_merkle_root (:system-merkle-root recomputed)
+                            :subtree_roots (:subtree-roots recomputed)})))))))
 
 (defn -main
   "CLI entry point for the Node.js full validator & infrastructure node."

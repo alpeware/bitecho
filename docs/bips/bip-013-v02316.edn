@@ -1,0 +1,107 @@
+{:bip-id "BIP-013"
+ :bip/id "BIP-013"
+ :title "BIP-013: Core Observability and Self-Defense, 2026-11-20 Findings Fixes (F-SOAK-1, F-SADV1-1, F-BCAST-1, F-ART-1), and Light-Node Pointer Auto-Update (P-UPD-1)"
+ :bip/title "BIP-013: Core Observability and Self-Defense, 2026-11-20 Findings Fixes (F-SOAK-1, F-SADV1-1, F-BCAST-1, F-ART-1), and Light-Node Pointer Auto-Update (P-UPD-1)"
+ :version "v0.23.16"
+ :bip/version "0.23.16"
+ :milestone "D38"
+ :bip/milestone "D38"
+ :bip/status :consented
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :bip/author-agent "axiom"
+ :author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :bip/author-pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+ :co-author-pubkeys ["302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                     "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"
+                     "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"]
+ :human-anchor-sunset "2027-06-30"
+ :bip/parent-bip-cid "3965973c429b96aac47e5d14152cce73ba69d61db04b12a06761dc6ac29e1203"
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :note "Direction 2026-11-20 07:49 CST + P-UPD-1 amendment 09:25 CST"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"}
+                   {:agent "lumen" :role :research-lead :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"}]
+ :invariant-diff {:defspec-vars ["bitecho.d38-bip013-observability-defense-and-autoupdate-test/prop-obs-step-instrumentation-pure-transparent-and-budget-bounded"
+                                 "bitecho.d38-bip013-observability-defense-and-autoupdate-test/prop-defense-fail-open-consensus-and-escalating-ban-with-expiry"
+                                 "bitecho.d38-bip013-observability-defense-and-autoupdate-test/prop-attest-manifest-fail-closed-on-missing-layers-or-empty-subtree"
+                                 "bitecho.d38-bip013-observability-defense-and-autoupdate-test/prop-light-node-autoupdate-monotonic-verified-and-stale-gen-guard"
+                                 "bitecho.d38-bip013-observability-defense-and-autoupdate-test/prop-streamlet-quorum-epoch-catchup-resists-single-byzantine-and-self-heals"]
+                  :seed 1795290000
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:passed? true
+                                            :seed 1795290000
+                                            :tests 16
+                                            :assertions 121
+                                            :executed-at 1795290000000}
+                   :vopr-jepsen-non-vacuity {:passed? true
+                                             :seed 1795290000
+                                             :scenarios-passed 102
+                                             :executed-at 1795290000000}
+                   :deterministic-bundle-sha256 "3793d4b2b3f1e3d2d3b30c38938dd5c306d127d2c6ffe91fb4fc8cbb7b4e8ce3"
+                   :bwrap-civilization-regression {:passed? true
+                                                   :browser-bundle-sha256 "84ab89b1057c68e2d170e26bd02aa245238009fb8b0895d76e7d4ac53291f9f2"
+                                                   :full-node-bundle-sha256 "56b04bcf4c4acd226734cf62a2d8fe14637f8fab7021fb687b7336224bdff382"
+                                                   :executed-at 1795290000000}}
+ :bip/oracle-receipts {:test-suite "bitecho.d38-bip013-observability-defense-and-autoupdate-test"
+                       :d38-tests-run 16
+                       :d38-failures 0
+                       :d38-errors 0
+                       :cljfmt-status :clean
+                       :clj-kondo-errors 0
+                       :clj-kondo-warnings 0
+                       :reproducible-node-bundle-sha256 "3793d4b2b3f1e3d2d3b30c38938dd5c306d127d2c6ffe91fb4fc8cbb7b4e8ce3"
+                       :reproducible-browser-bundle-sha256 "84ab89b1057c68e2d170e26bd02aa245238009fb8b0895d76e7d4ac53291f9f2"
+                       :reproducible-full-node-bundle-sha256 "56b04bcf4c4acd226734cf62a2d8fe14637f8fab7021fb687b7336224bdff382"}
+ :code-artifact {:parent-commit "7891fe4"
+                 :patch-path "dist/bips/bip-013-v02316.patch"
+                 :patch-cid "0f4df18e4ff5053b03d1f11b3536e852d53ad2c2e187d045a9ce76053773cabe"
+                 :patch-size-bytes 185790
+                 :verification-steps ["git checkout 7891fe4"
+                                      "git apply bip-013-v02316.patch"
+                                      "./scripts/build-full-node-bundle.sh && ./scripts/build-node-light-node.sh && ./scripts/build-browser-bundle.sh"
+                                      "clojure -M:test -n bitecho.d38-bip013-observability-defense-and-autoupdate-test"]}
+ :bip/scenarios ["S-D38-1: Instrumentation transparency and budget"
+                 "S-D38-2: Sink failure isolation"
+                 "S-D38-3: Restart accountability drill"
+                 "S-D38-4: DDoS defense drill"
+                 "S-D38-5: Broadcast-after-restart fanout (F-BCAST-1 regression)"
+                 "S-D38-6: Publish-then-fetch consistency (F-ART-1 regression)"
+                 "S-D38-7: Attest fail-closed (F-SADV1-1 regression)"
+                 "S-D38-8: ns1 profile replay (F-SOAK-1)"
+                 "S-D38-9: Light-node pointer auto-update drill (P-UPD-1)"
+                 "S-D38-10: Rule 6 co-commit, CLI flag inventory, and 8-gate admission check"
+                 "S-D38-11: F-EPOCH-1 quorum epoch self-healing & single-Byzantine guard (Simon-directed in-flight amendment 2026-11-20 09:46 CST)"]
+ :bip/pillars
+ {:P-OBS-1 {:title "Core step instrumentation (cljc, sans-IO)"
+            :files ["src/bitecho/observability/core.cljc"]}
+  :P-OBS-2 {:title "Shell log boundary and sequenced sinks (disk / network / IndexedDB)"
+            :files ["src/bitecho/observability/core.cljc"]}
+  :P-OBS-3 {:title "Host and service instrumentation adapters, per node type"
+            :files ["src/bitecho/observability/core.cljc" "src/bitecho/full_node_main.cljs"]}
+  :P-OBS-4 {:title "Network-published telemetry and six-nines accounting"
+            :files ["src/bitecho/observability/core.cljc"]}
+  :P-OBS-5 {:title "F-SOAK-1 interim mitigation (--max-old-space-size=384) & poll-route telemetry"
+            :files ["scripts/run-infra-node.sh" "scripts/run-validator-node.sh" "src/bitecho/full_node_main.cljs"]}
+  :P-OBS-6 {:title "Built-in request defense: throttle, drop, ban (fail2ban-class)"
+            :files ["src/bitecho/defense/core.cljc" "src/bitecho/full_node_main.cljs"]}
+  :P-OBS-7 {:title "Carried findings fixes: F-SADV1-1, F-BCAST-1, F-ART-1, F-EPOCH-1"
+            :files ["src/bitecho/host/core.cljc" "src/bitecho/full_node_main.cljs" "src/bitecho/light_node/core.cljc" "src/bitecho/streamlet/core.cljc"]}
+  :F-EPOCH-1 {:title "Self-healing quorum epoch catch-up in Streamlet + deterministic sorted /accountz EDN"
+              :files ["src/bitecho/streamlet/core.cljc" "src/bitecho/full_node_main.cljs"]}
+  :P-UPD-1 {:title "Light-node pointer auto-update with --pin-version and proxy support"
+            :files ["src/bitecho/deploy/core.cljc" "src/bitecho/node_main.cljs" "scripts/light-node.sh"]}}
+ :bip/human-anchor-sunset 26280}

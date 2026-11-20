@@ -581,4 +581,4 @@
       (is (str/includes? cluster-sh ":ready-threshold 2"))
       (is (str/includes? cluster-sh ":delivery-sample-size 5"))
       (is (str/includes? cluster-sh ":delivery-threshold 4"))
-      (is (contains? #{"0.23.12" "0.23.13" "0.23.14" "0.23.15"} config/version)))))
+      (is (contains? #{"0.23.12" "0.23.13" "0.23.14" "0.23.15" "0.23.16"} config/version)))))

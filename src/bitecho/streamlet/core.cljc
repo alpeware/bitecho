@@ -771,54 +771,168 @@
             {:state (prune-streamlet-state state) :commands commands})
           {:state (prune-streamlet-state state) :commands []})))))
 
+(defn- catchup-corroboration-threshold
+  "Minimum distinct verified committee validators required to corroborate an out-of-horizon
+   epoch jump (`F-EPOCH-1` / `BIP-013`): `f + 1` (at least 2 for N >= 3) so a single Byzantine
+   peer can never jump a node's epoch past `max-epoch-catchup-delta`."
+  [total-nodes]
+  (let [n (max 1 (long total-nodes))
+        f (quot (max 0 (dec n)) 3)]
+    (if (<= n 1) 1 (max 2 (inc f)))))
+
+(defn- valid-quorum-ancestor-epoch
+  "Returns the maximum epoch of any quorum-certified ancestor entry in `ancestors` (verified
+   against the committee validator set), or nil if none has a valid quorum certificate."
+  [state ancestors]
+  (when (seq ancestors)
+    (let [validator-hexes (extract-validator-hexes state)
+          validator-set (set validator-hexes)
+          total-nodes (total-node-count state validator-hexes)
+          q (quorum-threshold total-nodes)]
+      (reduce (fn [best entry]
+                (let [b (:block entry)
+                      votes (or (:votes entry) [])
+                      ep (when (and (map? b) (integer? (:epoch b))) (long (:epoch b)))]
+                  (if (and ep (pos? ep) (>= (count votes) q))
+                    (let [b-hash (hash-block b)
+                          valid-voters
+                          (reduce (fn [acc v]
+                                    (let [vhex (or (:voter-pubkey v) (:voter v))]
+                                      (if (and (string? vhex)
+                                               (contains? validator-set vhex)
+                                               (= b-hash (:block-hash v))
+                                               (= ep (:epoch v))
+                                               (valid-hex-string? (:voter-signature v))
+                                               (verify-vote-signature v (hex->bytes vhex)))
+                                        (conj acc vhex)
+                                        acc)))
+                                  #{}
+                                  votes)]
+                      (if (>= (count valid-voters) q)
+                        (max (or best 0) ep)
+                        best))
+                    best)))
+              nil
+              ancestors))))
+
+(defn- record-out-of-horizon-witness
+  "Pure F-EPOCH-1 helper: records a verified committee sender's out-of-horizon epoch witness and
+   returns `{:jump-to-epoch E-or-nil :state st' :diagnose diag-cmd}`.
+   Uses the `(f+1)`-th highest witnessed epoch so a single Byzantine peer cannot pull `:epoch`
+   ahead of honest validators."
+  [state sender-hex observed-epoch curr-epoch max-delta reason-on-drop ancestors]
+  (let [validator-hexes (extract-validator-hexes state)
+        total-nodes (total-node-count state validator-hexes)
+        threshold (catchup-corroboration-threshold total-nodes)
+        horizon (+ (long curr-epoch) (long max-delta))
+        qc-epoch (valid-quorum-ancestor-epoch state ancestors)
+        prev-witnesses (or (:epoch-catchup-witnesses state) {})
+        validator-set (set validator-hexes)
+        witnesses (if (and sender-hex (contains? validator-set sender-hex))
+                    (assoc prev-witnesses sender-hex (max (long observed-epoch)
+                                                          (long (get prev-witnesses sender-hex 0))))
+                    prev-witnesses)
+        above-horizon (into {} (filter (fn [[_ ep]] (> (long ep) horizon)) witnesses))
+        quorum-epoch (cond
+                       (and qc-epoch (> qc-epoch horizon))
+                       qc-epoch
+
+                       (>= (count above-horizon) threshold)
+                       (let [sorted-desc (vec (sort > (vals above-horizon)))]
+                         (long (nth sorted-desc (dec threshold))))
+
+                       :else nil)]
+    (if quorum-epoch
+      (let [diag {:type :diagnose
+                  :effect :diagnose
+                  :reason :quorum-epoch-catchup
+                  :from-epoch (long curr-epoch)
+                  :to-epoch (long quorum-epoch)
+                  :witness-count (count above-horizon)
+                  :threshold threshold
+                  :qc-backed? (boolean (and qc-epoch (> qc-epoch horizon)))}
+            st' (-> state
+                    (assoc :epoch (max (long curr-epoch) (long quorum-epoch))
+                           :epoch-catchup-witnesses {})
+                    (update-in [:diagnostics :quorum-epoch-catchup] (fnil inc 0)))]
+        {:jump-to-epoch (long quorum-epoch)
+         :state st'
+         :diagnose diag})
+      (let [diag {:type :diagnose
+                  :effect :diagnose
+                  :reason reason-on-drop
+                  :from-epoch (long curr-epoch)
+                  :observed-epoch (long observed-epoch)
+                  :max-delta (long max-delta)
+                  :witness-count (count above-horizon)
+                  :threshold threshold}
+            st' (-> state
+                    (assoc :epoch-catchup-witnesses above-horizon)
+                    (update-in [:diagnostics reason-on-drop] (fnil inc 0)))]
+        {:jump-to-epoch nil
+         :state st'
+         :diagnose diag}))))
+
+(defn- process-in-horizon-propose
+  [state event extra-cmds]
+  (let [block (:block event)
+        state-with-ancestors (if (seq (:ancestors event))
+                               (ingest-verified-ancestors state (:ancestors event))
+                               state)
+        state (update state-with-ancestors :epoch (fn [e] (max (or e 0) (long (:epoch block)))))
+        b-hash (hash-block block)
+        state (-> state
+                  (assoc-in [:blocks b-hash] block)
+                  (record-block-depth b-hash))
+        parent-hash (:parent-hash block)
+        known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
+    (if known-parent?
+      (let [validator-hexes (extract-validator-hexes state)
+            validator-set (set validator-hexes)
+            total-nodes (total-node-count state validator-hexes)
+            eligible-voter? (contains? validator-set (:node-pubkey state))
+            vote (when eligible-voter? (cast-vote state block))
+            local-pk (extract-local-pubkey-bytes state)
+            state (if vote
+                    (-> state
+                        (update :voted-epochs (fnil conj #{}) (:epoch block))
+                        (accumulate-vote vote local-pk total-nodes))
+                    state)
+            state (apply-future-votes state b-hash total-nodes)
+            state (-> state
+                      update-head-hash
+                      finalize-prefix)
+            targets (extract-targets state)
+            commands (cond-> (vec extra-cmds)
+                       vote (conj {:type :send-vote :targets targets :vote vote}))]
+        {:state state :commands commands})
+      (let [future-blocks (get state :future-blocks [])
+            state (-> state
+                      (assoc :future-blocks (conj future-blocks event))
+                      update-head-hash
+                      finalize-prefix)]
+        {:state state :commands (vec extra-cmds)}))))
+
 (defn- handle-propose-event
   "Handles a :receive-propose event: validates proposal fail-closed,
-   enforces epoch bounds, ingests verified quorum ancestors, records block and votes (if in :validators committee)."
+   enforces epoch bounds with F-EPOCH-1 self-healing quorum epoch catch-up,
+   ingests verified quorum ancestors, records block and votes (if in :validators committee)."
   [state event]
   (if-not (valid-block-proposal? state event)
     {:state state :commands []}
     (let [block (:block event)
-          curr-epoch (or (:epoch state) 0)
-          max-delta (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta)]
+          curr-epoch (long (or (:epoch state) 0))
+          max-delta (long (or (:max-epoch-catchup-delta state) max-epoch-catchup-delta))]
       (if (> (long (:epoch block)) (+ curr-epoch max-delta))
-        {:state state :commands []}
-        (let [state-with-ancestors (if (seq (:ancestors event))
-                                     (ingest-verified-ancestors state (:ancestors event))
-                                     state)
-              state (update state-with-ancestors :epoch (fn [e] (max (or e 0) (long (:epoch block)))))
-              b-hash (hash-block block)
-              state (-> state
-                        (assoc-in [:blocks b-hash] block)
-                        (record-block-depth b-hash))
-              parent-hash (:parent-hash block)
-              known-parent? (or (= parent-hash "genesis") (contains? (:blocks state) parent-hash))]
-          (if known-parent?
-            (let [validator-hexes (extract-validator-hexes state)
-                  validator-set (set validator-hexes)
-                  total-nodes (total-node-count state validator-hexes)
-                  eligible-voter? (contains? validator-set (:node-pubkey state))
-                  vote (when eligible-voter? (cast-vote state block))
-                  local-pk (extract-local-pubkey-bytes state)
-                  state (if vote
-                          (-> state
-                              (update :voted-epochs (fnil conj #{}) (:epoch block))
-                              (accumulate-vote vote local-pk total-nodes))
-                          state)
-                  state (apply-future-votes state b-hash total-nodes)
-                  state (-> state
-                            update-head-hash
-                            finalize-prefix)
-                  targets (extract-targets state)
-                  commands (if vote
-                             [{:type :send-vote :targets targets :vote vote}]
-                             [])]
-              {:state state :commands commands})
-            (let [future-blocks (get state :future-blocks [])
-                  state (-> state
-                            (assoc :future-blocks (conj future-blocks event))
-                            update-head-hash
-                            finalize-prefix)]
-              {:state state :commands []})))))))
+        (let [sender-pk (extract-sender-pubkey-bytes state event)
+              sender-hex (when sender-pk (bytes->hex sender-pk))
+              {:keys [jump-to-epoch state diagnose]}
+              (record-out-of-horizon-witness state sender-hex (:epoch block) curr-epoch max-delta
+                                             :proposal-exceeds-catchup-delta (:ancestors event))]
+          (if (and jump-to-epoch (<= (long (:epoch block)) (+ jump-to-epoch max-delta)))
+            (process-in-horizon-propose state event [diagnose])
+            {:state state :commands [diagnose]}))
+        (process-in-horizon-propose state event [])))))
 
 (defn- drain-future-blocks
   "Re-evaluates buffered future block proposals whose parents may now be known."
@@ -863,22 +977,40 @@
             (not (valid-hex-string? sig))
             (not (integer? epoch))
             (not (pos? epoch))
-            (> (long epoch) (+ curr-epoch max-delta))
             (not (verify-vote-signature vote sender-pk)))
       {:state state :commands []}
-      (let [state (update state :epoch (fn [e] (max (or e 0) (long epoch))))]
-        (if (contains? (:blocks state) b-hash)
-          (let [total-nodes (total-node-count state validator-hexes)
-                state (accumulate-vote state vote sender-pk total-nodes)
-                {state :state cmds :commands} (drain-future-blocks state)
-                state (-> state
-                          update-head-hash
-                          finalize-prefix)]
-            {:state state :commands cmds})
-          (let [state (-> (buffer-future-vote state vote sender-pk)
-                          update-head-hash
-                          finalize-prefix)]
-            {:state state :commands []}))))))
+      (if (> (long epoch) (+ (long curr-epoch) (long max-delta)))
+        (let [{:keys [jump-to-epoch state diagnose]}
+              (record-out-of-horizon-witness state sender-hex epoch curr-epoch max-delta
+                                             :vote-exceeds-catchup-delta nil)]
+          (if (and jump-to-epoch (<= (long epoch) (+ jump-to-epoch (long max-delta))))
+            (let [state (update state :epoch (fn [e] (max (or e 0) (long epoch))))]
+              (if (contains? (:blocks state) b-hash)
+                (let [total-nodes (total-node-count state validator-hexes)
+                      state (accumulate-vote state vote sender-pk total-nodes)
+                      {state :state cmds :commands} (drain-future-blocks state)
+                      state (-> state
+                                update-head-hash
+                                finalize-prefix)]
+                  {:state state :commands (into [diagnose] cmds)})
+                (let [state (-> (buffer-future-vote state vote sender-pk)
+                                update-head-hash
+                                finalize-prefix)]
+                  {:state state :commands [diagnose]})))
+            {:state state :commands [diagnose]}))
+        (let [state (update state :epoch (fn [e] (max (or e 0) (long epoch))))]
+          (if (contains? (:blocks state) b-hash)
+            (let [total-nodes (total-node-count state validator-hexes)
+                  state (accumulate-vote state vote sender-pk total-nodes)
+                  {state :state cmds :commands} (drain-future-blocks state)
+                  state (-> state
+                            update-head-hash
+                            finalize-prefix)]
+              {:state state :commands cmds})
+            (let [state (-> (buffer-future-vote state vote sender-pk)
+                            update-head-hash
+                            finalize-prefix)]
+              {:state state :commands []})))))))
 
 (defn handle-streamlet-event
   "Pure state machine reducer for Streamlet BFT nodes.
