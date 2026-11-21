@@ -23,6 +23,7 @@
             [bitecho.shell.identity :as identity]
             [bitecho.shell.light-node :as light-node]
             [bitecho.snapshot.core :as snap]
+            [bitecho.storage.chunk-constants :as chunk-const]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -975,6 +976,50 @@
   ([rt] (tick-runtime! rt (System/currentTimeMillis)))
   ([rt now-ms]
    (submit-event! rt {:type :leader-tick :now-ms now-ms})))
+
+(defn chunk-store-usage
+  "Computes committed and staged-but-unhashed bytes at rest for `rt` (BIP-017a)."
+  [rt]
+  (let [inst (when (:subnet-atom rt) @(:subnet-atom rt))
+        blobs (merge (get-in inst [:data :blobs] {}) (:blobs inst {}))
+        committed (reduce (fn [acc [_ b]]
+                            (let [bs (:blob/bytes b)]
+                              (+ acc (long (cond
+                                             (bytes? bs) (alength ^bytes bs)
+                                             (some? (:blob/size b)) (:blob/size b)
+                                             :else 0)))))
+                          0
+                          blobs)
+        shell-st (when (:shell-atom rt) @(:shell-atom rt))
+        staged (long (or (when (:staged-unhashed-bytes-atom rt) @(:staged-unhashed-bytes-atom rt))
+                         (:staged-unhashed-bytes shell-st)
+                         0))]
+    {:committed-bytes committed
+     :staged-unhashed-bytes staged
+     :bytes-at-rest (+ committed staged)}))
+
+(defn check-chunk-store-quota!
+  "Evaluates BIP-017a chunk store quota for `incoming-bytes` against `:max-chunk-store-bytes`
+   (counting staged-but-unhashed bytes). Records counted `:diagnose` effects on `rt`."
+  [rt config incoming-bytes]
+  (let [{:keys [committed-bytes staged-unhashed-bytes]} (chunk-store-usage rt)
+        max-quota (or (get-in config [:http :max-chunk-store-bytes])
+                      (:max-chunk-store-bytes config)
+                      (get-in (:config rt) [:http :max-chunk-store-bytes])
+                      (:max-chunk-store-bytes (:config rt))
+                      chunk-const/default-infra-chunk-quota-bytes)
+        q-res (chunk-const/evaluate-chunk-quota
+               {:committed-bytes committed-bytes
+                :staged-unhashed-bytes staged-unhashed-bytes
+                :incoming-bytes (long incoming-bytes)
+                :max-quota-bytes max-quota})]
+    (when (and (:shell-atom rt) (seq (:effects q-res)))
+      (doseq [eff (:effects q-res)]
+        (apply-shell-event! (:shell-atom rt)
+                            {:type :diagnose
+                             :reason (:kind eff)
+                             :message (:reason eff)})))
+    q-res))
 
 (defn put-blob!
   "Submits `:put-blob` to `rt` (persisting to `blob-fs` and replicating if `:eager-push`)."

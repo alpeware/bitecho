@@ -1,0 +1,40 @@
+{:bip-id "BIP-017a"
+ :bip/id "BIP-017a"
+ :title "BIP-017a: Chunked Large-Artifact Storage (bitecho/chunk-manifest/v1), BitechoLightNode v1.1.0 Additive Facade, & Safe Blob Headers"
+ :bip/title "BIP-017a: Chunked Large-Artifact Storage (bitecho/chunk-manifest/v1), BitechoLightNode v1.1.0 Additive Facade, & Safe Blob Headers"
+ :version "v0.23.19"
+ :bip/version "0.23.19"
+ :milestone "D43"
+ :bip/milestone "D43"
+ :bip/status :consented
+ :date "2026-11-21"
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :design-input-cid "11a164817e37aeed85c9639f5e5184a658efea92fccc3d9b4219de42c4f28631"
+ :draft-0-cid "015a2735cf9876ee758afd9a7033764b77fef6fd7ed6f8a477351e364685cf47"
+ :twin-circle-trace-cid "b7469480f13c4b7154e385d3bd3a0b9afe1cc17312354668a69a7d285fba7959"
+ :twin-circle-checklist-cid "3307570680b941658437499986bfff3f3094dc44b6ecd4f845767a39fbc859d0"
+ :shaped-spec-cid "fbcfe7bbe91f4738ac8735a66f0ee63e7567f986da512544b5e310143dfc6fde"
+ :ns1-rss-baseline-cid "95e682856a4c9f6a4ca0d79df845ae7b0c2b60585cba7ec0d46f83fe3fe3e416"
+ :vector-chrome-e2e-cid "2c6b8ebb19d29e17570aaa1173c0bedaee10443c2ca518b5d626b60246ef9c2e"
+ :stage2-telemetry-cid "de58b01cb8509dc6c9d3cddbd2cc9b7ef3eebc18fb7b0b51df72af29c1a7c766"
+ :patch-cid "11a8183883b6c42442ebda8d6b6c14caef4886a3f7701c2c71816725e1aba897"
+ :patch-size-bytes 155330
+ :consensus-impact :none
+ :consensus-impact-note "Pure Sans-IO .cljc chunk manifest & fetch reducer, scoped /artifact/v1/blob/<cid> headers & HTTP 507 quota enforcement, additive BitechoLightNode v1.1.0 facade, and Rule 6 CLI parity; zero consensus wire changes. BIP-017b (Hive UI cutover) stays gated on 017a's 144-epoch soak."
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :note "Real Stage 1 CONSENT (13:46 CST) + Real Stage 2 CONSENT (14:16 CST) on patch v2 (11a81838...) + v2 telemetry (de58b01c...) + Chrome E2E (2c6b8ebb...)"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8" :note "Real Stage 1 CONSENT (seq 237; ACAO:* scoped strictly to /artifact/v1/blob/<cid> honored) + Real Stage 2 CONSENT (seq 243, patch v2 + v2 telemetry SHA-verified firsthand)"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62" :note "5-seat twin-circle sim + Real Stage 1 CONSENT (seq 83) + Headless Chrome 156 af_heart 64 KiB 50% corrupt+resume E2E (2c6b8ebb...) + independent patch v2 build-browser-bundle.sh EXIT 0 + Real Stage 2 CONSENT (seq 86)"}
+                   {:agent "lumen" :role :steward :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de" :note "Real Stage 1 CONSENT (seq 14/12) + Real Stage 2 CONSENT (seq 14/15, patch v2 + telemetry + Chrome E2E SHA-verified)"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc" :note "Real Stage 1 CONSENT + disposable-branch strict-TDD implementation + Real Stage 2 CONSENT (5/5 closed)"}]
+ :invariant-diff {:defspec-vars ["bitecho.storage.chunk-fetch-test/prop-cap-clamp-never-exceeds-ceiling"
+                                 "bitecho.storage.chunk-fetch-test/prop-jcs-manifest-cid-deterministic"
+                                 "bitecho.storage.chunk-fetch-test/prop-chunk-fetch-model-command-sequence"]
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:status :pass :note "Byte-identical JVM == CLJS RFC 8785 JCS manifest-cid + detached owner envelope + state/effect traces across 11 tests / 119 assertions"}
+                   :vopr-jepsen-non-vacuity {:status :pass :note "58 JVM targeted tests / 993 assertions + 254 CLJS Node.js tests / 2,191 assertions, 0 failures, 0 lint warnings"}
+                   :deterministic-bundle-sha256 {:status :pass :note "./scripts/build-browser-bundle.sh EXIT 0: 100% 2-build reproducible dist/bitecho-browser.js (1,585,357 B, :output-wrapper true), all v1.1.0 + pure-browser smoke assertions PASSED"}
+                   :bwrap-civilization-regression {:status :pass :note "Headless Chrome 156 af_heart.safetensors (522,320 B, 8 x 64 KiB, concurrency=3) 50% corrupt-chunk #4 recovery & resume bit-exact (JS heap delta 0.838 MiB, telemetry 2c6b8ebb...)"}}
+ :open-findings []}

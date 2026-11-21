@@ -11,8 +11,8 @@
             [clojure.string :as str]))
 
 (def api-version
-  "Headless Browser Light Node API contract version (D40.4)."
-  "1.0.0")
+  "Headless Browser Light Node API contract version (D40.4 v1.0.0 + BIP-017a v1.1.0 additive facade)."
+  "1.1.0")
 
 ;; =============================================================================
 ;; 1. Browser Verb Parity Inventory (Rule 6)
@@ -66,6 +66,7 @@
                      canonical (or (get-in cli/legacy-verb-desugar-table [verb :canonical])
                                    (get-in cli/runner-alias-desugar-table [verb :canonical])
                                    (get-in cli/memento-verb-desugar-table [verb :canonical])
+                                   (get-in cli/chunked-artifact-verb-desugar-table [verb :canonical])
                                    (when (contains? cli/canonical-cli-verbs-set verb) verb)
                                    verb)]
                  [verb (cond-> {:verb verb
@@ -211,6 +212,16 @@
                  "await BitechoLightNode.sendMessage(sessionId, text)"
                  "await BitechoLightNode.sendBroadcast(subnetId, text)"
                  "await BitechoLightNode.getArtifact({cid})"
+                 "await BitechoLightNode.getChunkedArtifact(manifestCid, {concurrency, mirrors, onProgress})"
+                 "await BitechoLightNode.openChannel(callee)"
+                 "await BitechoLightNode.openSession(peer, opts)"
+                 "await BitechoLightNode.acceptOffer(offer)"
+                 "await BitechoLightNode.approveOffer(offerId, opts)"
+                 "await BitechoLightNode.denyOffer(offerId, reason)"
+                 "await BitechoLightNode.listPendingOffers()"
+                 "await BitechoLightNode.registerYubiKey(opts)"
+                 "await BitechoLightNode.recoverYubiKey(opts)"
+                 "await BitechoLightNode.saveIdentity()"
                  "await BitechoLightNode.status()"
                  "await BitechoLightNode.p2pChannelState({sessionId, connected})"
                  "await BitechoLightNode.exec(\"petname-list\", {})"

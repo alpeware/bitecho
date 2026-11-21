@@ -68,6 +68,7 @@
             [bitecho.state-machine-portability-test]
             [bitecho.state-machine-test]
             [bitecho.state-machine-ttl-test]
+            [bitecho.storage.chunk-fetch-test]
             [bitecho.streamlet.core-test]
             [bitecho.streamlet.fuzz-test]
             [bitecho.stress-e2e-test]

@@ -77,12 +77,13 @@ Every flag in `bitecho.light-node.cli/known-command-flags` is automatically veri
 | **Economy & Escrows** | `--amount`, `--burn`, `--min-balance`, `--price`, `--price-max` |
 | **Artifacts, Directory & Governance** | `--path`, `--cid`, `--file`, `--hex`, `--authority`, `--prefix`, `--nickname`, `--name`, `--domain`, `--bip-cid`, `--invariant-diff-edn`, `--jurisdiction-map`, `--human-anchor-sunset` |
 | **BIP-016 Rolodex & Memento (`rolodex-*`, `memento-*`)** | `--node-role`, `--retention-max-entries`, `--retention-max-bytes`, `--rotate-every`, `--grace-epochs`, `--lkg-cid`, `--walk-depth-cap`, `--owner-pubkey`, `--cache-incentive` |
+| **BIP-017a Chunked Large-Artifact Storage (`artifact-put-chunked`, `artifact-get-chunked`, `artifact-manifest-verify`)** | `--chunk-size`, `--concurrency`, `--resume-dir`, `--grace-epochs`, `--max-bytes` |
 
 ---
 
-## 4. Browser Console CLI Parity (`window.BitechoLightNode` — Shipped in `D40.3`)
+## 4. Browser Console CLI Parity & `BitechoLightNode` v1.1.0 (`D40.3` / `D40.4` / `BIP-017a`)
 
-In the browser web app (`dist/bitecho-browser.js`), `bitecho.browser-cli` derives its verb inventory directly from `bitecho.light-node.cli/all-recognized-cli-verbs-set` and exposes every supported verb on `window.BitechoLightNode` as camelCase async methods (plus `.cli("...")`, `.exec(verb, params)`, `.help([verb])`, `.peers()`, and `.verbs()`):
+In the browser web app (`dist/bitecho-browser.js`), `bitecho.browser-cli` derives its verb inventory directly from `bitecho.light-node.cli/all-recognized-cli-verbs-set` and exposes every supported verb on `window.BitechoLightNode` as camelCase async methods (plus `apiVersion: "1.1.0"`, `.getStatus()` including `pendingOffers`, `.onEvent(fn)`, `.openChannel`, `.openSession`, `.acceptOffer`, `.approveOffer`, `.denyOffer`, `.listPendingOffers`, `.registerYubiKey`, `.recoverYubiKey`, `.saveIdentity`, `.getChunkedArtifact(manifestCid, opts)`, `.cli("...")`, `.exec(verb, params)`, `.help([verb])`, `.peers()`, and `.verbs()`):
 
 ```javascript
 // Inspect status & multi-peer WebRTC mesh diagnostics

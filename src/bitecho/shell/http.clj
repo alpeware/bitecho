@@ -23,6 +23,7 @@
             [bitecho.shell.infra :as infra]
             [bitecho.shell.light-node :as light-node]
             [bitecho.shell.mesh :as mesh]
+            [bitecho.storage.chunk-constants :as chunk-const]
             [clojure.core.async :as async]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -2066,14 +2067,18 @@
                          {:response/status 405
                           :response/headers {"Allow" "POST" "Content-Type" "application/json; charset=utf-8"}
                           :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
-          (let [max-blob (long (or (get-in config [:http :max-artifact-blob-bytes]) 16777216))
+          (let [req-max (long (or (get-in config [:http :max-artifact-blob-bytes])
+                                  chunk-const/max-chunk-bytes))
+                clamp-res (chunk-const/clamp-cap :max-chunk-bytes chunk-const/max-chunk-bytes req-max)
+                max-blob (:value clamp-res)
                 [body-bytes body-exceeded?] (with-open [is (.getRequestBody exchange)]
                                               (read-body-bounded is max-blob))]
             (if body-exceeded?
               (send-response exchange
                              {:response/status 413
                               :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                              :response/body (json/write-str {"ok" false "error" "payload-too-large"})})
+                              :response/body (json/write-str {"ok" false "error" "payload-too-large"
+                                                              "max_chunk_bytes" max-blob})})
               (let [ct (first (get (:request/headers req) :header/content-type ""))
                     header-cid (first (get (:request/headers req) :header/x-bitecho-blob-cid))
                     parsed-json (when (and body-bytes
@@ -2089,6 +2094,7 @@
                     blob-res (if parsed-json
                                (normalize-artifact-blob parsed-json)
                                (normalize-artifact-blob {:bytes (or body-bytes (byte-array 0))
+                                                         :media-type (if (str/blank? (str ct)) "application/octet-stream" (str ct))
                                                          :cid header-cid}))]
                 (if-not (:ok? blob-res)
                   (send-response exchange
@@ -2097,19 +2103,53 @@
                                   :response/body (json/write-str {"ok" false
                                                                   "error" (name (or (:error blob-res) :invalid-blob))})})
                   (let [blob (:blob blob-res)
-                        sender (or (first (get (:request/headers req) :header/x-bitecho-pubkey))
-                                   (:default-sender target-rt))]
-                    (infra/submit-event! target-rt
-                                         {:type :put-blob
-                                          :blob blob
-                                          :sender sender
-                                          :now-ms now-ms})
-                    (send-response exchange
-                                   {:response/status 200
-                                    :response/headers {"Content-Type" "application/json; charset=utf-8"}
-                                    :response/body (json/write-str {"ok" true
-                                                                    "cid" (:blob/cid blob)
-                                                                    "size_bytes" (alength ^bytes (:blob/bytes blob))})})))))))
+                        blob-len (alength ^bytes (:blob/bytes blob))
+                        quota-res (infra/check-chunk-store-quota! target-rt config blob-len)]
+                    (if-not (:ok? quota-res)
+                      (send-response exchange
+                                     {:response/status 507
+                                      :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                      :response/body (json/write-str {"ok" false
+                                                                      "error" "chunk-store-quota-exceeded"
+                                                                      "bytes_at_rest" (:bytes-at-rest quota-res)
+                                                                      "quota_bytes" (:quota-bytes quota-res)})})
+                      (let [sender (or (first (get (:request/headers req) :header/x-bitecho-pubkey))
+                                       (:default-sender target-rt))]
+                        (infra/submit-event! target-rt
+                                             {:type :put-blob
+                                              :blob blob
+                                              :sender sender
+                                              :now-ms now-ms})
+                        (send-response exchange
+                                       {:response/status 200
+                                        :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                                        :response/body (json/write-str {"ok" true
+                                                                        "cid" (:blob/cid blob)
+                                                                        "size_bytes" blob-len})})))))))))
+
+        (str/starts-with? clean-path "/artifact/v1/blob/")
+        (if-not (or (= method :GET) (= method :HEAD))
+          (send-response exchange
+                         {:response/status 405
+                          :response/headers {"Allow" "GET, HEAD" "Content-Type" "application/json; charset=utf-8"}
+                          :response/body (json/write-str {"ok" false "error" "method-not-allowed"})})
+          (let [cid (subs clean-path (count "/artifact/v1/blob/"))
+                res (infra/resolve-cid-blob! target-rt cid)]
+            (if (:ok? res)
+              (let [b (:blob res)
+                    bs ^bytes (:blob/bytes b)
+                    hdrs (chunk-const/safe-blob-response-headers
+                          {:cid (:blob/cid b)
+                           :content-type (or (:blob/media-type b) "application/octet-stream")
+                           :content-length (alength bs)})]
+                (send-response exchange
+                               {:response/status 200
+                                :response/headers hdrs
+                                :response/body (if (= method :HEAD) nil bs)}))
+              (send-response exchange
+                             {:response/status 404
+                              :response/headers {"Content-Type" "application/json; charset=utf-8"}
+                              :response/body (json/write-str {"ok" false "error" "blob-not-found" "cid" cid})}))))
 
         (= clean-path "/artifact/v1/pointer")
         (if-not (= method :POST)

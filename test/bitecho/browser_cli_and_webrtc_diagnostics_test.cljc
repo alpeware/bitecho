@@ -496,8 +496,8 @@
                           (:urls plan))))))
 
 (deftest test-d40-4-headless-browser-api-contract
-  (testing "Pure API version constant and fail-closed artifact/messaging edge cases"
-    (is (= "1.0.0" browser-cli/api-version))
+  (testing "Pure API version constant (v1.1.0 additive over v1.0.0) and fail-closed artifact/messaging edge cases"
+    (is (= "1.1.0" browser-cli/api-version))
     (is (false? (:ok? (browser-cli/normalize-send-message-args "" "hello"))))
     (is (false? (:ok? (browser-cli/normalize-send-message-args "sess-1" nil))))
     (is (false? (:ok? (browser-cli/normalize-send-broadcast-args "" "hello"))))
@@ -511,16 +511,42 @@
       (is (false? (:ok? bad-path)))
       (is (= :invalid-artifact-path (:error bad-path)))
       (is (true? (:ok? sub-plan)))
-      (is (= ["https://custom.bitecho.org/hive/voicepacks/en.bin"] (:urls sub-plan)))))
+      (is (= ["https://custom.bitecho.org/hive/voicepacks/en.bin"] (:urls sub-plan))))
+    ;; BIP-017a CLI verbs & flags inventory check (Rule 6)
+    (doseq [v ["artifact-put-chunked" "artifact-get-chunked" "artifact-manifest-verify"]]
+      (is (contains? cli/all-recognized-cli-verbs-set v))
+      (is (contains? browser-cli/browser-cli-verb-inventory v))
+      (is (= :supported (get-in browser-cli/browser-cli-verb-inventory [v :support]))))
+    (doseq [f ["--chunk-size" "--concurrency" "--resume-dir" "--grace-epochs" "--max-bytes"]]
+      (is (some #{f} cli/known-command-flags)))
+    (let [put-cmd (cli/build-cmd-map "artifact-put-chunked"
+                                     ["--file" "af_heart.bin" "--chunk-size" "65536"
+                                      "--concurrency" "2" "--grace-epochs" "4" "--max-bytes" "523264"])
+          get-cmd (cli/build-cmd-map "artifact-get-chunked"
+                                     ["--cid" (apply str (repeat 64 "a")) "--resume-dir" "/tmp/r"
+                                      "--concurrency" "3" "--max-bytes" "523264"])
+          ver-cmd (cli/build-cmd-map "artifact-manifest-verify"
+                                     ["--cid" (apply str (repeat 64 "b")) "--grace-epochs" "4"])]
+      (is (= "artifact-put-chunked" (get put-cmd "cmd")))
+      (is (= 65536 (get put-cmd "chunk_size")))
+      (is (= 2 (get put-cmd "concurrency")))
+      (is (= 4 (get put-cmd "grace_epochs")))
+      (is (= 523264 (get put-cmd "max_bytes")))
+      (is (= "artifact-get-chunked" (get get-cmd "cmd")))
+      (is (= "/tmp/r" (get get-cmd "resume_dir")))
+      (is (= 3 (get get-cmd "concurrency")))
+      (is (= "artifact-manifest-verify" (get ver-cmd "cmd")))
+      (is (= 4 (get ver-cmd "grace_epochs")))))
 
   #?(:cljs
-     (testing "CLJS runtime: BitechoLightNode v1.0.0 exposes all additive methods, apiVersion, and error-isolated onEvent"
+     (testing "CLJS runtime: BitechoLightNode v1.1.0 exposes all v1.0.0 + v1.1.0 additive methods, apiVersion, and error-isolated onEvent"
        (let [na (browser-main/init-node {:peer-id "cljs-d40-4-node"})
              ln (aget js/globalThis "BitechoLightNode")
              received (atom [])
              unsub-bad ((aget ln "onEvent") (fn [_ev] (throw (js/Error. "boom-listener"))))
              unsub-good ((aget ln "onEvent") (fn [ev] (swap! received conj ev)))]
-         (is (= "1.0.0" (aget ln "apiVersion")))
+         (is (= "1.1.0" (aget ln "apiVersion")))
+         ;; v1.0.0 backwards-compatible contract
          (is (fn? (aget ln "getStatus")))
          (is (fn? (aget ln "onEvent")))
          (is (fn? (aget ln "listPetnames")))
@@ -530,6 +556,17 @@
          (is (fn? (aget ln "sendMessage")))
          (is (fn? (aget ln "sendBroadcast")))
          (is (fn? (aget ln "getArtifact")))
+         ;; v1.1.0 additive facade methods (BIP-017a)
+         (is (fn? (aget ln "openChannel")))
+         (is (fn? (aget ln "openSession")))
+         (is (fn? (aget ln "acceptOffer")))
+         (is (fn? (aget ln "approveOffer")))
+         (is (fn? (aget ln "denyOffer")))
+         (is (fn? (aget ln "listPendingOffers")))
+         (is (fn? (aget ln "registerYubiKey")))
+         (is (fn? (aget ln "recoverYubiKey")))
+         (is (fn? (aget ln "saveIdentity")))
+         (is (fn? (aget ln "getChunkedArtifact")))
          (is (fn? unsub-bad))
          (is (fn? unsub-good))
          ;; Emit a normalized event; throwing listener must not break subsequent listener

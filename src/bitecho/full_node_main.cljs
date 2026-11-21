@@ -34,6 +34,7 @@
             [bitecho.observability.core :as obs]
             [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
+            [bitecho.storage.chunk-constants :as chunk-const]
             [cljs.reader :as edn]
             [clojure.string :as str]
             [datachannel.api :as api]
@@ -1148,38 +1149,65 @@
       (= clean-path "/artifact/v1/blob")
       (if (not= method "POST")
         (send-json! res 405 {:ok false :error "method-not-allowed"})
-        (read-req-body-bounded!
-         req (long (or (get-in (:config rt) [:http :max-artifact-blob-bytes]) 16777216))
-         (fn [body-buf exceeded?]
-           (if exceeded?
-             (send-json! res 413 {:ok false :error "payload-too-large"})
-             (let [ct (str (or (get-header req "content-type") ""))
-                   hdr-cid (get-header req "x-bitecho-blob-cid")
-                   parsed-json (when (and body-buf (pos? (.-length body-buf))
-                                          (or (str/includes? (str/lower-case ct) "application/json")
-                                              (= 0x7B (aget body-buf 0))))
-                                 (try
-                                   (let [m (js->clj (js/JSON.parse (.toString body-buf "utf8")))]
-                                     (when (and (map? m) (some #(contains? m %) ["bytes_hex" "bytes-hex" "data" "bytes" "blob"]))
-                                       (or (get m "blob") m)))
-                                   (catch :default _ nil)))
-                   blob-res (if parsed-json
-                              (core-infra/normalize-artifact-blob parsed-json)
-                              (core-infra/normalize-artifact-blob {:bytes (buf->u8 (or body-buf (.alloc js/Buffer 0)))
-                                                                   :media-type (if (str/blank? ct) "application/octet-stream" ct)
-                                                                   :cid hdr-cid}))]
-               (if-not (:ok? blob-res)
-                 (send-json! res 400 {:ok false :error (name (or (:error blob-res) :invalid-blob))})
-                 (let [blob (:blob blob-res)
-                       sender (or (get-header req "x-bitecho-pubkey") (:default-sender rt))]
-                   (submit-subnet-event! rt {:type :put-blob
-                                             :blob blob
-                                             :sender sender
-                                             :now-ms now-ms
-                                             :from-peer? replicated?})
-                   (send-json! res 200 {:ok true
-                                        :cid (:blob/cid blob)
-                                        :size_bytes (fressian/count-bytes (:blob/bytes blob))}))))))))
+        (let [req-max (long (or (get-in (:config rt) [:http :max-artifact-blob-bytes])
+                                chunk-const/max-chunk-bytes))
+              max-blob (:value (chunk-const/clamp-cap :max-chunk-bytes chunk-const/max-chunk-bytes req-max))]
+          (read-req-body-bounded!
+           req max-blob
+           (fn [body-buf exceeded?]
+             (if exceeded?
+               (send-json! res 413 {:ok false :error "payload-too-large" :max_chunk_bytes max-blob})
+               (let [ct (str (or (get-header req "content-type") ""))
+                     hdr-cid (get-header req "x-bitecho-blob-cid")
+                     parsed-json (when (and body-buf (pos? (.-length body-buf))
+                                            (or (str/includes? (str/lower-case ct) "application/json")
+                                                (= 0x7B (aget body-buf 0))))
+                                   (try
+                                     (let [m (js->clj (js/JSON.parse (.toString body-buf "utf8")))]
+                                       (when (and (map? m) (some #(contains? m %) ["bytes_hex" "bytes-hex" "data" "bytes" "blob"]))
+                                         (or (get m "blob") m)))
+                                     (catch :default _ nil)))
+                     blob-res (if parsed-json
+                                (core-infra/normalize-artifact-blob parsed-json)
+                                (core-infra/normalize-artifact-blob {:bytes (buf->u8 (or body-buf (.alloc js/Buffer 0)))
+                                                                     :media-type (if (str/blank? ct) "application/octet-stream" ct)
+                                                                     :cid hdr-cid}))]
+                 (if-not (:ok? blob-res)
+                   (send-json! res 400 {:ok false :error (name (or (:error blob-res) :invalid-blob))})
+                   (let [blob (:blob blob-res)
+                         blob-len (fressian/count-bytes (:blob/bytes blob))
+                         inst @(:subnet-atom rt)
+                         blobs (merge (get-in inst [:data :blobs] {}) (:blobs inst {}))
+                         committed (reduce (fn [acc [_ b]]
+                                             (+ acc (long (or (when (:blob/bytes b) (fressian/count-bytes (:blob/bytes b)))
+                                                              (:blob/size b)
+                                                              0))))
+                                           0
+                                           blobs)
+                         staged (long (or (when (:staged-unhashed-bytes-atom rt) @(:staged-unhashed-bytes-atom rt))
+                                          0))
+                         max-quota (or (get-in (:config rt) [:http :max-chunk-store-bytes])
+                                       (:max-chunk-store-bytes (:config rt))
+                                       chunk-const/default-infra-chunk-quota-bytes)
+                         quota-res (chunk-const/evaluate-chunk-quota
+                                    {:committed-bytes committed
+                                     :staged-unhashed-bytes staged
+                                     :incoming-bytes blob-len
+                                     :max-quota-bytes max-quota})]
+                     (if-not (:ok? quota-res)
+                       (send-json! res 507 {:ok false
+                                            :error "chunk-store-quota-exceeded"
+                                            :bytes_at_rest (:bytes-at-rest quota-res)
+                                            :quota_bytes (:quota-bytes quota-res)})
+                       (let [sender (or (get-header req "x-bitecho-pubkey") (:default-sender rt))]
+                         (submit-subnet-event! rt {:type :put-blob
+                                                   :blob blob
+                                                   :sender sender
+                                                   :now-ms now-ms
+                                                   :from-peer? replicated?})
+                         (send-json! res 200 {:ok true
+                                              :cid (:blob/cid blob)
+                                              :size_bytes blob-len})))))))))))
 
       (str/starts-with? clean-path "/artifact/v1/blob/")
       (if-not (contains? #{"GET" "HEAD"} method)
@@ -1190,11 +1218,12 @@
            (fn [r]
              (if (:ok? r)
                (let [b (:blob r)
-                     buf (u8->buf (:blob/bytes b))]
-                 (.writeHead res 200 #js {"Content-Type" (or (:blob/media-type b) "application/octet-stream")
-                                          "Content-Length" (.-length buf)
-                                          "ETag" (str "\"" (:blob/cid b) "\"")
-                                          "X-Bitecho-Blob-Cid" (:blob/cid b)})
+                     buf (u8->buf (:blob/bytes b))
+                     hdrs (chunk-const/safe-blob-response-headers
+                           {:cid (:blob/cid b)
+                            :content-type (or (:blob/media-type b) "application/octet-stream")
+                            :content-length (.-length buf)})]
+                 (.writeHead res 200 (clj->js hdrs))
                  (if (= method "HEAD") (.end res) (.end res buf)))
                (send-json! res 404 {:ok false :error "blob-not-found" :cid cid}))))))
 

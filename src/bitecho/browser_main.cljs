@@ -14,6 +14,8 @@
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
             [bitecho.shell.browser :as browser]
+            [bitecho.storage.chunk-constants :as chunk-const]
+            [bitecho.storage.chunk-fetch :as chunk-fetch]
             [bitecho.webauthn :as webauthn]
             [cljs.reader :as edn]
             [clojure.string :as str]
@@ -2774,6 +2776,7 @@
          (gobj/set st-js "finalizedEpoch" fin-epoch)
          (gobj/set st-js "lastError" (when diag-js (gobj/get diag-js "lastError")))
          (gobj/set st-js "dropped" (if diag-js (gobj/get diag-js "dropped") 0))
+         (gobj/set st-js "pendingOffers" (clj->js (redact-for-js (or (:pending-offers light-st) {}))))
          (js/Promise.resolve st-js))))))
 
 (defn list-petnames-v1
@@ -3124,13 +3127,335 @@
                                    (try-url! (inc idx) (str (or (when err (.-message err)) err "fetch-error")))))))))]
            (try-url! 0 nil)))))))
 
+(defn list-pending-offers-v11
+  "BIP-017a v1.1.0: Returns a Promise resolving to `{ ok: true, pendingOffers: [...] }`."
+  ([] (list-pending-offers-v11 nil))
+  ([opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized" "pendingOffers" #js []})
+       (let [pending (or (get-in @na [:light-state :pending-offers]) {})
+             entries (mapv (fn [[k v]]
+                             (let [m (if (map? v) v {:offer v})]
+                               (assoc m :offerId (str (or (:offer-id m) (:session-id m) k)))))
+                           pending)]
+         (js/Promise.resolve #js {"ok" true
+                                  "pendingOffers" (clj->js (redact-for-js entries))}))))))
+
+(defn open-channel-v11
+  "BIP-017a v1.1.0: Opens a payment/messaging channel to `callee` and returns a Promise."
+  ([callee] (open-channel-v11 callee nil))
+  ([callee opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)
+         price (long (or (:price opts-clj) (get opts-clj "price") 10))
+         deposit (long (or (:deposit opts-clj) (get opts-clj "deposit") 500))]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized"})
+       (js/Promise.resolve (open-channel na callee price deposit))))))
+
+(defn open-session-v11
+  "BIP-017a v1.1.0: Opens an encrypted session/channel with `peer` and returns a Promise."
+  ([peer] (open-session-v11 peer nil))
+  ([peer opts]
+   (open-channel-v11 peer opts)))
+
+(defn accept-offer-v11
+  "BIP-017a v1.1.0: Accepts an inbound channel offer and returns a Promise."
+  ([offer] (accept-offer-v11 offer nil))
+  ([offer opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized"})
+       (js/Promise.resolve (accept-offer na offer))))))
+
+(defn approve-offer-v11
+  "BIP-017a v1.1.0: Approves a pending offer by `offerId` and returns a Promise."
+  ([offer-id] (approve-offer-v11 offer-id nil))
+  ([offer-id opts]
+   (js/Promise.resolve (approve-offer-cmd offer-id opts))))
+
+(defn deny-offer-v11
+  "BIP-017a v1.1.0: Denies a pending offer by `offerId` with optional `reason` and returns a Promise."
+  ([offer-id] (deny-offer-v11 offer-id "user-denied"))
+  ([offer-id reason]
+   (js/Promise.resolve (deny-offer-cmd offer-id reason))))
+
+(defn register-yubikey-v11
+  "BIP-017a v1.1.0: Registers a WebAuthn / YubiKey hardware anchor and returns a Promise."
+  ([] (register-yubikey-v11 nil))
+  ([opts]
+   (js/Promise.resolve (register-yubikey opts))))
+
+(defn recover-yubikey-v11
+  "BIP-017a v1.1.0: Recovers identity from a WebAuthn / YubiKey hardware anchor and returns a Promise."
+  ([] (recover-yubikey-v11 nil))
+  ([opts]
+   (js/Promise.resolve (recover-from-yubikey opts))))
+
+(defn save-identity-v11
+  "BIP-017a v1.1.0: Explicitly persists sanitized active node identity & state to IndexedDB."
+  ([] (save-identity-v11 nil))
+  ([opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized"})
+       (let [node @na
+             pk (get-in node [:light-state :pubkey])]
+         (browser/persist-state! (browser/sanitize-state-for-persistence node))
+         (js/Promise.resolve #js {"ok" true "pubkey" pk}))))))
+
+(defn- concat-uint8-arrays
+  "Concatenates a vector of Uint8Arrays into a single Uint8Array."
+  [chunks-vec total-bytes]
+  (let [out (js/Uint8Array. (long total-bytes))]
+    (loop [idx 0
+           offset 0]
+      (if (< idx (count chunks-vec))
+        (let [^js/Uint8Array arr (nth chunks-vec idx)]
+          (.set out arr offset)
+          (recur (inc idx) (+ offset (.-length arr))))
+        out))))
+
+(defn get-chunked-artifact-v11
+  "BIP-017a v1.1.0: Fetches, verifies per-chunk SHA-256, and streams incremental SHA-256
+   for a chunked large artifact identified by `manifestCid` using the pure Sans-IO
+   `bitecho.storage.chunk-fetch` state machine.
+   Supports `opts`:
+   - `mirrors` / `baseUrls` (default `browser-cli/default-artifact-base-urls`)
+   - `concurrency` (clamped to `chunk-const/max-fetch-concurrency-940mb`)
+   - `maxBytes` (optional hard total-bytes cap)
+   - `manifest` (optional pre-fetched manifest map/object)
+   - `envelope` (optional detached owner envelope for signature verification)
+   - `fetchFn` (optional custom `(fn [url] -> Promise<Response>)` for testing)."
+  ([manifest-cid] (get-chunked-artifact-v11 manifest-cid nil))
+  ([manifest-cid opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)
+         raw-cid (str/lower-case (str/trim (str (or manifest-cid ""))))
+         mirrors (vec (or (:mirrors opts-clj)
+                          (get opts-clj "mirrors")
+                          (:base-urls opts-clj)
+                          (get opts-clj "baseUrls")
+                          browser-cli/default-artifact-base-urls))
+         fetch-fn (or (:fetch-fn opts-clj)
+                      (get opts-clj "fetchFn")
+                      (when (exists? js/fetch) js/fetch))
+         concurrency (long (or (:concurrency opts-clj)
+                               (get opts-clj "concurrency")
+                               chunk-const/default-fetch-concurrency))
+         max-bytes (or (:max-bytes opts-clj) (get opts-clj "maxBytes"))
+         pre-manifest (or (:manifest opts-clj) (get opts-clj "manifest"))
+         envelope (or (:envelope opts-clj) (get opts-clj "envelope"))
+         emit-diag! (fn [d]
+                      (when (and na @na)
+                        (emit-browser-event! na (assoc d :type "diagnose" :timestamp-ms (.now js/Date)))))]
+     (if-not (re-matches #"^[0-9a-f]{64}$" raw-cid)
+       (do
+         (emit-diag! {:kind :invalid-cid :reason (str "invalid-manifest-cid:" raw-cid)})
+         (js/Promise.resolve #js {"ok" false "error" "invalid-cid" "manifestCid" raw-cid}))
+       (let [load-manifest-promise
+             (if (some? pre-manifest)
+               (js/Promise.resolve {:ok? true :manifest (if (map? pre-manifest) pre-manifest (js->clj pre-manifest))})
+               (if-not fetch-fn
+                 (js/Promise.resolve {:ok? false :error "fetch-unavailable"})
+                 (js/Promise.
+                  (fn [resolve _reject]
+                    (letfn [(try-m [idx last-err]
+                              (if (>= idx (count mirrors))
+                                (resolve {:ok? false :error (or last-err "manifest-fetch-failed")})
+                                (let [url (str (str/replace (nth mirrors idx) #"/+$" "") "/artifact/v1/blob/" raw-cid)]
+                                  (-> (fetch-fn url)
+                                      (.then (fn [resp]
+                                               (if (and resp (.-ok resp))
+                                                 (-> (.json resp)
+                                                     (.then (fn [j] (resolve {:ok? true :manifest (js->clj j)})))
+                                                     (.catch (fn [e] (try-m (inc idx) (str e)))))
+                                                 (try-m (inc idx) (str "http-" (when resp (.-status resp)))))))
+                                      (.catch (fn [e] (try-m (inc idx) (str e))))))))]
+                      (try-m 0 nil))))))]
+         (.then
+          load-manifest-promise
+          (fn [mres]
+            (if-not (:ok? mres)
+              (js/Promise.resolve #js {"ok" false "error" (str (:error mres)) "manifestCid" raw-cid})
+              (let [manifest (:manifest mres)
+                    val-res (chunk-const/validate-manifest manifest (cond-> {} (some? max-bytes) (assoc :max-bytes max-bytes)))
+                    env-res (when (and (:ok? val-res) (some? envelope))
+                              (chunk-const/verify-detached-owner-envelope (:manifest val-res)
+                                                                          (if (map? envelope) envelope (js->clj envelope :keywordize-keys true))))]
+                (cond
+                  (not (:ok? val-res))
+                  (do
+                    (doseq [e (:effects val-res)] (emit-diag! e))
+                    (js/Promise.resolve #js {"ok" false
+                                             "error" (name (:error val-res))
+                                             "manifestCid" raw-cid}))
+
+                  (not= raw-cid (:manifest-cid val-res))
+                  (do
+                    (emit-diag! {:kind :manifest-cid-mismatch :expected raw-cid :actual (:manifest-cid val-res)})
+                    (js/Promise.resolve #js {"ok" false
+                                             "error" "manifest-cid-mismatch"
+                                             "manifestCid" raw-cid
+                                             "actualCid" (:manifest-cid val-res)}))
+
+                  (and (some? env-res) (not (:ok? env-res)))
+                  (do
+                    (doseq [e (:effects env-res)] (emit-diag! e))
+                    (js/Promise.resolve #js {"ok" false
+                                             "error" (name (:error env-res))
+                                             "manifestCid" raw-cid}))
+
+                  (nil? fetch-fn)
+                  (js/Promise.resolve #js {"ok" false "error" "fetch-unavailable" "manifestCid" raw-cid})
+
+                  :else
+                  (let [init-res (chunk-fetch/init-fetch-state {:manifest (:manifest val-res)
+                                                                :mirrors mirrors
+                                                                :concurrency concurrency
+                                                                :max-bytes max-bytes})]
+                    (if-not (:ok? init-res)
+                      (js/Promise.resolve #js {"ok" false "error" (name (:error init-res)) "manifestCid" raw-cid})
+                      (js/Promise.
+                       (fn [resolve _reject]
+                         (let [st-atom (atom (:state init-res))
+                               staged-bytes-atom (atom {})
+                               ordered-chunks-atom (atom [])
+                               done-atom (atom false)]
+                           (letfn [(finish! [res-obj]
+                                     (when-not @done-atom
+                                       (reset! done-atom true)
+                                       (resolve res-obj)))
+                                   (run-effects! [effs]
+                                     (doseq [eff effs]
+                                       (when-not @done-atom
+                                         (case (:type eff)
+                                           :diagnose
+                                           (emit-diag! eff)
+
+                                           :emit
+                                           (cond
+                                             (= :chunked-artifact-complete (:event eff))
+                                             (let [st @st-atom
+                                                   assembled (concat-uint8-arrays @ordered-chunks-atom (:total-bytes st))]
+                                               (finish! #js {"ok" true
+                                                             "manifestCid" (:manifest-cid st)
+                                                             "totalSha256" (:total-sha256 st)
+                                                             "totalBytes" (:total-bytes st)
+                                                             "bytes" assembled
+                                                             "diagnostics" (clj->js (:diagnostics st))}))
+
+                                             (= :chunked-artifact-failed (:event eff))
+                                             (let [st @st-atom]
+                                               (finish! #js {"ok" false
+                                                             "error" (name (or (:reason eff) :chunked-artifact-failed))
+                                                             "manifestCid" (:manifest-cid st)
+                                                             "diagnostics" (clj->js (:diagnostics st))})))
+
+                                           :fetch-chunk
+                                           (let [idx (:index eff)
+                                                 cid (:cid eff)
+                                                 mirror (:mirror eff)
+                                                 gen (:generation eff)
+                                                 url (str (str/replace mirror #"/+$" "") "/artifact/v1/blob/" cid)]
+                                             (-> (fetch-fn url)
+                                                 (.then (fn [resp]
+                                                          (if (and resp (.-ok resp))
+                                                            (-> (.arrayBuffer resp)
+                                                                (.then (fn [ab]
+                                                                         (let [u8 (js/Uint8Array. ab)
+                                                                               actual-cid (crypto/sha256-hex u8)]
+                                                                           (swap! staged-bytes-atom assoc idx u8)
+                                                                           (let [[ns next-effs]
+                                                                                 (chunk-fetch/transition @st-atom
+                                                                                                         {:type :chunk-fetched
+                                                                                                          :generation gen
+                                                                                                          :index idx
+                                                                                                          :mirror mirror
+                                                                                                          :cid actual-cid
+                                                                                                          :size (.-length u8)})]
+                                                                             (reset! st-atom ns)
+                                                                             (run-effects! next-effs))))))
+                                                            (let [status (if resp (.-status resp) 0)
+                                                                  [ns next-effs]
+                                                                  (chunk-fetch/transition @st-atom
+                                                                                          {:type :chunk-http-error
+                                                                                           :generation gen
+                                                                                           :index idx
+                                                                                           :mirror mirror
+                                                                                           :status status
+                                                                                           :reason (str "http-" status)})]
+                                                              (reset! st-atom ns)
+                                                              (run-effects! next-effs)))))
+                                                 (.catch (fn [err]
+                                                           (let [[ns next-effs]
+                                                                 (chunk-fetch/transition @st-atom
+                                                                                         {:type :chunk-http-error
+                                                                                          :generation gen
+                                                                                          :index idx
+                                                                                          :mirror mirror
+                                                                                          :status 0
+                                                                                          :reason (str (or (when err (.-message err)) err "fetch-error"))})]
+                                                             (reset! st-atom ns)
+                                                             (run-effects! next-effs))))))
+
+                                           :digest-chunk
+                                           (let [idx (:index eff)
+                                                 gen (:generation eff)
+                                                 u8 (get @staged-bytes-atom idx)]
+                                             (if (and u8 (= (crypto/sha256-hex u8) (:cid eff)))
+                                               (do
+                                                 (swap! ordered-chunks-atom conj u8)
+                                                 (swap! staged-bytes-atom dissoc idx)
+                                                 (let [[ns next-effs]
+                                                       (chunk-fetch/transition @st-atom
+                                                                               {:type :digest-result
+                                                                                :generation gen
+                                                                                :index idx
+                                                                                :ok? true})]
+                                                   (reset! st-atom ns)
+                                                   (run-effects! next-effs)))
+                                               (let [[ns next-effs]
+                                                     (chunk-fetch/transition @st-atom
+                                                                             {:type :digest-result
+                                                                              :generation gen
+                                                                              :index idx
+                                                                              :ok? false
+                                                                              :reason "staged-chunk-missing-or-corrupt"})]
+                                                 (reset! st-atom ns)
+                                                 (run-effects! next-effs))))
+
+                                           :digest-final
+                                           (let [gen (:generation eff)
+                                                 st @st-atom
+                                                 assembled (concat-uint8-arrays @ordered-chunks-atom (:total-bytes st))
+                                                 actual-total-sha (crypto/sha256-hex assembled)
+                                                 [ns next-effs]
+                                                 (chunk-fetch/transition @st-atom
+                                                                         {:type :digest-final
+                                                                          :generation gen
+                                                                          :sha256 actual-total-sha})]
+                                             (reset! st-atom ns)
+                                             (run-effects! next-effs))
+
+                                           nil))))]
+                             (let [[st1 start-effs] (chunk-fetch/transition @st-atom {:type :start :generation 1})]
+                               (reset! st-atom st1)
+                               (run-effects! (into (:effects init-res) start-effs)))))))))))))))))))
+
 (defn build-light-node-api
-  "Constructs the unified `BitechoLightNode` browser console CLI & v1.0.0 Headless API object
+  "Constructs the unified `BitechoLightNode` browser console CLI & v1.1.0 Headless API object
    exposing EVERY Node/JVM CLI verb from `browser-cli/browser-cli-verb-inventory` as a camelCase
    Promise-returning method, plus the additive D40.4 v1.0.0 contract (`apiVersion`, `getStatus`,
    `onEvent`, `listPetnames`, `setPetname`, `listSessions`, `listSubnets`, `sendMessage`,
-   `sendBroadcast`, `getArtifact`), `exec`, `cli`, `help`, `verbs`, `peers`, `reconnect`, and
-   `autoUpdaterStatus`."
+   `sendBroadcast`, `getArtifact`), BIP-017a v1.1.0 additive facade (`openChannel`, `openSession`,
+   `acceptOffer`, `approveOffer`, `denyOffer`, `listPendingOffers`, `registerYubiKey`,
+   `recoverYubiKey`, `saveIdentity`, `getChunkedArtifact`), `exec`, `cli`, `help`, `verbs`,
+   `peers`, `reconnect`, and `autoUpdaterStatus`."
   []
   (let [obj #js {"apiVersion" browser-cli/api-version
                  "exec" exec-light-node-verb
@@ -3157,6 +3482,17 @@
       (gobj/set obj js-method
                 (fn [& [params opts]]
                   (exec-light-node-verb verb params opts))))
+    ;; Attach additive BIP-017a v1.1.0 top-level camelCase facade methods (preserving all v1.0.0 methods)
+    (gobj/set obj "openChannel" open-channel-v11)
+    (gobj/set obj "openSession" open-session-v11)
+    (gobj/set obj "acceptOffer" accept-offer-v11)
+    (gobj/set obj "approveOffer" approve-offer-v11)
+    (gobj/set obj "denyOffer" deny-offer-v11)
+    (gobj/set obj "listPendingOffers" list-pending-offers-v11)
+    (gobj/set obj "registerYubiKey" register-yubikey-v11)
+    (gobj/set obj "recoverYubiKey" recover-yubikey-v11)
+    (gobj/set obj "saveIdentity" save-identity-v11)
+    (gobj/set obj "getChunkedArtifact" get-chunked-artifact-v11)
     obj))
 
 (def light-node-api

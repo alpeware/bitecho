@@ -23,13 +23,15 @@ mkdir -p target/bundle-verify
 
 # 2. Compile bitecho.browser-main into dist/bitecho-browser.js (:optimizations :advanced)
 echo "Compiling bitecho.browser-main via ClojureScript (:optimizations :advanced)..."
-clojure -M:build-browser -e '
+# shellcheck disable=SC2086
+clojure ${BITECHO_CLJ_OPTS:-} -M:build-browser -e '
 (require (quote [cljs.build.api :as b]))
 (b/build (b/inputs "src")
          {:main (quote bitecho.browser-main)
           :output-to "dist/bitecho-browser.js"
           :output-dir "target/cljs-browser/out"
           :externs ["resources/closure-externs.js"]
+          :output-wrapper true
           :parallel-build false
           :optimizations :advanced})'
 
@@ -1213,13 +1215,15 @@ cp dist/index.html resources/public/index.html
 
 # 5. Verify build reproducibility across consecutive runs
 echo "Verifying build reproducibility (consecutive build comparison)..."
-clojure -M:build-browser -e '
+# shellcheck disable=SC2086
+clojure ${BITECHO_CLJ_OPTS:-} -M:build-browser -e '
 (require (quote [cljs.build.api :as b]))
 (b/build (b/inputs "src")
          {:main (quote bitecho.browser-main)
           :output-to "target/bundle-verify/bitecho-browser.js"
           :output-dir "target/cljs-browse2/out"
           :externs ["resources/closure-externs.js"]
+          :output-wrapper true
           :parallel-build false
           :optimizations :advanced})'
 
@@ -1309,12 +1313,12 @@ async function test() {
   if (!stateObj) throw new Error('getState failed');
   console.log('getState verified');
 
-  // D40.4: Verify BitechoLightNode v1.0.0 headless browser API contract on :advanced bundle
+  // D40.4 + BIP-017a: Verify BitechoLightNode v1.1.0 headless browser API contract on :advanced bundle
   const LN = globalThis.BitechoLightNode;
   if (!LN) throw new Error('BitechoLightNode not found on globalThis');
-  if (LN.apiVersion !== '1.0.0') throw new Error('Expected BitechoLightNode.apiVersion === 1.0.0, got: ' + LN.apiVersion);
+  if (LN.apiVersion !== '1.1.0') throw new Error('Expected BitechoLightNode.apiVersion === 1.1.0, got: ' + LN.apiVersion);
   const lnStatus = await LN.getStatus();
-  if (!lnStatus || !lnStatus.ok || lnStatus.apiVersion !== '1.0.0' || !lnStatus.pubkey) {
+  if (!lnStatus || !lnStatus.ok || lnStatus.apiVersion !== '1.1.0' || !lnStatus.pubkey || typeof lnStatus.pendingOffers !== 'object') {
     throw new Error('BitechoLightNode.getStatus() failed: ' + JSON.stringify(lnStatus));
   }
   const unsub = LN.onEvent(() => {});
@@ -1345,7 +1349,23 @@ async function test() {
     throw new Error('BitechoLightNode.getArtifact fail-closed check failed: ' + JSON.stringify(badArt));
   }
   if (typeof LN.sendMessage !== 'function') throw new Error('BitechoLightNode.sendMessage missing');
-  console.log('BitechoLightNode v1.0.0 headless API verified on :advanced bundle!');
+  for (const m of ['openChannel', 'openSession', 'acceptOffer', 'approveOffer', 'denyOffer',
+                   'listPendingOffers', 'registerYubiKey', 'recoverYubiKey', 'saveIdentity', 'getChunkedArtifact']) {
+    if (typeof LN[m] !== 'function') throw new Error('BitechoLightNode.' + m + ' missing');
+  }
+  const pendList = await LN.listPendingOffers();
+  if (!pendList || !pendList.ok || !Array.isArray(pendList.pendingOffers)) {
+    throw new Error('BitechoLightNode.listPendingOffers failed: ' + JSON.stringify(pendList));
+  }
+  const saveRes = await LN.saveIdentity();
+  if (!saveRes || !saveRes.ok || !saveRes.pubkey) {
+    throw new Error('BitechoLightNode.saveIdentity failed: ' + JSON.stringify(saveRes));
+  }
+  const badChunked = await LN.getChunkedArtifact('not-a-valid-cid');
+  if (!badChunked || badChunked.ok !== false || badChunked.error !== 'invalid-cid') {
+    throw new Error('BitechoLightNode.getChunkedArtifact fail-closed check failed: ' + JSON.stringify(badChunked));
+  }
+  console.log('BitechoLightNode v1.1.0 headless API verified on :advanced bundle!');
 
   const stopRes = B.stopNode();
   if (!stopRes || !stopRes.ok) throw new Error('stopNode failed');

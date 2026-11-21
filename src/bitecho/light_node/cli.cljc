@@ -196,12 +196,20 @@
    "memento-put"     {:canonical "put" :domain-cmd "memento-put"}
    "memento-walk"    {:canonical "get" :domain-cmd "memento-walk"}})
 
+(def chunked-artifact-verb-desugar-table
+  "BIP-017a chunked large-artifact domain verbs mapped to canonical 1-of-12 CLI verbs (Rule 6)."
+  {"artifact-put-chunked"     {:canonical "put" :domain-cmd "artifact-put-chunked"}
+   "artifact-get-chunked"     {:canonical "get" :domain-cmd "artifact-get-chunked"}
+   "artifact-manifest-verify" {:canonical "get" :domain-cmd "artifact-manifest-verify"}})
+
 (def all-recognized-cli-verbs-set
-  "Union of all 68 legacy verbs, 12 canonical verbs, shell/runner aliases, and BIP-016 Rolodex/Memento verbs."
+  "Union of all 68 legacy verbs, 12 canonical verbs, shell/runner aliases, BIP-016 Rolodex/Memento verbs,
+   and BIP-017a chunked-artifact verbs."
   (-> supported-cli-verbs-set
       (into canonical-cli-verbs-set)
       (into (keys runner-alias-desugar-table))
-      (into (keys memento-verb-desugar-table))))
+      (into (keys memento-verb-desugar-table))
+      (into (keys chunked-artifact-verb-desugar-table))))
 
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
@@ -220,7 +228,8 @@
    "--nickname" "--name" "--domain"
    "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"
    "--node-role" "--retention-max-entries" "--retention-max-bytes" "--rotate-every"
-   "--grace-epochs" "--lkg-cid" "--walk-depth-cap" "--owner-pubkey" "--cache-incentive"])
+   "--grace-epochs" "--lkg-cid" "--walk-depth-cap" "--owner-pubkey" "--cache-incentive"
+   "--chunk-size" "--concurrency" "--resume-dir" "--max-bytes"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -1273,6 +1282,67 @@
           sha256 (assoc "sha256" sha256)
           (some? b) (assoc "burn" b)))
 
+      "artifact-put-chunked"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil)
+                    "global")
+            path (extract-flag-value clean-tokens "--path" nil)
+            file (extract-flag-value clean-tokens "--file" nil)
+            chunk-size (extract-long-flag clean-tokens "--chunk-size" nil)
+            concurrency (extract-long-flag clean-tokens "--concurrency" nil)
+            grace-epochs (extract-long-flag clean-tokens "--grace-epochs" nil)
+            max-bytes (extract-long-flag clean-tokens "--max-bytes" nil)
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            owner-pk (extract-flag-value clean-tokens "--owner-pubkey" nil)
+            m {"cmd" "artifact-put-chunked" "subnet_id" sub}]
+        (cond-> m
+          path (assoc "path" path)
+          file (assoc "file" file)
+          chunk-size (assoc "chunk_size" chunk-size)
+          concurrency (assoc "concurrency" concurrency)
+          grace-epochs (assoc "grace_epochs" grace-epochs)
+          max-bytes (assoc "max_bytes" max-bytes)
+          relay-url (assoc "relay_url" relay-url)
+          owner-pk (assoc "owner_pubkey" owner-pk)))
+
+      "artifact-get-chunked"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil)
+                    "global")
+            cid (extract-flag-value clean-tokens "--cid" nil)
+            path (extract-flag-value clean-tokens "--path" nil)
+            out-file (or (extract-flag-value clean-tokens "--out-file" nil)
+                         (extract-flag-value clean-tokens "--file" nil))
+            chunk-size (extract-long-flag clean-tokens "--chunk-size" nil)
+            concurrency (extract-long-flag clean-tokens "--concurrency" nil)
+            resume-dir (extract-flag-value clean-tokens "--resume-dir" nil)
+            max-bytes (extract-long-flag clean-tokens "--max-bytes" nil)
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            m {"cmd" "artifact-get-chunked" "subnet_id" sub}]
+        (cond-> m
+          cid (assoc "cid" cid)
+          path (assoc "path" path)
+          out-file (assoc "out_file" out-file)
+          chunk-size (assoc "chunk_size" chunk-size)
+          concurrency (assoc "concurrency" concurrency)
+          resume-dir (assoc "resume_dir" resume-dir)
+          max-bytes (assoc "max_bytes" max-bytes)
+          relay-url (assoc "relay_url" relay-url)))
+
+      "artifact-manifest-verify"
+      (let [cid (extract-flag-value clean-tokens "--cid" nil)
+            file (extract-flag-value clean-tokens "--file" nil)
+            owner-pk (extract-flag-value clean-tokens "--owner-pubkey" nil)
+            max-bytes (extract-long-flag clean-tokens "--max-bytes" nil)
+            grace-epochs (extract-long-flag clean-tokens "--grace-epochs" nil)
+            m {"cmd" "artifact-manifest-verify"}]
+        (cond-> m
+          cid (assoc "cid" cid)
+          file (assoc "file" file)
+          owner-pk (assoc "owner_pubkey" owner-pk)
+          max-bytes (assoc "max_bytes" max-bytes)
+          grace-epochs (assoc "grace_epochs" grace-epochs)))
+
       "artifact-put"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
@@ -1582,7 +1652,8 @@
         raw-verb (str/lower-case (str/trim (str (or (get m "cmd") (get m "verb") "status"))))
         legacy-entry (get legacy-verb-desugar-table raw-verb)
         runner-entry (get runner-alias-desugar-table raw-verb)
-        memento-entry (get memento-verb-desugar-table raw-verb)]
+        memento-entry (get memento-verb-desugar-table raw-verb)
+        chunked-entry (get chunked-artifact-verb-desugar-table raw-verb)]
     (cond
       (some? (get m "canonical_cmd"))
       m
@@ -1601,6 +1672,11 @@
       (assoc m
              "cmd" (:domain-cmd memento-entry)
              "canonical_cmd" (:canonical memento-entry))
+
+      chunked-entry
+      (assoc m
+             "cmd" (:domain-cmd chunked-entry)
+             "canonical_cmd" (:canonical chunked-entry))
 
       (contains? canonical-cli-verbs-set raw-verb)
       (let [inferred-domain
