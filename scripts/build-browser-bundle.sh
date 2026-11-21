@@ -1309,6 +1309,44 @@ async function test() {
   if (!stateObj) throw new Error('getState failed');
   console.log('getState verified');
 
+  // D40.4: Verify BitechoLightNode v1.0.0 headless browser API contract on :advanced bundle
+  const LN = globalThis.BitechoLightNode;
+  if (!LN) throw new Error('BitechoLightNode not found on globalThis');
+  if (LN.apiVersion !== '1.0.0') throw new Error('Expected BitechoLightNode.apiVersion === 1.0.0, got: ' + LN.apiVersion);
+  const lnStatus = await LN.getStatus();
+  if (!lnStatus || !lnStatus.ok || lnStatus.apiVersion !== '1.0.0' || !lnStatus.pubkey) {
+    throw new Error('BitechoLightNode.getStatus() failed: ' + JSON.stringify(lnStatus));
+  }
+  const unsub = LN.onEvent(() => {});
+  if (typeof unsub !== 'function') throw new Error('BitechoLightNode.onEvent did not return unsubscribeFn');
+  unsub();
+  const pnSet = await LN.setPetname(lnStatus.pubkey, { petname: 'smoke-peer', voiceId: 'af_heart', color: '#4ecdc4' });
+  if (!pnSet || !pnSet.ok || pnSet.petname !== 'smoke-peer' || pnSet.voiceId !== 'af_heart' || pnSet.color !== '#4ecdc4') {
+    throw new Error('BitechoLightNode.setPetname failed: ' + JSON.stringify(pnSet));
+  }
+  const pnList = await LN.listPetnames();
+  if (!pnList || !pnList.ok || !Array.isArray(pnList.petnames) || !pnList.petnames.some(p => p.petname === 'smoke-peer' && p.voiceId === 'af_heart')) {
+    throw new Error('BitechoLightNode.listPetnames failed: ' + JSON.stringify(pnList));
+  }
+  const sessList = await LN.listSessions();
+  if (!sessList || !sessList.ok || !Array.isArray(sessList.sessions)) {
+    throw new Error('BitechoLightNode.listSessions failed: ' + JSON.stringify(sessList));
+  }
+  const subList = await LN.listSubnets();
+  if (!subList || !subList.ok || !Array.isArray(subList.subnets)) {
+    throw new Error('BitechoLightNode.listSubnets failed: ' + JSON.stringify(subList));
+  }
+  const bcastRes = await LN.sendBroadcast({ subnetId: 'global', text: 'Line 1\nLine 2 🌍' });
+  if (!bcastRes || !bcastRes.ok || bcastRes.subnetId !== 'global') {
+    throw new Error('BitechoLightNode.sendBroadcast failed: ' + JSON.stringify(bcastRes));
+  }
+  const badArt = await LN.getArtifact({ cid: 'not-a-valid-cid' });
+  if (!badArt || badArt.ok !== false || badArt.error !== 'invalid-cid') {
+    throw new Error('BitechoLightNode.getArtifact fail-closed check failed: ' + JSON.stringify(badArt));
+  }
+  if (typeof LN.sendMessage !== 'function') throw new Error('BitechoLightNode.sendMessage missing');
+  console.log('BitechoLightNode v1.0.0 headless API verified on :advanced bundle!');
+
   const stopRes = B.stopNode();
   if (!stopRes || !stopRes.ok) throw new Error('stopNode failed');
   console.log('stopNode verified');

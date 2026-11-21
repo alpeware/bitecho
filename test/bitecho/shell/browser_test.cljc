@@ -502,7 +502,8 @@
             "bounty-quorum-invalid" "unsubstantiated-objection-ignored" "paramount-objection-recorded" "unauthorized-circle-member"
             "network-uri" "network-replay-rejected"
             "subscribed-subnets" "offer-nonce"
-            "raw-public-hex" "stale-browser-bundle"}
+            "raw-public-hex" "stale-browser-bundle"
+            "petname-meta" "voice-id" "color" "event-listener-errors"}
           test-map (into {}
                          (concat (map (fn [k] [k "SENSITIVE"]) all-forbidden-keys)
                                  (map (fn [k] [k "UNLISTED"]) unlisted-keys)

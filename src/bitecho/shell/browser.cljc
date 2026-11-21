@@ -676,6 +676,7 @@
     "background-throttled-events" "ignored-stale" "dropped" "failover-count" "diagnostics-buffered"
     "validator-cursor" "validator-id" "diagnostics"
     "peer" "peers" "peer-id" "peer-petname" "petname" "petnames" "petnames-count"
+    "petname-meta" "voice-id" "color" "event-listener-errors"
     "node" "nodes" "node-id" "nodes-count" "node1" "node2" "node3" "ns1" "ns2" "ns3"
     "subnet" "subnet-id" "subscribed-subnets" "domain" "network" "address" "anchor-address" "hot-address"
     "ip" "port" "agent-port" "agent-tcp-port" "ingress-host" "ingress-port"

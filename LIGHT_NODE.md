@@ -180,5 +180,44 @@ await BitechoLightNode.autoUpdaterStatus()
 - **Explicit Unsupported-in-Browser Errors**: Genuinely OS-impossible verbs (`serve`, `daemon`, `mcp`) fail explicitly with `{ ok: false, error: "unsupported-in-browser", verb, reason }` and emit a counted `:diagnose` event (Rule 5).
 - **Single-Authority Multi-Peer WebRTC Diagnostics (Rules 4 & 5)**: All 6 validator WebRTC connections (`node1..node3`, `ns1..ns3`) transition through the single-authority `[:mesh-conns]` reducer (`bitecho.shell.browser/transition-mesh-peer`). Closed/failed/ICE-disconnected peers are never silently removed from diagnostics; `BitechoBrowser.getStatus().diagnostics` and `await BitechoLightNode.peers()` surface `totalPeers`, `openPeers`, `dialingPeers`, `closedPeers`, `degraded`, `closeCount`, `dialFailures`, `iceDisconnects`, `iceReconnects`, per-peer `peers` state maps (active and closed), and a bounded 64-entry `recentEvents` ring buffer.
 
+### Headless Browser API Contract (`window.BitechoLightNode` v`1.0.0`, D40.4)
+
+Alongside all 83 existing CLI verbs on `window.BitechoLightNode` and `window.BitechoBrowser`, `dist/bitecho-browser.js` exposes the additive headless v`1.0.0` contract (zero UI code in Bitecho):
+
+```javascript
+// 1. Versioning & Status
+BitechoLightNode.apiVersion // => "1.0.0"
+const status = await BitechoLightNode.getStatus()
+// => { ok, apiVersion, phase, generation, pubkey, finalizedEpoch, balance, spendable, lastError, dropped, diagnostics, ... }
+
+// 2. Single-Authority Event Subscription (error-isolated; throwing listeners emit counted :diagnose)
+const unsubscribe = BitechoLightNode.onEvent((ev) => {
+  // Normalized shape:
+  // { eventId, type: 'message-received'|'broadcast-received'|'status'|'diagnose',
+  //   sessionId, subnetId, from, fromPetname, voiceId, color, seq, text, timestampMs }
+})
+
+// 3. Petname / Rolodex Metadata (BIP-016 aligned, additive optional fields)
+await BitechoLightNode.setPetname(pubkey, { petname: "axiom", voiceId: "bm_lewis", color: "#6366f1" })
+// => { ok: true, pubkey, petname, voiceId, color }
+await BitechoLightNode.listPetnames()
+// => { ok: true, petnames: [{ pubkey, petname, voiceId, color }] }
+
+// 4. Messaging & Subnets (multi-line UTF-8 safe; positional or object arguments)
+await BitechoLightNode.listSessions()
+await BitechoLightNode.listSubnets()
+await BitechoLightNode.sendMessage(sessionId, "Line 1\nLine 2 🌍")
+await BitechoLightNode.sendMessage({ sessionId, text: "Line 1\nLine 2 🌍" })
+// => { ok, sessionId, seq, burn, error }
+await BitechoLightNode.sendBroadcast(subnetId, "Subnet update\nwith UTF-8 ✨")
+await BitechoLightNode.sendBroadcast({ subnetId, text: "Subnet update\nwith UTF-8 ✨" })
+// => { ok, subnetId, seq, burn, error }
+
+// 5. Verified Artifact Fetch (SHA-256 CID verification fail-closed with counted :diagnose)
+const art = await BitechoLightNode.getArtifact({ cid: "<64-hex-sha256>" })
+// or: await BitechoLightNode.getArtifact({ subnet: "hive", path: "voicepacks/en.bin", baseUrl: "https://bitecho.org" })
+// => { ok, cid, bytes: Uint8Array, contentType, error }
+```
+
 
 

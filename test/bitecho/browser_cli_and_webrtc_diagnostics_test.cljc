@@ -328,3 +328,217 @@
            (is (fn? (aget ln js-method))
                (str "Missing BitechoLightNode." js-method)))
          (browser-main/stop-node na)))))
+
+;; =============================================================================
+;; 6. D40.4 Strict TDD Generative & Runtime Tests (Headless Browser API v1.0.0)
+;; =============================================================================
+
+(def ^:private gen-hex-char
+  (gen/elements (seq "0123456789abcdef")))
+
+(def ^:private gen-raw-pubkey-hex
+  (gen/fmap #(apply str %) (gen/vector gen-hex-char 64)))
+
+(def ^:private gen-valid-petname
+  (gen/fmap (fn [[prefix suffix]] (str prefix "-" suffix))
+            (gen/tuple (gen/elements ["alice" "bob" "carol" "axiom" "nexus" "vector" "hive"])
+                       (gen/choose 1 999))))
+
+(def ^:private gen-optional-voice-id
+  (gen/elements [nil "af_heart" "af_bella" "bm_lewis" "am_adam" "ef_dora"]))
+
+(def ^:private gen-optional-color
+  (gen/elements [nil "#ff6b6b" "#4ecdc4" "#ffe66d" "#6366f1" "#10b981"]))
+
+(def ^:private gen-multiline-utf8
+  (gen/fmap (fn [[a b c d]]
+              (str a "\n" b "\r\n" c " — " d))
+            (gen/tuple (gen/elements ["Hello 🌍" "Line 1: \"quoted\"" "  leading space" "日本語テスト" "```clojure\n(+ 1 2)\n```"])
+                       (gen/elements ["Second line ✨" "café résumé" "tab\there" "emoji 🚀🔥"])
+                       (gen/elements ["Third line" "--flag-like" "key=value" "end\n"])
+                       gen/string-alphanumeric)))
+
+(defspec ^{:doc "D40.4 Rule 1 Property: Event normalization resolves fromPetname, voiceId, and color
+                 from local Rolodex/petname metadata when set, returns nil otherwise, and always
+                 emits all 11 canonical JS event fields."}
+  prop-d40-4-event-normalization-and-petname-resolution 100
+  (prop/for-all [raw-pk gen-raw-pubkey-hex
+                 other-pk gen-raw-pubkey-hex
+                 pname gen-valid-petname
+                 voice-id gen-optional-voice-id
+                 color gen-optional-color
+                 ev-type (gen/elements ["message-received" "broadcast-received" "status" "diagnose"])
+                 text gen-multiline-utf8
+                 seq-num (gen/choose 0 10000)
+                 ts-ms (gen/choose 1700000000000 1800000000000)
+                 known-sender? gen/boolean]
+                (let [norm-pk (light-core/normalize-pubkey-hex raw-pk)
+                      norm-other (light-core/normalize-pubkey-hex other-pk)
+                      st0 {:peer-id "browser-d40-test"
+                           :petnames {}
+                           :petname-meta {}
+                           :light-state (light-core/init-light-state {:pubkey-hex norm-pk} {:subnet-id "global"})}
+                      merged (browser-cli/merge-petname-entry st0 raw-pk {:petname pname
+                                                                          :voice-id voice-id
+                                                                          :color color})
+                      st1 (:state merged)
+                      sender (if known-sender? norm-pk norm-other)
+                      same-pk? (= sender norm-pk)
+                      ev (browser-cli/normalize-browser-event
+                          st1
+                          {:type ev-type
+                           :session-id "sess-1"
+                           :subnet-id "chat/test"
+                           :from sender
+                           :seq seq-num
+                           :text text
+                           :timestamp-ms ts-ms})
+                      js-map (browser-cli/event->js-map ev)
+                      required-keys #{"eventId" "type" "sessionId" "subnetId" "from"
+                                      "fromPetname" "voiceId" "color" "seq" "text" "timestampMs"}]
+                  (and (true? (:ok? merged))
+                       (set/subset? required-keys (set (keys js-map)))
+                       (string? (get js-map "eventId"))
+                       (= ev-type (get js-map "type"))
+                       (= text (get js-map "text"))
+                       (= seq-num (get js-map "seq"))
+                       (= ts-ms (get js-map "timestampMs"))
+                       (if same-pk?
+                         (and (= pname (get js-map "fromPetname"))
+                              (= voice-id (get js-map "voiceId"))
+                              (= color (get js-map "color")))
+                         (and (nil? (get js-map "fromPetname"))
+                              (nil? (get js-map "voiceId"))
+                              (nil? (get js-map "color"))))))))
+
+(defspec ^{:doc "D40.4 Rule 1 Property: Petname/Rolodex metadata roundtrips cleanly through
+                 merge-petname-entry, resolve-petname-entry, list-petname-entries, preserves
+                 existing :petnames compatibility, and survives sanitize-state-for-persistence."}
+  prop-d40-4-petname-metadata-roundtrip 100
+  (prop/for-all [raw-pk gen-raw-pubkey-hex
+                 pname gen-valid-petname
+                 voice-id gen-optional-voice-id
+                 color gen-optional-color
+                 new-color gen-optional-color]
+                (let [norm-pk (light-core/normalize-pubkey-hex raw-pk)
+                      st0 {:peer-id "browser-d40-test"
+                           :petnames {}
+                           :petname-meta {}
+                           :light-state (light-core/init-light-state {:pubkey-hex norm-pk} {:subnet-id "global"})}
+                      r1 (browser-cli/merge-petname-entry st0 raw-pk {:petname pname
+                                                                      :voiceId voice-id
+                                                                      :color color})
+                      st1 (:state r1)
+                      resolved1 (browser-cli/resolve-petname-entry st1 norm-pk)
+                      listed1 (browser-cli/list-petname-entries st1)
+                      ;; Updating only :color must preserve existing :petname and :voice-id
+                      r2 (browser-cli/merge-petname-entry st1 norm-pk {:color new-color})
+                      st2 (:state r2)
+                      resolved2 (browser-cli/resolve-petname-entry st2 norm-pk)
+                      ;; Persistence sanitization (Rule 4) must keep :petnames and :petname-meta
+                      persisted (browser/sanitize-state-for-persistence st2)
+                      resolved-persisted (browser-cli/resolve-petname-entry persisted norm-pk)]
+                  (and (true? (:ok? r1))
+                       (= norm-pk (:pubkey resolved1))
+                       (= pname (:petname resolved1))
+                       (= voice-id (:voice-id resolved1))
+                       (= color (:color resolved1))
+                       (= norm-pk (get-in st1 [:petnames pname]))
+                       (= norm-pk (get-in st1 [:light-state :petnames pname]))
+                       (some #(= resolved1 %) listed1)
+                       (true? (:ok? r2))
+                       (= pname (:petname resolved2))
+                       (= voice-id (:voice-id resolved2))
+                       (= new-color (:color resolved2))
+                       (= resolved2 resolved-persisted)))))
+
+(defspec ^{:doc "D40.4 Rule 1 Property: sendMessage and sendBroadcast argument normalization
+                 accepts both positional (id, text) and object ({sessionId/subnetId, text}) forms
+                 and preserves multi-line UTF-8 text byte-for-byte verbatim."}
+  prop-d40-4-multiline-utf8-message-and-broadcast-args 100
+  (prop/for-all [target-id (gen/such-that #(not (empty? %)) gen/string-alphanumeric)
+                 text gen-multiline-utf8
+                 use-object? gen/boolean]
+                (let [msg-res (if use-object?
+                                (browser-cli/normalize-send-message-args {:sessionId target-id :text text} nil)
+                                (browser-cli/normalize-send-message-args target-id text))
+                      bcast-res (if use-object?
+                                  (browser-cli/normalize-send-broadcast-args {:subnetId target-id :text text} nil)
+                                  (browser-cli/normalize-send-broadcast-args target-id text))]
+                  (and (true? (:ok? msg-res))
+                       (= target-id (:session-id msg-res))
+                       (= text (:text msg-res))
+                       (true? (:ok? bcast-res))
+                       (= target-id (:subnet-id bcast-res))
+                       (= text (:text bcast-res))))))
+
+(defspec ^{:doc "D40.4 Rule 1 & Rule 5 Property: Artifact CID verification succeeds on matching
+                 SHA-256 bytes and fails closed with cid-mismatch + counted :diagnose on corruption."}
+  prop-d40-4-artifact-cid-verification-and-diagnose 100
+  (prop/for-all [payload-str gen-multiline-utf8]
+                (let [payload-bytes (fressian/utf8->bytes payload-str)
+                      true-cid (fressian/bytes->hex (crypto/sha256 payload-bytes))
+                      tampered-bytes (fressian/utf8->bytes (str payload-str "!"))
+                      ok-res (browser-cli/verify-artifact-bytes true-cid payload-bytes)
+                      bad-res (browser-cli/verify-artifact-bytes true-cid tampered-bytes)
+                      plan (browser-cli/build-artifact-fetch-plan {:cid true-cid})]
+                  (and (true? (:ok? ok-res))
+                       (= true-cid (:cid ok-res))
+                       (false? (:ok? bad-res))
+                       (= "cid-mismatch" (:error bad-res))
+                       (= :diagnose (get-in bad-res [:diagnose :type]))
+                       (= :cid-mismatch (get-in bad-res [:diagnose :kind]))
+                       (= true-cid (:expected-cid bad-res))
+                       (not= true-cid (:actual-cid bad-res))
+                       (true? (:ok? plan))
+                       (= [(str "https://bitecho.org/artifact/v1/blob/" true-cid)
+                           (str "https://ns1.bitecho.org/artifact/v1/blob/" true-cid)]
+                          (:urls plan))))))
+
+(deftest test-d40-4-headless-browser-api-contract
+  (testing "Pure API version constant and fail-closed artifact/messaging edge cases"
+    (is (= "1.0.0" browser-cli/api-version))
+    (is (false? (:ok? (browser-cli/normalize-send-message-args "" "hello"))))
+    (is (false? (:ok? (browser-cli/normalize-send-message-args "sess-1" nil))))
+    (is (false? (:ok? (browser-cli/normalize-send-broadcast-args "" "hello"))))
+    (is (false? (:ok? (browser-cli/normalize-send-broadcast-args "sub-1" nil))))
+    (let [bad-cid (browser-cli/build-artifact-fetch-plan {:cid "not-a-hex-cid"})
+          bad-path (browser-cli/build-artifact-fetch-plan {:subnet "hive" :path "../etc/passwd"})
+          sub-plan (browser-cli/build-artifact-fetch-plan {:subnet "hive" :path "voicepacks/en.bin" :baseUrl "https://custom.bitecho.org/"})]
+      (is (false? (:ok? bad-cid)))
+      (is (= :invalid-cid (:error bad-cid)))
+      (is (= :diagnose (get-in bad-cid [:diagnose :type])))
+      (is (false? (:ok? bad-path)))
+      (is (= :invalid-artifact-path (:error bad-path)))
+      (is (true? (:ok? sub-plan)))
+      (is (= ["https://custom.bitecho.org/hive/voicepacks/en.bin"] (:urls sub-plan)))))
+
+  #?(:cljs
+     (testing "CLJS runtime: BitechoLightNode v1.0.0 exposes all additive methods, apiVersion, and error-isolated onEvent"
+       (let [na (browser-main/init-node {:peer-id "cljs-d40-4-node"})
+             ln (aget js/globalThis "BitechoLightNode")
+             received (atom [])
+             unsub-bad ((aget ln "onEvent") (fn [_ev] (throw (js/Error. "boom-listener"))))
+             unsub-good ((aget ln "onEvent") (fn [ev] (swap! received conj ev)))]
+         (is (= "1.0.0" (aget ln "apiVersion")))
+         (is (fn? (aget ln "getStatus")))
+         (is (fn? (aget ln "onEvent")))
+         (is (fn? (aget ln "listPetnames")))
+         (is (fn? (aget ln "setPetname")))
+         (is (fn? (aget ln "listSessions")))
+         (is (fn? (aget ln "listSubnets")))
+         (is (fn? (aget ln "sendMessage")))
+         (is (fn? (aget ln "sendBroadcast")))
+         (is (fn? (aget ln "getArtifact")))
+         (is (fn? unsub-bad))
+         (is (fn? unsub-good))
+         ;; Emit a normalized event; throwing listener must not break subsequent listener
+         ;; and must emit a counted :diagnose (:event-listener-error)
+         (browser-main/emit-browser-event! na {:type "status" :text "ready" :timestamp-ms 1795200000000})
+         (is (some #(= "status" (aget % "type")) @received)
+             "Good listener must receive event even when an earlier listener throws")
+         (is (pos? (long (or (get-in @na [:conn :diagnostics :event-listener-errors]) 0)))
+             "Throwing listener must increment counted :event-listener-errors diagnostic")
+         (unsub-bad)
+         (unsub-good)
+         (browser-main/stop-node na)))))

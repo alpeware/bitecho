@@ -66,6 +66,7 @@ BitechoBrowser.reconnect = function() {};
 BitechoBrowser.version = "";
 
 var BitechoLightNode = {};
+BitechoLightNode.apiVersion = "";
 BitechoLightNode.exec = function() {};
 BitechoLightNode.cli = function() {};
 BitechoLightNode.help = function() {};
@@ -77,6 +78,14 @@ BitechoLightNode.initNode = function() {};
 BitechoLightNode.stopNode = function() {};
 BitechoLightNode.getState = function() {};
 BitechoLightNode.getStatus = function() {};
+BitechoLightNode.onEvent = function() {};
+BitechoLightNode.listPetnames = function() {};
+BitechoLightNode.setPetname = function() {};
+BitechoLightNode.listSessions = function() {};
+BitechoLightNode.listSubnets = function() {};
+BitechoLightNode.sendMessage = function() {};
+BitechoLightNode.sendBroadcast = function() {};
+BitechoLightNode.getArtifact = function() {};
 BitechoLightNode.status = function() {};
 BitechoLightNode.version = "";
 

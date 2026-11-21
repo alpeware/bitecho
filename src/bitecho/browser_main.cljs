@@ -63,7 +63,60 @@
 
 (defonce ^:private ui-listeners-atom (atom []))
 
+(defonce ^:private event-listeners-atom (atom {}))
+(defonce ^:private event-listener-next-id-atom (atom 0))
+(defonce ^:private event-seq-atom (atom 0))
+
 (declare get-status fetch-relay-chain-state!)
+
+(defn emit-browser-event!
+  "Emits a normalized v1.0.0 event to all `BitechoLightNode.onEvent` subscribers.
+   If a subscriber callback throws, catches the error, increments the counted
+   `:event-listener-errors` diagnostic, emits a `:diagnose` event (`:event-listener-error`),
+   and continues delivering to all remaining subscribers (Rules 4 & 5)."
+  [node-atom raw-event]
+  (let [state (if (and node-atom @node-atom) @node-atom {})
+        ev-with-meta (cond-> (if (map? raw-event) raw-event {})
+                       (nil? (or (:timestamp-ms raw-event) (:timestampMs raw-event)))
+                       (assoc :timestamp-ms (.now js/Date))
+                       (nil? (or (:event-id raw-event) (:eventId raw-event)))
+                       (assoc :event-id (str "ev-" (swap! event-seq-atom inc))))
+        norm-ev (browser-cli/normalize-browser-event state ev-with-meta)
+        js-ev (clj->js (browser-cli/event->js-map norm-ev))
+        listeners @event-listeners-atom
+        listener-errors (atom [])]
+    (doseq [[_id cb] listeners]
+      (try
+        (cb js-ev)
+        (catch :default err
+          (let [err-msg (str (or (when err (.-message err)) err "listener-error"))]
+            (swap! listener-errors conj err-msg)
+            (when (and node-atom @node-atom)
+              (swap! node-atom
+                     (fn [curr]
+                       (-> curr
+                           (update-in [:conn :diagnostics :event-listener-errors] (fnil inc 0))
+                           (assoc-in [:conn :diagnostics :last-error] (str "event-listener-error:" err-msg))))))))))
+    (when (and (seq @listener-errors) (not= "diagnose" (:type norm-ev)))
+      (doseq [err-msg @listener-errors]
+        (emit-browser-event! node-atom
+                             {:type "diagnose"
+                              :kind :event-listener-error
+                              :reason (str "event-listener-error:" err-msg)
+                              :timestamp-ms (.now js/Date)})))
+    js-ev))
+
+(defn on-event
+  "Subscribes `cb` to normalized `BitechoLightNode` v1.0.0 events.
+   Returns an `unsubscribeFn` closure."
+  [cb]
+  (if-not (fn? cb)
+    (fn [] nil)
+    (let [id (swap! event-listener-next-id-atom inc)]
+      (swap! event-listeners-atom assoc id cb)
+      (fn []
+        (swap! event-listeners-atom dissoc id)
+        nil))))
 
 (defn- notify-ui-listeners! []
   (when-let [na @active-node-atom]
@@ -563,7 +616,7 @@
                                                   :economy-enabled? true
                                                   :burn-floor 100
                                                   :autonomous? false})
-         light-st (cond-> (assoc init-light :petnames default-petnames :max-epoch-skew 15)
+         light-st (cond-> (assoc init-light :petnames default-petnames :petname-meta {} :max-epoch-skew 15)
                     relay-url (assoc :relay-url relay-url))
          conn-state (browser/initial-conn-state {:peer-id node-id :subnet-id subnet-id})
          mesh-conns (browser/initial-mesh-conns-state)
@@ -576,6 +629,7 @@
                           :mesh-conns mesh-conns
                           :light-state light-st
                           :petnames default-petnames
+                          :petname-meta {}
                           :chat-history []
                           :active-channels {}
                           :p2p-channels {}
@@ -793,6 +847,8 @@
                                :iceReconnects eff-ice-reconn
                                :closeCount eff-close-cnt
                                :dialFailures eff-dial-fail
+                               :eventListenerErrors (long (or (:event-listener-errors diag) 0))
+                               :cidMismatch (long (or (:cid-mismatch diag) 0))
                                :lastIceState eff-last-ice
                                :lastConnectionState eff-last-cs
                                :totalPeers (long (or (:total-peers mesh-summary) 0))
@@ -851,6 +907,24 @@
         (when effect-handler-fn
           (doseq [eff effs]
             (effect-handler-fn eff)))
+        (doseq [eff effs]
+          (when (= :diagnose (:type eff))
+            (emit-browser-event! node-atom
+                                 {:type "diagnose"
+                                  :kind (:kind eff)
+                                  :reason (or (:reason eff) (:error eff))
+                                  :from (or (:peer-id eff) peer-id)
+                                  :generation (:generation eff)
+                                  :timestamp-ms (or (:timestamp-ms event) (.now js/Date))})))
+        (when (contains? #{:open :close :dial-failed :ice-state-change :connection-state-change} (:type event))
+          (let [peer-st (get-in @node-atom [:mesh-conns :peers peer-id])]
+            (emit-browser-event! node-atom
+                                 {:type "status"
+                                  :phase (:phase peer-st)
+                                  :generation (:generation peer-st)
+                                  :from peer-id
+                                  :text (name (:type event))
+                                  :timestamp-ms (or (:timestamp-ms event) (.now js/Date))})))
         (when (or (contains? #{:open :close :dial-failed :ice-state-change :connection-state-change} (:type event))
                   (some #(= :diagnose (:type %)) effs))
           (notify-ui-listeners!))
@@ -1005,8 +1079,9 @@
             new-st (:state res)
             curr-inbox (vec (get-in new-st [:inbox] []))
             curr-bcasts (vec (get-in new-st [:broadcast-inbox] []))
-            new-msgs (into (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
-                           (subvec curr-bcasts (min (count prev-bcasts) (count curr-bcasts))))
+            new-direct-msgs (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
+            new-bcast-msgs (subvec curr-bcasts (min (count prev-bcasts) (count curr-bcasts)))
+            new-msgs (into new-direct-msgs new-bcast-msgs)
             curr-offers (or (:pending-offers new-st) {})]
         (swap! node-atom (fn [curr]
                            (-> curr
@@ -1062,6 +1137,26 @@
           (route-browser-envelope! node-atom reply-env))
         (when-let [dial-info (:p2p-dial res)]
           (dial-browser-p2p-peer! node-atom dial-info))
+        (doseq [m new-direct-msgs]
+          (emit-browser-event! node-atom
+                               {:type "message-received"
+                                :session-id (or (:session-id m) (:session_id m))
+                                :subnet-id (or (:subnet-id m) (:subnet_id m))
+                                :from (or (:sender m) (:from m) (:peer-id m))
+                                :from-petname (or (:from-petname m) (:from_petname m))
+                                :seq (:seq m)
+                                :text (or (:text m) (:message m))
+                                :timestamp-ms (or (:timestamp-ms m) (:timestamp_ms m) (.now js/Date))}))
+        (doseq [b new-bcast-msgs]
+          (emit-browser-event! node-atom
+                               {:type "broadcast-received"
+                                :session-id (or (:session-id b) (:session_id b))
+                                :subnet-id (or (:subnet-id b) (:subnet_id b) (:subnet b))
+                                :from (or (:sender b) (:from b) (:peer-id b))
+                                :from-petname (or (:from-petname b) (:from_petname b))
+                                :seq (:seq b)
+                                :text (or (:text b) (:message b))
+                                :timestamp-ms (or (:timestamp-ms b) (:timestamp_ms b) (.now js/Date))}))
         (browser/persist-state! (browser/sanitize-state-for-persistence @node-atom))
         (notify-ui-listeners!)))))
 
@@ -2656,12 +2751,389 @@
                     :p2pPeers p2p-peers
                     :recentEvents (format-recent-events-js (:recent-events summary))})))))))
 
+(defn get-light-node-status
+  "D40.4 v1.0.0: Returns a Promise resolving to `{ ok, apiVersion, phase, generation, pubkey,
+   finalizedEpoch, balance, spendable, lastError, dropped, diagnostics, ... }`."
+  ([] (get-light-node-status @active-node-atom))
+  ([node-atom]
+   (let [na (or (when (or (satisfies? IAtom node-atom)
+                          (and (some? node-atom) (fn? (.-deref node-atom))))
+                  node-atom)
+                @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false
+                                "apiVersion" browser-cli/api-version
+                                "error" "node-not-initialized"})
+       (let [st-js (get-status na)
+             node @na
+             light-st (:light-state node)
+             diag-js (gobj/get st-js "diagnostics")
+             fin-epoch (long (or (:finalized-epoch light-st) (:epoch light-st) 0))]
+         (gobj/set st-js "ok" true)
+         (gobj/set st-js "apiVersion" browser-cli/api-version)
+         (gobj/set st-js "finalizedEpoch" fin-epoch)
+         (gobj/set st-js "lastError" (when diag-js (gobj/get diag-js "lastError")))
+         (gobj/set st-js "dropped" (if diag-js (gobj/get diag-js "dropped") 0))
+         (js/Promise.resolve st-js))))))
+
+(defn list-petnames-v1
+  "D40.4 v1.0.0: Returns a Promise resolving to `{ ok: true, petnames: [{ pubkey, petname, voiceId, color }] }`."
+  ([] (list-petnames-v1 nil))
+  ([opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized" "petnames" #js []})
+       (let [entries (browser-cli/list-petname-entries @na)
+             js-entries (clj->js (mapv (fn [e]
+                                         {"pubkey" (:pubkey e)
+                                          "petname" (:petname e)
+                                          "voiceId" (:voice-id e)
+                                          "color" (:color e)})
+                                       entries))]
+         (js/Promise.resolve #js {"ok" true "petnames" js-entries}))))))
+
+(defn set-petname-v1
+  "D40.4 v1.0.0: Sets `{ petname, voiceId, color }` for `pubkey` in local Rolodex state,
+   preserving 100% compatibility with existing `:petnames` and persisting to IndexedDB."
+  ([pubkey meta-opts] (set-petname-v1 pubkey meta-opts nil))
+  ([pubkey meta-opts opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized"})
+       (let [meta-clj (if (string? meta-opts)
+                        {:petname meta-opts}
+                        (js-params->clj-map meta-opts))
+             res (browser-cli/merge-petname-entry @na pubkey meta-clj)]
+         (if-not (:ok? res)
+           (do
+             (when-let [diag (:diagnose res)]
+               (emit-browser-event! na (assoc diag :type "diagnose" :timestamp-ms (.now js/Date))))
+             (js/Promise.resolve #js {"ok" false "error" (name (:error res))}))
+           (let [entry (:entry res)]
+             (reset! na (:state res))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+             (notify-ui-listeners!)
+             (js/Promise.resolve #js {"ok" true
+                                      "pubkey" (:pubkey entry)
+                                      "petname" (:petname entry)
+                                      "voiceId" (:voice-id entry)
+                                      "color" (:color entry)}))))))))
+
+(defn list-sessions-v1
+  "D40.4 v1.0.0: Returns a Promise resolving to `{ ok: true, sessions: [...] }`."
+  ([] (list-sessions-v1 nil))
+  ([opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized" "sessions" #js []})
+       (let [node @na
+             sessions (or (get-in node [:light-state :sessions]) (:sessions node) {})
+             items (mapv (fn [[sid s]]
+                           (let [peer-pk (:peer s)
+                                 rolodex (browser-cli/resolve-petname-entry node peer-pk)
+                                 safe-s (redact-for-js s)]
+                             {"sessionId" (str sid)
+                              "peer" peer-pk
+                              "peerPetname" (:petname rolodex)
+                              "voiceId" (:voice-id rolodex)
+                              "color" (:color rolodex)
+                              "state" (or (:state safe-s) (when (:status safe-s) (name (:status safe-s))) "unknown")
+                              "epoch" (long (or (:epoch safe-s) 0))
+                              "txSeq" (long (or (:tx-seq safe-s) 0))
+                              "rxHighSeq" (long (or (:rx-high-seq safe-s) 0))}))
+                         (sort-by first sessions))]
+         (js/Promise.resolve #js {"ok" true
+                                  "sessions" (clj->js items)
+                                  "sessionsMap" (get-sessions na)}))))))
+
+(defn list-subnets-v1
+  "D40.4 v1.0.0: Returns a Promise resolving to `{ ok: true, subnets: [...] }`."
+  ([] (list-subnets-v1 nil))
+  ([opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)]
+     (if-not (and na @na)
+       (js/Promise.resolve #js {"ok" false "error" "node-not-initialized" "subnets" #js []})
+       (let [node @na
+             light-st (:light-state node)
+             raw-subs (or (:subscribed-subnets light-st) (:subnets light-st))
+             eff-subs (vec (distinct (concat (when-let [s (:subnet-id node)] [s])
+                                             (when-let [s (:subnet-id light-st)] [s])
+                                             (map str (or raw-subs [])))))]
+         (js/Promise.resolve #js {"ok" true
+                                  "subnetId" (or (:subnet-id node) (:subnet-id light-st) "global")
+                                  "subnets" (clj->js eff-subs)}))))))
+
+(defn send-message-v1
+  "D40.4 v1.0.0: Multi-line UTF-8 safe sealed message sender accepting either
+   `(sessionId, text)` positional or `({sessionId, text})` object.
+   Returns a Promise resolving to `{ ok, sessionId, seq, burn, error }`."
+  ([arg1] (send-message-v1 arg1 nil nil))
+  ([arg1 arg2] (send-message-v1 arg1 arg2 nil))
+  ([arg1 arg2 opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)
+         norm-arg1 (if (and (some? arg1) (= "object" (js* "typeof ~{}" arg1)) (not (map? arg1)))
+                     (js-params->clj-map arg1)
+                     arg1)
+         parsed (browser-cli/normalize-send-message-args norm-arg1 arg2)]
+     (cond
+       (not (:ok? parsed))
+       (js/Promise.resolve #js {"ok" false
+                                "sessionId" nil
+                                "seq" nil
+                                "burn" 0
+                                "error" (name (:error parsed))})
+
+       (not (and na @na))
+       (js/Promise.resolve #js {"ok" false
+                                "sessionId" (:session-id parsed)
+                                "seq" nil
+                                "burn" 0
+                                "error" "node-not-initialized"})
+
+       :else
+       (let [node @na
+             privkey (or (get-in node [:keypair :private-key])
+                         (when @anchor-state-atom (:privkey-bytes @anchor-state-atom)))
+             sid (:session-id parsed)
+             text (:text parsed)]
+         (if-not privkey
+           (js/Promise.resolve #js {"ok" false
+                                    "sessionId" sid
+                                    "seq" nil
+                                    "burn" 0
+                                    "error" "hardware-unlock-required"})
+           (let [sessions (or (get-in node [:light-state :sessions]) {})
+                 direct-sess (get sessions sid)
+                 target-pub (if direct-sess
+                              (:peer direct-sess)
+                              (resolve-peer-target node sid))
+                 resolved-sid (resolve-best-open-session-id sessions target-pub (when direct-sess sid))
+                 resolved-sess (when resolved-sid (get sessions resolved-sid))
+                 actual-peer-pub (or (:peer resolved-sess) target-pub)
+                 cmd-map (cond-> {"cmd" "send"
+                                  "peer" actual-peer-pub
+                                  "text" text
+                                  "message" text}
+                           resolved-sid (assoc "session_id" resolved-sid))
+                 cmd-res (light-core/handle-command (:light-state node) cmd-map privkey)
+                 new-st (:state cmd-res)
+                 out-envs (:net-envelopes cmd-res)
+                 resp (:response cmd-res)
+                 cmd-ok? (and (boolean (get resp "ok" true))
+                              (pos? (count out-envs)))
+                 out-sid (or (get resp "session_id") resolved-sid sid)
+                 out-seq (get resp "seq")
+                 out-burn (long (or (get resp "burn") 0))]
+             (swap! na (fn [curr]
+                         (cond-> (-> curr
+                                     (assoc :light-state new-st)
+                                     (assoc :sessions (:sessions new-st)))
+                           cmd-ok?
+                           (update :chat-history
+                                   (fn [h]
+                                     (conj (vec (or h []))
+                                           {:timestamp (.toISOString (js/Date.))
+                                            :direction :outgoing
+                                            :peer (or (:petname (browser-cli/resolve-petname-entry curr actual-peer-pub))
+                                                      actual-peer-pub)
+                                            :sessionId out-sid
+                                            :seq out-seq
+                                            :text text
+                                            :status :sent}))))))
+             (doseq [env out-envs]
+               (route-browser-envelope! na env))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+             (notify-ui-listeners!)
+             (js/Promise.resolve #js {"ok" cmd-ok?
+                                      "sessionId" out-sid
+                                      "seq" out-seq
+                                      "burn" out-burn
+                                      "error" (when-not cmd-ok?
+                                                (or (get resp "error") "no-open-session-for-peer"))}))))))))
+
+(defn send-broadcast-v1
+  "D40.4 v1.0.0: Multi-line UTF-8 safe subnet broadcast sender accepting either
+   `(subnetId, text)` positional or `({subnetId, text})` object.
+   Returns a Promise resolving to `{ ok, subnetId, seq, burn, error }`."
+  ([arg1] (send-broadcast-v1 arg1 nil nil))
+  ([arg1 arg2] (send-broadcast-v1 arg1 arg2 nil))
+  ([arg1 arg2 opts]
+   (let [opts-clj (js-params->clj-map opts)
+         na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)
+         norm-arg1 (if (and (some? arg1) (= "object" (js* "typeof ~{}" arg1)) (not (map? arg1)))
+                     (js-params->clj-map arg1)
+                     arg1)
+         parsed (browser-cli/normalize-send-broadcast-args norm-arg1 arg2)]
+     (cond
+       (not (:ok? parsed))
+       (js/Promise.resolve #js {"ok" false
+                                "subnetId" nil
+                                "seq" nil
+                                "burn" 0
+                                "error" (name (:error parsed))})
+
+       (not (and na @na))
+       (js/Promise.resolve #js {"ok" false
+                                "subnetId" (:subnet-id parsed)
+                                "seq" nil
+                                "burn" 0
+                                "error" "node-not-initialized"})
+
+       :else
+       (let [node @na
+             privkey (or (get-in node [:keypair :private-key])
+                         (when @anchor-state-atom (:privkey-bytes @anchor-state-atom)))
+             sub-id (:subnet-id parsed)
+             text (:text parsed)]
+         (if-not privkey
+           (js/Promise.resolve #js {"ok" false
+                                    "subnetId" sub-id
+                                    "seq" nil
+                                    "burn" 0
+                                    "error" "hardware-unlock-required"})
+           (let [cmd-res (light-core/handle-command (:light-state node)
+                                                    {"cmd" "broadcast"
+                                                     "subnet_id" sub-id
+                                                     "text" text
+                                                     "message" text}
+                                                    privkey)
+                 new-st (:state cmd-res)
+                 out-envs (:net-envelopes cmd-res)
+                 resp (:response cmd-res)
+                 cmd-ok? (boolean (get resp "ok" true))
+                 out-sub (or (get resp "subnet_id") sub-id)
+                 out-seq (get resp "seq")
+                 out-burn (long (or (get resp "burn") 0))]
+             (swap! na (fn [curr]
+                         (cond-> (-> curr
+                                     (assoc :light-state new-st)
+                                     (assoc :sessions (:sessions new-st)))
+                           cmd-ok?
+                           (update :chat-history
+                                   (fn [h]
+                                     (conj (vec (or h []))
+                                           {:timestamp (.toISOString (js/Date.))
+                                            :direction :outgoing
+                                            :peer out-sub
+                                            :sessionId out-sub
+                                            :seq out-seq
+                                            :text text
+                                            :status :sent}))))))
+             (doseq [env out-envs]
+               (route-browser-envelope! na env))
+             (when-let [dial-info (:p2p-dial cmd-res)]
+               (dial-browser-p2p-peer! na dial-info))
+             (browser/persist-state! (browser/sanitize-state-for-persistence @na))
+             (notify-ui-listeners!)
+             (js/Promise.resolve #js {"ok" cmd-ok?
+                                      "subnetId" out-sub
+                                      "seq" out-seq
+                                      "burn" out-burn
+                                      "error" (when-not cmd-ok? (get resp "error"))}))))))))
+
+(defn get-artifact-v1
+  "D40.4 v1.0.0: Fetches an artifact by `{ cid }` or `{ subnet, path }` (plus optional `{ baseUrl }`),
+   verifies SHA-256 == `cid` fail-closed with counted `:diagnose` on mismatch, and returns
+   `Promise<{ ok, cid, bytes: Uint8Array, contentType, error }>`."
+  [opts]
+  (let [opts-clj (js-params->clj-map opts)
+        na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)
+        plan (browser-cli/build-artifact-fetch-plan opts-clj)]
+    (cond
+      (not (:ok? plan))
+      (do
+        (when-let [diag (:diagnose plan)]
+          (emit-browser-event! na (assoc diag :type "diagnose" :timestamp-ms (.now js/Date))))
+        (js/Promise.resolve #js {"ok" false
+                                 "cid" nil
+                                 "bytes" nil
+                                 "contentType" nil
+                                 "error" (name (:error plan))
+                                 "reason" (:reason plan)}))
+
+      (not (exists? js/fetch))
+      (do
+        (emit-browser-event! na {:type "diagnose"
+                                 :kind :fetch-unavailable
+                                 :reason "global-fetch-unavailable"
+                                 :timestamp-ms (.now js/Date)})
+        (js/Promise.resolve #js {"ok" false
+                                 "cid" (:cid plan)
+                                 "bytes" nil
+                                 "contentType" nil
+                                 "error" "fetch-unavailable"}))
+
+      :else
+      (js/Promise.
+       (fn [resolve _reject]
+         (let [urls (:urls plan)
+               expected-cid (:cid plan)
+               try-url!
+               (fn try-url! [idx last-err]
+                 (if (>= idx (count urls))
+                   (do
+                     (emit-browser-event! na {:type "diagnose"
+                                              :kind :artifact-fetch-failed
+                                              :reason (or last-err "artifact-fetch-failed")
+                                              :timestamp-ms (.now js/Date)})
+                     (resolve #js {"ok" false
+                                   "cid" expected-cid
+                                   "bytes" nil
+                                   "contentType" nil
+                                   "error" "artifact-fetch-failed"
+                                   "reason" (or last-err "artifact-fetch-failed")}))
+                   (let [u (nth urls idx)]
+                     (-> (js/fetch u #js {"method" "GET"})
+                         (.then (fn [resp]
+                                  (if-not (and resp (.-ok resp))
+                                    (try-url! (inc idx) (str "http-" (when resp (.-status resp))))
+                                    (let [ct (or (when-let [hdrs (.-headers resp)]
+                                                   (.get hdrs "content-type"))
+                                                 "application/octet-stream")]
+                                      (-> (.arrayBuffer resp)
+                                          (.then (fn [ab]
+                                                   (let [u8 (js/Uint8Array. ab)
+                                                         vres (browser-cli/verify-artifact-bytes expected-cid u8)]
+                                                     (if (:ok? vres)
+                                                       (resolve #js {"ok" true
+                                                                     "cid" (:cid vres)
+                                                                     "bytes" u8
+                                                                     "contentType" ct
+                                                                     "error" nil})
+                                                       (do
+                                                         (when (and na @na)
+                                                           (swap! na
+                                                                  (fn [curr]
+                                                                    (-> curr
+                                                                        (update-in [:conn :diagnostics :cid-mismatch] (fnil inc 0))
+                                                                        (assoc-in [:conn :diagnostics :last-error] (get-in vres [:diagnose :reason]))))))
+                                                         (when-let [diag (:diagnose vres)]
+                                                           (emit-browser-event! na (assoc diag :type "diagnose" :timestamp-ms (.now js/Date))))
+                                                         (resolve #js {"ok" false
+                                                                       "cid" (:actual-cid vres)
+                                                                       "expectedCid" (:expected-cid vres)
+                                                                       "bytes" nil
+                                                                       "contentType" ct
+                                                                       "error" (:error vres)})))))))))))
+                         (.catch (fn [err]
+                                   (try-url! (inc idx) (str (or (when err (.-message err)) err "fetch-error")))))))))]
+           (try-url! 0 nil)))))))
+
 (defn build-light-node-api
-  "Constructs the unified `BitechoLightNode` browser console CLI object exposing EVERY
-   Node/JVM CLI verb from `browser-cli/browser-cli-verb-inventory` as a camelCase Promise-returning
-   method, plus `exec`, `cli`, `help`, `verbs`, `peers`, `reconnect`, and `autoUpdaterStatus`."
+  "Constructs the unified `BitechoLightNode` browser console CLI & v1.0.0 Headless API object
+   exposing EVERY Node/JVM CLI verb from `browser-cli/browser-cli-verb-inventory` as a camelCase
+   Promise-returning method, plus the additive D40.4 v1.0.0 contract (`apiVersion`, `getStatus`,
+   `onEvent`, `listPetnames`, `setPetname`, `listSessions`, `listSubnets`, `sendMessage`,
+   `sendBroadcast`, `getArtifact`), `exec`, `cli`, `help`, `verbs`, `peers`, `reconnect`, and
+   `autoUpdaterStatus`."
   []
-  (let [obj #js {"exec" exec-light-node-verb
+  (let [obj #js {"apiVersion" browser-cli/api-version
+                 "exec" exec-light-node-verb
                  "cli" exec-light-node-cli
                  "verbs" (fn [] (js/Promise.resolve (clj->js browser-cli/browser-cli-verb-inventory)))
                  "peers" (fn [] (get-peers-status @active-node-atom))
@@ -2670,7 +3142,15 @@
                  "initNode" init-node
                  "stopNode" stop-node
                  "getState" get-state
-                 "getStatus" get-status
+                 "getStatus" get-light-node-status
+                 "onEvent" on-event
+                 "listPetnames" list-petnames-v1
+                 "setPetname" set-petname-v1
+                 "listSessions" list-sessions-v1
+                 "listSubnets" list-subnets-v1
+                 "sendMessage" send-message-v1
+                 "sendBroadcast" send-broadcast-v1
+                 "getArtifact" get-artifact-v1
                  "version" "0.23.17"}]
     ;; Attach every recognized CLI verb as a Closure :advanced-safe camelCase JS method
     (doseq [[verb {:keys [js-method]}] browser-cli/browser-cli-verb-inventory]
