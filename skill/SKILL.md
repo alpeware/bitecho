@@ -76,6 +76,7 @@ Every flag in `bitecho.light-node.cli/known-command-flags` is automatically veri
 | **Cursors, Waiting & Ordering** | `--timeout-ms`, `--min-seq`, `--min-broadcast-seq`, `--cursor`, `--after-ts`, `--block`, `--until-event`, `--seq` |
 | **Economy & Escrows** | `--amount`, `--burn`, `--min-balance`, `--price`, `--price-max` |
 | **Artifacts, Directory & Governance** | `--path`, `--cid`, `--file`, `--hex`, `--authority`, `--prefix`, `--nickname`, `--name`, `--domain`, `--bip-cid`, `--invariant-diff-edn`, `--jurisdiction-map`, `--human-anchor-sunset` |
+| **BIP-016 Rolodex & Memento (`rolodex-*`, `memento-*`)** | `--node-role`, `--retention-max-entries`, `--retention-max-bytes`, `--rotate-every`, `--grace-epochs`, `--lkg-cid`, `--walk-depth-cap`, `--owner-pubkey`, `--cache-incentive` |
 
 ---
 

@@ -186,10 +186,22 @@
    "export-reveal"     {:canonical "connect" :domain-cmd "export-reveal"}
    "import-envelope"   {:canonical "inbox"   :domain-cmd "import-envelope"}})
 
+(def memento-verb-desugar-table
+  "BIP-016 Rolodex & Memento domain verbs mapped to canonical 1-of-12 CLI verbs (Rule 6)."
+  {"rolodex-status"  {:canonical "get" :domain-cmd "rolodex-status"}
+   "rolodex-put"     {:canonical "put" :domain-cmd "rolodex-put"}
+   "rolodex-rotate"  {:canonical "ctl" :domain-cmd "rolodex-rotate"}
+   "rolodex-restore" {:canonical "put" :domain-cmd "rolodex-restore"}
+   "memento-head"    {:canonical "get" :domain-cmd "memento-head"}
+   "memento-put"     {:canonical "put" :domain-cmd "memento-put"}
+   "memento-walk"    {:canonical "get" :domain-cmd "memento-walk"}})
+
 (def all-recognized-cli-verbs-set
-  "Union of all 68 legacy verbs, 12 canonical verbs, and shell/runner aliases."
-  (into (into supported-cli-verbs-set canonical-cli-verbs-set)
-        (keys runner-alias-desugar-table)))
+  "Union of all 68 legacy verbs, 12 canonical verbs, shell/runner aliases, and BIP-016 Rolodex/Memento verbs."
+  (-> supported-cli-verbs-set
+      (into canonical-cli-verbs-set)
+      (into (keys runner-alias-desugar-table))
+      (into (keys memento-verb-desugar-table))))
 
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
@@ -206,7 +218,9 @@
    "--invariant-diff-edn" "--jurisdiction-map" "--human-anchor-sunset" "--bip-cid"
    "--path" "--cid" "--file" "--hex" "--seq" "--authority" "--prefix" "--endpoint" "--candidates"
    "--nickname" "--name" "--domain"
-   "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"])
+   "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"
+   "--node-role" "--retention-max-entries" "--retention-max-bytes" "--rotate-every"
+   "--grace-epochs" "--lkg-cid" "--walk-depth-cap" "--owner-pubkey" "--cache-incentive"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -1567,7 +1581,8 @@
   (let [m (into {} (map (fn [[k v]] [(if (keyword? k) (name k) (str k)) v]) (or cmd-map {})))
         raw-verb (str/lower-case (str/trim (str (or (get m "cmd") (get m "verb") "status"))))
         legacy-entry (get legacy-verb-desugar-table raw-verb)
-        runner-entry (get runner-alias-desugar-table raw-verb)]
+        runner-entry (get runner-alias-desugar-table raw-verb)
+        memento-entry (get memento-verb-desugar-table raw-verb)]
     (cond
       (some? (get m "canonical_cmd"))
       m
@@ -1581,6 +1596,11 @@
       (assoc m
              "cmd" (:domain-cmd runner-entry)
              "canonical_cmd" (:canonical runner-entry))
+
+      memento-entry
+      (assoc m
+             "cmd" (:domain-cmd memento-entry)
+             "canonical_cmd" (:canonical memento-entry))
 
       (contains? canonical-cli-verbs-set raw-verb)
       (let [inferred-domain

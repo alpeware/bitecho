@@ -1,0 +1,36 @@
+{:bip-id "BIP-016"
+ :bip/id "BIP-016"
+ :title "BIP-016: Unified Rolodex (Petnames, Subnets, Persistent Sessions) & Encrypted Memento Continuity"
+ :bip/title "BIP-016: Unified Rolodex (Petnames, Subnets, Persistent Sessions) & Encrypted Memento Continuity"
+ :version "v0.23.18"
+ :bip/version "0.23.18"
+ :milestone "D42"
+ :bip/milestone "D42"
+ :bip/status :consented
+ :date "2026-11-21"
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :coordination-brief-cid "778efc04f92fede8f105e4b035ed76de04d776d758a0caa1f3b8884e5779edf6"
+ :shaped-spec-cid "bafb18ffd992af48a7a73e2d047ad6e3ea3852962e9f025540c7e47d5b21f3e9"
+ :bwrap-sim-patch-cid "5cd092a1b4349ff2956da67ceab85fcaaafd1a6f2ad39c4a89ba63ee856c8841"
+ :bwrap-sim-telemetry-cid "f9961a1fbf369b42bdb350f4a6db8fbde63da1719b785523071aa3223e5bf414"
+ :stage2-telemetry-cid "b1f04e399d06d4d5c8b622ad834ed5de9bdb6661b3116638e4ef1449c80c0c99"
+ :patch-cid "5cab406868601a506b3a408e1ee85c41a40c484a2d5c3030a0d6b7653b1c3f80"
+ :patch-size-bytes 237419
+ :consensus-impact :none
+ :consensus-impact-note "Pure Sans-IO .cljc primitives for unified Rolodex + encrypted Memento continuity, JVM/Node golden vectors, and CLI/browser verb parity; zero consensus wire changes."
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :note "Stage 1 CONSENT (10:18 CST) + Stage 2 LANDING GO (10:42 CST: 'Land BIP-016 on main.')"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62" :note "bwrap 0.13.0 E2E sim + Stage 2 CONSENT (10:32 CST, artifacts SHA-verified firsthand)"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8" :note "Stage 1 CONSENT + Stage 2 LIGHT ACCEPT (10:33 CST, promotion-gate boundary flag resolved in docs/memento-continuity-spec.md)"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc" :note "Stage 1 CONSENT + Stage 2 implementation tranche builder"}]
+ :invariant-diff {:defspec-vars ["bitecho.memento-lumen-wakeup-sim-test/prop-bip016-bounded-growth-retention-and-rotation"
+                                 "bitecho.memento-lumen-wakeup-sim-test/prop-bip016-bytes-at-rest-accounting-exactness"
+                                 "bitecho.memento-lumen-wakeup-sim-test/prop-bip016-memento-head-pointer-discipline"]
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:status :pass :note "8/8 JVM == Node.js (node:crypto) HKDF-SHA-256 / AES-256-GCM / canonical frame CID (878fcff8...) / RFC 8032 genesis vectors bit-identical"}
+                   :vopr-jepsen-non-vacuity {:status :pass :note "54 JVM tests / 711 assertions + 238 CLJS Node.js tests / 2,002 assertions, 0 failures"}
+                   :deterministic-bundle-sha256 {:status :pass :note "D40.4 browser bundle 100% byte-for-byte reproducible (fb3e9ce7...); BIP-016 adds pure .cljc primitives + CLI parity"}
+                   :bwrap-civilization-regression {:status :pass :note "bubblewrap 0.13.0 (:bwrap-enforced? true, --unshare-net) 6/6 E2E scenarios passed (telemetry f9961a1f...)"}}
+ :open-findings []}

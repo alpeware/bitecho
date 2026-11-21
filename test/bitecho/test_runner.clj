@@ -2,6 +2,7 @@
   "Test runner for Bitecho"
   (:require [bitecho.anchor-webauthn-test]
             [bitecho.basalt.core-test]
+            [bitecho.bip016-shaped-sim-test]
             [bitecho.browser-cli-and-webrtc-diagnostics-test]
             [bitecho.contagion.core-test]
             [bitecho.core.anchoring-test]
@@ -46,6 +47,8 @@
             [bitecho.light-node.cli-flag-inventory-test]
             [bitecho.light-node.cli-test]
             [bitecho.light-node.core-test]
+            [bitecho.memento-golden-vectors-test]
+            [bitecho.memento-lumen-wakeup-sim-test]
             [bitecho.murmur.core-test]
             [bitecho.node-bundle-test]
             [bitecho.rendezvous.core-test]

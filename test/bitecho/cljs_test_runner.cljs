@@ -14,6 +14,7 @@
             [bitecho.economy.treasury-test]
             [bitecho.fractal-federation-test]
             [bitecho.fressian-test]
+            [bitecho.memento-golden-vectors-test]
             [bitecho.murmur.core-test]
             [bitecho.rendezvous.core-test]
             [bitecho.shell.browser-test]
@@ -43,6 +44,7 @@
   (run-tests 'bitecho.anchor-webauthn-test
              'bitecho.browser-cli-and-webrtc-diagnostics-test
              'bitecho.fressian-test
+             'bitecho.memento-golden-vectors-test
              'bitecho.basalt.core-test
              'bitecho.murmur.core-test
              'bitecho.contagion.core-test
