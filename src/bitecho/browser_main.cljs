@@ -2486,7 +2486,7 @@
         st0 (deploy/init-light-updater-state
              {:node-id "browser"
               :artifact-role :browser
-              :current-version "0.23.18"
+              :current-version "0.23.19"
               :current-cid (:currentCid opts)
               :pinned-version (:pinVersion opts)
               :trusted-deploy-authorities (:trustedAuthorities opts)
@@ -2607,13 +2607,13 @@
        "checkBundleFreshness" (fn [remote-ver]
                                 (let [na @active-node-atom
                                       st (if na @na {:diagnostics {}})
-                                      res (browser/check-browser-bundle-freshness st "0.23.18" remote-ver)]
+                                      res (browser/check-browser-bundle-freshness st "0.23.19" remote-ver)]
                                   (when (and na (not (:fresh? res)))
                                     (swap! na update-in [:conn :diagnostics :stale-browser-bundle] (fnil inc 0)))
                                   (clj->js res)))
        "startAutoUpdater" start-browser-auto-updater!
        "getAutoUpdaterStatus" (fn [] (clj->js (or @browser-updater-atom {})))
-       "version" "0.23.18"})
+       "version" "0.23.19"})
 
 (defn- js-params->clj-map
   "Safely converts a JS object (including null-prototype or cross-realm objects) or CLJ map
@@ -3476,7 +3476,7 @@
                  "sendMessage" send-message-v1
                  "sendBroadcast" send-broadcast-v1
                  "getArtifact" get-artifact-v1
-                 "version" "0.23.18"}]
+                 "version" "0.23.19"}]
     ;; Attach every recognized CLI verb as a Closure :advanced-safe camelCase JS method
     (doseq [[verb {:keys [js-method]}] browser-cli/browser-cli-verb-inventory]
       (gobj/set obj js-method

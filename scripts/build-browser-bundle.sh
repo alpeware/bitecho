@@ -250,7 +250,7 @@ cat <<EOF > dist/index.html
       <p style="color: var(--text-muted); font-size: 0.85rem;">Phase 3 / Milestone 12 — Fractal Composition, Zero-Burn Subnets &amp; Domain Federation</p>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
-      <span class="badge badge-primary" id="versionBadge">v0.23.18 (BIP-016)</span>
+      <span class="badge badge-primary" id="versionBadge">v0.23.19 (BIP-016)</span>
       <span class="badge badge-success">Sans-IO Core</span>
     </div>
   </header>
@@ -515,7 +515,7 @@ cat <<EOF > dist/index.html
     <pre id="outputLog">Loading BitechoBrowser bundle...</pre>
   </div>
 
-  <script src="/app/bitecho-browser.js?v=0.23.18" integrity="${SRI_384}" crossorigin="anonymous"></script>
+  <script src="/app/bitecho-browser.js?v=0.23.19" integrity="${SRI_384}" crossorigin="anonymous"></script>
   <script>
     (function () {
       const log = document.getElementById("outputLog");
