@@ -78,7 +78,7 @@
           updater-atom (atom (deploy/init-light-updater-state
                               {:node-id (or node-id "jvm-node")
                                :artifact-role :jvm-jar
-                               :current-version (or current-version "0.23.17")
+                               :current-version (or current-version "0.23.18")
                                :current-cid cur-cid
                                :trusted-deploy-authorities trusted-deploy-authorities
                                :pinned-version pinned-version
