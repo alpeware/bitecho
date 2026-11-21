@@ -510,6 +510,10 @@
                                 _ (when (map? headers)
                                     (set! (.-headers opts-obj) (clj->js headers)))
                                 _ (when tls-sock
+                                    (set! (.-agent opts-obj) false)
+                                    (let [h (or (.-headers opts-obj) #js {})]
+                                      (aset h "Connection" "close")
+                                      (set! (.-headers opts-obj) h))
                                     (set! (.-createConnection opts-obj) (fn [_ _] tls-sock)))
                                 req (.request client opts-obj
                                               (fn [res]
@@ -570,6 +574,10 @@
                                              :method "GET"
                                              :timeout (or timeout-ms 15000)}
                                _ (when tls-sock
+                                   (set! (.-agent opts-obj) false)
+                                   (let [h (or (.-headers opts-obj) #js {})]
+                                     (aset h "Connection" "close")
+                                     (set! (.-headers opts-obj) h))
                                    (set! (.-createConnection opts-obj) (fn [_ _] tls-sock)))
                                req (.request client opts-obj
                                              (fn [res]
@@ -634,6 +642,10 @@
                                               :timeout (or timeout-ms 5000)
                                               :headers (clj->js hdrs)}
                                  _ (when tls-sock
+                                     (set! (.-agent options) false)
+                                     (let [h (or (.-headers options) #js {})]
+                                       (aset h "Connection" "close")
+                                       (set! (.-headers options) h))
                                      (set! (.-createConnection options) (fn [_ _] tls-sock)))
                                  req (.request client options
                                                (fn [res]
