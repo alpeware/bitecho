@@ -209,7 +209,7 @@ For detailed specifications and cross-runtime CLI/JSONL/Browser usage of Bitecho
 
 ## 5. Autonomous Development & Tri-Circle Sociocratic Governance Protocol (`bitecho.governance.core`)
 
-Bitecho implements a pure Sans-IO 4-layer autonomous protocol evolution and governance state machine in [`src/bitecho/governance/core.cljc`](file:///home/simonpure/src/alpeware/bitecho/src/bitecho/governance/core.cljc):
+Bitecho implements a pure Sans-IO 4-layer autonomous protocol evolution and governance state machine in [`src/bitecho/governance/core.cljc`](../src/bitecho/governance/core.cljc):
 
 1. **Layer 1 — Permissionless Fractal Lab Subnets & RFC 6962 Binary Merkle Anchoring (`register-lab-subnet`, `compute-rfc6962-merkle-root`, `anchor-subnet-merkle-root`):**
    - Registers child lab subnets with custom `:min-signaling-burn`, `:admission-gate` (`:permissionless`, `:dac-attested`, `:stake-gated`), `:capability-schemas`, and `:settlement-take-bps`.
@@ -373,7 +373,35 @@ To avoid dual-dial race conditions, ICE candidate collisions, and asymmetric sta
 
 ### 13.3 Canonical `put` Relay Publishing, Idempotent `/artifact/v1/pointer`, & Ops Hardening (`P-ART-1`, `P-OPS-1`, `P-OPS-2`)
 1. **Canonical `put` Relay Upload & Idempotent Pointer Acceptance:** Both `"put"` and `"artifact-put"` trigger `post-artifact-to-relay!` (`30000ms` blob timeout, `15000ms` pointer timeout, awaited before process exit in one-shot mode), and `/artifact/v1/pointer` returns `200 OK` (`"idempotent": true`) when an already-applied pointer is re-submitted.
-2. **Non-Interactive SSH & Infra Rollback Hardening (`scripts/cluster.sh`, `scripts/infra_cluster.sh`):** All `ssh`, `scp`, and `rsync` invocations enforce `-o BatchMode=yes -o StrictHostKeyChecking=accept-new`; `rollback_node` restores `/opt/bitecho-infra/bitecho.jar.bak` and restarts `bitecho-infra.service`; and `publish-git --deploy` verifies live `/dist/bitecho-light-node.cjs.sha256`.
+2. **Non-Interactive SSH & Infra Rollback Hardening (`scripts/cluster.sh`, `scripts/infra_cluster.sh`):** All `ssh`, `scp`, and `rsync` invocations enforce `-o BatchMode=yes -o StrictHostKeyChecking=accept-new`; `rollback_node` restores previous bundle/config backups and restarts the service; and `publish-git --deploy` verifies live `/dist/bitecho-light-node.cjs.sha256`.
+
+---
+
+## 14. Milestones D34–D41: Hardened Gentoo + OpenRC, `P-OBS-*` Telemetry, `P-ASYNC-*` Zero-Sync-IO, `P-UPD-1` Auto-Update, `BitechoLightNode`, & `BIP-015` (`v0.23.12`–`v0.23.18`)
+
+### 14.1 Hardened Gentoo Linux + OpenRC & Node.js Full-Node Fleet (`BIP-010`, `BIP-011`, `BIP-012`)
+1. **Unified 6-Node (`4-of-6`) Node.js Fleet:** All 6 validators (`node1..node3` and `ns1..ns3`) run `dist/bitecho-full-node.cjs` (`--max-old-space-size=384`) supervised by OpenRC `supervise-daemon` on Hardened Gentoo Linux (`docs/runbooks/gentoo-stage3-live-migration.md`).
+2. **Merkle Root-Hash Attestation & Fail-Closed Admission (`BIP-011`, `BIP-013`):** Host and artifact manifests verify layered SHA-256 trees and fail closed on missing layers or empty subtrees.
+
+### 14.2 Core Observability (`P-OBS-*`), Six-Nines SLA & Request Defense (`BIP-013` / `D38`, `D39.5`–`D39.6.1`)
+1. **Pure Step Instrumentation (`bitecho.observability.core`):** Zero-allocation-bounded step instrumentation and sequenced sinks (disk, network, IndexedDB) with sink failure isolation.
+2. **Network Telemetry & Rolling Six-Nines Cluster SLA (`P-OBS-4`):** Nodes publish signed telemetry digests to `bitecho.org/observability` (`/telemetry/<node>/digest.edn`), aggregated into `https://bitecho.org/sla/latest.edn` using an interval-sweepline rollup (`:finalization-stall` breach triggers at quorum level `>= 3` simultaneous nodes per `D39.6.1`).
+3. **Built-In Request Defense (`bitecho.defense.core`):** Fail-open consensus protection with escalating throttle/drop/ban windows and automatic expiry.
+
+### 14.3 Zero-Sync-IO Boundary Shells & Immutable Epoch-Addressed Snapshots (`P-ASYNC-*` / `BIP-014` / `D39`)
+1. **Pure Snapshot Core (`bitecho.snapshot.core`):** Deterministic immutable snapshot naming (`snapshot-<node>-epoch-<012d>.fressian`), highest-epoch recovery with seamless legacy `snapshot-<node>.edn` fallback, tunable retention (`keep-epochs` default `360`, `min-keep >= 2`), and single-authority generation-tagged coalescing writer reducer (Rule 4 & Rule 5).
+2. **Zero-Sync-IO Across All 3 Runtimes:** Node.js (`full_node_main.cljs`, `node_main.cljs`), JVM (`shell/persistence.clj`, `shell/mesh.clj`, `shell/infra.clj`, `shell/light_node.clj`), and Browser (`shell/browser.cljc`, `browser_main.cljs`) eliminate synchronous disk/gzip I/O on runtime hot paths.
+3. **Browser WebRTC ICE Diagnostics (`P-ASYNC-4`):** `pc.oniceconnectionstatechange` and `pc.onconnectionstatechange` dispatch generation-tagged events into `transition-conn`, surfacing counted `:ice-disconnects`, `:ice-reconnects`, `:last-ice-state`, and `:last-connection-state` in `getStatus().diagnostics`.
+
+### 14.4 `P-UPD-1` Opt-In Auto-Update & `BitechoLightNode` Browser Console CLI (`D40.1`–`D40.3`)
+1. **Live Pointer Auto-Update (`D40.1` `e91214c`, `D40.2` `9ecf885`, `D40.2.1` `3d86ce2`):** Shipped across Node.js light/full nodes, JVM light/full nodes (`shell/updater.clj`), and Browser (`browser_main.cljs`). Verifies `SHA-256 == pointer.target-cid`, runs a pre-swap health gate, supports same-version hotfixes with distinct verified CIDs (`D40.2.1`), and restores `.lkg` on failure. Controlled via `--auto-update-pointer`, `--auto-update-interval-ms`, and `--pin-version`.
+2. **Browser Console CLI Parity (`D40.3` `b7dc6d4`, `bitecho.browser-cli`):** `window.BitechoLightNode` derives its verb inventory directly from `bitecho.light-node.cli/all-recognized-cli-verbs-set` and exposes camelCase methods + `.cli(...)`, `.exec(...)`, `.help(...)`, `.peers()`, and `.verbs()`, explicitly failing closed with `:unsupported-in-browser` on OS-only verbs (`serve`, `daemon`, `mcp`).
+
+### 14.5 Sociocratic Governance Formalization, Canonical Channels & Rule 6 Integrity (`BIP-015` / `D41`)
+1. **Two-Gate Sociocratic Consent & BIP Integrity (`docs/GOVERNANCE.md`, `bitecho.governance.integrity`):** Enforces full 64-char SHA-256 CIDs, zero `:pending` consent records, non-nil Stage 2 `:patch-cid`/`:patch-size-bytes`, and explicit resolution of `CONSENT-WITH-ADDENDUM` / `CONSENT-WITH-FLAGS` items (`S-D41-1`).
+2. **Canonical Broadcast Channels (`docs/CHANNELS.md`):** Establishes `bitecho.org/team` (primary circle), `bitecho.org/dev`, `bitecho.org/ops`, `bitecho.org/observability`, and `bitecho.org/infra`, with a gated migration/deprecation checklist for `chat/simon-nexus-axiom` (`S-D41-4`).
+3. **Automated Rule 6 Freshness & Pointer-Bump Gate (`S-D41-2`, `S-D41-3`, `S-D41-5`):** Automated JVM `test.check` tests verify live `cli` / `browser-cli` parity with `skill/SKILL.md`, reject hardcoded local `file://` doc links, verify `docs/bips/INDEX.md` covers all committed BIPs, and `./scripts/cluster.sh bump-pointers` automates signed `dist/*` and `web/app/*` pointer bumps.
+
 
 
 

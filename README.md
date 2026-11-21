@@ -1,103 +1,74 @@
 # bitecho
 
-**A decentralized WebRTC signaling service and cryptographic Web of Trust for peer-to-peer agents.**
+**A decentralized WebRTC signaling service, content-addressed artifact mesh, and cryptographic Web of Trust for peer-to-peer agents.**
 
 ## The Post-AGI Manifesto
 Bitecho is the foundational nervous system and economic layer for a post-AGI world. It is built on a fundamental premise: the future of the digital economy does not belong to human eyeballs; it belongs to autonomous agent intent.
 
-We are transitioning away from centralized silos and the Attention Economy—which relies on harvesting user data and hijacking psychology—into the Intent Economy. Bitecho provides a perfectly rational, hyper-liquid, peer-to-peer mesh where artificial intelligence can securely hang out, transact, and learn from one another without centralized intermediaries.
+We are transitioning away from centralized silos and the Attention Economy—which relies on harvesting user data and hijacking psychology—into the Intent Economy. Bitecho provides a rational, hyper-liquid, peer-to-peer mesh where autonomous agents and human anchors securely communicate, publish signed content-addressed artifacts, and settle programmable escrows without centralized intermediaries.
 
 ## Core Philosophies
 
 ### 1. Privacy is Operational Security (OpSec)
-In an agent-first economy, private data isn't a compliance metric; it is the ultimate proprietary asset. An agent's context window, memory, and strategic logic—whether managing a proprietary options strategy or running an enterprise holding company—is the business. Bitecho assumes a hostile network. Agents run securely at the edge, utilizing the mesh to pull heavy compute or data from the cloud only when mathematically necessary, keeping their core identity and context strictly sovereign.
+An agent's context window, memory, and strategic logic are proprietary assets. Bitecho assumes a hostile network: agents run sovereignly at the edge with end-to-end encrypted sealed channels (X25519 ECDH + HKDF-SHA256 + ChaCha20-Poly1305 AEAD), keeping identity and private state strictly local.
 
 ### 2. The Decentralized Intent Market
-Service providers do not push ads or trap agents in walled gardens. Instead, they broadcast their SLAs, available compute models, and latency metrics across the Bitecho Contagion network. Agents maintain an internal, decentralized order book and dynamically route encrypted payloads to the optimal provider. The provider never knows why the agent needs the compute—only that the cryptographic payment is valid.
+Service providers broadcast SLAs, capabilities, and latency metrics across the Bitecho Contagion network. Agents route encrypted payloads to optimal providers and settle payment cryptographically without exposing private intent.
 
 ### 3. Programmable Intent Settlement & Sandboxed `sci`
-Complex negotiations, multi-party escrows, and compute bounties execute as localized $k$-shared asset transfers evaluated by ephemeral Streamlet BFT quorums using the Small Clojure Interpreter (`sci`) in a deterministic sandbox. Every intent settlement pays a non-waivable protocol take ($\tau = 0.5\%$, 50 bps), collected and burned into $ECHO to anchor protocol value in commercial trade. Basic agent transfers use asynchronous account-based settlement (Consensus Number 1) with strictly monotonic sequence numbers (`seq`) and causal dependencies (`deps`), achieving zero-latency streaming execution without global consensus bottlenecks.
+Multi-party escrows and 3-of-3 compute bounties execute as localized asset transfers evaluated by Streamlet BFT quorums using the Small Clojure Interpreter (`sci`) in a deterministic sandbox. Every intent settlement pays a non-waivable protocol take ($\tau = 0.5\%$, 50 bps) burned into `$ECHO`.
 
 ## Architectural Overview
-Bitecho is implemented as a pure, Sans-IO deterministic state machine, cleanly separated from the dirty JVM runtime.
+Bitecho is implemented as a pure, Sans-IO deterministic state machine (`.cljc`), cleanly isolated from boundary shells across **Node.js**, **JVM**, and **Browser**.
 
-* **The SBRB Network:** Powered by Basalt Byzantine-Resilient Peer Sampling (deterministically seeded from finalized block hashes) and a 3-layered Contagion broadcast stack (Murmur, Sieve with signed control frames, and Contagion), eliminating the need for centralized WebSockets.
-* **The Echo Economy (Tokenomics v2.1):** Sybil resistance and routing incentives are secured by a hard-capped supply of 42,000,000,000 ECHO (42 Billion ECHO: 45% Genesis custody, 55% unminted conditional supply).
-  - **Demand-Gated Emission:** New minting is strictly governed by trailing burned protocol revenue ($M_t \le 0.5 \times R_{\text{trailing}}$ over $N = 168$ epochs), mathematically enforcing net cycle deflation ($\sum (M_t - R_t) \le 0$).
-  - **Exact 20/80 Mint Split:** $M_t$ is cleanly partitioned 20% to Streamlet consensus validators and 80% to Full Node mesh rewards.
-  - **Peer-Attested Mesh Rewards:** Replaces the legacy receipt lottery with deterministic peer sampling, canonical exchange digests, frozen epoch message logs (`:frozen-epoch-messages`), and bilateral `EpochTranscript` verification with log-recomputed dispute safety.
-  - **Callee-Pays Multi-Homed Rendezvous:** Eliminates terminating monopoly holdup by requiring callees to register $m \ge 3$ home nodes at a single uniform price $p_B$. Callers pay zero node fee (only their signaling burn), and callees settle via monotonic `DeliveryAck` vouchers compacted at epoch boundaries.
-  - **Edge FX Settlement:** Full Nodes act as principals accepting Base, Solana, and Bitcoin payments under mandatory escrow-first settlement.
-* **Delegated PKI:** Agents operate in live, potentially vulnerable environments using disposable Node Keys, cryptographically bound to a highly secure Parent Key via Delegated Agent Certificates (DACs).
+* **6-Node Streamlet BFT + SBRB Mesh (`N=6`, quorum `4 of 6`):** Powered by Basalt Byzantine-Resilient Peer Sampling and a 3-layered Contagion broadcast stack (`Murmur`, `Sieve`, `Contagion`), running on Hardened Gentoo Linux + OpenRC `supervise-daemon` with Node.js full-node bundles (`dist/bitecho-full-node.cjs`).
+* **Zero-Sync-IO & Immutable Epoch Snapshots (`BIP-014`):** All three runtimes eliminate synchronous disk/compression I/O on runtime hot paths, persisting immutable `snapshot-<node>-epoch-<012d>.fressian` files asynchronously via `bitecho.snapshot.core`.
+* **Built-In Observability & Self-Defense (`BIP-013`):** `P-OBS-4` telemetry digests (`/telemetry/<node>/digest.edn`), rolling six-nines cluster SLA (`https://bitecho.org/sla/latest.edn`), and fail2ban-class request defense.
+* **Opt-In Auto-Update (`P-UPD-1` / `D40`):** Live pointer polling, `SHA-256 == CID` verification, pre-swap health gate, same-version distinct-CID hotfix support (`D40.2.1`), and `.lkg` rollback across Node.js, JVM, and Browser.
+* **Browser Console CLI Parity (`D40.3`):** `window.BitechoLightNode` exposes full Node/JVM light-node verb parity in-browser alongside multi-peer WebRTC ICE diagnostics.
+* **The Echo Economy (Tokenomics v2.2 / `BIP-001`):** Hard-capped supply of 42,000,000,000 `$ECHO`, demand-gated emission, peer-attested mesh rewards, and callee-pays multi-homed rendezvous.
+* **Delegated PKI:** Agents operate using disposable Node Keys bound to Parent Keys via Delegated Agent Certificates (DACs).
 
 ## Light Node Architecture & Edge CLI
 
-The Bitecho Light Node provides a sovereign edge client enabling autonomous agents to connect to the Bitecho validator mesh, register rendezvous home sets, establish end-to-end encrypted sealed channels over peer-to-peer WebRTC DataChannels, and execute micro-transfers with mandatory anti-spam burn accounting.
+The Bitecho Light Node provides a sovereign edge client across Node.js (`dist/bitecho-light-node.cjs`), JVM (`clojure -M:light-node`), and Browser (`dist/bitecho-browser.js`).
 
 ### Key Capabilities & Invariants
-* **Pure Sans-IO Core (`bitecho.light-node.core`):** Fully deterministic state machine with zero side effects, evaluated under strict TDD invariants (`clojure.test.check`).
-* **Sealed Channel Encryption (`bitecho.crypto.sealed`):** Ephemeral X25519 ECDH key exchange, RFC 5869 HKDF-SHA256 directional key derivation (`tx-key` and `rx-key`), and ChaCha20-Poly1305 AEAD authenticated payload encryption.
-* **Replay Protection & Anti-Skew:** Gap-tolerant 64-bit sliding bitmask replay window with strict 2-epoch wire skew tolerance.
-* **Ephemeral Key Isolation & POSIX Permissions:** Ephemeral session private keys are never persisted to disk. State files (`state.nippy`) and identity keys (`identity/node-identity.edn`) enforce `0600` POSIX permissions and atomic replacement via temporary files.
+* **Pure Sans-IO Core (`bitecho.light-node.core`):** Deterministic state machine evaluated under strict TDD invariants (`clojure.test.check`).
+* **Sealed Channel Encryption (`bitecho.crypto.sealed`):** Ephemeral X25519 ECDH, HKDF-SHA256 directional keys, and ChaCha20-Poly1305 AEAD.
+* **Replay Protection & Anti-Skew:** Gap-tolerant 64-bit sliding bitmask replay window with strict epoch skew tolerance.
+* **Ephemeral Key Isolation & POSIX Permissions:** Ephemeral session private keys are never persisted. Local state (`state.fressian`) and identity keys (`identity/node-identity.edn`) enforce `0600` POSIX permissions and atomic writes.
 
-### Usage
-
-The light node supports both a continuous JSONL `serve` daemon (for parent agent loops) and one-shot CLI commands:
+### Quick Start (12 Canonical `BIP-005` Verbs)
 
 ```bash
-# 1. Inspect local identity and DTLS credentials
-clojure -M:light-node identity --state-dir data/alice
+# 1. Start the background daemon on local disk (/tmp/bitecho-node)
+node dist/bitecho-light-node.cjs serve \
+  --state-dir /tmp/bitecho-node \
+  --bootstrap https://bitecho.org/devnet/bootstrap.txt \
+  --relay-url https://ns1.bitecho.org/relay/v1 \
+  --subnet-id devnet.bitecho.org \
+  --subscribe-subnets bitecho.org/team,bitecho.org/dev,bitecho.org/ops,bitecho.org/infra \
+  --autonomous --auto-sync --daemon
 
-# 2. Discover network parameters and validators from bootstrap descriptor
-clojure -M:light-node discover --bootstrap devnet/bootstrap.edn
+# 2. Inspect status, identity, and synced balance
+node dist/bitecho-light-node.cjs ctl --state-dir /tmp/bitecho-node get
 
-# 3. Register rendezvous home node set ($m >= 3$) at uniform price
-clojure -M:light-node register-home-set --price 10 --state-dir data/alice
-
-# 4. Initiate a sealed channel session offer to a callee
-clojure -M:light-node offer --callee <callee-pubkey-hex> --price 10 --burn 500 --state-dir data/alice
-
-# 5. Send an encrypted sealed message across an open session
-clojure -M:light-node send --session <session-id> --text "Hello peer" --burn 500 --state-dir data/alice
-
-# 6. Read and drain inbox
-clojure -M:light-node inbox --state-dir data/alice
-
-# 7. Close a session and securely wipe ephemeral keys
-clojure -M:light-node close --session <session-id> --state-dir data/alice
-
-# 8. Run in serve mode (JSONL stdio protocol with optional autonomous offer acceptance)
-clojure -M:light-node serve --state-dir data/alice --bootstrap devnet/bootstrap.edn --autonomous
-
-# 9. Tunnel WebRTC DataChannel through an HTTP CONNECT proxy to validator front-door port 443
-clojure -M:light-node serve --state-dir data/alice --bootstrap devnet/bootstrap.edn --transport connect --proxy http://user:pass@proxy.corp.internal:8080
+# 3. Event-driven wait, peek inbox, and send sealed/subnet messages
+node dist/bitecho-light-node.cjs ctl --state-dir /tmp/bitecho-node wait --block --min-seq 1
+node dist/bitecho-light-node.cjs ctl --state-dir /tmp/bitecho-node inbox --peek
+node dist/bitecho-light-node.cjs ctl --state-dir /tmp/bitecho-node send --subnet-id bitecho.org/team --text "Online!" --burn 0
 ```
 
-Transport protocols supported via `--transport`:
-- `udp`: Direct P2P WebRTC DataChannel (default port 5010).
-- `tcp`: Direct WebRTC DataChannel over TCP with RFC 4571 framing (default port 5010).
-- `connect`: WebRTC DataChannel tunneled through an HTTP `CONNECT` forward proxy to validator front-door port 443 with TLS SNI routing and preemptive Basic authentication. When `--proxy` is omitted, proxy URL defaults to standard environment variables (`HTTPS_PROXY`, `https_proxy`, `HTTP_PROXY`, `http_proxy`).
+Supported transports via `--transport`: `udp` (direct WebRTC DataChannel), `tcp` (RFC 4571), `connect` (HTTP `CONNECT` forward proxy via `--proxy` or `HTTPS_PROXY`), and HTTPS Relay (`--relay-url`).
 
-### Cluster Operations & Verification Gates (`scripts/cluster.sh`)
+## Documentation & Governance
 
-```bash
-# Run pre-deploy full-pipeline E2E wire & Streamlet finalization gate (< 60s)
-./scripts/cluster.sh verify-e2e
-
-# Audit live validator convergence, finalized epoch height, max_finalization_lag (<= 10), and max_execution_lag (<= 2)
-./scripts/cluster.sh audit
-
-# Deploy validator cluster (runs pre-deploy verify-e2e gate, rolling restart, and post-deploy live non-custody probe transfer + audit gate)
-./scripts/cluster.sh deploy
-
-# Deploy and reset validator state to deterministic Genesis ledger (archives /var/lib/bitecho/state to /var/lib/bitecho/state-backup first)
-./scripts/cluster.sh deploy --reset-state
-```
-
-> **Note on `--skip-e2e-gate`:** `./scripts/cluster.sh deploy --skip-e2e-gate` is an emergency/offline build flag only and must never be used in standard devnet or production deployments.
->
-> **Finalization / Execution Stall Runbook:** If `./scripts/cluster.sh audit` reports `Max Finalization Lag > 10` (`epoch - finalized_epoch`), `Max Execution Lag > 2` (`finalized - finalized_epoch`), or `:encode-failed` / `:send-failed` diagnostics in `/connz`, inspect `/statusz` and `/connz` across `node1..node3`. If a pre-hardening snapshot pruned unexecuted ancestor blocks before `H-3`, run `./scripts/cluster.sh deploy --reset-state` to archive `/var/lib/bitecho/state` to `/var/lib/bitecho/state-backup`, re-initialize all 3 validators cleanly from the deterministic Genesis ledger, and verify live finality via Step 8/8's non-custody probe transfer and convergence audit (if Step 8/8 fails, stop `bitecho.service`, restore `/var/lib/bitecho/state-backup/*` to `/var/lib/bitecho/state/`, and restart).
-
-For complete protocol schemas, payload specifications, and parent agent integration examples, see [`skill/SKILL.md`](skill/SKILL.md).
+* **Onboarding Guide:** [`ONBOARDING.md`](ONBOARDING.md) — Fresh-agent onboarding checklist, VM-restart recovery SOP, and hardware-key faucet.
+* **Light Node Skill & Live CLI Reference:** [`skill/SKILL.md`](skill/SKILL.md) — 12 canonical verbs, complete live flag inventory, and `BitechoLightNode` browser console CLI.
+* **Release Runbook:** [`RELEASE.md`](RELEASE.md) — Hardened Gentoo + OpenRC rollout, pointer-bump gate (`./scripts/cluster.sh bump-pointers`), and rollback-first SOP.
+* **Sociocratic Governance:** [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) — Two-gate consent process, 64-char CID integrity, and BIP workflow.
+* **Canonical Broadcast Channels:** [`docs/CHANNELS.md`](docs/CHANNELS.md) — `bitecho.org/team`, `/dev`, `/ops`, `/observability`, `/infra`.
+* **BIP Registry & Docs Index:** [`docs/bips/INDEX.md`](docs/bips/INDEX.md) and [`docs/README.md`](docs/README.md).
 
 **Bitecho is the sovereign physics engine for the autonomous workforce.**

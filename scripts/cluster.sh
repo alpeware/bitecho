@@ -2197,6 +2197,89 @@ REMOTE_RB_NODE
 # CLI Dispatcher & Usage
 # ------------------------------------------------------------------------------
 
+cmd_bump_pointers() {
+  local version=""
+  local state_dir="${BITECHO_POINTER_STATE_DIR:-/tmp/antigravity-light-node}"
+  local relay_url="${BITECHO_RELAY_URL:-https://ns1.bitecho.org/relay/v1}"
+  local subnet_id="${BITECHO_INFRA_SUBNET:-bitecho.org/infra}"
+  local landing_url="${BITECHO_LANDING_URL:-https://bitecho.org}"
+  local dry_run=0
+  local verify_only=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --version) version="$2"; shift 2 ;;
+      --state-dir) state_dir="$2"; shift 2 ;;
+      --relay-url) relay_url="$2"; shift 2 ;;
+      --subnet-id) subnet_id="$2"; shift 2 ;;
+      --landing-url) landing_url="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --verify-only) verify_only=1; shift ;;
+      *) echo "Unknown option for bump-pointers: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ -z "${version}" ]]; then
+    echo "Error: bump-pointers requires --version <v0.23.XX> (AGENTS.md Rule 6 precondition)." >&2
+    exit 1
+  fi
+
+  local -a pointer_pairs=(
+    "dist/bitecho-light-node.cjs:${ROOT_DIR}/dist/bitecho-light-node.cjs"
+    "dist/bitecho-browser.js:${ROOT_DIR}/dist/bitecho-browser.js"
+    "dist/bitecho-full-node.cjs:${ROOT_DIR}/dist/bitecho-full-node.cjs"
+    "web/app/bitecho-browser.js:${ROOT_DIR}/dist/bitecho-browser.js"
+    "web/app/index.html:${ROOT_DIR}/resources/public/index.html"
+  )
+
+  echo "==> [S-D41-5] Release Pointer-Bump Gate for ${version} (subnet=${subnet_id})"
+  for pair in "${pointer_pairs[@]}"; do
+    local ppath="${pair%%:*}"
+    local fpath="${pair#*:}"
+    if [[ ! -f "${fpath}" ]]; then
+      echo "Error: Required release artifact missing: ${fpath} (for pointer ${ppath})" >&2
+      exit 1
+    fi
+    local sha
+    sha=$(sha256sum "${fpath}" | awk '{print $1}')
+    echo "  [ARTIFACT] ${ppath} -> ${sha} (${fpath})"
+    if [[ "${dry_run}" == "0" && "${verify_only}" == "0" ]]; then
+      if [[ ! -d "${state_dir}/identity" ]]; then
+        echo "Error: Signer identity missing at ${state_dir}/identity (pass --state-dir)." >&2
+        exit 1
+      fi
+      node "${ROOT_DIR}/dist/bitecho-light-node.cjs" put \
+        --state-dir "${state_dir}" \
+        --relay-url "${relay_url}" \
+        --subnet-id "${subnet_id}" \
+        --path "${ppath}" \
+        --file "${fpath}" \
+        --burn 0
+    fi
+  done
+
+  if [[ "${dry_run}" == "1" ]]; then
+    echo "==> [DRY-RUN OK] All 5 release artifacts verified for ${version}."
+    return 0
+  fi
+
+  echo "==> Verifying landing SHAs at ${landing_url} match built artifacts for ${version}..."
+  for pair in "dist/bitecho-light-node.cjs:${ROOT_DIR}/dist/bitecho-light-node.cjs" \
+              "dist/bitecho-browser.js:${ROOT_DIR}/dist/bitecho-browser.js"; do
+    local ppath="${pair%%:*}"
+    local fpath="${pair#*:}"
+    local expected_sha actual_sha
+    expected_sha=$(sha256sum "${fpath}" | awk '{print $1}')
+    actual_sha=$(curl -fsSL --max-time 15 "${landing_url}/${ppath}" | sha256sum | awk '{print $1}')
+    if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+      echo "Error: Landing SHA mismatch for ${ppath}: got ${actual_sha}, expected ${expected_sha}" >&2
+      exit 1
+    fi
+    echo "  [VERIFIED] ${landing_url}/${ppath} == ${expected_sha}"
+  done
+  echo "==> [S-D41-5 OK] Signed dist/* and web/app/* pointers verified for ${version}."
+}
+
 usage() {
   cat << USAGE_EOF
 Bitecho Cluster Management Tool (scripts/cluster.sh)
@@ -2207,7 +2290,9 @@ Usage:
 Commands:
   init                                Provision GCP projects, static IPs, firewall rules, VMs, and bootstrap packages
   deploy [--reset-state] [--skip-e2e-gate] [--canary] [--rolling] [--streamlet-validators node1,node2,node3]
-                                      Build local uberjar, run pre/post-deploy E2E transfer gates, sync configs, and restart
+                                      Build local bundles, run pre/post-deploy E2E transfer gates, sync configs, and restart
+  bump-pointers --version <ver> [--dry-run] [--verify-only] [--state-dir DIR] [--relay-url URL]
+                                      Publish & verify signed dist/* and web/app/* pointers on bitecho.org/infra (S-D41-5)
   rollback [node...]                  Restore .prev uberjar and config.edn backup on target nodes and restart service
   add-validator <node-id> [--streamlet-bft]
                                       Dynamically add a validator node to :mesh-nodes (and optionally :validators) with zero reset
@@ -2254,6 +2339,9 @@ main() {
       ;;
     deploy)
       cmd_deploy "$@"
+      ;;
+    bump-pointers|bump_pointers)
+      cmd_bump_pointers "$@"
       ;;
     rollback)
       cmd_rollback "$@"

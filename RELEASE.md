@@ -1,159 +1,153 @@
 # Bitecho Release & Upgrade Runbook (`RELEASE.md`)
 
-This runbook defines the authoritative release lifecycle, network separation model (`devnet.bitecho.org` / `testnet.bitecho.org` / `mainnet.bitecho.org`), pre-release verification gates, canary rolling deployment order, monitoring thresholds, and rollback procedures for Bitecho.
+This runbook defines the authoritative release lifecycle for Bitecho `v0.23.17+` (`D41` / `BIP-015`) running on **Hardened Gentoo Linux + OpenRC `supervise-daemon` + Node.js bundles** across the 6-node (`4-of-6` Streamlet BFT quorum) fleet.
 
 ---
 
-## 1. Network Topologies & URI Separation
+## 1. Fleet Architecture & Network Separation
 
-Every Bitecho network is identified by an explicit canonical `:network-uri` that also serves as its root `:subnet-id`:
+| Component | Production Runtime | Supervision & Host | Notes |
+| :--- | :--- | :--- | :--- |
+| **Core Validators (`node1..node3`)** | Node.js `dist/bitecho-full-node.cjs` (`--max-old-space-size=384`) | Hardened Gentoo + OpenRC `supervise-daemon` (`/etc/init.d/bitecho`) | Part of unified 6-node BFT committee (`N=6`, quorum `4 of 6`). |
+| **Infra Validators (`ns1..ns3`)** | Node.js `dist/bitecho-full-node.cjs` (`--max-old-space-size=384`) | Hardened Gentoo + OpenRC `supervise-daemon` (`/etc/init.d/bitecho-infra`) | Full BFT validators + HTTPS relay, DNS, static/pointer serving, and `P-OBS-4` telemetry rollups. |
+| **Edge Light Nodes** | Node.js `dist/bitecho-light-node.cjs` / JVM `clojure -M:light-node` | Local agent host / user machine | Sovereign edge client with opt-in `P-UPD-1` auto-update. |
+| **Browser Light Node** | `dist/bitecho-browser.js` (`:advanced` Closure bundle) | Web app (`https://bitecho.org`) | Includes `window.BitechoLightNode` console CLI parity (`D40.3`) and WebRTC ICE diagnostics (`D39`). |
 
-| Network | `:network` | `:network-uri` / Root `:subnet-id` | Purpose & Governance | Custody Key Policy | Default Tokenomics |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Devnet** | `:devnet` | `devnet.bitecho.org` | Rapid multi-agent & validator development, chaos testing, and automated E2E gates (`10s` fast epochs) | Automated Devnet custody keypair allowed for test funding | `burn-floor=100`, `take=50 bps`, `window=168` |
-| **Testnet** | `:testnet` | `testnet.bitecho.org` | Public staging & civilization soak cluster (`1h` epochs, `N=6` validators across `us-west1`/`us-central1`/`us-east1`) | Restricted staging custody keypair | `burn-floor=50`, `take=150 bps`, `window=336` |
-| **Mainnet** | `:mainnet` | `mainnet.bitecho.org` | Production network with ratified `BIP-001` v2.2 Pareto-optimal tokenomics and strict replay protection (`:strict-network-uri? true`) | **Cold offline custody only** — `validate-node-config` rejects hot `:custody-privkey` (`A-D23-4`) | `burn-floor=50`, `take=150 bps`, `window=336` |
-
-### Cross-Network Replay Protection & Rolling Upgrade Equivalence
-1. **Transfer Replay Protection (`A-D23-1`, `A-CARB-D23-1`):** Signed `Transfer` records bind `:network-uri` inside the canonical Ed25519 signing payload (`bitecho.economy.account/create-transfer`). Validators (`bitecho.state-machine`) and light nodes (`bitecho.light-node.core`) reject any transfer carrying a mismatched `:network-uri` (and Mainnet rejects any unscoped transfer missing `:network-uri`), incrementing `[:diagnostics :network-replay-rejected]` and emitting a `:diagnose` effect.
-2. **Escrow Replay Protection (`A-CARB-D23-2`):** `bitecho.economy.escrow/compute-escrow-id` (8-arity) binds `network-uri` into `bitecho-escrow-id-v1`, and `:lock-intent` / `:release-intent` / `:refund-intent` / `:settle-intent` reject foreign `:network-uri` events with counted `:network-replay-rejected` diagnostics.
-3. **Rolling `N` / `N+1` Root Subnet Compatibility:** During rolling upgrades, `bitecho.config/equivalent-subnet-id?` treats legacy `"global"` and the active network's root URI (`"devnet.bitecho.org"`) as equivalent while strictly isolating `"devnet.bitecho.org"`, `"testnet.bitecho.org"`, and `"mainnet.bitecho.org"` from one another.
+Every Bitecho network is isolated by an explicit canonical `:network-uri` (`devnet.bitecho.org`, `testnet.bitecho.org`, `mainnet.bitecho.org`) bound inside Ed25519 signing payloads for transfers and escrows.
 
 ---
 
-## 2. Pre-Release Verification Gate & BIP Governance Machine Workflow
+## 2. Two-Gate Consent-Then-Roll & 8-Gate BIP Receipt Workflow
 
-Every release candidate MUST pass all 6 local verification gates with zero warnings or failures before building release artifacts or initiating on-chain governance:
+Per [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md), **no release is tagged or rolled across the cluster until unanimous Stage 2 circle consent is recorded**.
 
+### Pre-Release Local Gates
 ```bash
-# 1. Code formatting & static analysis (AGENTS.md Rule 3)
+# 1. Code formatting & static analysis (AGENTS.md Rule 3 — 0 errors, 0 warnings)
 clojure -M:format
 clojure -M:lint
 
-# 2. Full unit + generative test.check suite (AGENTS.md Rule 1)
+# 2. Full unit + generative clojure.test.check suite (AGENTS.md Rule 1)
 clojure -M:test --skip-integration
 
-# 3. Multi-network release proof generator (devnet/testnet/mainnet + 6-pair replay matrix + N/N+1 rolling interop + S1-S24 scenarios)
-clojure -M:proof docs/releases/v0.23.5-proof.edn
-
-# 4. Pre-deploy E2E wire negotiation & 3-epoch Streamlet finalization gate
-./scripts/cluster.sh verify-e2e
-
-# 5. Production uberjar & Node/Browser light-node bundle build
+# 3. Reproducible Node.js & Browser bundle builds (zero JAR/systemd/SEA dependencies)
+./scripts/build-full-node-bundle.sh
 ./scripts/build-node-light-node.sh
 ./scripts/build-browser-bundle.sh
-./scripts/build-sea.sh
+sha256sum dist/bitecho-full-node.cjs dist/bitecho-light-node.cjs dist/bitecho-browser.js
+
+# 4. Pre-deploy E2E wire negotiation & Streamlet finalization gate
+./scripts/cluster.sh verify-e2e
 ```
 
-### The BIP Governance Machine Workflow (`--burn 100` Off-Leg Rule)
-Upgrades and parameter modifications are governed on-chain via the Tri-Circle Sociocratic Governance Machine:
-1. **Proof Generation & Gate Assertion:** Generate bit-for-bit release proof with `clojure -M:proof docs/releases/v0.23.5-proof.edn`. `scripts/cluster.sh` asserts that all test gates passed and verifies commit and tree SHAs.
-2. **Proposal Submission (`--burn 100`):** Submit the BIP proposal using `--burn 100` (mandatory anti-spam burn floor across validator mesh gossip):
-   ```bash
-   ./scripts/light-node.sh bip-submit \
-     --bip-id BIP-002 \
-     --title "Release v0.23.5" \
-     --proof-file docs/releases/v0.23.5-proof.edn \
-     --burn 100
-   ```
-3. **Tri-Circle Sociocratic Consent (`--burn 100`):** All three circles (`:mesh-validators`, `:builders-stewards`, `:token-anchors`) evaluate the proposal and record consent via `bip-consent --burn 100` (or substantiate objections with bit-for-bit reproducible regression vectors via `bip-object --burn 100`).
-4. **Scheduled Upgrade Epoch Activation:** Once 3-of-3 circle consent is achieved with 0 paramount objections, the proposal state transitions to `:ratified`, and its target epoch is scheduled in `:scheduled-upgrades`.
-5. **On-Network Artifact Publishing (`migrate-infra` / `publish-release`):** Binaries and web documents are published as content-addressed `Blob`s and Cold-Root-signed `Pointer`s into `bitecho.org/infra`, serving live at `https://bitecho.org/releases/v0.23.5/...` and `/bip/<bip-id>`.
+### Stage 2 Receipt & Self-Contained `.patch` Publication (`bitecho.org/dev`)
+1. Generate the self-contained patch from the parent commit (`git diff <parent>..HEAD > dist/bips/bip-NNN-v023XX.patch`) and compute its exact 64-char SHA-256 `:patch-cid` and `:patch-size-bytes`.
+2. Build the 8-gate Stage 2 receipt (`dist/bips/bip-NNN-v023XX.edn`) asserting:
+   - Non-nil 64-char `:code-artifact/:patch-cid` and positive `:patch-size-bytes`.
+   - Full 64-char SHA-256 CIDs everywhere (zero 8-char prefixes).
+   - Zero `:pending` consent records before commit.
+   - Explicit resolution of any `CONSENT-WITH-ADDENDUM` / `CONSENT-WITH-FLAGS` items (`:flag-resolutions` or owned `:open-findings`).
+3. Publish both `dist/bips/bip-NNN-v023XX.edn` and `dist/bips/bip-NNN-v023XX.patch` to `bitecho.org/dev` and announce the 64-char receipt CID on `bitecho.org/team`.
+4. After unanimous Stage 2 consent, create the annotated git tag (`git tag -a v0.23.XX -m "..."`) and proceed to canary rollout.
 
 ---
 
-## 3. Deterministic Artifact Build & On-Network Publishing Pipeline
+## 3. Automated Signed Pointer-Bump Release Gate (`S-D41-5`)
 
-1. Build the release uberjar, Node/Browser bundles, and SEA standalone binaries:
-   ```bash
-   clojure -T:build uber
-   ./scripts/build-node-light-node.sh
-   ./scripts/build-browser-bundle.sh
-   ./scripts/build-sea.sh
-   sha256sum dist/bitecho-light-node.cjs dist/bitecho-browser.js
-   ```
-2. Ingest compiled artifacts and web resources into the `bitecho.org/infra` subnet:
-   - Git tracks **source code and cryptographic proofs only** (`docs/releases/v0.23.5-proof.edn`). Compiled distribution artifacts in `dist/` are untracked in git.
-   - The infra cluster replicates artifacts across `ns1..ns3` via `migrate-clj-web-state!`, serving them with content-addressed `ETag`s and Ed25519 authenticity headers (`X-Bitecho-Pointer-Signature`, `X-Bitecho-Blob-Cid`).
-3. Tag the release commit with an annotated Git tag:
-   ```bash
-   git tag -a v0.23.5 -m "Release v0.23.5: Milestone D27 Docs Clean-Up, On-Network Publishing, Mealy Lab Foundation, and Mesh/Relay Offer Delivery Remediation"
-   ```
+> [!IMPORTANT]
+> On-network signed `dist/*` and `web/app/*` pointers on `bitecho.org/infra` **override** local disk files in `/var/www/clj-web/public/dist/`. If pointers are not bumped as part of the release, `https://bitecho.org` will continue serving stale bundles even after disk files are updated.
 
----
+Run the automated pointer-bump and verification gate on every release:
 
-## 4. Canary & Rolling Upgrade Procedure (`A-D23-5`)
+```bash
+# Dry-run precondition & SHA-256 check (verifies all built artifacts exist and hashes match)
+./scripts/cluster.sh bump-pointers --version v0.23.18 --dry-run
 
-To preserve Streamlet BFT quorum (`>= 4 of 6` validators in the 6-node mesh, `>= 2 of 3` in the 3-node core committee) at every instant, production and staging deployments follow a strict canary-first rolling sequence:
+# Live publish & verify signed dist/* and web/app/* pointers on bitecho.org/infra
+./scripts/cluster.sh bump-pointers \
+  --version v0.23.18 \
+  --state-dir /tmp/antigravity-light-node \
+  --relay-url https://ns1.bitecho.org/relay/v1
 
-```
-ns3 (infra canary) -> node3 (validator canary) -> [E2E Gate] -> ns2 -> ns1 -> node2 -> node1
+# Verify landing SHA == cluster version without republishing
+./scripts/cluster.sh bump-pointers --version v0.23.18 --verify-only
 ```
 
-### Step-by-Step Execution
-1. **Backup Current Artifacts (`.prev`):**
-   `./scripts/cluster.sh deploy` automatically copies `/opt/bitecho/bitecho.jar` to `/opt/bitecho/bitecho.jar.prev` and `/etc/bitecho/config.edn` to `/etc/bitecho/config.edn.prev` on every target host before uploading new artifacts.
-2. **Phase 1 — Canary Deploy (`ns3` + `node3`):**
-   ```bash
-   ./scripts/cluster.sh deploy --canary
-   ```
-   - Upgrades `ns3` and `node3` first while `node1`, `node2`, `ns1`, and `ns2` remain on version `N`.
-   - Polls `http://127.0.0.1:8080/healthz` on `node3` until healthy (up to `30s`) and runs the live E2E transfer & finality confirmation gate (`cmd_fund` + `cmd_audit`).
-   - If `node3` fails `/healthz` or the E2E gate, execution halts immediately before `node2` or `node1` is touched.
-3. **Phase 2 — Rolling Upgrade (`ns2` -> `ns1` -> `node2` -> `node1`):**
-   ```bash
-   ./scripts/cluster.sh deploy --rolling
-   ```
-   - Sequentially restarts `ns2`, `ns1`, `node2`, and `node1`, waiting for `/healthz` (`ok`) on each validator before proceeding to the next node.
+The gate publishes and verifies monotonic `:seq` bumps and exact 64-char `:target-cid` matches for:
+- `dist/bitecho-light-node.cjs`
+- `dist/bitecho-browser.js`
+- `dist/bitecho-full-node.cjs`
+- `web/app/bitecho-browser.js`
+- `web/app/index.html`
 
 ---
 
-## 5. Live Post-Deploy E2E Verification & Soak Gate
+## 4. `P-UPD-1` Opt-In Auto-Update (Shipped in `D40`)
 
-Immediately after completing the rolling upgrade:
-1. Run the live cluster convergence audit across all 6 validators:
-   ```bash
-   ./scripts/cluster.sh status --include-infra
-   ./scripts/cluster.sh audit --include-infra
-   ```
-2. Verify that a fresh light-node transfer finalizes within 3 Streamlet epochs and that all 6 validators report identical finalized ledger state digests.
+`P-UPD-1` live pointer auto-update with `SHA-256 == CID` verification, pre-swap health gate, and `.lkg` rollback is **shipped and live** across all three runtimes:
+- **`D40.1` (`e91214c`)**: Node.js light & full nodes (`node_main.cljs`, `full_node_main.cljs`).
+- **`D40.2` (`9ecf885`)**: JVM light & full nodes (`shell/updater.clj`, `shell/light_node.clj`, `main.clj`) and Browser (`browser_main.cljs`).
+- **`D40.2.1` (`3d86ce2`)**: Same-version hotfix upgrade rule (`equal-version` + distinct verified 64-char CID triggers update) and `cli/known-command-flags` inventory parity.
+- **`D40.3` (`b7dc6d4`)**: `window.BitechoLightNode` browser console CLI parity and multi-peer WebRTC diagnostics.
 
----
+### Opt-In Light-Node Flags
+- `--auto-update-pointer <path>` — Subscribe to signed release pointer (e.g. `dist/bitecho-light-node.cjs` on `bitecho.org/infra`).
+- `--auto-update-interval-ms <ms>` — Polling interval in milliseconds.
+- `--pin-version <semver>` — Pin to a specific release version and block automatic upgrades.
 
-## 6. Monitoring & Alerting Thresholds (`/healthz`, `/statusz`, `/connz`, `/burnsz`)
-
-Monitor the following localhost diagnostic endpoints (`http://127.0.0.1:8080/*`) on every validator:
-
-| Endpoint | Metric / Field | Healthy Bound | Alert / Rollback Trigger |
-| :--- | :--- | :--- | :--- |
-| `/healthz` | HTTP status & body | `200 OK` (`{"status":"ok"}`) | Non-200 for `> 15s` |
-| `/statusz` | `:finalized-epoch` skew across quorum | `<= 2` epochs | Skew `> 2` epochs for `> 60s` |
-| `/statusz` | `:failed-receipts-count` | `0` | Any increase (`> 0`) |
-| `/statusz` | `[:diagnostics :network-replay-rejected]` | Counted & surfaced (Rule 5) | Investigate foreign-network traffic spikes |
-| `/statusz` | `[:diagnostics :subnet-mismatch-dropped]` | `0` across upgraded peers | Non-zero between cluster validators |
-| `/connz` | `:phase`, `:generation`, `:dropped`, `:ignored-stale` | `:phase :open`, bounded drops | Persistent `:phase :dialing` or `:last-error` |
-| JVM / OS | Resident RSS memory (`free -m`) | `< 750 MB` on `1 GB` `e2-micro` | RSS `> 850 MB` or OOM-killer invocation |
+### Pointer-Bump Ownership
+- Only authorized release signers holding the `bitecho.org/infra` publishing key bump `dist/*` pointers after Stage 2 consent.
+- Every candidate artifact must pass `SHA-256(bytes) == pointer.target-cid` and a pre-swap health gate before replacing the active binary; failures automatically restore `.lkg` and emit a counted `:diagnose` event (Rule 5).
 
 ---
 
-## 7. Rollback Procedure
+## 5. Canary & Rolling Upgrade Order (6-Node `4-of-6` Quorum)
 
-If any canary or rolling upgrade step fails `/healthz`, `/statusz` convergence, or the post-deploy E2E transfer gate:
+Preserve Streamlet BFT quorum (`>= 4 of 6` validators online) at every step:
 
-1. **Automated Single-Command Rollback:**
+```text
+ns3 (infra canary) -> node3 (validator canary) -> [E2E & SLA Gate] -> ns2 -> ns1 -> node2 -> node1
+```
+
+```bash
+# Phase 1: Canary deploy (ns3 + node3)
+./scripts/cluster.sh deploy --canary
+
+# Phase 2: Rolling deploy (ns2 -> ns1 -> node2 -> node1)
+./scripts/cluster.sh deploy --rolling
+
+# Phase 3: Post-deploy convergence & six-nines SLA audit
+./scripts/cluster.sh status --include-infra
+./scripts/cluster.sh audit --include-infra
+```
+
+---
+
+## 6. Monitoring, `P-OBS-4` Telemetry & `P-ASYNC-*` Snapshots
+
+- **Rolling Cluster Six-Nines SLA:** `https://bitecho.org/sla/latest.edn` (interval-sweepline cluster SLA; `:finalization-stall` breach triggers at quorum level `>= 3` simultaneous nodes per `D39.6.1`).
+- **Per-Node Telemetry Digests (`P-OBS-4`):** `https://bitecho.org/telemetry/<node>/digest.edn` (published to `bitecho.org/observability`).
+- **Local Diagnostics Endpoints:** `http://127.0.0.1:8080/healthz`, `/statusz`, `/connz`, `/burnsz`.
+- **Immutable Epoch-Addressed Async Snapshots (`P-ASYNC-*` / `BIP-014`):** All three runtimes eliminate synchronous disk/gzip I/O on runtime hot paths. Full nodes write immutable `snapshot-<node>-epoch-<012d>.fressian` files asynchronously via `bitecho.snapshot.core` (retaining `keep-epochs` default `360`, `min-keep >= 2`), falling back seamlessly to legacy `snapshot-<node>.edn` on recovery.
+
+---
+
+## 7. Rollback-First SOP
+
+If any canary or rolling upgrade fails `/healthz`, stalls `finalized_epoch` (`F-EPOCH-1` loud-report rule), or degrades `https://bitecho.org/sla/latest.edn`:
+
+1. **Roll back immediately first** to restore 6-of-6 quorum before investigating root cause:
    ```bash
-   # Roll back specific canary nodes:
+   # Roll back canary nodes:
    ./scripts/cluster.sh rollback ns3 node3
 
-   # Or roll back all core validators (node3, node2, node1):
+   # Or roll back full validator set:
    ./scripts/cluster.sh rollback
    ```
-2. **What `rollback` Does:**
-   - Restores `/opt/bitecho/bitecho.jar.prev` -> `/opt/bitecho/bitecho.jar` (and `/opt/bitecho-infra/bitecho.jar.prev` on `ns*`).
-   - Restores `/etc/bitecho/config.edn.prev` -> `/etc/bitecho/config.edn`.
-   - Restarts `bitecho.service` (or `bitecho-infra.service`) and polls `http://127.0.0.1:8080/healthz` until healthy.
-3. **Post-Rollback Verification:**
+2. **OpenRC Restart & Verification:** `rollback` restores the previous `/opt/bitecho/bitecho-full-node.cjs.prev` (or `.lkg`), restarts the OpenRC service (`rc-service bitecho restart` / `rc-service bitecho-infra restart`), and polls `/healthz`.
+3. **Post-Rollback Audit & Loud Report:**
    ```bash
    ./scripts/cluster.sh status --include-infra
    ./scripts/cluster.sh audit --include-infra
    ```
+   Post an incident report with affected node, epoch, and diagnostic counts to `bitecho.org/ops` and `bitecho.org/team`.

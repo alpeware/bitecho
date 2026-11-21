@@ -1,53 +1,66 @@
 # Bitecho Documentation Index
 
-Welcome to the Bitecho documentation tree. This directory indexes all canonical protocol specifications, verification and audit reports, governance proposals (BIPs), and cryptographic release proofs co-committed with code per `AGENTS.md` Rule 6.
+Welcome to the Bitecho documentation tree. This directory indexes all canonical protocol specifications, Sociocratic governance rules, canonical broadcast channels, operational runbooks, verification and audit reports, governance proposals (BIPs), and cryptographic release proofs co-committed with code per [`AGENTS.md`](../AGENTS.md) Rule 6.
 
 ---
 
-## 1. Core Protocol & Architecture Specifications
-
-The following documents define the active protocol, execution rules, and security invariant models:
+## 1. Core Protocol, Governance & Architecture Specifications
 
 | Document | Description |
 | :--- | :--- |
-| [**`SPEC.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/SPEC.md) | Canonical protocol specification: Streamlet consensus, 2-phase rendezvous handshake, gossip contagion, and wire format. |
-| [**`STORAGE.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/STORAGE.md) | Content-addressed storage architecture: Content-addressed `Blob`s (`CID = sha256(bytes)`), signed mutable `Pointer`s, and Subnet trees. |
-| [**`CAPABILITIES.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/CAPABILITIES.md) | Object-capability security: Bilateral capability tokens, cryptographic delegation chains, attenuation, and revocation receipts. |
-| [**`SMART_CONTRACTS.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/SMART_CONTRACTS.md) | Pure Sans-IO Mealy state machine execution, deterministic contract transitions, and event verification. |
-| [**`simulation_and_stress_testing.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/simulation_and_stress_testing.md) | Deterministic VOPR simulation, fault-injection harnesses, and multi-agent economic testing framework. |
+| [**`SPEC.md`**](SPEC.md) | Canonical protocol specification: Streamlet consensus, 2-phase rendezvous handshake, gossip contagion, `P-OBS-*` telemetry, `P-ASYNC-*` zero-sync-IO snapshots, `P-UPD-1` auto-update, and wire format. |
+| [**`GOVERNANCE.md`**](GOVERNANCE.md) | Two-gate Sociocratic consent method (`CONSENT`, `CONSENT-WITH-ADDENDUM`, `PARAMOUNT-OBJECTION`), consent-then-roll gate, 64-char CID integrity, and rollback-first SOP (`BIP-015`). |
+| [**`CHANNELS.md`**](CHANNELS.md) | Canonical broadcast channel taxonomy (`bitecho.org/team`, `/dev`, `/ops`, `/observability`, `/infra`), ephemeral `lab-01`, and legacy `chat/simon-nexus-axiom` deprecation checklist (`BIP-015`). |
+| [**`STORAGE.md`**](STORAGE.md) | Content-addressed storage architecture: Content-addressed `Blob`s (`CID = sha256(bytes)`), signed mutable `Pointer`s, and Subnet trees. |
+| [**`CAPABILITIES.md`**](CAPABILITIES.md) | Object-capability security: Bilateral capability tokens, cryptographic delegation chains, attenuation, and revocation receipts. |
+| [**`SMART_CONTRACTS.md`**](SMART_CONTRACTS.md) | Pure Sans-IO Mealy state machine execution, deterministic contract transitions, and event verification. |
+| [**`simulation_and_stress_testing.md`**](simulation_and_stress_testing.md) | Deterministic VOPR simulation, fault-injection harnesses, and multi-agent economic testing framework. |
 
 ---
 
-## 2. Verification & Audit Reports (`docs/reports/`)
+## 2. Operational Runbooks (`docs/runbooks/`)
 
-Historical test campaigns, formal verification results, and simulation reports are consolidated under [`docs/reports/`](file:///home/simonpure/src/alpeware/bitecho/docs/reports):
+| Runbook | Scope |
+| :--- | :--- |
+| [**`gentoo-stage3-live-migration.md`**](runbooks/gentoo-stage3-live-migration.md) | Hardened Gentoo Stage3 + OpenRC live migration SOP for GCP `e2-micro` validator and infra hosts (`BIP-011` / `BIP-012`). |
+
+See also root-level operational guides: [`RELEASE.md`](../RELEASE.md), [`ONBOARDING.md`](../ONBOARDING.md), and [`skill/SKILL.md`](../skill/SKILL.md).
+
+---
+
+## 3. Verification & Audit Reports (`docs/reports/`)
+
+Historical test campaigns, formal verification results, and simulation reports are consolidated under [`docs/reports/`](reports/):
 
 | Report | Scope & Results |
 | :--- | :--- |
-| [**`JEPSEN_REPORT.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/reports/JEPSEN_REPORT.md) | Distributed consensus adversarial testing campaign (`JEP-01` through `JEP-12`) verifying Streamlet safety and CRDT convergence under partition. |
-| [**`JEPSEN_DATACHANNEL_REPORT.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/reports/JEPSEN_DATACHANNEL_REPORT.md) | Transport-layer WebRTC DataChannel packet-drop and boundary failure campaign (`DCT-01` through `DCT-12`). |
-| [**`bip001_simulation_report.md`**](file:///home/simonpure/src/alpeware/bitecho/docs/reports/bip001_simulation_report.md) | Dual Track A (30,000-epoch in-memory) and Track B (live 6-node GCP testnet) ratification report for BIP-001 tokenomics v2.2. |
+| [**`JEPSEN_REPORT.md`**](reports/JEPSEN_REPORT.md) | Distributed consensus adversarial testing campaign (`JEP-01` through `JEP-12`) verifying Streamlet safety and CRDT convergence under partition. |
+| [**`JEPSEN_DATACHANNEL_REPORT.md`**](reports/JEPSEN_DATACHANNEL_REPORT.md) | Transport-layer WebRTC DataChannel packet-drop and boundary failure campaign (`DCT-01` through `DCT-12`). |
+| [**`bip001_simulation_report.md`**](reports/bip001_simulation_report.md) | Dual Track A (30,000-epoch in-memory) and Track B (live 6-node GCP testnet) ratification report for BIP-001 tokenomics v2.2. |
 
 ---
 
-## 3. Governance Proposals (`docs/bips/`)
+## 4. Governance Proposals (`docs/bips/`)
 
-On-network Bitecho Improvement Proposals (BIPs) submitted and ratified via the Tri-Circle Sociocratic Governance Machine:
+On-network Bitecho Improvement Proposals (BIPs) ratified via Sociocratic consent are indexed with full 64-char SHA-256 CIDs in [**`docs/bips/INDEX.md`**](bips/INDEX.md):
 
-| Proposal | Title & Status |
-| :--- | :--- |
-| [**`bip-000-charter.edn`**](file:///home/simonpure/src/alpeware/bitecho/docs/bips/bip-000-charter.edn) | BIP-000: Bitecho Genesis Charter, Tri-Circle Consent Rules, and Anti-Filibuster Counterexample Requirements. *(Ratified)* |
-| [**`bip-001-v0234.edn`**](file:///home/simonpure/src/alpeware/bitecho/docs/bips/bip-001-v0234.edn) | BIP-001: Tokenomics v2.2 Parameter Schedule, Pareto Optimization, and Scheduled Upgrade Epoch Activation. *(Ratified)* |
+- [**`bips/INDEX.md`**](bips/INDEX.md) — Complete registry of **BIP-000** through **BIP-015** (`D41`).
 
 ---
 
-## 4. Cryptographic Release Proofs (`docs/releases/`)
+## 5. Cryptographic Release Proofs (`docs/releases/`)
 
 Bit-for-bit release proofs generated by `clojure -M:proof` verifying test suite passing, formatting, linting, and SHA-256 binary tree hashes before release gate approval:
 
-- [`docs/releases/v0.23.0-proof.edn`](file:///home/simonpure/src/alpeware/bitecho/docs/releases/v0.23.0-proof.edn)
-- [`docs/releases/v0.23.1-proof.edn`](file:///home/simonpure/src/alpeware/bitecho/docs/releases/v0.23.1-proof.edn)
-- [`docs/releases/v0.23.2-proof.edn`](file:///home/simonpure/src/alpeware/bitecho/docs/releases/v0.23.2-proof.edn)
-- [`docs/releases/v0.23.3-proof.edn`](file:///home/simonpure/src/alpeware/bitecho/docs/releases/v0.23.3-proof.edn)
-- [`docs/releases/v0.23.4-proof.edn`](file:///home/simonpure/src/alpeware/bitecho/docs/releases/v0.23.4-proof.edn)
-- [`docs/releases/v0.23.5-proof.edn`](file:///home/simonpure/src/alpeware/bitecho/docs/releases/v0.23.5-proof.edn)
+- [`docs/releases/v0.23.0-proof.edn`](releases/v0.23.0-proof.edn)
+- [`docs/releases/v0.23.1-proof.edn`](releases/v0.23.1-proof.edn)
+- [`docs/releases/v0.23.2-proof.edn`](releases/v0.23.2-proof.edn)
+- [`docs/releases/v0.23.3-proof.edn`](releases/v0.23.3-proof.edn)
+- [`docs/releases/v0.23.4-proof.edn`](releases/v0.23.4-proof.edn)
+- [`docs/releases/v0.23.5-proof.edn`](releases/v0.23.5-proof.edn)
+- [`docs/releases/v0.23.6-proof.edn`](releases/v0.23.6-proof.edn)
+- [`docs/releases/v0.23.7-proof.edn`](releases/v0.23.7-proof.edn)
+- [`docs/releases/v0.23.8-proof.edn`](releases/v0.23.8-proof.edn)
+- [`docs/releases/v0.23.9-proof.edn`](releases/v0.23.9-proof.edn)
+- [`docs/releases/v0.23.10-proof.edn`](releases/v0.23.10-proof.edn)
+- [`docs/releases/v0.23.11-proof.edn`](releases/v0.23.11-proof.edn)

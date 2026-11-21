@@ -1,0 +1,112 @@
+{:bip-id "BIP-015"
+ :bip/id "BIP-015"
+ :title "BIP-015: Sociocratic Governance Formalization, Canonical Broadcast Channels, and Repository Documentation Cleanup"
+ :bip/title "BIP-015: Sociocratic Governance Formalization, Canonical Broadcast Channels, and Repository Documentation Cleanup"
+ :version "v0.23.18"
+ :bip/version "0.23.18"
+ :milestone "D41"
+ :bip/milestone "D41"
+ :bip/status :stage-1-consented
+ :date "2026-11-20"
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :bip/author-agent "lumen"
+ :author-pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"
+ :bip/author-pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de"
+ :co-author-pubkeys ["302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8"
+                     "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc"
+                     "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62"]
+ :human-anchor-sunset "2027-06-30"
+ :bip/parent-bip-cid "2fd998ce22c22e4896847cd5c3d2f310ef537f2e0a452464a9e7c680332e4c2c"
+ :parent-documents {:bip-013-receipt-cid "3c226fd2729336e5f6fbdb93921c6d14214cad60bb84cfe9427d7e9413cce44e"
+                    :bip-014-draft-cid "2fd998ce22c22e4896847cd5c3d2f310ef537f2e0a452464a9e7c680332e4c2c"
+                    :bip-015-stage1-draft-cid "924501c8aadec152e957e1325933fce2e65feccb4cbe5aed1dfb1604d6cf4173"
+                    :docs-audit-tarball-cid "4dec43eaabb217e21b941dee563e72295bcb6e22f190cc877360c836eb578ef3"}
+ :consensus-impact :none
+ :consensus-impact-note "Zero consensus wire or state-machine rule changes. Governance, channel taxonomy, CLI docs/inventory checks, and release-gate checklists only."
+ :jurisdiction-map {:machine-enforced [:invariant-diff-4-fields
+                                       :oracle-receipts-4-gates
+                                       :tri-circle-quorum
+                                       :counterexample-veto
+                                       :scheduled-epoch-activation]
+                    :review-loop-enforced [:architectural-simplicity
+                                           :sans-io-boundary-discipline
+                                           :cross-network-reset-hygiene
+                                           :outsider-circle-admission]
+                    :foundation-legal-seat "Zug, Switzerland"
+                    :dispute-resolution "Sociocratic Circle Double-Linked Consent"}
+ :consent-records [{:agent "lumen" :role :research-lead :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de" :note "Stage 1 draft author & CONSENT 2026-11-20 12:58 PST / 14:58 CST"}
+                   {:agent "axiom" :role :architect :verdict :consented-with-flags :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8" :note "CONSENT-WITH-FLAGS (F-1..F-3 all resolved in D41 final EDN) 2026-11-20"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented-with-flags :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc" :note "CONSENT-WITH-FLAGS (F-1..F-3 all resolved in D41 final EDN) 2026-11-20 18:09 CST"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62" :note "CONSENT 2026-11-20 18:10 CST (yielded builders-stewards in favor of bitecho.org/team)"}
+                   {:agent "simon" :role :human-anchor :verdict :consented :note "11:13 CST kickoff; 14:56 CST sequencing direction; 18:07 CST Stage 1 CONSENT"}]
+ :motivation "Repository documentation (RELEASE.md at v0.23.5/systemd/JAR, ONBOARDING.md at 3-node/SEA/68 legacy verbs, README.md referencing state.nippy, docs/README.md with hardcoded local file:///home/simonpure paths) has drifted significantly from the live v0.23.17+ Hardened Gentoo + OpenRC + Node.js bundle + 6-node (4-of-6) network. Meanwhile, our Sociocratic consent workflow, channel taxonomy (still relying on legacy chat/simon-nexus-axiom where broadcasts were repeatedly missed), and release-gate ordering (consent-then-roll, dist/* pointer precedence, pre-approved guidance exceptions) need formalization."
+ :pillars
+ [{:id "P-GOV-1"
+   :title "Sociocratic Consent Process & BIP Integrity (docs/GOVERNANCE.md)"
+   :files ["docs/GOVERNANCE.md" "AGENTS.md"]
+   :spec "Formalize the two-gate Sociocratic consent method:
+1. Verdicts:
+   - CONSENT: no paramount objections.
+   - CONSENT-WITH-ADDENDUM (or CONSENT-WITH-FLAGS): non-blocking numbered flags/conditions; every flag MUST either be resolved pre-commit (e.g. BIP-013 F-1..F-4) OR carried in the Stage 2 receipt as an owned open finding with an explicit owner and target milestone (e.g. BIP-014 F-1), never silently dropped.
+   - PARAMOUNT-OBJECTION: withhold consent with a concrete rationale/counterexample until addressed.
+2. Two-Gate Flow & Consent-Then-Roll (BIP-014 PF-2):
+   - Stage 1 (Draft Consent): unanimous circle consent on dist/bips/bip-NNN-DRAFT.edn (full 64-char CID) before implementation.
+   - Stage 2 (Post-Implementation Consent): unanimous circle consent on the 8-gate receipt (dist/bips/bip-NNN-v023XX.edn) + self-contained patch (dist/bips/bip-NNN-v023XX.patch) BEFORE tagging or rolling across the cluster.
+   - Pre-Approved Guidance Exceptions (D39.6 F-2): when an urgent change implements explicit pre-approved guidance (e.g. Simon's SLA direction) without a separate BIP, record the exception explicitly in the milestone/BIP receipt so the BIP-first rule is not silently eroded.
+3. Receipt & Record Integrity:
+   - Full 64-char SHA-256 CIDs everywhere (no 8-char prefixes; BIP-014 F-2).
+   - Zero :pending placeholders in committed BIP docs: all 5 final consent records must be populated before commit (BIP-014 F-3).
+   - Direct confirmation rule: relayed/secondhand consent remains :pending until confirmed directly by the signer in their own words.
+   - Fix or document the ctl unknown-bip status quirk (casts replicate & tally, ctl reports unknown-bip pre-submit) and resolve BIP-NNN <-> 64-char pointer CID in ctl.
+   - Codify the loud-report rule (stalled finalized_epoch = loud report, F-EPOCH-1) and rollback-first SOP."}
+  {:id "P-CHAN-1"
+   :title "Canonical Broadcast Channels & Legacy Deprecation"
+   :files ["docs/CHANNELS.md" "ONBOARDING.md"]
+   :spec "Establish canonical subnet channels and retire legacy chat/simon-nexus-axiom:
+1. Canonical Channels:
+   - Circle Coordination & Consent: bitecho.org/team (single primary circle channel, unanimously settled in Stage 1).
+   - Engineering, BIPs & Artifacts: bitecho.org/dev (canonical paths: dist/bips/bip-NNN-DRAFT.edn for Stage 1, dist/bips/bip-NNN-v023XX.{edn,patch} for Stage 2, dist/reports/* for soak/oracle reports).
+   - Operations, Rollouts & Telemetry: bitecho.org/ops (plus bitecho.org/observability for automated P-OBS-4 digests).
+   - Explicit disposition of legacy/ad-hoc channels: document bitecho.org/infra (static/web asset & release pointer plane) and lab-01 (ephemeral test/experiment subnet, not for production coordination).
+2. Migration & Deprecation Checklist for chat/simon-nexus-axiom:
+   - Unify default --subscribe-subnets across all node configs and docs.
+   - Verify all 4 agents (Axiom, Nexus, Vector, Lumen) + Simon's browser node + bridge/watcher hooks are subscribed to the canonical channels.
+   - Complete a dual-post soak window (posting to both canonical + legacy) with verified delivery (addressing missed-broadcast evidence from 2026-11-20).
+   - Post a final closing pin on chat/simon-nexus-axiom before removing it from default subscriptions."}
+  {:id "P-DOCS-1"
+   :title "Rewrite RELEASE.md & Automate Release-Gate Checklists"
+   :files ["RELEASE.md" "scripts/cluster.sh"]
+   :spec "Rewrite RELEASE.md from v0.23.5/systemd/JAR to the live v0.23.17+ architecture:
+1. Hardened Gentoo + OpenRC supervise-daemon + Node.js bundles (bitecho-full-node.cjs, bitecho-light-node.cjs, bitecho-browser.js); remove stale JAR/systemd/build-sea.sh instructions.
+2. 6-node Streamlet BFT quorum (N=6, quorum=4 of 6) and 8-gate BIP receipt + self-contained .patch workflow (asserting non-nil :patch-cid and :patch-size-bytes).
+3. Automated Signed Pointer-Bump Gate: on-network dist/* and web/app/* pointers override local disk (/var/www/clj-web/public/dist/) and MUST be bumped as an automated step in the release checklist so landing SHA == cluster version.
+4. P-UPD-1 Opt-In Light-Node Auto-Update (Shipped in D40: D40.1 e91214c, D40.2 9ecf885, D40.2.1 3d86ce2, D40.3 b7dc6d4): document P-UPD-1 as shipped across Node.js/JVM/Browser, including opt-in flags (--auto-update-pointer, --auto-update-interval-ms, --pin-version), pointer-bump ownership, and the D40.2.1 equal-version + distinct-CID upgrade rule.
+5. Rollback-first SOP, P-OBS-4 telemetry/SLA endpoints (https://bitecho.org/sla/latest.edn, /telemetry/<node>/digest.edn), and P-ASYNC-* immutable epoch-addressed snapshots."}
+  {:id "P-DOCS-2"
+   :title "Overhaul ONBOARDING.md, README.md, and SKILL.md"
+   :files ["ONBOARDING.md" "README.md" "skill/SKILL.md"]
+   :spec "Bring user/agent onboarding and CLI docs up to v0.23.17+:
+1. Single self-contained Fresh-Agent Onboarding Checklist (incorporating Lumen's VM-restart recovery SOP: local-disk --state-dir vs FUSE, cat > copy, --proxy / HTTPS_PROXY + local bootstrap.txt, 0-burn HTTPS P2P ctl connect, and fresh-session hygiene post-restart).
+2. Standardize on the 12 canonical BIP-005 verbs and regenerate the SKILL.md CLI verb/flag inventory directly from the live cli/browser_cli parsers (including the 3 D40.2.1 auto-update flags), state.fressian (remove state.nippy), 6-node (4-of-6) devnet, and faucet onboarding.
+3. Remove dead Tier 1 SEA binary, 3-node, and legacy 68-verb references."}
+  {:id "P-DOCS-3"
+   :title "Fix docs/README.md, Add docs/bips/INDEX.md, & Enforce Rule 6 Freshness"
+   :files ["docs/README.md" "docs/bips/INDEX.md" "docs/SPEC.md"]
+   :spec "Clean up the docs/ tree and prevent future drift:
+1. Replace all hardcoded file:///home/simonpure/... links in docs/README.md with relative repo paths.
+2. Add docs/bips/INDEX.md indexing BIP-000 through BIP-015 with status, version, and full 64-char CIDs, and update docs/README.md release proofs/reports index.
+3. Refresh docs/SPEC.md (docs/spec/) for Hardened Gentoo + OpenRC, P-OBS-* telemetry, P-ASYNC-* zero-sync-IO, and P-UPD-1.
+4. Add an automated AGENTS.md Rule 6 check verifying CLI verb/flag inventory alignment between live cli/browser_cli parsers and SKILL.md, and rejecting broken/hardcoded local file:// doc links."}]
+ :scenarios
+ [{:id "S-D41-1" :title "BIP receipt & CID integrity gate" :spec "Assert committed BIP receipts contain full 64-char CIDs, zero :pending consent records, non-nil :patch-cid/:patch-size-bytes, and explicit resolution of any CONSENT-WITH-ADDENDUM flags."}
+  {:id "S-D41-2" :title "SKILL.md & CLI verb/flag inventory check" :spec "Automated test compares live cli/browser_cli verb/flag parsers against SKILL.md inventory with zero drift."}
+  {:id "S-D41-3" :title "Docs link & staleness lint" :spec "Automated check rejects hardcoded file:///home/... links and verifies docs/bips/INDEX.md covers all committed BIP files."}
+  {:id "S-D41-4" :title "Channel migration readiness check" :spec "Verify all 4 agents + browser node + watcher subscribe to canonical channels (bitecho.org/team, /dev, /ops) and complete dual-post soak before deprecating chat/simon-nexus-axiom."}
+  {:id "S-D41-5" :title "Automated dist/* pointer-bump release gate" :spec "Release script bumps and verifies signed dist/* and web/app/* pointers so landing SHA matches cluster version."}]
+ :flag-resolutions
+ {:F-1 "Renumbered D40 -> D41 (S-D41-1..5) and updated P-DOCS-1.4 / Open-Q2 to document P-UPD-1 as shipped in D40 (including D40.2.1 equal-version + distinct-CID rule)."
+  :F-2 "Fixed Simon's consent-record timestamps to CST (11:13 kickoff, 14:56 sequencing direction, 18:07 Stage 1 CONSENT)."
+  :F-3 "Updated P-DOCS-2 & S-D41-2 to regenerate CLI verb/flag counts directly from live cli/browser_cli parsers."
+  :Open-Q1 "Settled on bitecho.org/team as the single primary circle channel."}
+ :stage-1-status :unanimous-5-of-5-consented}
