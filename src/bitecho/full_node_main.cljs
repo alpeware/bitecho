@@ -55,7 +55,7 @@
 
 (def full-node-version
   "Current Node.js Full / Infra Node release version."
-  "0.23.19")
+  "0.23.20")
 
 (def ^:private obs-router-atom (atom (obs/init-sink-router {:node-id "full-node"})))
 (def ^:private defense-state-atom (atom (defense/init-defense-state)))
