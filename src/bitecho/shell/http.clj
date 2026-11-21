@@ -1068,6 +1068,45 @@
                        :response/headers {"Content-Type" "text/plain; charset=utf-8"}
                        :response/body "Not Found\n"})))
 
+                (or (= subpath "app") (str/starts-with? subpath "app/"))
+                (let [rel-res (infra/resolve-app-release-asset! rt raw-path now-ms)]
+                  (cond
+                    (:ok? rel-res)
+                    {:response/status (:status rel-res 200)
+                     :response/headers (:headers rel-res)
+                     :response/body (when (not= method :HEAD) (:body rel-res))}
+
+                    (:fallback? rel-res)
+                    (let [resolved (resolve-web-blob! config rt raw-path now-ms)]
+                      (case (:error resolved)
+                        :forbidden
+                        (do
+                          (infra/apply-shell-event! shell-atom {:type :drop :reason :http-forbidden-path})
+                          {:response/status 403
+                           :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                           :response/body "Forbidden\n"})
+
+                        (:not-found :missing-blob :tombstoned :denied-cid)
+                        {:response/status 404
+                         :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                         :response/body "Not Found\n"}
+
+                        (if (:ok? resolved)
+                          (render-resolved-blob config req resolved method)
+                          {:response/status 404
+                           :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                           :response/body "Not Found\n"})))
+
+                    :else
+                    (do
+                      (infra/apply-shell-event! shell-atom {:type :drop :reason (or (:error rel-res) :http-app-release-error)})
+                      {:response/status (or (:status rel-res) 404)
+                       :response/headers {"Content-Type" "text/plain; charset=utf-8"}
+                       :response/body (case (int (or (:status rel-res) 404))
+                                        403 "Forbidden\n"
+                                        503 "Service Unavailable\n"
+                                        "Not Found\n")})))
+
                 :else
                 (let [resolved (resolve-web-blob! config rt raw-path now-ms)]
                   (case (:error resolved)

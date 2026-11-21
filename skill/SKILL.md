@@ -78,6 +78,7 @@ Every flag in `bitecho.light-node.cli/known-command-flags` is automatically veri
 | **Artifacts, Directory & Governance** | `--path`, `--cid`, `--file`, `--hex`, `--authority`, `--prefix`, `--nickname`, `--name`, `--domain`, `--bip-cid`, `--invariant-diff-edn`, `--jurisdiction-map`, `--human-anchor-sunset` |
 | **BIP-016 Rolodex & Memento (`rolodex-*`, `memento-*`)** | `--node-role`, `--retention-max-entries`, `--retention-max-bytes`, `--rotate-every`, `--grace-epochs`, `--lkg-cid`, `--walk-depth-cap`, `--owner-pubkey`, `--cache-incentive` |
 | **BIP-017a Chunked Large-Artifact Storage (`artifact-put-chunked`, `artifact-get-chunked`, `artifact-manifest-verify`)** | `--chunk-size`, `--concurrency`, `--resume-dir`, `--grace-epochs`, `--max-bytes` |
+| **BIP-017b Atomic `web/app/release` Resolver (`web-release-publish`, `web-release-rollback`, `web-release-verify`)** | `--release-cid`, `--genesis-anchor-cid`, `--lkg-release-cid`, `--headers-config-cid` |
 
 ---
 

@@ -202,14 +202,21 @@
    "artifact-get-chunked"     {:canonical "get" :domain-cmd "artifact-get-chunked"}
    "artifact-manifest-verify" {:canonical "get" :domain-cmd "artifact-manifest-verify"}})
 
+(def web-release-verb-desugar-table
+  "BIP-017b atomic `web/app/release` domain verbs mapped to canonical 1-of-12 CLI verbs (Rule 6)."
+  {"web-release-publish"  {:canonical "put" :domain-cmd "web-release-publish"}
+   "web-release-rollback" {:canonical "put" :domain-cmd "web-release-rollback"}
+   "web-release-verify"   {:canonical "get" :domain-cmd "web-release-verify"}})
+
 (def all-recognized-cli-verbs-set
   "Union of all 68 legacy verbs, 12 canonical verbs, shell/runner aliases, BIP-016 Rolodex/Memento verbs,
-   and BIP-017a chunked-artifact verbs."
+   BIP-017a chunked-artifact verbs, and BIP-017b web-release verbs."
   (-> supported-cli-verbs-set
       (into canonical-cli-verbs-set)
       (into (keys runner-alias-desugar-table))
       (into (keys memento-verb-desugar-table))
-      (into (keys chunked-artifact-verb-desugar-table))))
+      (into (keys chunked-artifact-verb-desugar-table))
+      (into (keys web-release-verb-desugar-table))))
 
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
@@ -229,7 +236,8 @@
    "--pin-version" "--auto-update-pointer" "--auto-update-interval-ms"
    "--node-role" "--retention-max-entries" "--retention-max-bytes" "--rotate-every"
    "--grace-epochs" "--lkg-cid" "--walk-depth-cap" "--owner-pubkey" "--cache-incentive"
-   "--chunk-size" "--concurrency" "--resume-dir" "--max-bytes"])
+   "--chunk-size" "--concurrency" "--resume-dir" "--max-bytes"
+   "--release-cid" "--genesis-anchor-cid" "--lkg-release-cid" "--headers-config-cid"])
 
 ;; =============================================================================
 ;; 2. Pure CLI Tokenizer & JSONL Command Splitter (Rule 2)
@@ -1343,6 +1351,66 @@
           max-bytes (assoc "max_bytes" max-bytes)
           grace-epochs (assoc "grace_epochs" grace-epochs)))
 
+      "web-release-publish"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil)
+                    "bitecho.org/infra")
+            file (extract-flag-value clean-tokens "--file" nil)
+            release-cid (extract-flag-value clean-tokens "--release-cid" nil)
+            genesis-cid (extract-flag-value clean-tokens "--genesis-anchor-cid" nil)
+            lkg-cid (extract-flag-value clean-tokens "--lkg-release-cid" nil)
+            headers-cid (extract-flag-value clean-tokens "--headers-config-cid" nil)
+            seq-num (extract-long-flag clean-tokens "--seq" nil)
+            max-bytes (extract-long-flag clean-tokens "--max-bytes" nil)
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            m {"cmd" "web-release-publish" "subnet_id" sub}]
+        (cond-> m
+          file (assoc "file" file)
+          release-cid (assoc "release_cid" release-cid)
+          genesis-cid (assoc "genesis_anchor_cid" genesis-cid)
+          lkg-cid (assoc "lkg_release_cid" lkg-cid)
+          headers-cid (assoc "headers_config_cid" headers-cid)
+          seq-num (assoc "seq" seq-num)
+          max-bytes (assoc "max_bytes" max-bytes)
+          relay-url (assoc "relay_url" relay-url)))
+
+      "web-release-rollback"
+      (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
+                    (extract-flag-value clean-tokens "--subnet" nil)
+                    "bitecho.org/infra")
+            file (extract-flag-value clean-tokens "--file" nil)
+            release-cid (extract-flag-value clean-tokens "--release-cid" nil)
+            genesis-cid (extract-flag-value clean-tokens "--genesis-anchor-cid" nil)
+            lkg-cid (extract-flag-value clean-tokens "--lkg-release-cid" nil)
+            headers-cid (extract-flag-value clean-tokens "--headers-config-cid" nil)
+            seq-num (extract-long-flag clean-tokens "--seq" nil)
+            relay-url (extract-flag-value clean-tokens "--relay-url" nil)
+            m {"cmd" "web-release-rollback" "subnet_id" sub}]
+        (cond-> m
+          file (assoc "file" file)
+          release-cid (assoc "release_cid" release-cid)
+          genesis-cid (assoc "genesis_anchor_cid" genesis-cid)
+          lkg-cid (assoc "lkg_release_cid" lkg-cid)
+          headers-cid (assoc "headers_config_cid" headers-cid)
+          seq-num (assoc "seq" seq-num)
+          relay-url (assoc "relay_url" relay-url)))
+
+      "web-release-verify"
+      (let [file (extract-flag-value clean-tokens "--file" nil)
+            release-cid (extract-flag-value clean-tokens "--release-cid" nil)
+            genesis-cid (extract-flag-value clean-tokens "--genesis-anchor-cid" nil)
+            lkg-cid (extract-flag-value clean-tokens "--lkg-release-cid" nil)
+            headers-cid (extract-flag-value clean-tokens "--headers-config-cid" nil)
+            max-bytes (extract-long-flag clean-tokens "--max-bytes" nil)
+            m {"cmd" "web-release-verify"}]
+        (cond-> m
+          file (assoc "file" file)
+          release-cid (assoc "release_cid" release-cid)
+          genesis-cid (assoc "genesis_anchor_cid" genesis-cid)
+          lkg-cid (assoc "lkg_release_cid" lkg-cid)
+          headers-cid (assoc "headers_config_cid" headers-cid)
+          max-bytes (assoc "max_bytes" max-bytes)))
+
       "artifact-put"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
                     (extract-flag-value clean-tokens "--subnet" nil)
@@ -1653,7 +1721,8 @@
         legacy-entry (get legacy-verb-desugar-table raw-verb)
         runner-entry (get runner-alias-desugar-table raw-verb)
         memento-entry (get memento-verb-desugar-table raw-verb)
-        chunked-entry (get chunked-artifact-verb-desugar-table raw-verb)]
+        chunked-entry (get chunked-artifact-verb-desugar-table raw-verb)
+        web-release-entry (get web-release-verb-desugar-table raw-verb)]
     (cond
       (some? (get m "canonical_cmd"))
       m
@@ -1677,6 +1746,11 @@
       (assoc m
              "cmd" (:domain-cmd chunked-entry)
              "canonical_cmd" (:canonical chunked-entry))
+
+      web-release-entry
+      (assoc m
+             "cmd" (:domain-cmd web-release-entry)
+             "canonical_cmd" (:canonical web-release-entry))
 
       (contains? canonical-cli-verbs-set raw-verb)
       (let [inferred-domain

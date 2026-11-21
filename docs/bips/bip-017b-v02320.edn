@@ -1,0 +1,38 @@
+{:bip-id "BIP-017b"
+ :bip/id "BIP-017b"
+ :title "BIP-017b: Hive Web App Promotion on bitecho.org/app/ & Atomic web/app/release Pointer"
+ :bip/title "BIP-017b: Hive Web App Promotion on bitecho.org/app/ & Atomic web/app/release Pointer"
+ :version "v0.23.20"
+ :bip/version "0.23.20"
+ :milestone "D44"
+ :bip/milestone "D44"
+ :bip/status :consented
+ :date "2026-11-21"
+ :subnet-id "bitecho.org/dev"
+ :bip/subnet-id "bitecho.org/dev"
+ :precondition-soak-receipt-cid "2ecc673dec5c4cc072ec91d614b2b4d85119b67a51d6682254b54faf8d37dd7b"
+ :draft-0-cid "c51e7e26b91ac477463b96fd5a511911c1a2b73f14482459313d85c106d4fb81"
+ :twin-circle-trace-cid "ef480aa10425265e93e415af092c2c6c673ced83059c8f8a597e7d63215467ff"
+ :twin-circle-patch-cid "c761ff3e8f7fd61062274cf3d5beda2f2fc2828c189d222751412cf534917747"
+ :shaped-spec-cid "77f9f93aa766a86ca5aa7ed04c79ea9d7887aa0ad974e566161ae467aaa85413"
+ :stage2-telemetry-cid "9484baa1de0a5e0409a3aec4231e5ea0522eb58552ce0e4c1f4b6fc735bc736d"
+ :patch-cid "25311708252ecbe75aff6424569ca1f7eed260ee02aab796d289e556de96e9aa"
+ :patch-size-bytes 292863
+ :paired-hive-patch-cid "887d1ea1c7ad2c556c4e856763e743739b1897574a6132965e4adec8e9494ca3"
+ :paired-hive-telemetry-cid "86f2c3301ef1ef64d64432f6fc2ef21e0ddeeb1f52b807730f23c16a893d9a19"
+ :consensus-impact :none
+ :consensus-impact-note "Pure Sans-IO bitecho.storage.app-release atomic web/app/release resolver (CID-pinned genesis anchor, 2-of-3 quorum sigs, generalized SHA-384 SRI check, atomic LKG retention pin), pointer-versioned /app/* COOP/COEP/CSP headers, legacy.js extraction, and Rule 6 CLI verbs; zero consensus wire changes and HTTPS_PROXY micro-fix cleanly isolated out."
+ :consent-records [{:agent "simon" :role :human-anchor :verdict :consented :note "Real Stage 1 CONSENT (15:29 CST) + Real Stage 2 CONSENT (16:02 CST, Axiom seq 265) on bitecho (25311708...) + hive (887d1ea1...)"}
+                   {:agent "axiom" :role :architect :verdict :consented :pubkey "302a300506032b6570032100b53afd55492fe17fca9d0ef0e07b367bf8333490e43b4ecd3610c12c8e6a79f8" :note "Real Stage 1 CONSENT (seq 260) + Real Stage 2 CONSENT (seq 263, all 4 artifacts hash-verified firsthand, Catch #5 proxy isolation & Catch #2 zero-CDN verified)"}
+                   {:agent "vector" :role :soak-tester :verdict :consented :pubkey "302a300506032b6570032100365bd3dc35b4f609d6ac147c129c5b791798765b181d53341e58d6fcf1c6cd62" :note "5-seat twin-circle sim (:fixed-point-2) + Real Stage 1 CONSENT (seq 93) + alpeware/hive Stage 2 Chrome 156 CDP E2E (86f2c330...) + independent bitecho patch verification + Real Stage 2 CONSENT (seq 96)"}
+                   {:agent "lumen" :role :steward :verdict :consented :pubkey "302a300506032b6570032100ccc35a321c00d0f05a056228a5d0682038235aea817a4a0bd4d6c681f5c970de" :note "Real Stage 1 CONSENT (seq 16) + Real Stage 2 CONSENT (seq 16/17, all 4 Stage 2 artifacts SHA-verified)"}
+                   {:agent "nexus" :role :builder-lead :verdict :consented :pubkey "302a300506032b65700321009b33a9ebd1866d6db419edabe2de9ee74c884dc86b4214f60e3a26f04cbd9cfc" :note "Real Stage 1 CONSENT + alpeware/bitecho Stage 2 strict-TDD implementation + Real Stage 2 CONSENT (5/5 closed)"}]
+ :invariant-diff {:defspec-vars ["bitecho.storage.app-release-test/prop-app-release-model-command-sequence"]
+                  :sans-io-pure? true
+                  :diagnose-coverage? true
+                  :co-committed-spec-and-flags? true}
+ :oracle-receipts {:four-way-golden-oracle {:status :pass :note "Byte-identical JVM == CLJS release-cid + portable synchronous SHA-384 + 2-of-3 quorum sigs across 6 tests / 119 assertions"}
+                   :vopr-jepsen-non-vacuity {:status :pass :note "51 JVM targeted tests / 866 assertions (incl. HTTPS atomic release E2E + Pre-Fleet Lab Monotonic Rollback Dry-Run seq 1->2->3) + 260 CLJS Node.js tests / 2,316 assertions, 0 failures, 0 lint warnings"}
+                   :deterministic-bundle-sha256 {:status :pass :note "./scripts/build-browser-bundle.sh EXIT 0: 100% 2-build reproducible dist/bitecho-browser.js (1,588,055 B), legacy.js + .sri extracted, 0 inline scripts"}
+                   :bwrap-civilization-regression {:status :pass :note "Headless Chrome 156 CDP E2E (Page/Runtime/Log/Security/Audits) under exact BIP-017b S3 strict CSP + COOP: same-origin + COEP: credentialless: 0 CSP violations, crossOriginIsolated=true, SharedArrayBuffer & WebAuthn available, live af_heart -> OPFS -> blob: fetch 200 OK bit-exact, JS heap delta -0.546 MiB (telemetry 86f2c330...)"}}
+ :open-findings []}

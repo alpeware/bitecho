@@ -19,6 +19,7 @@
             [bitecho.rendezvous.core-test]
             [bitecho.shell.browser-test]
             [bitecho.state-machine-portability-test]
+            [bitecho.storage.app-release-test]
             [bitecho.storage.chunk-fetch-test]
             [bitecho.streamlet.core-test]
             [bitecho.wire-negotiation-test]
@@ -56,6 +57,7 @@
              'bitecho.economy.treasury-test
              'bitecho.shell.browser-test
              'bitecho.state-machine-portability-test
+             'bitecho.storage.app-release-test
              'bitecho.storage.chunk-fetch-test
              'bitecho.wire-negotiation-test
              'bitecho.fractal-federation-test

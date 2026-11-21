@@ -67,6 +67,7 @@
                                    (get-in cli/runner-alias-desugar-table [verb :canonical])
                                    (get-in cli/memento-verb-desugar-table [verb :canonical])
                                    (get-in cli/chunked-artifact-verb-desugar-table [verb :canonical])
+                                   (get-in cli/web-release-verb-desugar-table [verb :canonical])
                                    (when (contains? cli/canonical-cli-verbs-set verb) verb)
                                    verb)]
                  [verb (cond-> {:verb verb

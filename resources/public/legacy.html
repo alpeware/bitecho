@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' https: wss: blob:; img-src 'self' data: blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self';">
+  <title>Bitecho Human Anchor Dashboard</title>
+  <style>
+    :root {
+      --bg: #121214;
+      --card-bg: #1a1a1e;
+      --card-border: #2e2e36;
+      --text: #e1e1e6;
+      --text-muted: #8d8d99;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --danger: #ef4444;
+      --danger-hover: #dc2626;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --mono-font: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 24px 16px;
+      max-width: 1080px;
+      margin: 0 auto;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    h1 { font-size: 1.5rem; font-weight: 700; color: #fff; }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .badge-primary { background: rgba(99, 102, 241, 0.2); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.4); }
+    .badge-warning { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .badge-success { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.4); }
+    .badge-danger { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #fff;
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .field { margin-bottom: 12px; }
+    .field-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 4px; }
+    .mono { font-family: var(--mono-font); font-size: 0.85rem; word-break: break-all; background: #0d0d10; padding: 6px 8px; border-radius: 4px; border: 1px solid #202028; }
+    .select-input {
+      width: 100%;
+      background: #0d0d10;
+      color: var(--text);
+      border: 1px solid var(--card-border);
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 0.9rem;
+    }
+    .fido-box {
+      background: #141418;
+      border: 1px solid #2a2a34;
+      border-radius: 6px;
+      padding: 12px;
+      margin-top: 8px;
+    }
+    .fido-warning {
+      margin-top: 8px;
+      font-size: 0.75rem;
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.1);
+      padding: 6px 8px;
+      border-radius: 4px;
+      border-left: 3px solid var(--warning);
+    }
+    .parked-note {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+      display: block;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 8px; }
+    th { text-align: left; padding: 8px; color: var(--text-muted); border-bottom: 1px solid var(--card-border); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; }
+    td { padding: 8px; border-bottom: 1px solid #22222a; vertical-align: middle; }
+    .btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn:hover { background: var(--accent-hover); }
+    .btn-danger { background: var(--danger); }
+    .btn-danger:hover { background: var(--danger-hover); }
+    .btn-success { background: var(--success); }
+    .btn-outline { background: transparent; border: 1px solid var(--card-border); color: var(--text); }
+    .btn-outline:hover { background: #26262e; }
+    .actions-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    pre {
+      background: #0d0d10;
+      color: #10b981;
+      padding: 16px;
+      border-radius: 6px;
+      border: 1px solid var(--card-border);
+      overflow-x: auto;
+      font-family: var(--mono-font);
+      font-size: 0.8rem;
+      min-height: 220px;
+      max-height: 400px;
+      line-height: 1.4;
+    }
+    .empty-state { text-align: center; color: var(--text-muted); padding: 16px; font-style: italic; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Bitecho Human Anchor Dashboard</h1>
+      <p style="color: var(--text-muted); font-size: 0.85rem;">Phase 3 / Milestone 12 — Fractal Composition, Zero-Burn Subnets &amp; Domain Federation</p>
+    </div>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <span class="badge badge-primary" id="versionBadge">v0.23.19 (BIP-016)</span>
+      <span class="badge badge-success">Sans-IO Core</span>
+    </div>
+  </header>
+
+  <!-- Live Bitecho Mesh & Sealed Messenger (Axiom / Devnet) -->
+  <div class="card" style="margin-bottom: 24px; border: 1px solid rgba(99, 102, 241, 0.4); background: linear-gradient(180deg, #16161c 0%, #1a1a22 100%);">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--card-border); padding-bottom: 12px;">
+      <div>
+        <h2 style="font-size: 1.15rem; color: #fff; display: flex; align-items: center; gap: 8px;">
+          <span>⚡ Live Bitecho Mesh &amp; Sealed Messenger</span>
+          <span class="badge badge-warning" id="meshStatusBadge">DISCONNECTED</span>
+        </h2>
+        <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 2px;">
+          Real browser light-node over WebRTC DataChannel (node1: 35.212.129.138:5010)
+        </p>
+      </div>
+      <div>
+        <button class="btn btn-success" id="connectMeshBtn" style="font-size: 0.9rem; padding: 8px 16px;">Connect Live Devnet Mesh</button>
+      </div>
+    </div>
+
+    <!-- Live Messaging Grid: Target Peer / Channels & Chat Thread -->
+    <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 16px;">
+      <!-- Left: Peer & Session Control -->
+      <div>
+        <div class="field">
+          <div class="field-label">Target Peer (Handle or Ed25519 Pubkey)</div>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="targetPeerInput" class="select-input" value="axiom" style="font-family: var(--mono-font); font-size: 0.85rem;" placeholder="axiom or pubkey hex">
+          </div>
+          <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 4px;">
+            Known: <strong>axiom</strong> (core architect), <strong>nexus</strong> (directory authority)
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+          <button class="btn" id="openChannelBtn" style="flex: 1;">Open Sealed Channel</button>
+        </div>
+
+        <div class="field">
+          <div class="field-label" style="display: flex; justify-content: space-between;">
+            <span>Active Sealed Sessions</span>
+            <span id="sessionsCountBadge" class="badge badge-primary">0 Active</span>
+          </div>
+          <div id="sessionsContainer" style="max-height: 160px; overflow-y: auto; background: #0d0d10; border: 1px solid #202028; border-radius: 4px; padding: 6px;">
+            <div class="empty-state" style="padding: 10px; font-size: 0.75rem;" id="noSessionsMsg">No active sealed channels.</div>
+            <div id="sessionsList" style="display: none; font-size: 0.75rem;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Sealed Chat Thread & Input -->
+      <div style="display: flex; flex-direction: column;">
+        <div class="field-label" style="display: flex; justify-content: space-between;">
+          <span>Live Sealed Chat (E2E AES-256-GCM / SACK)</span>
+          <span style="font-size: 0.72rem; color: #10b981;" id="activePeerLabel">Peer: axiom</span>
+        </div>
+        <div id="chatMessages" style="flex: 1; min-height: 160px; max-height: 220px; overflow-y: auto; background: #0d0d10; border: 1px solid #202028; border-radius: 4px; padding: 10px; margin-bottom: 10px; font-family: var(--mono-font); font-size: 0.8rem; line-height: 1.4;">
+          <div style="color: var(--text-muted); text-align: center; margin-top: 40px; font-style: italic;">
+            Connect to devnet mesh and open a sealed channel to message Axiom.
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" id="chatInput" class="select-input" placeholder="Type sealed message to Axiom..." style="flex: 1;">
+          <button class="btn btn-success" id="sendMessageBtn" style="white-space: nowrap;">Send Sealed Message</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Collapsible Local Diagnostics & Offline Sandbox -->
+  <details style="margin-bottom: 20px; background: #16161c; border: 1px solid var(--card-border); border-radius: 6px; padding: 12px;">
+    <summary style="font-size: 0.85rem; font-weight: 600; cursor: pointer; color: var(--text-muted);">
+      🛠️ Local Diagnostics &amp; Offline Sandbox (Simulations &amp; Unit Scenarios)
+    </summary>
+    <div class="actions-bar" style="margin-top: 12px; margin-bottom: 0;">
+      <button class="btn btn-outline" id="runAnchorDemoBtn">Run Anchor End-to-End Demo</button>
+      <button class="btn btn-outline" id="runSubnetDemoBtn">Run Browser Subnet Demo</button>
+      <button class="btn btn-outline" id="runZeroBurnSubnetBtn">Run Zero-Burn Subnet Demo</button>
+      <button class="btn btn-outline" id="runFederationBtn">Run Domain Federation Demo</button>
+      <button class="btn btn-outline" id="simOfferBtn">Simulate Incoming Offer</button>
+      <button class="btn btn-outline" id="registerYubiKeyBtn">Register Hardware YubiKey</button>
+      <button class="btn btn-outline" id="recoverYubiKeyBtn">Recover from YubiKey</button>
+      <button class="btn btn-outline" id="spawnAgentBtn">Spawn Supervised Agent (Demo)</button>
+      <button class="btn btn-outline" id="resetAnchorBtn">Reset Anchor State</button>
+    </div>
+  </details>
+
+  <div class="grid">
+    <!-- Anchor Identity & Hardware Key Card -->
+    <div class="card">
+      <h2>
+        <span>Anchor Identity &amp; Key Mode</span>
+        <span class="badge badge-warning" id="hardwareLockedBadge" style="display: none;">[ LOCKED — Tap Recover from YubiKey to Sign ]</span>
+      </h2>
+      <div class="field">
+        <div class="field-label">Bech32m Address (BIP-0350)</div>
+        <div class="mono" id="anchorAddress">ech1...</div>
+      </div>
+      <div class="field">
+        <div class="field-label">Cold Public Key (Hex)</div>
+        <div class="mono" id="anchorPubkey">...</div>
+      </div>
+      <div class="field">
+        <div class="field-label">Key Mode</div>
+        <select class="select-input" id="keyModeSelect">
+          <option value="yubikey-discoverable">YubiKey Discoverable (Resident Key Seed)</option>
+          <option value="yubikey-prf">YubiKey PRF Extension</option>
+          <option value="webcrypto-non-extractable">Non-Extractable WebCrypto (P-256)</option>
+        </select>
+      </div>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
+        <button class="btn" id="registerYubiKeyCardBtn" style="flex: 1; font-size: 0.78rem; padding: 7px 10px;">🔑 Register Hardware YubiKey</button>
+        <button class="btn btn-success" id="recoverYubiKeyCardBtn" style="flex: 1; font-size: 0.78rem; padding: 7px 10px;">🔓 Recover from YubiKey</button>
+        <button class="btn btn-outline" id="saveStateIdbBtn" style="font-size: 0.78rem; padding: 7px 10px;" title="Save public identity &amp; address to IndexedDB for refresh continuity">💾 Save Identity</button>
+      </div>
+      <div class="fido-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <span style="font-weight: 600; font-size: 0.85rem;" id="fidoName">YubiKey 5 Series</span>
+          <span class="badge badge-warning" id="fidoStatusBadge">[ UNVERIFIED ]</span>
+        </div>
+        <div style="font-size: 0.75rem; color: var(--text-muted); margin-bottom: 4px;">
+          AAGUID: <code id="fidoAaguid">2fc0579f-8113-47ea-b116-bb5a8db9202a</code> | Level: <span id="fidoLevel">UNVERIFIED</span>
+        </div>
+        <div class="fido-warning" id="fidoWarning">
+          Standing Constraint 6: FIDO MDS v3 authenticator strength evaluations and MDS JWT parser are labeled UNVERIFIED pending full x5c attestation chain verification.
+        </div>
+        <span class="parked-note">Yubico central enrollment: :parked (decentralized ethos preserved).</span>
+      </div>
+    </div>
+
+    <!-- Economic Reserves & Balances -->
+    <div class="card">
+      <h2>Economic Reserves &amp; Balances</h2>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+        <div style="background: #141418; padding: 12px; border-radius: 6px; border: 1px solid #24242e;">
+          <div class="field-label">Balance</div>
+          <div style="font-size: 1.4rem; font-weight: 700; color: #fff;" id="balanceDisplay">0 ECH</div>
+        </div>
+        <div style="background: #141418; padding: 12px; border-radius: 6px; border: 1px solid #24242e;">
+          <div class="field-label">Total Burned</div>
+          <div style="font-size: 1.4rem; font-weight: 700; color: #f87171;" id="burnedDisplay">0 ECH</div>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">Offers Approved / Denied</div>
+        <div style="font-size: 0.95rem;">
+          <span style="color: var(--success); font-weight: 600;" id="approvedCount">0</span> Approved &nbsp;|&nbsp;
+          <span style="color: var(--danger); font-weight: 600;" id="deniedCount">0</span> Denied
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">Active Team-Call Subnet</div>
+        <div class="mono" id="teamCallDisplay">None (Idle)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- BIP-006: Subnet Broadcast, Sociocratic BIP Consent, & WebAuthn Hardware-Key Sponsored Faucet -->
+  <div class="grid">
+    <!-- Subnet Broadcast & Sociocratic BIP Governance Consent Card -->
+    <div class="card">
+      <h2>
+        <span>Subnet Broadcast &amp; Sociocratic BIP Consent</span>
+        <span class="badge badge-primary">BIP-006</span>
+      </h2>
+      <div class="field">
+        <div class="field-label">Subnet Broadcast</div>
+        <div style="display: flex; gap: 8px; margin-bottom: 6px;">
+          <input type="text" id="subnetBroadcastTarget" class="select-input" value="chat/simon-nexus-axiom" style="font-family: var(--mono-font); font-size: 0.8rem; width: 42%;" placeholder="subnet_id">
+          <input type="text" id="subnetBroadcastInput" class="select-input" style="flex: 1; font-size: 0.85rem;" placeholder="Broadcast message to subnet...">
+          <button class="btn btn-success" id="sendSubnetBroadcastBtn" style="white-space: nowrap;">Broadcast</button>
+        </div>
+      </div>
+      <div class="field" style="margin-top: 12px; border-top: 1px solid var(--card-border); padding-top: 12px;">
+        <div class="field-label">Sociocratic Tri-Circle BIP Decision</div>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+          <input type="text" id="bipIdInput" class="select-input" value="BIP-006" style="font-family: var(--mono-font); font-size: 0.85rem; width: 35%;" placeholder="BIP-006">
+          <select class="select-input" id="bipCircleSelect" style="flex: 1; font-size: 0.85rem;">
+            <option value="anchor-agent-users">anchor-agent-users</option>
+            <option value="builders-stewards">builders-stewards</option>
+            <option value="mesh-validators">mesh-validators</option>
+          </select>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-success" id="consentBipBtn" style="flex: 1;">Sign &amp; Broadcast Consent</button>
+          <button class="btn btn-outline" id="checkBipStatusBtn">Check BIP Status</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- WebAuthn Hardware-Key Sponsored Faucet Card -->
+    <div class="card">
+      <h2>
+        <span>WebAuthn Hardware-Key Sponsored Faucet</span>
+        <span class="badge badge-success">1,000,000 ECH</span>
+      </h2>
+      <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px;">
+        Sponsor a new agent (or your own anchor identity) with a one-time 1,000,000 ECH drip attested by your WebAuthn/FIDO2 hardware key. Claim receipts are recorded as immutable Blob/Pointer entries.
+      </p>
+      <div class="field">
+        <div class="field-label">Claimant Ed25519 Pubkey (Hex — leave blank for Anchor self-drip)</div>
+        <input type="text" id="faucetClaimantInput" class="select-input" style="font-family: var(--mono-font); font-size: 0.8rem;" placeholder="302a300506032b6570032100...">
+      </div>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <button class="btn" id="claimFaucetBtn" style="flex: 1;">Sponsor 1,000,000 ECH Faucet Drip</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pending Offers Table -->
+  <div class="card" style="margin-bottom: 20px;">
+    <h2>
+      <span>Pending Service Offers (Human Approval Required)</span>
+      <span class="badge badge-primary" id="offersCountBadge">0 Pending</span>
+    </h2>
+    <div id="offersContainer">
+      <div class="empty-state" id="noOffersMsg">No offers currently pending human review.</div>
+      <table id="offersTable" style="display: none;">
+        <thead>
+          <tr>
+            <th>Offer ID</th>
+            <th>Peer / Requester</th>
+            <th>Service Type</th>
+            <th>Burn Floor</th>
+            <th>Status</th>
+            <th style="text-align: right;">Action</th>
+          </tr>
+        </thead>
+        <tbody id="offersTbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Supervised Autonomous Agents Table -->
+  <div class="card" style="margin-bottom: 20px;">
+    <h2>
+      <span>Supervised Autonomous Agents (Cold-Certifies-Hot DAC)</span>
+      <span class="badge badge-primary" id="agentsCountBadge">0 Agents</span>
+    </h2>
+    <div id="agentsContainer">
+      <div class="empty-state" id="noAgentsMsg">No autonomous agents currently registered under anchor delegation.</div>
+      <table id="agentsTable" style="display: none;">
+        <thead>
+          <tr>
+            <th>Agent ID</th>
+            <th>Hot Key (Hex)</th>
+            <th>DAC Status</th>
+            <th>Permissions</th>
+            <th>Activities</th>
+            <th style="text-align: right;">Emergency Revocation</th>
+          </tr>
+        </thead>
+        <tbody id="agentsTbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Console Log Output -->
+  <div class="card">
+    <h2>Execution &amp; Diagnostic Log</h2>
+    <pre id="outputLog">Loading BitechoBrowser bundle...</pre>
+  </div>
+
+  <script src="/app/bitecho-browser.js?v=0.23.19" integrity="sha384-VUC0cjokOBSICVCS80/P7F1+xMNne2+IisAAM+S3LpZjJi82KDN8+Li4aS8CbONJ" crossorigin="anonymous"></script>
+  <script src="/app/legacy.js?v=0.23.19" integrity="sha384-mrHC0f4emb1e+lTKEDwdxFRVu2xgu4BhbhoNrtpNXEBz3+npnnOe9we/zOv2cyK6" crossorigin="anonymous"></script>
+</body>
+</html>

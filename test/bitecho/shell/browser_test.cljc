@@ -1125,11 +1125,16 @@
        (let [index-f (if (.exists (io/file "resources/public/index.html"))
                        (io/file "resources/public/index.html")
                        (io/file "dist/index.html"))
+             legacy-f (if (.exists (io/file "resources/public/legacy.js"))
+                        (io/file "resources/public/legacy.js")
+                        (io/file "dist/legacy.js"))
              html (slurp index-f)
+             legacy-js (slurp legacy-f)
              sri-lines (str/split-lines (str/trim (slurp "dist/bitecho-browser.js.sri")))
              sri-384 (first sri-lines)]
-         (is (str/includes? html "globalThis.BitechoBrowser.loadStateFromIndexedDB"))
-         (is (not (str/includes? html "loadStateFromIndexedDb")))
+         (is (str/includes? legacy-js "globalThis.BitechoBrowser.loadStateFromIndexedDB"))
+         (is (not (str/includes? legacy-js "loadStateFromIndexedDb")))
+         (is (str/includes? html "/app/legacy.js"))
          (is (str/includes? html sri-384))
          (let [node-res (sh/sh "node" "-e"
                                "require('./dist/bitecho-browser.js');

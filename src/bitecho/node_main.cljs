@@ -918,6 +918,11 @@
                (.existsSync node-fs file-arg))
           (assoc "manifest_json" (try (.readFileSync node-fs file-arg "utf8") (catch :default _ nil)))
 
+          (and (contains? #{"web-release-publish" "web-release-rollback" "web-release-verify"} cmd)
+               file-arg
+               (.existsSync node-fs file-arg))
+          (assoc "release_json" (try (.readFileSync node-fs file-arg "utf8") (catch :default _ nil)))
+
           (and (= cmd "import-poll") file-arg)
           (assoc "file_content" (or (try (.readFileSync node-fs file-arg "utf8") (catch :default _ nil)) ""))
 

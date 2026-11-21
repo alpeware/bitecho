@@ -23,6 +23,7 @@
             [bitecho.shell.identity :as identity]
             [bitecho.shell.light-node :as light-node]
             [bitecho.snapshot.core :as snap]
+            [bitecho.storage.app-release :as app-release]
             [bitecho.storage.chunk-constants :as chunk-const]
             [clojure.data.json :as json]
             [clojure.edn :as edn]
@@ -1138,6 +1139,104 @@
                  (assoc cid-res :pointer ptr)
                  (assoc cid-res :pointer ptr))))))))))
 
+(defn- parse-release-pointer-payload
+  "Parses a `web/app/release` blob (JSON or EDN) into `{:release ... :envelope ...}`."
+  [bs]
+  (let [s (fressian/bytes->utf8 bs)
+        parsed (or (try (json/read-str s) (catch Exception _ nil))
+                   (try (edn/read-string s) (catch Exception _ nil)))]
+    (when (map? parsed)
+      (let [rel (or (:release parsed) (get parsed "release"))
+            env (or (:envelope parsed) (get parsed "envelope"))]
+        (when (and (map? rel) (map? env))
+          {:release rel :envelope env})))))
+
+(defn- hydrate-release-blobs!
+  [rt release now-ms]
+  (let [hdr-cid (or (:headers-config-cid release) (get release "headers_config_cid") (get release "headers-config-cid"))
+        assets (or (:assets release) (get release "assets") {})
+        asset-cids (keep (fn [[_ v]] (when (map? v) (or (:cid v) (get v "cid")))) assets)
+        all-cids (distinct (remove nil? (cons hdr-cid asset-cids)))]
+    (reduce (fn [acc cid]
+              (let [res (resolve-cid-blob! rt cid now-ms)]
+                (if-let [bs (and (:ok? res) (get-in res [:blob :blob/bytes]))]
+                  (assoc acc (str/lower-case (str/trim (str cid))) bs)
+                  acc)))
+            {}
+            all-cids)))
+
+(defn apply-app-release!
+  "Atomically applies a BIP-017b release transition to `(:app-release-atom rt)`
+   and forwards any `:diagnose` effects to `(:shell-atom rt)`."
+  [rt event]
+  (if-let [ar-atom (:app-release-atom rt)]
+    (let [effs-box (atom [])]
+      (swap! ar-atom
+             (fn [st]
+               (let [[st' effs] (app-release/transition st event)]
+                 (reset! effs-box effs)
+                 st')))
+      (doseq [eff @effs-box]
+        (when (= :diagnose (:type eff))
+          (apply-shell-event! (:shell-atom rt)
+                              {:type :diagnose
+                               :reason (or (:kind eff) :app-release-diagnose)
+                               :detail (:reason eff)})))
+      {:state @ar-atom :effects @effs-box})
+    {:state nil :effects []}))
+
+(defn resolve-app-release-asset!
+  "Resolves `/app/*` requests atomically against the `web/app/release` pointer when present.
+   Returns `{:ok? false :fallback? true}` when no `web/app/release` pointer exists yet so
+   legacy individual `web/app/*` pointers continue serving without regression."
+  ([rt req-path]
+   (resolve-app-release-asset! rt req-path (System/currentTimeMillis)))
+  ([rt req-path now-ms]
+   (let [ar-atom (:app-release-atom rt)
+         ptr-res (resolve-path-blob! rt "web/app/release" now-ms)]
+     (cond
+       (nil? ar-atom)
+       {:ok? false :fallback? true}
+
+       (and (not (:ok? ptr-res))
+            (nil? (:active-release @ar-atom)))
+       {:ok? false :fallback? true}
+
+       :else
+       (do
+         (when (:ok? ptr-res)
+           (when-let [{:keys [release envelope]} (parse-release-pointer-payload (get-in ptr-res [:blob :blob/bytes]))]
+             (let [cur-cid (get-in @ar-atom [:active-release :release-cid])
+                   cand-cid (app-release/release-cid release)]
+               (when (not= cand-cid cur-cid)
+                 (let [blobs (hydrate-release-blobs! rt release now-ms)
+                       cur-gen (:generation @ar-atom 0)]
+                   (apply-app-release! rt {:type :apply-release
+                                           :generation cur-gen
+                                           :release release
+                                           :envelope envelope
+                                           :blobs blobs}))))))
+         (let [st @ar-atom
+               active (:active-release st)]
+           (if-not active
+             {:ok? false :status 503 :error (or (:last-error st) :release-not-active)}
+             (let [asset-key (app-release/sanitize-app-asset-key req-path)
+                   asset-cid (when asset-key (get-in active [:assets asset-key :cid]))
+                   blobs (if asset-cid
+                           (let [r (resolve-cid-blob! rt asset-cid now-ms)]
+                             (if-let [bs (and (:ok? r) (get-in r [:blob :blob/bytes]))]
+                               {asset-cid bs}
+                               {}))
+                           {})
+                   resp (app-release/resolve-app-asset-response st req-path blobs)]
+               (doseq [eff (:effects resp)]
+                 (when (= :diagnose (:type eff))
+                   (apply-shell-event! (:shell-atom rt)
+                                       {:type :diagnose
+                                        :reason (or (:kind eff) :app-release-diagnose)
+                                        :detail (:reason eff)})))
+               resp))))))))
+
 (defn merge-upgraded-policy
   "Pure helper (`F-D31-BUG-3`): merges newly added `:subnet/path-acl` patterns and upgraded
    `:signers` sets from `default-pol` into a persisted `snap-pol` loaded from `subnet-pointers.fressian`."
@@ -1224,8 +1323,16 @@
                                    (.setName "bitecho-infra-async-io")
                                    (.setDaemon true)))))
                 pointer-writer-atom (atom (snap/init-writer-state {:node-id (or (:node-id opts) "infra-pointers")}))
+                app-release-atom (atom (app-release/init-release-state
+                                        {:genesis-anchor-cid (or (:genesis-anchor-cid opts)
+                                                                 (get-in inst0 [:policy :subnet/genesis-policy-cid]))
+                                         :trusted-signers (or (:release-signers opts)
+                                                              (get-in inst0 [:policy :subnet/gate :gate/trust-anchors]))
+                                         :threshold (or (:release-threshold opts) 2)
+                                         :max-bytes (:app-release-max-bytes opts)}))
                 rt {:shell-atom shell-atom
                     :subnet-atom subnet-atom
+                    :app-release-atom app-release-atom
                     :epoch-atom (atom (:initial-epoch opts))
                     :epoch-fn (:epoch-fn opts)
                     :peer-identity (:peer-identity opts)

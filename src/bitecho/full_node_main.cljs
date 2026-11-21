@@ -34,6 +34,7 @@
             [bitecho.observability.core :as obs]
             [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
+            [bitecho.storage.app-release :as app-release]
             [bitecho.storage.chunk-constants :as chunk-const]
             [cljs.reader :as edn]
             [clojure.string :as str]
@@ -979,6 +980,88 @@
             (.then (fn [res] (cb res)))
             (.catch (fn [_] (cb {:ok? false :error :not-found}))))))))
 
+(defn- parse-release-pointer-payload
+  [bs]
+  (let [s (fressian/bytes->utf8 bs)
+        parsed (or (try (js->clj (js/JSON.parse s)) (catch :default _ nil))
+                   (try (edn/read-string s) (catch :default _ nil)))]
+    (when (map? parsed)
+      (let [rel (or (:release parsed) (get parsed "release"))
+            env (or (:envelope parsed) (get parsed "envelope"))]
+        (when (and (map? rel) (map? env))
+          {:release rel :envelope env})))))
+
+(defn- hydrate-release-blobs!
+  [rt release now-ms]
+  (let [hdr-cid (or (:headers-config-cid release) (get release "headers_config_cid") (get release "headers-config-cid"))
+        assets (or (:assets release) (get release "assets") {})
+        asset-cids (keep (fn [[_ v]] (when (map? v) (or (:cid v) (get v "cid")))) assets)
+        all-cids (distinct (remove nil? (cons hdr-cid asset-cids)))]
+    (reduce (fn [acc cid]
+              (let [res (resolve-cid-blob! rt cid now-ms)]
+                (if-let [bs (and (:ok? res) (get-in res [:blob :blob/bytes]))]
+                  (assoc acc (str/lower-case (str/trim (str cid))) bs)
+                  acc)))
+            {}
+            all-cids)))
+
+(defn- resolve-app-release-asset!
+  [rt req-path now-ms]
+  (let [ar-atom (:app-release-atom rt)
+        ptr-res (resolve-path-blob! rt "web/app/release" now-ms)]
+    (cond
+      (nil? ar-atom)
+      {:ok? false :fallback? true}
+
+      (and (not (:ok? ptr-res))
+           (nil? (:active-release @ar-atom)))
+      {:ok? false :fallback? true}
+
+      :else
+      (do
+        (when (:ok? ptr-res)
+          (when-let [{:keys [release envelope]} (parse-release-pointer-payload (get-in ptr-res [:blob :blob/bytes]))]
+            (let [cur-cid (get-in @ar-atom [:active-release :release-cid])
+                  cand-cid (app-release/release-cid release)]
+              (when (not= cand-cid cur-cid)
+                (let [blobs (hydrate-release-blobs! rt release now-ms)
+                      effs-box (atom [])]
+                  (swap! ar-atom
+                         (fn [st]
+                           (let [[st' effs] (app-release/transition st {:type :apply-release
+                                                                        :generation (:generation st 0)
+                                                                        :release release
+                                                                        :envelope envelope
+                                                                        :blobs blobs})]
+                             (reset! effs-box effs)
+                             st')))
+                  (doseq [eff @effs-box]
+                    (when (= :diagnose (:type eff))
+                      (apply-shell-event! (:shell-atom rt)
+                                          {:type :diagnose
+                                           :reason (or (:kind eff) :app-release-diagnose)
+                                           :detail (:reason eff)}))))))))
+        (let [st @ar-atom
+              active (:active-release st)]
+          (if-not active
+            {:ok? false :status 503 :error (or (:last-error st) :release-not-active)}
+            (let [asset-key (app-release/sanitize-app-asset-key req-path)
+                  asset-cid (when asset-key (get-in active [:assets asset-key :cid]))
+                  blobs (if asset-cid
+                          (let [r (resolve-cid-blob! rt asset-cid now-ms)]
+                            (if-let [bs (and (:ok? r) (get-in r [:blob :blob/bytes]))]
+                              {asset-cid bs}
+                              {}))
+                          {})
+                  resp (app-release/resolve-app-asset-response st req-path blobs)]
+              (doseq [eff (:effects resp)]
+                (when (= :diagnose (:type eff))
+                  (apply-shell-event! (:shell-atom rt)
+                                      {:type :diagnose
+                                       :reason (or (:kind eff) :app-release-diagnose)
+                                       :detail (:reason eff)})))
+              resp)))))))
+
 (defn- resolve-web-blob-async!
   "Zero-Sync-IO async web blob resolver: checks subnet pointers first, then falls back to `resolve-safe-content-root-async!`."
   [config rt req-path now-ms cb]
@@ -1863,8 +1946,48 @@
           (do
             (apply-shell-event! http-shell-atom {:type :drop :reason :http-forbidden-path :detail raw-path})
             (send-text! res 403 "Forbidden\n" method))
-          (if (str/starts-with? subpath "dist/")
+          (cond
+            (str/starts-with? subpath "dist/")
             (handle-dist-request! req res config rt raw-path query-str method extra-hdrs limiter-atom)
+
+            (or (= subpath "app") (str/starts-with? subpath "app/"))
+            (let [rel-res (resolve-app-release-asset! rt raw-path now-ms)]
+              (cond
+                (:ok? rel-res)
+                (let [buf (u8->buf (:body rel-res))
+                      hdrs (assoc (merge {} extra-hdrs (:headers rel-res))
+                                  "Content-Length" (.-length buf))]
+                  (swap! limiter-atom #(-> (dns-proto/record-egress % (.-length buf) (current-month-key)) :state))
+                  (.writeHead res (int (:status rel-res 200)) (clj->js hdrs))
+                  (if (= method "HEAD") (.end res) (.end res buf)))
+
+                (:fallback? rel-res)
+                (resolve-web-blob-async!
+                 config rt raw-path now-ms
+                 (fn [resolved]
+                   (cond
+                     (= :forbidden (:error resolved))
+                     (do
+                       (apply-shell-event! http-shell-atom {:type :drop :reason :http-forbidden-path :detail raw-path})
+                       (send-text! res 403 "Forbidden\n" method))
+
+                     (:ok? resolved)
+                     (send-resolved-blob! req res resolved method extra-hdrs limiter-atom)
+
+                     :else
+                     (send-text! res 404 "Not Found\n" method))))
+
+                :else
+                (do
+                  (apply-shell-event! http-shell-atom {:type :drop :reason (or (:error rel-res) :http-app-release-error) :detail raw-path})
+                  (send-text! res (int (or (:status rel-res) 404))
+                              (case (int (or (:status rel-res) 404))
+                                403 "Forbidden\n"
+                                503 "Service Unavailable\n"
+                                "Not Found\n")
+                              method))))
+
+            :else
             (resolve-web-blob-async!
              config rt raw-path now-ms
              (fn [resolved]
@@ -3717,6 +3840,13 @@
             :state-dir state-dir
             :shell-atom rt-shell-atom
             :subnet-atom (atom inst0)
+            :app-release-atom (atom (app-release/init-release-state
+                                     {:genesis-anchor-cid (or (:genesis-anchor-cid config)
+                                                              (get-in inst0 [:policy :subnet/genesis-policy-cid]))
+                                      :trusted-signers (or (:release-signers config)
+                                                           (get-in inst0 [:policy :subnet/gate :gate/trust-anchors]))
+                                      :threshold (or (:release-threshold config) 2)
+                                      :max-bytes (:app-release-max-bytes config)}))
             :epoch-atom (atom 1)
             :default-sender pk
             :node-privkey sk

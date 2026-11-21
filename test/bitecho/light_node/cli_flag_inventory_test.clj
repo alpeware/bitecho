@@ -557,4 +557,36 @@
         (is (contains? (set cli/known-command-flags) "--endpoint"))
         (is (= ["https://ns1.bitecho.org/relay/v1"] (get p2p1 "candidates")))
         (is (= "nexus" (get p2p1 "to")))
-        (is (= p2p1 p2p2))))))
+        (is (= p2p1 p2p2))))
+
+    (testing "BIP-017b web-release-publish, web-release-rollback, web-release-verify verbs and flags"
+      (let [flags (set cli/known-command-flags)
+            verbs cli/all-recognized-cli-verbs-set]
+        (doseq [f ["--release-cid" "--genesis-anchor-cid" "--lkg-release-cid" "--headers-config-cid"]]
+          (is (contains? flags f)))
+        (doseq [v ["web-release-publish" "web-release-rollback" "web-release-verify"]]
+          (is (contains? verbs v)))
+        (let [rcid (apply str (repeat 64 "a"))
+              gcid (apply str (repeat 64 "b"))
+              lcid (apply str (repeat 64 "c"))
+              hcid (apply str (repeat 64 "d"))
+              pub1 (cli/build-cmd-map "web-release-publish"
+                                      ["--release-cid" rcid "--genesis-anchor-cid" gcid
+                                       "--lkg-release-cid" lcid "--headers-config-cid" hcid
+                                       "--seq" "2" "--max-bytes" "1048576"])
+              rb1 (cli/build-cmd-map "web-release-rollback"
+                                     ["--release-cid" rcid "--lkg-release-cid" lcid "--seq" "3"])
+              ver1 (cli/build-cmd-map "web-release-verify"
+                                      ["--release-cid" rcid "--genesis-anchor-cid" gcid "--headers-config-cid" hcid])]
+          (is (= "web-release-publish" (get pub1 "cmd")))
+          (is (= rcid (get pub1 "release_cid")))
+          (is (= gcid (get pub1 "genesis_anchor_cid")))
+          (is (= lcid (get pub1 "lkg_release_cid")))
+          (is (= hcid (get pub1 "headers_config_cid")))
+          (is (= 2 (get pub1 "seq")))
+          (is (= "put" (get (cli/desugar-cli-cmd-map pub1) "canonical_cmd")))
+          (is (= "web-release-rollback" (get rb1 "cmd")))
+          (is (= 3 (get rb1 "seq")))
+          (is (= "put" (get (cli/desugar-cli-cmd-map rb1) "canonical_cmd")))
+          (is (= "web-release-verify" (get ver1 "cmd")))
+          (is (= "get" (get (cli/desugar-cli-cmd-map ver1) "canonical_cmd"))))))))
