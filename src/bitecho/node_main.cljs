@@ -3646,7 +3646,7 @@
           updater-atom (atom (deploy/init-light-updater-state
                               {:node-id (or (:peer-id identity) "light-node")
                                :artifact-role :light-node
-                               :current-version "0.23.20"
+                               :current-version "0.23.21"
                                :current-cid current-cid
                                :pinned-version (:pin-version opts)
                                :proxy-url proxy-url
