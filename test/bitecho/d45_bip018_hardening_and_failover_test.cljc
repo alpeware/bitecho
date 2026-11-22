@@ -500,4 +500,36 @@
          (is (str/includes? src "evaluate-artifact-pointer-upload-response")
              "post-artifact-to-relay! must validate POST /artifact/v1/pointer via core-infra/evaluate-artifact-pointer-upload-response")
          (is (str/includes? src "artifact-pointer-upload-failed")
-             "post-artifact-to-relay! must fail closed with artifact-pointer-upload-failed on pointer upload failure")))))
+             "post-artifact-to-relay! must fail closed with artifact-pointer-upload-failed on pointer upload failure")))
+     (testing "run-infra-node.sh and full_node_main.cljs wire throttled off-heap V8 GC for Node 26 ArrayBuffer pressure"
+       (let [sh-src (slurp (io/file "scripts/run-infra-node.sh"))
+             fn-src (slurp (io/file "src/bitecho/full_node_main.cljs"))]
+         (is (str/includes? sh-src "--expose-gc")
+             "run-infra-node.sh must pass --expose-gc so Node 26 can reclaim uncounted ArrayBuffers")
+         (is (str/includes? sh-src "BITECHO_NODE_MAX_OLD_SPACE_MB:-128")
+             "run-infra-node.sh must cap V8 old-space to 128 MiB on e2-micro")
+         (is (str/includes? fn-src "should-trigger-offheap-gc?")
+             "full_node_main.cljs must gate off-heap GC via pure core-infra/should-trigger-offheap-gc?")
+         (is (str/includes? fn-src ":offheap-gc-triggered")
+             "full_node_main.cljs must emit counted :offheap-gc-triggered diagnostic on GC")))))
+
+(defspec ^{:doc "BIP-018-SOAK-F1: should-trigger-offheap-gc? enforces cooldown, gc availability, and ArrayBuffer/external thresholds."}
+  prop-offheap-gc-trigger-throttled-and-bounded 100
+  (prop/for-all [ab-bytes (gen/choose 0 33554432)
+                 ext-bytes (gen/choose 0 33554432)
+                 elapsed-ms (gen/choose 0 120000)
+                 gc-avail? gen/boolean]
+                (let [last-gc 1000000
+                      now-ms (+ last-gc elapsed-ms)
+                      mem {:array-buffers-bytes ab-bytes
+                           :external-bytes ext-bytes}
+                      trigger? (core-infra/should-trigger-offheap-gc?
+                                {:memory mem
+                                 :last-gc-ms last-gc
+                                 :now-ms now-ms
+                                 :gc-available? gc-avail?})
+                      expected? (and gc-avail?
+                                     (>= elapsed-ms 30000)
+                                     (or (>= ab-bytes (* 8 1024 1024))
+                                         (>= ext-bytes (* 16 1024 1024))))]
+                  (= expected? trigger?))))

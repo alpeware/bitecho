@@ -152,7 +152,42 @@
                    (first (obs/route-records r [rt-rec relay-rec] {:disk {:ok? true} :network {:ok? true}})))))))
     (catch :default _ nil)))
 
-(declare fetch-validator-chain-state-snapshots! forward-gossip-to-agents! start-validator-mesh-node! step-validator-event!)
+(declare apply-shell-event! fetch-validator-chain-state-snapshots! forward-gossip-to-agents! start-validator-mesh-node! step-validator-event!)
+
+(defn- start-offheap-gc-monitor!
+  "Throttled 30s off-heap ArrayBuffer/external GC monitor for Node.js v26 (V8 14.6)
+   where ArrayBuffer backing stores do not count toward --max-old-space-size (BIP-018-SOAK-F1).
+   Gated by pure `core-infra/should-trigger-offheap-gc?` and emits Rule 5 `:offheap-gc-triggered`."
+  [shell-atom]
+  (let [last-gc-atom (atom 0)
+        timer (js/setInterval
+               (fn []
+                 (try
+                   (let [gc-fn (aget js/globalThis "gc")
+                         now-ms (.now js/Date)
+                         raw-mem (.memoryUsage js/process)
+                         norm-mem (core-infra/normalize-memory-telemetry
+                                   {:rss (.-rss raw-mem)
+                                    :heapUsed (.-heapUsed raw-mem)
+                                    :heapTotal (.-heapTotal raw-mem)
+                                    :external (.-external raw-mem)
+                                    :arrayBuffers (.-arrayBuffers raw-mem)})]
+                     (when (core-infra/should-trigger-offheap-gc?
+                            {:memory norm-mem
+                             :last-gc-ms @last-gc-atom
+                             :now-ms now-ms
+                             :gc-available? (fn? gc-fn)})
+                       (reset! last-gc-atom now-ms)
+                       (gc-fn)
+                       (apply-shell-event! shell-atom
+                                           {:type :diagnose
+                                            :reason :offheap-gc-triggered
+                                            :array-buffers-bytes (:array-buffers-bytes norm-mem)
+                                            :external-bytes (:external-bytes norm-mem)})))
+                   (catch :default _ nil)))
+               30000)]
+    (when (.-unref timer) (.unref timer))
+    #(js/clearInterval timer)))
 
 ;; =============================================================================
 ;; 1. Byte / Buffer / Crypto / Diagnostic Helpers
@@ -4208,6 +4243,9 @@
       ;; P-OBS-4 / D38.1 / D39.5: 60s signed observability digest & rolling SLA publisher
       (when-not (false? (:publish-telemetry? config))
         (swap! stop-fns conj (start-infra-telemetry-publisher! node-id rt waiters-atom)))
+
+      ;; BIP-018-SOAK-F1: 30s throttled off-heap ArrayBuffer GC monitor (active when --expose-gc is enabled)
+      (swap! stop-fns conj (start-offheap-gc-monitor! (:shell-atom rt)))
 
       ;; P-UPD-1 / D40.1: Optional pointer-driven self-update loop for infra nodes
       (when (:auto-update-pointer config)

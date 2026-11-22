@@ -724,3 +724,23 @@
      :external-bytes external
      :array-buffers-bytes array-buffers
      :off-heap-bytes off-heap}))
+
+(defn should-trigger-offheap-gc?
+  "Purely decides whether a throttled V8 major GC should be triggered to reclaim
+   uncounted off-heap `ArrayBuffer`/`Buffer` backing stores in Node.js v26 / V8 14.6
+   (BIP-018-SOAK-F1). Returns `true` only when `gc-available?` is true, at least
+   `cooldown-ms` (default 30s) has elapsed since `last-gc-ms`, and either
+   `array-buffers-bytes >= max-array-buffers-bytes` (default 8 MiB) or
+   `external-bytes >= max-external-bytes` (default 16 MiB)."
+  [{:keys [memory last-gc-ms now-ms gc-available? cooldown-ms max-array-buffers-bytes max-external-bytes]}]
+  (let [m (normalize-memory-telemetry memory)
+        cd (long (or cooldown-ms 30000))
+        ab-cap (long (or max-array-buffers-bytes (* 8 1024 1024)))
+        ext-cap (long (or max-external-bytes (* 16 1024 1024)))
+        last-t (long (or last-gc-ms 0))
+        now-t (long (or now-ms 0))]
+    (boolean
+     (and (true? gc-available?)
+          (>= (- now-t last-t) cd)
+          (or (>= (:array-buffers-bytes m) ab-cap)
+              (>= (:external-bytes m) ext-cap))))))

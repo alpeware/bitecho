@@ -77,13 +77,14 @@ if [[ "${RUNTIME}" == "nodejs" ]]; then
     check_unified_pointer "${RESOLVED_NODE}" || true
     # P-OBS-5 / BIP-018-SOAK-F1: bound glibc arena/mmap retention so >=16 KiB Node.js TLS records,
     # 64 KiB HTTP socket chunks, and 512 KiB chunk buffers return directly to Linux via munmap()
-    # instead of fragmenting glibc brk() [heap], and tighten V8 old-space heap cap to 192 MiB on e2-micro.
+    # instead of fragmenting glibc brk() [heap], cap V8 old-space to 128 MiB, and enable --expose-gc
+    # so Node 26 (V8 14.6) can reclaim uncounted off-heap ArrayBuffers via throttled GC.
     export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
     export MALLOC_MMAP_THRESHOLD_="${MALLOC_MMAP_THRESHOLD_:-16384}"
     export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-16384}"
-    NODE_MAX_OLD_SPACE_MB="${BITECHO_NODE_MAX_OLD_SPACE_MB:-192}"
+    NODE_MAX_OLD_SPACE_MB="${BITECHO_NODE_MAX_OLD_SPACE_MB:-128}"
     # Exit 75 triggers OpenRC supervise-daemon respawn after unified pointer advance (P-HOST-6)
-    exec "${RESOLVED_NODE}" "--max-old-space-size=${NODE_MAX_OLD_SPACE_MB}" "${NODE_BUNDLE}" infra-node "${CONFIG_FILE}"
+    exec "${RESOLVED_NODE}" --expose-gc "--max-old-space-size=${NODE_MAX_OLD_SPACE_MB}" "${NODE_BUNDLE}" infra-node "${CONFIG_FILE}"
   else
     echo '{"event":"runtime-fallback","from":"nodejs","to":"jvm"}' >&2
     RUNTIME="jvm"
