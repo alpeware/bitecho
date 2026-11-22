@@ -6331,6 +6331,97 @@
      :net-envelopes []
      :stdout-events []}))
 
+(defn- sanitize-rolodex-snapshot
+  "Builds a deterministic, secret-free BIP-016 Rolodex snapshot from light-node state."
+  [state next-seq node-role]
+  (let [petnames (into (sorted-map)
+                       (for [[k v] (or (:petnames state) {})
+                             :when (and (some? k) (some? v))]
+                         [(if (keyword? k) (name k) (str k)) (str v)]))
+        petname-meta (into (sorted-map)
+                           (for [[pk meta-m] (or (:petname-meta state) {})
+                                 :when (and (some? pk) (map? meta-m))]
+                             [(str pk) (select-keys meta-m [:petname :voice-id :color])]))
+        subnets (vec (sort (distinct (map str (or (:subscribed-subnets state) [])))))
+        sessions (into (sorted-map)
+                       (for [[sid s] (or (:sessions state) {})
+                             :when (and (some? sid) (map? s))]
+                         [(str sid) {:peer (str (:peer s))
+                                     :state (str (or (:state s) "unknown"))
+                                     :epoch (long (or (:epoch s) 0))}]))]
+    {:schema "bitecho/rolodex-snapshot-v1"
+     :pubkey (str (or (:pubkey state) ""))
+     :node-role (str (or node-role "light"))
+     :seq next-seq
+     :petnames petnames
+     :petname-meta petname-meta
+     :subscribed-subnets subnets
+     :sessions sessions}))
+
+(defn- exec-rolodex-put [state cmd-map]
+  (let [prev-seq (long (or (get-in state [:rolodex :seq]) 0))
+        next-seq (inc prev-seq)
+        node-role (or (get cmd-map "nodeRole") (get cmd-map "node_role") (:node-role cmd-map) "light")
+        snap (sanitize-rolodex-snapshot state next-seq node-role)
+        snap-cid (crypto/sha256-hex (pr-str snap))
+        rolodex-rec {:seq next-seq
+                     :cid snap-cid
+                     :node-role (str node-role)
+                     :snapshot snap}
+        new-state (assoc state :rolodex rolodex-rec)]
+    {:state new-state
+     :response {"ok" true
+                "seq" next-seq
+                "cid" snap-cid
+                "petnames" (count (:petnames snap))
+                "subnets" (count (:subscribed-subnets snap))
+                "sessions" (count (:sessions snap))
+                "snapshot" snap}
+     :net-envelopes []
+     :stdout-events []}))
+
+(defn- exec-rolodex-status [state]
+  (let [rec (:rolodex state)
+        snap (:snapshot rec)]
+    {:state state
+     :response {"ok" true
+                "seq" (long (or (:seq rec) 0))
+                "cid" (:cid rec)
+                "petnames" (count (or (:petnames state) {}))
+                "subnets" (count (or (:subscribed-subnets state) []))
+                "sessions" (count (or (:sessions state) {}))
+                "has_snapshot" (boolean (some? snap))}
+     :net-envelopes []
+     :stdout-events []}))
+
+(defn- exec-rolodex-restore [state cmd-map]
+  (let [raw-snap (or (get cmd-map "snapshot") (:snapshot cmd-map) (get-in state [:rolodex :snapshot]))]
+    (if-not (map? raw-snap)
+      {:state state
+       :response {"ok" false "error" "missing-rolodex-snapshot"}
+       :net-envelopes []
+       :stdout-events []}
+      (let [pnames (or (:petnames raw-snap) (get raw-snap "petnames") {})
+            pmeta (or (:petname-meta raw-snap) (get raw-snap "petname-meta") (get raw-snap "petname_meta") {})
+            subs (or (:subscribed-subnets raw-snap) (get raw-snap "subscribed-subnets") (get raw-snap "subscribed_subnets") [])
+            restored-seq (long (or (:seq raw-snap) (get raw-snap "seq") (get-in state [:rolodex :seq]) 0))
+            clean-snap (dissoc raw-snap :private-key "private-key" :privkey "privkey")
+            snap-cid (crypto/sha256-hex (pr-str clean-snap))
+            new-state (-> state
+                          (update :petnames #(merge (or % {}) pnames))
+                          (update :petname-meta #(merge (or % {}) pmeta))
+                          (update :subscribed-subnets #(into (into #{} (or % [])) (map str subs)))
+                          (assoc :rolodex {:seq restored-seq :cid snap-cid :snapshot clean-snap}))]
+        {:state new-state
+         :response {"ok" true
+                    "restored" true
+                    "seq" restored-seq
+                    "cid" snap-cid
+                    "petnames" (count (:petnames new-state))
+                    "subnets" (count (:subscribed-subnets new-state))}
+         :net-envelopes []
+         :stdout-events []}))))
+
 (defn handle-command
   "Dispatches a parsed JSON command map to its corresponding protocol verb reducer.
    Supports both flat command maps and nested {\"cmd\": ..., \"args\": {...}} maps,
@@ -6461,6 +6552,9 @@
                           :net-envelopes []
                           :stdout-events []}
                   "subscribe-subnets" (exec-subscribe-subnets state effective-map)
+                  "rolodex-put" (exec-rolodex-put state effective-map)
+                  "rolodex-status" (exec-rolodex-status state)
+                  "rolodex-restore" (exec-rolodex-restore state effective-map)
                   {:state state :response {"ok" false "error" "unknown-command"} :net-envelopes [] :stdout-events []})
             res' (if (seq (:net-envelopes res))
                    (update res :net-envelopes (fn [envs]

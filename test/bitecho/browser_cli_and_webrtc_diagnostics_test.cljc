@@ -630,3 +630,42 @@
                (:private-key kp))]
       (is (zero? (long (or (get-in res [:state :diagnostics :epoch-skew-dropped]) 0))))
       (is (not-any? #(= "epoch-skew-dropped" (get % "reason")) (:stdout-events res))))))
+
+(defspec ^{:doc "Rule 1 Property: rolodex-put, rolodex-status, and rolodex-restore roundtrip
+                 petnames and subscribed-subnets cleanly in light-core/handle-command with
+                 monotonic seq, 64-hex cid, and zero secret-key leakage."}
+  prop-rolodex-put-status-restore-roundtrip-and-no-secrets 30
+  (prop/for-all [pn-name (gen/not-empty gen/string-alphanumeric)
+                 sub-name (gen/not-empty gen/string-alphanumeric)]
+                (let [kp (crypto/generate-keypair)
+                      pub-hex (fressian/bytes->hex (:public-key kp))
+                      peer-pub (apply str (repeat 64 "a"))
+                      st (-> (light-core/init-light-state pub-hex {})
+                             (assoc-in [:petnames pn-name] peer-pub)
+                             (assoc-in [:petname-meta peer-pub] {:petname pn-name :voice-id "af_heart" :color "#34d399"})
+                             (assoc :subscribed-subnets [sub-name]))
+                      put1 (light-core/handle-command st {"cmd" "rolodex-put" "nodeRole" "light"} (:private-key kp))
+                      r1 (:response put1)
+                      st1 (:state put1)
+                      put2 (light-core/handle-command st1 {"cmd" "rolodex-put" "nodeRole" "light"} (:private-key kp))
+                      r2 (:response put2)
+                      st2 (:state put2)
+                      stat (light-core/handle-command st2 {"cmd" "rolodex-status"} (:private-key kp))
+                      rs (:response stat)
+                      fresh (light-core/init-light-state pub-hex {})
+                      restored (light-core/handle-command fresh {"cmd" "rolodex-restore" "snapshot" (get r2 "snapshot")} (:private-key kp))
+                      rr (:response restored)
+                      st-restored (:state restored)]
+                  (and (true? (get r1 "ok"))
+                       (true? (get r2 "ok"))
+                       (= 1 (get r1 "seq"))
+                       (= 2 (get r2 "seq"))
+                       (= 64 (count (str (get r2 "cid"))))
+                       (true? (get rs "ok"))
+                       (= 2 (get rs "seq"))
+                       (= (get r2 "cid") (get rs "cid"))
+                       (true? (get rr "ok"))
+                       (= peer-pub (get-in st-restored [:petnames pn-name]))
+                       (some #{sub-name} (:subscribed-subnets st-restored))
+                       (nil? (get-in r2 ["snapshot" :private-key]))
+                       (nil? (get-in r2 ["snapshot" "private-key"]))))))
