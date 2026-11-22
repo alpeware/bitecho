@@ -744,3 +744,137 @@
           (>= (- now-t last-t) cd)
           (or (>= (:array-buffers-bytes m) ab-cap)
               (>= (:external-bytes m) ext-cap))))))
+
+;; =============================================================================
+;; 11. Pure Passthrough Socket Pair Lifecycle Reducer (BIP-018-SOAK-F1, Rules 4 & 5)
+;; =============================================================================
+
+(def default-passthrough-drain-timeout-ms
+  "Maximum time (ms) to wait for a peer socket to flush final bytes after the other side
+   closes cleanly before forcing `.destroy()` to prevent leaked paused sockets / ArrayBuffers."
+  5000)
+
+(defn init-passthrough-pair
+  "Initializes single-authority generation-tagged lifecycle state for a spliced
+   `:443` passthrough `(client-sock, backend-sock)` pair."
+  ([] (init-passthrough-pair nil))
+  ([opts]
+   {:generation (long (or (:generation opts) 1))
+    :phase :spliced
+    :client-closed? false
+    :backend-closed? false
+    :client-writable-finished? false
+    :backend-writable-finished? false
+    :drain-timer-active? false
+    :drain-timeout-ms (long (or (:drain-timeout-ms opts) default-passthrough-drain-timeout-ms))
+    :ignored-stale 0}))
+
+(defn- other-passthrough-side
+  [side]
+  (if (= side :client) :backend :client))
+
+(defn- side-closed-key
+  [side]
+  (if (= side :client) :client-closed? :backend-closed?))
+
+(defn- side-finished-key
+  [side]
+  (if (= side :client) :client-writable-finished? :backend-writable-finished?))
+
+(defn transition-passthrough-pair
+  "Pure generation-tagged reducer `(transition-passthrough-pair st event) -> [new-st effects]`
+   guaranteeing that spliced `:443` passthrough socket pairs NEVER leak paused sockets,
+   `TCPSocketWrap` handles, or unread TLS `close_notify` `ArrayBuffer` slabs when one side closes.
+
+   Events:
+   - `{:type :socket-close :side (:client|:backend) :had-error? bool :peer-writable-finished? bool :generation g}`
+   - `{:type :socket-finish :side (:client|:backend) :generation g}`
+   - `{:type :socket-error :side (:client|:backend) :detail str :generation g}`
+   - `{:type :drain-timeout :side (:client|:backend) :generation g}`"
+  [st event]
+  (let [st (merge (init-passthrough-pair) st)
+        curr-gen (long (:generation st 1))
+        ev-gen (:generation event)
+        stale? (and (some? ev-gen) (< (long ev-gen) curr-gen))]
+    (if stale?
+      (let [diag {:effect :diagnose
+                  :reason :stale-passthrough-callback
+                  :event-type (:type event)
+                  :event-generation ev-gen
+                  :current-generation curr-gen}]
+        [(update st :ignored-stale (fnil inc 0)) [diag]])
+      (let [side (if (= :backend (:side event)) :backend :client)
+            peer (other-passthrough-side side)
+            side-ck (side-closed-key side)
+            peer-ck (side-closed-key peer)
+            side-fk (side-finished-key side)
+            peer-fk (side-finished-key peer)
+            clear-effs (if (:drain-timer-active? st) [{:effect :clear-drain-timeout}] [])]
+        (case (:type event)
+          :socket-finish
+          (let [st1 (assoc st side-fk true)]
+            (if (and (get st1 peer-ck) (not (get st1 side-ck)))
+              [(assoc st1
+                      :phase :closed
+                      side-ck true
+                      :drain-timer-active? false)
+               (conj clear-effs {:effect :destroy-socket :side side})]
+              [st1 []]))
+
+          :socket-close
+          (let [peer-fin? (or (boolean (:peer-writable-finished? event))
+                              (boolean (get st peer-fk)))
+                st1 (-> st
+                        (assoc side-ck true)
+                        (cond-> peer-fin? (assoc peer-fk true)))
+                peer-closed? (boolean (get st1 peer-ck))]
+            (cond
+              peer-closed?
+              [(assoc st1 :phase :closed :drain-timer-active? false)
+               clear-effs]
+
+              (or (boolean (:had-error? event)) peer-fin?)
+              [(assoc st1
+                      :phase :closed
+                      peer-ck true
+                      :drain-timer-active? false)
+               (conj clear-effs {:effect :destroy-socket :side peer})]
+
+              :else
+              [(assoc st1
+                      :phase :draining
+                      :drain-timer-active? true)
+               [{:effect :end-socket :side peer}
+                {:effect :schedule-drain-timeout
+                 :side peer
+                 :timeout-ms (:drain-timeout-ms st1)}]]))
+
+          :socket-error
+          (let [reason (if (= side :client)
+                         :passthrough-client-error
+                         :passthrough-backend-error)
+                diag (cond-> {:effect :diagnose :reason reason}
+                       (:detail event) (assoc :detail (:detail event)))
+                already-closed? (= :closed (:phase st))
+                effs (cond-> [diag]
+                       (:drain-timer-active? st) (conj {:effect :clear-drain-timeout})
+                       (not (get st peer-ck)) (conj {:effect :destroy-socket :side peer})
+                       (and (not already-closed?) (not (get st side-ck))) (conj {:effect :destroy-socket :side side}))]
+            [(assoc st
+                    :phase :closed
+                    :client-closed? true
+                    :backend-closed? true
+                    :drain-timer-active? false)
+             effs])
+
+          :drain-timeout
+          (if (and (= :draining (:phase st)) (not (get st side-ck)))
+            [(assoc st
+                    :phase :closed
+                    side-ck true
+                    :drain-timer-active? false)
+             [{:effect :diagnose :reason :passthrough-drain-timeout :side side}
+              {:effect :destroy-socket :side side}]]
+            [(assoc st :drain-timer-active? false) []])
+
+          [st [{:effect :diagnose :reason :unknown-passthrough-event :event-type (:type event)}]])))))

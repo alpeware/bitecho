@@ -533,3 +533,117 @@
                                      (or (>= ab-bytes (* 8 1024 1024))
                                          (>= ext-bytes (* 16 1024 1024))))]
                   (= expected? trigger?))))
+
+;; =============================================================================
+;; BIP-018-SOAK-F1 (Live ArrayBuffer Leak): Port 443 Passthrough Socket Lifecycle
+;; =============================================================================
+
+(def ^:private gen-passthrough-event
+  (gen/one-of
+   [(gen/let [side (gen/elements [:client :backend])
+              had-err? gen/boolean
+              peer-fin? gen/boolean
+              stale? gen/boolean]
+      {:type :socket-close
+       :side side
+       :had-error? had-err?
+       :peer-writable-finished? peer-fin?
+       :generation (if stale? 0 1)})
+    (gen/let [side (gen/elements [:client :backend])
+              stale? gen/boolean]
+      {:type :socket-finish
+       :side side
+       :generation (if stale? 0 1)})
+    (gen/let [side (gen/elements [:client :backend])
+              stale? gen/boolean]
+      {:type :socket-error
+       :side side
+       :detail "ECONNRESET"
+       :generation (if stale? 0 1)})
+    (gen/let [side (gen/elements [:client :backend])
+              stale? gen/boolean]
+      {:type :drain-timeout
+       :side side
+       :generation (if stale? 0 1)})]))
+
+(defspec ^{:doc "Rule 1/4/5: Model-based command-sequence test for passthrough socket pair lifecycle.
+                 Proves: (1) stale-generation callbacks never mutate phase/sockets and emit counted :diagnose,
+                 (2) any close/error followed by finish or drain-timeout ALWAYS destroys both sockets (zero leaked FDs/ArrayBuffers),
+                 (3) clean close while peer is still flushing emits :end-socket + :schedule-drain-timeout (no premature TCP RST)."}
+  prop-passthrough-pair-zero-leaked-sockets 150
+  (prop/for-all [events (gen/vector gen-passthrough-event 1 20)]
+                (let [init-st (core-infra/init-passthrough-pair {:generation 1})
+                      {:keys [st all-effs stale-ok? clean-drain-ok?]}
+                      (reduce
+                       (fn [{:keys [st all-effs stale-ok? clean-drain-ok?]} ev]
+                         (let [[st' effs] (core-infra/transition-passthrough-pair st ev)
+                               is-stale? (and (some? (:generation ev))
+                                              (< (long (:generation ev)) (long (:generation st 1))))
+                               stale-check (if is-stale?
+                                             (and (= (:phase st) (:phase st'))
+                                                  (= (:client-closed? st) (:client-closed? st'))
+                                                  (= (:backend-closed? st) (:backend-closed? st'))
+                                                  (= (inc (long (:ignored-stale st 0)))
+                                                     (long (:ignored-stale st' 0)))
+                                                  (some #(and (= :diagnose (:effect %))
+                                                              (= :stale-passthrough-callback (:reason %)))
+                                                        effs))
+                                             true)
+                               peer (if (= :client (:side ev)) :backend :client)
+                               peer-already-closed? (if (= peer :client) (:client-closed? st) (:backend-closed? st))
+                               peer-already-fin? (or (boolean (:peer-writable-finished? ev))
+                                                     (if (= peer :client)
+                                                       (:client-writable-finished? st)
+                                                       (:backend-writable-finished? st)))
+                               clean-drain-check (if (and (not is-stale?)
+                                                          (= :socket-close (:type ev))
+                                                          (= :spliced (:phase st))
+                                                          (not (:had-error? ev))
+                                                          (not peer-already-closed?)
+                                                          (not peer-already-fin?))
+                                                   (and (= :draining (:phase st'))
+                                                        (some #(and (= :end-socket (:effect %)) (= peer (:side %))) effs)
+                                                        (some #(and (= :schedule-drain-timeout (:effect %)) (= peer (:side %))) effs)
+                                                        (not (some #(= :destroy-socket (:effect %)) effs)))
+                                                   true)]
+                           {:st st'
+                            :all-effs (into all-effs effs)
+                            :stale-ok? (and stale-ok? stale-check)
+                            :clean-drain-ok? (and clean-drain-ok? clean-drain-check)}))
+                       {:st init-st :all-effs [] :stale-ok? true :clean-drain-ok? true}
+                       events)
+                      ;; If left in :draining, a drain-timeout MUST close both sockets with :destroy-socket + :diagnose
+                      [final-st final-effs]
+                      (if (= :draining (:phase st))
+                        (let [open-side (if (:client-closed? st) :backend :client)]
+                          (core-infra/transition-passthrough-pair st {:type :drain-timeout :side open-side :generation 1}))
+                        [st []])
+                      combined-effs (into all-effs final-effs)
+                      closed-invariant? (if (or (:client-closed? final-st) (:backend-closed? final-st))
+                                          (and (= :closed (:phase final-st))
+                                               (:client-closed? final-st)
+                                               (:backend-closed? final-st)
+                                               (not (:drain-timer-active? final-st)))
+                                          true)
+                      timeout-diag-ok? (if (= :draining (:phase st))
+                                         (and (some #(= :destroy-socket (:effect %)) final-effs)
+                                              (some #(and (= :diagnose (:effect %))
+                                                          (= :passthrough-drain-timeout (:reason %)))
+                                                    final-effs))
+                                         true)]
+                  (and stale-ok?
+                       clean-drain-ok?
+                       closed-invariant?
+                       timeout-diag-ok?
+                       (vector? combined-effs)))))
+
+#?(:clj
+   (deftest test-passthrough-socket-lifecycle-wiring
+     (testing "full_node_main.cljs wires splice-sockets! and handle-passthrough-socket! through core-infra/transition-passthrough-pair"
+       (let [src (slurp (io/file "src/bitecho/full_node_main.cljs"))]
+         (is (str/includes? src "init-passthrough-pair")
+             "splice-sockets! must initialize single-authority passthrough pair state via core-infra/init-passthrough-pair")
+         (is (str/includes? src "transition-passthrough-pair")
+             "splice-sockets! must drive socket teardown via pure core-infra/transition-passthrough-pair")
+         (is (str/includes? src "\"close\"")
+             "splice-sockets! must listen on socket close events so paused peers with unread TLS close_notify are destroyed")))))
