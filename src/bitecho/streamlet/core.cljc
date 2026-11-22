@@ -817,6 +817,53 @@
         (integer? now-ms) (assoc :epoch-started-at-ms (long now-ms)))
       state)))
 
+(defn- advance-epoch-on-proposal
+  "Advances `:epoch` to `(max old-epoch block-epoch)` and records `:epoch-started-at-ms`.
+   Also refreshes `:epoch-started-at-ms` at most ONCE per epoch (guarded by
+   `:last-proposal-dwell-epoch`) when the first valid leader proposal for the current
+   epoch arrives, allowing a node that ticked early across the dwell boundary to
+   re-synchronize with the committee while remaining immune to Byzantine replay or
+   same-epoch equivocation (`BIP-019-SOAK-F2`)."
+  [state block-epoch now-ms]
+  (let [old-ep (long (or (:epoch state) 0))
+        b-ep (long block-epoch)
+        last-dwell-ep (:last-proposal-dwell-epoch state)]
+    (cond
+      (> b-ep old-ep)
+      (cond-> (assoc state :epoch b-ep :last-proposal-dwell-epoch b-ep)
+        (integer? now-ms) (assoc :epoch-started-at-ms (long now-ms)))
+
+      (and (= b-ep old-ep)
+           (integer? now-ms)
+           (not= b-ep last-dwell-ep))
+      (assoc state
+             :epoch-started-at-ms (long now-ms)
+             :last-proposal-dwell-epoch b-ep)
+
+      :else
+      state)))
+
+(defn- max-prior-notarized-depth
+  "Returns the maximum valid cached depth among existing `:notarized-blocks` whose epoch
+   is strictly less than `target-epoch`. Used when anchoring a disconnected quorum-verified
+   ancestor fragment after a stale-snapshot restart (`BIP-019-SOAK-F2`) so the live
+   quorum-certified chain immediately supersedes stale pre-restart snapshot heads while
+   strictly preserving `depth <= epoch`."
+  [state target-epoch]
+  (let [blocks (:blocks state)
+        depths (:block-depths state)
+        target-ep (long target-epoch)]
+    (reduce (fn [mx h]
+              (if-let [b (get blocks h)]
+                (let [b-ep (long (or (:epoch b) 0))
+                      d (long (or (get depths h) 0))]
+                  (if (and (< b-ep target-ep) (pos? d) (<= d b-ep))
+                    (max mx d)
+                    mx))
+                mx))
+            0
+            (:notarized-blocks state))))
+
 (defn ingest-verified-ancestors
   "Ingests verified notarized ancestor blocks into state if they have valid quorum vote proofs
    and do not exceed max-epoch-catchup-delta. Ancestors are processed in ascending epoch order."
@@ -833,13 +880,20 @@
                                           (assoc-in [:blocks b-hash] block)
                                           (record-block-depth b-hash))
                          ;; Never seed depth from :epoch or :last-executed-finalized-epoch when
-                         ;; parent is unknown; anchor at minimal topological depth (<= epoch).
+                         ;; parent is unknown; anchor above any strictly older notarized depth
+                         ;; (clamped to <= epoch) so stale-snapshot restarts never invert head
+                         ;; selection (`BIP-019-SOAK-F2`) while keeping depth <= epoch.
                          s-anchored (if (not (contains? (:block-depths s-with-depth) b-hash))
                                       (let [ep (long (or (:epoch block) 1))]
                                         (if (> ep 1)
-                                          (-> s-with-depth
-                                              (assoc-in [:block-depths (:parent-hash block)] 1)
-                                              (assoc-in [:block-depths b-hash] 2))
+                                          (let [prior-max (max-prior-notarized-depth s-with-depth ep)
+                                                parent-depth (min (dec ep) (max 1 prior-max))
+                                                block-depth (inc parent-depth)]
+                                            (cond-> (-> s-with-depth
+                                                        (assoc-in [:block-depths (:parent-hash block)] parent-depth)
+                                                        (assoc-in [:block-depths b-hash] block-depth))
+                                              (pos? prior-max)
+                                              (update-in [:diagnostics :ancestor-sync-reanchored] (fnil inc 0))))
                                           (assoc-in s-with-depth [:block-depths b-hash] 1)))
                                       s-with-depth)]
                      (-> s-anchored
@@ -900,6 +954,7 @@
             (let [block (propose-block state new-epoch)
                   b-hash (hash-block block)
                   state (-> state
+                            (assoc :last-proposal-dwell-epoch new-epoch)
                             (assoc-in [:blocks b-hash] block)
                             (record-block-depth b-hash))
                   vote (cast-vote state block)
@@ -1040,7 +1095,7 @@
         state-with-ancestors (if (seq (:ancestors event))
                                (ingest-verified-ancestors state (:ancestors event) now-ms)
                                state)
-        state (advance-epoch state-with-ancestors (:epoch block) now-ms)
+        state (advance-epoch-on-proposal state-with-ancestors (:epoch block) now-ms)
         b-hash (hash-block block)
         state (-> state
                   (assoc-in [:blocks b-hash] block)

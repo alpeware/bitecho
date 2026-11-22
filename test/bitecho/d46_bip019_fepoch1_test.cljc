@@ -454,9 +454,10 @@
   "Deterministic discrete-event simulator for N Streamlet validators with per-node
    tick phase offsets and network latency `net-ms`. Optionally supports killing
    `kill-idx` during `[kill-start-ms, kill-end-ms)` and restarting it with
-   `restart-phase-ms` from a snapshot captured earlier."
-  [{:keys [n tick-ms phases net-ms total-ticks kill-idx kill-start-ms kill-end-ms restart-phase-ms]}]
-  (let [nodes (atom (make-timed-streamlet-cluster n tick-ms))
+   `restart-phase-ms` from a snapshot captured `snap-lag-ticks` (default 3) before kill."
+  [{:keys [n tick-ms phases net-ms total-ticks kill-idx kill-start-ms kill-end-ms restart-phase-ms snap-lag-ticks]}]
+  (let [snap-lag (long (or snap-lag-ticks 3))
+        nodes (atom (make-timed-streamlet-cluster n tick-ms))
         saved-snap (atom nil)
         killed? (atom false)
         restarted? (atom false)
@@ -465,24 +466,33 @@
         hex->idx (into {} (map-indexed (fn [i st] [(:node-pubkey st) i]) @nodes))
         sched! (fn [t idx ev] (swap! q conj [t (swap! seq-id inc) idx ev]))
         total-ms (* total-ticks tick-ms)
+        post-recovery-start-ms (when kill-end-ms (+ (long kill-end-ms) (* 4 (long tick-ms))))
         diag-suppressed (atom 0)]
     (dotimes [i n]
       (sched! (+ tick-ms (nth phases i)) i {:type :tick :now-ms (+ tick-ms (nth phases i))}))
-    (loop [max-fin-gap 0]
+    (loop [max-fin-gap 0
+           post-restart-max-fin-gap 0]
       (if-let [[t _ idx ev :as item] (first @q)]
         (if (> t total-ms)
-          {:final-epochs (mapv :epoch @nodes)
-           :final-fin (mapv (fn [st]
-                              (if-let [h (:latest-finalized-block-hash st)]
-                                (long (get-in st [:blocks h :epoch] 0))
-                                0))
-                            @nodes)
-           :max-fin-gap max-fin-gap
-           :suppressed-diag-count @diag-suppressed
-           :suppressed-state-counts (mapv #(long (get-in % [:diagnostics :tick-suppressed-epoch-already-advanced] 0)) @nodes)}
+          (let [live-idx (if (= kill-idx 0) 1 0)
+                live-st (nth @nodes live-idx)
+                notarized-epochs (into #{}
+                                       (keep #(get-in live-st [:blocks % :epoch]))
+                                       (:notarized-blocks live-st))]
+            {:final-epochs (mapv :epoch @nodes)
+             :final-fin (mapv (fn [st]
+                                (if-let [h (:latest-finalized-block-hash st)]
+                                  (long (get-in st [:blocks h :epoch] 0))
+                                  0))
+                              @nodes)
+             :max-fin-gap max-fin-gap
+             :post-restart-max-fin-gap post-restart-max-fin-gap
+             :notarized-epochs notarized-epochs
+             :suppressed-diag-count @diag-suppressed
+             :suppressed-state-counts (mapv #(long (get-in % [:diagnostics :tick-suppressed-epoch-already-advanced] 0)) @nodes)})
           (do
             (swap! q disj item)
-            (when (and (some? kill-idx) (nil? @saved-snap) (>= t (- kill-start-ms (* 3 tick-ms))))
+            (when (and (some? kill-idx) (nil? @saved-snap) (>= t (- kill-start-ms (* snap-lag tick-ms))))
               (reset! saved-snap (core-mesh/strip-unserializable-state (nth @nodes kill-idx))))
             (when (and (some? kill-idx) (not @killed?) (>= t kill-start-ms))
               (reset! killed? true))
@@ -533,8 +543,12 @@
                   ep (long (or (:epoch live-st) 0))
                   fin (if-let [h (:latest-finalized-block-hash live-st)]
                         (long (get-in live-st [:blocks h :epoch] 0))
-                        0)]
-              (recur (max max-fin-gap (- ep fin))))))
+                        0)
+                  gap (- ep fin)]
+              (recur (max max-fin-gap gap)
+                     (if (and post-recovery-start-ms (>= t post-recovery-start-ms))
+                       (max post-restart-max-fin-gap gap)
+                       post-restart-max-fin-gap)))))
         {:empty true}))))
 
 (defspec ^{:doc "BIP-019-SOAK-F1: Wall-clock-aligned validators firing within the (T_propose, T_notarize) killer window never double-tick into sibling forks; finalization advances cleanly at ~1 epoch/tick with counted Rule 5 suppression diagnostics."}
@@ -606,15 +620,17 @@
       (is (<= (:max-fin-gap res) 5)
           (str "Finalization gap must remain bounded (<= 5 epochs), got: " (pr-str res)))))
 
-  (testing "Rule 4: strip-unserializable-state and rebind-restored-state never persist or restore :epoch-started-at-ms"
+  (testing "Rule 4: strip-unserializable-state and rebind-restored-state never persist or restore :epoch-started-at-ms or :last-proposal-dwell-epoch"
     (let [kp (crypto/generate-keypair)
           pub-hex (basalt/bytes->hex (:public kp))
           ident {:pubkey-hex pub-hex :keypair kp}
-          st {:epoch 42 :epoch-started-at-ms 123456789 :blocks {} :ledger {}}
+          st {:epoch 42 :epoch-started-at-ms 123456789 :last-proposal-dwell-epoch 42 :blocks {} :ledger {}}
           stripped (core-mesh/strip-unserializable-state st)
           rebound (core-mesh/rebind-restored-state st {} ident)]
       (is (not (contains? stripped :epoch-started-at-ms)))
-      (is (not (contains? rebound :epoch-started-at-ms)))))
+      (is (not (contains? stripped :last-proposal-dwell-epoch)))
+      (is (not (contains? rebound :epoch-started-at-ms)))
+      (is (not (contains? rebound :last-proposal-dwell-epoch)))))
 
   #?(:clj
      (testing "Shell wiring: full_node_main.cljs and shell/mesh.clj attach :now-ms to :tick and peer network events"
@@ -624,3 +640,128 @@
              "full_node_main.cljs must pass :now-ms on :tick and peer ingress events")
          (is (str/includes? mesh-src ":now-ms (System/currentTimeMillis)")
              "shell/mesh.clj must pass :now-ms on :tick and peer ingress events")))))
+
+;; =============================================================================
+;; BIP-019-SOAK-F2: Post-Restart 1-of-6 Leader-Slot Miss / Sawtooth Prevention
+;; =============================================================================
+
+(defspec ^{:doc "BIP-019-SOAK-F2: ingest-verified-ancestors re-anchors disconnected quorum-verified ancestors above any strictly older notarized depth (beating stale restored snapshot heads immediately) while strictly maintaining depth <= epoch and 0 corrupt-depth repairs."}
+  prop-bip019-soak-f2-stale-snapshot-reanchor-invariants 100
+  (prop/for-all [snap-depth (gen/choose 20 200)
+                 snap-skip (gen/choose 0 25)
+                 gap-epochs (gen/choose 17 60)]
+                (let [{:keys [kps peers-map validators]} (make-test-validators)
+                      snap-ep (+ snap-depth snap-skip)
+                      anc-ep (+ snap-ep gap-epochs)
+                      leader (nth kps (mod anc-ep (count kps)))
+                      stale-hash "stale-snapshot-head"
+                      stale-blk (streamlet/->Block snap-ep "stale-parent" [] (:pub-hex (first kps)))
+                      raw-anc (streamlet/->Block anc-ep "unknown-gap-parent" [] (:pub-hex leader))
+                      signed-anc (streamlet/sign-block raw-anc (:priv-bytes leader))
+                      anc-hash (streamlet/hash-block signed-anc)
+                      votes-map (into {}
+                                      (map (fn [{:keys [pub-hex priv-bytes]}]
+                                             (let [sig (basalt/bytes->hex (crypto/sign priv-bytes (fressian/utf8->bytes anc-hash)))]
+                                               [pub-hex (streamlet/->Vote anc-hash anc-ep sig)]))
+                                           kps))
+                      init-state {:epoch snap-ep
+                                  :head-hash stale-hash
+                                  :peers-map peers-map
+                                  :validators validators
+                                  :blocks {stale-hash stale-blk}
+                                  :notarized-blocks #{stale-hash}
+                                  :block-depths {stale-hash snap-depth}}
+                      ingested (streamlet/ingest-verified-ancestors init-state [{:block signed-anc :votes votes-map}])
+                      d-anc (get-in ingested [:block-depths anc-hash])
+                      repaired (streamlet/repair-corrupt-block-depths ingested)]
+                  (and (some? d-anc)
+                       (> d-anc snap-depth)
+                       (<= d-anc anc-ep)
+                       (streamlet/longest-notarized-parent? ingested anc-hash (inc anc-ep))
+                       (not (streamlet/longest-notarized-parent? ingested stale-hash (inc anc-ep)))
+                       (zero? (get-in repaired [:diagnostics :corrupt-block-depth-repaired] 0))
+                       (= 1 (get-in ingested [:diagnostics :ancestor-sync-reanchored] 0))))))
+
+(defspec ^{:doc "BIP-019-SOAK-F2: Restarting a validator from a stale snapshot (>16 epochs behind) with an arbitrary timer phase offset phi in [0, tick-ms) never induces a periodic 4-5 epoch sawtooth (post-restart maxGap <= 3 and zero missed post-recovery epochs)."}
+  prop-bip019-soak-f2-post-restart-arbitrary-phase-and-stale-snapshot 8
+  (prop/for-all [phi (gen/choose 0 1499)]
+                (let [res (run-timed-streamlet-sim {:n 6
+                                                    :tick-ms 1500
+                                                    :phases [0 5 10 15 20 25]
+                                                    :net-ms 5
+                                                    :total-ticks 84
+                                                    :kill-idx 0
+                                                    :snap-lag-ticks 22
+                                                    :kill-start-ms (* 52 1500)
+                                                    :kill-end-ms (* 56 1500)
+                                                    :restart-phase-ms phi})
+                      notarized (:notarized-epochs res)
+                      min-ep (reduce min (:final-epochs res))
+                      post-epochs (range 62 (dec min-ep))
+                      missed (filterv #(not (contains? notarized %)) post-epochs)]
+                  (and (<= (:post-restart-max-fin-gap res) 3)
+                       (empty? missed)))))
+
+(deftest test-bip019-soak-f2-post-restart-stale-snapshot-and-phase-offset
+  (testing "Stale-snapshot restart (snapshot depth 35 > default-max-ancestor-sync-depth=16) eliminates 1-of-6 leader-slot sawtooth"
+    (let [res (run-timed-streamlet-sim {:n 6
+                                        :tick-ms 1500
+                                        :phases [0 5 10 15 20 25]
+                                        :net-ms 5
+                                        :total-ticks 90
+                                        :kill-idx 0
+                                        :snap-lag-ticks 22
+                                        :kill-start-ms (* 57 1500)
+                                        :kill-end-ms (* 61 1500)
+                                        :restart-phase-ms 10})
+          notarized (:notarized-epochs res)
+          min-ep (reduce min (:final-epochs res))
+          post-epochs (range 67 (dec min-ep))
+          missed (filterv #(not (contains? notarized %)) post-epochs)]
+      (is (<= (:post-restart-max-fin-gap res) 3)
+          (str "Post-restart maxGap must be <= 3 (no 4-5 epoch sawtooth), got: "
+               (select-keys res [:post-restart-max-fin-gap :max-fin-gap :final-epochs :final-fin])
+               " missed=" missed))
+      (is (empty? missed)
+          (str "All post-recovery epochs (including restarted validator's leader slots) must be notarized, missed=" missed))))
+
+  (testing "Knife-edge and arbitrary restart phase offsets phi in [0, tick-ms) maintain post-restart maxGap <= 3"
+    (doseq [phi [0 250 500 740 760 1000 1250 1480]]
+      (let [res (run-timed-streamlet-sim {:n 6
+                                          :tick-ms 1500
+                                          :phases [0 5 10 15 20 25]
+                                          :net-ms 5
+                                          :total-ticks 72
+                                          :kill-idx 0
+                                          :snap-lag-ticks 3
+                                          :kill-start-ms (* 40 1500)
+                                          :kill-end-ms (* 44 1500)
+                                          :restart-phase-ms phi})
+            notarized (:notarized-epochs res)
+            min-ep (reduce min (:final-epochs res))
+            post-epochs (range 50 (dec min-ep))
+            missed (filterv #(not (contains? notarized %)) post-epochs)]
+        (is (<= (:post-restart-max-fin-gap res) 3)
+            (str "phi=" phi " post-restart maxGap must be <= 3, got: "
+                 (select-keys res [:post-restart-max-fin-gap :max-fin-gap :final-epochs :final-fin])
+                 " missed=" missed))
+        (is (empty? missed)
+            (str "phi=" phi " must not miss post-recovery epochs, missed=" missed)))))
+
+  (testing "Byzantine same-epoch equivocation cannot refresh :epoch-started-at-ms more than once per epoch"
+    (let [nodes (make-timed-streamlet-cluster 3 1500)
+          v0 (nth nodes 0)
+          v1 (nth nodes 1)
+          b1 (streamlet/sign-block (streamlet/->Block 1 "genesis" [:tx1] (:node-pubkey v1)) (get-in v1 [:keypair :private]))
+          b2 (streamlet/sign-block (streamlet/->Block 1 "genesis" [:tx2] (:node-pubkey v1)) (get-in v1 [:keypair :private]))
+          ;; v0 ticks early to epoch 1 at t=1000
+          s1 (:state (streamlet/handle-streamlet-event v0 {:type :tick :now-ms 1000}))
+          ;; First valid leader proposal for epoch 1 arrives at t=1200 -> refreshes dwell once
+          s2 (:state (streamlet/handle-streamlet-event s1 {:type :receive-propose :block b1 :ancestors [] :sender (:node-pubkey v1) :now-ms 1200}))
+          ;; Equivocating 2nd signed block for epoch 1 arrives at t=1900 -> MUST NOT refresh dwell
+          s3 (:state (streamlet/handle-streamlet-event s2 {:type :receive-propose :block b2 :ancestors [] :sender (:node-pubkey v1) :now-ms 1900}))
+          ;; Next tick at t=2000 (elapsed 800 >= 750) MUST advance to epoch 2
+          s4 (:state (streamlet/handle-streamlet-event s3 {:type :tick :now-ms 2000}))]
+      (is (= 1200 (:epoch-started-at-ms s2)))
+      (is (= 1200 (:epoch-started-at-ms s3)))
+      (is (= 2 (:epoch s4))))))
