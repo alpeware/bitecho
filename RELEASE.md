@@ -47,15 +47,46 @@ sha256sum dist/bitecho-full-node.cjs dist/bitecho-light-node.cjs dist/bitecho-br
    - Full 64-char SHA-256 CIDs everywhere (zero 8-char prefixes).
    - Zero `:pending` consent records before commit.
    - Explicit resolution of any `CONSENT-WITH-ADDENDUM` / `CONSENT-WITH-FLAGS` items (`:flag-resolutions` or owned `:open-findings`).
-3. Publish both `dist/bips/bip-NNN-v023XX.edn` and `dist/bips/bip-NNN-v023XX.patch` to `bitecho.org/dev` and announce the 64-char receipt CID on `bitecho.org/team`.
-4. After unanimous Stage 2 consent, create the annotated git tag (`git tag -a v0.23.XX -m "..."`) and proceed to canary rollout.
+3. Publish both `dist/bips/bip-NNN-v023XX.edn` and `dist/bips/bip-NNN-v023XX.patch` to `bitecho.org/dev`, verify **3/3 HTTP 200 + SHA-256** reachability across `ns1..ns3` (see Section 4), and announce the 64-char receipt CID on `bitecho.org/team` + directed sessions.
+4. After unanimous Real Stage 2 consent, create the annotated git tag (`git tag -a v0.23.XX -m "..."`) and proceed to the declared Stage 4 soak gate and rollout.
 
 ---
 
-## 3. Automated Signed Pointer-Bump Release Gate (`S-D41-5`)
+## 3. Change-Class Soak Gates (Staging-First Before Live Rollout)
+
+Per the 5/5-consented Twin BIP-Process Pipeline Draft 2 (CID `86d593a5eed3a006cae2b667d98bd73ba9050f1edd30c415eb9d55480dfca1ca`; [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md)), every BIP **MUST** declare its Stage 4 soak gate (`P-MEM-1` / `P-FAIL-1` receipts) before Stage 2 consent. The soak declaration is itself consentable — objecting to a live soak for a risky change is a valid `PARAMOUNT-OBJECTION`. Soak verdicts are strictly separated from code merge.
+
+| Change Class | Default Soak Gate | Required Receipts & Verification |
+| :--- | :--- | :--- |
+| **Core Network / Transport / Broadcast** | **Staging-First** (`bitecho-gentoo-lab`) | `P-FAIL-1` + fail-closed failure-injection & restore/restart E2E across all 4 node classes before live rollout. |
+| **Consensus / Streamlet BFT / Finalization** | **Staging-First** (`bitecho-gentoo-lab`) | `P-FAIL-1` + quorum/term-divergence/restore E2E before live rollout. |
+| **Storage / Snapshots / Artifact Store** | **Staging-First** (`bitecho-gentoo-lab`) | `P-FAIL-1` + persistence, async snapshot, and 3/3 artifact parity verification before live rollout. |
+| **Memory / GC / Off-Heap / Relay Passthrough** | **Staging-First** (`bitecho-gentoo-lab`) | `P-MEM-1` with **mandatory declared soak duration** (burst soaks alone are insufficient; `/statusz` `{rss, external, arrayBuffers}` must remain flat post-GC over duration) before live rollout. |
+| **Rollout / Auto-Update / Pointer-Gate Mechanics** | **Staging-First** (`bitecho-gentoo-lab`) | `P-FAIL-1` + monotonic pointer `:seq` gate and autonomous client LKG self-fallback E2E before live rollout. |
+| **Client-Only / CLI / Browser UI** | **Live Soak** | Populated-petnames/sessions smoke test (`ctl status`, send, post-restart auto-redial) + headless-browser E2E. |
+| **Docs / Governance / Runbooks** | **Live Soak** | CI doc-link, BIP-receipt integrity, and `clojure -M:format` / `clojure -M:lint` gates. |
+
+> [!NOTE]
+> **Burst vs. Duration Rule:** Short burst soaks cannot close memory-retention questions (slow off-heap / `arrayBuffers` leaks can be invisible at 10 minutes and clear at 1 hour). Every memory-class BIP must declare an explicit soak **duration** in its gate.
+
+---
+
+## 4. Automated Signed Pointer-Bump Release Gate (`S-D41-5`) & 3/3 HTTP 200 Verification
 
 > [!IMPORTANT]
 > On-network signed `dist/*` and `web/app/*` pointers on `bitecho.org/infra` **override** local disk files in `/var/www/clj-web/public/dist/`. If pointers are not bumped as part of the release, `https://bitecho.org` will continue serving stale bundles even after disk files are updated.
+
+### Mandatory 3/3 HTTP 200 Artifact Verification Before Announcing Pointers
+Before announcing any release pointer, BIP receipt, or consent invite CID:
+1. Verify **3/3 HTTP 200 + `SHA-256(bytes) == CID`** on `/artifact/v1/blob/<cid>` across all three infra relays (`ns1.bitecho.org`, `ns2.bitecho.org`, `ns3.bitecho.org`).
+2. Never announce a pointer or consent invite citing an artifact that has not passed 3/3 HTTP 200 + SHA-256 verification; an invite or announcement citing an unreachable CID is invalid.
+
+```bash
+# Example 3/3 HTTP 200 + SHA-256 reachability check for a published artifact CID
+for host in ns1.bitecho.org ns2.bitecho.org ns3.bitecho.org; do
+  curl -fsSL "https://${host}/artifact/v1/blob/${CID}" | sha256sum | grep -q "^${CID} " || exit 1
+done
+```
 
 Run the automated pointer-bump and verification gate on every release:
 
@@ -82,7 +113,7 @@ The gate publishes and verifies monotonic `:seq` bumps and exact 64-char `:targe
 
 ---
 
-## 4. `P-UPD-1` Opt-In Auto-Update (Shipped in `D40`)
+## 5. `P-UPD-1` Auto-Update, Monotonic Pointer `:seq` Gate & LKG Rollback Rules (Shipped in `D40`)
 
 `P-UPD-1` live pointer auto-update with `SHA-256 == CID` verification, pre-swap health gate, and `.lkg` rollback is **shipped and live** across all three runtimes:
 - **`D40.1` (`e91214c`)**: Node.js light & full nodes (`node_main.cljs`, `full_node_main.cljs`).
@@ -90,20 +121,25 @@ The gate publishes and verifies monotonic `:seq` bumps and exact 64-char `:targe
 - **`D40.2.1` (`3d86ce2`)**: Same-version hotfix upgrade rule (`equal-version` + distinct verified 64-char CID triggers update) and `cli/known-command-flags` inventory parity.
 - **`D40.3` (`b7dc6d4`)**: `window.BitechoLightNode` browser console CLI parity and multi-peer WebRTC diagnostics.
 
+### Monotonic Pointer `:seq` Gate & Last-Known-Good (LKG) Rollback Rules (Draft 2)
+1. **Mesh-First Auto-Update with HTTP Fallback:** Clients fetch release updates mesh-first with automatic HTTP fallback.
+2. **Monotonic `:seq` Update Gate (Replaces Semver Gate):** The update gate keys strictly on the **pointer's monotonic sequence number (`:seq`)**, not arbitrary semver strings:
+   - **Higher `:seq` + new verified 64-char CID** is a valid update regardless of the version string — same-version hotfixes flow as ordinary updates without refusal.
+   - **Lower `:seq` is refused** (strict downgrade protection). Sequence numbers are never reused or decreased.
+3. **Fleet Rollback via Monotonic `:seq`:** A fleet-wide pointer rollback is **always** published as a **new, higher `:seq`** pointing at the **Last-Known-Good (LKG) CID** — never a `:seq` reuse or decrease.
+4. **Autonomous Client LKG Self-Fallback (Zero Boot-Loop):** Every candidate artifact must pass `SHA-256(bytes) == pointer.target-cid` and a pre-swap self-test/healthcheck before replacing the active binary. If a client fails self-test or healthcheck on a new bundle, it **automatically falls back to its local LKG bundle**, emits a counted `:diagnose` event (`AGENTS.md` Rule 5), and **refuses to boot-loop the bad CID**.
+5. **Pointer-Publisher Authority:** Only authorized release signers holding the `bitecho.org/infra` publishing key bump `dist/*` pointers after Real Stage 2 consent. Long-term owner policy direction (deferred, composes with monotonic `:seq`): subnets act as owners and pointer updates require a subnet-member quorum multi-signature.
+
 ### Opt-In Light-Node Flags
 - `--auto-update-pointer <path>` — Subscribe to signed release pointer (e.g. `dist/bitecho-light-node.cjs` on `bitecho.org/infra`).
 - `--auto-update-interval-ms <ms>` — Polling interval in milliseconds.
 - `--pin-version <semver>` — Pin to a specific release version and block automatic upgrades.
 
-### Pointer-Bump Ownership
-- Only authorized release signers holding the `bitecho.org/infra` publishing key bump `dist/*` pointers after Stage 2 consent.
-- Every candidate artifact must pass `SHA-256(bytes) == pointer.target-cid` and a pre-swap health gate before replacing the active binary; failures automatically restore `.lkg` and emit a counted `:diagnose` event (Rule 5).
-
 ---
 
-## 5. Canary & Rolling Upgrade Order (6-Node `4-of-6` Quorum)
+## 6. Canary & Rolling Upgrade Order (6-Node `4-of-6` Quorum)
 
-Preserve Streamlet BFT quorum (`>= 4 of 6` validators online) at every step:
+Preserve Streamlet BFT quorum (`>= 4 of 6` validators online) at every step. **Cluster validators and edge/browser clients converge in one unified rollout pipeline** — a release is not considered rolled out until clients have converged on the bumped, 3/3-verified pointers.
 
 ```text
 ns3 (infra canary) -> node3 (validator canary) -> [E2E & SLA Gate] -> ns2 -> ns1 -> node2 -> node1
@@ -123,16 +159,16 @@ ns3 (infra canary) -> node3 (validator canary) -> [E2E & SLA Gate] -> ns2 -> ns1
 
 ---
 
-## 6. Monitoring, `P-OBS-4` Telemetry & `P-ASYNC-*` Snapshots
+## 7. Monitoring, `P-OBS-4` Telemetry & `P-ASYNC-*` Snapshots
 
 - **Rolling Cluster Six-Nines SLA:** `https://bitecho.org/sla/latest.edn` (interval-sweepline cluster SLA; `:finalization-stall` breach triggers at quorum level `>= 3` simultaneous nodes per `D39.6.1`).
 - **Per-Node Telemetry Digests (`P-OBS-4`):** `https://bitecho.org/telemetry/<node>/digest.edn` (published to `bitecho.org/observability`).
-- **Local Diagnostics Endpoints:** `http://127.0.0.1:8080/healthz`, `/statusz`, `/connz`, `/burnsz`.
+- **Local Diagnostics Endpoints:** `http://127.0.0.1:8080/healthz`, `/statusz` (reports `{rss, external, arrayBuffers}` alongside V8 heap to expose off-heap retention leaks), `/connz`, `/burnsz`.
 - **Immutable Epoch-Addressed Async Snapshots (`P-ASYNC-*` / `BIP-014`):** All three runtimes eliminate synchronous disk/gzip I/O on runtime hot paths. Full nodes write immutable `snapshot-<node>-epoch-<012d>.fressian` files asynchronously via `bitecho.snapshot.core` (retaining `keep-epochs` default `360`, `min-keep >= 2`), falling back seamlessly to legacy `snapshot-<node>.edn` on recovery.
 
 ---
 
-## 7. Rollback-First SOP
+## 8. Rollback-First SOP
 
 If any canary or rolling upgrade fails `/healthz`, stalls `finalized_epoch` (`F-EPOCH-1` loud-report rule), or degrades `https://bitecho.org/sla/latest.edn`:
 
@@ -144,6 +180,7 @@ If any canary or rolling upgrade fails `/healthz`, stalls `finalized_epoch` (`F-
    # Or roll back full validator set:
    ./scripts/cluster.sh rollback
    ```
+   For pointer-distributed client/infra bundles, publish a **new, higher monotonic `:seq`** pointing at the **LKG CID** (never reuse or decrement `:seq`).
 2. **OpenRC Restart & Verification:** `rollback` restores the previous `/opt/bitecho/bitecho-full-node.cjs.prev` (or `.lkg`), restarts the OpenRC service (`rc-service bitecho restart` / `rc-service bitecho-infra restart`), and polls `/healthz`.
 3. **Post-Rollback Audit & Loud Report:**
    ```bash
