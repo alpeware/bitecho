@@ -4,6 +4,7 @@
    stale-epoch, 32 MiB infra hot-cache cap & <=16 MiB pinned app isolation, mechanical stall vs relay-down
    classification, postmortem schema validation & /status rate limiter, plus concrete repository gates."
   (:require [bitecho.core.data :as data]
+            [bitecho.core.infra :as core-infra]
             [bitecho.light-node.cli :as cli]
             [bitecho.net.relay-pool :as relay-pool]
             [bitecho.ops.incident :as incident]
@@ -283,3 +284,76 @@
                          "200"]]
            (is (str/includes? body needle)
                (str "Hardening script missing required directive/assertion: " needle)))))))
+
+;; =============================================================================
+;; 6. BIP-018-SOAK-F3: Artifact Blob Upload Fail-Closed & Peer Replication Tests
+;; =============================================================================
+
+(defspec ^{:doc "Every failed, non-2xx, malformed, or CID-mismatched POST /artifact/v1/blob response fails closed."}
+  prop-artifact-blob-upload-never-silently-succeeds 100
+  (prop/for-all [status (gen/one-of [(gen/return nil)
+                                     (gen/choose 200 204)
+                                     (gen/choose 400 429)
+                                     (gen/choose 500 507)])
+                 body-ok? (gen/one-of [(gen/return nil) gen/boolean])
+                 transport-err (gen/one-of [(gen/return nil)
+                                            (gen/elements ["timeout" "ECONNRESET" "socket hang up"])])
+                 cid-match? gen/boolean]
+                (let [expected-cid "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                      returned-cid (if cid-match? expected-cid "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                      parsed-body (when (some? body-ok?)
+                                    {"ok" body-ok? "cid" returned-cid})
+                      res (core-infra/evaluate-artifact-blob-upload-response
+                           {:status status
+                            :parsed-body parsed-body
+                            :transport-error transport-err
+                            :expected-cid expected-cid})
+                      should-succeed? (and (nil? transport-err)
+                                           (integer? status)
+                                           (<= 200 status 299)
+                                           (true? body-ok?)
+                                           cid-match?)]
+                  (and (= should-succeed? (boolean (:ok? res)))
+                       (if should-succeed?
+                         (= expected-cid (:cid res))
+                         (and (keyword? (:error res))
+                              (boolean? (:retryable? res))))))))
+
+(defspec ^{:doc "Every non-2xx or transport-error peer replication outcome produces a counted :diagnose event."}
+  prop-peer-replication-non-2xx-always-diagnoses 100
+  (prop/for-all [status (gen/one-of [(gen/return nil)
+                                     (gen/choose 200 204)
+                                     (gen/choose 400 599)])
+                 err-msg (gen/one-of [(gen/return nil) (gen/elements ["timeout" "socket hang up" "ECONNREFUSED"])])
+                 peer-id (gen/elements [:ns1 :ns2 :ns3])]
+                (let [res (core-infra/classify-peer-replication-response
+                           {:status status
+                            :error err-msg
+                            :peer peer-id
+                            :reason :peer-artifact-replicate-failed})
+                      ok-2xx? (and (nil? err-msg) (integer? status) (<= 200 status 299))]
+                  (if ok-2xx?
+                    (and (true? (:ok? res)) (nil? (:diagnose res)))
+                    (and (false? (:ok? res))
+                         (= :diagnose (get-in res [:diagnose :type]))
+                         (= :peer-artifact-replicate-failed (get-in res [:diagnose :reason]))
+                         (= peer-id (get-in res [:diagnose :peer])))))))
+
+#?(:clj
+   (deftest test-bip018-soak-f3-durability-and-fail-closed-wiring
+     (testing "full_node_main.cljs awaits disk persistence before 200 on POST /artifact/v1/blob and checks peer status"
+       (let [src (slurp (io/file "src/bitecho/full_node_main.cljs"))]
+         (is (str/includes? src "write-disk-blob-async!")
+             "full_node_main.cljs must define async promise-returning write-disk-blob-async!")
+         (is (str/includes? src "blob-persist-failed")
+             "POST /artifact/v1/blob must return 500 blob-persist-failed on disk write failure")
+         (is (str/includes? src "classify-peer-replication-response")
+             "post-to-peer! must classify non-2xx HTTP status codes via core-infra/classify-peer-replication-response")))
+     (testing "node_main.cljs sends raw binary blobs and fails closed on artifact blob upload errors"
+       (let [src (slurp (io/file "src/bitecho/node_main.cljs"))]
+         (is (str/includes? src "evaluate-artifact-blob-upload-response")
+             "node_main.cljs must validate POST /artifact/v1/blob responses via core-infra/evaluate-artifact-blob-upload-response")
+         (is (str/includes? src "X-Bitecho-Blob-Cid")
+             "post-artifact-to-relay! must upload raw binary blobs with X-Bitecho-Blob-Cid header instead of 2x JSON hex")
+         (is (str/includes? src "artifact-blob-upload-failed")
+             "one-shot/serve artifact-put must fail closed with artifact-blob-upload-failed instead of returning ok=true")))))

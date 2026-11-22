@@ -364,8 +364,10 @@
     (when (core-infra/valid-cid? ncid)
       (.join node-path state-dir "blobs" (subs ncid 0 2) (str ncid ".meta.edn")))))
 
-(defn- write-disk-blob!
-  "Zero-Sync-IO async CAS blob persistence (`fs.promises`). Emits Rule 5 `:diagnose` on failure."
+(defn- write-disk-blob-async!
+  "Zero-Sync-IO async CAS blob persistence (`fs.promises`) returning a JS Promise
+   that resolves to `{:ok? true :cid ... :path ...}` or `{:ok? false :error ... :detail ...}`.
+   Emits Rule 5 `:diagnose` on failure."
   [state-dir blob shell-atom]
   (let [ncid (core-infra/normalize-cid (:blob/cid blob))
         bs (:blob/bytes blob)
@@ -373,12 +375,12 @@
     (if-not (and (core-infra/valid-cid? ncid) (fressian/bytes? bs))
       (do
         (apply-shell-event! shell-atom {:type :diagnose :reason :blob-fs-malformed-write :cid ncid})
-        {:ok? false :error :malformed-blob})
+        (js/Promise.resolve {:ok? false :error :malformed-blob :detail "malformed-blob"}))
       (let [actual (data/compute-cid bs)]
         (if (not= ncid actual)
           (do
             (apply-shell-event! shell-atom {:type :diagnose :reason :blob-cid-mismatch :expected ncid :actual actual})
-            {:ok? false :error :blob-cid-mismatch})
+            (js/Promise.resolve {:ok? false :error :blob-cid-mismatch :detail "blob-cid-mismatch"}))
           (let [dest (blob-file-path state-dir ncid)
                 mdest (blob-meta-path state-dir ncid)
                 buf (u8->buf bs)
@@ -388,13 +390,21 @@
                 (.then (fn [_]
                          (-> (.access node-fsp mdest)
                              (.catch (fn [_] (atomic-write-file-async! mdest meta-str nil))))))
+                (.then (fn [_] {:ok? true :cid ncid :path dest}))
                 (.catch (fn [e]
-                          (apply-shell-event! shell-atom
-                                              {:type :diagnose
-                                               :reason :blob-fs-async-write-failed
-                                               :cid ncid
-                                               :detail (or (.-message e) (str e))}))))
-            {:ok? true :cid ncid :path dest}))))))
+                          (let [msg (or (.-message e) (str e))]
+                            (apply-shell-event! shell-atom
+                                                {:type :diagnose
+                                                 :reason :blob-fs-async-write-failed
+                                                 :cid ncid
+                                                 :detail msg})
+                            {:ok? false :error :blob-fs-async-write-failed :detail msg}))))))))))
+
+(defn- write-disk-blob!
+  "Fire-and-forget wrapper over `write-disk-blob-async!` for non-HTTP gossip ingestion paths."
+  [state-dir blob shell-atom]
+  (write-disk-blob-async! state-dir blob shell-atom)
+  {:ok? true :cid (core-infra/normalize-cid (:blob/cid blob))})
 
 (defn- read-disk-blob-async!
   "Zero-Sync-IO async CAS blob read (`fs.promises`), invoking `(cb result-map)`."
@@ -756,20 +766,40 @@
                         :port (:port peer)
                         :path endpoint
                         :method "POST"
-                        :timeout 2500
+                        :timeout 10000
                         :headers (clj->js (assoc headers "Content-Length" (.-length body-buf)))}
-          req (.request node-http req-opts (fn [res] (.resume res)))]
+          req (.request node-http req-opts
+                        (fn [res]
+                          (let [cls (core-infra/classify-peer-replication-response
+                                     {:status (.-statusCode res)
+                                      :peer (:node-id peer)
+                                      :reason diag-reason})]
+                            (when-let [diag (:diagnose cls)]
+                              (apply-shell-event! shell-atom diag)))
+                          (.resume res)))]
       (.on req "error"
            (fn [err]
-             (apply-shell-event! shell-atom {:type :diagnose :reason diag-reason :peer (:node-id peer) :detail (.-message err)})))
+             (when-let [diag (:diagnose (core-infra/classify-peer-replication-response
+                                         {:error (or (.-message err) (str err))
+                                          :peer (:node-id peer)
+                                          :reason diag-reason}))]
+               (apply-shell-event! shell-atom diag))))
       (.on req "timeout"
            (fn []
              (.destroy req)
-             (apply-shell-event! shell-atom {:type :diagnose :reason diag-reason :peer (:node-id peer) :detail "timeout"})))
+             (when-let [diag (:diagnose (core-infra/classify-peer-replication-response
+                                         {:error "timeout"
+                                          :peer (:node-id peer)
+                                          :reason diag-reason}))]
+               (apply-shell-event! shell-atom diag))))
       (.write req body-buf)
       (.end req))
     (catch :default e
-      (apply-shell-event! shell-atom {:type :diagnose :reason diag-reason :peer (:node-id peer) :detail (.-message e)}))))
+      (when-let [diag (:diagnose (core-infra/classify-peer-replication-response
+                                  {:error (or (.-message e) (str e))
+                                   :peer (:node-id peer)
+                                   :reason diag-reason}))]
+        (apply-shell-event! shell-atom diag)))))
 
 (defn- replicate-artifact-to-peers!
   [rt kind payload-buf headers]
@@ -797,22 +827,28 @@
              (let [r (subnet/reduce-subnet inst event)]
                (reset! res-box r)
                (:state r))))
-    (let [res @res-box]
-      (when (and (= :put-blob (:type event)) (:blob event))
-        (write-disk-blob! (:state-dir rt) (:blob event) (:shell-atom rt)))
+    (let [res @res-box
+          skip-disk? (boolean (:skip-disk-write? event))
+          written-cids (atom #{})]
+      (when (and (not skip-disk?) (= :put-blob (:type event)) (:blob event))
+        (let [cid (core-infra/normalize-cid (:blob/cid (:blob event)))]
+          (swap! written-cids conj cid)
+          (write-disk-blob! (:state-dir rt) (:blob event) (:shell-atom rt))))
       (doseq [eff (:effects res)]
         (case (:effect eff)
           :diagnose
           (apply-shell-event! (:shell-atom rt) (assoc eff :type :diagnose))
 
           :eager-push-blob
-          (do
-            (write-disk-blob! (:state-dir rt) (:blob eff) (:shell-atom rt))
+          (let [b (:blob eff)
+                cid (core-infra/normalize-cid (:blob/cid b))]
+            (when (and (not skip-disk?) (not (contains? @written-cids cid)))
+              (swap! written-cids conj cid)
+              (write-disk-blob! (:state-dir rt) b (:shell-atom rt)))
             (when-not (:from-peer? event)
-              (let [b (:blob eff)]
-                (replicate-artifact-to-peers! rt :blob (u8->buf (:blob/bytes b))
-                                              {"Content-Type" (or (:blob/media-type b) "application/octet-stream")
-                                               "X-Bitecho-Blob-Cid" (:blob/cid b)}))))
+              (replicate-artifact-to-peers! rt :blob (u8->buf (:blob/bytes b))
+                                            {"Content-Type" (or (:blob/media-type b) "application/octet-stream")
+                                             "X-Bitecho-Blob-Cid" (:blob/cid b)})))
 
           :replicate-pointer
           (let [ptr (:pointer eff)]
@@ -1348,14 +1384,26 @@
                                             :bytes_at_rest (:bytes-at-rest quota-res)
                                             :quota_bytes (:quota-bytes quota-res)})
                        (let [sender (or (get-header req "x-bitecho-pubkey") (:default-sender rt))]
-                         (submit-subnet-event! rt {:type :put-blob
-                                                   :blob blob
-                                                   :sender sender
-                                                   :now-ms now-ms
-                                                   :from-peer? replicated?})
-                         (send-json! res 200 {:ok true
-                                              :cid (:blob/cid blob)
-                                              :size_bytes blob-len})))))))))))
+                         (-> (write-disk-blob-async! (:state-dir rt) blob (:shell-atom rt))
+                             (.then (fn [persist-res]
+                                      (if-not (:ok? persist-res)
+                                        (send-json! res 500 {:ok false
+                                                             :error "blob-persist-failed"
+                                                             :detail (or (:detail persist-res) "disk-write-failed")})
+                                        (do
+                                          (submit-subnet-event! rt {:type :put-blob
+                                                                    :blob blob
+                                                                    :sender sender
+                                                                    :now-ms now-ms
+                                                                    :from-peer? replicated?
+                                                                    :skip-disk-write? true})
+                                          (send-json! res 200 {:ok true
+                                                               :cid (:blob/cid blob)
+                                                               :size_bytes blob-len})))))
+                             (.catch (fn [e]
+                                       (send-json! res 500 {:ok false
+                                                            :error "blob-persist-failed"
+                                                            :detail (or (.-message e) (str e))}))))))))))))))
 
       (str/starts-with? clean-path "/artifact/v1/blob/")
       (if-not (contains? #{"GET" "HEAD"} method)

@@ -587,3 +587,83 @@
     (if (str/starts-with? (str/trim (or raw-eml "")) "Received:")
       raw-eml
       (str hdr raw-eml))))
+
+;; =============================================================================
+;; 7. Artifact Blob Upload & Peer Replication Classification (BIP-018-SOAK-F3)
+;; =============================================================================
+
+(defn evaluate-artifact-blob-upload-response
+  "Purely evaluates an HTTP `POST /artifact/v1/blob` result (Rule 2, Rule 5).
+   Fails closed on any transport error, non-2xx HTTP status, missing/false `ok`,
+   or CID mismatch so callers never report `ok=true` after a failed upload."
+  [{:keys [status parsed-body transport-error expected-cid]}]
+  (let [norm-expected (when (string? expected-cid) (normalize-cid expected-cid))
+        body-ok? (when (map? parsed-body)
+                   (or (true? (:ok parsed-body))
+                       (true? (get parsed-body "ok"))))
+        raw-cid (when (map? parsed-body)
+                  (or (:cid parsed-body) (get parsed-body "cid")))
+        norm-returned (when (string? raw-cid) (normalize-cid raw-cid))]
+    (cond
+      (some? transport-error)
+      {:ok? false
+       :error :transport-error
+       :retryable? true
+       :detail (str transport-error)}
+
+      (not (and (integer? status) (<= 200 status 299)))
+      {:ok? false
+       :error (if (integer? status) :http-error :missing-status)
+       :status status
+       :retryable? (boolean (or (nil? status)
+                                (= status 408)
+                                (= status 429)
+                                (and (integer? status) (>= status 500))))
+       :detail (or (when (map? parsed-body) (or (:error parsed-body) (get parsed-body "error")))
+                   (when (integer? status) (str "http-" status))
+                   "missing-http-status")}
+
+      (not (true? body-ok?))
+      {:ok? false
+       :error :invalid-response-body
+       :status status
+       :retryable? false
+       :detail (or (when (map? parsed-body) (or (:error parsed-body) (get parsed-body "error")))
+                   "missing-ok-true")}
+
+      (and norm-expected (not= norm-expected norm-returned))
+      {:ok? false
+       :error :cid-mismatch
+       :status status
+       :retryable? false
+       :expected norm-expected
+       :actual norm-returned}
+
+      :else
+      {:ok? true
+       :status status
+       :cid (or norm-returned norm-expected)})))
+
+(defn classify-peer-replication-response
+  "Purely classifies an inter-node peer replication HTTP outcome (Rule 2, Rule 5).
+   Every non-2xx status or transport error produces a counted `:diagnose` event."
+  [{:keys [status error peer reason]}]
+  (let [diag-reason (or reason :peer-artifact-replicate-failed)]
+    (cond
+      (some? error)
+      {:ok? false
+       :diagnose {:type :diagnose
+                  :reason diag-reason
+                  :peer peer
+                  :detail (str error)}}
+
+      (not (and (integer? status) (<= 200 status 299)))
+      {:ok? false
+       :diagnose {:type :diagnose
+                  :reason diag-reason
+                  :peer peer
+                  :status status
+                  :detail (if (integer? status) (str "http-" status) "missing-status")}}
+
+      :else
+      {:ok? true :status status})))

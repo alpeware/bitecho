@@ -5,6 +5,7 @@
    with the JVM `bitecho.shell.light-node` shell, backed by `bitecho.light-node.core`,
    `bitecho.fressian`, and `datachannel.api`."
   (:require [bitecho.basalt.core :as basalt]
+            [bitecho.core.infra :as core-infra]
             [bitecho.core.protocol.relay :as relay]
             [bitecho.crypto :as crypto]
             [bitecho.deploy.core :as deploy]
@@ -671,6 +672,81 @@
            (run-post! nil)))
        (catch :default _
          (done! nil))))))
+
+(defn- http-post-bytes-detailed!
+  "Posts raw `Buffer`/`Uint8Array` or UTF-8 string `body` to `url-str` over HTTP/HTTPS,
+   invoking `(cb {:status int-or-nil :body str-or-nil :error str-or-nil})`."
+  [url-str body headers timeout-ms cb]
+  (let [settled? (atom false)
+        done! (fn [res]
+                (when (compare-and-set! settled? false true)
+                  (cb res)))]
+    (try
+      (let [https? (str/starts-with? (str/lower-case url-str) "https://")
+            Buf (.-Buffer js/globalThis)
+            body-buf (cond
+                       (.isBuffer Buf body) body
+                       (instance? js/Uint8Array body) (.from Buf (.-buffer body) (.-byteOffset body) (.-byteLength body))
+                       :else (.from Buf (str body) "utf8"))
+            url-obj (js/URL. url-str)
+            target-host (.-hostname url-obj)
+            target-port (int (or (not-empty (str (.-port url-obj))) (if https? 443 80)))
+            proxy-str (when (and https?
+                                 (not= target-host "127.0.0.1")
+                                 (not= target-host "localhost"))
+                        (resolve-proxy-url nil))
+            hdrs (cond-> {"Content-Type" "application/octet-stream"
+                          "Content-Length" (.-length body-buf)}
+                   (map? headers) (merge headers))
+            run-post! (fn [tls-sock]
+                        (try
+                          (let [client (if https? node-https node-http)
+                                options #js {:protocol (.-protocol url-obj)
+                                             :hostname target-host
+                                             :port target-port
+                                             :path (str (.-pathname url-obj) (.-search url-obj))
+                                             :method "POST"
+                                             :timeout (or timeout-ms 30000)
+                                             :headers (clj->js hdrs)}
+                                _ (when tls-sock
+                                    (set! (.-agent options) false)
+                                    (let [h (or (.-headers options) #js {})]
+                                      (aset h "Connection" "close")
+                                      (set! (.-headers options) h))
+                                    (set! (.-createConnection options) (fn [_ _] tls-sock)))
+                                req (.request client options
+                                              (fn [res]
+                                                (let [status (.-statusCode res)
+                                                      chunks #js []]
+                                                  (.on res "data" (fn [c] (.push chunks c)))
+                                                  (.on res "end" (fn []
+                                                                   (let [buf (.concat Buf chunks)]
+                                                                     (done! {:status status
+                                                                             :body (.toString buf "utf8")
+                                                                             :error nil}))))
+                                                  (.on res "error" (fn [e]
+                                                                     (done! {:status status
+                                                                             :body nil
+                                                                             :error (or (.-message e) (str e))}))))))]
+                            (.on req "timeout" (fn []
+                                                 (.destroy req)
+                                                 (done! {:status nil :body nil :error "timeout"})))
+                            (.on req "error" (fn [e]
+                                               (done! {:status nil :body nil :error (or (.-message e) (str e))})))
+                            (.write req body-buf)
+                            (.end req))
+                          (catch :default e
+                            (done! {:status nil :body nil :error (or (.-message e) (str e))}))))]
+        (if proxy-str
+          (open-https-proxy-tls-socket!
+           proxy-str target-host target-port (or timeout-ms 30000)
+           (fn [tls-sock err]
+             (if tls-sock
+               (run-post! tls-sock)
+               (done! {:status nil :body nil :error (or err "proxy-connect-failed")}))))
+          (run-post! nil)))
+      (catch :default e
+        (done! {:status nil :body nil :error (or (.-message e) (str e))})))))
 
 (defn- read-json-str
   [s]
@@ -3155,28 +3231,60 @@
         (catch :default _ nil)))))
 
 (defn- post-artifact-to-relay!
+  "Uploads raw binary blob bytes (`X-Bitecho-Blob-Cid`) and pointer to `raw-relay-url`.
+   Validates the blob upload via `core-infra/evaluate-artifact-blob-upload-response`
+   with up to 2 retries on retryable transport/5xx errors, failing closed (`{:ok? false ...}`)
+   if blob persistence fails so callers never report `ok=true` after a failed upload (Rule 5)."
   [raw-relay-url verb resp cb]
   (let [base-url (artifact-endpoint-base-url raw-relay-url)]
     (if-not (and base-url (map? resp) (true? (or (get resp "ok") (:ok resp))))
-      (when cb (cb nil))
+      (when cb (cb {:ok? true}))
       (let [post-ptr! (fn []
                         (if-let [ptr (or (get resp "pointer") (:pointer resp))]
                           (http-post-json! (str base-url "/artifact/v1/pointer")
                                            (pr-str ptr)
                                            {"Content-Type" "application/edn"}
                                            15000
-                                           (fn [r] (when cb (cb r))))
-                          (when cb (cb nil))))]
+                                           (fn [_] (when cb (cb {:ok? true}))))
+                          (when cb (cb {:ok? true}))))]
         (if (and (contains? #{"artifact-put" "put"} (str verb))
                  (or (get resp "blob") (:blob resp)))
-          (let [blob (or (get resp "blob") (:blob resp))]
-            (http-post-json! (str base-url "/artifact/v1/blob")
-                             (write-json-str {"bytes_hex" (basalt/bytes->hex (:blob/bytes blob))
-                                              "cid" (:blob/cid blob)
-                                              "media_type" (or (:blob/media-type blob) "application/octet-stream")})
-                             {"Content-Type" "application/json"}
-                             30000
-                             (fn [_] (post-ptr!))))
+          (let [blob (or (get resp "blob") (:blob resp))
+                cid (:blob/cid blob)
+                media-type (or (:blob/media-type blob) "application/octet-stream")
+                raw-bytes (:blob/bytes blob)
+                upload-attempt!
+                (fn upload-attempt! [attempt]
+                  (http-post-bytes-detailed!
+                   (str base-url "/artifact/v1/blob")
+                   raw-bytes
+                   {"Content-Type" media-type
+                    "X-Bitecho-Blob-Cid" cid}
+                   30000
+                   (fn [{:keys [status body error]}]
+                     (let [parsed (when (and (string? body) (not (str/blank? body)))
+                                    (try (js->clj (js/JSON.parse body)) (catch :default _ nil)))
+                           eval-res (core-infra/evaluate-artifact-blob-upload-response
+                                     {:status status
+                                      :parsed-body parsed
+                                      :transport-error error
+                                      :expected-cid cid})]
+                       (cond
+                         (:ok? eval-res)
+                         (post-ptr!)
+
+                         (and (:retryable? eval-res) (< attempt 2))
+                         (js/setTimeout #(upload-attempt! (inc attempt)) (* 250 (inc attempt)))
+
+                         :else
+                         (when cb
+                           (cb {:ok? false
+                                :error "artifact-blob-upload-failed"
+                                :status (:status eval-res)
+                                :detail (or (:detail eval-res) (name (or (:error eval-res) :upload-failed)))
+                                :relay-url base-url
+                                :cid cid})))))))]
+            (upload-attempt! 0))
           (post-ptr!))))))
 
 (defn handle-serve-line!
@@ -4399,7 +4507,19 @@
                                                     (emit-json-line! (:response res))
                                                     (.exit js/process 0))))]
                                           (if art-relay
-                                            (post-artifact-to-relay! art-relay eff-domain-verb (:response res) (fn [_] (proceed-after-artifact!)))
+                                            (post-artifact-to-relay!
+                                             art-relay eff-domain-verb (:response res)
+                                             (fn [art-res]
+                                               (if (false? (:ok? art-res))
+                                                 (do
+                                                   (emit-json-line! {"ok" false
+                                                                     "error" (or (:error art-res) "artifact-blob-upload-failed")
+                                                                     "status" (:status art-res)
+                                                                     "detail" (:detail art-res)
+                                                                     "relay_url" (:relay-url art-res)
+                                                                     "cid" (:cid art-res)})
+                                                   (.exit js/process 1))
+                                                 (proceed-after-artifact!))))
                                             (proceed-after-artifact!))))]
                                   (if poll-verb?
                                     (poll-and-ingest-relay-once! effective-relay-url identity state-atom state-file opts after-poll!)

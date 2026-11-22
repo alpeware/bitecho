@@ -75,8 +75,12 @@ if [[ "${RUNTIME}" == "nodejs" ]]; then
   RESOLVED_NODE="$(resolve_node_bin)"
   if check_node_preflight "${RESOLVED_NODE}"; then
     check_unified_pointer "${RESOLVED_NODE}" || true
-    # P-OBS-5 (BIP-013 / F-SOAK-1 interim mitigation): cap V8 old-space heap to 384 MiB
-    NODE_MAX_OLD_SPACE_MB="${BITECHO_NODE_MAX_OLD_SPACE_MB:-384}"
+    # P-OBS-5 / BIP-018-SOAK-F1: bound glibc arena/mmap retention so >=128 KiB chunk buffers
+    # return directly to Linux via munmap(), and tighten V8 old-space heap cap to 192 MiB on e2-micro.
+    export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+    export MALLOC_MMAP_THRESHOLD_="${MALLOC_MMAP_THRESHOLD_:-131072}"
+    export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
+    NODE_MAX_OLD_SPACE_MB="${BITECHO_NODE_MAX_OLD_SPACE_MB:-192}"
     # Exit 75 triggers OpenRC supervise-daemon respawn after unified pointer advance (P-HOST-6)
     exec "${RESOLVED_NODE}" "--max-old-space-size=${NODE_MAX_OLD_SPACE_MB}" "${NODE_BUNDLE}" infra-node "${CONFIG_FILE}"
   else
