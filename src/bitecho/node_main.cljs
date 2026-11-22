@@ -2365,6 +2365,11 @@
   (or (instance? js/Uint8Array v)
       (.isBuffer js/Buffer v)))
 
+(defn- safe-map-get
+  "Safe lookup that never throws CompareError when probing keyword keys on string-keyed sorted-maps."
+  [m k]
+  (try (get m k) (catch :default _ nil)))
+
 (defn- sanitize-stdout-log-data
   "Strips raw byte arrays (`:bytes`, `:blob/bytes`, `Uint8Array`, `Buffer`) from stdout/events JSONL logs,
    preserving only `{:cid :size_bytes :media_type}` metadata (BIP-018 Track 2 / Twin Edge Case #1)."
@@ -2374,13 +2379,16 @@
     {"size_bytes" (.-length v)}
 
     (map? v)
-    (let [raw-bs (or (:blob/bytes v) (:bytes v) (get v "blob/bytes") (get v "bytes"))]
+    (let [raw-bs (or (safe-map-get v :blob/bytes)
+                     (safe-map-get v :bytes)
+                     (safe-map-get v "blob/bytes")
+                     (safe-map-get v "bytes"))]
       (if (and (some? raw-bs) (raw-byte-array? raw-bs))
-        (cond-> {"size_bytes" (.-length raw-bs)}
-          (or (:blob/cid v) (:cid v) (get v "cid"))
-          (assoc "cid" (or (:blob/cid v) (:cid v) (get v "cid")))
-          (or (:blob/media-type v) (:media-type v) (:media_type v) (get v "media_type"))
-          (assoc "media_type" (or (:blob/media-type v) (:media-type v) (:media_type v) (get v "media_type"))))
+        (let [cid-val (or (safe-map-get v :blob/cid) (safe-map-get v :cid) (safe-map-get v "cid"))
+              mt-val (or (safe-map-get v :blob/media-type) (safe-map-get v :media-type) (safe-map-get v :media_type) (safe-map-get v "media_type"))]
+          (cond-> {"size_bytes" (.-length raw-bs)}
+            cid-val (assoc "cid" cid-val)
+            mt-val (assoc "media_type" mt-val)))
         (reduce-kv (fn [acc k val]
                      (if (contains? #{:bytes :blob/bytes "bytes" "blob/bytes"} k)
                        (if (raw-byte-array? val)
