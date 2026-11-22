@@ -1478,4 +1478,66 @@
           :state st'
           :effects [diag]})))))
 
+(defn classify-accept-offer-target
+  "Pure classifier for `acceptOffer` / `accept-offer` dispatch.
+   Prevents null-deref crashes in P2P X25519 key agreement when a live mesh
+   counter-offer (which carries `sessionId`/`offerId` and may carry `offerHash`/
+   `signature` without `caller-x25519`) is passed to `acceptOffer`."
+  [offer-or-id pending-offers]
+  (let [pending (or pending-offers {})]
+    (cond
+      (nil? offer-or-id)
+      {:mode :invalid :error "invalid-offer"}
+
+      (string? offer-or-id)
+      (let [sid (str/trim offer-or-id)]
+        (cond
+          (str/blank? sid)
+          {:mode :invalid :error "invalid-offer"}
+
+          (contains? pending sid)
+          {:mode :mesh-channel :session-id sid}
+
+          :else
+          {:mode :invalid :error "missing-x25519-key" :session-id sid}))
+
+      (map? offer-or-id)
+      (let [raw-sid (or (:session-id offer-or-id)
+                        (:sessionId offer-or-id)
+                        (:session_id offer-or-id)
+                        (:offer-id offer-or-id)
+                        (:offerId offer-or-id)
+                        (:id offer-or-id)
+                        (get offer-or-id "session_id")
+                        (get offer-or-id "sessionId")
+                        (get offer-or-id "offer_id")
+                        (get offer-or-id "offerId")
+                        (get offer-or-id "id"))
+            sid (when (some? raw-sid) (str/trim (str raw-sid)))
+            raw-x (or (:caller-x25519 offer-or-id)
+                      (:callerX25519 offer-or-id)
+                      (:caller-ephemeral-pub offer-or-id)
+                      (:callerEphemeralPub offer-or-id)
+                      (get offer-or-id "caller-x25519")
+                      (get offer-or-id "caller_x25519")
+                      (get offer-or-id "caller-ephemeral-pub")
+                      (get offer-or-id "caller_ephemeral_pub"))
+            has-x? (and (string? raw-x) (not (str/blank? raw-x)))]
+        (cond
+          (and (string? sid) (not (str/blank? sid)) (contains? pending sid))
+          {:mode :mesh-channel :session-id sid}
+
+          has-x?
+          {:mode :p2p-direct :offer offer-or-id :caller-x25519 raw-x}
+
+          (and (string? sid) (not (str/blank? sid)))
+          {:mode :invalid :error "missing-x25519-key" :session-id sid}
+
+          :else
+          {:mode :invalid :error "missing-x25519-key"}))
+
+      :else
+      {:mode :invalid :error "invalid-offer"})))
+
+
 

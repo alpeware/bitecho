@@ -579,3 +579,54 @@
          (unsub-bad)
          (unsub-good)
          (browser-main/stop-node na)))))
+
+(defspec ^{:doc "Rule 1 Property: classify-accept-offer-target routes matching live mesh
+                 pending-offers to :mesh-channel regardless of offerHash/signature/x25519
+                 fields, and never allows nil caller-x25519 into :p2p-direct."}
+  prop-accept-offer-mesh-vs-p2p-classification-never-derefs-null-x25519 50
+  (prop/for-all [sid (gen/not-empty gen/string-alphanumeric)
+                 key-variant (gen/elements [:session-id :sessionId :session_id :offer-id :offerId :id])
+                 has-sig? gen/boolean
+                 has-x25519? gen/boolean
+                 in-pending? gen/boolean]
+                (let [pending (if in-pending? {sid {:session-id sid :caller "aa" :price 10}} {})
+                      base-offer (cond-> {key-variant sid :caller "aa"}
+                                   has-sig? (assoc :offer-hash "deadbeef" :signature "cafebabe")
+                                   has-x25519? (assoc :caller-x25519 (apply str (repeat 64 "1"))))
+                      res (browser/classify-accept-offer-target base-offer pending)]
+                  (cond
+                    in-pending?
+                    (and (= :mesh-channel (:mode res))
+                         (= sid (:session-id res)))
+
+                    has-x25519?
+                    (= :p2p-direct (:mode res))
+
+                    :else
+                    (and (= :invalid (:mode res))
+                         (= "missing-x25519-key" (:error res)))))))
+
+(deftest accept-offer-and-query-chain-state-regression-test
+  (testing "classify-accept-offer-target handles string session-id, nil, and mesh counter-offers without x25519"
+    (is (= {:mode :invalid :error "invalid-offer"}
+           (browser/classify-accept-offer-target nil {})))
+    (is (= {:mode :mesh-channel :session-id "15dacb0f"}
+           (browser/classify-accept-offer-target "15dacb0f" {"15dacb0f" {:session-id "15dacb0f"}})))
+    (is (= {:mode :mesh-channel :session-id "15dacb0f"}
+           (browser/classify-accept-offer-target
+            {:sessionId "15dacb0f" :offerHash "abc" :signature "def" :caller-x25519 nil}
+            {"15dacb0f" {:session-id "15dacb0f"}})))
+    (is (= :invalid (:mode (browser/classify-accept-offer-target
+                            {:offerHash "abc" :signature "def" :caller-x25519 nil}
+                            {})))))
+  (testing "inbound :query-chain-state with epoch 0 does not emit spurious epoch-skew-dropped diagnostic"
+    (let [kp (crypto/generate-keypair)
+          pub-hex (fressian/bytes->hex (:public-key kp))
+          st (-> (light-core/init-light-state pub-hex {})
+                 (assoc :epoch 72278 :epoch-initialized? true))
+          res (light-core/handle-wire-payload
+               st
+               {:type :query-chain-state :pubkey pub-hex :epoch 0 :nonce "n1"}
+               (:private-key kp))]
+      (is (zero? (long (or (get-in res [:state :diagnostics :epoch-skew-dropped]) 0))))
+      (is (not-any? #(= "epoch-skew-dropped" (get % "reason")) (:stdout-events res))))))

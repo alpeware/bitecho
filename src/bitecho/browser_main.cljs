@@ -1708,32 +1708,59 @@
                   @active-node-atom)]
        (if (nil? na)
          (clj->js {:ok false :accepted false :error "no-active-node"})
-         (let [offer-map (if (map? offer) offer (js->clj offer :keywordize-keys true))
-               caller-pub (or (:caller-pubkey offer-map) (:caller offer-map))
-               caller-x25519 (or (when-let [x (:caller-x25519 offer-map)] (fressian/hex->bytes x))
-                                 (when-let [x (:caller-ephemeral-pub offer-map)] (fressian/hex->bytes x)))
-               offer-hash (:offer-hash offer-map)
-               sig-hex (:signature offer-map)
-               sig-valid? (and (string? caller-pub) (string? offer-hash) (string? sig-hex)
-                               (crypto/verify (basalt/hex->bytes caller-pub)
-                                              (fressian/utf8->bytes offer-hash)
-                                              (basalt/hex->bytes sig-hex)))]
-           (if-not sig-valid?
-             (clj->js {:ok false :accepted false :error "invalid-offer-signature"})
-             (let [my-x25519 (:x25519 @na)
-                   shared-secret (sealed/x25519-shared-secret (:private-key my-x25519) caller-x25519)
-                   session-keys (sealed/derive-channel-keys shared-secret "bitecho-browser-session-salt" :responder)
-                   burn (long (or (:burn offer-map) (:burn-amount offer-map) 50))]
-               (swap! na (fn [st]
-                           (-> st
-                               (assoc-in [:sessions caller-pub] {:session-keys session-keys
-                                                                 :suite "suite-v1-aes256gcm"
-                                                                 :seq 0})
-                               (update :burned-ech (fnil + 0) burn))))
-               (clj->js {:ok true
-                         :accepted true
-                         :peerId caller-pub
-                         :suite "suite-v1-aes256gcm"})))))))))
+         (let [offer-clj (cond
+                           (string? offer) offer
+                           (map? offer) offer
+                           :else (js->clj offer :keywordize-keys true))
+               pending-offers (or (get-in @na [:light-state :pending-offers]) {})
+               classified (browser/classify-accept-offer-target offer-clj pending-offers)]
+           (case (:mode classified)
+             :mesh-channel
+             (let [sid (:session-id classified)]
+               (when @anchor-state-atom
+                 (let [[new-anchor _] (light-core/approve-offer @anchor-state-atom sid nil)]
+                   (reset! anchor-state-atom new-anchor)))
+               (accept-channel-offer na sid))
+
+             :invalid
+             (clj->js (cond-> {:ok false
+                               :accepted false
+                               :error (or (:error classified) "invalid-offer")}
+                        (:session-id classified) (assoc :sessionId (:session-id classified))))
+
+             :p2p-direct
+             (let [offer-map (:offer classified)
+                   caller-pub (or (:caller-pubkey offer-map) (:caller offer-map))
+                   caller-x25519 (when-let [x (:caller-x25519 classified)]
+                                   (fressian/hex->bytes x))
+                   offer-hash (or (:offer-hash offer-map) (:offerHash offer-map))
+                   sig-hex (:signature offer-map)
+                   sig-valid? (and (string? caller-pub) (string? offer-hash) (string? sig-hex)
+                                   (crypto/verify (basalt/hex->bytes caller-pub)
+                                                  (fressian/utf8->bytes offer-hash)
+                                                  (basalt/hex->bytes sig-hex)))
+                   my-x25519 (:x25519 @na)]
+               (cond
+                 (not sig-valid?)
+                 (clj->js {:ok false :accepted false :error "invalid-offer-signature"})
+
+                 (or (nil? caller-x25519) (nil? (:private-key my-x25519)))
+                 (clj->js {:ok false :accepted false :error "missing-x25519-key"})
+
+                 :else
+                 (let [shared-secret (sealed/x25519-shared-secret (:private-key my-x25519) caller-x25519)
+                       session-keys (sealed/derive-channel-keys shared-secret "bitecho-browser-session-salt" :responder)
+                       burn (long (or (:burn offer-map) (:burn-amount offer-map) 50))]
+                   (swap! na (fn [st]
+                               (-> st
+                                   (assoc-in [:sessions caller-pub] {:session-keys session-keys
+                                                                     :suite "suite-v1-aes256gcm"
+                                                                     :seq 0})
+                                   (update :burned-ech (fnil + 0) burn))))
+                   (clj->js {:ok true
+                             :accepted true
+                             :peerId caller-pub
+                             :suite "suite-v1-aes256gcm"})))))))))))
 
 (defn send-sealed-message
   "Seals and sends a message to an active peer session."

@@ -8553,6 +8553,7 @@
                         skew-exceeded? (and (not open-session?)
                                             (not pending-offer-reply?)
                                             (not (contains? #{:chain-state-snapshot
+                                                              :query-chain-state
                                                               :p2p-link-bind
                                                               :p2p-hub-relay
                                                               :p2p-broadcast
