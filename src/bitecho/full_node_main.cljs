@@ -927,7 +927,9 @@
   (let [body (js/JSON.stringify (clj->js obj))
         buf (.from js/Buffer body "utf8")]
     (.writeHead res status #js {"Content-Type" "application/json; charset=utf-8"
-                                "Content-Length" (.-length buf)})
+                                "Content-Length" (.-length buf)
+                                "Access-Control-Allow-Origin" "*"
+                                "Access-Control-Allow-Methods" "GET, HEAD, POST, OPTIONS"})
     (.end res buf)))
 
 (defn- send-text!
@@ -2008,6 +2010,56 @@
                                      "Cache-Control" "public, max-age=5, stale-while-revalidate=10"
                                      "Access-Control-Allow-Origin" "*"})
             (if (= method "HEAD") (.end res) (.end res buf)))))
+
+      (and (contains? #{"GET" "HEAD"} method) (= clean-path "/favicon.ico"))
+      (let [rel-st @(:app-release-atom rt)
+            fav-cid (get-in rel-st [:active-release :assets "favicon.ico" :cid])
+            fav-res (when fav-cid (resolve-cid-blob! rt fav-cid now-ms))
+            fav-bytes (when (and fav-res (:ok? fav-res)) (get-in fav-res [:blob :blob/bytes]))]
+        (if fav-bytes
+          (let [buf (u8->buf fav-bytes)]
+            (.writeHead res 200 #js {"Content-Type" "image/x-icon"
+                                     "Content-Length" (.-length buf)
+                                     "Cache-Control" "public, max-age=3600"})
+            (if (= method "HEAD") (.end res) (.end res buf)))
+          (send-text! res 404 "Not Found" method)))
+
+      (and (contains? #{"GET" "HEAD"} method)
+           (or (str/starts-with? clean-path "/incidents/")
+               (str/starts-with? clean-path "/infra/incidents/")))
+      (let [prefix (if (str/starts-with? clean-path "/infra/incidents/")
+                     "/infra/incidents/"
+                     "/incidents/")
+            fname (subs clean-path (count prefix))
+            safe? (and (not (str/blank? fname))
+                       (not (str/includes? fname ".."))
+                       (not (str/includes? fname "/"))
+                       (not (str/includes? fname "\\")))]
+        (if-not safe?
+          (send-text! res 400 "Invalid incident path" method)
+          (let [ptr-path (str "incidents/" fname)
+                sub @(:subnet-atom rt)
+                ptr (get-in sub [:data :pointers ["bitecho.org/infra" ptr-path]])
+                cid (:pointer/target ptr)
+                ct (cond
+                     (str/ends-with? fname ".md") "text/markdown; charset=utf-8"
+                     (str/ends-with? fname ".edn") "application/edn; charset=utf-8"
+                     (str/ends-with? fname ".json") "application/json; charset=utf-8"
+                     :else "text/plain; charset=utf-8")]
+            (if-not cid
+              (send-text! res 404 "Not Found" method)
+              (resolve-cid-blob-async!
+               rt cid now-ms
+               (fn [bres]
+                 (if (and (:ok? bres) (get-in bres [:blob :blob/bytes]))
+                   (let [buf (u8->buf (get-in bres [:blob :blob/bytes]))]
+                     (.writeHead res 200 #js {"Content-Type" ct
+                                              "Content-Length" (.-length buf)
+                                              "Cache-Control" "public, max-age=60"
+                                              "Access-Control-Allow-Origin" "*"
+                                              "X-Bitecho-Blob-Cid" cid})
+                     (if (= method "HEAD") (.end res) (.end res buf)))
+                   (send-text! res 404 "Not Found" method))))))))
 
       (and (contains? #{"GET" "HEAD"} method) (str/starts-with? raw-path "/.well-known/acme-challenge/"))
       (let [token (subs raw-path (count "/.well-known/acme-challenge/"))

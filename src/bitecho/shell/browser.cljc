@@ -1539,5 +1539,36 @@
       :else
       {:mode :invalid :error "invalid-offer"})))
 
+(defn normalize-restored-light-state
+  "Pure restore normalizer for browser IndexedDB state (Rule 2).
+   1. Advances `:epoch` to `max(:epoch, account.finalized-epoch, max(chain-state-snapshots finalized-epoch))`
+      so restored browser nodes never stamp outbound offers with stale epochs.
+   2. Preserves persisted `:subscribed-subnets` and merges `default-subnets` so restored nodes
+      never drop circle broadcasts as `subnet-mismatch-dropped`."
+  [light-st default-subnets]
+  (let [st (or light-st {})
+        curr-ep (long (or (:epoch st) 0))
+        acc-ep (long (or (get-in st [:account :finalized-epoch])
+                         (get-in st [:account :finalized_epoch])
+                         0))
+        snap-eps (keep (fn [[_ s]]
+                         (when (map? s)
+                           (or (:finalized-epoch s)
+                               (:finalized_epoch s)
+                               (get s "finalized-epoch")
+                               (get s "finalized_epoch"))))
+                       (or (:chain-state-snapshots st) {}))
+        max-snap-ep (reduce max 0 (map long snap-eps))
+        best-ep (max curr-ep acc-ep max-snap-ep)
+        existing-subs (into #{}
+                            (keep (fn [x]
+                                    (when (and (some? x) (not (str/blank? (str x))))
+                                      (str/trim (str x)))))
+                            (or (:subscribed-subnets st) (:subnets st) []))
+        merged-subs (into existing-subs (map str (or default-subnets #{})))]
+    (cond-> (assoc st :subscribed-subnets merged-subs)
+      (pos? best-ep) (assoc :epoch best-ep :epoch-initialized? true))))
+
+
 
 

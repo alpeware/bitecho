@@ -248,7 +248,11 @@
                                (update-in [:light-state :inbox] #(vec (or % [])))
                                (assoc-in [:light-state :bootstrap] default-bootstrap-descriptor)
                                (assoc-in [:light-state :max-epoch-skew]
-                                         (or (get-in loaded [:light-state :max-epoch-skew]) 15)))]
+                                         (or (get-in loaded [:light-state :max-epoch-skew]) 15))
+                               (update :light-state
+                                       browser/normalize-restored-light-state
+                                       #{"bitecho.org/dev" "bitecho.org/team" "bitecho.org/infra"
+                                         "chat/simon-nexus-axiom" "devnet.bitecho.org" "global"}))]
           (swap! node-atom
                  (fn [curr]
                    (let [curr-kp (:keypair curr)

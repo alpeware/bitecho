@@ -669,3 +669,24 @@
                        (some #{sub-name} (:subscribed-subnets st-restored))
                        (nil? (get-in r2 ["snapshot" :private-key]))
                        (nil? (get-in r2 ["snapshot" "private-key"]))))))
+
+(defspec ^{:doc "Rule 1 Property: normalize-restored-light-state always advances :epoch to at
+                 least max(:epoch, account.finalized-epoch, chain-state-snapshots finalized-epoch)
+                 and preserves/merges default circle subnets so restored browser nodes never
+                 drop broadcasts or stamp stale offers."}
+  prop-normalize-restored-light-state-advances-epoch-and-preserves-subnets 40
+  (prop/for-all [saved-ep (gen/choose 100 50000)
+                 snap-delta (gen/choose 0 500)
+                 custom-sub (gen/not-empty gen/string-alphanumeric)]
+                (let [snap-ep (+ saved-ep snap-delta)
+                      defaults #{"bitecho.org/dev" "chat/simon-nexus-axiom" "global"}
+                      st {:epoch saved-ep
+                          :account {:finalized-epoch saved-ep}
+                          :chain-state-snapshots {"val1" {:finalized-epoch snap-ep}}
+                          :subscribed-subnets [custom-sub]}
+                      norm (browser/normalize-restored-light-state st defaults)]
+                  (and (= snap-ep (:epoch norm))
+                       (true? (:epoch-initialized? norm))
+                       (contains? (:subscribed-subnets norm) custom-sub)
+                       (contains? (:subscribed-subnets norm) "chat/simon-nexus-axiom")
+                       (contains? (:subscribed-subnets norm) "bitecho.org/dev")))))
