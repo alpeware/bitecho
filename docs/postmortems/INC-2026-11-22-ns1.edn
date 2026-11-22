@@ -1,0 +1,55 @@
+{:schema :bitecho/incident-postmortem-v1
+ :incident-id "INC-2026-11-22-ns1"
+ :severity :sev-2
+ :window-utc "2026-11-22T11:09:25Z/2026-11-22T12:44:08Z"
+ :window-cst "2026-11-22 05:09:25 CST -> 06:44:08 CST"
+ :ns1-unreachable-window-cst "2026-11-22 05:09:25 CST -> 06:38:02 CST"
+ :ns1-unreachable-min 88.6
+ :client-recovery-window-cst "2026-11-22 05:09:25 CST -> 06:44:08 CST"
+ :client-downtime-min 94.7
+ :detection-lag-min 22.4
+ :twin-circle-receipt {:shaped-proposal-cid-prefix "567a6113"
+                       :rendered-bip-path "bips/bip-018-draft1.md"
+                       :rendered-bip-cid "75ce46a03d02bad388ec87bf7a5b94d0c236da61230822258e83d5a75a9e74bb"}
+ :slo-breakdown {:consensus-finality {:target-pct 99.9999
+                                      :finality-halt-sec 0.0
+                                      :cluster-telemetry-breach-sec 45.6
+                                      :telemetry-budget-remaining-ms 86
+                                      :six-nines-met? false
+                                      :error-budget-burn-pct 99.81}
+                 :edge-fleet {:target-pct 99.99
+                              :degraded-nodes ["ns1.bitecho.org"]
+                              :healthy-nodes ["ns2.bitecho.org" "ns3.bitecho.org"]
+                              :ns1-unreachable-min 88.6
+                              :error-budget-burn-pct 0.0}
+                 :single-relay-client {:target-pct 99.9
+                                       :measured-downtime-min 94.7
+                                       :window-cst "05:09:25 -> 06:44:08 CST"
+                                       :cluster-telemetry-breach-sec 45.6
+                                       :error-budget-burn-pct 219.2}}
+ :hypotheses [{:claim "128 MiB hot-cache cap, raw byte-array stdout logging, and SSH brute-force churn exhausted e2-micro RAM on ns1"
+               :status :verified}
+              {:claim "Consensus chain halted globally during ns1 outage"
+               :status :falsified
+               :falsifier "ns2 and ns3 continuously finalized epochs throughout 05:09:25 -> 06:44:08 CST (relay-degraded, not chain-stalled)"}
+              {:claim "Authoritative DNS expiry caused single-relay client disconnect"
+               :status :falsified
+               :falsifier "ns2/ns3 DNS resolved normally; clients were pinned to ns1 as sole --relay-url without multi-relay failover"}]
+ :action-items [{:bip-id "BIP-018"
+                 :track :track-1
+                 :summary "Fleet SSH key-only hardening with pre-reload key-only login check, 60s /statusz watchdog, and OOMScoreAdjust"
+                 :invariant-test "bitecho.d45-bip018-hardening-and-failover-test/test-bip018-canonical-postmortem-and-hardening-script"}
+                {:bip-id "BIP-018"
+                 :track :track-2
+                 :summary "32 MiB infra hot-cache cap, <=16 MiB pinned web-app isolation, atomic disk writes, zero raw byte-array stdout logging"
+                 :invariant-test "bitecho.d45-bip018-hardening-and-failover-test/prop-blob-store-32mb-hot-cap-and-pinned-app-isolation"}
+                {:bip-id "BIP-018"
+                 :track :track-3
+                 :summary "Pure Sans-IO relay pool failover, stale-epoch demotion, mechanical stall classifier, --relay-urls/--quorum CLI, browser per-chunk failover"
+                 :invariant-test "bitecho.d45-bip018-hardening-and-failover-test/prop-relay-pool-failover-cooldown-stale-gen-and-stale-epoch"}
+                {:bip-id "BIP-018"
+                 :track :track-4
+                 :summary "Public GET /status with 5s cached ~2 KiB snapshot, 60 req/min/IP rate limiter, and :bitecho/incident-postmortem-v1 schema"
+                 :invariant-test "bitecho.d45-bip018-hardening-and-failover-test/prop-postmortem-record-schema-and-status-rate-limit"}]
+ :evidence-cids ["75ce46a03d02bad388ec87bf7a5b94d0c236da61230822258e83d5a75a9e74bb"
+                 "2b6d6a6a794ef168a00184faf35d3b77efb083c24671e3ff1092a432405f9448"]}

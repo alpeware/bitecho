@@ -13,6 +13,7 @@
             [bitecho.fressian :as fressian]
             [bitecho.light-node.cli :as cli]
             [bitecho.light-node.core :as light-core]
+            [bitecho.net.relay-pool :as relay-pool]
             [bitecho.shell.browser :as browser]
             [bitecho.storage.chunk-constants :as chunk-const]
             [bitecho.storage.chunk-fetch :as chunk-fetch]
@@ -3282,7 +3283,10 @@
    (let [opts-clj (js-params->clj-map opts)
          na (or (:node-atom opts-clj) (get opts-clj "nodeAtom") @active-node-atom)
          raw-cid (str/lower-case (str/trim (str (or manifest-cid ""))))
-         mirrors (vec (or (:mirrors opts-clj)
+         mirrors (vec (or (:relay-urls opts-clj)
+                          (get opts-clj "relayUrls")
+                          (get opts-clj "relay_urls")
+                          (:mirrors opts-clj)
                           (get opts-clj "mirrors")
                           (:base-urls opts-clj)
                           (get opts-clj "baseUrls")
@@ -3369,6 +3373,7 @@
                       (js/Promise.
                        (fn [resolve _reject]
                          (let [st-atom (atom (:state init-res))
+                               pool-atom (atom (relay-pool/init-relay-pool mirrors {:generation 1}))
                                staged-bytes-atom (atom {})
                                ordered-chunks-atom (atom [])
                                done-atom (atom false)]
@@ -3376,6 +3381,15 @@
                                      (when-not @done-atom
                                        (reset! done-atom true)
                                        (resolve res-obj)))
+                                   (record-pool-event! [ev]
+                                     (let [effs-box (atom [])]
+                                       (swap! pool-atom
+                                              (fn [p]
+                                                (let [[p' effs] (relay-pool/transition p ev)]
+                                                  (reset! effs-box effs)
+                                                  p')))
+                                       (doseq [d @effs-box]
+                                         (emit-diag! d))))
                                    (run-effects! [effs]
                                      (doseq [eff effs]
                                        (when-not @done-atom
@@ -3393,20 +3407,25 @@
                                                              "totalSha256" (:total-sha256 st)
                                                              "totalBytes" (:total-bytes st)
                                                              "bytes" assembled
-                                                             "diagnostics" (clj->js (:diagnostics st))}))
+                                                             "diagnostics" (clj->js (:diagnostics st))
+                                                             "relayPoolDiagnostics" (clj->js (:diagnostics @pool-atom))}))
 
                                              (= :chunked-artifact-failed (:event eff))
                                              (let [st @st-atom]
                                                (finish! #js {"ok" false
                                                              "error" (name (or (:reason eff) :chunked-artifact-failed))
                                                              "manifestCid" (:manifest-cid st)
-                                                             "diagnostics" (clj->js (:diagnostics st))})))
+                                                             "diagnostics" (clj->js (:diagnostics st))
+                                                             "relayPoolDiagnostics" (clj->js (:diagnostics @pool-atom))})))
 
                                            :fetch-chunk
                                            (let [idx (:index eff)
                                                  cid (:cid eff)
-                                                 mirror (:mirror eff)
+                                                 now-ms (.now js/Date)
+                                                 mirror (or (relay-pool/select-healthy-relay @pool-atom now-ms #{})
+                                                            (:mirror eff))
                                                  gen (:generation eff)
+                                                 pool-gen (:generation @pool-atom)
                                                  url (str (str/replace mirror #"/+$" "") "/artifact/v1/blob/" cid)]
                                              (-> (fetch-fn url)
                                                  (.then (fn [resp]
@@ -3414,7 +3433,13 @@
                                                             (-> (.arrayBuffer resp)
                                                                 (.then (fn [ab]
                                                                          (let [u8 (js/Uint8Array. ab)
-                                                                               actual-cid (crypto/sha256-hex u8)]
+                                                                               actual-cid (crypto/sha256-hex u8)
+                                                                               done-ms (.now js/Date)]
+                                                                           (record-pool-event! {:type :request-ok
+                                                                                                :url mirror
+                                                                                                :rtt-ms (max 0 (- done-ms now-ms))
+                                                                                                :generation pool-gen
+                                                                                                :now-ms done-ms})
                                                                            (swap! staged-bytes-atom assoc idx u8)
                                                                            (let [[ns next-effs]
                                                                                  (chunk-fetch/transition @st-atom
@@ -3427,27 +3452,45 @@
                                                                              (reset! st-atom ns)
                                                                              (run-effects! next-effs))))))
                                                             (let [status (if resp (.-status resp) 0)
-                                                                  [ns next-effs]
-                                                                  (chunk-fetch/transition @st-atom
-                                                                                          {:type :chunk-http-error
-                                                                                           :generation gen
-                                                                                           :index idx
-                                                                                           :mirror mirror
-                                                                                           :status status
-                                                                                           :reason (str "http-" status)})]
-                                                              (reset! st-atom ns)
-                                                              (run-effects! next-effs)))))
+                                                                  reason (str "http-" status)
+                                                                  fail-ms (.now js/Date)]
+                                                              (record-pool-event! {:type :request-failed
+                                                                                   :url mirror
+                                                                                   :status status
+                                                                                   :error reason
+                                                                                   :chunk-idx idx
+                                                                                   :generation pool-gen
+                                                                                   :now-ms fail-ms})
+                                                              (let [[ns next-effs]
+                                                                    (chunk-fetch/transition @st-atom
+                                                                                            {:type :chunk-http-error
+                                                                                             :generation gen
+                                                                                             :index idx
+                                                                                             :mirror mirror
+                                                                                             :status status
+                                                                                             :reason reason})]
+                                                                (reset! st-atom ns)
+                                                                (run-effects! next-effs))))))
                                                  (.catch (fn [err]
-                                                           (let [[ns next-effs]
-                                                                 (chunk-fetch/transition @st-atom
-                                                                                         {:type :chunk-http-error
-                                                                                          :generation gen
-                                                                                          :index idx
-                                                                                          :mirror mirror
-                                                                                          :status 0
-                                                                                          :reason (str (or (when err (.-message err)) err "fetch-error"))})]
-                                                             (reset! st-atom ns)
-                                                             (run-effects! next-effs))))))
+                                                           (let [reason (str (or (when err (.-message err)) err "fetch-error"))
+                                                                 fail-ms (.now js/Date)]
+                                                             (record-pool-event! {:type :request-failed
+                                                                                  :url mirror
+                                                                                  :status 0
+                                                                                  :error reason
+                                                                                  :chunk-idx idx
+                                                                                  :generation pool-gen
+                                                                                  :now-ms fail-ms})
+                                                             (let [[ns next-effs]
+                                                                   (chunk-fetch/transition @st-atom
+                                                                                           {:type :chunk-http-error
+                                                                                            :generation gen
+                                                                                            :index idx
+                                                                                            :mirror mirror
+                                                                                            :status 0
+                                                                                            :reason reason})]
+                                                               (reset! st-atom ns)
+                                                               (run-effects! next-effs)))))))
 
                                            :digest-chunk
                                            (let [idx (:index eff)

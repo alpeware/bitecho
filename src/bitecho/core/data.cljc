@@ -18,8 +18,16 @@
 (def ^:private bytes? fressian/bytes?)
 
 (def default-max-hot-bytes
-  "Default maximum hot in-memory Blob byte budget (128 MiB for 1 GB e2-micro nodes)."
+  "Default maximum hot in-memory Blob byte budget (128 MiB general default)."
   (* 128 1024 1024))
+
+(def default-infra-max-hot-bytes
+  "Default maximum hot in-memory Blob byte budget for 1 GB e2-micro infra nodes (32 MiB, BIP-018 Track 2)."
+  (* 32 1024 1024))
+
+(def default-pinned-app-max-bytes
+  "Default maximum hot byte budget for pinned web-app release blobs (16 MiB, BIP-018 Track 2)."
+  (* 16 1024 1024))
 
 (def default-max-unpinned-bytes
   "Default maximum logical byte budget for unpinned Blobs (128 MiB)."
@@ -69,14 +77,18 @@
    {:entries {}
     :hot-bytes 0
     :unpinned-bytes 0
+    :pinned-app-bytes 0
     :access-seq 0
     :max-hot-bytes (long (or (:max-hot-bytes opts) default-max-hot-bytes))
     :max-unpinned-bytes (long (or (:max-unpinned-bytes opts) default-max-unpinned-bytes))
+    :max-pinned-app-bytes (long (or (:max-pinned-app-bytes opts) default-pinned-app-max-bytes))
     :diagnostics {:cid-mismatch 0
                   :cache-misses 0
                   :dangling-pointers 0
                   :evicted-unpinned 0
-                  :evicted-hot 0}}))
+                  :evicted-hot 0
+                  :blob-hot-evicted 0
+                  :pinned-app-cap-exceeded 0}}))
 
 (defn has-blob?
   "Returns true if CID is logically tracked in the Blob store (either hot in RAM or cold/pinned)."
@@ -112,27 +124,51 @@
                          (update-in [:diagnostics :evicted-unpinned] (fnil inc 0)))))
             st))))))
 
-(defn- evict-hot-ram-lru
+(defn evict-hot-lru
   "Demotes hot `:bytes` to `nil` (cold metadata) in oldest-access-first order until :hot-bytes <= :max-hot-bytes.
-   Pinned entries keep their metadata and pin count in `:entries` so subsequent reads emit `:fetch-blob`."
-  [store keep-cid]
-  (let [max-h (long (:max-hot-bytes store default-max-hot-bytes))]
-    (loop [st store]
-      (if (<= (long (:hot-bytes st 0)) max-h)
-        st
-        (let [candidates (->> (:entries st)
-                              (keep (fn [[cid entry]]
-                                      (when (and (some? (:bytes entry))
-                                                 (not= cid keep-cid))
-                                        [cid entry])))
-                              (sort-by (fn [[cid entry]] [(:last-access entry 0) cid])))]
-          (if-let [[victim-cid victim] (first candidates)]
-            (let [sz (long (:size victim 0))]
-              (recur (-> st
-                         (assoc-in [:entries victim-cid :bytes] nil)
-                         (update :hot-bytes #(max 0 (- (long (or % 0)) sz)))
-                         (update-in [:diagnostics :evicted-hot] (fnil inc 0)))))
-            st))))))
+   Protects `:app-pinned?` web-app entries while any non-app-pinned hot entry is available, keeping pinned
+   web-app blobs isolated under their separate `<= 16 MiB` cap. Emits counted `:diagnose` `{:reason :blob-hot-evicted}`
+   effects for every evicted blob. Returns `[updated-store effects]`."
+  ([store]
+   (evict-hot-lru store nil))
+  ([store keep-cid]
+   (let [max-h (long (:max-hot-bytes store default-max-hot-bytes))]
+     (loop [st store
+            effs []]
+       (if (<= (long (:hot-bytes st 0)) max-h)
+         [st effs]
+         (let [regular-cands (->> (:entries st)
+                                  (keep (fn [[cid entry]]
+                                          (when (and (some? (:bytes entry))
+                                                     (not (:app-pinned? entry))
+                                                     (not= cid keep-cid))
+                                            [cid entry])))
+                                  (sort-by (fn [[cid entry]] [(:last-access entry 0) cid])))
+               candidates (if (seq regular-cands)
+                            regular-cands
+                            (->> (:entries st)
+                                 (keep (fn [[cid entry]]
+                                         (when (and (some? (:bytes entry))
+                                                    (not= cid keep-cid))
+                                           [cid entry])))
+                                 (sort-by (fn [[cid entry]] [(:last-access entry 0) cid]))))]
+           (if-let [[victim-cid victim] (first candidates)]
+             (let [sz (long (:size victim 0))
+                   was-app-pinned? (boolean (:app-pinned? victim))
+                   diag {:effect :diagnose
+                         :type :diagnose
+                         :reason :blob-hot-evicted
+                         :cid victim-cid
+                         :size sz}]
+               (recur (-> st
+                          (assoc-in [:entries victim-cid :bytes] nil)
+                          (update :hot-bytes #(max 0 (- (long (or % 0)) sz)))
+                          (cond-> was-app-pinned?
+                            (update :pinned-app-bytes #(max 0 (- (long (or % 0)) sz))))
+                          (update-in [:diagnostics :evicted-hot] (fnil inc 0))
+                          (update-in [:diagnostics :blob-hot-evicted] (fnil inc 0)))
+                      (conj effs diag)))
+             [st effs])))))))
 
 (defn put-blob
   "Purely inserts or warms a Blob in store after verifying `sha256(:blob/bytes) == :blob/cid`.
@@ -180,23 +216,73 @@
                            (assoc-in [:entries norm-cid :media-type] resolved-mt))
                 :effects []}
                (let [pins (long (or (:pins existing) 0))
+                     app-pinned? (boolean (:app-pinned? existing))
                      was-present? (some? existing)
                      entry {:cid norm-cid
                             :media-type resolved-mt
                             :bytes bs
                             :size sz
                             :pins pins
+                            :app-pinned? app-pinned?
                             :last-access next-seq}
                      st1 (-> store
                              (assoc :access-seq next-seq)
                              (assoc-in [:entries norm-cid] entry)
                              (update :hot-bytes (fnil + 0) sz)
+                             (cond-> app-pinned?
+                               (update :pinned-app-bytes (fnil + 0) sz))
                              (cond-> (and (not was-present?) (zero? pins))
                                (update :unpinned-bytes (fnil + 0) sz)))
-                     st2 (-> st1
-                             (evict-unpinned-lru norm-cid)
-                             (evict-hot-ram-lru norm-cid))]
-                 {:ok? true :cid norm-cid :store st2 :effects []})))))))))
+                     st2 (evict-unpinned-lru st1 norm-cid)
+                     [st3 evict-effs] (evict-hot-lru st2 norm-cid)]
+                 {:ok? true :cid norm-cid :store st3 :effects evict-effs})))))))))
+
+(defn pin-app-blob
+  "Pins a web-app release blob under the isolated `<= max-pinned-app-bytes` (`16 MiB`) cap.
+   Fails closed with a counted `:diagnose` `{:reason :pinned-app-cap-exceeded}` if pinning would exceed the cap.
+   Returns `{:ok? bool :cid cid :store store :effects [...]}`."
+  [store cid]
+  (if (or (nil? cid) (str/blank? (str cid)))
+    {:ok? false :error :invalid-cid :store store :effects []}
+    (let [norm-cid (str/lower-case (str/trim (str cid)))
+          existing (get-in store [:entries norm-cid])
+          sz (long (or (:size existing) 0))
+          max-app (long (or (:max-pinned-app-bytes store) default-pinned-app-max-bytes))
+          curr-app (long (or (:pinned-app-bytes store) 0))
+          already-app? (boolean (:app-pinned? existing))]
+      (cond
+        already-app?
+        {:ok? true :cid norm-cid :store store :effects []}
+
+        (> (+ curr-app sz) max-app)
+        (let [diag {:effect :diagnose
+                    :type :diagnose
+                    :reason :pinned-app-cap-exceeded
+                    :cid norm-cid
+                    :size sz
+                    :pinned-app-bytes curr-app
+                    :max-pinned-app-bytes max-app}
+              st' (update-in store [:diagnostics :pinned-app-cap-exceeded] (fnil inc 0))]
+          {:ok? false :error :pinned-app-cap-exceeded :cid norm-cid :store st' :effects [diag]})
+
+        :else
+        (let [prev-pins (long (or (:pins existing) 0))
+              st' (if existing
+                    (-> store
+                        (assoc-in [:entries norm-cid :app-pinned?] true)
+                        (assoc-in [:entries norm-cid :pins] (inc prev-pins))
+                        (update :pinned-app-bytes (fnil + 0) sz)
+                        (cond-> (zero? prev-pins)
+                          (update :unpinned-bytes #(max 0 (- (long (or % 0)) sz)))))
+                    (assoc-in store [:entries norm-cid]
+                              {:cid norm-cid
+                               :media-type "application/octet-stream"
+                               :bytes nil
+                               :size 0
+                               :pins 1
+                               :app-pinned? true
+                               :last-access (long (:access-seq store 0))}))]
+          {:ok? true :cid norm-cid :store st' :effects []})))))
 
 (defn pin-blob
   "Increments the pin reference count for `cid` (creating a cold pinned placeholder if not yet fetched)."

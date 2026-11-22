@@ -32,6 +32,7 @@
             [bitecho.host.core :as host]
             [bitecho.light-node.core :as light-core]
             [bitecho.observability.core :as obs]
+            [bitecho.ops.incident :as incident]
             [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
             [bitecho.storage.app-release :as app-release]
@@ -59,6 +60,8 @@
 
 (def ^:private obs-router-atom (atom (obs/init-sink-router {:node-id "full-node"})))
 (def ^:private defense-state-atom (atom (defense/init-defense-state)))
+(def ^:private status-rate-limiter-atom (atom (incident/init-status-rate-limiter)))
+(def ^:private status-snapshot-cache-atom (atom {:json nil :updated-at-ms 0}))
 (def ^:private poll-telemetry-atom (atom {:poll-count 0 :last-sample-ms 0 :last-heap-used 0}))
 (def ^:private validator-event-error-count (atom 0))
 (def ^:private runtime-metrics-atom
@@ -178,11 +181,49 @@
       (.update buf)
       (.digest "hex")))
 
+(defn- raw-byte-array?
+  [v]
+  (or (instance? js/Uint8Array v)
+      (.isBuffer js/Buffer v)))
+
+(defn- sanitize-log-payload
+  "Strips raw byte arrays (`:bytes`, `:blob/bytes`, `Uint8Array`, `Buffer`) from stdout/stderr JSON logs,
+   preserving only `{:cid :size_bytes :media_type}` metadata (BIP-018 Track 2)."
+  [v]
+  (cond
+    (raw-byte-array? v)
+    {:size_bytes (.-length v)}
+
+    (map? v)
+    (let [raw-bs (or (:blob/bytes v) (:bytes v) (get v "blob/bytes") (get v "bytes"))]
+      (if (and (some? raw-bs) (raw-byte-array? raw-bs))
+        (cond-> {:size_bytes (.-length raw-bs)}
+          (or (:blob/cid v) (:cid v) (get v "cid"))
+          (assoc :cid (or (:blob/cid v) (:cid v) (get v "cid")))
+          (or (:blob/media-type v) (:media-type v) (:media_type v) (get v "media_type"))
+          (assoc :media_type (or (:blob/media-type v) (:media-type v) (:media_type v) (get v "media_type"))))
+        (reduce-kv (fn [acc k val]
+                     (if (contains? #{:bytes :blob/bytes "bytes" "blob/bytes"} k)
+                       (if (raw-byte-array? val)
+                         (assoc acc :size_bytes (.-length val))
+                         acc)
+                       (assoc acc k (sanitize-log-payload val))))
+                   {}
+                   v)))
+
+    (vector? v)
+    (mapv sanitize-log-payload v)
+
+    (sequential? v)
+    (mapv sanitize-log-payload v)
+
+    :else v))
+
 (defn- log-diagnostic!
   [diag]
   (try
     (.write (.-stderr js/process)
-            (str (js/JSON.stringify (clj->js (assoc diag :ts (.now js/Date)))) "\n"))
+            (str (js/JSON.stringify (clj->js (sanitize-log-payload (assoc diag :ts (.now js/Date))))) "\n"))
     (catch :default _ nil)))
 
 (defn- apply-shell-event!
@@ -1917,6 +1958,56 @@
 
       (and (contains? #{"GET" "HEAD"} method) (= clean-path "/statusz"))
       (send-json! res 200 (build-statusz-payload rt limiter-atom http-shell-atom dns-shell-atom smtp-shell-atom))
+
+      (and (contains? #{"GET" "HEAD"} method) (= clean-path "/status"))
+      (let [client-ip (or (some-> (get-header req "x-forwarded-for") (str/split #",") first str/trim)
+                          (some-> (.-socket req) .-remoteAddress)
+                          "unknown")
+            rl-box (atom nil)
+            _ (swap! status-rate-limiter-atom
+                     (fn [st]
+                       (let [r (incident/check-status-rate-limit st client-ip now-ms)]
+                         (reset! rl-box r)
+                         (:state r))))
+            rl-res @rl-box]
+        (if-not (:allowed? rl-res)
+          (do
+            (when (:diagnose rl-res)
+              (apply-shell-event! http-shell-atom (:diagnose rl-res)))
+            (let [body-str (js/JSON.stringify #js {:ok false :error "rate-limited" :retry_after_sec (:retry-after-sec rl-res)})
+                  buf (.from js/Buffer body-str "utf8")]
+              (.writeHead res 429 #js {"Content-Type" "application/json"
+                                       "Content-Length" (.-length buf)
+                                       "Retry-After" (str (:retry-after-sec rl-res))
+                                       "Cache-Control" "no-store"})
+              (if (= method "HEAD") (.end res) (.end res buf))))
+          (let [cached @status-snapshot-cache-atom
+                fresh-json (if (and (:json cached) (< (- now-ms (long (:updated-at-ms cached 0))) 5000))
+                             (:json cached)
+                             (let [sub @(:subnet-atom rt)
+                                   le (:leader-election sub)
+                                   peers (get-in (:config rt) [:cluster :nodes] {})
+                                   relays (mapv (fn [[nid cfg]]
+                                                  {:url (or (:http-url cfg) (str "https://" (name nid) ".bitecho.org"))
+                                                   :status (if (contains? (or (:healthy-nodes le) #{}) nid) :healthy :degraded)
+                                                   :ewma-rtt-ms 0.0
+                                                   :finalized-epoch (long (or @(:epoch-atom rt) 0))})
+                                                peers)
+                                   rel-seq (long (or (get-in sub [:data :pointers ["bitecho.org/infra" "web/app/release"] :pointer/seq]) 0))
+                                   snap (incident/build-status-snapshot
+                                         {:finalized-epoch (long (or @(:epoch-atom rt) 0))
+                                          :release-seq rel-seq
+                                          :relays relays
+                                          :updated-at-ms now-ms})
+                                   j (js/JSON.stringify (clj->js snap))]
+                               (reset! status-snapshot-cache-atom {:json j :updated-at-ms now-ms})
+                               j))
+                buf (.from js/Buffer fresh-json "utf8")]
+            (.writeHead res 200 #js {"Content-Type" "application/json"
+                                     "Content-Length" (.-length buf)
+                                     "Cache-Control" "public, max-age=5, stale-while-revalidate=10"
+                                     "Access-Control-Allow-Origin" "*"})
+            (if (= method "HEAD") (.end res) (.end res buf)))))
 
       (and (contains? #{"GET" "HEAD"} method) (str/starts-with? raw-path "/.well-known/acme-challenge/"))
       (let [token (subs raw-path (count "/.well-known/acme-challenge/"))
@@ -3812,7 +3903,14 @@
         default-pol (core-infra/default-infra-policy {:trust-anchors trust-anchors
                                                       :cold-pubkey (:cold-pubkey config)
                                                       :threshold (max 1 (min 2 (count trust-anchors)))})
-        init-res (subnet/init-subnet-instance default-pol {:node-id node-id :all-nodes all-nodes})
+        init-res (subnet/init-subnet-instance
+                  default-pol
+                  {:node-id node-id
+                   :all-nodes all-nodes
+                   :max-hot-bytes (or (get-in config [:http :max-hot-bytes])
+                                      data/default-infra-max-hot-bytes)
+                   :max-pinned-app-bytes (or (get-in config [:http :max-pinned-app-bytes])
+                                             data/default-pinned-app-max-bytes)})
         snap (load-pointers-snapshot state-dir rt-shell-atom)
         inst0 (if (and snap (= (:subnet-id (:instance init-res)) (:subnet-id snap)))
                 (reduce (fn [acc [k ptr]]
@@ -4125,7 +4223,12 @@
         ticked (:state (sm/handle-event staged {:type :tick :rng (crypto/make-random 42)}))
         audit-check (deploy/reconstruct-cluster-history-from-audit-trail (:audit-trail ticked) 11)
         policy (core-infra/default-infra-policy {:trust-anchors #{auth-pk} :threshold 1})
-        sub-init (subnet/init-subnet-instance policy {:node-id :ns3 :all-nodes #{:ns1 :ns2 :ns3}})
+        sub-init (subnet/init-subnet-instance
+                  policy
+                  {:node-id :ns3
+                   :all-nodes #{:ns1 :ns2 :ns3}
+                   :max-hot-bytes data/default-infra-max-hot-bytes
+                   :max-pinned-app-bytes data/default-pinned-app-max-bytes})
         blob (data/make-blob (pr-str ptr) "application/edn")
         c-ptr (data/sign-pointer auth-sk {:pointer/authority auth-pk
                                           :pointer/subnet "bitecho.org/infra"

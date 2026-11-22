@@ -1,0 +1,8 @@
+{:schema :bitecho/postmortem-index-v1
+ :updated-at "2026-11-22"
+ :incidents [{:incident-id "INC-2026-11-22-ns1"
+              :severity :sev-2
+              :bip-id "BIP-018"
+              :edn-path "docs/postmortems/INC-2026-11-22-ns1.edn"
+              :md-path "docs/postmortems/INC-2026-11-22-ns1.md"
+              :rendered-bip-cid "75ce46a03d02bad388ec87bf7a5b94d0c236da61230822258e83d5a75a9e74bb"}]}

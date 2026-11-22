@@ -2360,6 +2360,44 @@
           ts-ok? (or (nil? after-ts) (> (or ev-ts 0) (or after-ts 0)))]
       (boolean (and waitable? sid-ok? subnet-ok? seq-ok? bseq-ok? ts-ok?)))))
 
+(defn- raw-byte-array?
+  [v]
+  (or (instance? js/Uint8Array v)
+      (.isBuffer js/Buffer v)))
+
+(defn- sanitize-stdout-log-data
+  "Strips raw byte arrays (`:bytes`, `:blob/bytes`, `Uint8Array`, `Buffer`) from stdout/events JSONL logs,
+   preserving only `{:cid :size_bytes :media_type}` metadata (BIP-018 Track 2 / Twin Edge Case #1)."
+  [v]
+  (cond
+    (raw-byte-array? v)
+    {"size_bytes" (.-length v)}
+
+    (map? v)
+    (let [raw-bs (or (:blob/bytes v) (:bytes v) (get v "blob/bytes") (get v "bytes"))]
+      (if (and (some? raw-bs) (raw-byte-array? raw-bs))
+        (cond-> {"size_bytes" (.-length raw-bs)}
+          (or (:blob/cid v) (:cid v) (get v "cid"))
+          (assoc "cid" (or (:blob/cid v) (:cid v) (get v "cid")))
+          (or (:blob/media-type v) (:media-type v) (:media_type v) (get v "media_type"))
+          (assoc "media_type" (or (:blob/media-type v) (:media-type v) (:media_type v) (get v "media_type"))))
+        (reduce-kv (fn [acc k val]
+                     (if (contains? #{:bytes :blob/bytes "bytes" "blob/bytes"} k)
+                       (if (raw-byte-array? val)
+                         (assoc acc "size_bytes" (.-length val))
+                         acc)
+                       (assoc acc k (sanitize-stdout-log-data val))))
+                   {}
+                   v)))
+
+    (vector? v)
+    (mapv sanitize-stdout-log-data v)
+
+    (sequential? v)
+    (mapv sanitize-stdout-log-data v)
+
+    :else v))
+
 (defn- write-json-str
   [data]
   (js/JSON.stringify (clj->js data)))
@@ -2371,18 +2409,21 @@
     (let [p (str events-out-path)
           parent (.dirname node-path p)
           _ (when parent (.mkdirSync node-fs parent #js {:recursive true}))
-          enriched (if (or (contains? data "timestamp_ms") (contains? data :timestamp-ms))
-                     data
-                     (assoc data "timestamp_ms" (js/Date.now)))]
+          safe-data (sanitize-stdout-log-data data)
+          enriched (if (or (contains? safe-data "timestamp_ms") (contains? safe-data :timestamp-ms))
+                     safe-data
+                     (assoc safe-data "timestamp_ms" (js/Date.now)))]
       (.appendFileSync node-fs p (str (write-json-str enriched) "\n") "utf8"))))
 
 (defn emit-json-line!
-  "Writes `data` as a JSON line to `process.stdout` and optionally mirrors to `events-out-path`."
+  "Writes `data` as a JSON line to `process.stdout` and optionally mirrors to `events-out-path`.
+   Sanitizes raw byte arrays so `artifact-replicated` / `put` logs never dump raw Uint8Arrays."
   ([data] (emit-json-line! data nil))
   ([data events-out-path]
-   (.write (.-stdout js/process) (str (write-json-str data) "\n"))
-   (when events-out-path
-     (try (append-event-jsonl! events-out-path data) (catch :default _ nil)))))
+   (let [safe-data (sanitize-stdout-log-data data)]
+     (.write (.-stdout js/process) (str (write-json-str safe-data) "\n"))
+     (when events-out-path
+       (try (append-event-jsonl! events-out-path safe-data) (catch :default _ nil))))))
 
 (defn read-new-cmd-file-lines!
   "Reads newly appended complete UTF-8 lines or balanced JSON objects from `cmd-file-path` starting at byte `offset`."

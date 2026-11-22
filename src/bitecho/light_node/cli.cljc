@@ -220,7 +220,7 @@
 
 (def known-command-flags
   "Inventory of all supported CLI flags across Bitecho shells (Rule 6)."
-  ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--subnet-id" "--subnet"
+  ["--state-dir" "--control-port" "--bootstrap" "--relay-url" "--relay-urls" "--quorum" "--subnet-id" "--subnet"
    "--subscribe-subnets" "--subnets" "--transport" "--proxy" "--timeout-ms" "--max-epoch-skew"
    "--cmd-file" "--events-out" "--session-id" "--session" "--min-seq" "--min-broadcast-seq"
    "--cursor" "--after-ts" "--min-balance"
@@ -406,6 +406,23 @@
             (recur next-rem (assoc opts flag-name val) args))
           (recur (rest rem-tokens) opts (conj args tok)))))))
 
+(defn- extract-relay-urls
+  [tokens]
+  (let [raw (extract-flag-value tokens "--relay-urls" nil)]
+    (cond
+      (sequential? raw) (vec (remove str/blank? (map #(str/trim (str %)) raw)))
+      (and (string? raw) (not (str/blank? raw)))
+      (vec (remove str/blank? (map str/trim (str/split raw #","))))
+      :else nil)))
+
+(defn- assoc-relay-pool-flags
+  [m tokens]
+  (let [relay-urls (extract-relay-urls tokens)
+        quorum (extract-long-flag tokens "--quorum" nil)]
+    (cond-> m
+      (seq relay-urls) (assoc "relay_urls" relay-urls)
+      (some? quorum) (assoc "quorum" quorum))))
+
 ;; =============================================================================
 ;; 4. Command Map Construction
 ;; =============================================================================
@@ -417,7 +434,7 @@
                        (rest tokens)
                        tokens)]
     (case verb
-      "status"   {"cmd" "status"}
+      "status"   (assoc-relay-pool-flags {"cmd" "status"} clean-tokens)
       "identity" {"cmd" "identity"}
       "discover" {"cmd" "discover"}
       "help"     {"cmd" "help"}
@@ -1303,15 +1320,16 @@
             relay-url (extract-flag-value clean-tokens "--relay-url" nil)
             owner-pk (extract-flag-value clean-tokens "--owner-pubkey" nil)
             m {"cmd" "artifact-put-chunked" "subnet_id" sub}]
-        (cond-> m
-          path (assoc "path" path)
-          file (assoc "file" file)
-          chunk-size (assoc "chunk_size" chunk-size)
-          concurrency (assoc "concurrency" concurrency)
-          grace-epochs (assoc "grace_epochs" grace-epochs)
-          max-bytes (assoc "max_bytes" max-bytes)
-          relay-url (assoc "relay_url" relay-url)
-          owner-pk (assoc "owner_pubkey" owner-pk)))
+        (-> (cond-> m
+              path (assoc "path" path)
+              file (assoc "file" file)
+              chunk-size (assoc "chunk_size" chunk-size)
+              concurrency (assoc "concurrency" concurrency)
+              grace-epochs (assoc "grace_epochs" grace-epochs)
+              max-bytes (assoc "max_bytes" max-bytes)
+              relay-url (assoc "relay_url" relay-url)
+              owner-pk (assoc "owner_pubkey" owner-pk))
+            (assoc-relay-pool-flags clean-tokens)))
 
       "artifact-get-chunked"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
@@ -1327,15 +1345,16 @@
             max-bytes (extract-long-flag clean-tokens "--max-bytes" nil)
             relay-url (extract-flag-value clean-tokens "--relay-url" nil)
             m {"cmd" "artifact-get-chunked" "subnet_id" sub}]
-        (cond-> m
-          cid (assoc "cid" cid)
-          path (assoc "path" path)
-          out-file (assoc "out_file" out-file)
-          chunk-size (assoc "chunk_size" chunk-size)
-          concurrency (assoc "concurrency" concurrency)
-          resume-dir (assoc "resume_dir" resume-dir)
-          max-bytes (assoc "max_bytes" max-bytes)
-          relay-url (assoc "relay_url" relay-url)))
+        (-> (cond-> m
+              cid (assoc "cid" cid)
+              path (assoc "path" path)
+              out-file (assoc "out_file" out-file)
+              chunk-size (assoc "chunk_size" chunk-size)
+              concurrency (assoc "concurrency" concurrency)
+              resume-dir (assoc "resume_dir" resume-dir)
+              max-bytes (assoc "max_bytes" max-bytes)
+              relay-url (assoc "relay_url" relay-url))
+            (assoc-relay-pool-flags clean-tokens)))
 
       "artifact-manifest-verify"
       (let [cid (extract-flag-value clean-tokens "--cid" nil)
@@ -1428,16 +1447,17 @@
                      (extract-flag-value clean-tokens "--pubkey" nil))
             cid (extract-flag-value clean-tokens "--cid" nil)
             m {"cmd" "artifact-put" "subnet_id" sub}]
-        (cond-> m
-          path (assoc "path" path)
-          file (assoc "file" file)
-          text (assoc "text" text "data" text)
-          hex (assoc "hex" hex "data_hex" hex)
-          seq-num (assoc "seq" seq-num)
-          (some? b) (assoc "burn" b)
-          relay-url (assoc "relay_url" relay-url)
-          auth (assoc "authority" auth)
-          cid (assoc "cid" cid)))
+        (-> (cond-> m
+              path (assoc "path" path)
+              file (assoc "file" file)
+              text (assoc "text" text "data" text)
+              hex (assoc "hex" hex "data_hex" hex)
+              seq-num (assoc "seq" seq-num)
+              (some? b) (assoc "burn" b)
+              relay-url (assoc "relay_url" relay-url)
+              auth (assoc "authority" auth)
+              cid (assoc "cid" cid))
+            (assoc-relay-pool-flags clean-tokens)))
 
       "artifact-get"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)
@@ -1451,12 +1471,13 @@
                          (extract-flag-value clean-tokens "--file" nil))
             relay-url (extract-flag-value clean-tokens "--relay-url" nil)
             m {"cmd" "artifact-get" "subnet_id" sub}]
-        (cond-> m
-          path (assoc "path" path)
-          cid (assoc "cid" cid)
-          auth (assoc "authority" auth)
-          out-file (assoc "out_file" out-file)
-          relay-url (assoc "relay_url" relay-url)))
+        (-> (cond-> m
+              path (assoc "path" path)
+              cid (assoc "cid" cid)
+              auth (assoc "authority" auth)
+              out-file (assoc "out_file" out-file)
+              relay-url (assoc "relay_url" relay-url))
+            (assoc-relay-pool-flags clean-tokens)))
 
       "artifact-list"
       (let [sub (or (extract-flag-value clean-tokens "--subnet-id" nil)

@@ -31,6 +31,7 @@
             [bitecho.d39-bip014-async-io-and-ice-diagnostics-test]
             [bitecho.d40-pupd1-self-update-test]
             [bitecho.d41-bip015-governance-and-docs-test]
+            [bitecho.d45-bip018-hardening-and-failover-test]
             [bitecho.e2e.d29-remediation-scenario-test]
             [bitecho.economy.account-fuzz-test]
             [bitecho.economy.account-test]
