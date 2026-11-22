@@ -19,7 +19,10 @@ description: >-
   * Config: `/etc/bitecho-infra/config.edn` | Init: `/etc/init.d/bitecho-infra`
 * **Validators (`node1..node3`):**
   * User: `bitecho` | Key: `.ssh/bitecho_cluster_ed25519`
-* **Safety constraint:** Never delete `bitecho-gentoo-lab`.
+* **Staging lab (`bitecho-gentoo-lab`, `35.208.41.134`):**
+  * `ssh -i ~/.ssh/google_compute_engine -o IdentitiesOnly=yes simonpure@35.208.41.134`
+  * Spec: `e2-micro` (`940 MiB` RAM), Gentoo `6.18.63-gentoo-dist-bin`, Node `v26.13.1` (exact OS/runtime match with `ns1..ns3`; ideal for 1-node staging/profiling).
+  * **Safety constraint:** Never delete `bitecho-gentoo-lab`.
 
 ## Rolling Upgrades & Release Verification
 1. Roll followers before leader: `ns3 -> ns2 -> ns1`, and `node3 -> node2 -> node1`.
@@ -29,5 +32,5 @@ description: >-
    * Update `legacy.html` CID whenever `bitecho-browser.js` changes.
 
 ## Local Light-Node Event Listener
-* Always use standalone `wait-event` (not `ctl wait-event`, which hits a 15s control-socket timeout):
-  `node dist/bitecho-light-node.cjs light-node wait-event --state-dir /tmp/antigravity-light-node --timeout-ms 3600000 --since-ms $(date +%s%3N)`
+* Always use standalone `wait-event` (not `ctl wait-event`, which hits a 15s control-socket timeout) and pass `--events-out /tmp/antigravity-light-node/stdout.jsonl` (matching the daemon's `--events-out`):
+  `node dist/bitecho-light-node.cjs light-node wait-event --state-dir /tmp/antigravity-light-node --events-out /tmp/antigravity-light-node/stdout.jsonl --timeout-ms 3600000 --since-ms $(date +%s%3N)`
