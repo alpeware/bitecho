@@ -1075,6 +1075,7 @@
             privkey (:private-key (:keypair node))
             st (:light-state node)
             prev-offers (or (:pending-offers st) {})
+            prev-sessions (or (:sessions st) {})
             prev-inbox (vec (get-in st [:inbox] []))
             prev-bcasts (vec (get-in st [:broadcast-inbox] []))
             res (light-core/handle-wire-payload st env privkey)
@@ -1084,7 +1085,8 @@
             new-direct-msgs (subvec curr-inbox (min (count prev-inbox) (count curr-inbox)))
             new-bcast-msgs (subvec curr-bcasts (min (count prev-bcasts) (count curr-bcasts)))
             new-msgs (into new-direct-msgs new-bcast-msgs)
-            curr-offers (or (:pending-offers new-st) {})]
+            curr-offers (or (:pending-offers new-st) {})
+            curr-sessions (or (:sessions new-st) {})]
         (swap! node-atom (fn [curr]
                            (-> curr
                                (assoc :light-state (update new-st :inbox #(vec (or % []))))
@@ -1134,7 +1136,24 @@
                     :callee-pubkey (:callee offer)
                     :price (or (:price offer) 10)
                     :burn (or (:burn offer) 100)
-                    :epoch (or (:epoch offer) 0)})))
+                    :epoch (or (:epoch offer) 0)})
+            (emit-browser-event! node-atom
+                                 {:type "offer-received"
+                                  :session-id sid
+                                  :from (:caller offer)
+                                  :price (or (:price offer) 10)
+                                  :burn (or (:burn offer) 100)
+                                  :epoch (or (:epoch offer) 0)
+                                  :timestamp-ms (.now js/Date)})))
+        (doseq [[sid sess] curr-sessions]
+          (when (not= (:state (get prev-sessions sid)) (:state sess))
+            (emit-browser-event! node-atom
+                                 {:type "session-updated"
+                                  :session-id sid
+                                  :from (:peer sess)
+                                  :phase (:state sess)
+                                  :text (str "session-" (or (:state sess) "updated"))
+                                  :timestamp-ms (.now js/Date)})))
         (doseq [reply-env (:net-envelopes res)]
           (route-browser-envelope! node-atom reply-env))
         (when-let [dial-info (:p2p-dial res)]
