@@ -8,6 +8,7 @@
             [bitecho.light-node.cli :as cli]
             [bitecho.net.relay-pool :as relay-pool]
             [bitecho.ops.incident :as incident]
+            [bitecho.streamlet.core :as streamlet]
             #?(:clj [clojure.edn :as edn])
             #?(:clj [clojure.java.io :as io])
             #?(:clj [clojure.string :as str])
@@ -647,3 +648,45 @@
              "splice-sockets! must drive socket teardown via pure core-infra/transition-passthrough-pair")
          (is (str/includes? src "\"close\"")
              "splice-sockets! must listen on socket close events so paused peers with unread TLS close_notify are destroyed")))))
+
+;; =============================================================================
+;; 10. Streamlet F-EPOCH-1 Block-Depth Poisoning Prevention & Self-Healing
+;; =============================================================================
+
+(defspec ^{:doc "record-block-depth never overwrites cached parent depths or assigns depth > epoch when parent is in :executed-finalized-blocks, and repair-corrupt-block-depths heals any poisoned depth > epoch."}
+  prop-streamlet-block-depth-never-exceeds-epoch-and-self-heals 100
+  (prop/for-all [base-epoch (gen/choose 100 100000)
+                 fin-ahead (gen/choose 1 50)
+                 parent-depth-lag (gen/choose 1 20)]
+                (let [p-epoch base-epoch
+                      p-depth (max 1 (- p-epoch parent-depth-lag))
+                      late-epoch (inc p-epoch)
+                      tip-epoch (+ p-epoch fin-ahead 1)
+                      tip-depth (+ p-depth fin-ahead 1)
+                      fin-watermark (+ p-epoch fin-ahead)
+                      p-hash "parent-exec-root"
+                      late-hash "late-fork-block"
+                      tip-hash "true-tip-block"
+                      state {:blocks {p-hash {:epoch p-epoch :parent-hash "older-root"}
+                                      late-hash {:epoch late-epoch :parent-hash p-hash}
+                                      tip-hash {:epoch tip-epoch :parent-hash "mid-block"}}
+                             :notarized-blocks #{p-hash late-hash tip-hash}
+                             :executed-finalized-blocks #{p-hash}
+                             :last-executed-finalized-epoch fin-watermark
+                             :block-depths {p-hash p-depth
+                                            tip-hash tip-depth}}
+                      s1 (streamlet/record-block-depth state late-hash)
+                      d-late (get-in s1 [:block-depths late-hash])
+                      d-p-after (get-in s1 [:block-depths p-hash])
+                      ;; Also test self-healing a pre-poisoned state where late-hash had depth > late-epoch
+                      poisoned (assoc-in state [:block-depths late-hash] (+ fin-watermark 1))
+                      healed (streamlet/repair-corrupt-block-depths poisoned)
+                      d-healed (get-in healed [:block-depths late-hash])]
+                  (and (= d-p-after p-depth)
+                       (= d-late (inc p-depth))
+                       (<= d-late late-epoch)
+                       (< d-late tip-depth)
+                       (<= d-healed late-epoch)
+                       (< d-healed tip-depth)
+                       (streamlet/longest-notarized-parent? healed tip-hash (inc tip-epoch))
+                       (not (streamlet/longest-notarized-parent? healed late-hash (inc tip-epoch)))))))
