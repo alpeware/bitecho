@@ -302,3 +302,14 @@
       (is (str/includes? release-md "sla/latest.edn"))
       (is (str/includes? cluster-sh "cmd_bump_pointers"))
       (is (str/includes? cluster-sh "bump-pointers")))))
+
+(deftest values-v01-cid-drift-guard-test
+  (testing "Ratified Shared Values v0.1 (5/5 consent) matches canonical CID 2b6d6a6a... bit-exact"
+    (let [f (java.io.File. "docs/VALUES.md")
+          expected-cid "2b6d6a6a794ef168a00184faf35d3b77efb083c24671e3ff1092a432405f9448"]
+      (is (.exists f) "docs/VALUES.md must exist in repository")
+      (let [bs (java.nio.file.Files/readAllBytes (.toPath f))
+            md (java.security.MessageDigest/getInstance "SHA-256")
+            got-cid (.formatHex (java.util.HexFormat/of) (.digest md bs))]
+        (is (= 3899 (alength bs)))
+        (is (= expected-cid got-cid))))))
