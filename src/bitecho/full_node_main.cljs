@@ -954,10 +954,23 @@
         m (inc (.getUTCMonth d))]
     (str y "-" (if (< m 10) (str "0" m) m))))
 
+(defn- current-finalized-epoch
+  "Returns the live consensus finalized epoch from the embedded validator state,
+   falling back to `:epoch-atom` if standalone (fixes BIP-018-SOAK-F2 follower lag)."
+  [rt]
+  (let [vnode (:validator-node rt)
+        vst (when (and vnode (:state-atom vnode)) @(:state-atom vnode))
+        v-fin (long (or (:last-executed-finalized-epoch vst)
+                        (:finalized-epoch vst)
+                        0))
+        rt-ep (long (or @(:epoch-atom rt) 0))]
+    (max v-fin rt-ep)))
+
 (defn- build-statusz-payload
   [rt limiter-atom http-shell-atom dns-shell-atom smtp-shell-atom]
   (let [sub @(:subnet-atom rt)
         le (:leader-election sub)
+        fin-ep (current-finalized-epoch rt)
         egress (long (get-in @limiter-atom [:egress-by-month (current-month-key)] 0))]
     {:ok true
      :runtime "nodejs"
@@ -966,7 +979,8 @@
      :role (name (or (:role le) :standalone))
      :leader (str (or (:leader-id le) :none))
      :term (long (or (:term le) 0))
-     :epoch (long (or @(:epoch-atom rt) 0))
+     :epoch fin-ep
+     :finalized_epoch fin-ep
      :healthy (count (or (:healthy-nodes le) #{}))
      :egress_bytes egress
      :pointer_count (count (get-in sub [:data :pointers]))
@@ -1989,15 +2003,16 @@
                              (let [sub @(:subnet-atom rt)
                                    le (:leader-election sub)
                                    peers (get-in (:config rt) [:cluster :nodes] {})
+                                   fin-ep (current-finalized-epoch rt)
                                    relays (mapv (fn [[nid cfg]]
                                                   {:url (or (:http-url cfg) (str "https://" (name nid) ".bitecho.org"))
                                                    :status (if (contains? (or (:healthy-nodes le) #{}) nid) :healthy :degraded)
                                                    :ewma-rtt-ms 0.0
-                                                   :finalized-epoch (long (or @(:epoch-atom rt) 0))})
+                                                   :finalized-epoch fin-ep})
                                                 peers)
                                    rel-seq (long (or (get-in sub [:data :pointers ["bitecho.org/infra" "web/app/release"] :pointer/seq]) 0))
                                    snap (incident/build-status-snapshot
-                                         {:finalized-epoch (long (or @(:epoch-atom rt) 0))
+                                         {:finalized-epoch fin-ep
                                           :release-seq rel-seq
                                           :relays relays
                                           :updated-at-ms now-ms})
@@ -3963,7 +3978,7 @@
                   {:node-id node-id
                    :all-nodes all-nodes
                    :max-hot-bytes (or (get-in config [:http :max-hot-bytes])
-                                      data/default-infra-max-hot-bytes)
+                                      (* 16 1024 1024))
                    :max-pinned-app-bytes (or (get-in config [:http :max-pinned-app-bytes])
                                              data/default-pinned-app-max-bytes)})
         snap (load-pointers-snapshot state-dir rt-shell-atom)
