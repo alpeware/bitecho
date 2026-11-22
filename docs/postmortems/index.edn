@@ -5,4 +5,10 @@
               :bip-id "BIP-018"
               :edn-path "docs/postmortems/INC-2026-11-22-ns1.edn"
               :md-path "docs/postmortems/INC-2026-11-22-ns1.md"
-              :rendered-bip-cid "75ce46a03d02bad388ec87bf7a5b94d0c236da61230822258e83d5a75a9e74bb"}]}
+              :rendered-bip-cid "75ce46a03d02bad388ec87bf7a5b94d0c236da61230822258e83d5a75a9e74bb"}
+             {:incident-id "INC-2026-11-22-fepoch1"
+              :severity :sev-1
+              :bip-id "BIP-019"
+              :edn-path "docs/postmortems/INC-2026-11-22-fepoch1.edn"
+              :md-path "docs/postmortems/INC-2026-11-22-fepoch1.md"
+              :rendered-bip-cid "1ee44bdd2876041ada0508574d1854d6137ad62fbcedfce768f048f436593e9d"}]}

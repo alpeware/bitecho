@@ -1,0 +1,56 @@
+{:schema :bitecho/incident-postmortem-v1
+ :incident-id "INC-2026-11-22-fepoch1"
+ :title "F-EPOCH-1 Streamlet Finalization Stall via Executed-Root Block-Depth Poisoning"
+ :date "2026-11-22"
+ :severity :sev-1
+ :status :mitigated-provisional
+ :window-utc "2026-11-22T18:10:00Z/2026-11-22T18:30:00Z"
+ :window-cst "2026-11-22 12:10:00 CST -> 12:30:00 CST"
+ :duration-ms-estimated 1200000
+ :sla-recorded-ms-buggy 45766
+ :detection-lag-min 20.0
+ :six-nines-met? false
+ :slo-budget-overrun {:24h-multiple 13888.9
+                      :30d-multiple 463.0
+                      :annual-multiple 38.05}
+ :root-cause "record-block-depth consulted :executed-finalized-blocks before cached :block-depths and seeded depth from :last-executed-finalized-epoch, assigning depth > epoch to a late fork block after skipped epochs and deadlocking longest-notarized-chain selection at epoch 85690."
+ :provisional-mitigation-commit "b52a95cc84fa6c5dad697147e3929baca86332e4"
+ :provisional-bundle-cid "326144883c635255220e77654562ddfabec121135682a7b8f07ea3c20167b09f"
+ :generator-case-added? true
+ :generator-case-var "bitecho.d45-bip018-hardening-and-failover-test/prop-streamlet-block-depth-never-exceeds-epoch-and-self-heals"
+ :slo-breakdown {:consensus-finality {:target-pct 99.9999
+                                      :finality-halt-sec 1200.0
+                                      :sla-recorded-ms-buggy 45766
+                                      :six-nines-met? false
+                                      :error-budget-burn-pct 1388888.9}
+                 :edge-fleet {:target-pct 99.99
+                              :degraded-nodes []
+                              :healthy-nodes ["ns1.bitecho.org" "ns2.bitecho.org" "ns3.bitecho.org"]
+                              :error-budget-burn-pct 0.0}
+                 :single-relay-client {:target-pct 99.9
+                                       :measured-downtime-min 20.0
+                                       :note "Light-node auto-sync reported ok: true, synced: true on 2f+1 agreement over frozen finalized-epoch 85690"
+                                       :error-budget-burn-pct 46.3}}
+ :hypotheses [{:claim "After skipped epochs caused tip-depth < tip-epoch, record-block-depth seeded an older executed parent's depth from :last-executed-finalized-epoch, assigning depth > epoch to a late fork block and deadlocking longest-notarized-chain selection at epoch 85690"
+               :status :verified}
+              {:claim "Deploy restarts cleared :active-stall-started-ms in observability.core/record-startup-event, erasing ~96% of the ~20-minute stall in sla/latest.edn (45,766 ms vs ~1,200,000 ms)"
+               :status :verified}
+              {:claim "Rollback-first SOP to the prior bundle would have resolved F-EPOCH-1 without state repair"
+               :status :falsified
+               :falsifier "Once poisoned depth > epoch was persisted in validator state at epoch 85690, rolling back left the corrupted :block-depths entry intact; repair-corrupt-block-depths was required to restore liveness"}]
+ :action-items [{:bip-id "BIP-019"
+                 :track :s2-streamlet-depth-hardening
+                 :summary "Persist immutable :executed-root-depths across prune-streamlet-state, rebind-restored-state, and ingest-verified-ancestors; emit counted Rule 5 :corrupt-block-depth-repaired diagnostics surfaced in /statusz and digest.edn"
+                 :invariant-test "bitecho.d46-bip019-fepoch1-test/prop-executed-root-depths-preserved-across-prune-and-late-fork"}
+                {:bip-id "BIP-019"
+                 :track :s3-sla-stall-persistence
+                 :summary "Preserve :active-stall-started-ms across restarts in observability.core/record-startup-event so sla/latest.edn records true end-to-end wall-clock stall duration"
+                 :invariant-test "bitecho.d46-bip019-fepoch1-test/prop-observability-stall-persists-across-restarts"}
+                {:bip-id "BIP-019"
+                 :track :s3-light-node-auto-sync-stall-honesty
+                 :summary "Detect frozen finalized-epoch in light-node auto-sync, emit counted Rule 5 :diagnose {:reason :finalized-epoch-stalled}, and surface :stalled? true in ctl status"
+                 :invariant-test "bitecho.d46-bip019-fepoch1-test/prop-light-node-auto-sync-stall-honesty"}]
+ :evidence-cids ["1ee44bdd2876041ada0508574d1854d6137ad62fbcedfce768f048f436593e9d"
+                 "326144883c635255220e77654562ddfabec121135682a7b8f07ea3c20167b09f"
+                 "8d6795563059e8eeeb161d99aa6093ec40dd37b2e33bb68568a13be6d12759de"
+                 "2b6d6a6a794ef168a00184faf35d3b77efb083c24671e3ff1092a432405f9448"]}

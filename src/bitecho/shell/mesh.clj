@@ -15,6 +15,7 @@
             [bitecho.shell.persistence :as persistence]
             [bitecho.snapshot.core :as snap]
             [bitecho.state-machine :as sm]
+            [bitecho.streamlet.core :as streamlet]
             [clojure.core.async :as async]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -684,24 +685,30 @@
                                      (get cluster-cfg :protocol {})
                                      overrides)
                         (seq effective-validators) (assoc :validators effective-validators)
-                        (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes))]
-    (merge loaded-state
-           overrides
-           (cond-> {:config merged-config
-                    :node-pubkey pubkey-hex
-                    :node-private-key privkey-bytes
-                    :keypair (:keypair identity)
-                    :last-executed-finalized-epoch (long (or (:last-executed-finalized-epoch loaded-state)
-                                                             (:epoch loaded-state)
-                                                             0))
-                    :executed-finalized-blocks (or (:executed-finalized-blocks loaded-state)
-                                                   (:finalized-blocks loaded-state)
-                                                   #{})
-                    :pending-receipts cleaned-pending-receipts
-                    :ledger merged-ledger}
-             (seq effective-validators) (assoc :validators effective-validators)
-             (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes)
-             (seq effective-peers-map) (assoc :peers-map effective-peers-map)))))
+                        (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes))
+        rebound (merge loaded-state
+                       overrides
+                       (cond-> {:config merged-config
+                                :node-pubkey pubkey-hex
+                                :node-private-key privkey-bytes
+                                :keypair (:keypair identity)
+                                :last-executed-finalized-epoch (long (or (:last-executed-finalized-epoch loaded-state)
+                                                                         (:epoch loaded-state)
+                                                                         0))
+                                :executed-finalized-blocks (or (:executed-finalized-blocks loaded-state)
+                                                               (:finalized-blocks loaded-state)
+                                                               #{})
+                                :executed-root-depths (or (:executed-root-depths loaded-state) {})
+                                :pending-receipts cleaned-pending-receipts
+                                :ledger merged-ledger}
+                         (seq effective-validators) (assoc :validators effective-validators)
+                         (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes)
+                         (seq effective-peers-map) (assoc :peers-map effective-peers-map)))]
+    (-> rebound
+        streamlet/repair-corrupt-block-depths
+        (streamlet/record-executed-root-depths
+         (into (or (:executed-finalized-blocks rebound) #{})
+               (or (:finalized-blocks rebound) #{}))))))
 
 (defn- validate-peer-node-entry
   "Validates a single peer node entry in cluster config.
@@ -1263,9 +1270,10 @@
          failed-receipts (long (or (:failed-receipts-count state) 0))
          conn-dropped (long (or (:conn_dropped conn-diag-summary) 0))
          conn-stale (long (or (:conn_stale conn-diag-summary) 0))
-         k-bps (long (or (:k-bps state) (get-in state [:config :treasury-k-bps]) (get-in state [:config :k-bps]) treasury/default-k-bps))]
-     (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d conn_dropped=%d conn_stale=%d k_bps=%d\n"
-             role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts conn-dropped conn-stale k-bps))))
+         k-bps (long (or (:k-bps state) (get-in state [:config :treasury-k-bps]) (get-in state [:config :k-bps]) treasury/default-k-bps))
+         corrupt-depth-repaired (long (or (get-in state [:diagnostics :corrupt-block-depth-repaired]) 0))]
+     (format "role=%s epoch=%d head=%s notarized=%d finalized=%d peers=%d/%d supply=%d minted=%d burns=%d finalized_epoch=%d burn_digest=%s pending_receipts=%d failed_receipts=%d conn_dropped=%d conn_stale=%d k_bps=%d corrupt_block_depth_repaired=%d\n"
+             role epoch head notarized finalized (long connected-count) (long total-peers) supply minted burns finalized-epoch burn-digest pending-receipts failed-receipts conn-dropped conn-stale k-bps corrupt-depth-repaired))))
 
 (defn parse-statusz-line
   "Parses a statusz line string into a keyword map with numeric fields parsed as longs."
@@ -1274,7 +1282,7 @@
     (let [kvs (str/split (str/trim line) #"\s+")
           numeric-keys #{:epoch :notarized :finalized :supply :minted :burns
                          :finalized_epoch :pending_receipts :failed_receipts
-                         :conn_dropped :conn_stale :k_bps}]
+                         :conn_dropped :conn_stale :k_bps :corrupt_block_depth_repaired}]
       (reduce
        (fn [m kv]
          (let [[k-str v-str] (str/split kv #"=" 2)]

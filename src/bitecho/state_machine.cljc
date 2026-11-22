@@ -176,6 +176,7 @@
       :executed-receipts-by-epoch {}
       :executed-finalized-blocks #{}
       :executed-finalized-blocks-order []
+      :executed-root-depths {}
       :last-executed-finalized-epoch 0
       :receipt-seq 0
       :failed-receipts-count 0
@@ -2411,9 +2412,11 @@
                                                        (:executed-finalized-blocks-order st-advanced)
                                                        b-hash
                                                        max-tracked)]
-         (assoc st-advanced
-                :executed-finalized-blocks next-blocks
-                :executed-finalized-blocks-order next-blocks-ord)))
+         (-> st-advanced
+             (streamlet/record-block-depth b-hash)
+             (streamlet/record-executed-root-depths [b-hash])
+             (assoc :executed-finalized-blocks next-blocks
+                    :executed-finalized-blocks-order next-blocks-ord))))
      state
      unexecuted-blocks)))
 

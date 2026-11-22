@@ -838,7 +838,11 @@
          :last-heartbeat-ms ts
          :clean-shutdown-ms nil
          :clean-shutdown-cause nil
-         :active-stall-started-ms nil}))))
+         ;; BIP-019 S3: Preserve ongoing finalization stall across restarts so sla/latest.edn
+         ;; records true end-to-end wall-clock stall duration until finalization advances.
+         :active-stall-started-ms (:active-stall-started-ms prev-ledger)
+         :last-finalized-epoch (:last-finalized-epoch prev-ledger)
+         :last-finalized-advanced-ms (:last-finalized-advanced-ms prev-ledger)}))))
 
 (defn record-shutdown-marker
   "Pure D39.5 transition on graceful shutdown (`SIGTERM`/`SIGINT`), marking the exit
@@ -851,21 +855,41 @@
            :last-heartbeat-ms ts)))
 
 (defn record-stall-sample
-  "Pure D39.5 heartbeat & consensus finalization-stall detector.
+  "Pure D39.5 / BIP-019 heartbeat & consensus finalization-stall detector.
    Opens a `:finalization-stall` interval when `head-epoch - finalized-epoch > max-healthy-lag`
-   (default 10) and closes it into `:downtime-events` once finalization catches up."
-  [ledger {:keys [node-id now-ms head-epoch finalized-epoch max-healthy-lag]}]
+   (default 10) OR when `:max-frozen-ms` is specified and `finalized-epoch` has not advanced
+   for `>= max-frozen-ms`, and closes it into `:downtime-events` once finalization catches up."
+  [ledger {:keys [node-id now-ms head-epoch finalized-epoch max-healthy-lag max-frozen-ms]}]
   (let [base (or ledger (record-startup-event nil {:node-id node-id :now-ms now-ms}))
         nid (str (or node-id (:node-id base) "unknown"))
         ts (max 0 (long (or now-ms 0)))
         head (long (or head-epoch 0))
         fin (long (or finalized-epoch 0))
         max-lag (max 1 (long (or max-healthy-lag 10)))
-        stalled? (and (pos? head) (pos? fin) (> (- head fin) max-lag))
-        active-start (:active-stall-started-ms base)]
+        prev-fin (:last-finalized-epoch base)
+        prev-adv-ms (:last-finalized-advanced-ms base)
+        fin-advanced? (and (pos? fin) (or (nil? prev-fin) (> fin (long prev-fin))))
+        next-fin (if (pos? fin) fin prev-fin)
+        next-adv-ms (cond
+                      fin-advanced? ts
+                      (some? prev-adv-ms) (long prev-adv-ms)
+                      (pos? fin) ts
+                      :else nil)
+        frozen-stalled? (and (some? max-frozen-ms)
+                             (pos? fin)
+                             (not fin-advanced?)
+                             (some? next-adv-ms)
+                             (>= (- ts (long next-adv-ms)) (long max-frozen-ms)))
+        lag-stalled? (and (pos? head) (pos? fin) (> (- head fin) max-lag))
+        stalled? (or lag-stalled? frozen-stalled?)
+        active-start (:active-stall-started-ms base)
+        base' (assoc base
+                     :last-heartbeat-ms ts
+                     :last-finalized-epoch next-fin
+                     :last-finalized-advanced-ms next-adv-ms)]
     (cond
       (and stalled? (nil? active-start))
-      (assoc base :last-heartbeat-ms ts :active-stall-started-ms ts)
+      (assoc base' :active-stall-started-ms ts)
 
       (and (not stalled?) (some? active-start))
       (let [ev {:node-id nid
@@ -873,12 +897,12 @@
                 :started-ms (long active-start)
                 :ended-ms ts
                 :duration-ms (max 0 (- ts (long active-start)))}]
-        (-> base
-            (assoc :last-heartbeat-ms ts :active-stall-started-ms nil)
+        (-> base'
+            (assoc :active-stall-started-ms nil)
             (update :downtime-events #(bounded-tail (conj (vec (or % [])) ev) 64))))
 
       :else
-      (assoc base :last-heartbeat-ms ts))))
+      base')))
 
 (defn effective-downtime-events
   "Returns all recorded `:downtime-events` plus an in-progress `:finalization-stall`

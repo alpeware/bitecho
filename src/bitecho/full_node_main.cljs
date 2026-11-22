@@ -3469,7 +3469,8 @@
                                              :finalized-count (+ (count (:finalized-blocks st))
                                                                  (long (or (:pruned-finalized-count st) 0)))}
                           :defense-counters {:conn-dropped (long (or (:dropped conn-diag) 0))
-                                             :conn-stale (long (or (:ignored-stale conn-diag) 0))}})
+                                             :conn-stale (long (or (:ignored-stale conn-diag) 0))
+                                             :corrupt-block-depth-repaired (long (or (get-in st [:diagnostics :corrupt-block-depth-repaired]) 0))}})
                     blob (data/make-blob (:edn-bytes pub) "application/edn")
                     next-seq (swap! seq-atom (fn [prev] (max (inc (long prev)) (quot now-ms 1000))))
                     ptr (data/sign-pointer auth-priv

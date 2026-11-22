@@ -125,16 +125,45 @@
                (recur (:parent-hash block) (conj visited curr) (inc len))
                -1)))))
 
+(defn- lookup-known-depth
+  "Looks up a positive topological depth for `h`, consulting cached `:block-depths`
+   first and immutable `:executed-root-depths` second. Returns nil if unknown."
+  [depths exec-root-depths h]
+  (let [d1 (long (or (get depths h) 0))
+        d2 (long (or (get exec-root-depths h) 0))]
+    (cond
+      (pos? d1) d1
+      (pos? d2) d2
+      :else nil)))
+
+(defn record-executed-root-depths
+  "Immutably records true positive topological depths of `hashes` into `:executed-root-depths`.
+   Never overwrites an existing positive entry in `:executed-root-depths`."
+  [state hashes]
+  (let [depths (or (:block-depths state) {})
+        existing (or (:executed-root-depths state) {})
+        updated (reduce (fn [acc h]
+                          (if (pos? (long (or (get acc h) 0)))
+                            acc
+                            (let [d (long (or (get depths h) 0))]
+                              (if (pos? d)
+                                (assoc acc h d)
+                                acc))))
+                        existing
+                        hashes)]
+    (if (identical? updated existing)
+      state
+      (assoc state :executed-root-depths updated))))
+
 (defn record-block-depth
   "Records the chain depth of block-hash in (:block-depths state) if it roots to genesis or an executed root.
-   If parent-hash is genesis, depth is 1.
-   If parent-hash has a cached depth d, depth is (inc d).
-   Otherwise walks ancestors in :blocks; if walk reaches genesis or a cached depth,
-   records the depths for all walked rooted blocks.
+   Always consults `:block-depths` then immutable `:executed-root-depths` before any fallback.
+   NEVER seeds depth from `:epoch` or `:last-executed-finalized-epoch`.
    Does not cache depths for unrooted orphan chains or cyclic chains."
   [state block-hash]
   (let [blocks (:blocks state)
         depths (get state :block-depths {})
+        exec-root-depths (get state :executed-root-depths {})
         executed-roots (or (:executed-finalized-blocks state) #{})]
     (cond
       (or (nil? block-hash) (= block-hash "genesis") (contains? depths block-hash))
@@ -147,17 +176,16 @@
             (= p-hash "genesis")
             (assoc-in state [:block-depths block-hash] 1)
 
-            (and (contains? depths p-hash) (pos? (long (get depths p-hash 0))))
-            (assoc-in state [:block-depths block-hash] (inc (long (get depths p-hash))))
-
-            (contains? executed-roots p-hash)
-            (let [b-epoch (long (or (:epoch block) 1))
-                  p-epoch (long (or (get-in blocks [p-hash :epoch]) (dec b-epoch)))
-                  d (max 1 (min (long (or (:last-executed-finalized-epoch state) 1))
-                                (max 1 p-epoch)))]
+            (lookup-known-depth depths exec-root-depths p-hash)
+            (let [d (lookup-known-depth depths exec-root-depths p-hash)]
               (-> state
                   (assoc-in [:block-depths p-hash] d)
                   (assoc-in [:block-depths block-hash] (inc d))))
+
+            (and (contains? executed-roots p-hash) (not (contains? blocks p-hash)))
+            (-> state
+                (assoc-in [:block-depths p-hash] 1)
+                (assoc-in [:block-depths block-hash] 2))
 
             :else
             (loop [curr p-hash
@@ -172,19 +200,15 @@
                 (contains? visited curr)
                 state
 
-                (and (contains? depths curr) (pos? (long (get depths curr 0))))
-                (let [d (long (get depths curr 0))
+                (lookup-known-depth depths exec-root-depths curr)
+                (let [d (lookup-known-depth depths exec-root-depths curr)
                       path-rev (vec (rseq path))
-                      new-depths (into {} (map-indexed (fn [idx h] [h (+ d (inc idx))]) path-rev))]
+                      new-depths (into {curr d} (map-indexed (fn [idx h] [h (+ d (inc idx))]) path-rev))]
                   (update state :block-depths (fnil merge {}) new-depths))
 
-                (contains? executed-roots curr)
+                (and (contains? executed-roots curr) (not (contains? blocks curr)))
                 (let [path-rev (vec (rseq path))
-                      first-child-epoch (long (or (get-in blocks [(first path-rev) :epoch]) 1))
-                      curr-epoch (long (or (get-in blocks [curr :epoch]) (dec first-child-epoch)))
-                      d (max 1 (min (long (or (:last-executed-finalized-epoch state) 1))
-                                    (max 1 curr-epoch)))
-                      new-depths (into {curr d} (map-indexed (fn [idx h] [h (+ d (inc idx))]) path-rev))]
+                      new-depths (into {curr 1} (map-indexed (fn [idx h] [h (+ 1 (inc idx))]) path-rev))]
                   (update state :block-depths (fnil merge {}) new-depths))
 
                 :else
@@ -195,25 +219,56 @@
 
 (defn repair-corrupt-block-depths
   "Self-heals any mathematically impossible cached `:block-depths` entries where
-   `depth > (:epoch block)` (which can occur if an older finalized root's depth was
-   overwritten by a higher `:last-executed-finalized-epoch` watermark). Strips
-   poisoned entries and recomputes them in ascending `:epoch` order."
+   `depth > (:epoch block)` OR where a cached `:block-depths` entry contradicts
+   the immutable `:executed-root-depths` truth. Strips poisoned entries, restores
+   `:executed-root-depths` truth, recomputes affected blocks in ascending `:epoch` order,
+   and records a counted Rule 5 `:corrupt-block-depth-repaired` diagnostic counter & event."
   [state]
   (let [blocks (:blocks state)
         depths (:block-depths state)
-        corrupt (when (and (map? blocks) (map? depths))
-                  (into []
-                        (keep (fn [[h d]]
-                                (when-let [blk (get blocks h)]
-                                  (let [ep (long (or (:epoch blk) 0))]
-                                    (when (and (pos? ep) (> (long (or d 0)) ep))
-                                      [ep h])))))
-                        depths))]
-    (if (empty? corrupt)
+        exec-root-depths (or (:executed-root-depths state) {})
+        corrupt-roots (when (and (map? depths) (map? exec-root-depths))
+                        (into []
+                              (keep (fn [[h d]]
+                                      (let [true-d (get exec-root-depths h)]
+                                        (when (and (some? true-d)
+                                                   (pos? (long true-d))
+                                                   (not= (long (or d 0)) (long true-d)))
+                                          [h (long true-d)]))))
+                              depths))
+        corrupt-blocks (when (and (map? blocks) (map? depths))
+                         (into []
+                               (keep (fn [[h d]]
+                                       (when-let [blk (get blocks h)]
+                                         (let [ep (long (or (:epoch blk) 0))]
+                                           (when (and (pos? ep) (> (long (or d 0)) ep))
+                                             [ep h])))))
+                               depths))]
+    (if (and (empty? corrupt-roots) (empty? corrupt-blocks))
       state
-      (let [sorted-hashes (mapv second (sort-by first corrupt))
-            cleaned (update state :block-depths #(apply dissoc % sorted-hashes))]
-        (reduce record-block-depth cleaned sorted-hashes)))))
+      (let [root-hashes (mapv first corrupt-roots)
+            sorted-block-hashes (mapv second (sort-by first corrupt-blocks))
+            all-repaired-hashes (vec (distinct (concat root-hashes sorted-block-hashes)))
+            repaired-count (count all-repaired-hashes)
+            diag-ev {:effect :diagnose
+                     :type :diagnose
+                     :reason :corrupt-block-depth-repaired
+                     :count repaired-count
+                     :hashes all-repaired-hashes}
+            cleaned-blocks (update state :block-depths #(apply dissoc % sorted-block-hashes))
+            restored-roots (reduce (fn [st [h true-d]]
+                                     (assoc-in st [:block-depths h] true-d))
+                                   cleaned-blocks
+                                   corrupt-roots)
+            rebuilt (reduce record-block-depth restored-roots sorted-block-hashes)]
+        (-> rebuilt
+            (update-in [:diagnostics :corrupt-block-depth-repaired] (fnil + 0) repaired-count)
+            (update-in [:diagnostics :corrupt-block-depth-repaired-events]
+                       (fn [evs]
+                         (let [v (conj (vec (or evs [])) diag-ev)]
+                           (if (> (count v) 64)
+                             (subvec v (- (count v) 64))
+                             v)))))))))
 
 (defn longest-notarized-parent?
   "Returns true if parent-hash extends one of the longest notarized chains in state.
@@ -362,10 +417,12 @@
             candidates (if-let [curr (:latest-finalized-block-hash state)]
                          (conj new-finalized curr)
                          new-finalized)
-            new-latest (last (sort-by #(get-in blocks [% :epoch] -1) candidates))]
-        (assoc state
-               :finalized-blocks updated-finalized
-               :latest-finalized-block-hash new-latest)))))
+            new-latest (last (sort-by #(get-in blocks [% :epoch] -1) candidates))
+            st-with-depths (reduce record-block-depth state new-finalized)]
+        (-> st-with-depths
+            (record-executed-root-depths new-finalized)
+            (assoc :finalized-blocks updated-finalized
+                   :latest-finalized-block-hash new-latest))))))
 
 (def default-streamlet-retention-epochs
   "Default number of historical epochs to retain before pruning state."
@@ -438,7 +495,10 @@
     (if (or (<= cutoff 0) (= head-hash "genesis"))
       state
       (let [blocks (:blocks state)
-            state-with-depths (reduce record-block-depth state (keys blocks))
+            state-with-depths (-> (reduce record-block-depth state (keys blocks))
+                                  (record-executed-root-depths
+                                   (set/union (or (:executed-finalized-blocks state) #{})
+                                              (or (:finalized-blocks state) #{}))))
             latest-finalized (:latest-finalized-block-hash state-with-depths)
             protected-hashes (protected-ancestor-chain-hashes state-with-depths)
             expired-hashes (into #{}
@@ -720,10 +780,15 @@
                         s-with-depth (-> s
                                          (assoc-in [:blocks b-hash] block)
                                          (record-block-depth b-hash))
+                        ;; Never seed depth from :epoch or :last-executed-finalized-epoch when
+                        ;; parent is unknown; anchor at minimal topological depth (<= epoch).
                         s-anchored (if (not (contains? (:block-depths s-with-depth) b-hash))
-                                     (-> s-with-depth
-                                         (assoc-in [:block-depths (:parent-hash block)] (max 1 (dec (long (:epoch block 1)))))
-                                         (assoc-in [:block-depths b-hash] (max 1 (long (:epoch block 1)))))
+                                     (let [ep (long (or (:epoch block) 1))]
+                                       (if (> ep 1)
+                                         (-> s-with-depth
+                                             (assoc-in [:block-depths (:parent-hash block)] 1)
+                                             (assoc-in [:block-depths b-hash] 2))
+                                         (assoc-in s-with-depth [:block-depths b-hash] 1)))
                                      s-with-depth)]
                     (-> s-anchored
                         (update-in [:block-votes b-hash] (fnil into #{}) (:voter-set res))

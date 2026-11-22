@@ -1329,6 +1329,89 @@
                           {:ok? false :error "validator-state-disagreement"}
                           {:ok? false :error "insufficient-snapshots-returned" :reason "insufficient-validator-quorum"})))))))))))))
 
+(def default-finalized-epoch-stall-threshold-ms
+  "Default wall-clock threshold (ms) before a frozen `finalized-epoch` during light-node
+   `auto-sync` is classified as `:finalized-epoch-stalled` (BIP-019 S3: 180s)."
+  180000)
+
+(defn evaluate-auto-sync-stall
+  "Pure BIP-019 S3 light-node `auto-sync` stall detector (Rules 2 & 5).
+   Tracks wall-clock advancement of `finalized-epoch` in `(:auto-sync-stall-tracker state)`.
+   If `finalized-epoch` remains frozen for `>= stall-threshold-ms`, returns:
+     `{:ok? false :synced? false :stalled? true :stall-duration-ms ms :finalized-epoch fin :state st' :diagnose diag}`
+   with a counted Rule 5 `:diagnose {:reason :finalized-epoch-stalled ...}` effect and
+   increments `[:diagnostics :finalized-epoch-stalled]`.
+   Once `finalized-epoch` advances again, clears `:stalled?` and returns `:ok? true :synced? true`."
+  ([state finalized-epoch now-ms]
+   (evaluate-auto-sync-stall state finalized-epoch now-ms nil))
+  ([state finalized-epoch now-ms opts]
+   (let [fin (long (or finalized-epoch 0))
+         now (max 0 (long (or now-ms 0)))
+         threshold-ms (max 1 (long (or (:stall-threshold-ms opts) default-finalized-epoch-stall-threshold-ms)))
+         head-ep (when (some? (:head-epoch opts)) (long (:head-epoch opts)))
+         tracker (or (:auto-sync-stall-tracker state) {})
+         prev-fin (:last-finalized-epoch tracker)
+         prev-adv-ms (:last-advanced-ms tracker)
+         advanced? (or (nil? prev-fin)
+                       (zero? (long prev-fin))
+                       (> fin (long prev-fin)))]
+     (if advanced?
+       (let [next-tracker {:last-finalized-epoch fin
+                           :last-advanced-ms now
+                           :stalled? false
+                           :stall-started-ms nil
+                           :stall-duration-ms 0}
+             st' (cond-> (assoc state :auto-sync-stall-tracker next-tracker)
+                   (= "finalized-epoch-stalled" (:auto-sync-last-error state))
+                   (assoc :auto-sync-last-error nil))]
+         {:ok? true
+          :synced? true
+          :stalled? false
+          :stall-duration-ms 0
+          :finalized-epoch fin
+          :state st'
+          :diagnose nil})
+       (let [anchor-ms (long (or prev-adv-ms now))
+             frozen-ms (max 0 (- now anchor-ms))]
+         (if (and (pos? fin) (>= frozen-ms threshold-ms))
+           (let [stall-start (long (or (:stall-started-ms tracker) anchor-ms))
+                 diag {:effect :diagnose
+                       :type :diagnose
+                       :reason :finalized-epoch-stalled
+                       :finalized-epoch fin
+                       :observed-lag (when head-ep (max 0 (- head-ep fin)))
+                       :stall-duration-ms frozen-ms
+                       :threshold-ms threshold-ms}
+                 next-tracker {:last-finalized-epoch (long prev-fin)
+                               :last-advanced-ms anchor-ms
+                               :stalled? true
+                               :stall-started-ms stall-start
+                               :stall-duration-ms frozen-ms}
+                 st' (-> state
+                         (assoc :auto-sync-stall-tracker next-tracker
+                                :auto-sync-last-error "finalized-epoch-stalled")
+                         (update-in [:diagnostics :finalized-epoch-stalled] (fnil inc 0)))]
+             {:ok? false
+              :synced? false
+              :stalled? true
+              :stall-duration-ms frozen-ms
+              :finalized-epoch fin
+              :state st'
+              :diagnose diag})
+           (let [next-tracker {:last-finalized-epoch (long prev-fin)
+                               :last-advanced-ms anchor-ms
+                               :stalled? false
+                               :stall-started-ms nil
+                               :stall-duration-ms frozen-ms}
+                 st' (assoc state :auto-sync-stall-tracker next-tracker)]
+             {:ok? true
+              :synced? true
+              :stalled? false
+              :stall-duration-ms frozen-ms
+              :finalized-epoch fin
+              :state st'
+              :diagnose nil})))))))
+
 (defn apply-verified-chain-state-snapshot
   "Applies a verified chain state snapshot to local light-node state.
    Guards against stale finalized epochs (monotonicity), unless `:network-generation`
@@ -4295,12 +4378,18 @@
                                 "acked_seq" (long (or (:acked-seq s) 0))
                                 "unacked_count" (count (:outbox s {}))
                                 "outbox_evicted" (long (or (:outbox-evicted s) 0))}))
+        stalled? (boolean (get-in state [:auto-sync-stall-tracker :stalled?] false))
+        stall-duration-ms (long (or (get-in state [:auto-sync-stall-tracker :stall-duration-ms]) 0))
+        stalled-count (long (or (get-in state [:diagnostics :finalized-epoch-stalled]) 0))
         resp (cond-> {"ok" true
                       "connected" (boolean (:connected? state false))
                       "connection_error" (:connection-error state)
                       "auto_sync_last_error" (or (:auto-sync-last-error state)
                                                  (get-in state [:diagnostics :auto-sync-last-error])
                                                  (get-in state [:conn-diagnostics :auto-sync-last-error]))
+                      "stalled" stalled?
+                      "stall_duration_ms" stall-duration-ms
+                      "finalized_epoch_stalled_count" stalled-count
                       "transport_healthy" (and (boolean (:connected? state false))
                                                (nil? (:connection-error state)))
                       "pubkey" (:pubkey state)
@@ -4347,6 +4436,8 @@
                (seq (:default-p2p-candidates state)) (assoc "default_p2p_candidates" (:default-p2p-candidates state)))]
     (merge resp
            {:state state
+            :stalled? stalled?
+            :stall-duration-ms stall-duration-ms
             :response resp
             :net-envelopes []
             :stdout-events []})))

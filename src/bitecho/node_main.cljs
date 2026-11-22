@@ -1656,6 +1656,18 @@
                            (push-diagnostic diag-eff))]
           [new-conn [diag-eff]])
 
+        :finalized-epoch-stalled
+        (let [diag-eff (or (:diagnose event)
+                           {:effect :diagnose
+                            :type :diagnose
+                            :reason :finalized-epoch-stalled
+                            :finalized-epoch (:finalized-epoch event)
+                            :stall-duration-ms (:stall-duration-ms event)})
+              new-conn (-> conn
+                           (assoc :last-error "finalized-epoch-stalled")
+                           (push-diagnostic diag-eff))]
+          [new-conn [diag-eff]])
+
         :shutdown
         (let [node-to-close (:node conn)
               effects (if node-to-close
@@ -3758,19 +3770,43 @@
      (fn [res]
        (if (:ok? res)
          (let [finish! (fn []
-                         (when state-file
-                           (try (save-light-state! state-file @state-atom) (catch :default _ nil)))
-                         (let [st @state-atom
-                               fin-ep (or (get-in st [:account :finalized-epoch]) (:epoch st) 0)
+                         (let [st0 @state-atom
+                               fin-ep (or (get-in st0 [:account :finalized-epoch]) (:epoch st0) 0)
+                               stall-res (light-core/evaluate-auto-sync-stall st0 fin-ep (.now js/Date) conn-opts)
+                               st (:state stall-res)
                                bal (or (get-in st [:account :balance]) 0)
                                spend (or (get-in st [:account :spendable]) bal 0)]
-                           (when event-out
-                             (event-out {"event" "auto-sync"
-                                         "ok" true
-                                         "finalized_epoch" fin-ep
-                                         "balance" bal
-                                         "spendable" spend
-                                         "synced" true}))))]
+                           (reset! state-atom st)
+                           (when state-file
+                             (try (save-light-state! state-file st) (catch :default _ nil)))
+                           (if (:stalled? stall-res)
+                             (do
+                               (when conn-atom
+                                 (apply-conn-event! conn-atom
+                                                    {:type :finalized-epoch-stalled
+                                                     :finalized-epoch fin-ep
+                                                     :stall-duration-ms (:stall-duration-ms stall-res)
+                                                     :diagnose (:diagnose stall-res)}
+                                                    conn-opts)
+                                 (sync-conn-diagnostics! state-atom conn-atom))
+                               (when event-out
+                                 (event-out {"event" "auto-sync"
+                                             "ok" false
+                                             "synced" false
+                                             "stalled" true
+                                             "stall_duration_ms" (:stall-duration-ms stall-res)
+                                             "finalized_epoch" fin-ep
+                                             "balance" bal
+                                             "spendable" spend
+                                             "error" "finalized-epoch-stalled"})))
+                             (when event-out
+                               (event-out {"event" "auto-sync"
+                                           "ok" true
+                                           "stalled" false
+                                           "finalized_epoch" fin-ep
+                                           "balance" bal
+                                           "spendable" spend
+                                           "synced" true})))))]
            (if (:auto-register-home-set? conn-opts)
              (let [price (or (:home-set-price conn-opts) 10)
                    hs-res (light-core/handle-command @state-atom {"cmd" "register-home-set" "price" price} privkey)

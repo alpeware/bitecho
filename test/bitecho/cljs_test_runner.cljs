@@ -10,6 +10,7 @@
             [bitecho.core.protocol.relay-test]
             [bitecho.core.subnet-test]
             [bitecho.d45-bip018-hardening-and-failover-test]
+            [bitecho.d46-bip019-fepoch1-test]
             [bitecho.economy.account-test]
             [bitecho.economy.burn-test]
             [bitecho.economy.treasury-test]
@@ -67,6 +68,7 @@
              'bitecho.core.protocol-test
              'bitecho.core.protocol.relay-test
              'bitecho.core.subnet-test
-             'bitecho.d45-bip018-hardening-and-failover-test))
+             'bitecho.d45-bip018-hardening-and-failover-test
+             'bitecho.d46-bip019-fepoch1-test))
 
 (set! *main-cli-fn* -main)
