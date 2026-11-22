@@ -357,3 +357,73 @@
              "post-artifact-to-relay! must upload raw binary blobs with X-Bitecho-Blob-Cid header instead of 2x JSON hex")
          (is (str/includes? src "artifact-blob-upload-failed")
              "one-shot/serve artifact-put must fail closed with artifact-blob-upload-failed instead of returning ok=true")))))
+
+;; =============================================================================
+;; 7. BIP-018-SOAK-F1: Cold-on-Disk Large-Blob Threshold & Native SHA-256 / glibc RSS Bounds
+;; =============================================================================
+
+(defspec ^{:doc "BIP-018-SOAK-F1: Blobs exceeding :max-hot-blob-bytes are stored cold (:bytes nil, :hot-bytes unchanged) with counted :blob-stored-cold :diagnose, while small blobs (<= cap) and app-pinned blobs remain hot."}
+  prop-large-blobs-stored-cold-and-hot-bytes-bounded 50
+  (prop/for-all [small-sizes (gen/vector (gen/choose 16 128) 2 6)
+                 large-sizes (gen/vector (gen/choose 257 640) 3 8)]
+                (let [max-entry 256
+                      st0 (data/init-blob-store {:max-hot-bytes 4096
+                                                 :max-hot-blob-bytes max-entry
+                                                 :max-unpinned-bytes 100000
+                                                 :max-pinned-app-bytes 2048})
+                      ;; Insert small blobs -> must stay hot
+                      {:keys [store small-cids]}
+                      (reduce (fn [{:keys [store small-cids idx]} sz]
+                                (let [b (data/make-blob (str "s" idx "-" (apply str (repeat sz "a"))) "application/octet-stream")
+                                      r (data/put-blob store b (+ 10 idx))]
+                                  {:store (:store r)
+                                   :small-cids (conj small-cids (:blob/cid b))
+                                   :idx (inc idx)}))
+                              {:store st0 :small-cids [] :idx 0}
+                              small-sizes)
+                      hot-after-small (:hot-bytes store)
+                      ;; Insert large blobs (> max-entry) -> must be stored cold (:bytes nil) with counted :blob-stored-cold
+                      {:keys [store large-cids cold-diags]}
+                      (reduce (fn [{:keys [store large-cids cold-diags idx]} sz]
+                                (let [b (data/make-blob (str "L" idx "-" (apply str (repeat sz "z"))) "application/octet-stream")
+                                      r (data/put-blob store b (+ 100 idx))]
+                                  {:store (:store r)
+                                   :large-cids (conj large-cids (:blob/cid b))
+                                   :cold-diags (into cold-diags (filter #(= :blob-stored-cold (:reason %)) (:effects r)))
+                                   :idx (inc idx)}))
+                              {:store store :large-cids [] :cold-diags [] :idx 0}
+                              large-sizes)
+                      ;; App-pinned large blob still stays hot if within max-pinned-app-bytes
+                      app-big (data/make-blob (apply str (repeat 300 "p")) "application/javascript")
+                      pin-pre (data/pin-app-blob store (:blob/cid app-big))
+                      put-app-big (data/put-blob (:store pin-pre) app-big 500)
+                      first-large-cid (first large-cids)
+                      first-large-entry (get-in store [:entries first-large-cid])]
+                  (and (= (* 64 1024) data/default-infra-max-hot-blob-bytes)
+                       (= hot-after-small (:hot-bytes store))
+                       (every? #(some? (get-in store [:entries % :bytes])) small-cids)
+                       (every? #(nil? (get-in store [:entries % :bytes])) large-cids)
+                       (every? #(pos? (long (or (get-in store [:entries % :size]) 0))) large-cids)
+                       (some? first-large-entry)
+                       (= (count large-cids) (count cold-diags))
+                       (= (count large-cids) (get-in store [:diagnostics :blob-stored-cold]))
+                       (some? (get-in (:store put-app-big) [:entries (:blob/cid app-big) :bytes]))))))
+
+#?(:clj
+   (deftest test-bip018-soak-f1-rss-bounds-wiring
+     (testing "crypto.cljc uses native node-crypto SHA-256 on Node.js instead of allocating 512 KiB Uint32Arrays"
+       (let [src (slurp (io/file "src/bitecho/crypto.cljc"))]
+         (is (str/includes? src "(.createHash node-crypto \"sha256\")")
+             "crypto/sha256 must use node:crypto on Node.js to avoid 512 KiB Uint32Array allocations per chunk")))
+     (testing "full_node_main.cljs configures :max-hot-blob-bytes on infra nodes"
+       (let [src (slurp (io/file "src/bitecho/full_node_main.cljs"))]
+         (is (str/includes? src ":max-hot-blob-bytes")
+             "start-infra-node! must pass :max-hot-blob-bytes to subnet/init-subnet-instance")
+         (is (str/includes? src "default-infra-max-hot-blob-bytes")
+             "start-infra-node! must default :max-hot-blob-bytes to data/default-infra-max-hot-blob-bytes")))
+     (testing "scripts/run-infra-node.sh bounds glibc mmap threshold to 16 KiB for Node.js HTTP/TLS chunks"
+       (let [src (slurp (io/file "scripts/run-infra-node.sh"))]
+         (is (str/includes? src "MALLOC_MMAP_THRESHOLD_:-16384")
+             "run-infra-node.sh must set MALLOC_MMAP_THRESHOLD_ default to 16384 (16 KiB)")
+         (is (str/includes? src "MALLOC_TRIM_THRESHOLD_:-16384")
+             "run-infra-node.sh must set MALLOC_TRIM_THRESHOLD_ default to 16384 (16 KiB)")))))

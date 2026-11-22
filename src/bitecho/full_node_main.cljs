@@ -4035,6 +4035,8 @@
                    :all-nodes all-nodes
                    :max-hot-bytes (or (get-in config [:http :max-hot-bytes])
                                       (* 16 1024 1024))
+                   :max-hot-blob-bytes (or (get-in config [:http :max-hot-blob-bytes])
+                                           data/default-infra-max-hot-blob-bytes)
                    :max-pinned-app-bytes (or (get-in config [:http :max-pinned-app-bytes])
                                              data/default-pinned-app-max-bytes)})
         snap (load-pointers-snapshot state-dir rt-shell-atom)

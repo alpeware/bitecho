@@ -128,6 +128,8 @@
 (defn sha256
   "Computes the SHA-256 hash of the given byte array or string.
    Pure and synchronous on both JVM and ClojureScript.
+   Uses native `node:crypto` on Node.js (avoiding transient 512 KiB Uint32Array allocations
+   under large chunk bursts, BIP-018-SOAK-F1) and falls back to `pure-cljs-sha256` in browsers.
    Returns a 32-byte array (byte[] on JVM, Uint8Array on CLJS)."
   [input]
   (let [ba (if (string? input)
@@ -135,7 +137,12 @@
              input)]
     #?(:clj  (let [md (MessageDigest/getInstance "SHA-256")]
                (.digest md ^bytes ba))
-       :cljs (pure-cljs-sha256 ba))))
+       :cljs (if node-crypto
+               (let [digest (-> (.createHash node-crypto "sha256")
+                                (.update ba)
+                                (.digest))]
+                 (js/Uint8Array. (.-buffer digest) (.-byteOffset digest) (.-byteLength digest)))
+               (pure-cljs-sha256 ba)))))
 
 (defn sha256-hex
   "Computes SHA-256 and returns a 64-character lowercase hex string."

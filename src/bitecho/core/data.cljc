@@ -25,6 +25,12 @@
   "Default maximum hot in-memory Blob byte budget for 1 GB e2-micro infra nodes (32 MiB, BIP-018 Track 2)."
   (* 32 1024 1024))
 
+(def default-infra-max-hot-blob-bytes
+  "Default maximum single-blob byte size kept hot in RAM on 1 GB e2-micro infra nodes (64 KiB, BIP-018-SOAK-F1).
+   Larger immutable disk-persisted chunks (e.g. 512 KiB BIP-017a chunks) are stored cold (`:bytes nil`)
+   so the Linux OS page cache serves them with zero V8 ArrayBuffer / RssAnon retention."
+  (* 64 1024))
+
 (def default-pinned-app-max-bytes
   "Default maximum hot byte budget for pinned web-app release blobs (16 MiB, BIP-018 Track 2)."
   (* 16 1024 1024))
@@ -80,6 +86,7 @@
     :pinned-app-bytes 0
     :access-seq 0
     :max-hot-bytes (long (or (:max-hot-bytes opts) default-max-hot-bytes))
+    :max-hot-blob-bytes (when-let [m (:max-hot-blob-bytes opts)] (long m))
     :max-unpinned-bytes (long (or (:max-unpinned-bytes opts) default-max-unpinned-bytes))
     :max-pinned-app-bytes (long (or (:max-pinned-app-bytes opts) default-pinned-app-max-bytes))
     :diagnostics {:cid-mismatch 0
@@ -88,6 +95,7 @@
                   :evicted-unpinned 0
                   :evicted-hot 0
                   :blob-hot-evicted 0
+                  :blob-stored-cold 0
                   :pinned-app-cap-exceeded 0}}))
 
 (defn has-blob?
@@ -218,24 +226,58 @@
                (let [pins (long (or (:pins existing) 0))
                      app-pinned? (boolean (:app-pinned? existing))
                      was-present? (some? existing)
-                     entry {:cid norm-cid
-                            :media-type resolved-mt
-                            :bytes bs
-                            :size sz
-                            :pins pins
-                            :app-pinned? app-pinned?
-                            :last-access next-seq}
-                     st1 (-> store
-                             (assoc :access-seq next-seq)
-                             (assoc-in [:entries norm-cid] entry)
-                             (update :hot-bytes (fnil + 0) sz)
-                             (cond-> app-pinned?
-                               (update :pinned-app-bytes (fnil + 0) sz))
-                             (cond-> (and (not was-present?) (zero? pins))
-                               (update :unpinned-bytes (fnil + 0) sz)))
-                     st2 (evict-unpinned-lru st1 norm-cid)
-                     [st3 evict-effs] (evict-hot-lru st2 norm-cid)]
-                 {:ok? true :cid norm-cid :store st3 :effects evict-effs})))))))))
+                     max-entry (:max-hot-blob-bytes store)
+                     store-cold? (and (some? max-entry)
+                                      (pos? (long max-entry))
+                                      (> sz (long max-entry))
+                                      (not app-pinned?))]
+                 (if store-cold?
+                   (if (and existing (nil? (:bytes existing)) (= sz (long (or (:size existing) 0))))
+                     {:ok? true
+                      :cid norm-cid
+                      :store (-> store
+                                 (assoc :access-seq next-seq)
+                                 (assoc-in [:entries norm-cid :last-access] next-seq)
+                                 (assoc-in [:entries norm-cid :media-type] resolved-mt))
+                      :effects []}
+                     (let [entry {:cid norm-cid
+                                  :media-type resolved-mt
+                                  :bytes nil
+                                  :size sz
+                                  :pins pins
+                                  :app-pinned? app-pinned?
+                                  :last-access next-seq}
+                           diag {:effect :diagnose
+                                 :type :diagnose
+                                 :reason :blob-stored-cold
+                                 :cid norm-cid
+                                 :size sz}
+                           st1 (-> store
+                                   (assoc :access-seq next-seq)
+                                   (assoc-in [:entries norm-cid] entry)
+                                   (cond-> (and (not was-present?) (zero? pins))
+                                     (update :unpinned-bytes (fnil + 0) sz))
+                                   (update-in [:diagnostics :blob-stored-cold] (fnil inc 0)))
+                           st2 (evict-unpinned-lru st1 norm-cid)]
+                       {:ok? true :cid norm-cid :store st2 :effects [diag]}))
+                   (let [entry {:cid norm-cid
+                                :media-type resolved-mt
+                                :bytes bs
+                                :size sz
+                                :pins pins
+                                :app-pinned? app-pinned?
+                                :last-access next-seq}
+                         st1 (-> store
+                                 (assoc :access-seq next-seq)
+                                 (assoc-in [:entries norm-cid] entry)
+                                 (update :hot-bytes (fnil + 0) sz)
+                                 (cond-> app-pinned?
+                                   (update :pinned-app-bytes (fnil + 0) sz))
+                                 (cond-> (and (not was-present?) (zero? pins))
+                                   (update :unpinned-bytes (fnil + 0) sz)))
+                         st2 (evict-unpinned-lru st1 norm-cid)
+                         [st3 evict-effs] (evict-hot-lru st2 norm-cid)]
+                     {:ok? true :cid norm-cid :store st3 :effects evict-effs})))))))))))
 
 (defn pin-app-blob
   "Pins a web-app release blob under the isolated `<= max-pinned-app-bytes` (`16 MiB`) cap.
