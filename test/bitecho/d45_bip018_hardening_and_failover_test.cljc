@@ -427,3 +427,77 @@
              "run-infra-node.sh must set MALLOC_MMAP_THRESHOLD_ default to 16384 (16 KiB)")
          (is (str/includes? src "MALLOC_TRIM_THRESHOLD_:-16384")
              "run-infra-node.sh must set MALLOC_TRIM_THRESHOLD_ default to 16384 (16 KiB)")))))
+
+;; =============================================================================
+;; 8. BIP-018-SOAK-F1 & F4: /statusz Memory Telemetry & Fail-Closed Serve/Pointer Upload
+;; =============================================================================
+
+(defspec ^{:doc "BIP-018-SOAK-F1: normalize-memory-telemetry always yields non-negative V8 & off-heap byte counters with off-heap-bytes = max(0, rss - heapTotal)."}
+  prop-statusz-memory-telemetry-normalization 100
+  (prop/for-all [rss (gen/one-of [(gen/return nil) (gen/choose -1000 500000000)])
+                 heap-used (gen/one-of [(gen/return nil) (gen/choose -1000 200000000)])
+                 heap-total (gen/one-of [(gen/return nil) (gen/choose -1000 300000000)])
+                 external (gen/one-of [(gen/return nil) (gen/choose -1000 100000000)])
+                 array-bufs (gen/one-of [(gen/return nil) (gen/choose -1000 100000000)])]
+                (let [m (core-infra/normalize-memory-telemetry
+                         {:rss-bytes rss
+                          :heap-used-bytes heap-used
+                          :heap-total-bytes heap-total
+                          :external-bytes external
+                          :array-buffers-bytes array-bufs})
+                      exp-rss (if (number? rss) (max 0 (long rss)) 0)
+                      exp-hu (if (number? heap-used) (max 0 (long heap-used)) 0)
+                      exp-ht (if (number? heap-total) (max 0 (long heap-total)) 0)
+                      exp-ext (if (number? external) (max 0 (long external)) 0)
+                      exp-ab (if (number? array-bufs) (max 0 (long array-bufs)) 0)
+                      exp-off (max 0 (- exp-rss exp-ht))]
+                  (and (= exp-rss (:rss-bytes m))
+                       (= exp-hu (:heap-used-bytes m))
+                       (= exp-ht (:heap-total-bytes m))
+                       (= exp-ext (:external-bytes m))
+                       (= exp-ab (:array-buffers-bytes m))
+                       (= exp-off (:off-heap-bytes m))
+                       (every? #(and (integer? %) (>= % 0)) (vals m))))))
+
+(defspec ^{:doc "BIP-018-SOAK-F4: Every failed, non-2xx, or malformed POST /artifact/v1/pointer response fails closed."}
+  prop-artifact-pointer-upload-never-silently-succeeds 100
+  (prop/for-all [status (gen/one-of [(gen/return nil)
+                                     (gen/choose 200 204)
+                                     (gen/choose 400 429)
+                                     (gen/choose 500 507)])
+                 body-ok? (gen/one-of [(gen/return nil) gen/boolean])
+                 transport-err (gen/one-of [(gen/return nil)
+                                            (gen/elements ["timeout" "ECONNRESET" "socket hang up"])])]
+                (let [parsed-body (when (some? body-ok?) {"ok" body-ok?})
+                      res (core-infra/evaluate-artifact-pointer-upload-response
+                           {:status status
+                            :parsed-body parsed-body
+                            :transport-error transport-err})
+                      should-succeed? (and (nil? transport-err)
+                                           (integer? status)
+                                           (<= 200 status 299)
+                                           (true? body-ok?))]
+                  (and (= should-succeed? (boolean (:ok? res)))
+                       (if should-succeed?
+                         (nil? (:error res))
+                         (and (keyword? (:error res))
+                              (boolean? (:retryable? res))))))))
+
+#?(:clj
+   (deftest test-bip018-soak-f1-f4-statusz-memory-and-serve-fail-closed-wiring
+     (testing "full_node_main.cljs exposes :memory telemetry on /statusz and verifies submit-subnet-event! :applied? on POST /artifact/v1/blob"
+       (let [src (slurp (io/file "src/bitecho/full_node_main.cljs"))]
+         (is (str/includes? src "normalize-memory-telemetry")
+             "build-statusz-payload must normalize process.memoryUsage() via core-infra/normalize-memory-telemetry")
+         (is (str/includes? src ":memory ")
+             "build-statusz-payload must include structured :memory telemetry")
+         (is (str/includes? src "blob-index-failed")
+             "POST /artifact/v1/blob must fail closed with 500 blob-index-failed if submit-subnet-event! does not apply")))
+     (testing "node_main.cljs awaits post-artifact-to-relay! in serve/ctl mode and validates pointer uploads fail-closed"
+       (let [src (slurp (io/file "src/bitecho/node_main.cljs"))]
+         (is (not (str/includes? src "(post-artifact-to-relay! art-relay eff-domain-verb (:response res) nil)"))
+             "handle-serve-line! must never call post-artifact-to-relay! fire-and-forget with nil callback (SOAK-F4)")
+         (is (str/includes? src "evaluate-artifact-pointer-upload-response")
+             "post-artifact-to-relay! must validate POST /artifact/v1/pointer via core-infra/evaluate-artifact-pointer-upload-response")
+         (is (str/includes? src "artifact-pointer-upload-failed")
+             "post-artifact-to-relay! must fail closed with artifact-pointer-upload-failed on pointer upload failure")))))

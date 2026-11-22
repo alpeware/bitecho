@@ -667,3 +667,60 @@
 
       :else
       {:ok? true :status status})))
+
+(defn evaluate-artifact-pointer-upload-response
+  "Purely evaluates an HTTP `POST /artifact/v1/pointer` result (Rule 2, Rule 5, SOAK-F4).
+   Fails closed on any transport error, non-2xx HTTP status, or missing/false `ok`."
+  [{:keys [status parsed-body transport-error]}]
+  (let [body-ok? (when (map? parsed-body)
+                   (or (true? (:ok parsed-body))
+                       (true? (get parsed-body "ok"))))]
+    (cond
+      (some? transport-error)
+      {:ok? false
+       :error :transport-error
+       :retryable? true
+       :detail (str transport-error)}
+
+      (not (and (integer? status) (<= 200 status 299)))
+      {:ok? false
+       :error (if (integer? status) :http-error :missing-status)
+       :status status
+       :retryable? (boolean (or (nil? status)
+                                (= status 408)
+                                (= status 429)
+                                (and (integer? status) (>= status 500))))
+       :detail (or (when (map? parsed-body) (or (:error parsed-body) (get parsed-body "error")))
+                   (when (integer? status) (str "http-" status))
+                   "missing-http-status")}
+
+      (not (true? body-ok?))
+      {:ok? false
+       :error :invalid-response-body
+       :status status
+       :retryable? false
+       :detail (or (when (map? parsed-body) (or (:error parsed-body) (get parsed-body "error")))
+                   "missing-ok-true")}
+
+      :else
+      {:ok? true :status status})))
+
+(defn normalize-memory-telemetry
+  "Purely normalizes Node.js `process.memoryUsage()` counters into the structured
+   `/statusz` `:memory` map (`:rss-bytes`, `:heap-used-bytes`, `:heap-total-bytes`,
+   `:external-bytes`, `:array-buffers-bytes`, plus derived `:off-heap-bytes`).
+   Coerces missing/negative values safely to `0` (BIP-018-SOAK-F1)."
+  [raw]
+  (let [clamp-nonneg (fn [v] (if (number? v) (max 0 (long v)) 0))
+        rss (clamp-nonneg (or (:rss-bytes raw) (:rss raw) (get raw "rss")))
+        heap-used (clamp-nonneg (or (:heap-used-bytes raw) (:heapUsed raw) (get raw "heapUsed")))
+        heap-total (clamp-nonneg (or (:heap-total-bytes raw) (:heapTotal raw) (get raw "heapTotal")))
+        external (clamp-nonneg (or (:external-bytes raw) (:external raw) (get raw "external")))
+        array-buffers (clamp-nonneg (or (:array-buffers-bytes raw) (:arrayBuffers raw) (get raw "arrayBuffers")))
+        off-heap (max 0 (- rss heap-total))]
+    {:rss-bytes rss
+     :heap-used-bytes heap-used
+     :heap-total-bytes heap-total
+     :external-bytes external
+     :array-buffers-bytes array-buffers
+     :off-heap-bytes off-heap}))

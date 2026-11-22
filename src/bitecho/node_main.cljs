@@ -717,13 +717,25 @@
                                 req (.request client options
                                               (fn [res]
                                                 (let [status (.-statusCode res)
-                                                      chunks #js []]
+                                                      chunks #js []
+                                                      ended? (atom false)]
                                                   (.on res "data" (fn [c] (.push chunks c)))
                                                   (.on res "end" (fn []
+                                                                   (reset! ended? true)
                                                                    (let [buf (.concat Buf chunks)]
                                                                      (done! {:status status
                                                                              :body (.toString buf "utf8")
                                                                              :error nil}))))
+                                                  (.on res "aborted" (fn []
+                                                                       (when-not @ended?
+                                                                         (done! {:status status
+                                                                                 :body nil
+                                                                                 :error "response-aborted"}))))
+                                                  (.on res "close" (fn []
+                                                                     (when-not @ended?
+                                                                       (done! {:status status
+                                                                               :body nil
+                                                                               :error "response-closed-early"}))))
                                                   (.on res "error" (fn [e]
                                                                      (done! {:status status
                                                                              :body nil
@@ -3232,59 +3244,112 @@
 
 (defn- post-artifact-to-relay!
   "Uploads raw binary blob bytes (`X-Bitecho-Blob-Cid`) and pointer to `raw-relay-url`.
-   Validates the blob upload via `core-infra/evaluate-artifact-blob-upload-response`
-   with up to 2 retries on retryable transport/5xx errors, failing closed (`{:ok? false ...}`)
-   if blob persistence fails so callers never report `ok=true` after a failed upload (Rule 5)."
+   Validates both blob and pointer uploads via `core-infra/evaluate-artifact-blob-upload-response`
+   and `core-infra/evaluate-artifact-pointer-upload-response` with up to 2 retries on retryable
+   transport/5xx errors, failing closed (`{:ok? false ...}`) if either upload fails so callers
+   never report `ok=true` after a failed upload (Rule 5, SOAK-F3/F4)."
   [raw-relay-url verb resp cb]
-  (let [base-url (artifact-endpoint-base-url raw-relay-url)]
-    (if-not (and base-url (map? resp) (true? (or (get resp "ok") (:ok resp))))
+  (let [base-url (artifact-endpoint-base-url raw-relay-url)
+        resp-ok? (and (map? resp) (true? (or (get resp "ok") (:ok resp))))
+        is-put? (contains? #{"artifact-put" "put"} (str verb))]
+    (cond
+      (not resp-ok?)
       (when cb (cb {:ok? true}))
-      (let [post-ptr! (fn []
-                        (if-let [ptr (or (get resp "pointer") (:pointer resp))]
-                          (http-post-json! (str base-url "/artifact/v1/pointer")
-                                           (pr-str ptr)
-                                           {"Content-Type" "application/edn"}
-                                           15000
-                                           (fn [_] (when cb (cb {:ok? true}))))
-                          (when cb (cb {:ok? true}))))]
-        (if (and (contains? #{"artifact-put" "put"} (str verb))
-                 (or (get resp "blob") (:blob resp)))
+
+      (nil? base-url)
+      (when cb
+        (cb {:ok? false
+             :error "artifact-blob-upload-failed"
+             :status nil
+             :detail "missing-relay-url"
+             :relay-url raw-relay-url
+             :cid (or (get resp "cid") (:cid resp))}))
+
+      :else
+      (let [post-ptr!
+            (fn []
+              (if-let [ptr (or (get resp "pointer") (:pointer resp))]
+                (let [ptr-body (pr-str ptr)
+                      ptr-attempt!
+                      (fn ptr-attempt! [attempt]
+                        (http-post-bytes-detailed!
+                         (str base-url "/artifact/v1/pointer")
+                         ptr-body
+                         {"Content-Type" "application/edn"}
+                         15000
+                         (fn [{:keys [status body error]}]
+                           (let [parsed (when (and (string? body) (not (str/blank? body)))
+                                          (try (js->clj (js/JSON.parse body)) (catch :default _ nil)))
+                                 eval-res (core-infra/evaluate-artifact-pointer-upload-response
+                                           {:status status
+                                            :parsed-body parsed
+                                            :transport-error error})]
+                             (cond
+                               (:ok? eval-res)
+                               (when cb (cb {:ok? true}))
+
+                               (and (:retryable? eval-res) (< attempt 2))
+                               (js/setTimeout #(ptr-attempt! (inc attempt)) (* 250 (inc attempt)))
+
+                               (and is-put? (integer? (:status eval-res)) (<= 400 (:status eval-res) 499))
+                               ;; Blob was already durably stored; cross-subnet relays may return 400/403 on pointer index
+                               (when cb (cb {:ok? true :pointer-status (:status eval-res)}))
+
+                               :else
+                               (when cb
+                                 (cb {:ok? false
+                                      :error "artifact-pointer-upload-failed"
+                                      :status (:status eval-res)
+                                      :detail (or (:detail eval-res) (name (or (:error eval-res) :pointer-upload-failed)))
+                                      :relay-url base-url
+                                      :cid (or (get resp "cid") (:cid resp))})))))))]
+                  (ptr-attempt! 0))
+                (when cb (cb {:ok? true}))))]
+        (if is-put?
           (let [blob (or (get resp "blob") (:blob resp))
                 cid (:blob/cid blob)
                 media-type (or (:blob/media-type blob) "application/octet-stream")
-                raw-bytes (:blob/bytes blob)
-                upload-attempt!
-                (fn upload-attempt! [attempt]
-                  (http-post-bytes-detailed!
-                   (str base-url "/artifact/v1/blob")
-                   raw-bytes
-                   {"Content-Type" media-type
-                    "X-Bitecho-Blob-Cid" cid}
-                   30000
-                   (fn [{:keys [status body error]}]
-                     (let [parsed (when (and (string? body) (not (str/blank? body)))
-                                    (try (js->clj (js/JSON.parse body)) (catch :default _ nil)))
-                           eval-res (core-infra/evaluate-artifact-blob-upload-response
-                                     {:status status
-                                      :parsed-body parsed
-                                      :transport-error error
-                                      :expected-cid cid})]
-                       (cond
-                         (:ok? eval-res)
-                         (post-ptr!)
+                raw-bytes (:blob/bytes blob)]
+            (if-not (and (map? blob) (string? cid) (not (str/blank? cid)) (some? raw-bytes))
+              (when cb
+                (cb {:ok? false
+                     :error "artifact-blob-upload-failed"
+                     :status nil
+                     :detail "missing-blob-payload"
+                     :relay-url base-url
+                     :cid (or cid (get resp "cid") (:cid resp))}))
+              (let [upload-attempt!
+                    (fn upload-attempt! [attempt]
+                      (http-post-bytes-detailed!
+                       (str base-url "/artifact/v1/blob")
+                       raw-bytes
+                       {"Content-Type" media-type
+                        "X-Bitecho-Blob-Cid" cid}
+                       30000
+                       (fn [{:keys [status body error]}]
+                         (let [parsed (when (and (string? body) (not (str/blank? body)))
+                                        (try (js->clj (js/JSON.parse body)) (catch :default _ nil)))
+                               eval-res (core-infra/evaluate-artifact-blob-upload-response
+                                         {:status status
+                                          :parsed-body parsed
+                                          :transport-error error
+                                          :expected-cid cid})]
+                           (cond
+                             (:ok? eval-res)
+                             (post-ptr!)
 
-                         (and (:retryable? eval-res) (< attempt 2))
-                         (js/setTimeout #(upload-attempt! (inc attempt)) (* 250 (inc attempt)))
+                             (and (:retryable? eval-res) (< attempt 2))
+                             (js/setTimeout #(upload-attempt! (inc attempt)) (* 250 (inc attempt)))
 
-                         :else
-                         (when cb
-                           (cb {:ok? false
-                                :error "artifact-blob-upload-failed"
-                                :status (:status eval-res)
-                                :detail (or (:detail eval-res) (name (or (:error eval-res) :upload-failed)))
-                                :relay-url base-url
-                                :cid cid})))))))]
-            (upload-attempt! 0))
+                             :else
+                             (when cb
+                               (cb {:ok? false
+                                    :error "artifact-blob-upload-failed"
+                                    :status (:status eval-res)
+                                    :detail (or (:detail eval-res) (name (or (:error eval-res) :upload-failed)))
+                                    :relay-url base-url
+                                    :cid cid})))))))]
+                (upload-attempt! 0))))
           (post-ptr!))))))
 
 (defn handle-serve-line!
@@ -3323,139 +3388,155 @@
           (let [eff-domain-verb (effective-artifact-domain-verb verb cmd-map)
                 res (light-core/process-jsonl-line @state-atom effective-line (:privkey-bytes identity))
                 _ (maybe-write-artifact-out-file! eff-domain-verb cmd-map (:response res))
-                _ (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
-                    (when-let [art-relay (or (get cmd-map "relay_url")
-                                             (get cmd-map "relay-url")
-                                             (:relay-url cmd-map)
-                                             relay-url)]
-                      (post-artifact-to-relay! art-relay eff-domain-verb (:response res) nil)))
-                _ (when (:state res)
+                art-relay (when (contains? #{"artifact-put" "artifact-revoke"} eff-domain-verb)
+                            (or (get cmd-map "relay_url")
+                                (get cmd-map "relay-url")
+                                (:relay-url cmd-map)
+                                relay-url))
+                proceed-after-artifact!
+                (fn []
+                  (when (:state res)
                     (reset! state-atom (:state res))
                     (when state-file
                       (try (save-light-state! state-file @state-atom) (catch :default _ nil))))
-                _ (if (seq (:p2p-dials res))
+                  (if (seq (:p2p-dials res))
                     (doseq [dial-info (:p2p-dials res)]
                       (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file))
                     (when-let [dial-info (:p2p-dial res)]
                       (dial-p2p-peer! state-atom p2p-peers-atom ingress-peers-atom mdns-atom (:privkey-bytes identity) emit! dial-info state-file)))
-                shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
-                import-shuttle-verb? (contains? #{"import-envelope" "import-poll" "import"} verb)
-                connect-explicit? (true? (or (get cmd-map "connect") (:connect cmd-map)))
-                currently-live? (connection-live? @conn-atom @state-atom)
-                has-live-peers? (or (and p2p-peers-atom (seq @p2p-peers-atom))
-                                    (and ingress-peers-atom (seq @ingress-peers-atom)))
-                shuttle-can-forward? (and import-shuttle-verb?
-                                          (or connect-explicit? currently-live? has-live-peers?))
-                needs-net? (and (seq (:net-envelopes res))
-                                (if shuttle-verb?
-                                  (or connect-explicit? shuttle-can-forward?)
-                                  true))]
-            (if needs-net?
-              (let [replay-envs (when (= verb "register-home-set")
-                                  (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
-                    live-envs (if (seq replay-envs)
-                                (into (vec replay-envs) (:net-envelopes res))
-                                (:net-envelopes res))
-                    mirror-to-relay! (fn [envs]
-                                       (when (and (string? relay-url)
-                                                  (not (str/blank? relay-url))
-                                                  (not= :http-relay (:transport @conn-atom)))
-                                         (doseq [env (remove :p2p-direct? envs)]
-                                           (try
-                                             (submit-relay-envelope! relay-url env (fn [_] nil) {:timeout-ms 5000})
-                                             (catch :default _ nil)))))]
-                (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
-                  (do
-                    (send-routed-envelopes! live-envs
-                                            (when currently-live? (:send-fn @conn-atom))
-                                            p2p-peers-atom
-                                            ingress-peers-atom
-                                            state-atom
-                                            (:privkey-bytes identity))
-                    (mirror-to-relay! live-envs)
-                    (sync-conn-diagnostics! state-atom conn-atom)
-                    (save-light-state! state-file @state-atom)
-                    (finish-resp! res))
-                  (let [sent-ingress? (boolean
-                                       (when (and ingress-peers-atom (seq @ingress-peers-atom))
-                                         (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
-                        sent-val? (when currently-live?
-                                    (send-all-envelopes! (:send-fn @conn-atom) live-envs))
-                        _ (mirror-to-relay! live-envs)
-                        sent? (or sent-val? sent-ingress?)]
-                    (if sent?
-                      (do
-                        (swap! state-atom assoc :connected? true :connection-error nil)
+                  (let [shuttle-verb? (contains? #{"export-offer" "export-poll" "export-ack" "export-reveal" "export-p2p-offer" "export-p2p-answer" "export-send" "import-envelope" "import-poll" "import"} verb)
+                        import-shuttle-verb? (contains? #{"import-envelope" "import-poll" "import"} verb)
+                        connect-explicit? (true? (or (get cmd-map "connect") (:connect cmd-map)))
+                        currently-live? (connection-live? @conn-atom @state-atom)
+                        has-live-peers? (or (and p2p-peers-atom (seq @p2p-peers-atom))
+                                            (and ingress-peers-atom (seq @ingress-peers-atom)))
+                        shuttle-can-forward? (and import-shuttle-verb?
+                                                  (or connect-explicit? currently-live? has-live-peers?))
+                        needs-net? (and (seq (:net-envelopes res))
+                                        (if shuttle-verb?
+                                          (or connect-explicit? shuttle-can-forward?)
+                                          true))]
+                    (if needs-net?
+                      (let [replay-envs (when (= verb "register-home-set")
+                                          (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity)))
+                            live-envs (if (seq replay-envs)
+                                        (into (vec replay-envs) (:net-envelopes res))
+                                        (:net-envelopes res))
+                            mirror-to-relay! (fn [envs]
+                                               (when (and (string? relay-url)
+                                                          (not (str/blank? relay-url))
+                                                          (not= :http-relay (:transport @conn-atom)))
+                                                 (doseq [env (remove :p2p-direct? envs)]
+                                                   (try
+                                                     (submit-relay-envelope! relay-url env (fn [_] nil) {:timeout-ms 5000})
+                                                     (catch :default _ nil)))))]
+                        (if (some #(or (:p2p-direct? %) (:p2p-broadcast? %)) live-envs)
+                          (do
+                            (send-routed-envelopes! live-envs
+                                                    (when currently-live? (:send-fn @conn-atom))
+                                                    p2p-peers-atom
+                                                    ingress-peers-atom
+                                                    state-atom
+                                                    (:privkey-bytes identity))
+                            (mirror-to-relay! live-envs)
+                            (sync-conn-diagnostics! state-atom conn-atom)
+                            (save-light-state! state-file @state-atom)
+                            (finish-resp! res))
+                          (let [sent-ingress? (boolean
+                                               (when (and ingress-peers-atom (seq @ingress-peers-atom))
+                                                 (some true? (mapv #(send-all-envelopes! % live-envs) (vals @ingress-peers-atom)))))
+                                sent-val? (when currently-live?
+                                            (send-all-envelopes! (:send-fn @conn-atom) live-envs))
+                                _ (mirror-to-relay! live-envs)
+                                sent? (or sent-val? sent-ingress?)]
+                            (if sent?
+                              (do
+                                (swap! state-atom assoc :connected? true :connection-error nil)
+                                (sync-conn-diagnostics! state-atom conn-atom)
+                                (save-light-state! state-file @state-atom)
+                                (finish-resp! res))
+                              (do
+                                (swap! state-atom assoc :connected? false :connection-error "send-failed")
+                                (when conn-atom
+                                  (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
+                                (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
+                                      cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
+                                      home-set (if state-atom (:home-set @state-atom) [])
+                                      opts-with-gen (assoc (or conn-opts {})
+                                                           :generation target-gen
+                                                           :validator-cursor cursor
+                                                           :home-set home-set)]
+                                  (connect-validators!
+                                   identity bootstrap opts-with-gen
+                                   (fn [reconn]
+                                     (if (:ok? reconn)
+                                       (do
+                                         (when conn-atom
+                                           (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
+                                         (let [r-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
+                                               all-envs (into (vec r-envs) (:net-envelopes res))]
+                                           (if (send-all-envelopes! (:send-fn reconn) all-envs)
+                                             (do
+                                               (swap! state-atom assoc :connected? true :connection-error nil)
+                                               (sync-conn-diagnostics! state-atom conn-atom)
+                                               (save-light-state! state-file @state-atom)
+                                               (finish-resp! res))
+                                             (let [err "send-failed"]
+                                               (when conn-atom
+                                                 (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
+                                               (swap! state-atom assoc :connected? false :connection-error err)
+                                               (if (= verb "send")
+                                                 (do
+                                                   (sync-conn-diagnostics! state-atom conn-atom)
+                                                   (save-light-state! state-file @state-atom)
+                                                   (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
+                                                     (emit! err-map)
+                                                     (done-cb err-map)))
+                                                 (do
+                                                   (sync-conn-diagnostics! state-atom conn-atom)
+                                                   (let [resp {"ok" false "error" err}]
+                                                     (emit! resp)
+                                                     (done-cb resp))))))))
+                                       (let [err (or (:error reconn) "listener-disabled")]
+                                         (when conn-atom
+                                           (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
+                                         (swap! state-atom assoc :connected? false :connection-error err)
+                                         (if (= verb "send")
+                                           (do
+                                             (sync-conn-diagnostics! state-atom conn-atom)
+                                             (save-light-state! state-file @state-atom)
+                                             (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
+                                               (emit! err-map)
+                                               (done-cb err-map)))
+                                           (do
+                                             (sync-conn-diagnostics! state-atom conn-atom)
+                                             (let [resp {"ok" false "error" err}]
+                                               (emit! resp)
+                                               (done-cb resp))))))))))))))
+                      (let [deferred-forward? (and import-shuttle-verb? (seq (:net-envelopes res)))
+                            final-res (if deferred-forward?
+                                        (do
+                                          (swap! state-atom update-in [:diagnostics :shuttle-import-forward-deferred] (fnil inc 0))
+                                          (update res :response assoc "pending_forward_count" (count (:net-envelopes res))))
+                                        res)]
                         (sync-conn-diagnostics! state-atom conn-atom)
                         (save-light-state! state-file @state-atom)
-                        (finish-resp! res))
-                      (do
-                        (swap! state-atom assoc :connected? false :connection-error "send-failed")
-                        (when conn-atom
-                          (apply-conn-event! conn-atom {:type :dial-started} conn-opts))
-                        (let [target-gen (if conn-atom (:generation @conn-atom 0) 1)
-                              cursor (if conn-atom (:validator-cursor @conn-atom 0) 0)
-                              home-set (if state-atom (:home-set @state-atom) [])
-                              opts-with-gen (assoc (or conn-opts {})
-                                                   :generation target-gen
-                                                   :validator-cursor cursor
-                                                   :home-set home-set)]
-                          (connect-validators!
-                           identity bootstrap opts-with-gen
-                           (fn [reconn]
-                             (if (:ok? reconn)
-                               (do
-                                 (when conn-atom
-                                   (apply-conn-event! conn-atom (assoc reconn :type :dial-ok :generation target-gen) conn-opts))
-                                 (let [r-envs (light-core/build-unacked-replay-envelopes @state-atom (:privkey-bytes identity))
-                                       all-envs (into (vec r-envs) (:net-envelopes res))]
-                                   (if (send-all-envelopes! (:send-fn reconn) all-envs)
-                                     (do
-                                       (swap! state-atom assoc :connected? true :connection-error nil)
-                                       (sync-conn-diagnostics! state-atom conn-atom)
-                                       (save-light-state! state-file @state-atom)
-                                       (finish-resp! res))
-                                     (let [err "send-failed"]
-                                       (when conn-atom
-                                         (apply-conn-event! conn-atom {:type :send-failed :error err :generation target-gen} conn-opts))
-                                       (swap! state-atom assoc :connected? false :connection-error err)
-                                       (if (= verb "send")
-                                         (do
-                                           (sync-conn-diagnostics! state-atom conn-atom)
-                                           (save-light-state! state-file @state-atom)
-                                           (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
-                                             (emit! err-map)
-                                             (done-cb err-map)))
-                                         (do
-                                           (sync-conn-diagnostics! state-atom conn-atom)
-                                           (let [resp {"ok" false "error" err}]
-                                             (emit! resp)
-                                             (done-cb resp))))))))
-                               (let [err (or (:error reconn) "listener-disabled")]
-                                 (when conn-atom
-                                   (apply-conn-event! conn-atom {:type :dial-failed :error err :node (:node reconn) :generation target-gen} conn-opts))
-                                 (swap! state-atom assoc :connected? false :connection-error err)
-                                 (if (= verb "send")
-                                   (do
-                                     (sync-conn-diagnostics! state-atom conn-atom)
-                                     (save-light-state! state-file @state-atom)
-                                     (let [err-map (assoc (or (:response res) {"ok" true}) "ok" true "queued" true "transport_error" err)]
-                                       (emit! err-map)
-                                       (done-cb err-map)))
-                                   (do
-                                     (sync-conn-diagnostics! state-atom conn-atom)
-                                     (let [resp {"ok" false "error" err}]
-                                       (emit! resp)
-                                       (done-cb resp))))))))))))))
-              (let [deferred-forward? (and import-shuttle-verb? (seq (:net-envelopes res)))
-                    final-res (if deferred-forward?
-                                (do
-                                  (swap! state-atom update-in [:diagnostics :shuttle-import-forward-deferred] (fnil inc 0))
-                                  (update res :response assoc "pending_forward_count" (count (:net-envelopes res))))
-                                res)]
-                (sync-conn-diagnostics! state-atom conn-atom)
-                (save-light-state! state-file @state-atom)
-                (finish-resp! final-res)))))
+                        (finish-resp! final-res)))))]
+            (if (and art-relay
+                     (true? (or (get (:response res) "ok") (:ok (:response res)))))
+              (post-artifact-to-relay!
+               art-relay eff-domain-verb (:response res)
+               (fn [art-res]
+                 (if (false? (:ok? art-res))
+                   (finish-resp!
+                    {:response {"ok" false
+                                "error" (or (:error art-res) "artifact-blob-upload-failed")
+                                "status" (:status art-res)
+                                "detail" (:detail art-res)
+                                "relay_url" (:relay-url art-res)
+                                "cid" (:cid art-res)}})
+                   (proceed-after-artifact!))))
+              (proceed-after-artifact!))))
         after-sync!
         (fn []
           (if (and (contains? #{"directory-lookup" "directory-verify"} verb)

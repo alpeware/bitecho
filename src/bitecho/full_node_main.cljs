@@ -1015,7 +1015,16 @@
   (let [sub @(:subnet-atom rt)
         le (:leader-election sub)
         fin-ep (current-finalized-epoch rt)
-        egress (long (get-in @limiter-atom [:egress-by-month (current-month-key)] 0))]
+        egress (long (get-in @limiter-atom [:egress-by-month (current-month-key)] 0))
+        mem-raw (try
+                  (let [m (.memoryUsage js/process)]
+                    {:rss-bytes (.-rss m)
+                     :heap-used-bytes (.-heapUsed m)
+                     :heap-total-bytes (.-heapTotal m)
+                     :external-bytes (.-external m)
+                     :array-buffers-bytes (.-arrayBuffers m)})
+                  (catch :default _ nil))
+        memory (core-infra/normalize-memory-telemetry mem-raw)]
     {:ok true
      :runtime "nodejs"
      :version full-node-version
@@ -1028,6 +1037,7 @@
      :healthy (count (or (:healthy-nodes le) #{}))
      :egress_bytes egress
      :pointer_count (count (get-in sub [:data :pointers]))
+     :memory memory
      :diagnostics {:runtime (core-infra/shell-status-summary @(:shell-atom rt))
                    :http (when http-shell-atom (core-infra/shell-status-summary @http-shell-atom))
                    :dns (when dns-shell-atom (core-infra/shell-status-summary @dns-shell-atom))
@@ -1390,16 +1400,19 @@
                                         (send-json! res 500 {:ok false
                                                              :error "blob-persist-failed"
                                                              :detail (or (:detail persist-res) "disk-write-failed")})
-                                        (do
-                                          (submit-subnet-event! rt {:type :put-blob
-                                                                    :blob blob
-                                                                    :sender sender
-                                                                    :now-ms now-ms
-                                                                    :from-peer? replicated?
-                                                                    :skip-disk-write? true})
-                                          (send-json! res 200 {:ok true
-                                                               :cid (:blob/cid blob)
-                                                               :size_bytes blob-len})))))
+                                        (let [sub-res (submit-subnet-event! rt {:type :put-blob
+                                                                                :blob blob
+                                                                                :sender sender
+                                                                                :now-ms now-ms
+                                                                                :from-peer? replicated?
+                                                                                :skip-disk-write? true})]
+                                          (if-not (:applied? sub-res)
+                                            (send-json! res 500 {:ok false
+                                                                 :error "blob-index-failed"
+                                                                 :detail (name (or (:error sub-res) :put-blob-rejected))})
+                                            (send-json! res 200 {:ok true
+                                                                 :cid (:blob/cid blob)
+                                                                 :size_bytes blob-len}))))))
                              (.catch (fn [e]
                                        (send-json! res 500 {:ok false
                                                             :error "blob-persist-failed"
