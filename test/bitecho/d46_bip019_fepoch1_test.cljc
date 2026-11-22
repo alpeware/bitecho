@@ -420,3 +420,207 @@
              "node_main.cljs must emit counted :finalized-epoch-stalled diagnostic")
          (is (str/includes? full-src ":corrupt-block-depth-repaired")
              "full_node_main.cljs must surface :corrupt-block-depth-repaired in telemetry digest")))))
+
+;; =============================================================================
+;; BIP-019-SOAK-F1: Epoch-Dwell Double-Tick Guard (Eliminating ~97s Fork Stalls)
+;; =============================================================================
+
+(defn- make-timed-streamlet-cluster
+  [n tick-ms]
+  (let [kps (repeatedly n crypto/generate-keypair)
+        hexes (mapv #(basalt/bytes->hex (:public %)) kps)
+        sorted-pairs (sort-by first (map vector hexes kps))
+        peers-map (into {} (map (fn [[h kp]] [h (:public kp)]) sorted-pairs))
+        validators (mapv first sorted-pairs)]
+    (mapv (fn [[h kp]]
+            {:node-pubkey h
+             :keypair kp
+             :peers-map peers-map
+             :validators validators
+             :config {:tick-interval-ms tick-ms}
+             :epoch 0
+             :blocks {}
+             :block-depths {}
+             :notarized-blocks #{}
+             :finalized-blocks #{}
+             :block-votes {}
+             :block-vote-proofs {}
+             :voted-epochs #{}
+             :head-hash "genesis"
+             :mempool []})
+          sorted-pairs)))
+
+(defn- run-timed-streamlet-sim
+  "Deterministic discrete-event simulator for N Streamlet validators with per-node
+   tick phase offsets and network latency `net-ms`. Optionally supports killing
+   `kill-idx` during `[kill-start-ms, kill-end-ms)` and restarting it with
+   `restart-phase-ms` from a snapshot captured earlier."
+  [{:keys [n tick-ms phases net-ms total-ticks kill-idx kill-start-ms kill-end-ms restart-phase-ms]}]
+  (let [nodes (atom (make-timed-streamlet-cluster n tick-ms))
+        saved-snap (atom nil)
+        killed? (atom false)
+        restarted? (atom false)
+        seq-id (atom 0)
+        q (atom (sorted-set-by (fn [a b] (compare [(first a) (second a)] [(first b) (second b)]))))
+        hex->idx (into {} (map-indexed (fn [i st] [(:node-pubkey st) i]) @nodes))
+        sched! (fn [t idx ev] (swap! q conj [t (swap! seq-id inc) idx ev]))
+        total-ms (* total-ticks tick-ms)
+        diag-suppressed (atom 0)]
+    (dotimes [i n]
+      (sched! (+ tick-ms (nth phases i)) i {:type :tick :now-ms (+ tick-ms (nth phases i))}))
+    (loop [max-fin-gap 0]
+      (if-let [[t _ idx ev :as item] (first @q)]
+        (if (> t total-ms)
+          {:final-epochs (mapv :epoch @nodes)
+           :final-fin (mapv (fn [st]
+                              (if-let [h (:latest-finalized-block-hash st)]
+                                (long (get-in st [:blocks h :epoch] 0))
+                                0))
+                            @nodes)
+           :max-fin-gap max-fin-gap
+           :suppressed-diag-count @diag-suppressed
+           :suppressed-state-counts (mapv #(long (get-in % [:diagnostics :tick-suppressed-epoch-already-advanced] 0)) @nodes)}
+          (do
+            (swap! q disj item)
+            (when (and (some? kill-idx) (nil? @saved-snap) (>= t (- kill-start-ms (* 3 tick-ms))))
+              (reset! saved-snap (core-mesh/strip-unserializable-state (nth @nodes kill-idx))))
+            (when (and (some? kill-idx) (not @killed?) (>= t kill-start-ms))
+              (reset! killed? true))
+            (when (and (some? kill-idx) @killed? (not @restarted?) (>= t kill-end-ms))
+              (reset! restarted? true)
+              (let [orig (nth @nodes kill-idx)
+                    restored (assoc (or @saved-snap orig)
+                                    :keypair (:keypair orig)
+                                    :peers-map (:peers-map orig)
+                                    :validators (:validators orig)
+                                    :config (:config orig))]
+                (swap! nodes assoc kill-idx (dissoc restored :epoch-started-at-ms))
+                (let [next-t (+ t (long (or restart-phase-ms 0)))]
+                  (sched! next-t kill-idx {:type :tick :now-ms next-t}))))
+            (let [node-down? (and (some? kill-idx) (= idx kill-idx) @killed? (not @restarted?))]
+              (when-not node-down?
+                (when (= (:type ev) :tick)
+                  (let [next-t (+ t tick-ms)]
+                    (sched! next-t idx {:type :tick :now-ms next-t})))
+                (let [st (nth @nodes idx)
+                      {:keys [state commands]} (streamlet/handle-streamlet-event st ev)]
+                  (swap! nodes assoc idx state)
+                  (doseq [cmd commands]
+                    (case (:type cmd)
+                      :diagnose
+                      (when (= :tick-suppressed-epoch-already-advanced (:reason cmd))
+                        (swap! diag-suppressed inc))
+                      :send-propose
+                      (doseq [target (:targets cmd) :when (not= target (:node-pubkey state))]
+                        (when-let [tidx (get hex->idx target)]
+                          (sched! (+ t net-ms) tidx
+                                  {:type :receive-propose
+                                   :block (:block cmd)
+                                   :ancestors (:ancestors cmd)
+                                   :sender (:node-pubkey state)
+                                   :now-ms (+ t net-ms)})))
+                      :send-vote
+                      (doseq [target (:targets cmd) :when (not= target (:node-pubkey state))]
+                        (when-let [tidx (get hex->idx target)]
+                          (sched! (+ t net-ms) tidx
+                                  {:type :receive-vote
+                                   :vote (:vote cmd)
+                                   :sender (:node-pubkey state)
+                                   :now-ms (+ t net-ms)})))
+                      nil)))))
+            (let [live-idx (if (= kill-idx 0) 1 0)
+                  live-st (nth @nodes live-idx)
+                  ep (long (or (:epoch live-st) 0))
+                  fin (if-let [h (:latest-finalized-block-hash live-st)]
+                        (long (get-in live-st [:blocks h :epoch] 0))
+                        0)]
+              (recur (max max-fin-gap (- ep fin))))))
+        {:empty true}))))
+
+(defspec ^{:doc "BIP-019-SOAK-F1: Wall-clock-aligned validators firing within the (T_propose, T_notarize) killer window never double-tick into sibling forks; finalization advances cleanly at ~1 epoch/tick with counted Rule 5 suppression diagnostics."}
+  prop-streamlet-epoch-dwell-prevents-double-tick-fork-stall 20
+  (prop/for-all [n (gen/elements [3 6])
+                 tick-ms (gen/choose 1000 2000)
+                 net-ms (gen/choose 4 10)
+                 extra-offset (gen/choose 1 4)]
+                (let [step (+ net-ms (min extra-offset (dec net-ms)))
+                      phases (mapv #(* % step) (range n))
+                      res (run-timed-streamlet-sim {:n n
+                                                    :tick-ms tick-ms
+                                                    :phases phases
+                                                    :net-ms net-ms
+                                                    :total-ticks 24})]
+                  (and (every? #(>= % 18) (:final-fin res))
+                       (every? #(<= % 28) (:final-epochs res))
+                       (<= (:max-fin-gap res) 4)
+                       (pos? (:suppressed-diag-count res))
+                       (some pos? (:suppressed-state-counts res))))))
+
+(defspec ^{:doc "BIP-019-SOAK-F1 security invariant: replaying an old/same-epoch proposal or vote never updates :epoch-started-at-ms and never freezes future ticks; backwards clock jumps never suppress ticks."}
+  prop-streamlet-byzantine-old-epoch-replay-never-freezes-tick 50
+  (prop/for-all [tick-ms (gen/choose 1000 10000)
+                 start-ms (gen/choose 100000 200000)
+                 backwards-jump (gen/choose 1 5000)]
+                (let [nodes (make-timed-streamlet-cluster 3 tick-ms)
+                      v0 (nth nodes 0)
+                      v1 (nth nodes 1)
+                      r1 (streamlet/handle-streamlet-event v1 {:type :tick :now-ms start-ms})
+                      prop-cmd (first (filter #(= :send-propose (:type %)) (:commands r1)))
+                      r0-init (streamlet/handle-streamlet-event
+                               v0 {:type :receive-propose
+                                   :block (:block prop-cmd)
+                                   :ancestors (:ancestors prop-cmd)
+                                   :sender (:node-pubkey v1)
+                                   :now-ms (+ start-ms 5)})
+                      st0 (:state r0-init)
+                      replay-ms (+ start-ms (- tick-ms 50))
+                      r0-replay (streamlet/handle-streamlet-event
+                                 st0 {:type :receive-propose
+                                      :block (:block prop-cmd)
+                                      :ancestors (:ancestors prop-cmd)
+                                      :sender (:node-pubkey v1)
+                                      :now-ms replay-ms})
+                      st0-replayed (:state r0-replay)
+                      r0-next (streamlet/handle-streamlet-event
+                               st0-replayed {:type :tick :now-ms (+ start-ms tick-ms)})
+                      r0-back (streamlet/handle-streamlet-event
+                               st0 {:type :tick :now-ms (- start-ms backwards-jump)})]
+                  (and (= (+ start-ms 5) (:epoch-started-at-ms st0))
+                       (= (+ start-ms 5) (:epoch-started-at-ms st0-replayed))
+                       (= 2 (:epoch (:state r0-next)))
+                       (= 2 (:epoch (:state r0-back)))))))
+
+(deftest test-bip019-soak-f1-kill-restart-and-shell-wiring
+  (testing "6-node cluster with SIGKILL + restart into killer phase window continues finalizing cleanly without 97s stall"
+    (let [res (run-timed-streamlet-sim {:n 6
+                                        :tick-ms 1500
+                                        :phases [0 8 16 24 32 40]
+                                        :net-ms 5
+                                        :total-ticks 36
+                                        :kill-idx 5
+                                        :kill-start-ms (* 12 1500)
+                                        :kill-end-ms (* 16 1500)
+                                        :restart-phase-ms 8})]
+      (is (every? #(>= % 30) (:final-fin res))
+          (str "All 6 nodes must finalize >= 30 epochs across kill+restart, got: " (pr-str res)))
+      (is (<= (:max-fin-gap res) 5)
+          (str "Finalization gap must remain bounded (<= 5 epochs), got: " (pr-str res)))))
+
+  (testing "Rule 4: strip-unserializable-state and rebind-restored-state never persist or restore :epoch-started-at-ms"
+    (let [kp (crypto/generate-keypair)
+          pub-hex (basalt/bytes->hex (:public kp))
+          ident {:pubkey-hex pub-hex :keypair kp}
+          st {:epoch 42 :epoch-started-at-ms 123456789 :blocks {} :ledger {}}
+          stripped (core-mesh/strip-unserializable-state st)
+          rebound (core-mesh/rebind-restored-state st {} ident)]
+      (is (not (contains? stripped :epoch-started-at-ms)))
+      (is (not (contains? rebound :epoch-started-at-ms)))))
+
+  #?(:clj
+     (testing "Shell wiring: full_node_main.cljs and shell/mesh.clj attach :now-ms to :tick and peer network events"
+       (let [full-src (slurp (io/file "src/bitecho/full_node_main.cljs"))
+             mesh-src (slurp (io/file "src/bitecho/shell/mesh.clj"))]
+         (is (str/includes? full-src ":now-ms (.now js/Date)")
+             "full_node_main.cljs must pass :now-ms on :tick and peer ingress events")
+         (is (str/includes? mesh-src ":now-ms (System/currentTimeMillis)")
+             "shell/mesh.clj must pass :now-ms on :tick and peer ingress events")))))

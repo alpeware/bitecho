@@ -767,37 +767,89 @@
            :voter-set (set (keys verified-votes))
            :vote-proofs verified-votes})))))
 
+(defn resolve-min-epoch-dwell-ms
+  "Resolves the minimum wall-clock dwell time (in ms) before a local :tick may advance
+   :epoch again after a prior epoch advance (`BIP-019-SOAK-F1`).
+   Defaults to half of `:tick-interval-ms` (or `:epoch-length-ms`) when configured;
+   returns 0 when no positive tick interval is present."
+  [state]
+  (let [explicit (or (get-in state [:config :min-epoch-dwell-ms])
+                     (:min-epoch-dwell-ms state))]
+    (if (some? explicit)
+      (max 0 (long explicit))
+      (let [tick-ms (or (get-in state [:config :tick-interval-ms])
+                        (:tick-interval-ms state)
+                        (get-in state [:config :epoch-length-ms])
+                        (:epoch-length-ms state)
+                        0)]
+        (if (pos? (long tick-ms))
+          (quot (long tick-ms) 2)
+          0)))))
+
+(defn tick-suppressed?
+  "Returns true when a local `:tick` event carrying `:now-ms` arrives within
+   `min-epoch-dwell-ms` of `:epoch-started-at-ms`, preventing wall-clock-aligned
+   timers from double-ticking into sibling forks right after a peer's proposal
+   already advanced `:epoch` for the current slot (`BIP-019-SOAK-F1`).
+   Never suppresses when `:now-ms` or `:epoch-started-at-ms` is absent, when
+   `min-epoch-dwell-ms` <= 0, or on backwards clock steps (`elapsed < 0`)."
+  [state event]
+  (let [now-ms (:now-ms event)
+        started-at (:epoch-started-at-ms state)
+        min-dwell (resolve-min-epoch-dwell-ms state)]
+    (boolean
+     (and (integer? now-ms)
+          (integer? started-at)
+          (pos? min-dwell)
+          (let [elapsed (- (long now-ms) (long started-at))]
+            (and (>= elapsed 0)
+                 (< elapsed min-dwell)))))))
+
+(defn- advance-epoch
+  "Advances `:epoch` to `(max old-epoch target-epoch)`. Only updates `:epoch-started-at-ms`
+   when `:epoch` strictly increases and `now-ms` is an integer (immune to Byzantine replay
+   of old or same-epoch messages)."
+  [state target-epoch now-ms]
+  (let [old-ep (long (or (:epoch state) 0))
+        new-ep (max old-ep (long target-epoch))]
+    (if (> new-ep old-ep)
+      (cond-> (assoc state :epoch new-ep)
+        (integer? now-ms) (assoc :epoch-started-at-ms (long now-ms)))
+      state)))
+
 (defn ingest-verified-ancestors
   "Ingests verified notarized ancestor blocks into state if they have valid quorum vote proofs
    and do not exceed max-epoch-catchup-delta. Ancestors are processed in ascending epoch order."
-  [state ancestors]
-  (let [sorted-ancestors (sort-by (fn [entry] (or (get-in entry [:block :epoch]) 0)) ancestors)]
-    (reduce (fn [s entry]
-              (let [res (verify-ancestor-quorum s entry)]
-                (if (:valid? res)
-                  (let [b-hash (:b-hash res)
-                        block (:block res)
-                        s-with-depth (-> s
-                                         (assoc-in [:blocks b-hash] block)
-                                         (record-block-depth b-hash))
-                        ;; Never seed depth from :epoch or :last-executed-finalized-epoch when
-                        ;; parent is unknown; anchor at minimal topological depth (<= epoch).
-                        s-anchored (if (not (contains? (:block-depths s-with-depth) b-hash))
-                                     (let [ep (long (or (:epoch block) 1))]
-                                       (if (> ep 1)
-                                         (-> s-with-depth
-                                             (assoc-in [:block-depths (:parent-hash block)] 1)
-                                             (assoc-in [:block-depths b-hash] 2))
-                                         (assoc-in s-with-depth [:block-depths b-hash] 1)))
-                                     s-with-depth)]
-                    (-> s-anchored
-                        (update-in [:block-votes b-hash] (fnil into #{}) (:voter-set res))
-                        (update-in [:block-vote-proofs b-hash] merge (:vote-proofs res))
-                        (update :notarized-blocks (fnil conj #{}) b-hash)
-                        (update :epoch (fn [e] (max (or e 0) (long (:epoch block)))))))
-                  s)))
-            state
-            sorted-ancestors)))
+  ([state ancestors]
+   (ingest-verified-ancestors state ancestors nil))
+  ([state ancestors now-ms]
+   (let [sorted-ancestors (sort-by (fn [entry] (or (get-in entry [:block :epoch]) 0)) ancestors)]
+     (reduce (fn [s entry]
+               (let [res (verify-ancestor-quorum s entry)]
+                 (if (:valid? res)
+                   (let [b-hash (:b-hash res)
+                         block (:block res)
+                         s-with-depth (-> s
+                                          (assoc-in [:blocks b-hash] block)
+                                          (record-block-depth b-hash))
+                         ;; Never seed depth from :epoch or :last-executed-finalized-epoch when
+                         ;; parent is unknown; anchor at minimal topological depth (<= epoch).
+                         s-anchored (if (not (contains? (:block-depths s-with-depth) b-hash))
+                                      (let [ep (long (or (:epoch block) 1))]
+                                        (if (> ep 1)
+                                          (-> s-with-depth
+                                              (assoc-in [:block-depths (:parent-hash block)] 1)
+                                              (assoc-in [:block-depths b-hash] 2))
+                                          (assoc-in s-with-depth [:block-depths b-hash] 1)))
+                                      s-with-depth)]
+                     (-> s-anchored
+                         (update-in [:block-votes b-hash] (fnil into #{}) (:voter-set res))
+                         (update-in [:block-vote-proofs b-hash] merge (:vote-proofs res))
+                         (update :notarized-blocks (fnil conj #{}) b-hash)
+                         (advance-epoch (:epoch block) now-ms)))
+                   s)))
+             state
+             sorted-ancestors))))
 
 (defn truncate-ancestors-to-wire-budget
   "Truncates a newest-first vector of notarized ancestor entries to the longest contiguous prefix
@@ -818,53 +870,66 @@
             kept))))))
 
 (defn- handle-tick-event
-  "Handles a :tick event: advances epoch, elects proposer from Streamlet BFT :validators committee, and proposes if local node."
-  [state]
-  (let [new-epoch (inc (get state :epoch 0))
-        state (-> state
-                  (assoc :epoch new-epoch)
-                  update-head-hash)
-        validator-hexes (extract-validator-hexes state)]
-    (if (empty? validator-hexes)
-      {:state (prune-streamlet-state state) :commands []}
-      (let [total-nodes (total-node-count state validator-hexes)
-            proposer-idx (mod new-epoch total-nodes)
-            proposer-hex (nth validator-hexes proposer-idx)
-            is-proposer? (= proposer-hex (:node-pubkey state))]
-        (if is-proposer?
-          (let [block (propose-block state new-epoch)
-                b-hash (hash-block block)
-                state (-> state
-                          (assoc-in [:blocks b-hash] block)
-                          (record-block-depth b-hash))
-                vote (cast-vote state block)
-                local-pk (extract-local-pubkey-bytes state)
-                state (if vote
-                        (-> state
-                            (update :voted-epochs (fnil conj #{}) (:epoch block))
-                            (accumulate-vote vote local-pk total-nodes))
-                        state)
-                state (apply-future-votes state b-hash total-nodes)
-                state (-> state
-                          update-head-hash
-                          finalize-prefix)
-                targets (extract-targets state)
-                ancestor-depth (long (or (get-in state [:config :max-ancestor-sync-depth])
-                                         (:max-ancestor-sync-depth state)
-                                         default-max-ancestor-sync-depth))
-                wire-budget (long (or (get-in state [:config :max-propose-wire-bytes])
-                                      (:max-propose-wire-bytes state)
-                                      default-max-propose-wire-bytes))
-                raw-ancestors (extract-notarized-ancestors state (:parent-hash block) ancestor-depth)
-                base-propose {:type :send-propose :targets targets :block block :ancestors []}
-                ancestors (truncate-ancestors-to-wire-budget base-propose raw-ancestors wire-budget)
-                propose-cmd (assoc base-propose :ancestors ancestors)
-                commands (if vote
-                           [propose-cmd
-                            {:type :send-vote :targets targets :vote vote}]
-                           [propose-cmd])]
-            {:state (prune-streamlet-state state) :commands commands})
-          {:state (prune-streamlet-state state) :commands []})))))
+  "Handles a :tick event: enforces epoch-dwell guard against double-ticking (`BIP-019-SOAK-F1`),
+   advances epoch, elects proposer from Streamlet BFT :validators committee, and proposes if local node."
+  [state event]
+  (if (tick-suppressed? state event)
+    (let [curr-ep (long (or (:epoch state) 0))
+          elapsed (- (long (:now-ms event)) (long (:epoch-started-at-ms state)))
+          min-dwell (resolve-min-epoch-dwell-ms state)
+          diag {:type :diagnose
+                :effect :diagnose
+                :reason :tick-suppressed-epoch-already-advanced
+                :epoch curr-ep
+                :elapsed-ms elapsed
+                :min-dwell-ms min-dwell}
+          state' (update-in state [:diagnostics :tick-suppressed-epoch-already-advanced] (fnil inc 0))]
+      {:state (prune-streamlet-state state') :commands [diag]})
+    (let [new-epoch (inc (get state :epoch 0))
+          state (-> state
+                    (advance-epoch new-epoch (:now-ms event))
+                    update-head-hash)
+          validator-hexes (extract-validator-hexes state)]
+      (if (empty? validator-hexes)
+        {:state (prune-streamlet-state state) :commands []}
+        (let [total-nodes (total-node-count state validator-hexes)
+              proposer-idx (mod new-epoch total-nodes)
+              proposer-hex (nth validator-hexes proposer-idx)
+              is-proposer? (= proposer-hex (:node-pubkey state))]
+          (if is-proposer?
+            (let [block (propose-block state new-epoch)
+                  b-hash (hash-block block)
+                  state (-> state
+                            (assoc-in [:blocks b-hash] block)
+                            (record-block-depth b-hash))
+                  vote (cast-vote state block)
+                  local-pk (extract-local-pubkey-bytes state)
+                  state (if vote
+                          (-> state
+                              (update :voted-epochs (fnil conj #{}) (:epoch block))
+                              (accumulate-vote vote local-pk total-nodes))
+                          state)
+                  state (apply-future-votes state b-hash total-nodes)
+                  state (-> state
+                            update-head-hash
+                            finalize-prefix)
+                  targets (extract-targets state)
+                  ancestor-depth (long (or (get-in state [:config :max-ancestor-sync-depth])
+                                           (:max-ancestor-sync-depth state)
+                                           default-max-ancestor-sync-depth))
+                  wire-budget (long (or (get-in state [:config :max-propose-wire-bytes])
+                                        (:max-propose-wire-bytes state)
+                                        default-max-propose-wire-bytes))
+                  raw-ancestors (extract-notarized-ancestors state (:parent-hash block) ancestor-depth)
+                  base-propose {:type :send-propose :targets targets :block block :ancestors []}
+                  ancestors (truncate-ancestors-to-wire-budget base-propose raw-ancestors wire-budget)
+                  propose-cmd (assoc base-propose :ancestors ancestors)
+                  commands (if vote
+                             [propose-cmd
+                              {:type :send-vote :targets targets :vote vote}]
+                             [propose-cmd])]
+              {:state (prune-streamlet-state state) :commands commands})
+            {:state (prune-streamlet-state state) :commands []}))))))
 
 (defn- catchup-corroboration-threshold
   "Minimum distinct verified committee validators required to corroborate an out-of-horizon
@@ -915,7 +980,7 @@
    returns `{:jump-to-epoch E-or-nil :state st' :diagnose diag-cmd}`.
    Uses the `(f+1)`-th highest witnessed epoch so a single Byzantine peer cannot pull `:epoch`
    ahead of honest validators."
-  [state sender-hex observed-epoch curr-epoch max-delta reason-on-drop ancestors]
+  [state sender-hex observed-epoch curr-epoch max-delta reason-on-drop ancestors now-ms]
   (let [validator-hexes (extract-validator-hexes state)
         total-nodes (total-node-count state validator-hexes)
         threshold (catchup-corroboration-threshold total-nodes)
@@ -947,8 +1012,8 @@
                   :threshold threshold
                   :qc-backed? (boolean (and qc-epoch (> qc-epoch horizon)))}
             st' (-> state
-                    (assoc :epoch (max (long curr-epoch) (long quorum-epoch))
-                           :epoch-catchup-witnesses {})
+                    (advance-epoch quorum-epoch now-ms)
+                    (assoc :epoch-catchup-witnesses {})
                     (update-in [:diagnostics :quorum-epoch-catchup] (fnil inc 0)))]
         {:jump-to-epoch (long quorum-epoch)
          :state st'
@@ -971,10 +1036,11 @@
 (defn- process-in-horizon-propose
   [state event extra-cmds]
   (let [block (:block event)
+        now-ms (:now-ms event)
         state-with-ancestors (if (seq (:ancestors event))
-                               (ingest-verified-ancestors state (:ancestors event))
+                               (ingest-verified-ancestors state (:ancestors event) now-ms)
                                state)
-        state (update state-with-ancestors :epoch (fn [e] (max (or e 0) (long (:epoch block)))))
+        state (advance-epoch state-with-ancestors (:epoch block) now-ms)
         b-hash (hash-block block)
         state (-> state
                   (assoc-in [:blocks b-hash] block)
@@ -1023,7 +1089,7 @@
               sender-hex (when sender-pk (bytes->hex sender-pk))
               {:keys [jump-to-epoch state diagnose]}
               (record-out-of-horizon-witness state sender-hex (:epoch block) curr-epoch max-delta
-                                             :proposal-exceeds-catchup-delta (:ancestors event))]
+                                             :proposal-exceeds-catchup-delta (:ancestors event) (:now-ms event))]
           (if (and jump-to-epoch (<= (long (:epoch block)) (+ jump-to-epoch max-delta)))
             (process-in-horizon-propose state event [diagnose])
             {:state state :commands [diagnose]}))
@@ -1077,9 +1143,9 @@
       (if (> (long epoch) (+ (long curr-epoch) (long max-delta)))
         (let [{:keys [jump-to-epoch state diagnose]}
               (record-out-of-horizon-witness state sender-hex epoch curr-epoch max-delta
-                                             :vote-exceeds-catchup-delta nil)]
+                                             :vote-exceeds-catchup-delta nil (:now-ms event))]
           (if (and jump-to-epoch (<= (long epoch) (+ jump-to-epoch (long max-delta))))
-            (let [state (update state :epoch (fn [e] (max (or e 0) (long epoch))))]
+            (let [state (advance-epoch state epoch (:now-ms event))]
               (if (contains? (:blocks state) b-hash)
                 (let [total-nodes (total-node-count state validator-hexes)
                       state (accumulate-vote state vote sender-pk total-nodes)
@@ -1093,7 +1159,7 @@
                                 finalize-prefix)]
                   {:state state :commands [diagnose]})))
             {:state state :commands [diagnose]}))
-        (let [state (update state :epoch (fn [e] (max (or e 0) (long epoch))))]
+        (let [state (advance-epoch state epoch (:now-ms event))]
           (if (contains? (:blocks state) b-hash)
             (let [total-nodes (total-node-count state validator-hexes)
                   state (accumulate-vote state vote sender-pk total-nodes)
@@ -1113,7 +1179,7 @@
    {:state new-state :commands [...]}"
   [state event]
   (case (:type event)
-    :tick (handle-tick-event state)
+    :tick (handle-tick-event state event)
     :receive-propose (handle-propose-event state event)
     :receive-vote (handle-vote-event state event)
     {:state state :commands []}))

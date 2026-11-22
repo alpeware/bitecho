@@ -1008,46 +1008,50 @@
 
 (defn- apply-streamlet-tick
   "Steps Streamlet BFT tick if peers-map is configured, advancing consensus state and commands."
-  [state commands closing-epoch]
-  (if (consensus-mode? state)
-    (let [ancestor-rids (collect-ancestor-receipt-ids state)
-          exec-rids (or (:executed-receipt-ids state) #{})
-          max-rcpts (long (or (get-in state [:config :max-receipts-per-block])
-                              (:max-receipts-per-block state)
-                              32))
-          filtered-receipts (->> (or (:pending-receipts state) [])
-                                 (remove (fn [r]
-                                           (let [rid (:receipt-id r)]
-                                             (or (contains? exec-rids rid)
-                                                 (contains? ancestor-rids rid)))))
-                                 (sort-by (fn [r]
-                                            [(case (:type r)
-                                               :reconfigure-membership -1
-                                               :register-home-set 0
-                                               :burn 1
-                                               :transfer 2
-                                               :settle-intent 3
-                                               :lock-intent 4
-                                               :release-intent 5
-                                               :refund-intent 6
-                                               :voucher 7
-                                               :transcript 8
-                                               9)
-                                             (long (or (:seq r) 0))
-                                             (str (:receipt-id r))]))
-                                 (take max-rcpts)
-                                 vec)
-          should-set-mempool? (or (seq filtered-receipts)
-                                  (empty? (:mempool state))
-                                  (boolean (seq (filter #(and (map? %) (:receipt-id %)) (:mempool state)))))
-          tick-state (cond-> (assoc state :epoch closing-epoch)
-                       should-set-mempool? (assoc :mempool filtered-receipts))
-          streamlet-res (streamlet/handle-streamlet-event tick-state {:type :tick})
-          post-exec-state (execute-finalized-blocks (:state streamlet-res))]
-      {:state post-exec-state
-       :commands (into (or commands []) (:commands streamlet-res))})
-    {:state state
-     :commands commands}))
+  ([state commands closing-epoch]
+   (apply-streamlet-tick state commands closing-epoch nil))
+  ([state commands closing-epoch now-ms]
+   (if (consensus-mode? state)
+     (let [ancestor-rids (collect-ancestor-receipt-ids state)
+           exec-rids (or (:executed-receipt-ids state) #{})
+           max-rcpts (long (or (get-in state [:config :max-receipts-per-block])
+                               (:max-receipts-per-block state)
+                               32))
+           filtered-receipts (->> (or (:pending-receipts state) [])
+                                  (remove (fn [r]
+                                            (let [rid (:receipt-id r)]
+                                              (or (contains? exec-rids rid)
+                                                  (contains? ancestor-rids rid)))))
+                                  (sort-by (fn [r]
+                                             [(case (:type r)
+                                                :reconfigure-membership -1
+                                                :register-home-set 0
+                                                :burn 1
+                                                :transfer 2
+                                                :settle-intent 3
+                                                :lock-intent 4
+                                                :release-intent 5
+                                                :refund-intent 6
+                                                :voucher 7
+                                                :transcript 8
+                                                9)
+                                              (long (or (:seq r) 0))
+                                              (str (:receipt-id r))]))
+                                  (take max-rcpts)
+                                  vec)
+           should-set-mempool? (or (seq filtered-receipts)
+                                   (empty? (:mempool state))
+                                   (boolean (seq (filter #(and (map? %) (:receipt-id %)) (:mempool state)))))
+           tick-state (cond-> (assoc state :epoch closing-epoch)
+                        should-set-mempool? (assoc :mempool filtered-receipts))
+           tick-ev (cond-> {:type :tick}
+                     (integer? now-ms) (assoc :now-ms (long now-ms)))
+           streamlet-res (streamlet/handle-streamlet-event tick-state tick-ev)
+           post-exec-state (execute-finalized-blocks (:state streamlet-res))]
+       {:state post-exec-state
+        :commands (into (or commands []) (:commands streamlet-res))})
+     {:state state
+      :commands commands})))
 
 (defn- peer-pubkey-hex
   "Normalizes a Peer record, map, hex string, or byte array into a hex pubkey string."
@@ -1079,98 +1083,103 @@
 (defn- handle-tick
   "Handles a periodic tick event to drive Basalt reseeding and Contagion anti-entropy."
   [state event]
-  (let [cfg (:config state)
-        new-epoch (inc (or (:epoch state) 0))
-        epoch-entropy (derive-epoch-entropy state cfg)
-        view (sanitize-basalt-view state (:basalt-view state))
-        rng (:rng event)
-        reset-result (basalt/reset-slots-deterministic view epoch-entropy (:node-pubkey state) (:basalt-index state) 1)
-        new-view (sanitize-basalt-view state (:view reset-result))
-        new-index (:next-r reset-result)
-        extracted-peers (exclude-self-peers state (basalt/extract-peers new-view))
-        push-targets (basalt/select-peers-deterministic (str epoch-entropy ":push:" new-epoch) (:node-pubkey state) new-view 1)
-        push-command (when (seq push-targets)
-                       {:type :send-push-view
-                        :targets push-targets
-                        :view extracted-peers})
-        summary-window (long (or (:contagion-summary-window-epochs cfg)
-                                 (:gossip-ttl-epochs cfg)
-                                 16))
-        summary-cutoff (- new-epoch summary-window)
-        msg-epochs (:message-epochs state)
-        trailing-known-ids (if (seq msg-epochs)
-                             (into #{}
-                                   (filter (fn [mid]
-                                             (let [ep (get msg-epochs mid)]
-                                               (or (nil? ep)
-                                                   (>= (long ep) summary-cutoff))))
-                                           (:contagion-known-ids state)))
-                             (:contagion-known-ids state))
-        summary (contagion/generate-summary rng extracted-peers trailing-known-ids)
-        summary-command (when summary
-                          {:type :send-summary
-                           :target (:target summary)
-                           :summary (:summary summary)})
-        sampling-res (sample-peer-roles state cfg epoch-entropy new-epoch extracted-peers)
-        echo-subs (:echo-subscribers state)
-        pending-echo-ids (set/difference (ensure-set (:contagion-known-ids state))
-                                         (ensure-set (:sieve-delivered-set state)))
-        echo-ae-commands (when (seq echo-subs)
-                           (mapv (fn [mid]
-                                   (attach-control-frame-signature
-                                    state
-                                    {:type :send-sieve-echo
-                                     :targets echo-subs
-                                     :message-id mid}
-                                    :sieve-echo
-                                    mid))
-                                 (sort pending-echo-ids)))
-        commands (into (filterv some? (concat [push-command summary-command] (:subscribe-commands sampling-res)))
-                       echo-ae-commands)
-        closing-epoch (or (:epoch state) 0)
-        closing-messages (get (:epoch-to-messages state) closing-epoch #{})
-        closing-roles (get (:epoch-to-message-roles state) closing-epoch {})
-        frozen-epoch-messages (assoc (or (:frozen-epoch-messages state) {}) closing-epoch closing-messages)
-        frozen-epoch-roles (assoc (or (:frozen-epoch-message-roles state) {}) closing-epoch closing-roles)
-        base-state (assoc state
-                          :epoch new-epoch
-                          :epoch-entropy epoch-entropy
-                          :basalt-view new-view
-                          :basalt-index new-index
-                          :frozen-epoch-messages frozen-epoch-messages
-                          :frozen-epoch-message-roles frozen-epoch-roles
-                          :fault-strikes (or (:fault-strikes state) {})
-                          :global-echo-sample (:echo-sample sampling-res)
-                          :global-ready-sample (:ready-sample sampling-res)
-                          :global-delivery-sample (:delivery-sample sampling-res))
-        cfg-act-res (deploy/apply-epoch-boundary-configs base-state new-epoch)
-        base-state' (:state cfg-act-res)
-        pruned-state (prune-expired-tick-state base-state' new-epoch (:config base-state'))
-        transcript-commands (when (and (consensus-mode? pruned-state)
-                                       (seq closing-messages)
-                                       (or (:node-private-key pruned-state)
-                                           (get-in pruned-state [:keypair :private])))
-                              (let [my-pub (:node-pubkey pruned-state)
-                                    my-priv (or (:node-private-key pruned-state)
-                                                (get-in pruned-state [:keypair :private]))
-                                    auth-roles (attestation/canonicalize-message-roles
-                                                (derive-authoritative-roles closing-messages closing-roles))
-                                    my-frozen-log (attestation/sign-frozen-log closing-epoch my-pub closing-messages my-priv)
-                                    peer-pubs (sort (disj (set (keys (:peers-map pruned-state))) my-pub))]
-                                (mapv (fn [peer-pub]
-                                        (let [half-tx (attestation/create-transcript closing-epoch my-pub peer-pub auth-roles my-priv)]
-                                          {:type :send-transcript-sig
-                                           :target peer-pub
-                                           :epoch closing-epoch
-                                           :transcript (into {} half-tx)
-                                           :frozen-log my-frozen-log}))
-                                      peer-pubs)))
-        all-commands (into (into commands transcript-commands) (:effects cfg-act-res))]
-    (if (consensus-mode? pruned-state)
-      (apply-streamlet-tick pruned-state all-commands closing-epoch)
-      (let [tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)
-            treasury-state (apply-epoch-treasury-boundary tick-state-settled new-epoch)]
-        (apply-streamlet-tick treasury-state all-commands closing-epoch)))))
+  (if (and (consensus-mode? state) (streamlet/tick-suppressed? state event))
+    (let [streamlet-res (streamlet/handle-streamlet-event state event)
+          post-exec-state (execute-finalized-blocks (:state streamlet-res))]
+      {:state post-exec-state
+       :commands (:commands streamlet-res)})
+    (let [cfg (:config state)
+          new-epoch (inc (or (:epoch state) 0))
+          epoch-entropy (derive-epoch-entropy state cfg)
+          view (sanitize-basalt-view state (:basalt-view state))
+          rng (:rng event)
+          reset-result (basalt/reset-slots-deterministic view epoch-entropy (:node-pubkey state) (:basalt-index state) 1)
+          new-view (sanitize-basalt-view state (:view reset-result))
+          new-index (:next-r reset-result)
+          extracted-peers (exclude-self-peers state (basalt/extract-peers new-view))
+          push-targets (basalt/select-peers-deterministic (str epoch-entropy ":push:" new-epoch) (:node-pubkey state) new-view 1)
+          push-command (when (seq push-targets)
+                         {:type :send-push-view
+                          :targets push-targets
+                          :view extracted-peers})
+          summary-window (long (or (:contagion-summary-window-epochs cfg)
+                                   (:gossip-ttl-epochs cfg)
+                                   16))
+          summary-cutoff (- new-epoch summary-window)
+          msg-epochs (:message-epochs state)
+          trailing-known-ids (if (seq msg-epochs)
+                               (into #{}
+                                     (filter (fn [mid]
+                                               (let [ep (get msg-epochs mid)]
+                                                 (or (nil? ep)
+                                                     (>= (long ep) summary-cutoff))))
+                                             (:contagion-known-ids state)))
+                               (:contagion-known-ids state))
+          summary (contagion/generate-summary rng extracted-peers trailing-known-ids)
+          summary-command (when summary
+                            {:type :send-summary
+                             :target (:target summary)
+                             :summary (:summary summary)})
+          sampling-res (sample-peer-roles state cfg epoch-entropy new-epoch extracted-peers)
+          echo-subs (:echo-subscribers state)
+          pending-echo-ids (set/difference (ensure-set (:contagion-known-ids state))
+                                           (ensure-set (:sieve-delivered-set state)))
+          echo-ae-commands (when (seq echo-subs)
+                             (mapv (fn [mid]
+                                     (attach-control-frame-signature
+                                      state
+                                      {:type :send-sieve-echo
+                                       :targets echo-subs
+                                       :message-id mid}
+                                      :sieve-echo
+                                      mid))
+                                   (sort pending-echo-ids)))
+          commands (into (filterv some? (concat [push-command summary-command] (:subscribe-commands sampling-res)))
+                         echo-ae-commands)
+          closing-epoch (or (:epoch state) 0)
+          closing-messages (get (:epoch-to-messages state) closing-epoch #{})
+          closing-roles (get (:epoch-to-message-roles state) closing-epoch {})
+          frozen-epoch-messages (assoc (or (:frozen-epoch-messages state) {}) closing-epoch closing-messages)
+          frozen-epoch-roles (assoc (or (:frozen-epoch-message-roles state) {}) closing-epoch closing-roles)
+          base-state (assoc state
+                            :epoch new-epoch
+                            :epoch-entropy epoch-entropy
+                            :basalt-view new-view
+                            :basalt-index new-index
+                            :frozen-epoch-messages frozen-epoch-messages
+                            :frozen-epoch-message-roles frozen-epoch-roles
+                            :fault-strikes (or (:fault-strikes state) {})
+                            :global-echo-sample (:echo-sample sampling-res)
+                            :global-ready-sample (:ready-sample sampling-res)
+                            :global-delivery-sample (:delivery-sample sampling-res))
+          cfg-act-res (deploy/apply-epoch-boundary-configs base-state new-epoch)
+          base-state' (:state cfg-act-res)
+          pruned-state (prune-expired-tick-state base-state' new-epoch (:config base-state'))
+          transcript-commands (when (and (consensus-mode? pruned-state)
+                                         (seq closing-messages)
+                                         (or (:node-private-key pruned-state)
+                                             (get-in pruned-state [:keypair :private])))
+                                (let [my-pub (:node-pubkey pruned-state)
+                                      my-priv (or (:node-private-key pruned-state)
+                                                  (get-in pruned-state [:keypair :private]))
+                                      auth-roles (attestation/canonicalize-message-roles
+                                                  (derive-authoritative-roles closing-messages closing-roles))
+                                      my-frozen-log (attestation/sign-frozen-log closing-epoch my-pub closing-messages my-priv)
+                                      peer-pubs (sort (disj (set (keys (:peers-map pruned-state))) my-pub))]
+                                  (mapv (fn [peer-pub]
+                                          (let [half-tx (attestation/create-transcript closing-epoch my-pub peer-pub auth-roles my-priv)]
+                                            {:type :send-transcript-sig
+                                             :target peer-pub
+                                             :epoch closing-epoch
+                                             :transcript (into {} half-tx)
+                                             :frozen-log my-frozen-log}))
+                                        peer-pubs)))
+          all-commands (into (into commands transcript-commands) (:effects cfg-act-res))]
+      (if (consensus-mode? pruned-state)
+        (apply-streamlet-tick pruned-state all-commands closing-epoch (:now-ms event))
+        (let [tick-state-settled (apply-epoch-voucher-settlement pruned-state closing-epoch)
+              treasury-state (apply-epoch-treasury-boundary tick-state-settled new-epoch)]
+          (apply-streamlet-tick treasury-state all-commands closing-epoch (:now-ms event)))))))
 
 (defn- apply-broadcast-burn
   "Enforces a signaling burn on broadcast. If :economy-enabled? is false or burn-floor is 0,

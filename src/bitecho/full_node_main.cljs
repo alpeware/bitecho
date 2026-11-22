@@ -3076,6 +3076,7 @@
                                      (let [event (assoc msg
                                                         :sender peer-hex
                                                         :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
+                                                        :now-ms (.now js/Date)
                                                         :rng (crypto/make-random))]
                                        (step-validator-event! ctx event true)
                                        (when (= :receive-gossip (:type msg))
@@ -3726,7 +3727,7 @@
          interval-atom (atom nil)
          tick-fn! (fn []
                     (try
-                      (step-validator-event! ctx {:type :tick :rng (crypto/make-random)} false)
+                      (step-validator-event! ctx {:type :tick :now-ms (.now js/Date) :rng (crypto/make-random)} false)
                       (when (= transport :datachannel)
                         (send-peer-keepalives! peer-conns)
                         (check-and-reconnect-peers! ctx timeout-ms (.now js/Date)))

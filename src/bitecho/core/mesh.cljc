@@ -100,7 +100,8 @@
    :delivery-vote-counts
    :local-ready-set
    :sieve-delivered-set
-   :delivered-set])
+   :delivered-set
+   :epoch-started-at-ms])
 
 (defn- unserializable-val?
   [x]
@@ -1118,6 +1119,7 @@
                          (seq effective-mesh-nodes) (assoc :mesh-nodes effective-mesh-nodes)
                          (seq effective-peers-map) (assoc :peers-map effective-peers-map)))]
     (-> rebound
+        (dissoc :epoch-started-at-ms)
         streamlet/repair-corrupt-block-depths
         (streamlet/record-executed-root-depths
          (into (or (:executed-finalized-blocks rebound) #{})

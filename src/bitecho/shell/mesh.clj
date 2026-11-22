@@ -1711,7 +1711,7 @@
                           (fn []
                             (try
                               (async/put! (:events-in shell-node)
-                                          {:type :tick :rng (java.util.Random.)})
+                                          {:type :tick :now-ms (System/currentTimeMillis) :rng (java.util.Random.)})
                               (when (= transport :datachannel)
                                 (send-peer-keepalives! (:peer-conns ctx))
                                 (check-and-reconnect-peers! ctx timeout-ms))
@@ -1953,6 +1953,7 @@
                                      (let [event (assoc msg
                                                         :sender peer-hex
                                                         :sender-pubkey-bytes (basalt/hex->bytes peer-hex)
+                                                        :now-ms (System/currentTimeMillis)
                                                         :rng (java.util.Random.))]
                                        (async/put! (:network-in shell-node) event)
                                        (when (= :receive-gossip (:type msg))
