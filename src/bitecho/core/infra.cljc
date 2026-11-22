@@ -228,6 +228,7 @@
                                         {:pattern "bip/*"            :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "config/*"         :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "sla/*"            :principal {:type :allowlist :signers doc-blog-signers}}
+                                        {:pattern "incidents/*"      :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "deploy/*"         :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "research/*"       :principal {:type :allowlist :signers doc-blog-signers}}
                                         {:pattern "telemetry/*"      :principal {:type :allowlist :signers telemetry-signers}}
