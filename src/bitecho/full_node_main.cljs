@@ -2039,7 +2039,10 @@
           (send-text! res 400 "Invalid incident path" method)
           (let [ptr-path (str "incidents/" fname)
                 sub @(:subnet-atom rt)
-                ptr (get-in sub [:data :pointers ["bitecho.org/infra" ptr-path]])
+                ptr (or (get-in sub [:data :pointers [(str (:subnet-id sub)) ptr-path]])
+                        (get-in sub [:data :pointers ["bitecho.org/infra" ptr-path]])
+                        (some (fn [[[_ p] v]] (when (= p ptr-path) v))
+                              (get-in sub [:data :pointers])))
                 cid (:pointer/target ptr)
                 ct (cond
                      (str/ends-with? fname ".md") "text/markdown; charset=utf-8"
